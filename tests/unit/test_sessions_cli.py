@@ -36,6 +36,39 @@ def test_session_summary_renderer_emits_json(tmp_path: Path) -> None:
     assert payload["sessions"][0]["model"] == "openai/gpt-5.2"
 
 
+def test_session_human_renderers_neutralize_persisted_terminal_controls(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(
+        str(tmp_path / "project\u202ehidden\u202c"),
+        model="openai/model\x1b]0;owned\x07",
+    )
+    store.rename_session(session.session_id, "title\x1b[2J\nforged")
+    child = store.fork_session(
+        session.session_id,
+        branch_name="branch\x1b[3J\u202ehidden\u202c",
+    )
+
+    summaries = list_session_summaries(store, project_path=None, all_projects=True)
+    summary_text = render_session_summaries(summaries)
+    tree_text = render_session_tree(store.session_tree(session.session_id))
+
+    assert "\x1b" not in summary_text
+    assert "\x1b" not in tree_text
+    assert "\u202e" not in summary_text
+    assert "\u202e" not in tree_text
+    assert "title\\x1b[2J forged" in summary_text
+    assert "openai/model\\x1b]0;owned\\x07" in summary_text
+    assert "branch\\x1b[3J\\u202ehidden\\u202c" in tree_text
+    assert child.session_id in tree_text
+
+    payload = json.loads(render_session_summaries(summaries, json_output=True))
+    stored = next(item for item in payload["sessions"] if item["session_id"] == session.session_id)
+    assert stored["title"] == "title\x1b[2J forged"
+    assert stored["model"] == "openai/model\x1b]0;owned\x07"
+
+
 def test_sessions_cli_lists_current_project_sessions(
     tmp_path: Path,
     monkeypatch,

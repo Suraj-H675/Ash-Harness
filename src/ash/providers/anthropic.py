@@ -8,6 +8,7 @@ surface a clear error to the user instead of crashing mid-turn.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from typing import Any, AsyncGenerator
 
@@ -17,6 +18,7 @@ from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_me
 from ash.providers.readiness import (
     ProviderConfigurationError,
     normalize_provider_base_url,
+    redact_provider_error,
     require_secure_provider_transport,
 )
 
@@ -172,14 +174,20 @@ class AnthropicProvider(ProviderABC):
             )
 
         try:
-            from anthropic import AsyncAnthropic  # type: ignore[import-not-found]
+            from anthropic import (  # type: ignore[import-not-found]
+                AsyncAnthropic,
+                DefaultAsyncHttpxClient,
+            )
         except ImportError as exc:  # pragma: no cover - depends on host env
             raise ProviderBackendUnavailable(
                 "The 'anthropic' package is not installed. "
                 "Install it with `pip install anthropic` or inject a client."
             ) from exc
 
-        kwargs: dict[str, Any] = {"max_retries": 0}
+        kwargs: dict[str, Any] = {
+            "max_retries": 0,
+            "http_client": DefaultAsyncHttpxClient(follow_redirects=False),
+        }
         if self._api_key:
             kwargs["api_key"] = self._api_key
         if self._base_url:
@@ -200,8 +208,11 @@ class AnthropicProvider(ProviderABC):
         request_kwargs: dict[str, Any] = {
             "model": self._model_name,
             "messages": conversation,
-            "temperature": temperature,
         }
+        # Anthropic deprecated sampling temperature for current Claude models,
+        # and the 1.x Python SDK no longer accepts the argument. Keep the
+        # provider-neutral method signature, but let Anthropic use its supported
+        # server-side default instead of sending an incompatible value.
         if system_prompt:
             request_kwargs["system"] = system_prompt
         anthropic_tools = prepare_anthropic_tools(tools)
@@ -219,68 +230,76 @@ class AnthropicProvider(ProviderABC):
         if max_tokens:
             request_kwargs["max_tokens"] = max_tokens
 
-        async with client.messages.stream(**request_kwargs) as stream:
-            async for text in stream.text_stream:
-                if text:
-                    yield StreamChunk(content=text, model=self._model_name)
+        try:
+            stream_context = client.messages.stream(**request_kwargs)
+            async with stream_context as stream:
+                async for text in stream.text_stream:
+                    if text:
+                        yield StreamChunk(content=text, model=self._model_name)
 
-            final_message = await stream.get_final_message()
-            usage = getattr(final_message, "usage", None)
-            uncached_input_tokens = getattr(usage, "input_tokens", 0) or 0
-            cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
-            cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
-            stop_reason = getattr(final_message, "stop_reason", None)
-            native_tool_calls: list[CanonicalToolCall] = []
-            reasoning_blocks: list[dict[str, Any]] = []
-            for block in getattr(final_message, "content", []) or []:
-                if getattr(block, "type", None) == "tool_use":
-                    native_tool_calls.append(
-                        CanonicalToolCall(
-                            call_id=block.id,
-                            name=block.name,
-                            arguments=block.input,
-                        )
-                    )
-                elif getattr(block, "type", None) in {
-                    "thinking",
-                    "redacted_thinking",
-                    "web_search_tool_result",
-                }:
-                    reasoning_blocks.append(
-                        {
-                            "type": block.type,
-                            **(
-                                {"thinking": str(block.thinking)[:20_000]}
-                                if getattr(block, "thinking", None)
-                                else {}
-                            ),
-                            **(
-                                {"data": getattr(block, "data", "")[:20_000]}
-                                if getattr(block, "type", None) == "redacted_thinking"
-                                else {}
-                            ),
-                            **(
-                                {"content": getattr(block, "content", [])}
-                                if block.type == "web_search_tool_result"
-                                else {}
-                            ),
-                        }
-                    )
-            yield StreamChunk(
-                content="",
-                is_done=True,
-                prompt_tokens=(
-                    uncached_input_tokens + cache_read_tokens + cache_write_tokens
-                ),
-                completion_tokens=getattr(usage, "output_tokens", 0) or 0,
-                cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
-                usage_source="provider" if usage is not None else "unavailable",
-                stop_reason=stop_reason,
-                model=self._model_name,
-                native_tool_calls=native_tool_calls or None,
-                reasoning=reasoning_blocks or None,
+                final_message = await stream.get_final_message()
+        except Exception as exc:  # noqa: BLE001
+            detail = redact_provider_error(
+                str(exc),
+                self._api_key,
+                os.environ.get("ANTHROPIC_API_KEY", ""),
             )
+            raise RuntimeError(f"Anthropic API error: {detail}") from exc
+
+        usage = getattr(final_message, "usage", None)
+        uncached_input_tokens = getattr(usage, "input_tokens", 0) or 0
+        cache_read_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_write_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        stop_reason = getattr(final_message, "stop_reason", None)
+        native_tool_calls: list[CanonicalToolCall] = []
+        reasoning_blocks: list[dict[str, Any]] = []
+        for block in getattr(final_message, "content", []) or []:
+            if getattr(block, "type", None) == "tool_use":
+                native_tool_calls.append(
+                    CanonicalToolCall(
+                        call_id=block.id,
+                        name=block.name,
+                        arguments=block.input,
+                    )
+                )
+            elif getattr(block, "type", None) in {
+                "thinking",
+                "redacted_thinking",
+                "web_search_tool_result",
+            }:
+                reasoning_blocks.append(
+                    {
+                        "type": block.type,
+                        **(
+                            {"thinking": str(block.thinking)[:20_000]}
+                            if getattr(block, "thinking", None)
+                            else {}
+                        ),
+                        **(
+                            {"data": getattr(block, "data", "")[:20_000]}
+                            if getattr(block, "type", None) == "redacted_thinking"
+                            else {}
+                        ),
+                        **(
+                            {"content": getattr(block, "content", [])}
+                            if block.type == "web_search_tool_result"
+                            else {}
+                        ),
+                    }
+                )
+        yield StreamChunk(
+            content="",
+            is_done=True,
+            prompt_tokens=(uncached_input_tokens + cache_read_tokens + cache_write_tokens),
+            completion_tokens=getattr(usage, "output_tokens", 0) or 0,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            usage_source="provider" if usage is not None else "unavailable",
+            stop_reason=stop_reason,
+            model=self._model_name,
+            native_tool_calls=native_tool_calls or None,
+            reasoning=reasoning_blocks or None,
+        )
 
     def configure_max_tokens(self, max_tokens: int) -> None:
         """Set the per-completion cap. Call before streaming."""

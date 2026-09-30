@@ -72,12 +72,7 @@ class LSPClient:
         self.config = config
         self.root = root.resolve()
         self._guard = SafetyGuard(self.root)
-        try:
-            root_metadata = os.stat(self.root)
-        except OSError:
-            self._root_identity: tuple[int, int] | None = None
-        else:
-            self._root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+        self._root_identity = self._guard.project_root_identity
         self._diagnostics_callback = diagnostics_callback
         self.process: asyncio.subprocess.Process | None = None
         self._process_tree_plan: ProcessTreePlan | None = None
@@ -345,6 +340,10 @@ class LSPClient:
         result_id = result.get("resultId")
         bounded_result_id = result_id[:512] if isinstance(result_id, str) else None
         if kind == "unchanged":
+            if previous_result_id is None:
+                raise LSPResponseError(
+                    "unchanged document diagnostics require a previous result id"
+                )
             return DocumentDiagnosticReport("unchanged", [], bounded_result_id)
         if kind != "full":
             raise LSPResponseError("invalid document diagnostic report kind")

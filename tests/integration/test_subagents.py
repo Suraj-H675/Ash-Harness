@@ -8,9 +8,11 @@ import time
 from pathlib import Path
 
 import pytest
+import ash.agents.orchestrator as orchestrator_module
 
 from ash.agents import (
     AGENT_ROLES,
+    AgentReport,
     LEAD_AGENT_ID,
     SharedState,
     SubagentOrchestrator,
@@ -230,10 +232,10 @@ def test_subprocess_agent_spawn_subprocess_publishes_report(tmp_path: Path) -> N
 
 
 def test_subprocess_agent_spawn_preserves_worker_contract(tmp_path: Path) -> None:
-    ss = SharedState(tmp_path / "state.db")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ss = SharedState(tmp_path / "state.db", workspace=workspace)
     try:
-        workspace = tmp_path / "workspace"
-        workspace.mkdir()
         agent = SubprocessAgent(
             agent_id="custom-child",
             role="docs-specialist",
@@ -404,7 +406,60 @@ def test_orchestrator_rejects_invalid_concurrency(tmp_path: Path) -> None:
     ss = SharedState(tmp_path / "state.db")
     with pytest.raises(ValueError):
         SubagentOrchestrator(ss, max_concurrency=0)
+    with pytest.raises(ValueError):
+        SubagentOrchestrator(ss, max_concurrency=33)
     ss.close()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_limits_owned_worker_tasks_to_concurrency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    created_tasks = 0
+    original_create_task = asyncio.create_task
+
+    class BlockingAgent:
+        def __init__(self, *, agent_id: str, role: str, task: str, **_: object) -> None:
+            self.agent_id = agent_id
+            self.role = role
+            self.task = task
+
+        async def run_in_process(self) -> AgentReport:
+            await release.wait()
+            return AgentReport(
+                agent_id=self.agent_id,
+                role=self.role,
+                task=self.task,
+                success=True,
+                summary="done",
+            )
+
+    def count_create_task(coro):
+        nonlocal created_tasks
+        created_tasks += 1
+        return original_create_task(coro)
+
+    monkeypatch.setattr(orchestrator_module, "SubprocessAgent", BlockingAgent)
+    monkeypatch.setattr(orchestrator_module.asyncio, "create_task", count_create_task)
+    state = SharedState(tmp_path / "state.db")
+    orchestrator = SubagentOrchestrator(state, max_concurrency=2)
+    specs = [
+        SubagentSpec(role="researcher", task=f"task-{index}", agent_id=f"r-{index}")
+        for index in range(20)
+    ]
+    run = original_create_task(orchestrator._run_agents(specs))
+    try:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert created_tasks == 2
+    finally:
+        release.set()
+        reports = await run
+        state.close()
+
+    assert len(reports) == 20
 
 
 def test_orchestrator_respects_max_concurrency(tmp_path: Path) -> None:

@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,67 @@ def test_trust_round_trip_uses_canonical_workspace(tmp_path, monkeypatch) -> Non
     assert is_workspace_trusted(workspace) is False
 
 
+def test_concurrent_trust_updates_do_not_restore_revoked_workspace(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import ash.safety.trust as trust_module
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    assert set_workspace_trusted(second, True) is True
+
+    original_load = trust_module._load_from_directory
+    first_loaded = threading.Event()
+    release_first = threading.Event()
+    second_loaded = threading.Event()
+    calls_lock = threading.Lock()
+    load_calls = 0
+
+    def controlled_load(directory, name):
+        nonlocal load_calls
+        entries = original_load(directory, name)
+        with calls_lock:
+            load_calls += 1
+            call_number = load_calls
+        if call_number == 1:
+            first_loaded.set()
+            assert release_first.wait(timeout=2)
+        elif call_number == 2:
+            second_loaded.set()
+        return entries
+
+    monkeypatch.setattr(trust_module, "_load_from_directory", controlled_load)
+    errors: list[BaseException] = []
+
+    def update(path: Path, trusted: bool) -> None:
+        try:
+            set_workspace_trusted(path, trusted)
+        except BaseException as exc:
+            errors.append(exc)
+
+    revoke = threading.Thread(target=update, args=(second, False))
+    trust_first = threading.Thread(target=update, args=(first, True))
+    revoke.start()
+    assert first_loaded.wait(timeout=2)
+    trust_first.start()
+    try:
+        assert second_loaded.wait(timeout=0.1) is False
+    finally:
+        release_first.set()
+    revoke.join(timeout=2)
+    trust_first.join(timeout=2)
+
+    assert not revoke.is_alive()
+    assert not trust_first.is_alive()
+    assert errors == []
+    assert is_workspace_trusted(first) is True
+    assert is_workspace_trusted(second) is False
+
+
 def test_oversized_trust_store_fails_closed(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     path = trust_store_path()
@@ -33,6 +95,23 @@ def test_oversized_trust_store_fails_closed(tmp_path, monkeypatch) -> None:
     path.write_bytes(b" " * (MAX_TRUST_STORE_BYTES + 1))
 
     assert is_workspace_trusted(tmp_path / "workspace") is False
+
+
+def test_non_standard_json_trust_store_fails_closed(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    path = trust_store_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        '{"version":1,"workspaces":['
+        + json.dumps(str(workspace.resolve()))
+        + '],"metric":NaN}',
+        encoding="utf-8",
+    )
+
+    assert is_workspace_trusted(workspace) is False
 
 
 def test_symlinked_trust_store_cannot_grant_workspace_trust(

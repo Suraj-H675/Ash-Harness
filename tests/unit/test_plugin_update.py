@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import ash.commands.extensions as extension_commands
 import ash.plugins.lifecycle as lifecycle
+import ash.plugins.state as plugin_state
 from ash.cli import main
 from ash.plugins.catalog import sign_catalog
 from ash.plugins.lifecycle import (
@@ -41,9 +42,13 @@ def _commit_plugin(
     name: str = "demo",
     version: str,
     tag: str | None = None,
+    dependencies: list[dict[str, str]] | None = None,
 ) -> str:
+    manifest: dict[str, object] = {"name": name, "version": version}
+    if dependencies:
+        manifest["dependencies"] = dependencies
     (root / "plugin.json").write_text(
-        json.dumps({"name": name, "version": version}), encoding="utf-8"
+        json.dumps(manifest), encoding="utf-8"
     )
     (root / "README.md").write_text(f"{name} {version}\n", encoding="utf-8")
     env = _git_env()
@@ -70,12 +75,19 @@ def _git_plugin(
     name: str = "demo",
     version: str = "1.0.0",
     tag: str | None = None,
+    dependencies: list[dict[str, str]] | None = None,
 ) -> tuple[str, str, str]:
     if shutil.which("git") is None:
         pytest.skip("git is unavailable")
     root.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(root)], check=True)
-    digest = _commit_plugin(root, name=name, version=version, tag=tag)
+    digest = _commit_plugin(
+        root,
+        name=name,
+        version=version,
+        tag=tag,
+        dependencies=dependencies,
+    )
     branch = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
         check=True,
@@ -226,6 +238,87 @@ def test_extensions_update_direct_git_branch_replaces_with_new_commit(
     assert load_plugin_install_records()["demo"].digest == second_digest
 
 
+def test_single_update_uses_committed_record_without_postcommit_store_reread(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, branch, first_digest = _git_plugin(tmp_path / "repo")
+    install_git_plugin(source, ref=branch)
+    second_digest = _commit_plugin(tmp_path / "repo", version="2.0.0")
+
+    def unexpected_store_reread(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("single update must use the provenance committed by lifecycle")
+
+    monkeypatch.setattr(
+        extension_commands,
+        "load_plugin_install_records",
+        unexpected_store_reread,
+    )
+
+    result = extension_commands.update_local_plugin("demo")
+
+    assert result["status"] == "updated"
+    assert result["previous_digest"] == first_digest
+    assert result["digest"] == second_digest
+    assert result["version"] == "2.0.0"
+
+
+def test_extensions_update_rejects_new_reverse_dependency_breakage(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, branch, _ = _git_plugin(tmp_path / "base-repo", name="base")
+    install_git_plugin(source, ref=branch)
+    dependent = tmp_path / "dependent"
+    dependent.mkdir()
+    (dependent / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "dependent",
+                "version": "1.0.0",
+                "dependencies": [{"name": "base", "version": "<2"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    install_local_plugin(dependent)
+    before = load_plugin_install_records()["base"]
+    _commit_plugin(tmp_path / "base-repo", name="base", version="2.0.0")
+
+    assert main(["extensions", "update", "base"]) == 2
+    captured = capsys.readouterr()
+
+    assert "dependent requires base <2" in captured.err
+    installed = json.loads(
+        (user_plugin_root() / "base" / "plugin.json").read_text(encoding="utf-8")
+    )
+    assert installed["version"] == "1.0.0"
+    assert load_plugin_install_records()["base"] == before
+
+
+def test_git_install_rolls_back_plugin_and_provenance_when_activation_state_fails(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, branch, _ = _git_plugin(tmp_path / "repo")
+
+    def fail_state_write(*args, **kwargs):
+        del args, kwargs
+        raise OSError("injected activation-state failure")
+
+    monkeypatch.setattr(plugin_state, "_save_extension_state_at", fail_state_write)
+
+    with pytest.raises(lifecycle.PluginLifecycleError, match="activation-state failure"):
+        install_git_plugin(source, ref=branch, enabled=True)
+
+    assert not (user_plugin_root() / "demo").exists()
+    assert load_plugin_install_records() == {}
+
+
 def test_extensions_update_direct_git_unchanged_is_true_noop(
     tmp_path: Path,
     isolated_home: Path,
@@ -263,6 +356,165 @@ def test_extensions_update_direct_git_unchanged_rejects_tampered_installed_tree(
     assert "differs from trusted source" in captured.err
     assert (root / "README.md").read_text(encoding="utf-8") == "locally tampered\n"
     assert load_plugin_install_records()["demo"] == record
+
+
+def test_changed_update_can_repair_semantically_invalid_installed_plugin(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, branch, _ = _git_plugin(tmp_path / "repo")
+    install_git_plugin(source, ref=branch)
+    root = user_plugin_root() / "demo"
+    hook = root / "hooks" / "hooks.json"
+    hook.parent.mkdir(parents=True)
+    hook.write_text('{"pre_tool": "invalid"}', encoding="utf-8")
+    second_digest = _commit_plugin(tmp_path / "repo", version="2.0.0")
+
+    assert main(["extensions", "update", "demo", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "updated"
+    assert result["version"] == "2.0.0"
+    assert result["digest"] == second_digest
+    assert not hook.exists()
+    assert json.loads((root / "plugin.json").read_text(encoding="utf-8"))[
+        "version"
+    ] == "2.0.0"
+
+
+def test_changed_update_can_restore_missing_declared_component(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "repo"
+    source, branch, _ = _git_plugin(repository)
+    manifest = {
+        "name": "demo",
+        "version": "1.0.0",
+        "hooks": ["hooks/hooks.json"],
+    }
+    (repository / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+    hook = repository / "hooks" / "hooks.json"
+    hook.parent.mkdir(parents=True)
+    hook.write_text('{"pre_tool": []}', encoding="utf-8")
+    env = _git_env()
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-q", "-m", "declare hook"],
+        check=True,
+        env=env,
+    )
+    install_git_plugin(source, ref=branch)
+    installed_hook = user_plugin_root() / "demo" / "hooks" / "hooks.json"
+    installed_hook.unlink()
+
+    manifest["version"] = "2.0.0"
+    (repository / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+    hook.write_text('{"pre_tool": []}', encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-q", "-m", "repair hook"],
+        check=True,
+        env=env,
+    )
+    second_digest = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+
+    assert main(["extensions", "update", "demo", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "updated"
+    assert result["version"] == "2.0.0"
+    assert result["digest"] == second_digest
+    assert installed_hook.is_file()
+
+
+def test_changed_update_can_repair_corrupted_installed_manifest(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, branch, _ = _git_plugin(tmp_path / "repo")
+    install_git_plugin(source, ref=branch)
+    root = user_plugin_root() / "demo"
+    (root / "plugin.json").write_text("{not-json", encoding="utf-8")
+    second_digest = _commit_plugin(tmp_path / "repo", version="2.0.0")
+
+    assert main(["extensions", "update", "demo", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "updated"
+    assert result["version"] == "2.0.0"
+    assert result["digest"] == second_digest
+    installed = json.loads((root / "plugin.json").read_text(encoding="utf-8"))
+    assert installed["name"] == "demo"
+    assert installed["version"] == "2.0.0"
+
+
+def test_changed_update_repairs_visible_plugin_substitution(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "repo"
+    source, branch, _digest = _git_plugin(repository)
+    install_git_plugin(source, ref=branch)
+    root = user_plugin_root()
+    visible = root / "demo"
+    displaced = root / ".demo-displaced"
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    (attacker / "plugin.json").write_text(
+        json.dumps({"name": "demo", "version": "9.0.0"}),
+        encoding="utf-8",
+    )
+    (attacker / "README.md").write_text("attacker\n", encoding="utf-8")
+    visible.rename(displaced)
+    attacker.rename(visible)
+    second_digest = _commit_plugin(repository, version="2.0.0")
+
+    assert main(["extensions", "update", "demo", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "updated"
+    assert result["version"] == "2.0.0"
+    assert result["digest"] == second_digest
+    assert json.loads((visible / "plugin.json").read_text(encoding="utf-8"))[
+        "version"
+    ] == "2.0.0"
+    assert json.loads((displaced / "plugin.json").read_text(encoding="utf-8"))[
+        "version"
+    ] == "1.0.0"
+
+
+def test_changed_update_restores_missing_tracked_plugin_directory(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "repo"
+    source, branch, _ = _git_plugin(repository)
+    install_git_plugin(source, ref=branch)
+    root = user_plugin_root() / "demo"
+    shutil.rmtree(root)
+    second_digest = _commit_plugin(repository, version="2.0.0")
+
+    assert main(["extensions", "update", "demo", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "updated"
+    assert result["version"] == "2.0.0"
+    assert result["digest"] == second_digest
+    assert json.loads((root / "plugin.json").read_text(encoding="utf-8"))[
+        "version"
+    ] == "2.0.0"
 
 
 def test_extensions_update_changed_commit_rejects_stale_provenance_race(
@@ -354,6 +606,95 @@ def test_extensions_update_preserves_disabled_state(
     assert "demo" in load_extension_state().disabled_plugins
 
 
+def test_extensions_update_disabled_plugin_allows_disabled_dependencies(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "plugin.json").write_text(
+        json.dumps({"name": "base", "version": "1.0.0"}),
+        encoding="utf-8",
+    )
+    install_local_plugin(base)
+    dependencies = [{"name": "base", "version": ">=1"}]
+    source, branch, _ = _git_plugin(
+        tmp_path / "repo",
+        dependencies=dependencies,
+    )
+    install_git_plugin(source, ref=branch)
+    set_plugin_enabled("demo", enabled=False)
+    set_plugin_enabled("base", enabled=False)
+    _commit_plugin(
+        tmp_path / "repo",
+        version="2.0.0",
+        dependencies=dependencies,
+    )
+
+    assert main(["extensions", "update", "demo", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["status"] == "updated"
+    assert result["version"] == "2.0.0"
+    assert {"demo", "base"} <= set(load_extension_state().disabled_plugins)
+
+
+def test_extensions_update_rechecks_dependencies_if_plugin_is_enabled_during_update(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "plugin.json").write_text(
+        json.dumps({"name": "base", "version": "1.0.0"}),
+        encoding="utf-8",
+    )
+    install_local_plugin(base)
+    dependencies = [{"name": "base", "version": ">=1"}]
+    source, branch, _ = _git_plugin(
+        tmp_path / "repo",
+        dependencies=dependencies,
+    )
+    install_git_plugin(source, ref=branch)
+    set_plugin_enabled("demo", enabled=False)
+    set_plugin_enabled("base", enabled=False)
+    before_record = load_plugin_install_records()["demo"]
+    _commit_plugin(
+        tmp_path / "repo",
+        version="2.0.0",
+        dependencies=dependencies,
+    )
+    original_validate = extension_commands.validate_plugin_contents_at
+    flipped = False
+
+    def enable_during_validation(snapshot, manifest):
+        nonlocal flipped
+        if not flipped:
+            flipped = True
+            set_plugin_enabled("demo", enabled=True)
+        return original_validate(snapshot, manifest)
+
+    monkeypatch.setattr(
+        extension_commands,
+        "validate_plugin_contents_at",
+        enable_during_validation,
+    )
+
+    assert main(["extensions", "update", "demo"]) == 2
+    captured = capsys.readouterr()
+
+    assert "Missing dependency: base" in captured.err
+    installed = json.loads(
+        (user_plugin_root() / "demo" / "plugin.json").read_text(encoding="utf-8")
+    )
+    assert installed["version"] == "1.0.0"
+    assert load_plugin_install_records()["demo"] == before_record
+    assert "demo" not in load_extension_state().disabled_plugins
+
+
 def test_extensions_update_rejects_installed_version_drift(
     tmp_path: Path,
     isolated_home: Path,
@@ -369,7 +710,7 @@ def test_extensions_update_rejects_installed_version_drift(
     assert main(["extensions", "update", "demo"]) == 2
     captured = capsys.readouterr()
 
-    assert "does not match installed plugin version" in captured.err
+    assert "differs from trusted source" in captured.err
     assert load_plugin_install_records()["demo"].version == "1.0.0"
 
 
@@ -620,6 +961,78 @@ def test_extensions_update_signed_publisher_unchanged_is_noop(
 
     assert result["status"] == "unchanged"
     assert root.stat().st_ino == before_inode
+
+
+def test_extensions_update_reports_provenance_only_catalog_change_as_updated(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "repo"
+    source, _branch, digest = _git_plugin(repository, tag="v1.0.0")
+    subprocess.run(
+        ["git", "-C", str(repository), "tag", "v1-alias"],
+        check=True,
+    )
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "catalog.json",
+        private_key,
+        publisher="alpha",
+        source=source,
+        version="1.0.0",
+        ref="v1.0.0",
+        digest=digest,
+        sequence=1,
+    )
+    assert (
+        main(
+            [
+                "extensions",
+                "install",
+                "@alpha/demo",
+                "--catalog",
+                str(catalog),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    before = load_plugin_install_records()["demo"]
+
+    _write_catalog(
+        catalog,
+        private_key,
+        publisher="alpha",
+        source=source,
+        version="1.0.0",
+        ref="v1-alias",
+        digest=digest,
+        sequence=2,
+    )
+
+    assert (
+        main(
+            [
+                "extensions",
+                "update",
+                "demo",
+                "--catalog",
+                str(catalog),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    after = load_plugin_install_records()["demo"]
+
+    assert result["status"] == "updated"
+    assert after.digest == before.digest == digest
+    assert before.ref == "v1.0.0"
+    assert after.ref == "v1-alias"
 
 
 def test_extensions_update_catalog_noop_rejects_stale_provenance_race(
@@ -975,12 +1388,51 @@ def test_extensions_update_all_continues_after_error_and_returns_failure(
 
     assert [item["name"] for item in payload["results"]] == ["alpha", "beta"]
     assert payload["results"][0]["status"] == "error"
-    assert "does not match installed plugin version" in payload["results"][0]["error"]
+    assert "differs from trusted source" in payload["results"][0]["error"]
     assert payload["results"][1]["status"] == "updated"
     assert payload["updated"] == 1
     assert payload["unchanged"] == 0
     assert payload["errors"] == 1
     assert load_plugin_install_records()["beta"].digest == beta_new_digest
+
+
+def test_update_all_fails_closed_on_coordinated_dependency_version_transition(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    base_source, base_branch, base_v1_digest = _git_plugin(
+        tmp_path / "base-repo",
+        name="alpha-base",
+    )
+    dependent_source, dependent_branch, dependent_v1_digest = _git_plugin(
+        tmp_path / "dependent-repo",
+        name="z-dependent",
+        dependencies=[{"name": "alpha-base", "version": "<2"}],
+    )
+    install_git_plugin(base_source, ref=base_branch)
+    install_git_plugin(dependent_source, ref=dependent_branch)
+    _commit_plugin(
+        tmp_path / "base-repo",
+        name="alpha-base",
+        version="2.0.0",
+    )
+    _commit_plugin(
+        tmp_path / "dependent-repo",
+        name="z-dependent",
+        version="2.0.0",
+        dependencies=[{"name": "alpha-base", "version": ">=2"}],
+    )
+
+    assert main(["extensions", "update", "--all", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["updated"] == 0
+    assert payload["errors"] == 2
+    assert [item["status"] for item in payload["results"]] == ["error", "error"]
+    records = load_plugin_install_records()
+    assert records["alpha-base"].digest == base_v1_digest
+    assert records["z-dependent"].digest == dependent_v1_digest
 
 
 def test_extensions_update_all_ignores_untracked_local_plugins(

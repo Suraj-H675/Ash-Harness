@@ -12,11 +12,13 @@ from typing import Any, Callable, Iterable
 from ash.core.session import Session, SessionStore
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import (
+    ScopedFileChanged,
     ScopedFileSnapshot,
     ScopedIOError,
     remove_scoped_file,
     restore_scoped_file,
     snapshot_scoped_file,
+    workspace_mutation_lock,
 )
 from ash.tools.base import BaseTool, ToolMiddleware, ToolResult
 from ash.tools.patch import extract_patch_paths
@@ -47,6 +49,8 @@ class RecoveredToolCall:
     success: bool = False
     output: str = ""
     arguments: dict[str, Any] | None = None
+    assistant_message_id: int | None = None
+    assistant_arguments: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +170,24 @@ def recover_interrupted_turns(
     deferred_call_ids: set[str] | None = None,
 ) -> RecoverySummary:
     """Compensate provably interrupted direct edits and flag unknown effects."""
+
+    with workspace_mutation_lock():
+        return _recover_interrupted_turns_locked(
+            store,
+            guard,
+            session_id,
+            deferred_call_ids=deferred_call_ids,
+        )
+
+
+def _recover_interrupted_turns_locked(
+    store: SessionStore,
+    guard: SafetyGuard,
+    session_id: str,
+    *,
+    deferred_call_ids: set[str] | None = None,
+) -> RecoverySummary:
+    """Run interrupted-turn recovery while the mutation lease is held."""
 
     deferred_call_ids = deferred_call_ids or set()
     turns = store.recoverable_turns(session_id)
@@ -383,6 +405,8 @@ def recover_interrupted_turns(
                         dispatched=False,
                         ambiguous=False,
                         arguments=dict(missing.get("arguments") or {}),
+                        assistant_message_id=int(missing["assistant_message_id"]),
+                        assistant_arguments=dict(missing.get("arguments") or {}),
                     )
                 )
                 continue
@@ -418,6 +442,8 @@ def recover_interrupted_turns(
                         arguments=(
                             dict(arguments) if isinstance(arguments, dict) else {}
                         ),
+                        assistant_message_id=int(missing["assistant_message_id"]),
+                        assistant_arguments=dict(missing.get("arguments") or {}),
                     )
                 )
                 continue
@@ -447,6 +473,8 @@ def recover_interrupted_turns(
                     success=success,
                     output=output,
                     arguments=(dict(arguments) if isinstance(arguments, dict) else {}),
+                    assistant_message_id=int(missing["assistant_message_id"]),
+                    assistant_arguments=dict(missing.get("arguments") or {}),
                 )
             )
 
@@ -523,11 +551,12 @@ def _restore_checkpoint_rows(
     rows: list[tuple[Any, Path]], guard: SafetyGuard
 ) -> None:
     originals = _capture_file_states((path for _, path in rows), guard)
+    rollback_expected: dict[Path, set[str]] = {}
     try:
-        _apply_checkpoint_rows(rows, guard, originals)
+        _apply_checkpoint_rows(rows, guard, originals, rollback_expected)
     except Exception as primary:
         try:
-            _rollback_file_states(originals, guard)
+            _rollback_file_states(originals, guard, rollback_expected)
         except RuntimeError as rollback_error:
             raise RuntimeError(
                 "Checkpoint restore failed "
@@ -551,16 +580,19 @@ def _apply_checkpoint_rows(
     rows: list[tuple[Any, Path]],
     guard: SafetyGuard,
     originals: dict[Path, ScopedFileSnapshot],
+    rollback_expected: dict[Path, set[str]],
 ) -> None:
     current_digests = {path: snapshot.sha256 for path, snapshot in originals.items()}
     for row, path in rows:
-        expected = row["after_sha256"] or current_digests[path]
+        expected = str(row["after_sha256"] or current_digests[path])
+        resulting = _checkpoint_before_digest(row)
+        rollback_expected[path] = {expected, resulting}
         if bool(row["existed"]):
             restore_scoped_file(
                 path,
                 _checkpoint_content(row),
                 guard,
-                expected_sha256=str(expected),
+                expected_sha256=expected,
                 mode=(
                     int(row["before_mode"])
                     if row["before_mode"] is not None
@@ -572,19 +604,30 @@ def _apply_checkpoint_rows(
             remove_scoped_file(
                 path,
                 guard,
-                expected_sha256=str(expected),
+                expected_sha256=expected,
                 max_bytes=MAX_CHECKPOINT_BYTES,
             )
-        current_digests[path] = _checkpoint_before_digest(row)
+        current_digests[path] = resulting
+        rollback_expected[path] = {resulting}
 
 
 def _rollback_file_states(
-    originals: dict[Path, ScopedFileSnapshot], guard: SafetyGuard
+    originals: dict[Path, ScopedFileSnapshot],
+    guard: SafetyGuard,
+    rollback_expected: dict[Path, set[str]],
 ) -> None:
     rollback_errors: list[str] = []
-    for path, original in originals.items():
+    for path, allowed_digests in rollback_expected.items():
+        original = originals[path]
         try:
             _, current = _checkpoint_snapshot(path, guard)
+            if current.sha256 == original.sha256:
+                continue
+            if current.sha256 not in allowed_digests:
+                raise ScopedFileChanged(
+                    "file changed after the failed checkpoint operation; "
+                    "rollback refused"
+                )
             if original.exists:
                 restore_scoped_file(
                     path,
@@ -612,6 +655,13 @@ def _rollback_file_states(
 def undo_latest_checkpoint(
     store: SessionStore, guard: SafetyGuard, session_id: str
 ) -> list[Path]:
+    with workspace_mutation_lock():
+        return _undo_latest_checkpoint_locked(store, guard, session_id)
+
+
+def _undo_latest_checkpoint_locked(
+    store: SessionStore, guard: SafetyGuard, session_id: str
+) -> list[Path]:
     rows = store.latest_file_checkpoints(session_id)
     if not rows:
         return []
@@ -623,12 +673,18 @@ def undo_latest_checkpoint(
             + ", ".join(conflicts)
         )
     originals = _capture_file_states(paths, guard)
+    rollback_expected: dict[Path, set[str]] = {}
     try:
-        _apply_checkpoint_rows(list(zip(rows, paths, strict=True)), guard, originals)
+        _apply_checkpoint_rows(
+            list(zip(rows, paths, strict=True)),
+            guard,
+            originals,
+            rollback_expected,
+        )
         store.mark_file_checkpoints_restored(session_id, rows[0]["turn_id"])
     except Exception as primary:
         try:
-            _rollback_file_states(originals, guard)
+            _rollback_file_states(originals, guard, rollback_expected)
         except RuntimeError as rollback_error:
             raise RuntimeError(
                 f"Undo failed ({primary}) and file rollback was incomplete: "
@@ -645,6 +701,23 @@ def rewind_session_with_files(
     message_count: int,
 ) -> tuple[Session, list[Path]]:
     """Rewind complete turns and restore all of their direct file edits."""
+
+    with workspace_mutation_lock():
+        return _rewind_session_with_files_locked(
+            store,
+            guard,
+            session_id,
+            message_count,
+        )
+
+
+def _rewind_session_with_files_locked(
+    store: SessionStore,
+    guard: SafetyGuard,
+    session_id: str,
+    message_count: int,
+) -> tuple[Session, list[Path]]:
+    """Rewind while the workspace mutation lease is held."""
 
     turn_ids = store.rewind_turn_ids(
         session_id,
@@ -676,9 +749,15 @@ def rewind_session_with_files(
         )
 
     originals = _capture_file_states(paths, guard)
+    rollback_expected: dict[Path, set[str]] = {}
 
     try:
-        _apply_checkpoint_rows(list(zip(rows, paths, strict=True)), guard, originals)
+        _apply_checkpoint_rows(
+            list(zip(rows, paths, strict=True)),
+            guard,
+            originals,
+            rollback_expected,
+        )
         session = store.rewind_session(
             session_id,
             message_count,
@@ -686,7 +765,7 @@ def rewind_session_with_files(
         )
     except Exception as primary:
         try:
-            _rollback_file_states(originals, guard)
+            _rollback_file_states(originals, guard, rollback_expected)
         except RuntimeError as rollback_error:
             raise RuntimeError(
                 f"Combined rewind failed ({primary}) and file rollback was incomplete: "

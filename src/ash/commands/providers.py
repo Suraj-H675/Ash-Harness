@@ -155,7 +155,7 @@ def render_provider_test(
 
 
 def _redact_completion_error(
-    exc: Exception,
+    exc: BaseException,
     verification: ProviderVerification,
 ) -> str:
     message = str(exc).strip() or type(exc).__name__
@@ -163,6 +163,31 @@ def _redact_completion_error(
     if api_key:
         message = message.replace(api_key, "[REDACTED]")
     return redact_text(message)
+
+
+async def _settle_probe_provider_close(provider: Any) -> tuple[BaseException | None, bool]:
+    task = asyncio.create_task(
+        provider.aclose(),
+        name="ash-provider-completion-probe-close",
+    )
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                continue
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, interrupted
+    return None, interrupted
 
 
 async def _probe_provider_completion(
@@ -176,6 +201,7 @@ async def _probe_provider_completion(
     provider = None
     verified = False
     error: str | None = None
+    primary_cancellation: asyncio.CancelledError | None = None
     try:
         provider = get_provider_registry().build(config)
         provider.configure_max_tokens(PROVIDER_TEST_MAX_TOKENS)
@@ -233,7 +259,8 @@ async def _probe_provider_completion(
         if not "".join(response_parts).strip():
             raise RuntimeError("provider completion probe returned no text")
         verified = True
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as cancellation:
+        primary_cancellation = cancellation
         raise
     except TimeoutError:
         error = "provider completion probe timed out"
@@ -241,14 +268,41 @@ async def _probe_provider_completion(
         error = _redact_completion_error(exc, verification)
     finally:
         if provider is not None:
-            try:
-                await provider.aclose()
-            except Exception as exc:  # noqa: BLE001 - cleanup is part of the explicit probe
-                if verified:
-                    verified = False
-                    error = "provider completion probe cleanup failed: " + _redact_completion_error(
-                        exc, verification
+            cleanup_error, cleanup_interrupted = await _settle_probe_provider_close(
+                provider
+            )
+            if cleanup_error is not None:
+                cleanup_text = _redact_completion_error(cleanup_error, verification)
+                if primary_cancellation is not None:
+                    primary_cancellation.add_note(
+                        "provider completion probe cleanup failed: " + cleanup_text
                     )
+                elif isinstance(cleanup_error, asyncio.CancelledError):
+                    if error:
+                        cleanup_error.add_note(
+                            "provider completion probe failed before cleanup cancellation: "
+                            + error
+                        )
+                    raise cleanup_error
+                elif verified:
+                    verified = False
+                    error = "provider completion probe cleanup failed: " + cleanup_text
+                elif error:
+                    error += "; provider completion probe cleanup failed: " + cleanup_text
+                else:
+                    error = "provider completion probe cleanup failed: " + cleanup_text
+            if cleanup_interrupted:
+                if primary_cancellation is not None:
+                    primary_cancellation.add_note(
+                        "provider completion probe cleanup was interrupted by cancellation"
+                    )
+                else:
+                    cleanup_cancellation = asyncio.CancelledError()
+                    if error:
+                        cleanup_cancellation.add_note(
+                            "provider completion probe result before cancellation: " + error
+                        )
+                    raise cleanup_cancellation from cleanup_error
     return verified, error
 
 

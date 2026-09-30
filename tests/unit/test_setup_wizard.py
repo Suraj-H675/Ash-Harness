@@ -548,22 +548,21 @@ class TestOpenaiCompatibleFlow:
             "ash.commands.setup._probe_models_detailed",
             return_value=ModelProbe(models=("MiniMax-M2.7",)),
         ):
-            with patch("ash.commands.setup.save_config") as mock_save_config:
-                from ash.commands.setup import _flow_openai_compatible
+            from ash.commands.config import load_config
+            from ash.commands.setup import _flow_openai_compatible
 
-                _flow_openai_compatible()
-                mock_save_config.assert_called_once()
-                call_args = mock_save_config.call_args[0][0]
-                assert "custom_providers" in call_args
-                assert "my-minimax" in call_args["custom_providers"]
-                cp = call_args["custom_providers"]["my-minimax"]
-                assert cp["base_url"] == "https://api.minimax.io/v1"
-                assert cp["key_env"] == "ASH_PROVIDER_MY_MINIMAX_API_KEY"
-                assert cp["auth_mode"] == "bearer"
-                assert "api_key" not in cp
-                env_text = (tmp_path / ".ash" / ".env").read_text()
-                assert "ASH_PROVIDER_MY_MINIMAX_API_KEY=sk-cp-test\n" in env_text
-                assert "ASH_MODEL=my-minimax/MiniMax-M2.7\n" in env_text
+            _flow_openai_compatible()
+            saved = load_config(strict=True)
+            assert "custom_providers" in saved
+            assert "my-minimax" in saved["custom_providers"]
+            cp = saved["custom_providers"]["my-minimax"]
+            assert cp["base_url"] == "https://api.minimax.io/v1"
+            assert cp["key_env"] == "ASH_PROVIDER_MY_MINIMAX_API_KEY"
+            assert cp["auth_mode"] == "bearer"
+            assert "api_key" not in cp
+            env_text = (tmp_path / ".ash" / ".env").read_text()
+            assert "ASH_PROVIDER_MY_MINIMAX_API_KEY=sk-cp-test\n" in env_text
+            assert "ASH_MODEL=my-minimax/MiniMax-M2.7\n" in env_text
 
     def test_normalizes_custom_provider_name_to_runtime_identifier(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -582,11 +581,12 @@ class TestOpenaiCompatibleFlow:
                 "ash.commands.setup._probe_models_detailed",
                 return_value=ModelProbe(models=("local-model",)),
             ),
-            patch("ash.commands.setup.save_config") as save_config,
         ):
             _flow_openai_compatible()
 
-        saved = save_config.call_args.args[0]
+        from ash.commands.config import load_config
+
+        saved = load_config(strict=True)
         assert "myprovider" in saved["custom_providers"]
         assert "MyProvider" not in saved["custom_providers"]
         env_text = (tmp_path / ".ash" / ".env").read_text()
@@ -606,13 +606,13 @@ class TestOpenaiCompatibleFlow:
 
         with (
             patch("ash.commands.setup._probe_models_detailed") as probe,
-            patch("ash.commands.setup.save_config") as save_config,
+            patch("ash.commands.setup.mutate_config") as mutate_config,
             pytest.raises(SetupBack),
         ):
             _flow_openai_compatible()
 
         probe.assert_not_called()
-        save_config.assert_not_called()
+        mutate_config.assert_not_called()
 
     def test_saves_anonymous_custom_provider_without_a_missing_key_requirement(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -631,11 +631,12 @@ class TestOpenaiCompatibleFlow:
                 "ash.commands.setup._probe_models_detailed",
                 return_value=ModelProbe(models=("local-model",)),
             ),
-            patch("ash.commands.setup.save_config") as save_config,
         ):
             _flow_openai_compatible()
 
-        custom = save_config.call_args.args[0]["custom_providers"]["local"]
+        from ash.commands.config import load_config
+
+        custom = load_config(strict=True)["custom_providers"]["local"]
         assert custom["auth_mode"] == "none"
         assert "key_env" not in custom
 
@@ -655,13 +656,13 @@ class TestOpenaiCompatibleFlow:
 
         with (
             patch("ash.commands.setup._probe_models_detailed") as probe,
-            patch("ash.commands.setup.save_config") as save_config,
+            patch("ash.commands.setup.mutate_config") as mutate_config,
             pytest.raises(ValueError, match="must use HTTPS"),
         ):
             _flow_openai_compatible()
 
         probe.assert_not_called()
-        save_config.assert_not_called()
+        mutate_config.assert_not_called()
 
     def test_rejects_unbounded_numeric_model_selection(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
@@ -1030,7 +1031,7 @@ class TestCmdSetup:
             fallback_models=["ollama/local"],
             custom_providers={},
             web_search_provider="auto",
-            memory_backend="fts5",
+            memory_backend="sqlite",
             sandbox_backend="auto",
             workspace_root=tmp_path,
         )
@@ -1049,7 +1050,7 @@ class TestCmdSetup:
         assert payload["provider"]["id"] == "openai"
         assert payload["provider"]["ready"] is True
         assert payload["fallback_models"] == ["ollama/local"]
-        assert payload["capabilities"]["memory"]["backend"] == "fts5"
+        assert payload["capabilities"]["memory"]["backend"] == "sqlite"
         assert "sk-status-secret" not in json.dumps(payload)
 
     def test_status_human_output_sanitizes_untrusted_model_identifier(
@@ -1065,7 +1066,7 @@ class TestCmdSetup:
             fallback_models=[],
             custom_providers={},
             web_search_provider="auto",
-            memory_backend="fts5",
+            memory_backend="sqlite",
             sandbox_backend="auto",
             workspace_root=tmp_path,
         )
@@ -1131,7 +1132,10 @@ class TestBrowserSetup:
 
         assert setup_browser() == SetupOutcome.ERROR
         error = capsys.readouterr().err
-        assert "installer.py | python3 - --extra browser" in error
+        assert " -I -c " in error
+        assert "api.github.com/repos/Suraj-H675/Ash-Harness/releases/latest" in error
+        assert "--extra browser" in error
+        assert "curl" not in error
         assert "pipx install" not in error
 
     def test_existing_browser_never_runs_installer(
@@ -1142,7 +1146,7 @@ class TestBrowserSetup:
 
         monkeypatch.setattr("ash.commands.setup._browser_is_installed", lambda: True)
         run = MagicMock(side_effect=AssertionError("installer unexpectedly ran"))
-        monkeypatch.setattr("ash.commands.setup.subprocess.run", run)
+        monkeypatch.setattr("ash.commands.setup.run_browser_subprocess", run)
 
         assert setup_browser() == SetupOutcome.SUCCESS
         run.assert_not_called()
@@ -1160,13 +1164,13 @@ class TestBrowserSetup:
         monkeypatch.setattr("builtins.input", _fake_input([""]))
         completed = MagicMock(returncode=0)
         monkeypatch.setattr(
-            "ash.commands.setup.subprocess.run", MagicMock(return_value=completed)
+            "ash.commands.setup.run_browser_subprocess", MagicMock(return_value=completed)
         )
 
         assert setup_browser() == SetupOutcome.SUCCESS
         from ash.commands import setup
 
-        setup.subprocess.run.assert_called_once_with(
+        setup.run_browser_subprocess.assert_called_once_with(
             [
                 setup.sys.executable,
                 "-I",
@@ -1192,7 +1196,7 @@ class TestBrowserSetup:
         )
         monkeypatch.setattr("builtins.input", _fake_input([""]))
         monkeypatch.setattr(
-            "ash.commands.setup.subprocess.run",
+            "ash.commands.setup.run_browser_subprocess",
             MagicMock(side_effect=subprocess.TimeoutExpired("playwright", 300)),
         )
 
@@ -1249,7 +1253,7 @@ class TestSetupNavigation:
             fallback_models=["anthropic/backup", "ollama/local"],
         )
         monkeypatch.setattr("builtins.input", _fake_input(["6"]))
-        with patch("ash.commands.setup.save_config") as save_config:
+        with patch("ash.commands.setup.mutate_config") as mutate_config:
             result = setup_providers(config)
 
         assert result == SetupOutcome.SUCCESS
@@ -1257,7 +1261,7 @@ class TestSetupNavigation:
         assert "Primary: openai/primary" in output
         assert "1. anthropic/backup" in output
         assert "2. ollama/local" in output
-        save_config.assert_not_called()
+        mutate_config.assert_not_called()
         assert config.fallback_models == ["anthropic/backup", "ollama/local"]
 
     def test_setup_providers_displays_empty_fallback_state(
@@ -1320,13 +1324,14 @@ class TestSetupNavigation:
             _fake_input(["1", "anthropic/backup", "1", "ollama/local", "6"]),
         )
         saved: list[dict[str, object]] = []
+        current: dict[str, object] = {"other": "preserved"}
 
-        with patch(
-            "ash.commands.setup.load_config", return_value={"other": "preserved"}
-        ), patch(
-            "ash.commands.setup.save_config",
-            side_effect=lambda value: saved.append(dict(value)),
-        ):
+        def apply_mutation(mutator):
+            mutator(current)
+            saved.append(json.loads(json.dumps(current)))
+            return dict(current)
+
+        with patch("ash.commands.setup.mutate_config", side_effect=apply_mutation):
             outcome = setup_providers(config)
 
         assert outcome is SetupOutcome.SUCCESS
@@ -1509,6 +1514,24 @@ class TestSetupNavigation:
 
 class TestLegacyConfigMigration:
     @pytest.fixture(autouse=True)
+    def _restore_config_paths(self) -> None:
+        from ash.commands import config as cli_config
+
+        original = (
+            cli_config.ASH_DIR,
+            cli_config.ENV_FILE,
+            cli_config.CONFIG_FILE,
+        )
+        try:
+            yield
+        finally:
+            (
+                cli_config.ASH_DIR,
+                cli_config.ENV_FILE,
+                cli_config.CONFIG_FILE,
+            ) = original
+
+    @pytest.fixture(autouse=True)
     def _trusted_workspace(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             "ash.commands.setup.is_workspace_trusted",
@@ -1576,7 +1599,7 @@ class TestLegacyConfigMigration:
         assert env["ASH_MODEL"] == "openai/gpt-test"
         assert "ANTHROPIC_API_KEY" not in env
         user = cli_config.load_config(strict=True)
-        assert user["config_schema_version"] == 1
+        assert user["config_schema_version"] == 2
         assert user["temperature"] == 0.3
         assert user["max_context_tokens"] == 64000
         assert user["max_completion_tokens"] == 2048
@@ -1768,6 +1791,175 @@ class TestLegacyConfigMigration:
             _migrate_old_ash_toml()
 
         assert cli_config.CONFIG_FILE.read_bytes() == original
+        assert cli_config.is_config_migration_recorded(legacy) is False
+
+    def test_refuses_invalid_supported_values_before_persisting_migration(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands import config as cli_config
+        from ash.commands.setup import _migrate_old_ash_toml
+
+        self._configure_paths(tmp_path)
+        project = tmp_path / "project"
+        project.mkdir()
+        legacy = project / "ash.toml"
+        legacy.write_text(
+            'provider = "openai"\n'
+            'model_name = "gpt-test"\n'
+            "max_context_tokens = -1\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(project)
+        monkeypatch.setattr("builtins.input", _fake_input(["y"]))
+
+        with pytest.raises(ValueError, match="max_context_tokens"):
+            _migrate_old_ash_toml()
+
+        assert not cli_config.CONFIG_FILE.exists()
+        assert not cli_config.ENV_FILE.exists()
+        assert cli_config.is_config_migration_recorded(legacy) is False
+
+    def test_refuses_invalid_toml_model_even_with_valid_legacy_model_name(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands import config as cli_config
+        from ash.commands.setup import _migrate_old_ash_toml
+
+        self._configure_paths(tmp_path)
+        project = tmp_path / "project"
+        project.mkdir()
+        legacy = project / "ash.toml"
+        legacy.write_text(
+            'model = "/invalid"\n'
+            'provider = "anthropic"\n'
+            'model_name = "valid-legacy-model"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(project)
+        monkeypatch.setattr("builtins.input", _fake_input(["y"]))
+
+        with pytest.raises(ValueError, match="legacy configuration migration"):
+            _migrate_old_ash_toml()
+
+        assert not cli_config.CONFIG_FILE.exists()
+        assert not cli_config.ENV_FILE.exists()
+        assert cli_config.is_config_migration_recorded(legacy) is False
+
+    def test_setup_uses_migrated_config_for_followup_provider_decisions(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, run_setup_wizard
+
+        self._configure_paths(tmp_path)
+        home = tmp_path / "home"
+        project = tmp_path / "project"
+        project.mkdir()
+        project.joinpath("ash.toml").write_text(
+            'provider = "anthropic"\nmodel_name = "legacy-model"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.chdir(project)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: True)
+        monkeypatch.setattr("builtins.input", _fake_input(["y"]))
+        observed_models: list[str] = []
+
+        def record_model(config, *, quick=False):
+            del quick
+            observed_models.append(str(config.model))
+            return SetupOutcome.SUCCESS
+
+        monkeypatch.setattr("ash.commands.setup.setup_model_provider", record_model)
+        args = SimpleNamespace(section="model", quick=False, non_interactive=False)
+
+        assert run_setup_wizard(args) is SetupOutcome.SUCCESS
+        assert observed_models == ["anthropic/legacy-model"]
+
+    def test_refuses_source_changed_while_migration_prompt_is_open(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands import config as cli_config
+        from ash.commands.setup import _migrate_old_ash_toml
+
+        self._configure_paths(tmp_path)
+        project = tmp_path / "project"
+        project.mkdir()
+        legacy = project / "ash.toml"
+        legacy.write_text(
+            'provider = "anthropic"\nmodel_name = "snapshot-a"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(project)
+
+        def change_source(_prompt: str) -> str:
+            legacy.write_text(
+                'provider = "anthropic"\nmodel_name = "snapshot-b"\n',
+                encoding="utf-8",
+            )
+            return "y"
+
+        monkeypatch.setattr("builtins.input", change_source)
+
+        with pytest.raises(ValueError, match="changed while migration was pending"):
+            _migrate_old_ash_toml()
+
+        assert not cli_config.CONFIG_FILE.exists()
+        assert not cli_config.ENV_FILE.exists()
+        assert cli_config.is_config_migration_recorded(legacy) is False
+
+    def test_source_changed_after_backup_does_not_leave_partial_migration_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands import config as cli_config
+        from ash.commands import setup as setup_module
+
+        self._configure_paths(tmp_path)
+        project = tmp_path / "project"
+        project.mkdir()
+        legacy = project / "ash.toml"
+        snapshot_a = (
+            'provider = "anthropic"\n'
+            'model_name = "snapshot-a"\n'
+            "temperature = 0.2\n"
+        )
+        snapshot_b = (
+            'provider = "anthropic"\n'
+            'model_name = "snapshot-b"\n'
+            "temperature = 0.9\n"
+        )
+        legacy.write_text(snapshot_a, encoding="utf-8")
+        monkeypatch.chdir(project)
+        monkeypatch.setattr("builtins.input", _fake_input(["y"]))
+        real_replace = setup_module.replace_config_if_current
+
+        def replace_then_change(expected, updated):
+            real_replace(expected, updated)
+            legacy.write_text(snapshot_b, encoding="utf-8")
+
+        monkeypatch.setattr(
+            setup_module,
+            "replace_config_if_current",
+            replace_then_change,
+        )
+
+        setup_module._migrate_old_ash_toml()
+
+        assert cli_config.load_config(strict=True)["temperature"] == 0.2
+        assert cli_config.load_env()["ASH_MODEL"] == "anthropic/snapshot-a"
+        backups = list((cli_config.ASH_DIR / "backups").glob("legacy-*.bak"))
+        assert len(backups) == 1
+        assert backups[0].read_text(encoding="utf-8") == snapshot_a
+        assert legacy.read_text(encoding="utf-8") == snapshot_b
         assert cli_config.is_config_migration_recorded(legacy) is False
 
 

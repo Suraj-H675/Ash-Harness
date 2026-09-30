@@ -17,6 +17,7 @@ from ash.plugins.catalog import (
     MAX_CATALOG_BYTES,
     PluginCatalogError,
     CatalogEntry,
+    default_catalog_source,
     fetch_catalog,
     generate_catalog_signing_key,
     load_trusted_keys,
@@ -24,6 +25,7 @@ from ash.plugins.catalog import (
     sign_catalog,
 )
 from ash.plugins.lifecycle import PluginLifecycleError, install_git_plugin
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.sandbox.process_utils import ProcessTreeUnavailable
 
 
@@ -94,6 +96,25 @@ def test_signed_catalog_round_trip(tmp_path: Path) -> None:
     assert verified.entries["demo"].name == "demo"
     assert verified.publisher is None
     assert verified.entries["demo"].publisher is None
+
+
+def test_default_catalog_source_preserves_https_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://catalog.example/plugins.json"
+    monkeypatch.setenv("ASH_PLUGIN_CATALOG", url)
+
+    assert default_catalog_source() == url
+
+
+def test_default_catalog_source_returns_local_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "catalog.json"
+    monkeypatch.setenv("ASH_PLUGIN_CATALOG", str(path))
+
+    assert default_catalog_source() == path
 
 
 def test_signed_catalog_v2_binds_publisher_identity(tmp_path: Path) -> None:
@@ -270,6 +291,166 @@ def test_catalog_version_fields_remain_strict(tmp_path: Path) -> None:
             parse_and_verify_catalog(path, trusted_keys_path=keys)
 
 
+def test_signed_catalog_rejects_invalid_plugin_version(tmp_path: Path) -> None:
+    private_key, public_key, key_id = generate_catalog_signing_key()
+    keys = tmp_path / "keys.json"
+    keys.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": key_id,
+                        "algorithm": "ed25519",
+                        "publicKey": public_key,
+                    }
+                ],
+            }
+        )
+    )
+    catalog = {
+        "version": 1,
+        "sequence": 1,
+        "entries": [
+            {
+                "name": "demo",
+                "version": "not a valid version !!!",
+                "source": "https://plugins.example/demo.git",
+                "ref": "main",
+                "digest": "0" * 64,
+            }
+        ],
+    }
+    path = tmp_path / "catalog.json"
+    path.write_text(
+        json.dumps(
+            {
+                "catalog": catalog,
+                "keyId": key_id,
+                "algorithm": "ed25519",
+                "signature": sign_catalog(catalog, private_key),
+            }
+        )
+    )
+
+    with pytest.raises(PluginCatalogError, match="entry version"):
+        parse_and_verify_catalog(path, trusted_keys_path=keys)
+
+
+@pytest.mark.parametrize("digest", ["a" * 39, "a" * 41, "a" * 63, "a" * 65])
+def test_signed_catalog_rejects_noncanonical_git_digest_length(
+    tmp_path: Path,
+    digest: str,
+) -> None:
+    private_key, public_key, key_id = generate_catalog_signing_key()
+    keys = tmp_path / "keys.json"
+    keys.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": key_id,
+                        "algorithm": "ed25519",
+                        "publicKey": public_key,
+                    }
+                ],
+            }
+        )
+    )
+    catalog = {
+        "version": 1,
+        "sequence": 1,
+        "entries": [
+            {
+                "name": "demo",
+                "version": "1.0.0",
+                "source": "https://plugins.example/demo.git",
+                "ref": "main",
+                "digest": digest,
+            }
+        ],
+    }
+    path = tmp_path / "catalog.json"
+    path.write_text(
+        json.dumps(
+            {
+                "catalog": catalog,
+                "keyId": key_id,
+                "algorithm": "ed25519",
+                "signature": sign_catalog(catalog, private_key),
+            }
+        )
+    )
+
+    with pytest.raises(PluginCatalogError, match="entry digest"):
+        parse_and_verify_catalog(path, trusted_keys_path=keys)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://user:secret@plugins.example/demo.git",
+        "https://plugins.example/demo.git?token=secret",
+        "https://plugins.example/demo.git#fragment",
+        "https:///missing-host.git",
+        "https://plugins.example:not-a-port/demo.git",
+        "file://remote.example/tmp/demo.git",
+        "file://localhost:123/tmp/demo.git",
+        "file://user:secret@localhost/tmp/demo.git",
+        "file:///tmp/demo.git?token=secret",
+        "https://plugins.example/\x1bdemo.git",
+    ],
+)
+def test_signed_catalog_rejects_invalid_plugin_source(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    private_key, public_key, key_id = generate_catalog_signing_key()
+    keys = tmp_path / "keys.json"
+    keys.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": key_id,
+                        "algorithm": "ed25519",
+                        "publicKey": public_key,
+                    }
+                ],
+            }
+        )
+    )
+    catalog = {
+        "version": 1,
+        "sequence": 1,
+        "entries": [
+            {
+                "name": "demo",
+                "version": "1.0.0",
+                "source": source,
+                "ref": "main",
+                "digest": "0" * 64,
+            }
+        ],
+    }
+    path = tmp_path / "catalog.json"
+    path.write_text(
+        json.dumps(
+            {
+                "catalog": catalog,
+                "keyId": key_id,
+                "algorithm": "ed25519",
+                "signature": sign_catalog(catalog, private_key),
+            }
+        )
+    )
+
+    with pytest.raises(PluginCatalogError, match="entry source"):
+        parse_and_verify_catalog(path, trusted_keys_path=keys)
+
+
 def test_signed_catalog_relative_paths_resolve_from_working_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -382,8 +563,11 @@ def test_remote_catalog_fetch_rejects_malformed_content_length(
 def test_remote_catalog_fetch_streams_valid_payload_into_cache(
     tmp_path: Path, monkeypatch
 ) -> None:
+    files = _write_catalog(tmp_path / "remote.json")
+    raw = files["catalog_path"].read_bytes()
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b'{"keyId":"demo"}')
+        return httpx.Response(200, content=raw)
 
     destination = tmp_path / "catalog.json"
     monkeypatch.setattr(
@@ -393,15 +577,18 @@ def test_remote_catalog_fetch_streams_valid_payload_into_cache(
         fetch_catalog(
             "https://plugins.example/catalog.json",
             transport=httpx.MockTransport(handler),
+            trusted_keys_path=files["keys_path"],
         )
         == destination
     )
-    assert destination.read_bytes() == b'{"keyId":"demo"}'
+    assert destination.read_bytes() == raw
 
 
 def test_remote_catalog_fetch_does_not_follow_predictable_temp_symlink(
     tmp_path: Path, monkeypatch
 ) -> None:
+    files = _write_catalog(tmp_path / "remote.json")
+    raw = files["catalog_path"].read_bytes()
     destination = tmp_path / "catalog.json"
     victim = tmp_path / "victim.txt"
     victim.write_text("do not overwrite", encoding="utf-8")
@@ -415,12 +602,13 @@ def test_remote_catalog_fetch_does_not_follow_predictable_temp_symlink(
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b'{"keyId":"demo"}')
+        return httpx.Response(200, content=raw)
 
     assert (
         fetch_catalog(
             "https://plugins.example/catalog.json",
             transport=httpx.MockTransport(handler),
+            trusted_keys_path=files["keys_path"],
         )
         == destination
     )
@@ -428,7 +616,7 @@ def test_remote_catalog_fetch_does_not_follow_predictable_temp_symlink(
     assert victim.read_text(encoding="utf-8") == "do not overwrite"
     assert destination.is_file()
     assert not destination.is_symlink()
-    assert destination.read_bytes() == b'{"keyId":"demo"}'
+    assert destination.read_bytes() == raw
 
 
 def test_remote_catalog_fetch_rejects_linked_cache_parent(
@@ -461,6 +649,8 @@ def test_remote_catalog_fetch_rejects_linked_cache_parent(
 def test_remote_catalog_fetch_rejects_cache_parent_swapped_before_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    files = _write_catalog(tmp_path / "remote.json")
+    raw = files["catalog_path"].read_bytes()
     cache_parent = tmp_path / "cache"
     cache_parent.mkdir()
     outside = tmp_path / "outside"
@@ -486,16 +676,72 @@ def test_remote_catalog_fetch_rejects_cache_parent_swapped_before_write(
     monkeypatch.setattr(catalog_module, "atomic_write_unlinked_bytes", write_then_swap)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b'{"keyId":"demo"}', request=request)
+        return httpx.Response(200, content=raw, request=request)
 
     with pytest.raises(PluginCatalogError, match="could not save plugin catalog"):
         fetch_catalog(
             "https://plugins.example/catalog.json",
             transport=httpx.MockTransport(handler),
+            trusted_keys_path=files["keys_path"],
         )
 
     assert swapped is True
     assert victim.read_text(encoding="utf-8") == '{"marker":"do-not-touch"}\n'
+
+
+def test_remote_catalog_fetch_invalid_signature_preserves_verified_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _write_catalog(tmp_path / "verified.json")
+    verified_raw = files["catalog_path"].read_bytes()
+    tampered = json.loads(verified_raw)
+    tampered["catalog"]["sequence"] = 99
+    tampered_raw = json.dumps(tampered).encode("utf-8")
+    destination = tmp_path / "catalog.json"
+    destination.write_bytes(verified_raw)
+    monkeypatch.setattr(catalog_module, "catalog_cache_path", lambda url: destination)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=tampered_raw, request=request)
+
+    with pytest.raises(PluginCatalogError, match="signature is invalid"):
+        fetch_catalog(
+            "https://plugins.example/catalog.json",
+            transport=httpx.MockTransport(handler),
+            trusted_keys_path=files["keys_path"],
+        )
+
+    assert destination.read_bytes() == verified_raw
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://plugins.example/catalog.json",
+        "https://user:secret@plugins.example/catalog.json",
+        "https://plugins.example/catalog.json?channel=dev",
+        "https://plugins.example/catalog.json#fragment",
+        "https://plugins.example:0/catalog.json",
+        "https://plugins.example:not-a-port/catalog.json",
+    ],
+)
+def test_remote_catalog_fetch_rejects_noncanonical_url_before_request(
+    url: str,
+) -> None:
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"invalid catalog URL reached network: {request.url}")
+
+    with pytest.raises(PluginCatalogError, match="catalog URL"):
+        fetch_catalog(url, transport=httpx.MockTransport(unexpected_request))
+
+
+def test_catalog_cache_identity_includes_https_port() -> None:
+    assert catalog_module.catalog_cache_path(
+        "https://plugins.example/catalog.json"
+    ) != catalog_module.catalog_cache_path(
+        "https://plugins.example:8443/catalog.json"
+    )
 
 
 def test_rejects_duplicate_json_keys(tmp_path: Path) -> None:
@@ -729,8 +975,6 @@ def test_git_install_verifies_catalog_revision(tmp_path: Path) -> None:
 def test_git_install_times_out_without_leaking_clone_process(
     tmp_path: Path, monkeypatch
 ) -> None:
-    if os.name == "nt":
-        pytest.skip("process-group termination probe is POSIX-only")
     fake_git = tmp_path / "fake-git"
     marker = tmp_path / "clone-survived"
     fake_git.write_text(
@@ -760,8 +1004,6 @@ def test_git_install_times_out_without_leaking_clone_process(
 def test_git_install_stops_clone_when_disk_budget_is_exceeded(
     tmp_path: Path, monkeypatch
 ) -> None:
-    if os.name == "nt":
-        pytest.skip("process-group termination probe is POSIX-only")
     fake_git = tmp_path / "fake-git"
     marker = tmp_path / "clone-survived"
     fake_git.write_text(
@@ -792,8 +1034,15 @@ def test_git_install_stops_clone_when_disk_budget_is_exceeded(
     assert not (tmp_path / "installed").exists()
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://user:embeddedvalue@plugins.example/demo.git",
+        "file://user:embeddedvalue@localhost/tmp/demo.git",
+    ],
+)
 def test_git_install_rejects_embedded_url_credentials_before_clone(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, source: str
 ) -> None:
     popen = monkeypatch.setattr(
         "ash.plugins.lifecycle.subprocess.Popen",
@@ -802,7 +1051,7 @@ def test_git_install_rejects_embedded_url_credentials_before_clone(
 
     with pytest.raises(PluginLifecycleError, match="embedded credentials"):
         install_git_plugin(
-            "https://user:embeddedvalue@plugins.example/demo.git",
+            source,
             ref="main",
             destination_root=tmp_path / "installed",
         )
@@ -842,6 +1091,8 @@ def test_git_install_does_not_spawn_without_managed_tree_preflight(
     [
         "https://plugins.example/demo.git?access_token=embeddedvalue",
         "https://plugins.example/demo.git#embeddedvalue",
+        "file:///tmp/demo.git?access_token=embeddedvalue",
+        "file:///tmp/demo.git#embeddedvalue",
     ],
 )
 def test_git_install_rejects_query_or_fragment_before_clone(
@@ -883,6 +1134,75 @@ def test_git_install_rejects_workspace_shadowed_git_before_clone(
         )
 
     assert not marker.exists()
+
+
+def test_git_install_scrubs_secrets_and_git_overrides_before_clone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "git-env.txt"
+    fake_git = tmp_path / "fake-git"
+    fake_git.write_text(
+        "#!/bin/sh\nenv > " + str(marker) + "\nexit 1\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "attacker.gitconfig"))
+    monkeypatch.setenv("HTTPS_PROXY", "https://user:secret@proxy.example")
+    monkeypatch.setattr(
+        "ash.plugins.lifecycle.resolve_host_executable",
+        lambda *args, **kwargs: str(fake_git),
+    )
+
+    with pytest.raises(PluginLifecycleError, match="could not clone plugin source"):
+        install_git_plugin(
+            "https://plugins.example/demo.git",
+            ref="main",
+            destination_root=tmp_path / "installed",
+        )
+
+    environment = marker.read_text(encoding="utf-8")
+    assert "provider-secret" not in environment
+    assert "proxy.example" not in environment
+    assert str(tmp_path / "attacker.gitconfig") not in environment
+    assert "GIT_TERMINAL_PROMPT=0" in environment
+    assert "GIT_CONFIG_NOSYSTEM=1" in environment
+
+
+def test_git_install_closes_isolated_git_home_descriptor_on_clone_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_home_directories: list[AnchoredDirectory] = []
+    original_create_child = AnchoredDirectory.create_child
+
+    def capture_child(
+        directory: AnchoredDirectory,
+        name: str,
+        **kwargs,
+    ) -> AnchoredDirectory:
+        child = original_create_child(directory, name, **kwargs)
+        if name == "git-home":
+            git_home_directories.append(child)
+        return child
+
+    monkeypatch.setattr(AnchoredDirectory, "create_child", capture_child)
+    monkeypatch.setattr(
+        "ash.plugins.lifecycle.resolve_host_executable",
+        lambda *args, **kwargs: "/bin/false",
+    )
+
+    with pytest.raises(PluginLifecycleError, match="could not clone plugin source"):
+        install_git_plugin(
+            "https://plugins.example/demo.git",
+            ref="main",
+            destination_root=tmp_path / "installed",
+    )
+
+    assert len(git_home_directories) == 1
+    with pytest.raises(AnchoredFilesystemError, match="closed"):
+        _ = git_home_directories[0].descriptor
 
 
 def test_git_install_caps_clone_error_detail(

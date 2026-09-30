@@ -7,7 +7,8 @@ import os
 import stat
 from pathlib import Path
 
-from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.json_utils import strict_json_loads
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 
 
 MAX_TRUST_STORE_BYTES = 1_000_000
@@ -19,15 +20,6 @@ def trust_store_path() -> Path:
 
 def canonical_workspace(path: str | Path) -> str:
     return os.path.normcase(str(Path(path).expanduser().resolve()))
-
-
-def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    value: dict[str, object] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate JSON object key: {key!r}")
-        value[key] = item
-    return value
 
 
 def load_trusted_workspaces() -> set[str]:
@@ -55,10 +47,7 @@ def _load_from_directory(directory: AnchoredDirectory, name: str) -> set[str]:
     raw = directory.read_file(name, max_bytes=MAX_TRUST_STORE_BYTES)
     if raw is None:
         return set()
-    payload = json.loads(
-        raw.decode("utf-8"),
-        object_pairs_hook=_unique_json_object,
-    )
+    payload = strict_json_loads(raw)
     if not isinstance(payload, dict) or payload.get("version") != 1:
         return set()
     entries = payload.get("workspaces")
@@ -85,14 +74,15 @@ def set_workspace_trusted(path: str | Path, trusted: bool) -> bool:
         ) as directory:
             if os.name != "nt":
                 directory.chmod(0o700)
-            entries = _load_from_directory(directory, state_path.name)
-            changed = canonical not in entries if trusted else canonical in entries
-            if trusted:
-                entries.add(canonical)
-            else:
-                entries.discard(canonical)
-            _save(directory, state_path.name, entries)
-            return changed
+            with directory.lock(f".{state_path.name}.lock"):
+                entries = _load_from_directory(directory, state_path.name)
+                changed = canonical not in entries if trusted else canonical in entries
+                if trusted:
+                    entries.add(canonical)
+                else:
+                    entries.discard(canonical)
+                _save(directory, state_path.name, entries)
+                return changed
     except AnchoredFilesystemError as exc:
         if "link" in str(exc).casefold() or "reparse" in str(exc).casefold():
             raise ValueError(

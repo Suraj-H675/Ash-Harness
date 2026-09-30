@@ -97,6 +97,27 @@ def test_git_branch_reports_branch_and_handles_non_repository(
     assert git_branch(tmp_path) in {"main", "master"}
 
 
+def test_git_branch_ignores_parent_git_dir_redirection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    inside = tmp_path / "inside"
+    outside = tmp_path / "outside"
+    inside.mkdir()
+    outside.mkdir()
+    for repo, branch in ((inside, "inside-branch"), (outside, "outside-branch")):
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "symbolic-ref", "HEAD", f"refs/heads/{branch}"],
+            cwd=repo,
+            check=True,
+        )
+    monkeypatch.setenv("GIT_DIR", str(outside / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(outside))
+
+    assert git_branch(inside) == "inside-branch"
+
+
 def test_git_branch_renders_bidi_controls_visibly(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, capture_output=True)
     branch = "safe\u202ehidden\u202c"

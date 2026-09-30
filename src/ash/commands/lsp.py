@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ash.config import AshConfig
+from ash.core.redaction import redact_text
 from ash.lsp.config import lsp_command_available, load_lsp_server_configs
 from ash.lsp.manager import LanguageServerManager
 from ash.safety.trust import is_workspace_trusted
@@ -47,6 +48,7 @@ async def inspect_lsp(
     if not selected_operation:
         raise ValueError("an LSP query operation is required")
     manager = LanguageServerManager(workspace, configs)
+    primary_error: BaseException | None = None
     try:
         result = await manager.query(
             selected_operation,
@@ -62,8 +64,18 @@ async def inspect_lsp(
             tab_size=tab_size,
             insert_spaces=insert_spaces,
         )
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        await manager.aclose()
+        try:
+            await manager.aclose()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                "LSP manager cleanup failed: " + redact_text(str(cleanup_error))
+            )
     return {
         "schema_version": 1,
         "workspace": str(workspace),

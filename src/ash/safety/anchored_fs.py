@@ -1,4 +1,4 @@
-"""Descriptor-anchored filesystem operations for plugin lifecycle mutations."""
+"""Descriptor-anchored filesystem operations for trusted local state."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 try:
     import fcntl
@@ -22,405 +21,12 @@ _FCHMOD = getattr(os, "fchmod", None)
 _FLOCK = getattr(fcntl, "flock", None) if fcntl is not None else None
 _LOCK_EX = getattr(fcntl, "LOCK_EX", None) if fcntl is not None else None
 _LOCK_UN = getattr(fcntl, "LOCK_UN", None) if fcntl is not None else None
+_LOCK_NB = getattr(fcntl, "LOCK_NB", None) if fcntl is not None else None
 
-
-def _windows_backend_available() -> bool:
-    if os.name != "nt":
-        return False
-    try:
-        import ctypes
-        import msvcrt
-
-        getattr(ctypes, "WinDLL")
-        getattr(msvcrt, "open_osfhandle")
-        getattr(msvcrt, "get_osfhandle")
-    except (ImportError, AttributeError):
-        return False
-    return True
-
-
-def _windows_path_is_reparse(path: Path) -> bool:
-    if os.name != "nt":
-        return False
-    import ctypes
-    from ctypes import wintypes
-
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    get_attributes: Any = kernel32.GetFileAttributesW
-    get_attributes.argtypes = [wintypes.LPCWSTR]
-    get_attributes.restype = wintypes.DWORD
-    invalid = 0xFFFFFFFF
-    reparse = 0x00000400
-    attributes = int(get_attributes(str(path)))
-    return attributes != invalid and bool(attributes & reparse)
-
-
-def _windows_retry_readonly_unlink(
-    path: Path,
-    expected: os.stat_result,
-    original_error: PermissionError,
-) -> None:
-    """Retry deletion only for the same Windows regular file's read-only bit."""
-
-    try:
-        current = os.stat(path, follow_symlinks=False)
-    except OSError:
-        raise original_error
-    if (
-        not stat.S_ISREG(current.st_mode)
-        or not _same_identity(current, expected)
-        or _windows_path_is_reparse(path)
-    ):
-        raise AnchoredFilesystemError(
-            f"anchored entry changed before read-only unlink retry: {path}"
-        ) from original_error
-    original_mode = stat.S_IMODE(current.st_mode)
-    if original_mode & stat.S_IWRITE:
-        raise original_error
-
-    os.chmod(path, original_mode | stat.S_IWRITE)
-    try:
-        writable = os.stat(path, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(writable.st_mode)
-            or not _same_identity(writable, expected)
-            or _windows_path_is_reparse(path)
-        ):
-            raise AnchoredFilesystemError(
-                f"anchored entry changed during read-only unlink retry: {path}"
-            )
-        os.unlink(path)
-    except BaseException:
-        try:
-            remaining = os.stat(path, follow_symlinks=False)
-            if _same_identity(remaining, expected) and not _windows_path_is_reparse(path):
-                os.chmod(path, original_mode)
-        except OSError:
-            pass
-        raise
-
-
-def _windows_open_entry(
-    path: Path,
-    *,
-    directory: bool,
-    readable: bool = True,
-    writable: bool = False,
-    create_new: bool = False,
-    share_delete: bool = True,
-) -> int:
-    """Open one Windows entry without following a reparse point."""
-
-    if os.name != "nt":
-        raise AnchoredFilesystemUnavailable("Windows anchored backend is unavailable")
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    get_last_error: Any = getattr(ctypes, "get_last_error")
-    format_error: Any = getattr(ctypes, "FormatError")
-    open_osfhandle: Any = getattr(msvcrt, "open_osfhandle")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    create_file: Any = kernel32.CreateFileW
-    create_file.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    create_file.restype = wintypes.HANDLE
-    get_info: Any = kernel32.GetFileInformationByHandleEx
-    get_info.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    get_info.restype = wintypes.BOOL
-
-    class FileAttributeTagInfo(ctypes.Structure):
-        _fields_ = [
-            ("FileAttributes", wintypes.DWORD),
-            ("ReparseTag", wintypes.DWORD),
-        ]
-
-    generic_read = 0x80000000
-    generic_write = 0x40000000
-    file_list_directory = 0x00000001
-    file_read_attributes = 0x00000080
-    synchronize = 0x00100000
-    share_read = 0x00000001
-    share_write = 0x00000002
-    share_delete_flag = 0x00000004
-    create_new_value = 1
-    open_existing = 3
-    attribute_normal = 0x00000080
-    flag_backup_semantics = 0x02000000
-    flag_open_reparse_point = 0x00200000
-    attribute_reparse_point = 0x00000400
-    invalid_handle = ctypes.c_void_p(-1).value
-
-    desired_access = file_read_attributes | synchronize
-    if directory:
-        desired_access |= file_list_directory
-        if writable:
-            desired_access |= generic_write
-    else:
-        if readable:
-            desired_access |= generic_read
-        if writable:
-            desired_access |= generic_write
-    attributes = flag_open_reparse_point
-    if directory:
-        attributes |= flag_backup_semantics
-    else:
-        attributes |= attribute_normal
-    handle = create_file(
-        str(path),
-        desired_access,
-        share_read | share_write | (share_delete_flag if share_delete else 0),
-        None,
-        create_new_value if create_new else open_existing,
-        attributes,
-        None,
-    )
-    if handle == invalid_handle:
-        error_number = int(get_last_error())
-        raise OSError(error_number, str(format_error(error_number)), str(path))
-    try:
-        info = FileAttributeTagInfo()
-        if not get_info(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
-            error_number = int(get_last_error())
-            raise OSError(error_number, str(format_error(error_number)), str(path))
-        if int(info.FileAttributes) & attribute_reparse_point:
-            raise AnchoredFilesystemError(
-                f"cannot traverse a link in the anchored plugin path: {path}"
-            )
-        flags = int(getattr(os, "O_BINARY", 0))
-        if writable and readable:
-            flags |= os.O_RDWR
-        elif writable:
-            flags |= os.O_WRONLY
-        else:
-            flags |= os.O_RDONLY
-        return int(open_osfhandle(int(handle), flags))
-    except BaseException:
-        close_handle: Any = kernel32.CloseHandle
-        close_handle(wintypes.HANDLE(handle))
-        raise
-
-
-def _windows_filesystem_name(descriptor: int) -> str:
-    """Return the filesystem backing one held Windows directory descriptor."""
-
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    get_last_error: Any = getattr(ctypes, "get_last_error")
-    format_error: Any = getattr(ctypes, "FormatError")
-    get_osfhandle: Any = getattr(msvcrt, "get_osfhandle")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    get_volume_info: Any = kernel32.GetVolumeInformationByHandleW
-    dword_pointer = ctypes.POINTER(wintypes.DWORD)
-    get_volume_info.argtypes = [
-        wintypes.HANDLE,
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-        dword_pointer,
-        dword_pointer,
-        dword_pointer,
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-    ]
-    get_volume_info.restype = wintypes.BOOL
-    filesystem = ctypes.create_unicode_buffer(64)
-    handle = wintypes.HANDLE(int(get_osfhandle(descriptor)))
-    if not get_volume_info(
-        handle,
-        None,
-        0,
-        None,
-        None,
-        None,
-        filesystem,
-        len(filesystem),
-    ):
-        error_number = int(get_last_error())
-        raise OSError(error_number, str(format_error(error_number)))
-    return filesystem.value
-
-
-def _windows_drive_type(path: Path) -> int:
-    """Return the Win32 drive type for one anchored path."""
-
-    import ctypes
-    from ctypes import wintypes
-
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    get_drive_type: Any = kernel32.GetDriveTypeW
-    get_drive_type.argtypes = [wintypes.LPCWSTR]
-    get_drive_type.restype = wintypes.UINT
-    root = path.anchor
-    if not root:
-        return 0
-    return int(get_drive_type(root))
-
-
-def _windows_require_supported_filesystem(path: Path, descriptor: int) -> None:
-    """Keep Windows anchored mutation on local fixed NTFS volumes."""
-
-    try:
-        filesystem = _windows_filesystem_name(descriptor)
-    except OSError as exc:
-        raise AnchoredFilesystemUnavailable(
-            "Windows anchored plugin mutation currently requires local NTFS"
-        ) from exc
-    if filesystem.upper() != "NTFS" or _windows_drive_type(path) != 3:
-        raise AnchoredFilesystemUnavailable(
-            "Windows anchored plugin mutation currently requires local NTFS; "
-            f"found {filesystem or 'unknown'}"
-        )
-
-
-def _windows_open_sync_directory(path: Path, expected_descriptor: int) -> int:
-    """Acquire and identity-check the write-capable handle used for durability."""
-
-    expected = os.fstat(expected_descriptor)
-    descriptor = _windows_open_entry(
-        path,
-        directory=True,
-        readable=False,
-        writable=True,
-    )
-    try:
-        _windows_require_supported_filesystem(path, descriptor)
-        opened = os.fstat(descriptor)
-        _require_directory_identity(opened, expected, path)
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
-def _windows_flush_descriptor(descriptor: int) -> None:
-    """Flush a write-capable Windows filesystem handle through Win32 directly."""
-
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    get_last_error: Any = getattr(ctypes, "get_last_error")
-    format_error: Any = getattr(ctypes, "FormatError")
-    get_osfhandle: Any = getattr(msvcrt, "get_osfhandle")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    flush: Any = kernel32.FlushFileBuffers
-    flush.argtypes = [wintypes.HANDLE]
-    flush.restype = wintypes.BOOL
-    handle = wintypes.HANDLE(int(get_osfhandle(descriptor)))
-    if not flush(handle):
-        error_number = int(get_last_error())
-        raise OSError(error_number, str(format_error(error_number)))
-
-
-def _windows_open_directory_path(
-    path: str | Path,
-    *,
-    create: bool,
-    expected: os.stat_result | None = None,
-    pin_path: bool = False,
-) -> tuple[Path, int]:
-    absolute = _absolute_lexical_path(path)
-    components = _path_components(absolute)
-    current = Path(absolute.anchor)
-    descriptor = _windows_open_entry(
-        current,
-        directory=True,
-        share_delete=not pin_path,
-    )
-    try:
-        _windows_require_supported_filesystem(current, descriptor)
-        for component in components:
-            next_path = current / component
-            if not next_path.exists():
-                if not create:
-                    raise FileNotFoundError(next_path)
-                try:
-                    os.mkdir(next_path)
-                except FileExistsError as exc:
-                    raise AnchoredFilesystemError(
-                        "anchored directory appeared during secure creation"
-                    ) from exc
-            next_descriptor = _windows_open_entry(
-                next_path,
-                directory=True,
-                share_delete=not pin_path,
-            )
-            os.close(descriptor)
-            descriptor = next_descriptor
-            current = next_path
-        opened = os.fstat(descriptor)
-        _require_directory_identity(opened, expected, absolute)
-        return absolute, descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
-@contextmanager
-def _windows_mutex_lock(descriptor: int):
-    import ctypes
-    from ctypes import wintypes
-
-    metadata = os.fstat(descriptor)
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    get_last_error: Any = getattr(ctypes, "get_last_error")
-    format_error: Any = getattr(ctypes, "FormatError")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    create_mutex: Any = kernel32.CreateMutexW
-    create_mutex.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-    create_mutex.restype = wintypes.HANDLE
-    wait: Any = kernel32.WaitForSingleObject
-    wait.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    wait.restype = wintypes.DWORD
-    release: Any = kernel32.ReleaseMutex
-    release.argtypes = [wintypes.HANDLE]
-    release.restype = wintypes.BOOL
-    close: Any = kernel32.CloseHandle
-    close.argtypes = [wintypes.HANDLE]
-    close.restype = wintypes.BOOL
-    name = f"Local\\AshPluginLifecycle-{metadata.st_dev:x}-{metadata.st_ino:x}"
-    handle = create_mutex(None, False, name)
-    if not handle:
-        error_number = int(get_last_error())
-        raise OSError(error_number, str(format_error(error_number)))
-    acquired = False
-    try:
-        status = int(wait(handle, 0xFFFFFFFF))
-        if status not in {0x00000000, 0x00000080}:
-            raise AnchoredFilesystemError(
-                "could not acquire the Windows plugin lifecycle mutex"
-            )
-        acquired = True
-        yield
-    finally:
-        if acquired and not release(handle):
-            error_number = int(get_last_error())
-            close(handle)
-            raise OSError(error_number, str(format_error(error_number)))
-        close(handle)
 
 
 class AnchoredFilesystemError(RuntimeError):
-    """A descriptor-anchored plugin filesystem operation was unsafe or failed."""
+    """A descriptor-anchored filesystem operation was unsafe or failed."""
 
 
 class AnchoredFilesystemUnavailable(AnchoredFilesystemError):
@@ -428,10 +34,8 @@ class AnchoredFilesystemUnavailable(AnchoredFilesystemError):
 
 
 def supports_anchored_mutation() -> bool:
-    """Return whether this runtime has the required POSIX descriptor primitives."""
+    """Return whether this supported host has the required POSIX primitives."""
 
-    if os.name == "nt":
-        return _windows_backend_available()
     if os.name != "posix" or fcntl is None:
         return False
     if not _O_DIRECTORY or not _O_NOFOLLOW or not os.O_CREAT or not os.O_EXCL:
@@ -465,11 +69,11 @@ def supports_anchored_mutation() -> bool:
 
 
 def require_anchored_mutation() -> None:
-    """Fail closed when the platform cannot anchor a plugin mutation."""
+    """Fail closed when the platform cannot anchor a filesystem mutation."""
 
     if not supports_anchored_mutation():
         raise AnchoredFilesystemUnavailable(
-            "descriptor-anchored plugin lifecycle mutation is unavailable "
+            "descriptor-anchored filesystem mutation is unavailable "
             "on this platform/build"
         )
 
@@ -492,7 +96,7 @@ def require_strict_identity_mutation() -> None:
 
     if not supports_strict_identity_mutation():
         raise AnchoredFilesystemUnavailable(
-            "strict same-principal plugin filesystem mutation is unavailable "
+            "strict same-principal filesystem mutation is unavailable "
             "on this platform/build"
         )
 
@@ -520,7 +124,6 @@ class AnchoredDirectory:
     def __init__(self, path: Path, descriptor: int) -> None:
         self.path = path
         self._descriptor = descriptor
-        self._sync_descriptor = -1
 
     @classmethod
     def open(
@@ -541,14 +144,9 @@ class AnchoredDirectory:
         """
 
         require_anchored_mutation()
-        if os.name == "nt":
-            absolute, descriptor = _windows_open_directory_path(
-                path,
-                create=create,
-                expected=expected,
-                pin_path=pin_path,
-            )
-            return cls(absolute, descriptor)
+        # POSIX directory descriptors already pin the opened inode. ``pin_path``
+        # remains part of the public API for callers that request this property.
+        _ = pin_path
         absolute = _absolute_lexical_path(path)
         components = _path_components(absolute)
         root_descriptor = -1
@@ -591,26 +189,14 @@ class AnchoredDirectory:
         return self._descriptor
 
     def close(self) -> None:
-        if self._sync_descriptor >= 0:
-            os.close(self._sync_descriptor)
-            self._sync_descriptor = -1
         if self._descriptor >= 0:
             os.close(self._descriptor)
             self._descriptor = -1
 
     def prepare_durable_mutation(self) -> None:
-        """Preflight the durability barrier before mutating persistent state."""
+        """Preflight durable mutation support on the descriptor-backed POSIX path."""
 
-        if os.name != "nt" or self._sync_descriptor >= 0:
-            return
-        self._visible_path()
-        descriptor = _windows_open_sync_directory(self.path, self.descriptor)
-        try:
-            self._visible_path()
-        except BaseException:
-            os.close(descriptor)
-            raise
-        self._sync_descriptor = descriptor
+        require_anchored_mutation()
 
     def validation_path(self) -> Path:
         """Return the held directory's visible path for legacy validators.
@@ -645,10 +231,6 @@ class AnchoredDirectory:
 
     def _visible_path(self) -> Path:
         held = os.fstat(self.descriptor)
-        if os.name == "nt" and _windows_path_is_reparse(self.path):
-            raise AnchoredFilesystemError(
-                f"anchored directory path became a reparse point: {self.path}"
-            )
         try:
             current = os.stat(self.path, follow_symlinks=False)
         except OSError:
@@ -674,17 +256,6 @@ class AnchoredDirectory:
         expected: os.stat_result | None = None,
     ) -> AnchoredDirectory:
         _validate_name(name)
-        if os.name == "nt":
-            self._visible_path()
-            descriptor = _windows_open_entry(self.path / name, directory=True)
-            try:
-                opened = os.fstat(descriptor)
-                _require_directory_identity(opened, expected, self.path / name)
-                self._visible_path()
-                return AnchoredDirectory(self.path / name, descriptor)
-            except BaseException:
-                os.close(descriptor)
-                raise
         descriptor = _open_or_create_directory(
             self.descriptor,
             name,
@@ -697,25 +268,6 @@ class AnchoredDirectory:
         """Create and then open a directory, verifying the created identity."""
 
         _validate_name(name)
-        if os.name == "nt":
-            self._visible_path()
-            target = self.path / name
-            os.mkdir(target)
-            created_windows: os.stat_result | None = None
-            try:
-                created_windows = os.stat(target, follow_symlinks=False)
-                child = self.child(name, expected=created_windows)
-                self._visible_path()
-                return child
-            except BaseException as primary:
-                if created_windows is not None:
-                    try:
-                        current = os.stat(target, follow_symlinks=False)
-                        if _same_identity(created_windows, current):
-                            os.rmdir(target)
-                    except BaseException as cleanup:
-                        primary.add_note(f"created-directory cleanup failed: {cleanup}")
-                raise
         os.mkdir(name, 0o700, dir_fd=self.descriptor)
         created: os.stat_result | None = None
         try:
@@ -740,28 +292,10 @@ class AnchoredDirectory:
         return self.create_child(name)
 
     def list_names(self) -> list[str]:
-        if os.name == "nt":
-            self._visible_path()
-            names = os.listdir(self.path)
-            self._visible_path()
-            return names
         return list(os.listdir(self.descriptor))
 
     def stat(self, name: str) -> os.stat_result | None:
         _validate_name(name)
-        if os.name == "nt":
-            self._visible_path()
-            target = self.path / name
-            try:
-                metadata = os.stat(target, follow_symlinks=False)
-            except FileNotFoundError:
-                return None
-            if _windows_path_is_reparse(target):
-                raise AnchoredFilesystemError(
-                    f"cannot use a linked entry: {target}"
-                )
-            self._visible_path()
-            return metadata
         try:
             return os.stat(name, dir_fd=self.descriptor, follow_symlinks=False)
         except FileNotFoundError:
@@ -771,12 +305,6 @@ class AnchoredDirectory:
         """Return whether ``name`` still refers to the held filesystem object."""
 
         _validate_name(name)
-        if os.name == "nt":
-            current = self.stat(name)
-            if current is None:
-                return False
-            expected = os.fstat(descriptor)
-            return _same_identity(current, expected)
         try:
             current = os.stat(name, dir_fd=self.descriptor, follow_symlinks=False)
             expected = os.fstat(descriptor)
@@ -796,37 +324,6 @@ class AnchoredDirectory:
         """Open a file relative to this directory and verify its identity."""
 
         _validate_name(name)
-        if os.name == "nt":
-            observed = expected
-            is_exclusive_create = bool(flags & os.O_CREAT and flags & os.O_EXCL)
-            if observed is None and not is_exclusive_create:
-                observed = self.stat(name)
-                if observed is None:
-                    raise FileNotFoundError(name)
-            writable = bool(flags & (os.O_WRONLY | os.O_RDWR))
-            readable = not bool(flags & os.O_WRONLY) or bool(flags & os.O_RDWR)
-            descriptor = _windows_open_entry(
-                self.path / name,
-                directory=False,
-                readable=readable,
-                writable=writable,
-                create_new=is_exclusive_create,
-            )
-            try:
-                opened = os.fstat(descriptor)
-                if observed is not None and not _same_identity(observed, opened):
-                    raise AnchoredFilesystemError(
-                        f"anchored entry changed while opening: {self.path / name}"
-                    )
-                if expected_type is not None and stat.S_IFMT(opened.st_mode) != expected_type:
-                    raise AnchoredFilesystemError(
-                        f"unexpected anchored entry type: {self.path / name}"
-                    )
-                self._visible_path()
-                return descriptor
-            except BaseException:
-                os.close(descriptor)
-                raise
         observed = expected
         is_exclusive_create = bool(flags & os.O_CREAT and flags & os.O_EXCL)
         if observed is None and not is_exclusive_create:
@@ -871,8 +368,6 @@ class AnchoredDirectory:
     def chmod(self, mode: int) -> None:
         """Apply a mode to the held directory through the anchored descriptor."""
 
-        if os.name == "nt":
-            return
         _fchmod(self.descriptor, mode)
 
     def create_file(self, name: str, *, mode: int = 0o600) -> int:
@@ -883,8 +378,7 @@ class AnchoredDirectory:
             expected_type=stat.S_IFREG,
         )
         try:
-            if os.name != "nt":
-                _fchmod(descriptor, mode)
+            _fchmod(descriptor, mode)
             return descriptor
         except BaseException:
             try:
@@ -894,25 +388,62 @@ class AnchoredDirectory:
             raise
 
     @contextmanager
-    def lock(self, name: str):
+    def lock(self, name: str, *, blocking: bool = True):
         """Hold an exclusive lock for mutations rooted in this directory."""
 
         _validate_name(name)
-        if os.name == "nt":
-            with _windows_mutex_lock(self.descriptor):
-                yield
-            return
         if _FLOCK is None or _LOCK_EX is None or _LOCK_UN is None:
             raise AnchoredFilesystemUnavailable(
-                "descriptor-anchored plugin lifecycle locking is unavailable"
+                "descriptor-anchored filesystem locking is unavailable"
             )
-        descriptor = self.descriptor
+        descriptor = -1
         try:
-            _FLOCK(descriptor, _LOCK_EX)
+            while True:
+                metadata = self.stat(name)
+                if metadata is None:
+                    try:
+                        descriptor = self.create_file(name, mode=0o600)
+                        break
+                    except FileExistsError:
+                        continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise AnchoredFilesystemError(
+                        f"filesystem lock is not a regular file: {self.path / name}"
+                    )
+                descriptor = self.open_file(
+                    name,
+                    os.O_RDWR,
+                    expected=metadata,
+                    expected_type=stat.S_IFREG,
+                )
+                break
+            operation = _LOCK_EX
+            if not blocking:
+                if _LOCK_NB is None:
+                    raise AnchoredFilesystemUnavailable(
+                        "non-blocking filesystem locking is unavailable"
+                    )
+                operation |= _LOCK_NB
+            try:
+                _FLOCK(descriptor, operation)
+            except BlockingIOError as exc:
+                raise AnchoredFilesystemError(
+                    f"filesystem lock is already held: {self.path / name}"
+                ) from exc
+            if not self.same_entry(name, descriptor):
+                raise AnchoredFilesystemError(
+                    f"filesystem lock changed while acquiring: {self.path / name}"
+                )
         except OSError as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
             raise AnchoredFilesystemError(
-                "could not acquire the anchored plugin lifecycle lock"
+                "could not acquire the anchored filesystem lock"
             ) from exc
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
         try:
             yield
         finally:
@@ -920,8 +451,10 @@ class AnchoredDirectory:
                 _FLOCK(descriptor, _LOCK_UN)
             except OSError as exc:
                 raise AnchoredFilesystemError(
-                    "could not release the anchored plugin lifecycle lock"
+                    "could not release the anchored filesystem lock"
                 ) from exc
+            finally:
+                os.close(descriptor)
 
     def rename(
         self,
@@ -942,24 +475,6 @@ class AnchoredDirectory:
                 raise AnchoredFilesystemError(
                     f"anchored entry changed before rename: {self.path / source}"
                 )
-        if os.name == "nt":
-            self._visible_path()
-            destination_metadata = self.stat(destination)
-            if destination_metadata is not None and _windows_path_is_reparse(
-                self.path / destination
-            ):
-                raise AnchoredFilesystemError(
-                    f"refusing to replace linked entry: {self.path / destination}"
-                )
-            os.replace(self.path / source, self.path / destination)
-            self._visible_path()
-            if expected is not None:
-                moved = self.stat(destination)
-                if moved is None or not _same_identity(moved, expected):
-                    raise AnchoredFilesystemError(
-                        f"anchored entry changed during rename: {self.path / destination}"
-                    )
-            return
         os.rename(
             source,
             destination,
@@ -1007,15 +522,6 @@ class AnchoredDirectory:
             raise AnchoredFilesystemError(
                 f"refusing to unlink linked entry: {self.path / name}"
             )
-        if os.name == "nt":
-            self._visible_path()
-            target = self.path / name
-            try:
-                os.unlink(target)
-            except PermissionError as exc:
-                _windows_retry_readonly_unlink(target, current, exc)
-            self._visible_path()
-            return
         os.unlink(name, dir_fd=self.descriptor)
 
     def unlink_strict(
@@ -1076,11 +582,6 @@ class AnchoredDirectory:
             return
         if not _same_identity(metadata, current):
             raise AnchoredFilesystemError("anchored tree entry changed during cleanup")
-        if os.name == "nt":
-            self._visible_path()
-            os.rmdir(self.path / name)
-            self._visible_path()
-            return
         try:
             os.rmdir(name, dir_fd=self.descriptor)
         except FileNotFoundError:
@@ -1119,11 +620,6 @@ class AnchoredDirectory:
                     raise AnchoredFilesystemError(
                         "anchored tree entry changed during cleanup"
                     )
-                if os.name == "nt":
-                    self._visible_path()
-                    os.rmdir(self.path / name)
-                    self._visible_path()
-                    continue
                 try:
                     os.rmdir(name, dir_fd=self.descriptor)
                 except FileNotFoundError:
@@ -1140,9 +636,6 @@ class AnchoredDirectory:
         if current is None:
             return
         if _same_identity(current, expected) and stat.S_ISDIR(current.st_mode):
-            if os.name == "nt":
-                os.rmdir(self.path / name)
-                return
             os.rmdir(name, dir_fd=self.descriptor)
 
     def _unlink_descriptor_if_same(self, name: str, descriptor: int) -> None:
@@ -1183,15 +676,6 @@ class AnchoredDirectory:
             os.close(descriptor)
 
     def sync(self) -> None:
-        if os.name == "nt":
-            if self._sync_descriptor < 0:
-                raise AnchoredFilesystemUnavailable(
-                    "Windows durable plugin mutation was not prepared before publication"
-                )
-            self._visible_path()
-            _windows_flush_descriptor(self._sync_descriptor)
-            self._visible_path()
-            return
         try:
             os.fsync(self.descriptor)
         except OSError as exc:
@@ -1204,150 +688,9 @@ class AnchoredDirectory:
             }:
                 return
             raise AnchoredFilesystemError(
-                "could not durably update the anchored plugin directory"
+                "could not durably update the anchored directory"
             ) from exc
 
-
-def copy_tree(
-    source: AnchoredDirectory | str | Path,
-    destination: AnchoredDirectory,
-    *,
-    max_files: int,
-    max_bytes: int,
-    max_entries: int,
-    max_depth: int,
-) -> None:
-    """Copy a link-free source tree from a held descriptor when supplied."""
-
-    if isinstance(source, AnchoredDirectory):
-        counters = _CopyCounters()
-        _copy_directory(
-            source,
-            destination,
-            counters,
-            max_files=max_files,
-            max_bytes=max_bytes,
-            max_entries=max_entries,
-            max_depth=max_depth,
-            depth=0,
-        )
-        return
-    with AnchoredDirectory.open(source, create=False, private=False) as source_directory:
-        copy_tree(
-            source_directory,
-            destination,
-            max_files=max_files,
-            max_bytes=max_bytes,
-            max_entries=max_entries,
-            max_depth=max_depth,
-        )
-
-
-@dataclass
-class _CopyCounters:
-    files: int = 0
-    total_bytes: int = 0
-    entries: int = 0
-
-
-def _copy_directory(
-    source: AnchoredDirectory,
-    destination: AnchoredDirectory,
-    counters: _CopyCounters,
-    *,
-    max_files: int,
-    max_bytes: int,
-    max_entries: int,
-    max_depth: int,
-    depth: int,
-) -> None:
-    if depth > max_depth:
-        raise AnchoredFilesystemError(f"plugin tree exceeds depth {max_depth}")
-    for name in sorted(source.list_names()):
-        counters.entries += 1
-        if counters.entries > max_entries:
-            raise AnchoredFilesystemError(f"plugin tree exceeds {max_entries} entries")
-        metadata = source.stat(name)
-        if metadata is None:
-            continue
-        if stat.S_ISLNK(metadata.st_mode):
-            raise AnchoredFilesystemError(
-                f"plugin tree contains a link: {source.path / name}"
-            )
-        if stat.S_ISDIR(metadata.st_mode):
-            child_source = source.child(name, expected=metadata)
-            child_destination: AnchoredDirectory | None = None
-            try:
-                child_destination = destination.create_child(name)
-                _copy_directory(
-                    child_source,
-                    child_destination,
-                    counters,
-                    max_files=max_files,
-                    max_bytes=max_bytes,
-                    max_entries=max_entries,
-                    max_depth=max_depth,
-                    depth=depth + 1,
-                )
-                child_destination.chmod(stat.S_IMODE(metadata.st_mode))
-            finally:
-                child_source.close()
-                if child_destination is not None:
-                    child_destination.close()
-            continue
-        if not stat.S_ISREG(metadata.st_mode):
-            raise AnchoredFilesystemError(
-                f"plugin tree contains unsupported entry: {source.path / name}"
-            )
-        counters.files += 1
-        if counters.files > max_files:
-            raise AnchoredFilesystemError(
-                f"plugin contains more than {max_files} files"
-            )
-        if metadata.st_size > max_bytes - counters.total_bytes:
-            raise AnchoredFilesystemError(f"plugin exceeds {max_bytes} bytes")
-        source_descriptor = source.open_file(
-            name,
-            os.O_RDONLY,
-            expected=metadata,
-            expected_type=stat.S_IFREG,
-        )
-        destination_descriptor = -1
-        try:
-            destination_descriptor = destination.create_file(
-                name,
-                mode=stat.S_IMODE(metadata.st_mode),
-            )
-            copied = 0
-            while True:
-                chunk = os.read(source_descriptor, 1024 * 1024)
-                if not chunk:
-                    break
-                copied += len(chunk)
-                counters.total_bytes += len(chunk)
-                if counters.total_bytes > max_bytes:
-                    raise AnchoredFilesystemError(f"plugin exceeds {max_bytes} bytes")
-                _write_all(destination_descriptor, chunk)
-            os.fsync(destination_descriptor)
-            if copied != metadata.st_size:
-                raise AnchoredFilesystemError(
-                    f"plugin source changed while copying: {source.path / name}"
-                )
-        except BaseException as primary:
-            if destination_descriptor >= 0:
-                try:
-                    destination.unlink(
-                        name,
-                        expected_descriptor=destination_descriptor,
-                        missing_ok=True,
-                    )
-                except BaseException as cleanup:
-                    primary.add_note(f"copied-file cleanup failed: {cleanup}")
-            raise
-        finally:
-            os.close(source_descriptor)
-            if destination_descriptor >= 0:
-                os.close(destination_descriptor)
 
 
 def _open_or_create_directory(
@@ -1388,7 +731,7 @@ def _open_existing_directory(
     expected: os.stat_result,
 ) -> int:
     if stat.S_ISLNK(expected.st_mode):
-        raise AnchoredFilesystemError("cannot traverse a link in the anchored plugin path")
+        raise AnchoredFilesystemError("cannot traverse a link in the anchored path")
     if not stat.S_ISDIR(expected.st_mode):
         raise NotADirectoryError(name)
     descriptor = -1
@@ -1402,7 +745,7 @@ def _open_existing_directory(
             os.close(descriptor)
         if _is_link_entry(parent_descriptor, name, exc):
             raise AnchoredFilesystemError(
-                "cannot traverse a link in the anchored plugin path"
+                "cannot traverse a link in the anchored path"
             ) from exc
         raise
     except BaseException:
@@ -1447,15 +790,15 @@ def _absolute_lexical_path(path: str | Path) -> Path:
 def _path_components(path: Path) -> tuple[str, ...]:
     anchor = path.anchor
     if not anchor:
-        raise AnchoredFilesystemError("anchored plugin path must be absolute")
+        raise AnchoredFilesystemError("anchored path must be absolute")
     components = tuple(path.relative_to(Path(anchor)).parts)
     if not components:
         raise AnchoredFilesystemError(
-            "anchored plugin path cannot be the filesystem root"
+            "anchored path cannot be the filesystem root"
         )
     if any(component in {"", ".", ".."} for component in components):
         raise AnchoredFilesystemError(
-            "anchored plugin path contains invalid components"
+            "anchored path contains invalid components"
         )
     return components
 
@@ -1515,5 +858,5 @@ def _write_all(descriptor: int, payload: bytes) -> None:
     while view:
         written = os.write(descriptor, view)
         if written <= 0:
-            raise AnchoredFilesystemError("short write to anchored plugin file")
+            raise AnchoredFilesystemError("short write to anchored file")
         view = view[written:]

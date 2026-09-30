@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import builtins
-import os
 import sqlite3
 import threading
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 from ash.core.session import normalize_project_path
-from ash.safe_io import validate_unlinked_file_path
+from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
 
 
 REMOTE_TASK_SCHEMA_VERSION = 2
+MAX_NONTERMINAL_REMOTE_TASKS_PER_WORKSPACE = 1024
+MAX_TERMINAL_REMOTE_TASK_HISTORY_PER_WORKSPACE = 10_000
+TERMINAL_REMOTE_TASK_STATES = frozenset(
+    {
+        "TASK_STATE_COMPLETED",
+        "TASK_STATE_FAILED",
+        "TASK_STATE_CANCELED",
+        "TASK_STATE_REJECTED",
+        "MESSAGE",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -39,19 +48,24 @@ class RemoteTaskStore:
     """Persist remote task identities without prompts, output, or credentials."""
 
     def __init__(self, db_path: Path, workspace: Path) -> None:
-        self.db_path = validate_unlinked_file_path(
-            db_path,
-            label="A2A remote task database",
-        )
+        try:
+            self._database = PinnedSQLiteDatabase.prepare(
+                db_path,
+                label="A2A remote task database",
+            )
+        except SQLitePathError as exc:
+            raise ValueError(str(exc)) from exc
+        self.db_path = self._database.path
         self.workspace = normalize_project_path(workspace)
         self._lock = threading.RLock()
         self._closed = False
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.db_path = validate_unlinked_file_path(
-            self.db_path,
-            label="A2A remote task database",
-        )
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        try:
+            self._conn = self._database.connect(
+                label="A2A remote task database",
+                check_same_thread=False,
+            )
+        except (SQLitePathError, sqlite3.Error) as exc:
+            raise ValueError(f"cannot open A2A remote task database: {exc}") from exc
         self._conn.row_factory = sqlite3.Row
         try:
             with self._lock, self._conn:
@@ -82,6 +96,8 @@ class RemoteTaskStore:
                     );
                     CREATE INDEX IF NOT EXISTS idx_remote_agent_tasks_workspace
                         ON remote_agent_tasks(workspace, updated_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_remote_agent_tasks_workspace_state
+                        ON remote_agent_tasks(workspace, state, updated_at DESC);
 
                     CREATE TABLE IF NOT EXISTS remote_agent_task_intents (
                         workspace TEXT NOT NULL,
@@ -102,7 +118,12 @@ class RemoteTaskStore:
             self._conn.close()
             self._closed = True
             raise
-        self._restrict_file_permissions()
+        try:
+            self._restrict_file_permissions()
+        except BaseException:
+            self._conn.close()
+            self._closed = True
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -128,8 +149,41 @@ class RemoteTaskStore:
             context_id=context_id,
             state=state,
         )
-        with self._lock, self._conn:
-            self._conn.execute(
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    """
+                    SELECT state FROM remote_agent_tasks
+                    WHERE workspace = ? AND agent = ? AND endpoint = ? AND task_id = ?
+                    """,
+                    (self.workspace, values[0], values[1], values[2]),
+                ).fetchone()
+                matching_intent = (
+                    self._conn.execute(
+                        """
+                        SELECT 1 FROM remote_agent_task_intents
+                        WHERE workspace = ? AND agent = ? AND endpoint = ?
+                            AND context_id = ?
+                        LIMIT 1
+                        """,
+                        (self.workspace, values[0], values[1], values[3]),
+                    ).fetchone()
+                    if values[3]
+                    else None
+                )
+                existing_counts_live = bool(
+                    existing is not None
+                    and str(existing["state"]) not in TERMINAL_REMOTE_TASK_STATES
+                )
+                if (
+                    values[4] not in TERMINAL_REMOTE_TASK_STATES
+                    and not existing_counts_live
+                    and matching_intent is None
+                ):
+                    self._require_nonterminal_capacity_locked()
+
+                self._conn.execute(
                 """
                 INSERT INTO remote_agent_tasks
                     (workspace, agent, endpoint, task_id, context_id, state)
@@ -140,24 +194,30 @@ class RemoteTaskStore:
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (self.workspace, *values),
-            )
-            row = self._conn.execute(
+                )
+                row = self._conn.execute(
                 """
                 SELECT agent, endpoint, task_id, context_id, state, updated_at
                 FROM remote_agent_tasks
                 WHERE workspace = ? AND agent = ? AND endpoint = ? AND task_id = ?
                 """,
                 (self.workspace, values[0], values[1], values[2]),
-            ).fetchone()
-            if values[3]:
-                self._conn.execute(
+                ).fetchone()
+                if values[3]:
+                    self._conn.execute(
                     """
                     DELETE FROM remote_agent_task_intents
                     WHERE workspace = ? AND agent = ? AND endpoint = ?
                         AND context_id = ?
                     """,
                     (self.workspace, values[0], values[1], values[3]),
-                )
+                    )
+                if values[4] in TERMINAL_REMOTE_TASK_STATES:
+                    self._prune_terminal_history_locked()
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         assert row is not None
         self._restrict_file_permissions()
         return self._row(row)
@@ -199,8 +259,26 @@ class RemoteTaskStore:
         normalized_agent = self._bounded(agent, "remote agent name", 64)
         normalized_endpoint = self._bounded(endpoint, "remote agent endpoint", 4096)
         normalized_context = self._bounded(context_id, "remote context ID", 512)
-        with self._lock, self._conn:
-            self._conn.execute(
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    """
+                    SELECT 1 FROM remote_agent_task_intents
+                    WHERE workspace = ? AND agent = ? AND endpoint = ?
+                        AND context_id = ?
+                    LIMIT 1
+                    """,
+                    (
+                        self.workspace,
+                        normalized_agent,
+                        normalized_endpoint,
+                        normalized_context,
+                    ),
+                ).fetchone()
+                if existing is None:
+                    self._require_nonterminal_capacity_locked()
+                self._conn.execute(
                 """
                 INSERT INTO remote_agent_task_intents
                     (workspace, agent, endpoint, context_id)
@@ -214,8 +292,8 @@ class RemoteTaskStore:
                     normalized_endpoint,
                     normalized_context,
                 ),
-            )
-            row = self._conn.execute(
+                )
+                row = self._conn.execute(
                 """
                 SELECT agent, endpoint, context_id, updated_at
                 FROM remote_agent_task_intents
@@ -228,7 +306,11 @@ class RemoteTaskStore:
                     normalized_endpoint,
                     normalized_context,
                 ),
-            ).fetchone()
+                ).fetchone()
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         assert row is not None
         self._restrict_file_permissions()
         return self._intent_row(row)
@@ -297,6 +379,13 @@ class RemoteTaskStore:
                 ),
             )
 
+    def ensure_nonterminal_capacity(self) -> None:
+        """Fail before network dispatch when another remote task cannot be tracked."""
+
+        self._require_open()
+        with self._lock:
+            self._require_nonterminal_capacity_locked()
+
     def conflicting_endpoint(
         self,
         *,
@@ -363,6 +452,48 @@ class RemoteTaskStore:
             ),
         )
 
+    def _require_nonterminal_capacity_locked(self) -> None:
+        terminal_placeholders = ",".join("?" for _ in TERMINAL_REMOTE_TASK_STATES)
+        active = int(
+            self._conn.execute(
+                f"""
+                SELECT COUNT(*) FROM remote_agent_tasks
+                WHERE workspace = ? AND state NOT IN ({terminal_placeholders})
+                """,
+                (self.workspace, *sorted(TERMINAL_REMOTE_TASK_STATES)),
+            ).fetchone()[0]
+        )
+        intents = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM remote_agent_task_intents WHERE workspace = ?",
+                (self.workspace,),
+            ).fetchone()[0]
+        )
+        if active + intents >= MAX_NONTERMINAL_REMOTE_TASKS_PER_WORKSPACE:
+            raise ValueError(
+                "A2A remote nonterminal task tracking limit reached for workspace: "
+                f"maximum {MAX_NONTERMINAL_REMOTE_TASKS_PER_WORKSPACE}"
+            )
+
+    def _prune_terminal_history_locked(self) -> None:
+        terminal_placeholders = ",".join("?" for _ in TERMINAL_REMOTE_TASK_STATES)
+        self._conn.execute(
+            f"""
+            DELETE FROM remote_agent_tasks
+            WHERE rowid IN (
+                SELECT rowid FROM remote_agent_tasks
+                WHERE workspace = ? AND state IN ({terminal_placeholders})
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (
+                self.workspace,
+                *sorted(TERMINAL_REMOTE_TASK_STATES),
+                MAX_TERMINAL_REMOTE_TASK_HISTORY_PER_WORKSPACE,
+            ),
+        )
+
     def _intent_row(self, row: sqlite3.Row) -> RemoteTaskIntent:
         return RemoteTaskIntent(
             agent=self._bounded(str(row["agent"]), "stored remote agent name", 64),
@@ -415,13 +546,7 @@ class RemoteTaskStore:
             raise RuntimeError("A2A remote task store is closed")
 
     def _restrict_file_permissions(self) -> None:
-        if os.name == "nt":
-            return
-        for path in (
-            self.db_path,
-            Path(f"{self.db_path}-wal"),
-            Path(f"{self.db_path}-shm"),
-        ):
-            if path.exists():
-                with suppress(OSError):
-                    os.chmod(path, 0o600)
+        try:
+            self._database.restrict_permissions(label="A2A remote task database")
+        except SQLitePathError as exc:
+            raise ValueError(str(exc)) from exc

@@ -9,7 +9,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -18,10 +18,11 @@ import httpx
 from pydantic import BaseModel, Field
 
 from ash.agents.a2a_tasks import RemoteTaskStore
-from ash.core.redaction import redact_urls_in_text
+from ash.core.redaction import redact_known_secrets, redact_urls_in_text
 from ash.safe_io import strict_json_loads
 from ash.safety.guard import SafetyGuard
 from ash.safe_io import read_bounded_bytes
+from ash.safety.scoped_io import ScopedIOError, snapshot_scoped_file
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 
 
@@ -32,15 +33,17 @@ A2A_AGENT_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 A2A_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-async def _settle_cleanup_task_after_cancellation(
+async def _settle_cleanup_task(
     task: asyncio.Task[Any],
-) -> BaseException | None:
-    """Wait for a shielded A2A cleanup task despite repeated cancellation."""
+) -> tuple[BaseException | None, bool]:
+    """Settle one A2A cleanup task despite repeated caller cancellation."""
 
+    interrupted = False
     while not task.done():
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
+            interrupted = True
             current = asyncio.current_task()
             if current is not None:
                 current.uncancel()
@@ -53,8 +56,66 @@ async def _settle_cleanup_task_after_cancellation(
     try:
         task.result()
     except BaseException as exc:
-        return exc
-    return None
+        return exc, interrupted
+    return None, interrupted
+
+
+async def _settle_cleanup_task_after_cancellation(
+    task: asyncio.Task[Any],
+) -> BaseException | None:
+    """Compatibility wrapper for cleanup where cancellation is already primary."""
+
+    error, _ = await _settle_cleanup_task(task)
+    return error
+
+
+async def _close_remote_agent_resources(
+    client: Any | None,
+    http: Any | None,
+    *,
+    primary_error: BaseException | None,
+) -> None:
+    failures: list[tuple[str, BaseException]] = []
+    interrupted = False
+    cleanups: list[tuple[str, Callable[[], Coroutine[Any, Any, Any]]]] = []
+    if client is not None:
+        cleanups.append(("A2A client cleanup", client.close))
+    if http is not None:
+        cleanups.append(("A2A HTTP client cleanup", http.aclose))
+    for label, cleanup in cleanups:
+        task = asyncio.create_task(cleanup())
+        cleanup_error, cleanup_interrupted = await _settle_cleanup_task(task)
+        interrupted = interrupted or cleanup_interrupted
+        if cleanup_error is not None:
+            failures.append((label, cleanup_error))
+
+    if primary_error is not None:
+        for label, _failure in failures:
+            primary_error.add_note(f"{label} failed")
+        if interrupted:
+            if isinstance(primary_error, asyncio.CancelledError):
+                primary_error.add_note("A2A cleanup was interrupted by cancellation")
+                return
+            cancellation = asyncio.CancelledError()
+            cancellation.add_note(
+                "remote A2A operation failed before cleanup was cancelled"
+            )
+            for label, _failure in failures:
+                cancellation.add_note(f"{label} also failed")
+            raise cancellation from primary_error
+        return
+
+    if interrupted:
+        cancellation = asyncio.CancelledError()
+        for label, _failure in failures:
+            cancellation.add_note(f"{label} failed")
+        raise cancellation from (failures[0][1] if failures else None)
+    if failures:
+        primary_label, primary_failure = failures[0]
+        primary_failure.add_note(primary_label)
+        for label, _failure in failures[1:]:
+            primary_failure.add_note(f"{label} also failed")
+        raise primary_failure
 
 
 @dataclass(frozen=True)
@@ -72,6 +133,15 @@ class RemoteAgentResult:
     task_id: str
     context_id: str
     state: str
+
+
+def _redact_remote_agent_error(config: RemoteAgentConfig, exc: BaseException) -> str:
+    return _redact_remote_agent_text(config, str(exc))
+
+
+def _redact_remote_agent_text(config: RemoteAgentConfig, value: str) -> str:
+    token = os.environ.get(config.token_env, "")
+    return redact_known_secrets(value, token)
 
 
 class ListRemoteAgentsArgs(BaseModel):
@@ -281,6 +351,15 @@ class DelegateRemoteAgentTool(_RemoteTaskStoreTool):
                 output="",
                 error=f"unknown remote agent: {args.agent}",
             )
+        if self.task_store is not None:
+            try:
+                await asyncio.to_thread(self.task_store.ensure_nonterminal_capacity)
+            except (RuntimeError, ValueError) as exc:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=_redact_remote_agent_error(config, exc),
+                )
         pending_context = ""
         try:
             async def remember_request(context_id: str) -> None:
@@ -316,7 +395,7 @@ class DelegateRemoteAgentTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_urls_in_text(str(exc)),
+                error=_redact_remote_agent_error(config, exc),
             )
         except Exception as exc:
             from a2a.utils.errors import A2AError
@@ -326,7 +405,7 @@ class DelegateRemoteAgentTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_urls_in_text(str(exc)),
+                error=_redact_remote_agent_error(config, exc),
             )
         payload = json.dumps(
             {
@@ -334,7 +413,7 @@ class DelegateRemoteAgentTool(_RemoteTaskStoreTool):
                 "task_id": result.task_id or None,
                 "context_id": result.context_id or None,
                 "state": result.state,
-                "response": result.response,
+                "response": _redact_remote_agent_text(config, result.response),
             }
         )
         success = result.state in {"TASK_STATE_COMPLETED", "MESSAGE"}
@@ -387,7 +466,7 @@ class RemoteAgentTaskStatusTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_urls_in_text(str(exc)),
+                error=_redact_remote_agent_error(config, exc),
             )
         except Exception as exc:
             from a2a.utils.errors import A2AError
@@ -397,7 +476,7 @@ class RemoteAgentTaskStatusTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_urls_in_text(str(exc)),
+                error=_redact_remote_agent_error(config, exc),
             )
         payload = json.dumps(
             {
@@ -405,7 +484,7 @@ class RemoteAgentTaskStatusTool(_RemoteTaskStoreTool):
                 "task_id": result.task_id,
                 "context_id": result.context_id or None,
                 "state": result.state,
-                "response": result.response,
+                "response": _redact_remote_agent_text(config, result.response),
             }
         )
         return ToolResult(
@@ -456,7 +535,7 @@ class RemoteAgentTaskCancelTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_urls_in_text(str(exc)),
+                error=_redact_remote_agent_error(config, exc),
             )
         except Exception as exc:
             from a2a.utils.errors import A2AError
@@ -466,7 +545,7 @@ class RemoteAgentTaskCancelTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_urls_in_text(str(exc)),
+                error=_redact_remote_agent_error(config, exc),
             )
         payload = json.dumps(
             {
@@ -616,7 +695,7 @@ class RecoverRemoteAgentTaskTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_urls_in_text(str(exc)),
+                error=_redact_remote_agent_error(config, exc),
             )
         except Exception as exc:
             from a2a.utils.errors import A2AError
@@ -626,7 +705,7 @@ class RecoverRemoteAgentTaskTool(_RemoteTaskStoreTool):
             return ToolResult(
                 success=False,
                 output="",
-                error=redact_urls_in_text(str(exc)),
+                error=_redact_remote_agent_error(config, exc),
             )
         payload = json.dumps(
             {
@@ -649,6 +728,7 @@ def load_remote_agent_configs(
     workspace: Path,
     *,
     include_project: bool,
+    project_guard: SafetyGuard | None = None,
 ) -> dict[str, RemoteAgentConfig]:
     paths: list[tuple[Path, Path | None]] = [
         (Path.home() / ".ash" / "a2a.json", None)
@@ -657,17 +737,33 @@ def load_remote_agent_configs(
         paths.append((workspace / ".ash" / "a2a.json", workspace))
     agents: dict[str, RemoteAgentConfig] = {}
     for path, trusted_root in paths:
-        if not path.is_file():
-            continue
+        if trusted_root is not None and project_guard is not None:
+            try:
+                _, snapshot = snapshot_scoped_file(
+                    path,
+                    project_guard,
+                    max_bytes=MAX_A2A_CONFIG_BYTES,
+                )
+            except ScopedIOError as exc:
+                raise ValueError(f"invalid A2A config {path}: {exc}") from exc
+            if not snapshot.exists:
+                continue
+            raw_bytes = snapshot.content
+        else:
+            if not path.is_file():
+                continue
+            try:
+                raw_bytes = read_bounded_bytes(
+                    path,
+                    MAX_A2A_CONFIG_BYTES,
+                    label="A2A config",
+                    trusted_root=trusted_root,
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"invalid A2A config {path}: {exc}") from exc
         try:
-            raw_bytes = read_bounded_bytes(
-                path,
-                MAX_A2A_CONFIG_BYTES,
-                label="A2A config",
-                trusted_root=trusted_root,
-            )
             payload = strict_json_loads(raw_bytes)
-        except (OSError, ValueError) as exc:
+        except ValueError as exc:
             raise ValueError(f"invalid A2A config {path}: {exc}") from exc
         if not isinstance(payload, dict) or set(payload) != {"agents"}:
             raise ValueError(f"A2A config {path} must contain only an agents object")
@@ -714,7 +810,7 @@ async def send_remote_agent(
     resolved_context = str(uuid4()) if generated_context else context_id
     token = os.environ.get(config.token_env, "")
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    async with httpx.AsyncClient(
+    http = httpx.AsyncClient(
         headers=headers,
         timeout=httpx.Timeout(
             config.timeout_seconds,
@@ -722,7 +818,15 @@ async def send_remote_agent(
         ),
         follow_redirects=False,
         transport=transport,
-    ) as http:
+    )
+    client: Any | None = None
+    primary_error: BaseException | None = None
+    task_id = ""
+    state = ""
+    chunks: list[str] = []
+    output_bytes = 0
+    event_count = 0
+    try:
         card = await A2ACardResolver(http, config.url).get_agent_card()
         validate_agent_card_origins(config.url, card.supported_interfaces)
         client = ClientFactory(
@@ -733,85 +837,84 @@ async def send_remote_agent(
                 accepted_output_modes=["text/plain"],
             )
         ).create(card)
-        task_id = ""
-        state = ""
-        chunks: list[str] = []
-        output_bytes = 0
-        event_count = 0
-        client_closed = False
-        try:
-            if generated_context and request_observer is not None:
-                await request_observer(resolved_context)
-            message = Message(
-                message_id=str(uuid4()),
-                role=Role.ROLE_USER,
-                parts=[Part(text=prompt)],
-            )
-            if resolved_context:
-                message.context_id = resolved_context
-            async for event in client.send_message(SendMessageRequest(message=message)):
-                event_count += 1
-                if event_count > MAX_A2A_REMOTE_EVENTS:
-                    raise RuntimeError("remote A2A response exceeded 10,000 events")
-                if event.HasField("task"):
-                    task_id = event.task.id
-                    resolved_context = event.task.context_id
-                    state = TaskState.Name(event.task.status.state)
-                elif event.HasField("message"):
-                    task_id = event.message.task_id
-                    resolved_context = event.message.context_id
-                    state = "MESSAGE"
-                    output_bytes = _append_text_parts(
-                        event.message.parts, chunks, output_bytes
-                    )
-                elif event.HasField("status_update"):
-                    task_id = event.status_update.task_id
-                    resolved_context = event.status_update.context_id
-                    state = TaskState.Name(event.status_update.status.state)
-                elif event.HasField("artifact_update"):
-                    task_id = event.artifact_update.task_id
-                    resolved_context = event.artifact_update.context_id
-                    output_bytes = _append_text_parts(
-                        event.artifact_update.artifact.parts,
-                        chunks,
-                        output_bytes,
-                    )
-                if task_id and task_observer is not None:
-                    try:
-                        await task_observer(
-                            RemoteAgentResult(
-                                response="",
-                                task_id=task_id,
-                                context_id=resolved_context,
-                                state=state or "UNKNOWN",
-                            )
-                        )
-                    except Exception as observer_error:
-                        cancel_task = asyncio.create_task(
-                            client.cancel_task(CancelTaskRequest(id=task_id))
-                        )
-                        cleanup_error = await _settle_cleanup_task_after_cancellation(
-                            cancel_task
-                        )
-                        if cleanup_error is not None:
-                            observer_error.add_note(
-                                "remote task cancellation after durable-state failure "
-                                f"also failed: {cleanup_error}"
-                            )
-                        raise
-        except asyncio.CancelledError:
-            if task_id:
-                cancel_task = asyncio.create_task(
-                    client.cancel_task(CancelTaskRequest(id=task_id))
+        if generated_context and request_observer is not None:
+            await request_observer(resolved_context)
+        message = Message(
+            message_id=str(uuid4()),
+            role=Role.ROLE_USER,
+            parts=[Part(text=prompt)],
+        )
+        if resolved_context:
+            message.context_id = resolved_context
+        async for event in client.send_message(SendMessageRequest(message=message)):
+            event_count += 1
+            if event_count > MAX_A2A_REMOTE_EVENTS:
+                raise RuntimeError("remote A2A response exceeded 10,000 events")
+            if event.HasField("task"):
+                task_id = event.task.id
+                resolved_context = event.task.context_id
+                state = TaskState.Name(event.task.status.state)
+            elif event.HasField("message"):
+                task_id = event.message.task_id
+                resolved_context = event.message.context_id
+                state = "MESSAGE"
+                output_bytes = _append_text_parts(
+                    event.message.parts, chunks, output_bytes
                 )
-                await _settle_cleanup_task_after_cancellation(cancel_task)
-            close_task = asyncio.create_task(client.close())
-            await _settle_cleanup_task_after_cancellation(close_task)
-            client_closed = True
-            raise
-        finally:
-            if not client_closed:
-                await client.close()
+            elif event.HasField("status_update"):
+                task_id = event.status_update.task_id
+                resolved_context = event.status_update.context_id
+                state = TaskState.Name(event.status_update.status.state)
+            elif event.HasField("artifact_update"):
+                task_id = event.artifact_update.task_id
+                resolved_context = event.artifact_update.context_id
+                output_bytes = _append_text_parts(
+                    event.artifact_update.artifact.parts,
+                    chunks,
+                    output_bytes,
+                )
+            if task_id and task_observer is not None:
+                try:
+                    await task_observer(
+                        RemoteAgentResult(
+                            response="",
+                            task_id=task_id,
+                            context_id=resolved_context,
+                            state=state or "UNKNOWN",
+                        )
+                    )
+                except Exception as observer_error:
+                    cancel_task = asyncio.create_task(
+                        client.cancel_task(CancelTaskRequest(id=task_id))
+                    )
+                    cleanup_error = await _settle_cleanup_task_after_cancellation(
+                        cancel_task
+                    )
+                    if cleanup_error is not None:
+                        observer_error.add_note(
+                            "remote task cancellation after durable-state failure "
+                            f"also failed: {cleanup_error}"
+                        )
+                    raise
+    except asyncio.CancelledError as exc:
+        primary_error = exc
+        if task_id and client is not None:
+            cancel_task = asyncio.create_task(
+                client.cancel_task(CancelTaskRequest(id=task_id))
+            )
+            cancel_error = await _settle_cleanup_task_after_cancellation(cancel_task)
+            if cancel_error is not None:
+                exc.add_note("remote A2A task cancellation failed")
+        raise
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        await _close_remote_agent_resources(
+            client,
+            http,
+            primary_error=primary_error,
+        )
     return RemoteAgentResult(
         response="".join(chunks),
         task_id=task_id,
@@ -830,7 +933,7 @@ async def recover_remote_agent_task(
 
     _validate_remote_context_id(context_id)
     http, client = await _open_remote_agent_client(config, transport=transport)
-    closed = False
+    primary_error: BaseException | None = None
     try:
         response = await client.list_tasks(
             ListTasksRequest(
@@ -857,15 +960,15 @@ async def recover_remote_agent_task(
             context_id=task.context_id,
             state=TaskState.Name(task.status.state),
         )
-    except asyncio.CancelledError:
-        close_task = asyncio.create_task(client.close())
-        await _settle_cleanup_task_after_cancellation(close_task)
-        closed = True
+    except BaseException as exc:
+        primary_error = exc
         raise
     finally:
-        if not closed:
-            await client.close()
-        await http.aclose()
+        await _close_remote_agent_resources(
+            client,
+            http,
+            primary_error=primary_error,
+        )
 
 
 async def get_remote_agent_task(
@@ -878,7 +981,7 @@ async def get_remote_agent_task(
 
     _validate_remote_task_id(task_id)
     http, client = await _open_remote_agent_client(config, transport=transport)
-    closed = False
+    primary_error: BaseException | None = None
     try:
         task = await client.get_task(GetTaskRequest(id=task_id))
         chunks: list[str] = []
@@ -895,15 +998,15 @@ async def get_remote_agent_task(
             context_id=task.context_id,
             state=TaskState.Name(task.status.state),
         )
-    except asyncio.CancelledError:
-        close_task = asyncio.create_task(client.close())
-        await _settle_cleanup_task_after_cancellation(close_task)
-        closed = True
+    except BaseException as exc:
+        primary_error = exc
         raise
     finally:
-        if not closed:
-            await client.close()
-        await http.aclose()
+        await _close_remote_agent_resources(
+            client,
+            http,
+            primary_error=primary_error,
+        )
 
 
 async def cancel_remote_agent_task(
@@ -916,7 +1019,7 @@ async def cancel_remote_agent_task(
 
     _validate_remote_task_id(task_id)
     http, client = await _open_remote_agent_client(config, transport=transport)
-    closed = False
+    primary_error: BaseException | None = None
     try:
         task = await client.cancel_task(CancelTaskRequest(id=task_id))
         return RemoteAgentResult(
@@ -925,15 +1028,15 @@ async def cancel_remote_agent_task(
             context_id=task.context_id,
             state=TaskState.Name(task.status.state),
         )
-    except asyncio.CancelledError:
-        close_task = asyncio.create_task(client.close())
-        await _settle_cleanup_task_after_cancellation(close_task)
-        closed = True
+    except BaseException as exc:
+        primary_error = exc
         raise
     finally:
-        if not closed:
-            await client.close()
-        await http.aclose()
+        await _close_remote_agent_resources(
+            client,
+            http,
+            primary_error=primary_error,
+        )
 
 
 async def _open_remote_agent_client(
@@ -967,8 +1070,24 @@ async def _open_remote_agent_client(
                 accepted_output_modes=["text/plain"],
             )
         ).create(card)
-    except BaseException:
-        await http.aclose()
+    except BaseException as primary_error:
+        close_task = asyncio.create_task(http.aclose())
+        cleanup_error, cleanup_interrupted = await _settle_cleanup_task(close_task)
+        if cleanup_error is not None:
+            primary_error.add_note("A2A HTTP client cleanup failed")
+        if cleanup_interrupted:
+            if isinstance(primary_error, asyncio.CancelledError):
+                primary_error.add_note(
+                    "A2A HTTP client cleanup was interrupted by cancellation"
+                )
+            else:
+                cancellation = asyncio.CancelledError()
+                cancellation.add_note(
+                    "A2A client setup failed before HTTP cleanup was cancelled"
+                )
+                if cleanup_error is not None:
+                    cancellation.add_note("A2A HTTP client cleanup also failed")
+                raise cancellation from primary_error
         raise
     return http, client
 

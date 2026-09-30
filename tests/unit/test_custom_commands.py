@@ -202,3 +202,34 @@ def test_custom_command_catalog_bounds_recursive_discovery(
     commands = CustomCommandCatalog(((root, "user"),)).discover()
 
     assert len(commands) <= 2
+
+
+def test_custom_command_rejects_aba_swapped_source_generation(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    original_root = workspace / ".ash" / "commands"
+    replacement_root = replacement / ".ash" / "commands"
+    original_root.mkdir(parents=True)
+    replacement_root.mkdir(parents=True)
+    (original_root / "review.md").write_text(
+        "ORIGINAL_COMMAND $ARGUMENTS",
+        encoding="utf-8",
+    )
+    (replacement_root / "review.md").write_text(
+        "REPLACEMENT_COMMAND_SECRET $ARGUMENTS",
+        encoding="utf-8",
+    )
+    catalog = CustomCommandCatalog(((original_root, "project"),))
+
+    workspace.rename(saved)
+    replacement.rename(workspace)
+    try:
+        commands = catalog.discover()
+    finally:
+        workspace.rename(replacement)
+        saved.rename(workspace)
+
+    assert len(commands) == 1
+    with pytest.raises(ValueError, match="command source identity changed after discovery"):
+        catalog.parse("/review inspect")

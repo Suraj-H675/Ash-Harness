@@ -22,7 +22,7 @@ When assembling the prompt context for a model invocation, the `ContextBuilder` 
 ├─────────────────────────────────────────────────────────────┤ │
 │ 6. Dynamic Repository Map (Personalized PageRank symbols)    │ │
 ├─────────────────────────────────────────────────────────────┤ │
-│ 7. Relevant Semantic Memories (FTS5 search results)         │ ▼ Low Priority
+│ 7. Relevant Project Memory (lexical or hybrid retrieval)    │ ▼ Low Priority
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -223,9 +223,15 @@ Using the PPR scores, Ash extracts code definitions (signatures) from the highes
 
 ---
 
-## 5. Semantic Memory & FTS5 Lookup Pipeline
+## 5. Project Memory Retrieval Pipeline
 
-To retrieve relevant code blocks from past sessions or files that are not currently open, Ash executes a dual-tier search pipeline.
+Project memory is durable **derived state owned by Ash**. It is stored in one
+per-workspace SQLite database under the configured Ash `db_directory`; it is
+not stored in the repository and does not require a separate vector database.
+
+```text
+<db_directory>/memory/v1-<workspace-hash>/memory.db
+```
 
 ```
                   ┌────────────────────────────────┐
@@ -234,26 +240,71 @@ To retrieve relevant code blocks from past sessions or files that are not curren
                                   │
                  ┌────────────────┴────────────────┐
                  ▼                                 ▼
-       [ Vector Embeddings ]              [ SQLite FTS5 MATCH ]
-    (ChromaDB / Optional Package)      (Lexical Fallback / Standard)
+       [ Optional Embeddings ]             [ SQLite FTS5 MATCH ]
+       (explicit provider only)              (always available)
                  │                                 │
-     Cosine Similarity Check               BM25 Lexical Score
+       Cosine Similarity                  AND-first BM25 Search
+                                           OR relaxation if empty
                  │                                 │
                  └────────────────┬────────────────┘
                                   ▼
-                     Merge & Rank Top 5 Chunks
+                     Reciprocal-Rank Fusion
                                   ▼
                     Inject to Context Builder
 ```
 
-### 5.1 Document Chunking Strategy
+### 5.1 Single Transactional Store
+
+`memory.db` contains document metadata, canonical chunks, FTS5 rows, optional
+embedding BLOBs, and index-identity metadata. Replacing a document publishes
+its text, lexical rows, and vectors in one SQLite transaction, so a failed
+replacement cannot expose mixed document generations.
+
+Vectors are stored as bounded little-endian `float32` values with a validated
+dimension. Corrupt or incompatible payloads fail closed. The database runs in
+WAL mode and Ash keeps database/WAL/SHM files private on POSIX systems.
+
+On Linux, SQLite is opened through the held directory descriptor
+(`/proc/self/fd/<dirfd>/memory.db`), so ordinary replacement of the visible
+parent directory cannot redirect the DB or its sidecars. Other supported
+platforms use Ash's anchored-directory and path-identity checks.
+
+### 5.2 Document Chunking Strategy
 To prevent code blocks from losing structural context, documents are chunked using a **Line-Preserving Sliding Window**:
 *   **Window Size**: 30 lines (approx. 1,500 characters).
 *   **Overlap**: 5 lines (approx. 250 characters).
-*   **Chunk Key**: `file_path:start_line-end_line`.
+*   **Chunk Key**: `workspace_relative_path:start_line-end_line`.
 
-### 5.2 Embedding Adapter Interface
-If `chromadb` is available, Ash uses the following interface for vector lookups:
+The chunking contract has an explicit version. Incompatible future chunking
+changes invalidate derived memory instead of silently mixing generations.
+
+### 5.3 Lexical Retrieval Is the Baseline
+
+SQLite FTS5 is always available when project memory is enabled. Ash converts
+natural-language input into bounded literal terms and first issues an **AND**
+query. If that returns no results, it deliberately relaxes to **OR** recall.
+BM25 scores rank candidates only inside the lexical channel; they are never
+compared directly with cosine scores.
+
+### 5.4 Semantic Retrieval Is Explicit
+
+Semantic embeddings are optional. Ash never enables them merely because an API
+key or optional package happens to be installed.
+
+`embedding_provider` supports:
+
+* `none` — default; lexical memory only and no embedding network cost.
+* `openai` — `text-embedding-3-small`; chunk text supplied for indexing and
+  memory-search queries are sent to OpenAI to produce embeddings.
+* `onnx` — explicit local ONNX model plus adjacent `tokenizer.json`; install
+  the `local-embeddings` capability pack.
+
+There is no deterministic/hash embedding fallback in production. If a real
+embedding backend is unavailable, fresh lexical state is still published and
+that document simply has no vector. Query-time embedding failures likewise
+degrade to lexical retrieval.
+
+The embedding adapter interface is:
 
 ```python
 from abc import ABC, abstractmethod
@@ -264,22 +315,18 @@ class EmbeddingAdapter(ABC):
         """Returns a list of floats representing the text representation."""
         ...
 
-class ONNXLocalEmbedding(EmbeddingAdapter):
-    """
-    Local embedding generator using a quantized sentence-transformers/all-MiniLM-L6-v2
-    model executed via ONNX runtime, ensuring 100% offline functionality.
-    Produces 384-dimensional vectors.
-    """
-    ...
-
-class OpenAIEmbedding(EmbeddingAdapter):
-    """
-    Remote embedding generator using text-embedding-3-small (1536 dimensions).
-    """
-    ...
+class ONNXLocalEmbedding(EmbeddingAdapter): ...
+class OpenAIEmbedding(EmbeddingAdapter): ...
 ```
 
-### 5.3 Cosine Similarity Matching
+### 5.5 Embedding Identity and Cosine Matching
+
+Stored vectors are bound to an explicit embedding identity and dimension. For
+OpenAI the identity includes the model and dimension. For local ONNX it also
+includes model/tokenizer filesystem identity, size, and modification metadata.
+When that identity changes, Ash discards incompatible vectors while preserving
+lexical chunks for continued search and incremental re-embedding.
+
 Vectors returned from the embedding adapter are compared using the cosine similarity metric:
 
 $$\text{Cosine Similarity}(\mathbf{q}, \mathbf{d}) = \frac{\sum_{i=1}^{D} q_i d_i}{\sqrt{\sum_{i=1}^{D} q_i^2} \sqrt{\sum_{i=1}^{D} d_i^2}}$$
@@ -289,26 +336,22 @@ Where:
 *   $\mathbf{d}$: Indexed document chunk vector.
 *   $D$: Vector dimension (384 or 1536).
 
-### 5.4 SQLite FTS5 BM25 Lexical Fallback
-If the vector dependencies are missing or the API returns an error, the pipeline falls back gracefully to a lexical query in `fts5.db`:
+### 5.6 Hybrid Ranking
 
-```python
-def query_lexical_fallback(db_conn, query_str: str, limit: int = 5) -> list[dict]:
-    """
-    Queries the FTS5 virtual table using SQLite's built-in BM25 scoring algorithm.
-    """
-    cursor = db_conn.cursor()
-    # sqlite3's bm25 ranking matches lower scores first (descending relevance)
-    cursor.execute(
-        """
-        SELECT file_path, content, symbol_tags, bm25(fts_index) as rank
-        FROM fts_index
-        WHERE fts_index MATCH ?
-        ORDER BY rank
-        LIMIT ?
-        """,
-        (query_str, limit)
-    )
-    return [dict(row) for row in cursor.fetchall()]
-```
-The resulting top chunks are formatted and injected as a supplemental background reference block inside the context window.
+When both lexical and semantic channels return candidates, Ash combines their
+**ranks**, not their incompatible raw score scales, using normalized reciprocal
+rank fusion. Cross-channel agreement is rewarded; lexical rank is the
+deterministic tie-break so exact source evidence wins equal fusion scores.
+
+### 5.7 Bounds, Privacy, and Trust
+
+Indexing is bounded by file count, file size, scan depth, and scan-entry caps.
+Software vector scanning is additionally capped at 100,000 records. Current
+benchmarks show that in-process cosine search is sufficient at Ash's intended
+repository scale, so a native vector extension is deferred until measured
+workloads justify one.
+
+Memory exports are bounded and redacted. Recalled content is injected as
+**untrusted workspace data**: it can supply factual context but never grants
+permissions, authorizes tools, overrides system instructions, or changes the
+safety policy.

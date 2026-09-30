@@ -6,7 +6,9 @@ unit-test expectations.
 
 ## Development Setup
 
-Python 3.11 or newer and `uv` are required.
+Python 3.12 through 3.14 and `uv` are required for Ash development. Supported
+native development hosts are Linux and macOS. On Windows, develop inside WSL2;
+native Windows is intentionally outside the supported/tested host matrix.
 
 ```bash
 uv sync --group dev --extra server --extra acp --extra a2a
@@ -26,13 +28,18 @@ committing:
 uv run ruff check src tests
 uv run mypy src/ash
 uv run pytest -q
-uv build
+uv build --sdist --out-dir dist --clear
+uv build --wheel "$(printf '%s\n' dist/*.tar.gz)" --out-dir dist
 ```
 
-Packaging changes must also be tested by installing the built wheel into a
-clean environment and running `tests/packaging/smoke_minimal_install.py` from
-outside the repository. Tests involving optional external services must remain
-explicitly opt-in and document their prerequisites.
+Build release wheels from the freshly generated sdist rather than directly
+from the checkout. Setuptools reuses its ignored local `build/` directory, so a
+direct source-tree wheel build can otherwise retain files that were deleted
+from `src/ash`. Packaging changes must also be tested by installing the built
+wheel into a clean environment and running
+`tests/packaging/smoke_minimal_install.py` from outside the repository. Tests
+involving optional external services must remain explicitly opt-in and
+document their prerequisites.
 
 ## Change Standards
 

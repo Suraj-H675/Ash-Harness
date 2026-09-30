@@ -7,8 +7,11 @@ from contextlib import closing
 from dataclasses import dataclass
 from typing import Any
 
-from ash.core.session import SessionStore, get_db_connection
+from ash.core.session import SessionStore
 from ash.core.sprint import ChecklistStatus
+
+
+MAX_PLAN_LIST_LIMIT = 1000
 
 
 @dataclass(frozen=True)
@@ -40,11 +43,13 @@ def list_plans(
     all_projects: bool = False,
     limit: int = 20,
 ) -> list[PlanSummary]:
-    if limit < 1:
-        raise ValueError("limit must be positive")
+    if type(limit) is not int or not 1 <= limit <= MAX_PLAN_LIST_LIMIT:
+        raise ValueError(
+            f"limit must be between 1 and {MAX_PLAN_LIST_LIMIT}"
+        )
     where = "" if all_projects else "WHERE sessions.project_path = ?"
     params: tuple[Any, ...] = (limit,) if all_projects else (project_path, limit)
-    with closing(get_db_connection(store.db_path)) as conn:
+    with closing(store.open_connection()) as conn:
         rows = conn.execute(
             f"""
             SELECT
@@ -115,7 +120,7 @@ def update_plan_item(
 
 
 def _plan_session_id(store: SessionStore, sprint_id: str) -> str:
-    with closing(get_db_connection(store.db_path)) as conn:
+    with closing(store.open_connection()) as conn:
         row = conn.execute(
             "SELECT session_id FROM sprints WHERE sprint_id = ?",
             (sprint_id,),

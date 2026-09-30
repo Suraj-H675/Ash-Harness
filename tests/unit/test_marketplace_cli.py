@@ -11,7 +11,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ash.cli import main
 from ash.config import AshConfig
-from ash.plugins.catalog import sign_catalog
+from ash.plugins.catalog import catalog_key_fingerprint, sign_catalog
+
+
+TEST_SIGNER_FINGERPRINT = "sha256:" + "1" * 64
 
 
 @pytest.fixture(autouse=True)
@@ -171,6 +174,49 @@ def test_registered_marketplace_rejects_publisher_signed_by_different_trusted_ke
         sequence=2,
         key_id="key-b",
     )
+    assert main(["extensions", "search", "", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert "signing key" in captured.err.casefold()
+    assert captured.out == ""
+
+    assert main(["marketplace", "add", str(catalog)]) == 2
+    assert "--replace" in capsys.readouterr().err
+    assert main(["marketplace", "add", str(catalog), "--replace"]) == 0
+    capsys.readouterr()
+    assert main(["extensions", "search", "", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["publisher"] == "alpha"
+    assert result["sequence"] == 2
+
+
+def test_registered_marketplace_rejects_changed_key_material_under_same_key_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    first_key = Ed25519PrivateKey.generate()
+    second_key = Ed25519PrivateKey.generate()
+    keyring = _write_keyring(tmp_path, [("shared-key", first_key)])
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(keyring))
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        first_key,
+        publisher="alpha",
+        key_id="shared-key",
+    )
+
+    assert main(["marketplace", "add", str(catalog)]) == 0
+    capsys.readouterr()
+
+    _write_keyring(tmp_path, [("shared-key", second_key)])
+    _write_catalog(
+        catalog,
+        second_key,
+        publisher="alpha",
+        sequence=2,
+        key_id="shared-key",
+    )
+
     assert main(["extensions", "search", "", "--json"]) == 2
     captured = capsys.readouterr()
     assert "signing key" in captured.err.casefold()
@@ -354,11 +400,15 @@ def test_registered_marketplace_sequence_updates_preserve_concurrent_maximum(
     home = tmp_path / "concurrent-home"
     monkeypatch.setenv("HOME", str(home))
     errors: list[BaseException] = []
-    accept_registered_marketplace_sequences({"alpha": 1})
+    accept_registered_marketplace_sequences(
+        {"alpha": (TEST_SIGNER_FINGERPRINT, 1)}
+    )
 
     def accept(sequence: int) -> None:
         try:
-            accept_registered_marketplace_sequences({"alpha": sequence})
+            accept_registered_marketplace_sequences(
+                {"alpha": (TEST_SIGNER_FINGERPRINT, sequence)}
+            )
         except BaseException as exc:  # pragma: no cover - diagnostic assertion
             errors.append(exc)
 
@@ -373,7 +423,9 @@ def test_registered_marketplace_sequence_updates_preserve_concurrent_maximum(
     assert not second.is_alive()
     assert all("sequence rollback" in str(exc) for exc in errors)
     with pytest.raises(ValueError, match="sequence rollback"):
-        accept_registered_marketplace_sequences({"alpha": 2})
+        accept_registered_marketplace_sequences(
+            {"alpha": (TEST_SIGNER_FINGERPRINT, 2)}
+        )
 
 
 def test_existing_bound_marketplace_first_use_seeds_sequence_baseline(
@@ -396,11 +448,28 @@ def test_existing_bound_marketplace_first_use_seeds_sequence_baseline(
         {
             "plugin_marketplaces": {"alpha": str(catalog.resolve())},
             "plugin_marketplace_key_ids": {"alpha": "marketplace-key"},
+            "plugin_marketplace_key_fingerprints": {
+                "alpha": catalog_key_fingerprint(
+                    private_key.public_key().public_bytes_raw()
+                )
+            },
         }
+    )
+    from ash.commands import marketplace
+
+    marketplace._marketplace_trust_state_path().write_text(
+        '{"version":1,"publishers":{"alpha":5}}\n',
+        encoding="utf-8",
     )
 
     assert main(["extensions", "search", "", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["sequence"] == 5
+    state = marketplace._parse_marketplace_trust_state(
+        marketplace._marketplace_trust_state_path().read_bytes()
+    )
+    fingerprint = catalog_key_fingerprint(private_key.public_key().public_bytes_raw())
+    assert state["alpha"].legacy_sequence is None
+    assert dict(state["alpha"].signers) == {fingerprint: 5}
 
     _write_catalog(
         catalog,
@@ -557,6 +626,7 @@ def test_marketplace_signer_rotation_requires_explicit_replace(
         first_key,
         publisher="alpha",
         key_id="key-a",
+        sequence=100,
     )
     assert main(["marketplace", "add", str(catalog)]) == 0
     capsys.readouterr()
@@ -565,7 +635,7 @@ def test_marketplace_signer_rotation_requires_explicit_replace(
         catalog,
         second_key,
         publisher="alpha",
-        sequence=2,
+        sequence=1,
         key_id="key-b",
     )
     assert main(["marketplace", "add", str(catalog)]) == 2
@@ -573,16 +643,35 @@ def test_marketplace_signer_rotation_requires_explicit_replace(
     assert cli_config.load_config(strict=True)["plugin_marketplace_key_ids"] == {
         "alpha": "key-a"
     }
+    assert cli_config.load_config(strict=True)[
+        "plugin_marketplace_key_fingerprints"
+    ] == {
+        "alpha": catalog_key_fingerprint(first_key.public_key().public_bytes_raw())
+    }
 
     assert main(["marketplace", "add", str(catalog), "--replace"]) == 0
     capsys.readouterr()
     assert cli_config.load_config(strict=True)["plugin_marketplace_key_ids"] == {
         "alpha": "key-b"
     }
+    assert cli_config.load_config(strict=True)[
+        "plugin_marketplace_key_fingerprints"
+    ] == {
+        "alpha": catalog_key_fingerprint(second_key.public_key().public_bytes_raw())
+    }
+    from ash.commands import marketplace
+
+    trust = marketplace._parse_marketplace_trust_state(
+        marketplace._marketplace_trust_state_path().read_bytes()
+    )["alpha"]
+    assert dict(trust.signers) == {
+        catalog_key_fingerprint(first_key.public_key().public_bytes_raw()): 100,
+        catalog_key_fingerprint(second_key.public_key().public_bytes_raw()): 1,
+    }
     assert main(["extensions", "search", "", "--json"]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["publisher"] == "alpha"
-    assert result["sequence"] == 2
+    assert result["sequence"] == 1
 
 
 def test_legacy_registered_marketplace_without_signer_binding_fails_closed(
@@ -597,7 +686,10 @@ def test_legacy_registered_marketplace_without_signer_binding_fails_closed(
     catalog = _write_catalog(tmp_path / "alpha.json", private_key, publisher="alpha")
     cli_config.ensure_ash_dir()
     cli_config.save_config(
-        {"plugin_marketplaces": {"alpha": str(catalog.resolve())}}
+        {
+            "plugin_marketplaces": {"alpha": str(catalog.resolve())},
+            "plugin_marketplace_key_ids": {"alpha": "marketplace-key"},
+        }
     )
 
     assert main(["extensions", "search", "", "--json"]) == 2
@@ -630,6 +722,11 @@ def test_marketplace_add_persists_verified_v2_publisher_and_lists_it(
     }
     assert cli_config.load_config(strict=True)["plugin_marketplace_key_ids"] == {
         "alpha": "marketplace-key"
+    }
+    assert cli_config.load_config(strict=True)[
+        "plugin_marketplace_key_fingerprints"
+    ] == {
+        "alpha": catalog_key_fingerprint(private_key.public_key().public_bytes_raw())
     }
 
     assert main(["marketplace", "list", "--json"]) == 0
@@ -705,6 +802,85 @@ def test_marketplace_add_rejects_v1_and_requires_replace_for_source_change(
     assert main(["marketplace", "add", str(second)]) == 2
     assert "--replace" in capsys.readouterr().err
     assert main(["marketplace", "add", str(second), "--replace"]) == 0
+
+
+def test_marketplace_replace_config_failure_keeps_trust_and_allows_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands import marketplace
+    from ash.commands import config as cli_config
+
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    first = _write_catalog(
+        tmp_path / "alpha-one.json",
+        private_key,
+        publisher="alpha",
+        sequence=1,
+    )
+    second = _write_catalog(
+        tmp_path / "alpha-two.json",
+        private_key,
+        publisher="alpha",
+        sequence=2,
+    )
+    assert main(["marketplace", "add", str(first)]) == 0
+    capsys.readouterr()
+    original_save = cli_config.UserConfigTransaction.save
+
+    def fail_save(self):
+        del self
+        raise OSError("injected marketplace config failure")
+
+    monkeypatch.setattr(cli_config.UserConfigTransaction, "save", fail_save)
+    assert main(["marketplace", "add", str(second), "--replace"]) == 2
+    assert "config failure" in capsys.readouterr().err
+    monkeypatch.setattr(cli_config.UserConfigTransaction, "save", original_save)
+
+    fingerprint = catalog_key_fingerprint(private_key.public_key().public_bytes_raw())
+    state = marketplace._parse_marketplace_trust_state(
+        marketplace._marketplace_trust_state_path().read_bytes()
+    )
+    assert dict(state["alpha"].signers) == {fingerprint: 2}
+    assert cli_config.load_config(strict=True)["plugin_marketplaces"] == {
+        "alpha": str(first.resolve())
+    }
+
+    assert main(["marketplace", "add", str(second), "--replace"]) == 0
+    capsys.readouterr()
+    assert main(["extensions", "search", "", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["sequence"] == 2
+
+
+def test_legacy_marketplace_trust_without_signer_binding_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands import marketplace
+
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "alpha.json",
+        private_key,
+        publisher="alpha",
+        sequence=6,
+    )
+    state_path = marketplace._marketplace_trust_state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = b'{"version":1,"publishers":{"alpha":5}}\n'
+    state_path.write_bytes(legacy)
+
+    assert main(["marketplace", "add", str(catalog)]) == 2
+    captured = capsys.readouterr()
+    assert "legacy" in captured.err.casefold()
+    assert "signer binding" in captured.err.casefold()
+    assert captured.out == ""
+    assert state_path.read_bytes() == legacy
 
 
 def test_marketplace_remove_is_idempotent(
@@ -842,8 +1018,6 @@ def test_registered_marketplace_drives_publisher_qualified_install(
     monkeypatch: pytest.MonkeyPatch,
     capsys,
 ) -> None:
-    from types import SimpleNamespace
-
     from ash.plugins.lifecycle import InstalledPlugin
 
     private_key = Ed25519PrivateKey.generate()
@@ -851,13 +1025,6 @@ def test_registered_marketplace_drives_publisher_qualified_install(
     catalog = _write_catalog(tmp_path / "alpha.json", private_key, publisher="alpha")
     assert main(["marketplace", "add", str(catalog)]) == 0
     capsys.readouterr()
-    monkeypatch.setattr(
-        "ash.commands.extensions.load_extension_state",
-        lambda: SimpleNamespace(disabled_plugins=frozenset()),
-    )
-    monkeypatch.setattr(
-        "ash.commands.extensions.set_plugin_enabled", lambda *args, **kwargs: None
-    )
     observed: dict[str, object] = {}
 
     def install(source: str, **kwargs):

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from typing import Any, AsyncGenerator
 
+from ash.core.redaction import redact_text
 from ash.providers.base import (
     CompletionStopCategory,
     ProviderABC,
@@ -40,6 +42,7 @@ class FailoverProvider(ProviderABC):
         self.active_index = 0
         self.provider_family = providers[0].provider_family
         self.failures: list[str] = []
+        self._closed_provider_ids: set[int] = set()
 
     @property
     def model_name(self) -> str:
@@ -153,7 +156,9 @@ class FailoverProvider(ProviderABC):
                     self.failures = failures
                     raise
                 last_error = exc
-                failures.append(f"{provider.model_name}: {exc}")
+                failures.append(
+                    f"{provider.model_name}: {redact_text(str(exc))}"
+                )
         self.failures = failures
         assert last_error is not None
         raise RuntimeError(
@@ -161,5 +166,36 @@ class FailoverProvider(ProviderABC):
         ) from last_error
 
     async def aclose(self) -> None:
-        for provider in self.providers:
-            await provider.aclose()
+        pending = [
+            provider
+            for provider in self.providers
+            if id(provider) not in self._closed_provider_ids
+        ]
+        if not pending:
+            return
+        outcomes = await asyncio.gather(
+            *(provider.aclose() for provider in pending),
+            return_exceptions=True,
+        )
+        failures: list[BaseException] = []
+        cancellation: asyncio.CancelledError | None = None
+        for provider, outcome in zip(pending, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                failures.append(outcome)
+                if isinstance(outcome, asyncio.CancelledError) and cancellation is None:
+                    cancellation = outcome
+                continue
+            self._closed_provider_ids.add(id(provider))
+        if cancellation is not None:
+            for failure in failures:
+                if failure is cancellation:
+                    continue
+                cancellation.add_note(
+                    "additional failover provider cleanup failure: "
+                    + redact_text(str(failure))
+                )
+            raise cancellation
+        if failures:
+            raise RuntimeError(
+                f"failed to close {len(failures)} failover provider(s)"
+            ) from failures[0]

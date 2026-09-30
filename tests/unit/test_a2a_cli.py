@@ -1,6 +1,7 @@
 import asyncio
 import io
 import sys
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -249,3 +250,140 @@ def test_a2a_status_text_redacts_signed_url() -> None:
 
     assert marker not in text
     assert "X-Amz-Signature=[REDACTED]" in text
+
+
+@pytest.mark.asyncio
+async def test_a2a_send_preserves_remote_error_when_client_close_fails(
+    monkeypatch,
+) -> None:
+    from ash.commands import a2a as a2a_commands
+
+    class FakeHTTP:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class FakeResolver:
+        def __init__(self, _http, _url) -> None:
+            pass
+
+        async def get_agent_card(self):
+            return SimpleNamespace(supported_interfaces=[])
+
+    class FakeClient:
+        async def send_message(self, _request):
+            raise RuntimeError("primary send failure")
+            yield
+
+        async def close(self) -> None:
+            raise RuntimeError("client close failure")
+
+    class FakeFactory:
+        def __init__(self, _config) -> None:
+            pass
+
+        def create(self, _card):
+            return FakeClient()
+
+    http = FakeHTTP()
+    monkeypatch.setattr(a2a_commands, "_remote_http_client", lambda _args: http)
+    monkeypatch.setattr(a2a_commands, "A2ACardResolver", FakeResolver)
+    monkeypatch.setattr(a2a_commands, "ClientConfig", lambda **_kwargs: object())
+    monkeypatch.setattr(a2a_commands, "ClientFactory", FakeFactory)
+    monkeypatch.setattr(a2a_commands, "validate_agent_card_origins", lambda *_: None)
+    args = SimpleNamespace(
+        url="https://agent.example.com",
+        prompt="hello",
+        context_id=None,
+        token_env="ASH_A2A_TOKEN",
+        timeout=30.0,
+        json=False,
+    )
+
+    with pytest.raises(RuntimeError, match="primary send failure") as captured:
+        await a2a_commands.send_a2a(args)
+
+    assert http.closed is True
+    assert any(
+        "A2A client cleanup failed" in note for note in captured.value.__notes__
+    )
+
+
+@pytest.mark.asyncio
+async def test_a2a_send_settles_client_close_before_repeated_cancellation(
+    monkeypatch,
+) -> None:
+    from a2a.types.a2a_pb2 import Part
+    from ash.commands import a2a as a2a_commands
+
+    close_started = asyncio.Event()
+    close_release = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class FakeHTTP:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class FakeResolver:
+        def __init__(self, _http, _url) -> None:
+            pass
+
+        async def get_agent_card(self):
+            return SimpleNamespace(supported_interfaces=[])
+
+    class FakeEvent:
+        message = SimpleNamespace(parts=[Part(text="ok")])
+
+        def HasField(self, field: str) -> bool:
+            return field == "message"
+
+    class FakeClient:
+        async def send_message(self, _request):
+            yield FakeEvent()
+
+        async def close(self) -> None:
+            close_started.set()
+            await close_release.wait()
+            close_finished.set()
+
+    class FakeFactory:
+        def __init__(self, _config) -> None:
+            pass
+
+        def create(self, _card):
+            return FakeClient()
+
+    http = FakeHTTP()
+    monkeypatch.setattr(a2a_commands, "_remote_http_client", lambda _args: http)
+    monkeypatch.setattr(a2a_commands, "A2ACardResolver", FakeResolver)
+    monkeypatch.setattr(a2a_commands, "ClientConfig", lambda **_kwargs: object())
+    monkeypatch.setattr(a2a_commands, "ClientFactory", FakeFactory)
+    monkeypatch.setattr(a2a_commands, "validate_agent_card_origins", lambda *_: None)
+    args = SimpleNamespace(
+        url="https://agent.example.com",
+        prompt="hello",
+        context_id=None,
+        token_env="ASH_A2A_TOKEN",
+        timeout=30.0,
+        json=False,
+    )
+
+    call = asyncio.create_task(a2a_commands.send_a2a(args))
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    call.cancel()
+    call.cancel()
+    await asyncio.sleep(0)
+    assert not call.done()
+    assert not close_finished.is_set()
+
+    close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(call, timeout=1)
+
+    assert close_finished.is_set()
+    assert http.closed is True

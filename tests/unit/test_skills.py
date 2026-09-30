@@ -368,6 +368,42 @@ def test_compile_markdown_skill_invokes_run_command_via_context(tmp_path: Path) 
     assert result.output == "ok-from-stub"
 
 
+def test_registry_skill_context_is_not_redirected_by_later_runtime(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    skill_root = first_root / "skills"
+    skill_root.mkdir()
+    skill_path = skill_root / "workspace.py"
+    skill_path.write_text(
+        '"""\nname: workspace\ndescription: report workspace\n"""\n'
+        "async def execute(context):\n"
+        "    return str(context.project_root)\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(
+        SafetyGuard(project_root=first_root),
+        skill_roots=(skill_root,),
+        allow_executable_skills=True,
+    )
+    registry.discover_skills()
+
+    configure_runtime(
+        tools_provider=lambda: [],
+        root_provider=lambda: second_root,
+    )
+    tool = registry.load_skill("workspace")
+    assert tool is not None
+
+    result = asyncio.run(tool.run())
+
+    assert result.success is True
+    assert result.output == str(first_root)
+
+
 def test_compile_markdown_skill_reports_invalid_args(tmp_path: Path) -> None:
     md = textwrap.dedent(
         """\
@@ -935,6 +971,58 @@ def test_registry_reload_does_not_execute_external_code_after_path_swap(
     with pytest.raises(SkillParseError, match="cannot be a link"):
         registry.reload_skill_module("safe", target)
     assert swapped is True
+    assert not marker.exists()
+
+
+def test_registry_reload_validates_exact_source_before_executing_top_level_code(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    marker = tmp_path / "RELOAD_SIDE_EFFECT"
+    target = skill_dir / "unsafe.py"
+    target.write_text(
+        '"""\nname: unsafe\nname: duplicate\ndescription: invalid\n"""\n'
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('EXECUTED')\n"
+        "async def execute(context):\n    return 'unsafe'\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(
+        _safety_guard(tmp_path),
+        skill_roots=(skill_dir,),
+        allow_executable_skills=True,
+    )
+
+    with pytest.raises(SkillParseError, match="Duplicate Python skill metadata"):
+        registry.reload_skill_module("unsafe", target)
+
+    assert not marker.exists()
+
+
+def test_registry_reload_rejects_declared_name_mismatch_before_execution(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    marker = tmp_path / "RELOAD_NAME_SIDE_EFFECT"
+    target = skill_dir / "expected.py"
+    target.write_text(
+        '"""\nname: different\ndescription: mismatch\n"""\n'
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('EXECUTED')\n"
+        "async def execute(context):\n    return 'different'\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(
+        _safety_guard(tmp_path),
+        skill_roots=(skill_dir,),
+        allow_executable_skills=True,
+    )
+
+    with pytest.raises(SkillParseError, match="declares name 'different', expected 'expected'"):
+        registry.reload_skill_module("expected", target)
+
     assert not marker.exists()
 
 

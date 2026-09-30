@@ -20,7 +20,12 @@ from pydantic import BaseModel, Field
 from ash.core.redaction import find_secret_candidates
 from ash.safe_io import read_bounded_bytes
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
-from ash.safety.git import read_only_git_args, read_only_git_environment
+from ash.safety.git import (
+    read_only_git_args,
+    read_only_git_config_probe_args,
+    read_only_git_environment,
+    read_only_git_untrusted_config_keys,
+)
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import ScopedIOError, snapshot_scoped_file
 from ash.sandbox import SandboxBackendUnavailable, SandboxManager
@@ -34,7 +39,7 @@ from ash.sandbox.process_utils import (
     settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
-from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from ash.tools.base import BaseTool, ToolExecutionContract, ToolResult, count_output_tokens
 
 
 DEFAULT_COMMIT_AUTHOR = "ash <ash@local>"
@@ -47,8 +52,13 @@ MAX_COMMIT_MESSAGE_BYTES = MAX_COMMIT_MESSAGE_CHARS * 4
 MAX_COMMIT_PATHS = 1_000
 MAX_COMMIT_AUTHOR_CHARS = 512
 MAX_AUTO_COMMIT_VERIFY_BYTES = 20 * 1024 * 1024
+MAX_READ_ONLY_GIT_FILTER_DRIVERS = 256
 _GitPath = Annotated[str, Field(min_length=1, max_length=MAX_GIT_PATH_CHARS)]
 _DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_FILTER_CONFIG_KEY = re.compile(
+    r"^filter\.(?P<driver>.+)\.(?:clean|smudge|process|required)$",
+    re.IGNORECASE,
+)
 
 
 class GitStatusArgs(BaseModel):
@@ -66,6 +76,7 @@ class GitLogArgs(BaseModel):
 
 class GitStatusTool(BaseTool):
     name = "git_status"
+    execution_contract = ToolExecutionContract(parallel_safe=True)
     description = "Show machine-readable Git worktree and branch status."
     args_schema = GitStatusArgs
 
@@ -83,6 +94,7 @@ class GitStatusTool(BaseTool):
 
 class GitDiffTool(BaseTool):
     name = "git_diff"
+    execution_contract = ToolExecutionContract(parallel_safe=True)
     description = "Show a unified Git diff for the workspace or one path."
     args_schema = GitDiffArgs
 
@@ -104,6 +116,7 @@ class GitDiffTool(BaseTool):
 
 class GitLogTool(BaseTool):
     name = "git_log"
+    execution_contract = ToolExecutionContract(parallel_safe=True)
     description = "Show recent commits without invoking a pager."
     args_schema = GitLogArgs
 
@@ -747,13 +760,162 @@ async def _run_git(
     if git is None:
         return 127, "", "git is unavailable outside the workspace"
     allowlist = tuple(environment_allowlist)
-    git_args = read_only_git_args(args) if read_only else list(args)
-    cmd = [git, *git_args]
     environment = (
         read_only_git_environment(allowlist)
         if read_only
         else build_scrubbed_environment(allowlist)
     )
+    filter_drivers: tuple[str, ...] = ()
+    if read_only:
+        untrusted_keys, config_error = await _read_only_git_untrusted_config_keys(
+            cwd,
+            git,
+            args,
+            environment,
+            allowlist,
+            expected_cwd_identity=expected_cwd_identity,
+            sandbox_manager=sandbox_manager,
+        )
+        if config_error is not None:
+            return 126, "", config_error
+        if untrusted_keys:
+            rendered = ", ".join(untrusted_keys[:8])
+            suffix = ", ..." if len(untrusted_keys) > 8 else ""
+            return (
+                126,
+                "",
+                "read-only Git refused untrusted repository Git config: "
+                f"{rendered}{suffix}",
+            )
+        filter_drivers, discovery_error = await _read_only_git_filter_drivers(
+            cwd,
+            git,
+            environment,
+            allowlist,
+            expected_cwd_identity=expected_cwd_identity,
+            sandbox_manager=sandbox_manager,
+        )
+        if discovery_error is not None:
+            return 126, "", discovery_error
+    git_args = (
+        read_only_git_args(args, filter_drivers=filter_drivers)
+        if read_only
+        else list(args)
+    )
+    return await _run_prepared_git(
+        cwd,
+        git,
+        git_args,
+        environment,
+        allowlist,
+        expected_cwd_identity=expected_cwd_identity,
+        sandbox_manager=sandbox_manager,
+    )
+
+
+async def _read_only_git_untrusted_config_keys(
+    cwd: Path,
+    git: str,
+    arguments: Sequence[str],
+    environment: dict[str, str],
+    allowlist: tuple[str, ...],
+    *,
+    expected_cwd_identity: tuple[int, int] | None,
+    sandbox_manager: SandboxManager | None,
+) -> tuple[tuple[str, ...], str | None]:
+    """Reject host-path indirections sourced from repository-owned Git config."""
+
+    config_args = read_only_git_config_probe_args(arguments)
+    code, stdout, stderr = await _run_prepared_git(
+        cwd,
+        git,
+        config_args,
+        environment,
+        allowlist,
+        expected_cwd_identity=expected_cwd_identity,
+        sandbox_manager=sandbox_manager,
+    )
+    if code == 1:
+        return (), None
+    if code != 0:
+        detail = stderr.strip() or stdout.strip() or f"git config exited with {code}"
+        return (), f"read-only Git config provenance check failed: {detail}"
+    try:
+        rejected = read_only_git_untrusted_config_keys(stdout)
+    except ValueError as exc:
+        return (), f"read-only Git config provenance check failed: {exc}"
+    return rejected, None
+
+
+async def _read_only_git_filter_drivers(
+    cwd: Path,
+    git: str,
+    environment: dict[str, str],
+    allowlist: tuple[str, ...],
+    *,
+    expected_cwd_identity: tuple[int, int] | None,
+    sandbox_manager: SandboxManager | None,
+) -> tuple[tuple[str, ...], str | None]:
+    """Return effective filter driver names without evaluating filter commands."""
+
+    config_args = [
+        "--no-pager",
+        "--work-tree=.",
+        "config",
+        "--includes",
+        "--null",
+        "--name-only",
+        "--get-regexp",
+        r"^filter\..*\.(clean|smudge|process|required)$",
+    ]
+    code, stdout, stderr = await _run_prepared_git(
+        cwd,
+        git,
+        config_args,
+        environment,
+        allowlist,
+        expected_cwd_identity=expected_cwd_identity,
+        sandbox_manager=sandbox_manager,
+    )
+    if code == 1:
+        return (), None
+    if code != 0:
+        detail = stderr.strip() or stdout.strip() or f"git config exited with {code}"
+        return (), f"read-only Git filter discovery failed: {detail}"
+    drivers: list[str] = []
+    seen: set[str] = set()
+    for raw_name in stdout.split("\0"):
+        if not raw_name:
+            continue
+        match = _FILTER_CONFIG_KEY.fullmatch(raw_name)
+        if match is None:
+            return (), "read-only Git filter discovery returned an invalid config key"
+        driver = match.group("driver")
+        if driver in seen:
+            continue
+        seen.add(driver)
+        drivers.append(driver)
+        if len(drivers) > MAX_READ_ONLY_GIT_FILTER_DRIVERS:
+            return (), (
+                "read-only Git filter discovery exceeded "
+                f"{MAX_READ_ONLY_GIT_FILTER_DRIVERS} configured drivers"
+            )
+    return tuple(drivers), None
+
+
+async def _run_prepared_git(
+    cwd: Path,
+    git: str,
+    git_args: Sequence[str],
+    environment: dict[str, str],
+    allowlist: tuple[str, ...],
+    *,
+    expected_cwd_identity: tuple[int, int] | None,
+    sandbox_manager: SandboxManager | None,
+) -> tuple[int, str, str]:
+    """Execute one already-policy-prepared Git command."""
+
+    cmd = [git, *git_args]
     if sandbox_manager is not None:
         sandbox_command = (
             ["git", *git_args] if sandbox_manager.backend_name == "docker" else cmd
@@ -851,6 +1013,23 @@ async def _run_git(
             cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
         if cleanup_cancelled:
             cancellation.add_note("Process-tree cleanup was cancelled")
+        raise
+    except Exception as primary_error:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            primary_error.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cleanup_cancellation = asyncio.CancelledError()
+            cleanup_cancellation.add_note(
+                "Git command failed before process-tree cleanup was cancelled"
+            )
+            if cleanup_error is not None:
+                cleanup_cancellation.add_note("Process-tree cleanup also failed")
+            raise cleanup_cancellation from primary_error
         raise
     return (
         process.returncode if process.returncode is not None else -1,

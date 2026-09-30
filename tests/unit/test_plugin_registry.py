@@ -26,6 +26,33 @@ def test_local_plugin_catalog_discovers_valid_manifest(tmp_path) -> None:
     assert found[0].manifest.name == "example"
 
 
+def test_plugin_catalog_ignores_lifecycle_transaction_artifacts(tmp_path) -> None:
+    root = tmp_path / "plugins"
+    live = root / "example"
+    live.mkdir(parents=True)
+    (live / "plugin.json").write_text(
+        json.dumps({"name": "example", "version": "2.0.0"})
+    )
+    for name in (
+        ".example.backup-" + "a" * 32,
+        ".example.uninstall-" + "b" * 32,
+        ".example.install-conflict-" + "c" * 32,
+        ".example.uninstall-conflict-" + "d" * 32,
+        ".install-" + "e" * 32 + ".tmp",
+    ):
+        candidate = root / name
+        candidate.mkdir()
+        (candidate / "plugin.json").write_text(
+            json.dumps({"name": "example", "version": "1.0.0"})
+        )
+
+    found = PluginCatalog(((root, "user"),)).discover()
+
+    assert [(plugin.manifest.name, plugin.root.name) for plugin in found] == [
+        ("example", "example")
+    ]
+
+
 def test_local_plugin_catalog_rejects_escaping_skill_path(tmp_path) -> None:
     root = tmp_path / "plugins"
     plugin = root / "bad"

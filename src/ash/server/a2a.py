@@ -55,7 +55,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message as ASGIMessage, Receive, Scope, Send
 
 from ash.sdk import AshClient
-from ash.safe_io import validate_unlinked_file_path
+from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
 from ash.config import AshConfig
 from ash.core.redaction import redact_urls_in_text
 from ash.core.session import normalize_project_path
@@ -66,6 +66,7 @@ MAX_A2A_BODY_BYTES = 8 * 1024 * 1024
 MAX_A2A_CONTEXT_ID_BYTES = 512
 MAX_A2A_SESSION_MAPPINGS = 100_000
 MAX_A2A_RATE_LIMIT_KEYS = 10_000
+MAX_A2A_IN_FLIGHT_TASKS = 16
 
 
 class _TokenUser(User):
@@ -234,16 +235,17 @@ class A2ASessionRegistry:
     """Durably map opaque A2A context IDs to project-scoped Ash sessions."""
 
     def __init__(self, db_path: Path, workspace: Path) -> None:
-        self.db_path = validate_unlinked_file_path(
-            db_path, label="A2A session registry database"
-        )
+        try:
+            self._database = PinnedSQLiteDatabase.prepare(
+                db_path,
+                label="A2A session registry database",
+            )
+        except SQLitePathError as exc:
+            raise ValueError(str(exc)) from exc
+        self.db_path = self._database.path
         self.workspace = normalize_project_path(workspace)
         self._lock = asyncio.Lock()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.db_path = validate_unlinked_file_path(
-            self.db_path, label="A2A session registry database"
-        )
-        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ash_context_sessions (
@@ -255,13 +257,19 @@ class A2ASessionRegistry:
                 """
             )
 
+    def _connect(self) -> sqlite3.Connection:
+        try:
+            return self._database.connect(
+                label="A2A session registry database",
+                check_same_thread=True,
+            )
+        except (SQLitePathError, sqlite3.Error) as exc:
+            raise ValueError(f"cannot open A2A session registry database: {exc}") from exc
+
     async def get(self, context_id: str) -> str | None:
         _validate_context_id(context_id)
         async with self._lock:
-            database = validate_unlinked_file_path(
-                self.db_path, label="A2A session registry database"
-            )
-            with closing(sqlite3.connect(database)) as conn:
+            with closing(self._connect()) as conn:
                 row = conn.execute(
                     "SELECT session_id, project_path FROM ash_context_sessions "
                     "WHERE context_id = ?",
@@ -278,10 +286,7 @@ class A2ASessionRegistry:
         if not session_id or len(session_id.encode("utf-8")) > 512:
             raise ValueError("invalid Ash session ID")
         async with self._lock:
-            database = validate_unlinked_file_path(
-                self.db_path, label="A2A session registry database"
-            )
-            with closing(sqlite3.connect(database)) as conn, conn:
+            with closing(self._connect()) as conn, conn:
                 count = conn.execute(
                     "SELECT COUNT(*) FROM ash_context_sessions"
                 ).fetchone()[0]
@@ -311,16 +316,35 @@ class A2ASessionRegistry:
 def _create_a2a_task_engine(db_path: Path) -> AsyncEngine:
     """Create the SDK task engine with link checks at each new connection."""
 
-    database = validate_unlinked_file_path(db_path, label="A2A task database")
-    database.parent.mkdir(parents=True, exist_ok=True)
-    database = validate_unlinked_file_path(database, label="A2A task database")
+    try:
+        database = PinnedSQLiteDatabase.prepare(
+            db_path,
+            label="A2A task database",
+        )
+    except SQLitePathError as exc:
+        raise ValueError(str(exc)) from exc
 
     async def connect() -> aiosqlite.Connection:
-        current = validate_unlinked_file_path(database, label="A2A task database")
-        return await aiosqlite.connect(current)
+        connection: aiosqlite.Connection | None = None
+        try:
+            database.verify(label="A2A task database")
+            connection = await aiosqlite.connect(
+                database.read_write_uri(),
+                uri=True,
+            )
+            database.verify(label="A2A task database")
+            return connection
+        except SQLitePathError as exc:
+            if connection is not None:
+                await connection.close()
+            raise ValueError(str(exc)) from exc
+        except BaseException:
+            if connection is not None:
+                await connection.close()
+            raise
 
     return create_async_engine(
-        f"sqlite+aiosqlite:///{database}",
+        f"sqlite+aiosqlite:///{database.path}",
         async_creator=connect,
     )
 
@@ -339,6 +363,8 @@ async def _settle_a2a_cleanup_task(
             current = asyncio.current_task()
             if current is not None:
                 current.uncancel()
+        except BaseException:
+            break
     try:
         task.result()
     except BaseException as exc:
@@ -349,9 +375,70 @@ async def _settle_a2a_cleanup_task(
 class AshA2AExecutor(AgentExecutor):
     """Translate A2A tasks into cancellation-safe Ash SDK turns."""
 
-    def __init__(self, config: AshConfig, registry: A2ASessionRegistry) -> None:
+    def __init__(
+        self,
+        config: AshConfig,
+        registry: A2ASessionRegistry,
+        *,
+        max_in_flight_tasks: int = MAX_A2A_IN_FLIGHT_TASKS,
+    ) -> None:
+        if max_in_flight_tasks < 1:
+            raise ValueError("A2A in-flight task limit must be positive")
         self.config = config
         self.registry = registry
+        self._max_in_flight_tasks = max_in_flight_tasks
+        self._active_tasks = 0
+        self._retired_clients: set[AshClient] = set()
+        self._cleanup_lock = asyncio.Lock()
+
+    def _try_acquire_task_slot(self) -> bool:
+        if self._active_tasks >= self._max_in_flight_tasks:
+            return False
+        self._active_tasks += 1
+        return True
+
+    def _release_task_slot(self) -> None:
+        if self._active_tasks <= 0:
+            raise RuntimeError("A2A task admission accounting underflow")
+        self._active_tasks -= 1
+
+    async def _retry_retired_clients(self) -> int:
+        async with self._cleanup_lock:
+            clients = tuple(self._retired_clients)
+            if not clients:
+                return 0
+            outcomes = await asyncio.gather(
+                *(client.close() for client in clients),
+                return_exceptions=True,
+            )
+            failed = {
+                client
+                for client, outcome in zip(clients, outcomes, strict=True)
+                if isinstance(outcome, BaseException)
+            }
+            self._retired_clients.difference_update(set(clients) - failed)
+            return len(failed)
+
+    def _retain_retired_client(self, client: AshClient) -> None:
+        # Retention must not await: this is the last ownership handoff after a
+        # failed close, and caller cancellation cannot be allowed to drop it.
+        # Cleanup works from a snapshot, so clients added during a retry remain
+        # in the set for the next pass.
+        self._retired_clients.add(client)
+
+    async def aclose(self) -> None:
+        cleanup = asyncio.create_task(
+            self._retry_retired_clients(),
+            name="ash-a2a-retired-client-cleanup",
+        )
+        cleanup_error, cleanup_interrupted = await _settle_a2a_cleanup_task(cleanup)
+        if cleanup_error is not None:
+            raise cleanup_error
+        failed = cleanup.result()
+        if failed:
+            raise RuntimeError(f"failed to close {failed} retired A2A client(s)")
+        if cleanup_interrupted:
+            raise asyncio.CancelledError
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         task_id = context.task_id or ""
@@ -387,9 +474,26 @@ class AshA2AExecutor(AgentExecutor):
                 _agent_message(updater, "Ash currently returns text/plain only.")
             )
             return
+        if await self._retry_retired_clients():
+            await updater.failed(
+                _agent_message(
+                    updater,
+                    "Ash runtime cleanup is incomplete; retry this task later.",
+                )
+            )
+            return
+        if not self._try_acquire_task_slot():
+            await updater.failed(
+                _agent_message(
+                    updater,
+                    "Ash is busy; retry this task later.",
+                )
+            )
+            return
 
         client: AshClient | None = None
         cancellation: asyncio.CancelledError | None = None
+        terminal_published = False
         try:
             session_id = await self.registry.get(context_id)
             client = await AshClient.create(
@@ -443,10 +547,13 @@ class AshA2AExecutor(AgentExecutor):
                 )
             if cancelled:
                 await updater.cancel(_agent_message(updater, "Task cancelled."))
+                terminal_published = True
             elif failure:
                 await updater.failed(_agent_message(updater, failure))
+                terminal_published = True
             else:
                 await updater.complete()
+                terminal_published = True
         except asyncio.CancelledError as exc:
             cancellation = exc
             raise
@@ -457,24 +564,29 @@ class AshA2AExecutor(AgentExecutor):
                     redact_urls_in_text(str(exc) or "Ash task failed"),
                 )
             )
+            terminal_published = True
         finally:
-            if client is not None:
-                close_task = asyncio.create_task(
-                    client.close(), name=f"ash-a2a-client-close-{task_id}"
-                )
-                close_error, close_interrupted = await _settle_a2a_cleanup_task(
-                    close_task
-                )
-                if close_error is not None:
-                    if cancellation is not None:
-                        cancellation.add_note("A2A client closure failed")
-                    else:
-                        raise close_error
-                if close_interrupted:
-                    if cancellation is not None:
-                        cancellation.add_note("A2A client closure was interrupted")
-                    else:
-                        raise asyncio.CancelledError
+            try:
+                if client is not None:
+                    close_task = asyncio.create_task(
+                        client.close(), name=f"ash-a2a-client-close-{task_id}"
+                    )
+                    close_error, close_interrupted = await _settle_a2a_cleanup_task(
+                        close_task
+                    )
+                    if close_error is not None:
+                        self._retain_retired_client(client)
+                        if cancellation is not None:
+                            cancellation.add_note("A2A client closure failed")
+                        elif not terminal_published:
+                            raise close_error
+                    if close_interrupted:
+                        if cancellation is not None:
+                            cancellation.add_note("A2A client closure was interrupted")
+                        elif not terminal_published:
+                            raise asyncio.CancelledError
+            finally:
+                self._release_task_slot()
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         updater = TaskUpdater(
@@ -504,8 +616,9 @@ def create_a2a_app(
         task_store = DatabaseTaskStore(engine)
     registry = A2ASessionRegistry(mapping_db_path, config.workspace_root)
     card = build_agent_card(base_url)
+    executor = AshA2AExecutor(config, registry)
     handler = DefaultRequestHandler(
-        agent_executor=AshA2AExecutor(config, registry),
+        agent_executor=executor,
         task_store=task_store,
         agent_card=card,
     )
@@ -539,9 +652,36 @@ def create_a2a_app(
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         if isinstance(task_store, DatabaseTaskStore):
             await task_store.initialize()
-        yield
-        if engine is not None:
-            await engine.dispose()
+        primary_error: BaseException | None = None
+        try:
+            yield
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            cleanup_errors: list[BaseException] = []
+            try:
+                await handler.aclose()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            try:
+                await executor.aclose()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            if engine is not None:
+                try:
+                    await engine.dispose()
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            if cleanup_errors:
+                if primary_error is not None:
+                    for _error in cleanup_errors:
+                        primary_error.add_note("A2A shutdown cleanup also failed")
+                else:
+                    primary = cleanup_errors[0]
+                    for extra in cleanup_errors[1:]:
+                        primary.add_note(f"additional A2A shutdown error: {extra}")
+                    raise primary
 
     app = Starlette(routes=routes, lifespan=lifespan)
     app.add_middleware(
@@ -551,6 +691,7 @@ def create_a2a_app(
     )
     app.state.a2a_task_store = task_store
     app.state.a2a_engine = engine
+    app.state.a2a_executor = executor
     return app
 
 

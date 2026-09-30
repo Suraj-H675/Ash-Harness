@@ -39,6 +39,22 @@ def test_notification_message_is_safe_and_bounded() -> None:
     assert message.endswith("...")
 
 
+def test_notification_message_redacts_credentials_before_preview() -> None:
+    provider_secret = "sk-proj-" + "A" * 32
+    signed_marker = "signed-notification-marker"
+
+    message = sanitize_notification_message(
+        f"token={provider_secret} "
+        "https://storage.example/object?"
+        f"X-Amz-Signature={signed_marker}&view=complete"
+    )
+
+    assert provider_secret not in message
+    assert signed_marker not in message
+    assert "[REDACTED]" in message
+    assert "view=complete" in message
+
+
 def test_osc9_sequence_supports_tmux_passthrough() -> None:
     assert notification_sequence(NotificationMethod.OSC9, "done") == "\x1b]9;done\x07"
     assert (

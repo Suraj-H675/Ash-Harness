@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import platform
 import re
 from pathlib import Path
 from typing import Any, Iterable
@@ -12,8 +11,8 @@ from typing import Any, Iterable
 from pydantic import BaseModel, Field
 
 from ash.core.redaction import StreamingRedactor
-from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
-from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.environment import build_scrubbed_environment
+from ash.safety.guard import SafetyGuard
 from ash.sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable
 from ash.sandbox.manager import SandboxManager, SandboxResult
 from ash.sandbox.process_utils import (
@@ -45,16 +44,6 @@ MAX_COMMAND_OUTPUT_CHARS = 100_000
 OUTPUT_CAPTURE_LIMIT_NOTICE = "Process output capture limit reached."
 MAX_DIAGNOSTIC_ITEMS = 50
 MAX_SUMMARY_ITEMS = 8
-POWERSHELL_FILE_CMDLETS = (
-    "get-content",
-    "set-content",
-    "add-content",
-    "copy-item",
-    "move-item",
-    "remove-item",
-    "rename-item",
-    "new-item",
-)
 
 
 class RunCommandArgs(BaseModel):
@@ -204,7 +193,6 @@ class RunCommandTool(BaseTool):
     async def run(self, **kwargs: Any) -> ToolResult:
         args = RunCommandArgs(**kwargs)
         self.safety_guard.validate_command(args.command_line)
-        validate_windows_shell_command(args.command_line)
 
         if self.project_root is not None and self._project_root_identity is not None:
             if _directory_identity(Path(self.project_root)) != self._project_root_identity:
@@ -356,58 +344,30 @@ class RunCommandTool(BaseTool):
                     output="",
                     error=f"Error: command was not started: {exc}",
                 )
-            if platform.system() == "Windows":
-                powershell = resolve_host_executable(
-                    "powershell.exe",
-                    workspace_root=workspace,
-                    cwd=workspace,
+            cwd_target = Path(cwd) if cwd is not None else workspace
+            try:
+                with prepare_scoped_process_launch(
+                    ["/bin/sh", "-c", command_line],
+                    cwd=cwd_target,
+                    guard=self.safety_guard,
                     search_path=env.get("PATH"),
-                )
-                if powershell is None:
-                    return ToolResult(
-                        success=False,
-                        output="",
-                        error="PowerShell executable is unavailable outside the workspace.",
+                    expected_cwd_identity=expected_cwd_identity,
+                ) as launch:
+                    process = await asyncio.create_subprocess_exec(
+                        *launch.argv,
+                        cwd=launch.cwd,
+                        env=env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        pass_fds=launch.pass_fds,
+                        **process_tree_plan.spawn_options,
                     )
-                process = await asyncio.create_subprocess_exec(
-                    powershell,
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    command_line,
-                    cwd=cwd,
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    **process_tree_plan.spawn_options,
+            except ProcessTreeUnavailable as exc:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Error: command was not started: {exc}",
                 )
-            else:
-                cwd_target = Path(cwd) if cwd is not None else workspace
-                try:
-                    with prepare_scoped_process_launch(
-                        ["/bin/sh", "-c", command_line],
-                        cwd=cwd_target,
-                        guard=self.safety_guard,
-                        search_path=env.get("PATH"),
-                        expected_cwd_identity=expected_cwd_identity,
-                    ) as launch:
-                        process = await asyncio.create_subprocess_exec(
-                            *launch.argv,
-                            cwd=launch.cwd,
-                            env=env,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            pass_fds=launch.pass_fds,
-                            **process_tree_plan.spawn_options,
-                        )
-                except ProcessTreeUnavailable as exc:
-                    return ToolResult(
-                        success=False,
-                        output="",
-                        error=f"Error: command was not started: {exc}",
-                    )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 communicate_process(
                     process,
@@ -470,6 +430,28 @@ class RunCommandTool(BaseTool):
                 diagnostics=extract_diagnostics(stdout, stderr),
                 diagnostic_summary=extract_diagnostic_summary(stdout, stderr),
             )
+        except Exception as primary_error:
+            if "process" in locals():
+                cleanup_error, cleanup_cancelled = (
+                    await settle_process_tree_after_cancellation(
+                        process, plan=process_tree_plan
+                    )
+                )
+                if cleanup_error is not None:
+                    primary_error.add_note(
+                        f"Process-tree cleanup failed: {cleanup_error}"
+                    )
+                if cleanup_cancelled:
+                    cleanup_cancellation = asyncio.CancelledError()
+                    cleanup_cancellation.add_note(
+                        "command failed before process-tree cleanup was cancelled"
+                    )
+                    if cleanup_error is not None:
+                        cleanup_cancellation.add_note(
+                            "Process-tree cleanup also failed"
+                        )
+                    raise cleanup_cancellation from primary_error
+            raise
 
         stdout = _redact_captured_output(decode_stream(stdout_bytes))
         stderr = _redact_captured_output(decode_stream(stderr_bytes))
@@ -500,143 +482,42 @@ def decode_stream(raw_bytes: bytes) -> str:
         return raw_bytes.decode("cp1252", errors="replace")
 
 
-def quote_powershell_literal_path(path: str) -> str:
-    escaped = path.replace("'", "''")
-    return f"-LiteralPath '{escaped}'"
-
-
-_WINDOWS_CHAIN_COMPILERS = frozenset(
-    {"cargo", "npm", "pnpm", "yarn", "uv", "python", "python3", "pytest", "go", "dotnet"}
-)
-
-
-def _split_top_level_windows_chain(
-    command_line: str,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Split PowerShell command chaining without treating quoted text as syntax."""
-
-    segments: list[str] = []
-    operators: list[str] = []
-    start = 0
-    quote: str | None = None
-    index = 0
-    while index < len(command_line):
-        character = command_line[index]
-        if quote == "'":
-            if character == "'" and index + 1 < len(command_line):
-                if command_line[index + 1] == "'":
-                    index += 2
-                    continue
-            if character == "'":
-                quote = None
-            index += 1
-            continue
-        if quote == '"':
-            if character == "`" and index + 1 < len(command_line):
-                index += 2
-                continue
-            if character == '"':
-                quote = None
-            index += 1
-            continue
-        if character == "`" and index + 1 < len(command_line):
-            index += 2
-            continue
-        if character in {"'", '"'}:
-            quote = character
-            index += 1
-            continue
-        operator = ""
-        if command_line.startswith("&&", index):
-            operator = "&&"
-        elif command_line.startswith("||", index):
-            operator = "||"
-        elif character == ";":
-            operator = ";"
-        if not operator:
-            index += 1
-            continue
-        segments.append(command_line[start:index].strip())
-        operators.append(operator)
-        index += len(operator)
-        start = index
-    segments.append(command_line[start:].strip())
-    return tuple(segments), tuple(operators)
-
-
-def _windows_segment_executable(segment: str) -> str | None:
-    """Return the first PowerShell command token for bounded chain classification."""
-
-    value = segment.lstrip()
-    if value.startswith("&"):
-        value = value[1:].lstrip()
-    if not value:
-        return None
-    if value[0] in {"'", '"'}:
-        quote = value[0]
-        index = 1
-        token: list[str] = []
-        while index < len(value):
-            character = value[index]
-            if quote == "'" and character == "'":
-                if index + 1 < len(value) and value[index + 1] == "'":
-                    token.append("'")
-                    index += 2
-                    continue
-                break
-            if quote == '"' and character == "`" and index + 1 < len(value):
-                token.append(value[index + 1])
-                index += 2
-                continue
-            if character == quote:
-                break
-            token.append(character)
-            index += 1
-        executable = "".join(token)
-    else:
-        executable = value.split(maxsplit=1)[0]
-    basename = re.split(r"[\\/]", executable)[-1].casefold()
-    if basename.endswith(".exe"):
-        basename = basename[:-4]
-    return basename or None
-
-
-def contains_forbidden_windows_chain(command_line: str) -> bool:
-    segments, operators = _split_top_level_windows_chain(command_line)
-    if not operators:
-        return False
-    if any(operator == ";" for operator in operators):
-        return True
-    return any(
-        _windows_segment_executable(segment) not in _WINDOWS_CHAIN_COMPILERS
-        for segment in segments
-    )
-
-
-def validate_windows_shell_command(command_line: str) -> None:
-    """Apply Windows PowerShell-specific safety checks to a shell command."""
-
-    if platform.system() != "Windows":
-        return
-    lowered = command_line.casefold()
-    if contains_forbidden_windows_chain(command_line):
-        raise SafetyViolation("Windows command chains are forbidden for this command.")
-    if not any(cmdlet in lowered for cmdlet in POWERSHELL_FILE_CMDLETS):
-        return
-    if "-literalpath" not in lowered:
-        raise SafetyViolation(
-            "PowerShell file cmdlets must use -LiteralPath for path arguments."
-        )
-
-
 def build_scrubbed_command_env(
     project_root: Path | None = None,
     environment_allowlist: Iterable[str] = (),
 ) -> dict[str, str]:
-    env = build_scrubbed_environment(environment_allowlist)
+    allowlist = tuple(environment_allowlist)
+    env = build_scrubbed_environment(allowlist)
     if project_root is not None:
         env["ASH_WORKSPACE_ROOT"] = str(project_root)
+        if not any(name.casefold() == "path" for name in allowlist):
+            env["PATH"] = _sanitize_command_path(
+                env.get("PATH", os.defpath),
+                project_root,
+            )
     return env
+
+
+def _sanitize_command_path(path_value: str, project_root: Path) -> str:
+    """Drop implicit PATH entries controlled by the active workspace."""
+
+    root = project_root.expanduser().resolve()
+    retained: list[str] = []
+    for raw_entry in path_value.split(os.pathsep):
+        if not raw_entry:
+            continue
+        entry = Path(raw_entry).expanduser()
+        if not entry.is_absolute():
+            continue
+        try:
+            resolved = entry.resolve()
+        except OSError:
+            continue
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            retained.append(str(resolved))
+    return os.pathsep.join(dict.fromkeys(retained)) or os.defpath
 
 
 def _redact_captured_output(output: str) -> str:

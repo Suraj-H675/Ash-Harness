@@ -38,12 +38,11 @@ def test_anthropic_counter_scales_with_input_length() -> None:
     assert long > short
 
 
-def test_openai_counter_matches_tiktoken_encoder() -> None:
+def test_openai_counter_returns_positive_estimate() -> None:
     counter = OpenAITokenCounter("gpt-4")
     text = "The quick brown fox jumps over the lazy dog."
-    expected = len(counter._encoder.encode(text))
 
-    assert counter.count(text) == expected
+    assert counter.count(text) > 0
 
 
 def test_openai_counter_zero_for_empty_input() -> None:
@@ -56,6 +55,18 @@ def test_openai_counter_falls_back_for_unknown_model() -> None:
     counter = OpenAITokenCounter("totally-fake-model-xyz")
 
     assert counter.count("hello world") > 0
+
+
+def test_openai_counter_does_not_collapse_long_code_identifier() -> None:
+    counter = OpenAITokenCounter("gpt-4")
+
+    assert counter.count("x" * 300) >= 100
+
+
+def test_openai_counter_charges_non_ascii_by_utf8_size() -> None:
+    counter = OpenAITokenCounter("gpt-4")
+
+    assert counter.count("漢" * 10) >= 30
 
 
 def test_get_token_counter_returns_anthropic_for_anthropic_provider() -> None:

@@ -401,7 +401,10 @@ def test_manifest_rejects_oversized_file(tmp_path: Path) -> None:
         PluginManifest.load(manifest_file)
 
 
-def test_manifest_rejects_linked_file(tmp_path: Path) -> None:
+def test_manifest_rejects_linked_file_and_link_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     target = tmp_path / "target.json"
     target.write_text('{"name":"demo","version":"1.0.0"}', encoding="utf-8")
     linked = tmp_path / "plugin.json"
@@ -412,3 +415,23 @@ def test_manifest_rejects_linked_file(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="cannot be a link"):
         PluginManifest.load(linked)
+
+    linked.unlink()
+    linked.write_text('{"name":"inside","version":"1.0.0"}', encoding="utf-8")
+    real_is_symlink = Path.is_symlink
+    swapped = False
+
+    def race_link_check(path: Path) -> bool:
+        nonlocal swapped
+        result = real_is_symlink(path)
+        if path == linked and not swapped:
+            linked.unlink()
+            linked.symlink_to(target)
+            swapped = True
+            return False
+        return result
+
+    monkeypatch.setattr(Path, "is_symlink", race_link_check)
+    with pytest.raises(ValueError, match="cannot be a link"):
+        PluginManifest.load(linked)
+    assert swapped is True

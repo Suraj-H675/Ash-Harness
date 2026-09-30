@@ -16,7 +16,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.json_utils import strict_json_loads
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.safety.trust import canonical_workspace
 from ash.safe_io import (
     read_bounded_open_file,
@@ -28,6 +29,8 @@ CURRENT_PERMISSION_RULE_VERSION = 3
 MAX_RULE_FILE_BYTES = 1_000_000
 MAX_MANAGED_RULE_FILES = 16
 MAX_EXACT_VALUE_BYTES = 8192
+MAX_RULE_MATCHERS = 64
+MAX_RULE_BYTES = 64 * 1024
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
 _BULK_ARGUMENTS = frozenset(
@@ -101,10 +104,11 @@ def _json_size(value: Any) -> int:
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
+            allow_nan=False,
         )
-    except (TypeError, ValueError) as exc:
+        return len(serialized.encode("utf-8"))
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
         raise PermissionGrantError("exact matcher value must be valid JSON") from exc
-    return len(serialized.encode("utf-8"))
 
 
 def _safe_command_tokens(command_line: str) -> tuple[str, ...] | None:
@@ -473,7 +477,13 @@ def _rule_identifier(
         "tool": tool_name,
         "matches": [matcher.as_payload() for matcher in matchers],
     }
-    canonical = json.dumps(content, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(
+        content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
@@ -496,16 +506,39 @@ class PermissionRule:
         normalized_effect = RuleEffect(effect)
         normalized_tool = _validate_identifier(tool_name, label="tool name")
         normalized_matchers = tuple(matchers)
-        return cls(
-            _rule_identifier(
+        if len(normalized_matchers) > MAX_RULE_MATCHERS:
+            raise PermissionGrantError(
+                f"permission rule exceeds {MAX_RULE_MATCHERS} matchers"
+            )
+        try:
+            rule_id = _rule_identifier(
                 normalized_effect,
                 normalized_tool,
                 normalized_matchers,
-            ),
+            )
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise PermissionGrantError("permission rule must be valid JSON") from exc
+        rule = cls(
+            rule_id,
             normalized_effect,
             normalized_tool,
             normalized_matchers,
         )
+        try:
+            encoded = json.dumps(
+                rule.as_payload(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise PermissionGrantError("permission rule must be valid JSON") from exc
+        if len(encoded) > MAX_RULE_BYTES:
+            raise PermissionGrantError(
+                f"permission rule exceeds {MAX_RULE_BYTES} bytes"
+            )
+        return rule
 
     @property
     def scoped(self) -> bool:
@@ -602,15 +635,6 @@ def grants_path() -> Path:
     return Path.home() / ".ash" / "permission-grants.json"
 
 
-def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    value: dict[str, Any] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate JSON object key: {key!r}")
-        value[key] = item
-    return value
-
-
 def _read_payload(path: Path) -> dict[str, Any]:
     try:
         validate_unlinked_path(
@@ -637,10 +661,7 @@ def _read_payload(path: Path) -> dict[str, Any]:
 
 def _decode_payload(raw: bytes) -> dict[str, Any]:
     try:
-        payload = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=_unique_json_object,
-        )
+        payload = strict_json_loads(raw)
     except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise PermissionGrantError(f"cannot read permission rule file: {exc}") from exc
     if not isinstance(payload, dict):

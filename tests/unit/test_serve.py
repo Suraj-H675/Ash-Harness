@@ -112,3 +112,32 @@ async def test_serve_closes_client_when_server_stops(monkeypatch) -> None:
     assert closed is True
     assert observed_config.ssl_certfile == "cert.pem"
     assert observed_config.ssl_keyfile == "key.pem"
+
+
+@pytest.mark.asyncio
+async def test_serve_preserves_server_failure_when_client_close_fails(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ASH_SERVER_TOKEN", "0123456789abcdef")
+
+    class Client:
+        async def close(self) -> None:
+            raise RuntimeError("client close failure")
+
+    class Server:
+        def __init__(self, _config) -> None:
+            pass
+
+        async def serve(self) -> None:
+            raise RuntimeError("server failure")
+
+    async def create_client():
+        return Client()
+
+    monkeypatch.setattr("ash.commands.serve.AshClient.create", create_client)
+    monkeypatch.setattr("ash.commands.serve.uvicorn.Server", Server)
+
+    with pytest.raises(RuntimeError, match="server failure") as captured:
+        await serve_http(args())
+
+    assert any("HTTP server client cleanup failed" in note for note in captured.value.__notes__)

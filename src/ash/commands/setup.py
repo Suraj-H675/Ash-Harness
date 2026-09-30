@@ -7,6 +7,7 @@ storage to ~/.ash/.env and ~/.ash/ash.toml.
 from __future__ import annotations
 
 import getpass
+import hashlib
 import importlib.util
 import json
 import os
@@ -39,8 +40,9 @@ from ash.commands.config import (
     load_config,
     mask_key,
     MAX_CONFIG_FILE_BYTES,
+    mutate_config,
     record_config_migration,
-    save_config,
+    replace_config_if_current,
     save_env_values,
 )
 from ash.provider_catalog import (
@@ -49,6 +51,7 @@ from ash.provider_catalog import (
     get_provider_descriptor,
 )
 from ash.safe_io import read_bounded_bytes
+from ash.safety.browser_process import run_browser_subprocess
 from ash.safety.trust import is_workspace_trusted
 from ash.ui.safe_text import terminal_safe_text
 
@@ -178,7 +181,7 @@ def _setup_status_payload(config) -> dict[str, Any]:
             },
             "browser": {"installed": _browser_is_installed()},
             "mcp": {"configured": (workspace_root / ".mcp.json").is_file()},
-            "memory": {"backend": str(getattr(config, "memory_backend", "auto"))},
+            "memory": {"backend": str(getattr(config, "memory_backend", "sqlite"))},
             "sandbox": {"backend": str(getattr(config, "sandbox_backend", "auto"))},
         },
     }
@@ -326,6 +329,7 @@ def run_setup_wizard(args) -> SetupOutcome:
 
     # Check for old ash.toml and offer migration
     _migrate_old_ash_toml()
+    config = AshConfig.load()
 
     setup_result = SetupOutcome.SUCCESS
     if section == "model":
@@ -569,9 +573,11 @@ def _prompt_position(length: int) -> int | None:
 def _save_fallback_models(config, fallbacks: list[str]) -> None:
     """Persist a fallback chain without dropping other user configuration."""
 
-    user_config = load_config(strict=True)
-    user_config["fallback_models"] = list(fallbacks)
-    save_config(user_config)
+    mutate_config(
+        lambda user_config: user_config.__setitem__(
+            "fallback_models", list(fallbacks)
+        )
+    )
     config.fallback_models = list(fallbacks)
 
 
@@ -636,7 +642,7 @@ def setup_browser() -> SetupOutcome:
     if answer in {"n", "no"}:
         return SetupOutcome.CANCELLED
     try:
-        completed = subprocess.run(
+        completed = run_browser_subprocess(
             [sys.executable, "-I", "-m", "playwright", "install", "chromium"],
             check=False,
             timeout=BROWSER_INSTALL_TIMEOUT_SECONDS,
@@ -671,7 +677,7 @@ def _browser_is_installed() -> bool:
     if importlib.util.find_spec("playwright") is None:
         return False
     try:
-        completed = subprocess.run(
+        completed = run_browser_subprocess(
             [sys.executable, "-I", "-m", "playwright", "install", "--list"],
             check=False,
             capture_output=True,
@@ -1016,10 +1022,6 @@ def _flow_openai_compatible() -> SetupOutcome:
     _confirm_undiscovered_model(model, models, verified)
 
     # Update custom_providers without replacing unrelated user configuration.
-    user_config = load_config(strict=True)
-    custom = user_config.get("custom_providers", {})
-    if not isinstance(custom, dict):
-        raise ValueError("custom_providers must be a TOML table")
     custom_provider = {
         "base_url": base_url,
         "models": models,
@@ -1027,9 +1029,15 @@ def _flow_openai_compatible() -> SetupOutcome:
     }
     if api_key:
         custom_provider["key_env"] = key_env
-    custom[name] = custom_provider
-    user_config["custom_providers"] = custom
-    save_config(user_config)
+
+    def save_custom_provider(user_config: dict[str, Any]) -> None:
+        custom = user_config.get("custom_providers", {})
+        if not isinstance(custom, dict):
+            raise ValueError("custom_providers must be a TOML table")
+        custom[name] = custom_provider
+        user_config["custom_providers"] = custom
+
+    mutate_config(save_custom_provider)
 
     settings = {"ASH_MODEL": f"{name}/{model}"}
     if api_key:
@@ -1292,13 +1300,12 @@ def _migrate_old_ash_toml() -> None:
     try:
         import tomllib
 
-        old_config = tomllib.loads(
-            read_bounded_bytes(
-                old_path,
-                MAX_CONFIG_FILE_BYTES,
-                label="legacy TOML config",
-            ).decode("utf-8")
+        legacy_snapshot = read_bounded_bytes(
+            old_path,
+            MAX_CONFIG_FILE_BYTES,
+            label="legacy TOML config",
         )
+        old_config = tomllib.loads(legacy_snapshot.decode("utf-8"))
     except Exception:
         return
 
@@ -1319,6 +1326,16 @@ def _migrate_old_ash_toml() -> None:
     resp = input("\n  Migrate settings now? [Y/n] ").strip().lower()
     if resp in ("n", "no"):
         return
+    current_snapshot = read_bounded_bytes(
+        old_path,
+        MAX_CONFIG_FILE_BYTES,
+        label="legacy TOML config",
+    )
+    if current_snapshot != legacy_snapshot:
+        raise ValueError(
+            f"legacy configuration changed while migration was pending: {old_path}"
+        )
+    legacy_snapshot_digest = hashlib.sha256(legacy_snapshot).hexdigest()
 
     user_config = load_config(strict=True)
     config_updates, env_updates, preserved, skipped = _plan_legacy_config_migration(
@@ -1326,7 +1343,23 @@ def _migrate_old_ash_toml() -> None:
         old_path=old_path,
         user_config=user_config,
     )
-    source_backup = backup_config_file(old_path, label="legacy-project-ash.toml")
+    from ash.config import AshConfig
+
+    validation_values = dict(config_updates)
+    if "model" not in validation_values and "ASH_MODEL" in env_updates:
+        validation_values["model"] = env_updates["ASH_MODEL"]
+    try:
+        AshConfig.validate_persisted_values(validation_values)
+    except ValueError as exc:
+        raise ValueError(
+            f"legacy configuration migration would create invalid settings: {exc}"
+        ) from exc
+
+    source_backup = backup_config_file(
+        old_path,
+        label="legacy-project-ash.toml",
+        expected_sha256=legacy_snapshot_digest,
+    )
     destination_path = get_config_path()
     destination_backup: Path | None = None
     if config_updates != user_config and destination_path.is_file():
@@ -1335,10 +1368,14 @@ def _migrate_old_ash_toml() -> None:
             label="user-ash.toml-pre-migration",
         )
     if config_updates != user_config:
-        save_config(config_updates)
+        replace_config_if_current(user_config, config_updates)
     if env_updates:
         save_env_values(env_updates)
-    record_config_migration(old_path, source_backup)
+    record_config_migration(
+        old_path,
+        source_backup,
+        source_sha256=legacy_snapshot_digest,
+    )
 
     print("\n  Migration complete.")
     print(f"  Legacy backup: {source_backup}")

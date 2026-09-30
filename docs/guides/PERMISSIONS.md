@@ -25,7 +25,9 @@ Place one or more JSON files in the platform policy directory:
 
 - Linux: `/etc/ash/policy`
 - macOS: `/Library/Application Support/Ash/policy`
-- Windows: `%ProgramData%\Ash\policy`
+
+Windows users should run Ash inside WSL2; WSL2 follows the Linux policy path.
+Native Windows is not currently a supported Ash host.
 
 Each file uses the same versioned schema as `permission-grants.json`, but keys
 workspaces by canonical absolute path. For example:

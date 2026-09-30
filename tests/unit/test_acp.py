@@ -37,7 +37,7 @@ from ash.config import AshConfig
 from ash.core.session import Message, SessionStore, ToolCallRecord
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.trust import set_workspace_trusted
-from ash.server.acp import AshACPAgent, _tool_kind
+from ash.server.acp import AshACPAgent, _tool_kind, run_acp_agent
 
 
 def test_acp_classifies_core_read_tool_names() -> None:
@@ -52,6 +52,104 @@ def test_acp_classifies_browser_tab_tools_by_effect() -> None:
     assert _tool_kind("browser_open_tab") == "fetch"
     assert _tool_kind("browser_focus_tab") == "other"
     assert _tool_kind("browser_close_tab") == "other"
+
+
+@pytest.mark.asyncio
+async def test_acp_runner_preserves_transport_failure_when_agent_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.server.acp as acp_module
+
+    class FailingAgent:
+        async def aclose(self) -> None:
+            raise RuntimeError("agent close failure")
+
+    async def fail_run_agent(*_args, **_kwargs) -> None:
+        raise RuntimeError("ACP transport failure")
+
+    monkeypatch.setattr(acp_module, "AshACPAgent", FailingAgent)
+    monkeypatch.setattr(acp_module, "run_agent", fail_run_agent)
+
+    with pytest.raises(RuntimeError, match="ACP transport failure") as captured:
+        await run_acp_agent()
+
+    assert any(
+        "ACP agent cleanup failed" in note for note in captured.value.__notes__
+    )
+
+
+@pytest.mark.asyncio
+async def test_acp_session_reservation_release_settles_before_cancellation() -> None:
+    agent = AshACPAgent()
+    await agent._reserve_session()
+    lock_held = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def hold_lifecycle_lock() -> None:
+        async with agent._lifecycle_condition:
+            lock_held.set()
+            await release_lock.wait()
+
+    holder = asyncio.create_task(hold_lifecycle_lock())
+    await asyncio.wait_for(lock_held.wait(), timeout=1)
+    release = asyncio.create_task(agent._release_reservation())
+    await asyncio.sleep(0)
+
+    release.cancel()
+    await asyncio.sleep(0)
+
+    assert release.done() is False
+    assert agent._pending_sessions == 1
+
+    release_lock.set()
+    await holder
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(release, timeout=1)
+
+    assert agent._pending_sessions == 0
+
+
+@pytest.mark.asyncio
+async def test_acp_fork_reservation_release_attempts_all_before_cancellation() -> None:
+    agent = AshACPAgent()
+    await agent._reserve_session()
+    child_id = "child-reservation"
+    source_id = "source-reservation"
+    await agent._reserve_pending_session_id(child_id)
+    await agent._reserve_fork_source(source_id)
+    lock_held = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def hold_lifecycle_lock() -> None:
+        async with agent._lifecycle_condition:
+            lock_held.set()
+            await release_lock.wait()
+
+    holder = asyncio.create_task(hold_lifecycle_lock())
+    await asyncio.wait_for(lock_held.wait(), timeout=1)
+    release = asyncio.create_task(
+        agent._release_fork_reservations(
+            child_id=child_id,
+            child_id_reserved=True,
+            source_session_id=source_id,
+            fork_source_reserved=True,
+        )
+    )
+    await asyncio.sleep(0)
+
+    release.cancel()
+    await asyncio.sleep(0)
+
+    assert release.done() is False
+
+    release_lock.set()
+    await holder
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(release, timeout=1)
+
+    assert agent._pending_sessions == 0
+    assert child_id not in agent._pending_session_ids
+    assert source_id not in agent._forking_sessions
 
 
 class FakeACPConnection:
@@ -620,6 +718,131 @@ async def test_acp_close_cancels_active_prompt_and_closes_client(
 
 
 @pytest.mark.asyncio
+async def test_acp_close_session_retries_failed_client_cleanup(tmp_path: Path) -> None:
+    class FlakyCloseClient(FakeAshClient):
+        def __init__(
+            self,
+            session_id: str,
+            approval_callback: Any,
+            *,
+            fail_once: bool,
+        ) -> None:
+            super().__init__(session_id, [], approval_callback)
+            self.close_calls = 0
+            self.fail_once = fail_once
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.fail_once and self.close_calls == 1:
+                raise RuntimeError("ACP client close failed once")
+            await super().close()
+
+    clients: list[FlakyCloseClient] = []
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        del workspace, mcp_configs
+        client = FlakyCloseClient(
+            session_id or "retry-close-session",
+            approval_callback,
+            fail_once=not clients,
+        )
+        clients.append(client)
+        return client
+
+    agent = AshACPAgent(client_factory=factory, max_sessions=1)  # type: ignore[arg-type]
+    session = await agent.new_session(str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="ACP client close failed once"):
+        await agent.close_session(session.session_id)
+
+    assert session.session_id not in agent._sessions
+    assert session.session_id in agent._retired_sessions
+    assert clients[0].close_calls == 1
+
+    with pytest.raises(acp.RequestError) as capacity:
+        await agent.new_session(str(tmp_path))
+    assert capacity.value.code == -32003
+
+    await agent.close_session(session.session_id)
+
+    assert clients[0].close_calls == 2
+    assert clients[0].closed is True
+    assert session.session_id not in agent._retired_sessions
+    with pytest.raises(acp.RequestError) as missing:
+        await agent.close_session(session.session_id)
+    assert missing.value.code == -32002
+
+    replacement = await agent.new_session(str(tmp_path))
+    assert replacement.session_id == session.session_id
+    await agent.close_session(replacement.session_id)
+
+
+@pytest.mark.asyncio
+async def test_acp_agent_close_retains_only_failed_session_runtime(tmp_path: Path) -> None:
+    class CountingCloseClient(FakeAshClient):
+        def __init__(
+            self,
+            session_id: str,
+            approval_callback: Any,
+            *,
+            fail_once: bool,
+        ) -> None:
+            super().__init__(session_id, [], approval_callback)
+            self.close_calls = 0
+            self.fail_once = fail_once
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.fail_once and self.close_calls == 1:
+                raise RuntimeError("ACP retained close failure")
+            await super().close()
+
+    clients: list[CountingCloseClient] = []
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        del workspace, mcp_configs
+        index = len(clients) + 1
+        client = CountingCloseClient(
+            session_id or f"agent-close-{index}",
+            approval_callback,
+            fail_once=index == 1,
+        )
+        clients.append(client)
+        return client
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    first = await agent.new_session(str(tmp_path))
+    second = await agent.new_session(str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="failed to close 1 ACP session runtime"):
+        await agent.aclose()
+
+    assert not agent._sessions
+    assert set(agent._retired_sessions) == {first.session_id}
+    assert clients[0].close_calls == 1
+    assert clients[1].close_calls == 1
+    assert clients[1].closed is True
+
+    await agent.aclose()
+
+    assert not agent._retired_sessions
+    assert clients[0].close_calls == 2
+    assert clients[0].closed is True
+    assert clients[1].close_calls == 1
+    assert second.session_id != first.session_id
+
+
+@pytest.mark.asyncio
 async def test_acp_prompt_cannot_start_after_concurrent_session_close(
     tmp_path: Path,
 ) -> None:
@@ -697,6 +920,101 @@ async def test_acp_new_session_cancellation_closes_created_client(
         await task
 
     assert clients[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_acp_new_session_retains_unpublished_client_when_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    class UnattachedClient(FakeAshClient):
+        def __init__(self, approval_callback: Any) -> None:
+            super().__init__("invalid-new-session", [], approval_callback)
+            self.loop.current_session = None
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("unpublished ACP client cleanup failed once")
+            await super().close()
+
+    clients: list[UnattachedClient] = []
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        del workspace, session_id, mcp_configs
+        client = UnattachedClient(approval_callback)
+        clients.append(client)
+        return client
+
+    agent = AshACPAgent(client_factory=factory, max_sessions=1)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="did not create an ACP session") as failure:
+        await agent.new_session(str(tmp_path))
+
+    assert any(
+        "unpublished ACP client cleanup failed once" in note
+        for note in failure.value.__notes__
+    )
+    assert clients[0].close_calls == 1
+    assert len(agent._unpublished_sessions) == 1
+
+    with pytest.raises(acp.RequestError) as capacity:
+        await agent.new_session(str(tmp_path))
+    assert capacity.value.code == -32003
+
+    await agent.aclose()
+
+    assert clients[0].close_calls == 2
+    assert clients[0].closed is True
+    assert not agent._unpublished_sessions
+
+
+@pytest.mark.asyncio
+async def test_acp_shutdown_waits_for_inflight_session_creation(tmp_path: Path) -> None:
+    factory_started = asyncio.Event()
+    allow_factory = asyncio.Event()
+    clients: list[FakeAshClient] = []
+
+    async def factory(
+        workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        del workspace, session_id, mcp_configs
+        client = FakeAshClient("late-session", [], approval_callback)
+        clients.append(client)
+        factory_started.set()
+        await allow_factory.wait()
+        return client
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    creating = asyncio.create_task(agent.new_session(str(tmp_path)))
+    await asyncio.wait_for(factory_started.wait(), timeout=1)
+    shutdown = asyncio.create_task(agent.aclose())
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert shutdown.done() is False
+    allow_factory.set()
+
+    with pytest.raises(acp.RequestError) as closing:
+        await creating
+    assert closing.value.data["reason"] == "ACP agent is closing"
+    await asyncio.wait_for(shutdown, timeout=1)
+
+    assert clients[0].closed is True
+    assert not agent._sessions
+    assert not agent._retired_sessions
+    assert not agent._unpublished_sessions
+    with pytest.raises(acp.RequestError) as closed:
+        await agent.new_session(str(tmp_path))
+    assert closed.value.data["reason"] == "ACP agent is closing"
 
 
 @pytest.mark.asyncio
@@ -791,6 +1109,86 @@ async def test_acp_load_replays_and_lists_durable_sessions(
 
     await agent.aclose()
     assert clients[0].closed
+
+
+@pytest.mark.asyncio
+async def test_acp_load_replay_failure_preserves_primary_and_retains_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(config.db_directory / "sessions.db")
+    stored = store.create_session(str(workspace), model="test")
+    store.save_message(
+        stored.session_id,
+        Message(
+            role="user",
+            content="replay me",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(
+        AshConfig,
+        "load",
+        classmethod(lambda cls, **kwargs: config),
+    )
+
+    class FailingReplayConnection(FakeACPConnection):
+        async def session_update(self, session_id: str, update: Any) -> None:
+            del session_id, update
+            raise RuntimeError("ACP replay delivery failed")
+
+    class FlakyCloseClient(FakeAshClient):
+        def __init__(self, session_id: str, approval_callback: Any) -> None:
+            super().__init__(session_id, [], approval_callback)
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("ACP load cleanup failed once")
+            await super().close()
+
+    clients: list[FlakyCloseClient] = []
+
+    async def factory(
+        selected_workspace: Path,
+        session_id: str | None,
+        mcp_configs: dict[str, Any],
+        approval_callback: Any,
+    ) -> Any:
+        del selected_workspace, mcp_configs
+        assert session_id is not None
+        client = FlakyCloseClient(session_id, approval_callback)
+        clients.append(client)
+        return client
+
+    agent = AshACPAgent(client_factory=factory, max_sessions=1)  # type: ignore[arg-type]
+    agent.on_connect(FailingReplayConnection())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="ACP replay delivery failed") as failure:
+        await agent.load_session(str(workspace), stored.session_id)
+
+    assert any("ACP load cleanup failed once" in note for note in failure.value.__notes__)
+    assert stored.session_id not in agent._sessions
+    assert stored.session_id in agent._retired_sessions
+    assert clients[0].close_calls == 1
+    with pytest.raises(acp.RequestError) as capacity:
+        await agent.new_session(str(workspace))
+    assert capacity.value.code == -32003
+
+    await agent.close_session(stored.session_id)
+
+    assert stored.session_id not in agent._retired_sessions
+    assert clients[0].close_calls == 2
+    assert clients[0].closed is True
 
 
 @pytest.mark.asyncio
@@ -965,9 +1363,15 @@ async def test_acp_resume_preserves_primary_error_when_cleanup_fails(
     )
 
     class UncleanClient(FakeAshClient):
+        def __init__(self, session_id: str, events, approval_callback: Any) -> None:
+            super().__init__(session_id, events, approval_callback)
+            self.close_calls = 0
+
         async def close(self) -> None:
-            self.closed = True
-            raise RuntimeError("runtime cleanup failed")
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("runtime cleanup failed")
+            await super().close()
 
     client: UncleanClient | None = None
 
@@ -987,8 +1391,16 @@ async def test_acp_resume_preserves_primary_error_when_cleanup_fails(
     with pytest.raises(RuntimeError, match="did not resume"):
         await agent.resume_session(stored.session_id, str(workspace))
 
-    assert client is not None and client.closed is True
+    assert client is not None and client.close_calls == 1
+    assert stored.session_id not in agent._sessions
+    assert stored.session_id in agent._retired_sessions
     assert store.load_session(stored.session_id).session_id == stored.session_id
+
+    await agent.close_session(stored.session_id)
+
+    assert client.close_calls == 2
+    assert client.closed is True
+    assert stored.session_id not in agent._retired_sessions
 
 
 @pytest.mark.asyncio
@@ -1307,9 +1719,15 @@ async def test_acp_fork_preserves_child_when_runtime_cleanup_is_unconfirmed(
     )
 
     class UncleanClient(FakeAshClient):
+        def __init__(self, session_id: str, events, approval_callback: Any) -> None:
+            super().__init__(session_id, events, approval_callback)
+            self.close_calls = 0
+
         async def close(self) -> None:
-            self.closed = True
-            raise RuntimeError("runtime cleanup failed")
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("runtime cleanup failed")
+            await super().close()
 
     client: UncleanClient | None = None
 
@@ -1329,12 +1747,20 @@ async def test_acp_fork_preserves_child_when_runtime_cleanup_is_unconfirmed(
     with pytest.raises(RuntimeError, match="did not attach"):
         await agent.fork_session(parent.session_id, str(workspace))
 
-    assert client is not None and client.closed is True
+    assert client is not None and client.close_calls == 1
     children = [
         item for item in store.list_sessions() if item.session_id != parent.session_id
     ]
     assert len(children) == 1
     assert children[0].parent_session_id == parent.session_id
+    assert children[0].session_id not in agent._sessions
+    assert children[0].session_id in agent._retired_sessions
+
+    await agent.close_session(children[0].session_id)
+
+    assert client.close_calls == 2
+    assert client.closed is True
+    assert children[0].session_id not in agent._retired_sessions
 
 
 @pytest.mark.asyncio

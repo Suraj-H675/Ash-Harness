@@ -8,6 +8,8 @@ from pathlib import Path
 import shlex
 
 from ash.safe_io import anchored_regular_file_exists, read_bounded_open_file
+from ash.safety.guard import SafetyGuard
+from ash.safety.scoped_io import ScopedIOError, snapshot_scoped_file
 
 
 MAX_INSTRUCTION_FILE_BYTES = 128 * 1024
@@ -37,12 +39,14 @@ def discover_instructions(
     include_project: bool,
     current_directory: Path | None = None,
     diagnostics: list[InstructionDiagnostic] | None = None,
+    project_guard: SafetyGuard | None = None,
 ) -> list[InstructionFile]:
     return discover_instructions_for_directories(
         workspace,
         include_project=include_project,
         current_directories=((current_directory or Path.cwd()),),
         diagnostics=diagnostics,
+        project_guard=project_guard,
     )
 
 
@@ -52,6 +56,7 @@ def discover_instructions_for_directories(
     include_project: bool,
     current_directories: Sequence[Path],
     diagnostics: list[InstructionDiagnostic] | None = None,
+    project_guard: SafetyGuard | None = None,
 ) -> list[InstructionFile]:
     files: list[InstructionFile] = []
     global_path = Path.home() / ".ash" / "ASH.md"
@@ -62,6 +67,7 @@ def discover_instructions_for_directories(
             root=global_path.parent,
             diagnostics=diagnostics,
             seen=set(),
+            guard=None,
         )
     )
 
@@ -75,6 +81,7 @@ def discover_instructions_for_directories(
             root,
             root=root,
             diagnostics=diagnostics,
+            guard=project_guard,
         )
     )
     files.extend(
@@ -84,6 +91,7 @@ def discover_instructions_for_directories(
             root=root,
             diagnostics=diagnostics,
             seen=set(),
+            guard=project_guard,
         )
     )
     visited_directories = {root}
@@ -104,6 +112,7 @@ def discover_instructions_for_directories(
                     cursor,
                     root=root,
                     diagnostics=diagnostics,
+                    guard=project_guard,
                 )
             )
     lint_instruction_conflicts(files, diagnostics)
@@ -115,6 +124,7 @@ def _read_project_scope(
     *,
     root: Path,
     diagnostics: list[InstructionDiagnostic] | None,
+    guard: SafetyGuard | None,
 ) -> list[InstructionFile]:
     for filename in PROJECT_INSTRUCTION_FILENAMES:
         loaded = _read_with_imports(
@@ -123,6 +133,7 @@ def _read_project_scope(
             root=root,
             diagnostics=diagnostics,
             seen=set(),
+            guard=guard,
         )
         if loaded:
             return loaded
@@ -194,6 +205,7 @@ def _read_with_imports(
     root: Path,
     diagnostics: list[InstructionDiagnostic] | None,
     seen: set[Path],
+    guard: SafetyGuard | None,
     depth: int = 0,
 ) -> list[InstructionFile]:
     resolved = path.expanduser().resolve()
@@ -215,7 +227,7 @@ def _read_with_imports(
         return []
 
     seen.add(resolved)
-    instruction = _read(resolved, scope, root=root)
+    instruction = _read(resolved, scope, root=root, guard=guard)
     if instruction is None:
         if depth > 0:
             _diagnose(diagnostics, path, "instruction import file does not exist")
@@ -237,13 +249,47 @@ def _read_with_imports(
                 root=root,
                 diagnostics=diagnostics,
                 seen=seen,
+                guard=guard,
                 depth=depth + 1,
             )
         )
     return files
 
 
-def _read(path: Path, scope: str, *, root: Path) -> InstructionFile | None:
+def _read(
+    path: Path,
+    scope: str,
+    *,
+    root: Path,
+    guard: SafetyGuard | None,
+) -> InstructionFile | None:
+    if guard is not None:
+        try:
+            _, snapshot = snapshot_scoped_file(
+                path,
+                guard,
+                max_bytes=MAX_INSTRUCTION_FILE_BYTES,
+            )
+        except ScopedIOError as exc:
+            message = str(exc).casefold()
+            if "symlink" in message:
+                raise ValueError(
+                    f"refusing to read symlinked Instruction file: {path}"
+                ) from exc
+            if "exceeds" in message:
+                raise ValueError(
+                    f"Instruction file is too large (>{MAX_INSTRUCTION_FILE_BYTES} bytes): {path}"
+                ) from exc
+            raise ValueError(f"Cannot safely read Instruction file: {path}: {exc}") from exc
+        if not snapshot.exists:
+            return None
+        raw = snapshot.content
+        return InstructionFile(
+            path=path,
+            content=raw.decode("utf-8").strip(),
+            scope=scope,
+        )
+
     if not anchored_regular_file_exists(
         path,
         trusted_root=root,

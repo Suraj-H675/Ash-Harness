@@ -4,16 +4,18 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
-import stat
 import threading
 
 import pytest
 
-import ash.plugins.anchored_fs as anchored_fs
-import ash.commands.extensions as extensions
+import ash.safety.anchored_fs as anchored_fs
+import ash.plugins._lifecycle_support as lifecycle_support
+import ash.plugins.validation as plugin_validation
+import ash.plugins.inventory as plugin_inventory
 import ash.plugins.lifecycle as lifecycle
-from ash.commands.extensions import discover_extensions
-from ash.plugins.anchored_fs import AnchoredDirectory
+import ash.plugins.state as plugin_state
+from ash.plugins.inventory import discover_extensions
+from ash.safety.anchored_fs import AnchoredDirectory
 from ash.plugins.lifecycle import (
     MAX_EXTENSION_STATE_BYTES,
     ExtensionState,
@@ -52,8 +54,7 @@ def _require_anchored_platform() -> None:
 def test_install_local_plugin_copies_validated_tree(tmp_path) -> None:
     source = _plugin(tmp_path / "source")
     destination_root = tmp_path / "installed"
-    if os.name != "nt":
-        source.chmod(0o755)
+    source.chmod(0o755)
 
     installed = install_local_plugin(source, destination_root=destination_root)
 
@@ -61,8 +62,7 @@ def test_install_local_plugin_copies_validated_tree(tmp_path) -> None:
     assert installed.version == "1.0.0"
     assert installed.root == destination_root / "example"
     assert (installed.root / "README.md").read_text() == "plugin contents"
-    if os.name != "nt":
-        assert source.stat().st_mode & 0o777 == 0o755
+    assert source.stat().st_mode & 0o777 == 0o755
 
 
 def test_install_local_plugin_requires_replace_and_updates_atomically(tmp_path) -> None:
@@ -81,6 +81,66 @@ def test_install_local_plugin_requires_replace_and_updates_atomically(tmp_path) 
     )
     assert installed.version == "2.0.0"
     payload = json.loads((installed.root / "plugin.json").read_text())
+    assert payload["version"] == "2.0.0"
+
+
+def test_replacement_rejects_new_reverse_dependency_breakage(tmp_path: Path) -> None:
+    destination_root = tmp_path / "installed"
+    base_v1 = _plugin(tmp_path / "base-v1", name="base", version="1.0.0")
+    dependent = _plugin(tmp_path / "dependent", name="dependent", version="1.0.0")
+    dependent_manifest = json.loads((dependent / "plugin.json").read_text())
+    dependent_manifest["dependencies"] = [{"name": "base", "version": "<2"}]
+    (dependent / "plugin.json").write_text(
+        json.dumps(dependent_manifest), encoding="utf-8"
+    )
+    install_local_plugin(base_v1, destination_root=destination_root)
+    install_local_plugin(dependent, destination_root=destination_root)
+    base_v2 = _plugin(tmp_path / "base-v2", name="base", version="2.0.0")
+
+    with pytest.raises(
+        PluginLifecycleError,
+        match=r"dependent requires base <2; candidate 2\.0\.0 would break it",
+    ):
+        install_local_plugin(
+            base_v2,
+            destination_root=destination_root,
+            replace=True,
+        )
+
+    installed = json.loads(
+        (destination_root / "base" / "plugin.json").read_text(encoding="utf-8")
+    )
+    assert installed["version"] == "1.0.0"
+
+
+def test_replacement_can_repair_preexisting_reverse_dependency_breakage(
+    tmp_path: Path,
+) -> None:
+    destination_root = tmp_path / "installed"
+    base_v1 = _plugin(tmp_path / "base-v1", name="base", version="1.0.0")
+    dependent = _plugin(tmp_path / "dependent", name="dependent", version="1.0.0")
+    dependent_manifest = json.loads((dependent / "plugin.json").read_text())
+    dependent_manifest["dependencies"] = [{"name": "base", "version": "<2"}]
+    (dependent / "plugin.json").write_text(
+        json.dumps(dependent_manifest), encoding="utf-8"
+    )
+    install_local_plugin(base_v1, destination_root=destination_root)
+    install_local_plugin(dependent, destination_root=destination_root)
+
+    installed_dependent = destination_root / "dependent" / "plugin.json"
+    broken_manifest = json.loads(installed_dependent.read_text(encoding="utf-8"))
+    broken_manifest["dependencies"] = [{"name": "base", "version": ">=2"}]
+    installed_dependent.write_text(json.dumps(broken_manifest), encoding="utf-8")
+
+    base_v2 = _plugin(tmp_path / "base-v2", name="base", version="2.0.0")
+    installed = install_local_plugin(
+        base_v2,
+        destination_root=destination_root,
+        replace=True,
+    )
+
+    assert installed.version == "2.0.0"
+    payload = json.loads((installed.root / "plugin.json").read_text(encoding="utf-8"))
     assert payload["version"] == "2.0.0"
 
 
@@ -170,9 +230,8 @@ def test_enable_disable_state_is_atomic_and_private(tmp_path) -> None:
     assert load_extension_state(state_path) == disabled
     enabled = set_plugin_enabled("example", enabled=True, path=state_path)
     assert enabled.disabled_plugins == frozenset()
-    if os.name != "nt":
-        assert state_path.parent.stat().st_mode & 0o777 == 0o700
-        assert state_path.stat().st_mode & 0o777 == 0o600
+    assert state_path.parent.stat().st_mode & 0o777 == 0o700
+    assert state_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_loading_extension_state_does_not_change_directory_mode(tmp_path) -> None:
@@ -212,6 +271,57 @@ def test_uninstall_requires_confirmation_and_clears_disabled_state(tmp_path) -> 
     )
     assert not removed.exists()
     assert load_extension_state(state_path).disabled_plugins == frozenset()
+
+
+def test_custom_root_uninstall_does_not_mutate_default_activation_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    set_plugin_enabled("example", enabled=False)
+    destination_root = tmp_path / "installed"
+    install_local_plugin(
+        _plugin(tmp_path / "source"),
+        destination_root=destination_root,
+    )
+
+    uninstall_local_plugin(
+        "example",
+        destination_root=destination_root,
+        confirmed=True,
+    )
+
+    assert load_extension_state().disabled_plugins == frozenset({"example"})
+
+
+def test_uninstall_rolls_back_plugin_when_state_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination_root = tmp_path / "installed"
+    state_path = tmp_path / "extensions.json"
+    installed = install_local_plugin(
+        _plugin(tmp_path / "source"), destination_root=destination_root
+    )
+    set_plugin_enabled("example", enabled=False, path=state_path)
+
+    def fail_state_write(*args, **kwargs):
+        del args, kwargs
+        raise OSError("injected state cleanup failure")
+
+    monkeypatch.setattr(plugin_state, "_save_extension_state_at", fail_state_write)
+
+    with pytest.raises(PluginLifecycleError, match="state cleanup failure"):
+        uninstall_local_plugin(
+            "example",
+            destination_root=destination_root,
+            confirmed=True,
+            state_path=state_path,
+        )
+
+    assert installed.root.is_dir()
+    assert load_extension_state(state_path).disabled_plugins == frozenset({"example"})
 
 
 def test_invalid_extension_state_is_rejected(tmp_path) -> None:
@@ -263,6 +373,65 @@ def test_install_requires_local_plugin_dependencies_first(tmp_path) -> None:
     )
     installed = install_local_plugin(dependent, destination_root=destination_root)
     assert installed.name == "dependent"
+
+
+def test_enabled_install_rejects_disabled_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    base = _plugin(tmp_path / "base", name="base")
+    dependent = _plugin(tmp_path / "dependent", name="dependent")
+    payload = json.loads((dependent / "plugin.json").read_text(encoding="utf-8"))
+    payload["dependencies"] = [{"name": "base", "version": ">=1.0"}]
+    (dependent / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+    install_local_plugin(base, enabled=False)
+
+    with pytest.raises(PluginLifecycleError, match="Missing dependency: base"):
+        install_local_plugin(dependent, enabled=True)
+
+    assert not (lifecycle.user_plugin_root() / "dependent").exists()
+    assert load_extension_state().disabled_plugins == frozenset({"base"})
+
+
+def test_install_does_not_accept_dependency_from_mismatched_directory(tmp_path) -> None:
+    destination_root = tmp_path / "installed"
+    _plugin(destination_root / "impostor", name="base")
+    dependent = _plugin(tmp_path / "dependent", name="dependent")
+    manifest = json.loads((dependent / "plugin.json").read_text(encoding="utf-8"))
+    manifest["dependencies"] = [{"name": "base", "version": ">=1"}]
+    (dependent / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PluginLifecycleError, match="Missing dependency: base"):
+        install_local_plugin(dependent, destination_root=destination_root)
+
+    assert not (destination_root / "dependent").exists()
+
+
+def test_named_anchored_locks_are_independent(tmp_path: Path) -> None:
+    _require_anchored_platform()
+    root = tmp_path / "locks"
+    root.mkdir()
+    acquired_second = threading.Event()
+
+    with (
+        AnchoredDirectory.open(root, create=False) as first_directory,
+        AnchoredDirectory.open(root, create=False) as second_directory,
+    ):
+        def acquire_second() -> None:
+            with second_directory.lock(".second.lock"):
+                acquired_second.set()
+
+        with first_directory.lock(".first.lock"):
+            worker = threading.Thread(target=acquire_second)
+            worker.start()
+            independent = acquired_second.wait(0.25)
+        worker.join(5)
+
+    assert independent is True
+    assert not worker.is_alive()
 
 
 def test_concurrent_no_replace_installs_are_serialized(
@@ -394,6 +563,23 @@ def test_concurrent_state_updates_preserve_both_changes(
     )
 
 
+def test_extension_state_restore_preserves_unrelated_concurrent_change(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "state" / "extensions.json"
+    set_plugin_enabled("example", enabled=False, path=state_path)
+    previous = load_extension_state(state_path)
+    set_plugin_enabled("example", enabled=True, path=state_path)
+    expected = load_extension_state(state_path)
+    set_plugin_enabled("other", enabled=False, path=state_path)
+
+    plugin_state.restore_extension_state(expected, previous, path=state_path)
+
+    assert load_extension_state(state_path).disabled_plugins == frozenset(
+        {"example", "other"}
+    )
+
+
 def test_install_ancestor_swap_cannot_redirect_staged_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -427,7 +613,7 @@ def test_install_ancestor_swap_cannot_redirect_staged_tree(
 
     def validate_staged(snapshot: object, manifest: object) -> None:
         observed.append(snapshot)
-        extensions._validate_plugin_contents_at(snapshot, manifest)
+        plugin_validation.validate_plugin_contents_at(snapshot, manifest)
 
     with pytest.raises(PluginLifecycleError, match="displaced"):
         install_local_plugin(
@@ -628,7 +814,9 @@ def test_extension_state_cleans_temporary_file_after_failed_rename(
     with pytest.raises(PluginLifecycleError, match="injected rename failure"):
         set_plugin_enabled("example", enabled=False, path=state_path)
 
-    assert list(state_path.parent.iterdir()) == []
+    assert {path.name for path in state_path.parent.iterdir()} == {
+        f".{state_path.name}.lock"
+    }
 
 
 def test_replace_failure_preserves_previous_plugin_when_destination_changes(
@@ -800,7 +988,7 @@ def test_failed_install_does_not_delete_substituted_staging_directory(
     ] == "2.0.0"
 
 
-def test_uninstall_failure_preserves_plugin_when_destination_changes(
+def test_committed_uninstall_cleanup_race_fails_closed_without_overwrite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _require_anchored_platform()
@@ -841,17 +1029,23 @@ def test_uninstall_failure_preserves_plugin_when_destination_changes(
         )
 
     assert injected
-    assert (destination_root / "example" / "plugin.json").is_file()
-    assert (
-        json.loads((destination_root / "example" / "plugin.json").read_text())[
-            "version"
-        ]
-        == "1.0.0"
-    )
+    live = destination_root / "example"
+    assert live.is_symlink()
+    assert json.loads((live / "plugin.json").read_text())["version"] == "outside"
     assert json.loads((outside / "plugin.json").read_text())["version"] == "outside"
-    conflicts = list(destination_root.glob(".example.uninstall-conflict-*"))
-    assert len(conflicts) == 1
-    assert conflicts[0].is_symlink()
+    quarantines = list(destination_root.glob(".example.uninstall-*"))
+    assert len(quarantines) == 1
+    assert json.loads((quarantines[0] / "plugin.json").read_text())["version"] == "1.0.0"
+    assert (destination_root / ".ash-lifecycle-journal.json").is_file()
+
+    with pytest.raises(PluginLifecycleError, match="live destination"):
+        lifecycle.recover_plugin_lifecycle(destination_root)
+
+    live.unlink()
+    assert lifecycle.recover_plugin_lifecycle(destination_root) is True
+    assert not live.exists()
+    assert not list(destination_root.glob(".example.uninstall-*"))
+    assert not (destination_root / ".ash-lifecycle-journal.json").exists()
 
 
 def test_plugin_mutations_fail_closed_without_anchored_capability(
@@ -869,7 +1063,8 @@ def test_plugin_mutations_fail_closed_without_anchored_capability(
     original_state = state_path.read_bytes()
 
     monkeypatch.setattr(anchored_fs, "supports_anchored_mutation", lambda: False)
-    monkeypatch.setattr(lifecycle, "supports_anchored_mutation", lambda: False)
+    monkeypatch.setattr(lifecycle_support, "supports_anchored_mutation", lambda: False)
+    monkeypatch.setattr(plugin_state, "supports_anchored_mutation", lambda: False)
 
     with pytest.raises(PluginLifecycleError, match="unavailable"):
         install_local_plugin(source, destination_root=tmp_path / "new-installed")
@@ -887,186 +1082,18 @@ def test_plugin_mutations_fail_closed_without_anchored_capability(
     assert state_path.read_bytes() == original_state
 
 
-def test_windows_sync_handle_reopens_same_identity_with_write_access(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = tmp_path / "root"
-    root.mkdir()
-    metadata = os.stat(root)
-    held_descriptor = 101
-    sync_descriptor = 202
-    opened: list[tuple[Path, bool, bool, bool]] = []
-
-    def open_for_sync(
-        path: Path,
-        *,
-        directory: bool,
-        readable: bool = True,
-        writable: bool = False,
-        create_new: bool = False,
-    ) -> int:
-        opened.append((path, directory, readable, writable))
-        assert create_new is False
-        return sync_descriptor
-
-    monkeypatch.setattr(anchored_fs, "_windows_open_entry", open_for_sync)
-    monkeypatch.setattr(
-        anchored_fs, "_windows_require_supported_filesystem", lambda path, fd: None
-    )
-    monkeypatch.setattr(anchored_fs.os, "fstat", lambda fd: metadata)
-
-    descriptor = anchored_fs._windows_open_sync_directory(root, held_descriptor)
-
-    assert descriptor == sync_descriptor
-    assert opened == [(root, True, False, True)]
 
 
-def test_windows_sync_handle_rejects_reopened_identity_change(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = tmp_path / "root"
-    other = tmp_path / "other"
-    root.mkdir()
-    other.mkdir()
-    held_metadata = os.stat(root)
-    replacement_metadata = os.stat(other)
-    held_descriptor = 101
-    replacement_descriptor = 202
-    closed: list[int] = []
-
-    monkeypatch.setattr(
-        anchored_fs,
-        "_windows_open_entry",
-        lambda *args, **kwargs: replacement_descriptor,
-    )
-    monkeypatch.setattr(
-        anchored_fs, "_windows_require_supported_filesystem", lambda path, fd: None
-    )
-    monkeypatch.setattr(
-        anchored_fs.os,
-        "fstat",
-        lambda fd: held_metadata if fd == held_descriptor else replacement_metadata,
-    )
-    monkeypatch.setattr(anchored_fs.os, "close", closed.append)
-
-    with pytest.raises(anchored_fs.AnchoredFilesystemError, match="changed"):
-        anchored_fs._windows_open_sync_directory(root, held_descriptor)
-
-    assert closed == [replacement_descriptor]
 
 
-def test_windows_durable_mutation_rejects_non_ntfs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        anchored_fs, "_windows_filesystem_name", lambda descriptor: "ReFS"
-    )
-
-    with pytest.raises(
-        anchored_fs.AnchoredFilesystemUnavailable,
-        match="requires local NTFS",
-    ):
-        anchored_fs._windows_require_supported_filesystem(Path("C:/root"), 101)
 
 
-def test_windows_durable_mutation_rejects_remote_ntfs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        anchored_fs, "_windows_filesystem_name", lambda descriptor: "NTFS"
-    )
-    monkeypatch.setattr(anchored_fs, "_windows_drive_type", lambda path: 4)
-
-    with pytest.raises(
-        anchored_fs.AnchoredFilesystemUnavailable,
-        match="requires local NTFS",
-    ):
-        anchored_fs._windows_require_supported_filesystem(Path("Z:/root"), 101)
 
 
-def test_windows_unsupported_filesystem_fails_before_directory_creation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    closed: list[int] = []
-    created: list[Path] = []
-    monkeypatch.setattr(
-        anchored_fs, "_windows_open_entry", lambda *args, **kwargs: 101
-    )
-    monkeypatch.setattr(
-        anchored_fs,
-        "_windows_require_supported_filesystem",
-        lambda path, descriptor: (_ for _ in ()).throw(
-            anchored_fs.AnchoredFilesystemUnavailable("requires local NTFS")
-        ),
-    )
-    monkeypatch.setattr(anchored_fs.os, "close", closed.append)
-    monkeypatch.setattr(anchored_fs.os, "mkdir", lambda path: created.append(Path(path)))
-
-    with pytest.raises(
-        anchored_fs.AnchoredFilesystemUnavailable,
-        match="requires local NTFS",
-    ):
-        anchored_fs._windows_open_directory_path(
-            tmp_path / "missing" / "plugin-root",
-            create=True,
-        )
-
-    assert created == []
-    assert closed == [101]
 
 
-def test_windows_directory_path_pin_disables_delete_sharing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = tmp_path / "state" / "db"
-    root.mkdir(parents=True)
-    metadata = os.stat(root)
-    opened: list[bool] = []
-    descriptors = iter(range(101, 200))
-
-    def fake_open_entry(
-        path: Path,
-        *,
-        directory: bool,
-        readable: bool = True,
-        writable: bool = False,
-        create_new: bool = False,
-        share_delete: bool = True,
-    ) -> int:
-        del path, readable, writable, create_new
-        assert directory is True
-        opened.append(share_delete)
-        return next(descriptors)
-
-    monkeypatch.setattr(anchored_fs, "_windows_open_entry", fake_open_entry)
-    monkeypatch.setattr(
-        anchored_fs, "_windows_require_supported_filesystem", lambda path, fd: None
-    )
-    monkeypatch.setattr(anchored_fs.os, "fstat", lambda fd: metadata)
-    monkeypatch.setattr(anchored_fs.os, "close", lambda fd: None)
-
-    _, pinned_descriptor = anchored_fs._windows_open_directory_path(
-        root,
-        create=False,
-        pin_path=True,
-    )
-    pinned_count = len(opened)
-    assert pinned_count > 0
-    assert opened == [False] * pinned_count
-
-    _, default_descriptor = anchored_fs._windows_open_directory_path(
-        root,
-        create=False,
-    )
-    assert opened[pinned_count:] == [True] * pinned_count
-    assert pinned_descriptor != default_descriptor
 
 
-@pytest.mark.skipif(os.name != "nt", reason="native Windows directory durability")
-def test_windows_ntfs_directory_durability_barrier(tmp_path: Path) -> None:
-    with AnchoredDirectory.open(tmp_path, create=False, private=False) as directory:
-        directory.prepare_durable_mutation()
-        directory.sync()
 
 
 def test_install_preflights_durability_before_publishing(
@@ -1215,7 +1242,7 @@ def test_semantic_validation_and_publication_use_snapshot_bytes(
         encoding="utf-8",
     )
 
-    original_validator = extensions._validate_plugin_contents_at
+    original_validator = plugin_validation.validate_plugin_contents_at
 
     def validate_then_mutate_source(snapshot, manifest) -> None:
         original_validator(snapshot, manifest)
@@ -1252,7 +1279,7 @@ def test_publication_ignores_mutated_legacy_stage_after_validation(
     )
 
     def validate_then_mutate_stage(stage: Path, manifest: object) -> None:
-        extensions._validate_plugin_contents(stage, manifest)
+        plugin_validation.validate_plugin_contents(stage, manifest)
         (stage / "commands" / "review.md").write_bytes(
             b"unvalidated replacement\n"
         )
@@ -1321,7 +1348,7 @@ def test_snapshot_validator_covers_all_plugin_component_bytes(tmp_path: Path) ->
     installed = install_local_plugin(
         source,
         destination_root=tmp_path / "installed",
-        _validator_at=extensions._validate_plugin_contents_at,
+        _validator_at=plugin_validation.validate_plugin_contents_at,
     )
 
     assert (installed.root / "skills" / "review" / "SKILL.md").is_file()
@@ -1343,7 +1370,7 @@ def test_snapshot_validator_accepts_a_root_level_skill(tmp_path: Path) -> None:
     installed = install_local_plugin(
         source,
         destination_root=tmp_path / "installed",
-        _validator_at=extensions._validate_plugin_contents_at,
+        _validator_at=plugin_validation.validate_plugin_contents_at,
     )
 
     assert (installed.root / "SKILL.md").is_file()
@@ -1481,7 +1508,7 @@ def test_changed_destination_content_cannot_be_published_after_snapshot_copy(
         install_local_plugin(
             source,
             destination_root=tmp_path / "installed",
-            _validator_at=extensions._validate_plugin_contents_at,
+            _validator_at=plugin_validation.validate_plugin_contents_at,
         )
 
     assert swapped
@@ -1530,70 +1557,10 @@ def test_recursive_cleanup_leaves_replaced_regular_file_untouched(
     assert victim.read_text(encoding="utf-8") == "attacker"
 
 
-def test_windows_readonly_unlink_retry_requires_same_readonly_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    victim = tmp_path / "readonly-object"
-    victim.write_bytes(b"git-object")
-    victim.chmod(0o444)
-    expected = victim.stat()
-    real_unlink = os.unlink
-    calls = 0
-
-    def unlink_after_retry(path: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> None:
-        nonlocal calls
-        calls += 1
-        real_unlink(path)
-
-    monkeypatch.setattr(anchored_fs.os, "unlink", unlink_after_retry)
-    anchored_fs._windows_retry_readonly_unlink(
-        victim,
-        expected,
-        PermissionError(13, "read-only file", str(victim)),
-    )
-
-    assert calls == 1
-    assert not victim.exists()
 
 
-def test_windows_readonly_unlink_retry_rejects_replaced_file(tmp_path: Path) -> None:
-    victim = tmp_path / "readonly-object"
-    victim.write_bytes(b"original")
-    victim.chmod(0o444)
-    expected = victim.stat()
-    displaced = tmp_path / "displaced-object"
-    victim.rename(displaced)
-    victim.write_bytes(b"replacement")
-    victim.chmod(0o444)
-
-    with pytest.raises(anchored_fs.AnchoredFilesystemError, match="changed"):
-        anchored_fs._windows_retry_readonly_unlink(
-            victim,
-            expected,
-            PermissionError(13, "read-only file", str(victim)),
-        )
-
-    assert victim.read_bytes() == b"replacement"
-    assert displaced.read_bytes() == b"original"
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows read-only deletion semantics")
-def test_windows_recursive_cleanup_removes_readonly_regular_file(tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    target = root / "tree"
-    target.mkdir(parents=True)
-    victim = target / "git-object"
-    victim.write_bytes(b"git-object")
-    os.chmod(victim, stat.S_IREAD)
-
-    with AnchoredDirectory.open(root, create=False, private=False) as directory:
-        with directory.child("tree") as held_tree:
-            directory.remove_tree(
-                "tree",
-                expected_descriptor=held_tree.descriptor,
-            )
-
-    assert not target.exists()
 
 
 def test_extension_state_cleanup_identity_check_preserves_replacement(
@@ -1679,7 +1646,7 @@ def test_extension_state_load_uses_portable_safe_reader_when_anchoring_is_unavai
     )
     original = state_path.read_bytes()
     monkeypatch.setattr(anchored_fs, "supports_anchored_mutation", lambda: False)
-    monkeypatch.setattr(lifecycle, "supports_anchored_mutation", lambda: False)
+    monkeypatch.setattr(plugin_state, "supports_anchored_mutation", lambda: False)
 
     assert load_extension_state(state_path).disabled_plugins == frozenset({"safe"})
     assert state_path.read_bytes() == original
@@ -1696,7 +1663,7 @@ def test_extension_inventory_does_not_activate_plugins_without_state(
     _plugin(plugin_root / "example")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(
-        extensions,
+        plugin_inventory,
         "load_extension_state",
         lambda: (_ for _ in ()).throw(
             PluginLifecycleError("secure extension state unavailable")

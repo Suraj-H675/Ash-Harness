@@ -13,6 +13,7 @@ from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
 from ash.providers.readiness import (
     normalize_provider_base_url,
+    redact_provider_error,
     require_secure_provider_transport,
 )
 
@@ -51,6 +52,15 @@ async def _strip_authorization_header(request: httpx.Request) -> None:
     """Keep explicit anonymous OpenAI-compatible calls free of bearer auth."""
 
     request.headers.pop("Authorization", None)
+
+
+def _owned_openai_http_client(*, anonymous: bool = False) -> Any:
+    """Build an Ash-owned SDK transport that never follows redirects."""
+
+    options: dict[str, Any] = {"follow_redirects": False}
+    if anonymous:
+        options["event_hooks"] = {"request": [_strip_authorization_header]}
+    return openai.DefaultAsyncHttpxClient(**options)
 
 
 def prepare_openai_messages(
@@ -130,6 +140,14 @@ class OpenAIProvider(ProviderABC):
         self._model_name = model_name
         self._api_key = api_key
         self._base_url = base_url
+        self._error_secrets = tuple(
+            value
+            for value in (
+                api_key or "",
+                *(str(value) for value in (default_headers or {}).values()),
+            )
+            if value
+        )
         self._token_counter = token_counter or OpenAITokenCounter(model_name)
         client_options: dict[str, Any] = {
             # A non-empty placeholder prevents the SDK from inheriting
@@ -140,13 +158,9 @@ class OpenAIProvider(ProviderABC):
         }
         if default_headers:
             client_options["default_headers"] = dict(default_headers)
-        if allow_anonymous and client is None:
-            client_options["http_client"] = httpx.AsyncClient(
-                event_hooks={"request": [_strip_authorization_header]}
-            )
-        self._client = client or openai.AsyncOpenAI(
-            **client_options,
-        )
+        self._client_options = client_options
+        self._allow_anonymous = allow_anonymous
+        self._client = client
         self._owns_client = client is None
         self._prompt_cache_enabled = False
         self._prompt_cache_key = ""
@@ -158,6 +172,16 @@ class OpenAIProvider(ProviderABC):
 
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
+
+    def _resolve_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        options = dict(self._client_options)
+        options["http_client"] = _owned_openai_http_client(
+            anonymous=self._allow_anonymous
+        )
+        self._client = openai.AsyncOpenAI(**options)
+        return self._client
 
     def configure_max_tokens(self, max_tokens: int) -> None:
         if max_tokens < 1:
@@ -202,9 +226,11 @@ class OpenAIProvider(ProviderABC):
         if hasattr(self, "_max_tokens"):
             kwargs["max_tokens"] = self._max_tokens
         try:
-            stream = await self._client.chat.completions.create(**kwargs)
+            client = self._resolve_client()
+            stream = await client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"OpenAI API error: {exc}") from exc
+            detail = redact_provider_error(str(exc), *self._error_secrets)
+            raise RuntimeError(f"OpenAI API error: {detail}") from exc
 
         # Buffer for accumulating streaming tool calls.
         partials: dict[int, _PartialToolCall] = {}
@@ -304,5 +330,8 @@ class OpenAIProvider(ProviderABC):
             completed.clear()
 
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.close()
+        client = self._client
+        if self._owns_client and client is not None:
+            await client.close()
+            if self._client is client:
+                self._client = None

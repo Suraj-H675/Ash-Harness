@@ -13,7 +13,7 @@ import secrets
 import threading
 import time
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +39,63 @@ NEXT_AUTH_SCHEME = re.compile(
     r"(?=[!#$%&'*+\-.^_`|~0-9A-Za-z]+=)"
 )
 SCOPE = re.compile(r"[\x21\x23-\x5B\x5D-\x7E]+(?: [\x21\x23-\x5B\x5D-\x7E]+)*")
+
+
+async def _settle_oauth_cleanup(
+    cleanup: Callable[[], Coroutine[Any, Any, None]],
+    *,
+    name: str,
+) -> tuple[BaseException | None, bool]:
+    task: asyncio.Task[None] = asyncio.create_task(cleanup(), name=name)
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                continue
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, interrupted
+    return None, interrupted
+
+
+def _finish_oauth_cleanup(
+    *,
+    primary_error: BaseException | None,
+    failures: list[tuple[str, BaseException]],
+    interrupted: bool,
+) -> None:
+    if primary_error is not None:
+        for label, _error in failures:
+            primary_error.add_note(f"{label} failed")
+        if interrupted:
+            primary_error.add_note("OAuth cleanup was interrupted by cancellation")
+        if interrupted and not isinstance(primary_error, asyncio.CancelledError):
+            cancellation = asyncio.CancelledError()
+            cancellation.add_note("OAuth operation failed before cleanup was cancelled")
+            for label, _error in failures:
+                cancellation.add_note(f"{label} also failed")
+            raise cancellation from primary_error
+        return
+    if interrupted:
+        cancellation = asyncio.CancelledError()
+        for label, _error in failures:
+            cancellation.add_note(f"{label} failed")
+        raise cancellation from (failures[0][1] if failures else None)
+    if failures:
+        primary_label, primary_failure = failures[0]
+        for label, _error in failures[1:]:
+            primary_failure.add_note(f"{label} also failed")
+        primary_failure.add_note(primary_label)
+        raise primary_failure
 
 
 class MCPOAuthError(RuntimeError):
@@ -325,21 +382,39 @@ class MCPOAuthSession:
         }
         if bundle.client.client_secret:
             data["client_secret"] = bundle.client.client_secret
+        primary_error: BaseException | None = None
         try:
-            payload = await _request_json(
-                client,
-                "POST",
-                bundle.discovery.token_endpoint,
-                "OAuth token refresh",
-                data=data,
-            )
-        except (httpx.HTTPError, MCPOAuthError) as exc:
-            raise MCPAuthorizationRequired(
-                self._login_guidance("token refresh failed")
-            ) from exc
+            try:
+                payload = await _request_json(
+                    client,
+                    "POST",
+                    bundle.discovery.token_endpoint,
+                    "OAuth token refresh",
+                    data=data,
+                )
+            except (httpx.HTTPError, MCPOAuthError) as exc:
+                raise MCPAuthorizationRequired(
+                    self._login_guidance("token refresh failed")
+                ) from exc
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
             if owns_client:
-                await client.aclose()
+                cleanup_error, interrupted = await _settle_oauth_cleanup(
+                    client.aclose,
+                    name="ash-mcp-oauth-refresh-client-close",
+                )
+                failures = (
+                    [("OAuth HTTP client cleanup", cleanup_error)]
+                    if cleanup_error is not None
+                    else []
+                )
+                _finish_oauth_cleanup(
+                    primary_error=primary_error,
+                    failures=failures,
+                    interrupted=interrupted,
+                )
         try:
             tokens = _tokens_from_payload(
                 payload,
@@ -389,6 +464,7 @@ async def authorize_mcp_server(
     )
     state = secrets.token_urlsafe(32)
     callback_server: asyncio.AbstractServer | None = None
+    primary_error: BaseException | None = None
     try:
         port = int(config.get("redirect_port", 0) or 0)
         if not 0 <= port <= 65535:
@@ -556,13 +632,42 @@ async def authorize_mcp_server(
         token_store.save(bundle)
         return bundle
     except asyncio.TimeoutError as exc:
-        raise MCPOAuthError("OAuth authorization timed out") from exc
+        primary_error = MCPOAuthError("OAuth authorization timed out")
+        raise primary_error from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
+        failures: list[tuple[str, BaseException]] = []
+        interrupted = False
         if callback_server is not None:
-            callback_server.close()
-            await callback_server.wait_closed()
+            try:
+                callback_server.close()
+            except BaseException as exc:
+                failures.append(("OAuth callback listener cleanup", exc))
+            else:
+                cleanup_error, cleanup_interrupted = await _settle_oauth_cleanup(
+                    callback_server.wait_closed,
+                    name="ash-mcp-oauth-callback-listener-close",
+                )
+                interrupted = interrupted or cleanup_interrupted
+                if cleanup_error is not None:
+                    failures.append(
+                        ("OAuth callback listener cleanup", cleanup_error)
+                    )
         if owns_client:
-            await client.aclose()
+            cleanup_error, cleanup_interrupted = await _settle_oauth_cleanup(
+                client.aclose,
+                name="ash-mcp-oauth-login-client-close",
+            )
+            interrupted = interrupted or cleanup_interrupted
+            if cleanup_error is not None:
+                failures.append(("OAuth HTTP client cleanup", cleanup_error))
+        _finish_oauth_cleanup(
+            primary_error=primary_error,
+            failures=failures,
+            interrupted=interrupted,
+        )
 
 
 async def discover_oauth(
@@ -869,6 +974,7 @@ def _validate_oauth_url(value: str, *, allow_loopback_http: bool = False) -> str
 async def _bounded_json_response(
     response: httpx.Response, label: str
 ) -> dict[str, Any]:
+    primary_error: BaseException | None = None
     try:
         if response.status_code >= 400:
             raise MCPOAuthError(f"{label} returned HTTP {response.status_code}")
@@ -901,8 +1007,24 @@ async def _bounded_json_response(
         if not isinstance(payload, dict):
             raise MCPOAuthError(f"{label} returned a non-object response")
         return payload
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        await response.aclose()
+        cleanup_error, interrupted = await _settle_oauth_cleanup(
+            response.aclose,
+            name="ash-mcp-oauth-response-close",
+        )
+        failures = (
+            [("OAuth response cleanup", cleanup_error)]
+            if cleanup_error is not None
+            else []
+        )
+        _finish_oauth_cleanup(
+            primary_error=primary_error,
+            failures=failures,
+            interrupted=interrupted,
+        )
 
 
 async def _request_json(
@@ -1225,11 +1347,32 @@ async def _handle_callback(
         ).encode("ascii")
         + payload
     )
+    primary_error: BaseException | None = None
     try:
         await writer.drain()
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        writer.close()
-        await writer.wait_closed()
+        failures: list[tuple[str, BaseException]] = []
+        interrupted = False
+        try:
+            writer.close()
+        except BaseException as exc:
+            failures.append(("OAuth callback writer cleanup", exc))
+        else:
+            cleanup_error, cleanup_interrupted = await _settle_oauth_cleanup(
+                writer.wait_closed,
+                name="ash-mcp-oauth-callback-writer-close",
+            )
+            interrupted = cleanup_interrupted
+            if cleanup_error is not None:
+                failures.append(("OAuth callback writer cleanup", cleanup_error))
+        _finish_oauth_cleanup(
+            primary_error=primary_error,
+            failures=failures,
+            interrupted=interrupted,
+        )
 
 
 def bearer_challenge_parameters(header: str) -> dict[str, str]:

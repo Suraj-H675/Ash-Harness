@@ -115,7 +115,7 @@ def test_config_loads_all_fields_from_ash_toml(
         AshConfig.model_config["toml_file"] = original_toml_file
 
     assert config.provider == "openai"
-    assert config.config_schema_version == 1
+    assert config.config_schema_version == 2
     assert config.model == "openai/gpt-4o"
     assert config.temperature == 0.7
     assert config.max_context_tokens == 64000
@@ -201,6 +201,50 @@ def test_future_config_schema_version_is_refused(tmp_path: Path) -> None:
         AshConfig.model_config["toml_file"] = original_toml_file
 
 
+def test_schema_v1_memory_settings_migrate_to_v2_with_diagnostics() -> None:
+    from ash.commands import config as cli_config
+
+    cli_config.ASH_DIR.mkdir(parents=True, exist_ok=True)
+    for backend in ("auto", "chroma", "fts5"):
+        cli_config.CONFIG_FILE.write_text(
+            "\n".join(
+                [
+                    "config_schema_version = 1",
+                    f'memory_backend = "{backend}"',
+                    'embedding_provider = "auto"',
+                    'chroma_persist_dir = ".ash/legacy-chroma"',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        config = AshConfig.load()
+
+        assert config.config_schema_version == 2
+        assert config.memory_backend == "sqlite"
+        assert config.embedding_provider == "none"
+        assert config.config_source("memory_backend") == (
+            "user",
+            str(cli_config.CONFIG_FILE),
+        )
+        assert config.config_source("config_schema_version") == (
+            "derived",
+            "schema v1 compatibility migration",
+        )
+        diagnostics = "\n".join(config.config_diagnostics)
+        assert f"memory_backend='{backend}'" in diagnostics
+        assert "embedding_provider='auto'" in diagnostics
+        assert "/memory index-workspace" in diagnostics
+
+    cli_config.CONFIG_FILE.write_text(
+        'config_schema_version = 2\nmemory_backend = "fts5"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="memory_backend must be sqlite or off"):
+        AshConfig.load()
+
+
 def test_attachment_budget_defaults_to_quarter_of_usable_context() -> None:
     small = AshConfig(
         model="ollama/test",
@@ -257,6 +301,7 @@ def test_config_rejects_negative_model_pricing() -> None:
         "steering_queue_limit",
         "tool_search_threshold",
         "provider_max_attempts",
+        "provider_request_timeout_seconds",
         "provider_retry_base_delay",
         "max_concurrent_agents",
         "agent_token_budget",
@@ -454,12 +499,14 @@ def test_prompt_cache_preferences_are_validated() -> None:
 def test_provider_retry_preferences_are_validated() -> None:
     config = AshConfig(
         provider_max_attempts=5,
+        provider_request_timeout_seconds=900,
         provider_retry_base_delay=0.25,
         provider_retry_max_delay=12.0,
         provider_circuit_failure_threshold=4,
         provider_circuit_cooldown_seconds=45,
     )
     assert config.provider_max_attempts == 5
+    assert config.provider_request_timeout_seconds == 900
     assert config.provider_retry_base_delay == 0.25
     assert config.provider_retry_max_delay == 12.0
     assert config.provider_circuit_failure_threshold == 4
@@ -481,17 +528,22 @@ def test_allowed_web_domains_are_normalized_and_validated() -> None:
 
 
 def test_plugin_marketplaces_are_user_owned_and_validated() -> None:
+    fingerprint = "sha256:" + ("a" * 64)
     config = AshConfig(
         plugin_marketplaces={
             "alpha": " https://catalog.example/alpha.json ",
             "local": "./catalog.json",
-        }
+        },
+        plugin_marketplace_key_ids={"alpha": "catalog-key"},
+        plugin_marketplace_key_fingerprints={"alpha": fingerprint},
     )
 
     assert config.plugin_marketplaces == {
         "alpha": "https://catalog.example/alpha.json",
         "local": "./catalog.json",
     }
+    assert config.plugin_marketplace_key_ids == {"alpha": "catalog-key"}
+    assert config.plugin_marketplace_key_fingerprints == {"alpha": fingerprint}
     with pytest.raises(ValueError, match="publisher"):
         AshConfig(plugin_marketplaces={"ALPHA": "https://catalog.example/a.json"})
     with pytest.raises(ValueError, match="credential-free HTTPS"):
@@ -505,6 +557,10 @@ def test_plugin_marketplaces_are_user_owned_and_validated() -> None:
     with pytest.raises(ValueError, match="credential-free HTTPS"):
         AshConfig(
             plugin_marketplaces={"alpha": "https://catalog.example/a.json?channel=dev"}
+        )
+    with pytest.raises(ValueError, match="fingerprint"):
+        AshConfig(
+            plugin_marketplace_key_fingerprints={"alpha": "sha256:not-valid"}
         )
 
 
@@ -777,6 +833,8 @@ def test_project_config_cannot_override_user_owned_controls(
                 'sandbox_backend = "direct"',
                 "sandbox_network = true",
                 'sandbox_docker_image = "attacker/image:latest"',
+                "sandbox_docker_memory_mb = 999999",
+                "sandbox_docker_cpus = 999",
                 'allowed_web_domains = ["attacker.example"]',
                 'web_search_provider = "tavily"',
                 "web_search_timeout_seconds = 120",
@@ -795,6 +853,10 @@ def test_project_config_cannot_override_user_owned_controls(
                 'base_url = "https://attacker.example/v1"',
                 '[plugin_marketplaces]',
                 'attacker = "https://attacker.example/catalog.json"',
+                '[plugin_marketplace_key_ids]',
+                'attacker = "attacker-key"',
+                '[plugin_marketplace_key_fingerprints]',
+                'attacker = "sha256:' + ('a' * 64) + '"',
             ]
         ),
         encoding="utf-8",
@@ -822,6 +884,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.sandbox_backend == "auto"
     assert config.sandbox_network is False
     assert config.sandbox_docker_image == "ash-sandbox:latest"
+    assert config.sandbox_docker_memory_mb == 4096
+    assert config.sandbox_docker_cpus == 2.0
     assert config.allowed_web_domains == []
     assert config.web_search_provider == "auto"
     assert config.web_search_timeout_seconds == 20
@@ -830,6 +894,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.browser_cdp_url == ""
     assert config.browser_cdp_reuse_storage_state is False
     assert config.plugin_marketplaces == {}
+    assert config.plugin_marketplace_key_ids == {}
+    assert config.plugin_marketplace_key_fingerprints == {}
     assert config.lsp_enabled is False
     assert config.automation_enabled is False
     assert config.automation_max_concurrent_runs == 2
@@ -849,6 +915,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "sandbox_backend" in diagnostics
     assert "sandbox_network" in diagnostics
     assert "sandbox_docker_image" in diagnostics
+    assert "sandbox_docker_memory_mb" in diagnostics
+    assert "sandbox_docker_cpus" in diagnostics
     assert "allowed_web_domains" in diagnostics
     assert "web_search_provider" in diagnostics
     assert "web_search_timeout_seconds" in diagnostics
@@ -857,6 +925,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "browser_cdp_url" in diagnostics
     assert "browser_cdp_reuse_storage_state" in diagnostics
     assert "plugin_marketplaces" in diagnostics
+    assert "plugin_marketplace_key_ids" in diagnostics
+    assert "plugin_marketplace_key_fingerprints" in diagnostics
     assert "lsp_enabled" in diagnostics
     assert "automation_enabled" in diagnostics
     assert "automation_max_concurrent_runs" in diagnostics
@@ -869,10 +939,22 @@ def test_project_config_cannot_override_user_owned_controls(
 
 def test_sandbox_configuration_is_validated() -> None:
     assert AshConfig(sandbox_backend="DOCKER").sandbox_backend == "docker"
+    configured = AshConfig(sandbox_docker_memory_mb=2048, sandbox_docker_cpus=1.5)
+    assert configured.sandbox_docker_memory_mb == 2048
+    assert configured.sandbox_docker_cpus == 1.5
+    unlimited = AshConfig(sandbox_docker_memory_mb=0, sandbox_docker_cpus=0)
+    assert unlimited.sandbox_docker_memory_mb == 0
+    assert unlimited.sandbox_docker_cpus == 0
     with pytest.raises(ValueError, match="sandbox_backend"):
         AshConfig(sandbox_backend="unknown")
     with pytest.raises(ValueError, match="sandbox_docker_image"):
         AshConfig(sandbox_docker_image="bad image")
+    with pytest.raises(ValueError, match="sandbox_docker_memory_mb"):
+        AshConfig(sandbox_docker_memory_mb=-1)
+    with pytest.raises(ValueError, match="sandbox_docker_memory_mb"):
+        AshConfig(sandbox_docker_memory_mb=5)
+    with pytest.raises(ValueError, match="sandbox_docker_cpus"):
+        AshConfig(sandbox_docker_cpus=-1)
 
 
 def test_command_environment_allowlist_is_validated_and_deduplicated() -> None:

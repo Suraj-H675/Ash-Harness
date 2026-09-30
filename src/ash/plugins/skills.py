@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import html
+import os
 import re
+import stat
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,11 +15,15 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-from ash.safety.guard import SafetyGuard
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 
 
 MAX_SKILL_BYTES = 512 * 1024
+MAX_SKILL_FRONTMATTER_BYTES = 64 * 1024
+MAX_SKILL_YAML_DEPTH = 32
+MAX_SKILL_YAML_NODES = 4_096
 MAX_SKILL_RESOURCE_BYTES = 512 * 1024
 MAX_LISTED_RESOURCES = 200
 MAX_SKILL_DISCOVERY_ENTRIES = 100_000
@@ -36,7 +43,49 @@ KNOWN_FRONTMATTER_FIELDS = frozenset(
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
-    """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
+    """Safe YAML loader with explicit structural resource limits."""
+
+    def __init__(self, stream: Any) -> None:
+        super().__init__(stream)
+        self._ash_yaml_depth = 0
+        self._ash_yaml_nodes = 0
+
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            event = self.get_event()
+            raise yaml.composer.ComposerError(
+                None,
+                None,
+                "YAML aliases are not allowed in skill frontmatter",
+                event.start_mark,
+            )
+        self._ash_yaml_depth += 1
+        self._ash_yaml_nodes += 1
+        try:
+            event = self.peek_event()
+            if self._ash_yaml_depth > MAX_SKILL_YAML_DEPTH:
+                raise yaml.composer.ComposerError(
+                    None,
+                    None,
+                    (
+                        "skill YAML frontmatter exceeds maximum nesting depth "
+                        f"{MAX_SKILL_YAML_DEPTH}"
+                    ),
+                    event.start_mark,
+                )
+            if self._ash_yaml_nodes > MAX_SKILL_YAML_NODES:
+                raise yaml.composer.ComposerError(
+                    None,
+                    None,
+                    (
+                        "skill YAML frontmatter exceeds maximum node count "
+                        f"{MAX_SKILL_YAML_NODES}"
+                    ),
+                    event.start_mark,
+                )
+            return super().compose_node(parent, index)
+        finally:
+            self._ash_yaml_depth -= 1
 
     def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
         self.flatten_mapping(node)
@@ -77,6 +126,7 @@ class InstructionSkill:
     metadata: tuple[tuple[str, str], ...] = ()
     allowed_tools: tuple[str, ...] = ()
     extra_frontmatter: tuple[tuple[str, Any], ...] = ()
+    package_identity: tuple[int, int] | None = None
 
     @property
     def root(self) -> Path:
@@ -122,12 +172,17 @@ class SkillCatalog:
     def list(self) -> list[InstructionSkill]:
         if not self._skills:
             self.discover()
+        for skill in self._skills.values():
+            _ensure_skill_package_current(skill)
         return list(self._skills.values())
 
     def get(self, name: str) -> InstructionSkill | None:
         if not self._skills:
             self.discover()
-        return self._skills.get(name)
+        skill = self._skills.get(name)
+        if skill is not None:
+            _ensure_skill_package_current(skill)
+        return skill
 
 
 def _skill_paths(paths: tuple[Path, ...]) -> list[Path]:
@@ -178,10 +233,38 @@ def parse_instruction_skill(path: Path, *, namespace: str = "") -> InstructionSk
 
     if path.is_symlink():
         raise ValueError("skill manifest cannot be a symbolic link")
-    if path.name != "SKILL.md" or not path.is_file():
+    if path.name != "SKILL.md":
         raise ValueError("skill path must point to a SKILL.md file")
-    text = _read_limited_text(path, MAX_SKILL_BYTES, "skill file exceeds 512 KiB")
-    return _parse_instruction_skill_text(text, path, namespace=namespace)
+    try:
+        with AnchoredDirectory.open(
+            path.parent,
+            create=False,
+            private=False,
+        ) as directory:
+            manifest = directory.stat(path.name)
+            if manifest is None or not stat.S_ISREG(manifest.st_mode):
+                if manifest is not None and stat.S_ISLNK(manifest.st_mode):
+                    raise ValueError("skill manifest cannot be a symbolic link")
+                raise ValueError("skill path must point to a SKILL.md file")
+            raw = directory.read_file(path.name, max_bytes=MAX_SKILL_BYTES)
+            if raw is None:
+                raise ValueError("skill path must point to a SKILL.md file")
+            root_metadata = os.fstat(directory.descriptor)
+            package_identity = _directory_identity(root_metadata)
+            directory.validation_path()
+    except (AnchoredFilesystemError, ValueError) as exc:
+        message = str(exc).casefold()
+        if "symlink" in message or "junction" in message:
+            raise ValueError("skill manifest cannot be a symbolic link") from exc
+        if "exceeds" in message and str(MAX_SKILL_BYTES) in message:
+            raise ValueError("skill file exceeds 512 KiB") from exc
+        raise
+    return parse_instruction_skill_bytes(
+        raw,
+        path,
+        namespace=namespace,
+        package_identity=package_identity,
+    )
 
 
 def parse_instruction_skill_bytes(
@@ -189,6 +272,7 @@ def parse_instruction_skill_bytes(
     path: Path,
     *,
     namespace: str = "",
+    package_identity: tuple[int, int] | None = None,
 ) -> InstructionSkill:
     """Parse one bounded skill from immutable bytes."""
 
@@ -198,7 +282,12 @@ def parse_instruction_skill_bytes(
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("skill file is not valid UTF-8") from exc
-    return _parse_instruction_skill_text(text, path, namespace=namespace)
+    return _parse_instruction_skill_text(
+        text,
+        path,
+        namespace=namespace,
+        package_identity=package_identity,
+    )
 
 
 def _parse_instruction_skill_text(
@@ -206,9 +295,12 @@ def _parse_instruction_skill_text(
     path: Path,
     *,
     namespace: str = "",
+    package_identity: tuple[int, int] | None = None,
 ) -> InstructionSkill:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     frontmatter_text, instructions = _split_frontmatter(text)
+    if len(frontmatter_text.encode("utf-8")) > MAX_SKILL_FRONTMATTER_BYTES:
+        raise ValueError("skill YAML frontmatter exceeds 64 KiB")
     try:
         raw = yaml.load(frontmatter_text, Loader=_UniqueKeySafeLoader)
     except yaml.YAMLError as exc:
@@ -270,6 +362,7 @@ def _parse_instruction_skill_text(
         metadata=tuple(sorted(raw_metadata.items())),
         allowed_tools=tuple(allowed_tools.split()) if allowed_tools else (),
         extra_frontmatter=extras,
+        package_identity=package_identity,
     )
 
 
@@ -337,14 +430,21 @@ class ListSkillsTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ListSkillsArgs(**kwargs)
+        try:
+            self.safety_guard.ensure_project_root_current()
+        except SafetyViolation as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         query = args.query.casefold()
-        skills = [
-            skill
-            for skill in self.catalog.list()
-            if not query
-            or query in skill.name.casefold()
-            or query in skill.description.casefold()
-        ]
+        try:
+            skills = [
+                skill
+                for skill in self.catalog.list()
+                if not query
+                or query in skill.name.casefold()
+                or query in skill.description.casefold()
+            ]
+        except (AnchoredFilesystemError, OSError, ValueError) as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         output = "\n".join(f"{skill.name}: {skill.description}" for skill in skills)
         return ToolResult(
             success=True,
@@ -368,7 +468,14 @@ class ActivateSkillTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ActivateSkillArgs(**kwargs)
-        skill = self.catalog.get(args.name)
+        try:
+            self.safety_guard.ensure_project_root_current()
+        except SafetyViolation as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+        try:
+            skill = self.catalog.get(args.name)
+        except (AnchoredFilesystemError, OSError, ValueError) as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         if skill is None:
             return ToolResult(
                 success=False,
@@ -412,7 +519,14 @@ class ReadSkillResourceTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ReadSkillResourceArgs(**kwargs)
-        skill = self.catalog.get(args.name)
+        try:
+            self.safety_guard.ensure_project_root_current()
+        except SafetyViolation as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+        try:
+            skill = self.catalog.get(args.name)
+        except (AnchoredFilesystemError, OSError, ValueError) as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         if skill is None:
             return ToolResult(
                 success=False,
@@ -420,13 +534,12 @@ class ReadSkillResourceTool(BaseTool):
                 error=f"Unknown skill: {args.name}",
             )
         try:
-            resource = _resolve_skill_resource(skill, args.path)
-            output = _read_limited_text(
-                resource,
-                MAX_SKILL_RESOURCE_BYTES,
-                "skill resource exceeds 512 KiB",
+            output = _read_skill_resource_text(
+                skill,
+                args.path,
+                max_bytes=MAX_SKILL_RESOURCE_BYTES,
             )
-        except (OSError, UnicodeError, ValueError) as exc:
+        except (AnchoredFilesystemError, OSError, UnicodeError, ValueError) as exc:
             return ToolResult(success=False, output="", error=str(exc))
         return ToolResult(
             success=True,
@@ -437,7 +550,7 @@ class ReadSkillResourceTool(BaseTool):
 
 def _list_skill_resources(skill: InstructionSkill) -> list[str]:
     resources: list[str] = []
-    for path in _iter_skill_resource_paths(skill.root):
+    for path in _iter_skill_resource_paths(skill):
         if len(resources) >= MAX_LISTED_RESOURCES:
             resources.append("[resource listing truncated]")
             break
@@ -447,66 +560,124 @@ def _list_skill_resources(skill: InstructionSkill) -> list[str]:
     return resources
 
 
-def _iter_skill_resource_paths(root: Path) -> Iterator[Path]:
-    pending: list[tuple[Path, int]] = [(root, 0)]
+def _directory_identity(metadata: os.stat_result) -> tuple[int, int] | None:
+    if metadata.st_ino == 0:
+        return None
+    return int(metadata.st_dev), int(metadata.st_ino)
+
+
+def _ensure_skill_package_current(skill: InstructionSkill) -> None:
+    try:
+        with _open_skill_root(skill):
+            pass
+    except AnchoredFilesystemError as exc:
+        raise ValueError(
+            f"skill package identity changed after discovery: {skill.root}"
+        ) from exc
+
+
+@contextmanager
+def _open_skill_root(skill: InstructionSkill) -> Iterator[AnchoredDirectory]:
+    try:
+        directory = AnchoredDirectory.open(
+            skill.root,
+            create=False,
+            private=False,
+        )
+    except (AnchoredFilesystemError, OSError) as exc:
+        raise ValueError(f"skill package is unavailable: {skill.root}") from exc
+    try:
+        observed = _directory_identity(os.fstat(directory.descriptor))
+        if skill.package_identity is not None and observed != skill.package_identity:
+            raise ValueError(
+                f"skill package identity changed after discovery: {skill.root}"
+            )
+        directory.validation_path()
+        yield directory
+    finally:
+        directory.close()
+
+
+def _iter_skill_resource_paths(skill: InstructionSkill) -> Iterator[Path]:
     entries_seen = 0
-    while pending:
-        directory, depth = pending.pop()
-        children: list[Path] = []
-        try:
-            for child in directory.iterdir():
-                children.append(child)
-                if len(children) >= MAX_SKILL_RESOURCE_ENTRIES:
-                    break
-        except OSError:
-            continue
-        children.sort(key=lambda path: path.name)
-        for path in children:
+
+    def walk(
+        directory: AnchoredDirectory,
+        relative: tuple[str, ...],
+        depth: int,
+    ) -> Iterator[Path]:
+        nonlocal entries_seen
+        names = sorted(directory.list_names())[:MAX_SKILL_RESOURCE_ENTRIES]
+        for name in names:
             entries_seen += 1
             if entries_seen > MAX_SKILL_RESOURCE_ENTRIES:
                 return
-            if path.is_symlink() or (
-                hasattr(path, "is_junction") and path.is_junction()
-            ):
+            metadata = directory.stat(name)
+            if metadata is None or stat.S_ISLNK(metadata.st_mode):
                 continue
+            child_relative = (*relative, name)
+            if stat.S_ISREG(metadata.st_mode):
+                yield skill.root.joinpath(*child_relative)
+                continue
+            if not stat.S_ISDIR(metadata.st_mode) or depth >= MAX_SKILL_DISCOVERY_DEPTH:
+                continue
+            child = directory.child(name, expected=metadata)
             try:
-                is_directory = path.is_dir()
-                is_file = path.is_file()
-            except OSError:
-                continue
-            if is_file:
-                yield path
-            elif is_directory and depth < MAX_SKILL_DISCOVERY_DEPTH:
-                pending.append((path, depth + 1))
+                yield from walk(child, child_relative, depth + 1)
+            finally:
+                child.close()
+
+    with _open_skill_root(skill) as root_directory:
+        yield from walk(root_directory, (), 0)
 
 
-def _read_limited_text(path: Path, max_bytes: int, error: str) -> str:
-    with path.open("rb") as handle:
-        raw = handle.read(max_bytes + 1)
-    if len(raw) > max_bytes:
-        raise ValueError(error)
-    return raw.decode("utf-8")
-
-
-def _resolve_skill_resource(skill: InstructionSkill, requested: str) -> Path:
+def _skill_resource_parts(requested: str) -> tuple[str, ...]:
     relative = Path(requested)
     if relative.is_absolute() or not relative.parts:
         raise ValueError("skill resource path must be relative")
     if any(part in {"", ".", ".."} for part in relative.parts):
         raise ValueError("skill resource path cannot contain traversal components")
-    root = skill.root.resolve()
-    candidate = root
-    for part in relative.parts:
-        candidate = candidate / part
-        if candidate.is_symlink():
-            raise ValueError("skill resources cannot be symbolic links")
-    try:
-        resolved = candidate.resolve(strict=True)
-        resolved.relative_to(root)
-    except (OSError, ValueError) as exc:
-        raise ValueError(
-            "skill resource is missing or outside the skill package"
-        ) from exc
-    if not resolved.is_file():
-        raise ValueError("skill resource must be a file")
-    return resolved
+    return tuple(relative.parts)
+
+
+def _read_skill_resource_text(
+    skill: InstructionSkill,
+    requested: str,
+    *,
+    max_bytes: int,
+) -> str:
+    parts = _skill_resource_parts(requested)
+    with _open_skill_root(skill) as root_directory:
+        directory = root_directory
+        owned: list[AnchoredDirectory] = []
+        try:
+            for part in parts[:-1]:
+                metadata = directory.stat(part)
+                if metadata is None:
+                    raise ValueError("skill resource is missing or outside the skill package")
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise ValueError("skill resources cannot be symbolic links")
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise ValueError("skill resource parent must be a directory")
+                child = directory.child(part, expected=metadata)
+                owned.append(child)
+                directory = child
+            metadata = directory.stat(parts[-1])
+            if metadata is None:
+                raise ValueError("skill resource is missing or outside the skill package")
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("skill resources cannot be symbolic links")
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("skill resource must be a file")
+            try:
+                raw = directory.read_file(parts[-1], max_bytes=max_bytes)
+            except AnchoredFilesystemError as exc:
+                if "exceeds" in str(exc).casefold():
+                    raise ValueError("skill resource exceeds 512 KiB") from exc
+                raise
+            if raw is None:
+                raise ValueError("skill resource is missing or outside the skill package")
+            return raw.decode("utf-8")
+        finally:
+            for child in reversed(owned):
+                child.close()

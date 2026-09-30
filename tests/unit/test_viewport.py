@@ -8,12 +8,18 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
+from ash.ui.history import PrivateFileHistory as CorePrivateFileHistory
 from ash.ui.transcript import Transcript
 from ash.ui.viewport import (
+    PrivateFileHistory,
     RichTranscriptFormatter,
     TranscriptViewport,
     format_transcript,
 )
+
+
+def test_viewport_reexports_private_history_for_compatibility() -> None:
+    assert PrivateFileHistory is CorePrivateFileHistory
 
 
 class SizedDummyOutput(DummyOutput):

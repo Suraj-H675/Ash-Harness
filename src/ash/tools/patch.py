@@ -10,9 +10,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ash.safety.environment import resolve_host_executable
+from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.guard import SafetyGuard, SafetyViolation
-from ash.safety.scoped_io import ScopedIOError
+from ash.safety.scoped_io import ScopedIOError, workspace_mutation_lock
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     ProcessTreeError,
@@ -54,30 +54,54 @@ class ApplyPatchTool(BaseTool):
             paths = extract_patch_paths(args.patch, self.safety_guard)
         except (ValueError, SafetyViolation) as exc:
             return ToolResult(success=False, output="", error=f"Invalid patch: {exc}")
-        check = await _git_apply(self.safety_guard.project_root, args.patch, check=True)
-        if check[0] != 0:
-            return ToolResult(
-                success=False,
-                output=check[1],
-                error=f"Patch check failed: {check[2].strip()}",
-            )
         if args.dry_run:
+            check = await _git_apply(
+                self.safety_guard.project_root,
+                args.patch,
+                check=True,
+            )
+            if check[0] != 0:
+                return ToolResult(
+                    success=False,
+                    output=check[1],
+                    error=f"Patch check failed: {check[2].strip()}",
+                )
             return ToolResult(
                 success=True,
                 output=f"Patch is valid for {len(paths)} file(s); no files changed.",
             )
         try:
-            for path in paths:
-                self.safety_guard.validate_mutation_path(path)
+            with workspace_mutation_lock():
+                check = await _git_apply(
+                    self.safety_guard.project_root,
+                    args.patch,
+                    check=True,
+                )
+                if check[0] != 0:
+                    return ToolResult(
+                        success=False,
+                        output=check[1],
+                        error=f"Patch check failed: {check[2].strip()}",
+                    )
+                for path in paths:
+                    self.safety_guard.validate_mutation_path(path)
+                applied = await _git_apply(
+                    self.safety_guard.project_root,
+                    args.patch,
+                    check=False,
+                )
         except SafetyViolation as exc:
             return ToolResult(
                 success=False,
                 output="",
                 error=f"Patch path changed after validation: {exc}",
             )
-        applied = await _git_apply(
-            self.safety_guard.project_root, args.patch, check=False
-        )
+        except ScopedIOError as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Patch workspace mutation was refused: {exc}",
+            )
         if applied[0] != 0:
             return ToolResult(
                 success=False,
@@ -137,7 +161,15 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
     git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
     if git is None:
         return 127, "", "git is unavailable outside the workspace"
-    command = [git, "apply", "--whitespace=nowarn"]
+    environment = build_scrubbed_environment(
+        overrides={
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": os.devnull,
+            "SSH_ASKPASS": os.devnull,
+        }
+    )
+    command = [git, "--no-pager", "--work-tree=.", "apply", "--whitespace=nowarn"]
     if check:
         command.append("--check")
     command.append("-")
@@ -162,6 +194,7 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
             process = await asyncio.create_subprocess_exec(
                 *launch.argv,
                 cwd=launch.cwd,
+                env=environment,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -209,6 +242,23 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
             cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
         if cleanup_cancelled:
             cancellation.add_note("Process-tree cleanup was cancelled")
+        raise
+    except Exception as primary_error:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            primary_error.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cleanup_cancellation = asyncio.CancelledError()
+            cleanup_cancellation.add_note(
+                "git apply failed before process-tree cleanup was cancelled"
+            )
+            if cleanup_error is not None:
+                cleanup_cancellation.add_note("Process-tree cleanup also failed")
+            raise cleanup_cancellation from primary_error
         raise
     return (
         process.returncode if process.returncode is not None else -1,

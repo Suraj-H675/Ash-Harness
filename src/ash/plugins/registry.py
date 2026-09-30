@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+import re
+import stat
 
 from ash.plugins.manifest import PluginManifest, validate_plugin_identity
 
@@ -12,6 +14,11 @@ from ash.plugins.manifest import PluginManifest, validate_plugin_identity
 MAX_PLUGIN_DISCOVERY_ENTRIES = 10_000
 MAX_PLUGIN_TREE_ENTRIES = 100_000
 MAX_PLUGIN_TREE_DEPTH = 32
+_LIFECYCLE_ARTIFACT_NAME = re.compile(
+    r"^(?:\.install-[0-9a-f]{32}\.tmp|"
+    r"\.[A-Za-z0-9][A-Za-z0-9._-]*\."
+    r"(?:backup|install-conflict|uninstall|uninstall-conflict)-[0-9a-f]{32})$"
+)
 
 
 @dataclass(frozen=True)
@@ -20,12 +27,31 @@ class DiscoveredPlugin:
     root: Path
     source: str
     enabled: bool = True
+    root_identity: tuple[int, int] | None = None
 
     @property
     def deprecation_notice(self) -> str | None:
         return self.manifest.deprecation_notice
 
+    def ensure_current(self) -> None:
+        """Reject mixing a discovered manifest with a different live plugin tree."""
+
+        if self.root_identity is None:
+            return
+        try:
+            metadata = self.root.lstat()
+        except OSError as exc:
+            raise ValueError(
+                f"plugin root became unavailable after discovery: {self.root}"
+            ) from exc
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"plugin root identity changed after discovery: {self.root}")
+        current = (int(metadata.st_dev), int(metadata.st_ino))
+        if current != self.root_identity:
+            raise ValueError(f"plugin root identity changed after discovery: {self.root}")
+
     def skill_paths(self) -> tuple[Path, ...]:
+        self.ensure_current()
         if self.manifest.skills:
             return tuple(self.root / relative for relative in self.manifest.skills)
         defaults = []
@@ -38,6 +64,7 @@ class DiscoveredPlugin:
         return tuple(defaults)
 
     def command_paths(self) -> tuple[Path, ...]:
+        self.ensure_current()
         declared = tuple(
             self.root / item for item in self.manifest.commands if isinstance(item, str)
         )
@@ -47,6 +74,7 @@ class DiscoveredPlugin:
         return (default,) if default.is_dir() else ()
 
     def hook_paths(self) -> tuple[Path, ...]:
+        self.ensure_current()
         declared = tuple(
             self.root / item for item in self.manifest.hooks if isinstance(item, str)
         )
@@ -56,6 +84,7 @@ class DiscoveredPlugin:
         return (default,) if default.is_file() else ()
 
     def mcp_paths(self) -> tuple[Path, ...]:
+        self.ensure_current()
         declared = tuple(
             self.root / item
             for item in self.manifest.mcp_servers
@@ -67,6 +96,7 @@ class DiscoveredPlugin:
         return (default,) if default.is_file() else ()
 
     def agent_paths(self) -> tuple[Path, ...]:
+        self.ensure_current()
         declared = tuple(
             self.root / item for item in self.manifest.agents if isinstance(item, str)
         )
@@ -119,8 +149,15 @@ class PluginCatalog:
                         f"{existing.root / 'plugin.json'}"
                     )
                     continue
+                metadata = path.parent.lstat()
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise ValueError(f"plugin root is not a directory: {path.parent}")
                 plugins[manifest.name] = DiscoveredPlugin(
-                    manifest, path.parent, source, enabled
+                    manifest,
+                    path.parent,
+                    source,
+                    enabled,
+                    (int(metadata.st_dev), int(metadata.st_ino)),
                 )
         while True:
             versions = {
@@ -190,6 +227,8 @@ def _plugin_manifest_paths(root: Path) -> list[Path]:
         raise ValueError(f"cannot read plugin root {root}: {exc}") from exc
     paths: list[Path] = []
     for child in sorted(children, key=lambda path: path.name):
+        if _LIFECYCLE_ARTIFACT_NAME.fullmatch(child.name):
+            continue
         if child.is_symlink() or (
             hasattr(child, "is_junction") and child.is_junction()
         ):

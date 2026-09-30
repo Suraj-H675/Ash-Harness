@@ -41,6 +41,30 @@ def test_redaction_handles_bare_provider_api_keys(provider_key: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("kind", "secret"),
+    [
+        ("GitHub token", "ghp_" + "A" * 36),
+        ("GitHub token", "github_pat_" + "A" * 48),
+        ("Slack token", "xoxb-" + "A" * 24),
+        ("Stripe live key", "sk_live_" + "A" * 24),
+    ],
+)
+def test_redaction_covers_scanner_recognized_bearer_secrets(
+    kind: str,
+    secret: str,
+) -> None:
+    value = f"tool output contained {secret}"
+
+    assert [(item.kind, item.line_number) for item in find_secret_candidates(value)] == [
+        (kind, 1)
+    ]
+    rendered = redact_text(value)
+
+    assert secret not in rendered
+    assert "[REDACTED]" in rendered
+
+
+@pytest.mark.parametrize(
     ("header", "safe_prefix"),
     [
         ("Authorization: Basic dXNlcjpwYXNz", "Authorization: Basic "),
@@ -94,6 +118,64 @@ async def test_tool_result_redaction() -> None:
     assert "hunter2-secret" not in (result.error or "")
 
 
+@pytest.mark.asyncio
+async def test_tool_result_redaction_covers_structured_side_channels() -> None:
+    signed_marker = "signed-citation-marker"
+    provider_secret = "sk-proj-" + "A" * 32
+    opaque_image_data = f"opaque-{provider_secret}"
+    result = ToolResult(
+        success=True,
+        output="ok",
+        diagnostics=[
+            {
+                "message": f"token={provider_secret}",
+                "path": "src/example.py",
+            }
+        ],
+        citations=[
+            {
+                "title": f"token={provider_secret}",
+                "url": (
+                    "https://storage.example/object?"
+                    f"X-Amz-Signature={signed_marker}&view=complete"
+                ),
+            }
+        ],
+        images=[
+            {
+                "path": f"preview?token={provider_secret}",
+                "media_type": "image/png",
+                "sha256": "abc",
+            }
+        ],
+        image_blocks=[
+            {
+                "type": "image",
+                "media_type": f"image/png?token={provider_secret}",
+                "data": opaque_image_data,
+            }
+        ],
+    )
+
+    await SecretRedactionMiddleware().after_tool("web_search", {}, result)
+
+    rendered = repr(
+        {
+            "diagnostics": result.diagnostics,
+            "citations": result.citations,
+            "images": result.images,
+            "image_blocks": [
+                {key: value for key, value in block.items() if key != "data"}
+                for block in result.image_blocks
+            ],
+        }
+    )
+    assert provider_secret not in rendered
+    assert signed_marker not in rendered
+    assert "view=complete" in result.citations[0]["url"]
+    assert result.image_blocks[0]["data"] == opaque_image_data
+
+
 def test_streaming_redactor_retains_chunk_split_secrets() -> None:
     redactor = StreamingRedactor()
 
@@ -104,6 +186,52 @@ def test_streaming_redactor_retains_chunk_split_secrets() -> None:
     assert "supersecretvalue" not in emitted
     assert "[REDACTED]" in emitted
     assert tail == "next"
+
+
+def test_redaction_removes_private_key_blocks() -> None:
+    marker = "SYNTHETIC_PRIVATE_KEY_BODY_MARKER"
+    value = (
+        "before\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        f"{marker}\n"
+        "-----END PRIVATE KEY-----\n"
+        "after\n"
+    )
+
+    rendered = redact_text(value)
+
+    assert marker not in rendered
+    assert "-----BEGIN PRIVATE KEY-----" not in rendered
+    assert "-----END PRIVATE KEY-----" not in rendered
+    assert "[REDACTED]" in rendered
+    assert rendered.startswith("before\n")
+    assert rendered.endswith("\nafter\n")
+
+
+def test_streaming_redactor_never_emits_chunk_split_private_key() -> None:
+    marker = "SYNTHETIC_PRIVATE_KEY_BODY_MARKER"
+    value = (
+        "before\n"
+        "-----BEGIN PRIVATE KEY-----\n"
+        f"{marker}\n"
+        "-----END PRIVATE KEY-----\n"
+        "after\n"
+    )
+
+    for split in range(len(value) + 1):
+        redactor = StreamingRedactor()
+        emitted = (
+            redactor.feed(value[:split])
+            + redactor.feed(value[split:])
+            + redactor.finish()
+        )
+
+        assert marker not in emitted
+        assert "-----BEGIN PRIVATE KEY-----" not in emitted
+        assert "-----END PRIVATE KEY-----" not in emitted
+        assert "[REDACTED]" in emitted
+        assert emitted.startswith("before\n")
+        assert emitted.endswith("after\n")
 
 
 def test_streaming_redactor_never_emits_chunk_split_quoted_secret() -> None:

@@ -24,6 +24,7 @@ from prompt_toolkit.output.base import Output
 from prompt_toolkit.styles import Style
 
 from ash.core.session import Session, SessionSummary
+from ash.ui.safe_text import terminal_safe_text
 
 
 def _relative_time(value: datetime) -> str:
@@ -180,11 +181,14 @@ class SessionPicker:
         start, end = self._page()
         for index, session in enumerate(self._filtered[start:end], start=start):
             style = "class:selected" if index == self._selected else ""
-            title = session.title or "(untitled)"
-            model = session.model or "unknown model"
+            title = terminal_safe_text(session.title or "(untitled)", single_line=True)
+            model = terminal_safe_text(
+                session.model or "unknown model", single_line=True
+            )
+            session_id = terminal_safe_text(session.session_id[:8], single_line=True)
             suffix = (
                 f"  {session.message_count} msg  {_relative_time(session.updated_at)}  "
-                f"{model}  {session.session_id[:8]}"
+                f"{model}  {session_id}"
             )
             available = max(8, columns - len(suffix) - 4)
             if len(title) > available:
@@ -224,10 +228,11 @@ class SessionPicker:
         try:
             session = self._load_session(session_id)
         except Exception as exc:  # noqa: BLE001
-            self._preview_text = f"Could not load preview: {exc}"
+            self._preview_text = "Could not load preview: " + terminal_safe_text(str(exc))
             return
         messages = [
-            f"{message.role}: {message.content}"
+            f"{terminal_safe_text(str(message.role), single_line=True)}: "
+            f"{terminal_safe_text(str(message.content))}"
             for message in session.messages[-3:]
             if message.content
         ]

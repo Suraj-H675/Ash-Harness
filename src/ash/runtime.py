@@ -17,6 +17,7 @@ from ash.context.instructions import (
 from ash.core.checkpoints import FileCheckpointMiddleware
 from ash.core.loop import AshLoop, LoopUI
 from ash.core.planner import Planner
+from ash.core.redaction import redact_text
 from ash.core.secret_middleware import SecretRedactionMiddleware
 from ash.core.session import SessionStore
 from ash.hooks.config import HookConfigSource, load_command_hooks
@@ -25,12 +26,18 @@ from ash.mcp.interactions import (
     MCPInteractionController,
     SamplingReview,
 )
-from ash.mcp.server import MCPConfigSource, MCPServerConfig, load_mcp_server_sources
-from ash.plugins.lifecycle import load_extension_state
+from ash.mcp.server import (
+    MCPConfigSource,
+    MCPServerConfig,
+    load_mcp_server_sources,
+    validate_mcp_server_count,
+)
+from ash.plugins.lifecycle import recover_plugin_lifecycle
+from ash.plugins.state import load_extension_state
 from ash.plugins.registry import DiscoveredPlugin, PluginCatalog
+from ash.platform_support import require_supported_native_platform
 from ash.providers.base import ProviderABC
 from ash.providers.registry import get_provider_registry
-from ash.safe_io import validate_unlinked_path
 from ash.safety.grants import (
     PermissionRule,
     load_managed_permission_rules,
@@ -46,6 +53,20 @@ from ash.sandbox import (
 
 
 ApprovalCallback = Callable[[str, dict[str, Any]], Awaitable[bool]]
+
+
+def _rollback_startup_owners(
+    closers: Sequence[Callable[[], None]],
+    primary_error: BaseException,
+) -> None:
+    for close in reversed(tuple(closers)):
+        try:
+            close()
+        except BaseException as cleanup_error:
+            primary_error.add_note(
+                "runtime startup cleanup failed: "
+                + redact_text(str(cleanup_error))[:500]
+            )
 
 
 @dataclass(frozen=True)
@@ -66,6 +87,7 @@ def discover_active_plugins(
     *,
     include_project: bool,
 ) -> list[DiscoveredPlugin]:
+    recover_plugin_lifecycle()
     roots = [(Path.home() / ".ash" / "plugins", "user")]
     if include_project:
         roots.append((workspace / ".ash" / "plugins", "project"))
@@ -89,6 +111,7 @@ def build_tools(
     runtime_config: AshConfig | None = None,
     active_plugins: list[DiscoveredPlugin] | None = None,
     lsp_manager: Any | None = None,
+    _startup_rollback: list[Callable[[], None]] | None = None,
 ) -> dict[str, Any]:
     """Build the standard tool set and its trusted declarative extensions."""
 
@@ -245,99 +268,129 @@ def build_tools(
     from ash.agents.a2a_tasks import RemoteTaskStore
 
     remote_agents = load_remote_agent_configs(
-        root, include_project=allow_project_extensions
+        root,
+        include_project=allow_project_extensions,
+        project_guard=safety_guard if allow_project_extensions else None,
     )
-    if remote_agents:
-        remote_task_store = (
-            RemoteTaskStore(runtime_config.db_directory / "a2a_remote_tasks.db", root)
-            if runtime_config is not None
-            else None
-        )
-        tools.extend(
-            [
-                ListRemoteAgentsTool(safety_guard, remote_agents),
-                DelegateRemoteAgentTool(
-                    safety_guard,
-                    remote_agents,
-                    remote_task_store,
-                ),
-                ListRemoteAgentTasksTool(
-                    safety_guard,
-                    remote_agents,
-                    remote_task_store,
-                ),
-                RecoverRemoteAgentTaskTool(
-                    safety_guard,
-                    remote_agents,
-                    remote_task_store,
-                ),
-                RemoteAgentTaskStatusTool(
-                    safety_guard,
-                    remote_agents,
-                    remote_task_store,
-                ),
-                RemoteAgentTaskCancelTool(
-                    safety_guard,
-                    remote_agents,
-                    remote_task_store,
-                ),
-            ]
-        )
-    if provider_factory is not None and agent_db_path is not None:
-        spawn_tool = SpawnAgentTool(
-            safety_guard,
-            SharedState(agent_db_path),
-            provider_factory,
-            config=runtime_config,
-            custom_agents=agent_definitions,
-            provider_config_backed=provider_factory_config_backed,
-        )
-        tools.append(spawn_tool)
-        if runtime_config is not None:
-            tools.append(
-                DelegateAgentsTool(
-                    safety_guard,
-                    SharedState(agent_db_path),
-                    spawn_tool,
-                    runtime_config,
+    owned_closers: list[Callable[[], None]] = []
+    try:
+        if remote_agents:
+            remote_task_store = (
+                RemoteTaskStore(
+                    runtime_config.db_directory / "a2a_remote_tasks.db",
+                    root,
                 )
+                if runtime_config is not None
+                else None
             )
-    if repo_map is not None:
-        tools.extend(
-            [
-                FindSymbolTool(safety_guard, repo_map),
-                FindReferencesTool(safety_guard, repo_map),
-            ]
+            if remote_task_store is not None:
+                owned_closers.append(remote_task_store.close)
+            tools.extend(
+                [
+                    ListRemoteAgentsTool(safety_guard, remote_agents),
+                    DelegateRemoteAgentTool(
+                        safety_guard,
+                        remote_agents,
+                        remote_task_store,
+                    ),
+                    ListRemoteAgentTasksTool(
+                        safety_guard,
+                        remote_agents,
+                        remote_task_store,
+                    ),
+                    RecoverRemoteAgentTaskTool(
+                        safety_guard,
+                        remote_agents,
+                        remote_task_store,
+                    ),
+                    RemoteAgentTaskStatusTool(
+                        safety_guard,
+                        remote_agents,
+                        remote_task_store,
+                    ),
+                    RemoteAgentTaskCancelTool(
+                        safety_guard,
+                        remote_agents,
+                        remote_task_store,
+                    ),
+                ]
+            )
+        if provider_factory is not None and agent_db_path is not None:
+            spawn_state = SharedState(
+                agent_db_path,
+                workspace=safety_guard.project_root,
+            )
+            owned_closers.append(spawn_state.close)
+            spawn_tool = SpawnAgentTool(
+                safety_guard,
+                spawn_state,
+                provider_factory,
+                config=runtime_config,
+                custom_agents=agent_definitions,
+                provider_config_backed=provider_factory_config_backed,
+            )
+            tools.append(spawn_tool)
+            if runtime_config is not None:
+                delegate_state = SharedState(
+                    agent_db_path,
+                    workspace=safety_guard.project_root,
+                )
+                owned_closers.append(delegate_state.close)
+                tools.append(
+                    DelegateAgentsTool(
+                        safety_guard,
+                        delegate_state,
+                        spawn_tool,
+                        runtime_config,
+                    )
+                )
+        if repo_map is not None:
+            tools.extend(
+                [
+                    FindSymbolTool(safety_guard, repo_map),
+                    FindReferencesTool(safety_guard, repo_map),
+                ]
+            )
+        by_name = {tool.name: tool for tool in tools}
+        tool_search = SearchToolsTool(
+            safety_guard,
+            lambda: by_name,
+            threshold=(runtime_config.tool_search_threshold if runtime_config else 32),
         )
-    by_name = {tool.name: tool for tool in tools}
-    tool_search = SearchToolsTool(
-        safety_guard,
-        lambda: by_name,
-        threshold=(runtime_config.tool_search_threshold if runtime_config else 32),
-    )
-    if tool_search.name in by_name:
-        raise ValueError(f"tool collides with an existing tool: {tool_search.name}")
-    by_name[tool_search.name] = tool_search
-    plugin_tools = build_plugin_runtime_tools(
-        plugins,
-        safety_guard,
-        backend_preference=(
-            runtime_config.sandbox_backend if runtime_config else "auto"
-        ),
-        docker_image=(
-            runtime_config.sandbox_docker_image
-            if runtime_config
-            else "ash-sandbox:latest"
-        ),
-        allow_unisolated=(
-            runtime_config.allow_unsafe_plugin_runtime if runtime_config else False
-        ),
-    )
-    for tool in plugin_tools:
-        if tool.name in by_name:
-            raise ValueError(f"plugin tool collides with an existing tool: {tool.name}")
-        by_name[tool.name] = tool
-    return by_name
+        if tool_search.name in by_name:
+            raise ValueError(f"tool collides with an existing tool: {tool_search.name}")
+        by_name[tool_search.name] = tool_search
+        plugin_tools = build_plugin_runtime_tools(
+            plugins,
+            safety_guard,
+            backend_preference=(
+                runtime_config.sandbox_backend if runtime_config else "auto"
+            ),
+            docker_image=(
+                runtime_config.sandbox_docker_image
+                if runtime_config
+                else "ash-sandbox:latest"
+            ),
+            docker_memory_mb=(
+                runtime_config.sandbox_docker_memory_mb if runtime_config else 4096
+            ),
+            docker_cpus=(runtime_config.sandbox_docker_cpus if runtime_config else 2.0),
+            allow_unisolated=(
+                runtime_config.allow_unsafe_plugin_runtime if runtime_config else False
+            ),
+        )
+        for tool in plugin_tools:
+            if tool.name in by_name:
+                raise ValueError(
+                    f"plugin tool collides with an existing tool: {tool.name}"
+                )
+            by_name[tool.name] = tool
+        if _startup_rollback is not None:
+            _startup_rollback.extend(owned_closers)
+        return by_name
+    except BaseException as primary_error:
+        _rollback_startup_owners(owned_closers, primary_error)
+        raise
 
 
 def build_repo_map(config: AshConfig) -> Any | None:
@@ -359,37 +412,14 @@ def build_repo_map(config: AshConfig) -> Any | None:
         return None
 
 
-def _memory_persist_directory(config: AshConfig) -> Path:
-    """Anchor relative semantic-memory persistence to the selected workspace."""
+def _memory_database_path(config: AshConfig) -> Path:
+    """Return Ash-owned durable memory storage for the selected workspace."""
 
-    path = config.chroma_persist_dir.expanduser()
-    workspace = config.workspace_root.expanduser().resolve()
-    if not path.is_absolute():
-        target = Path(os.path.abspath(workspace / path)).resolve(strict=False)
-        try:
-            target.relative_to(workspace)
-        except ValueError as exc:
-            raise ValueError(
-                "relative semantic-memory persistence path escapes the workspace"
-            ) from exc
-        return target
-
-    path = Path(os.path.abspath(path))
-    if path.parent == path or not path.name:
-        raise ValueError(
-            "absolute semantic-memory persistence path must name a directory "
-            "below the filesystem root"
-        )
-    path = validate_unlinked_path(
-        path,
-        trusted_root=Path(path.anchor),
-        label="semantic-memory persistence path",
-    )
     identity = hashlib.sha256(
-        os.fsencode(os.path.normcase(str(workspace)))
+        os.fsencode(os.path.normcase(str(config.workspace_root.expanduser().resolve())))
     ).hexdigest()
-    namespace = path.parent / ".ash-workspaces" / f"v1-{identity}"
-    return namespace / path.name
+    database_root = Path(os.path.abspath(config.db_directory.expanduser()))
+    return database_root / "memory" / f"v1-{identity}" / "memory.db"
 
 
 def build_runtime(
@@ -397,6 +427,7 @@ def build_runtime(
     ui: LoopUI,
     *,
     provider: ProviderABC | None = None,
+    provider_factory: Callable[[AshConfig], ProviderABC] | None = None,
     agent_provider_factory: Callable[[], ProviderABC] | None = None,
     session_store: SessionStore | None = None,
     permission_rules: list[PermissionRule] | None = None,
@@ -410,6 +441,8 @@ def build_runtime(
 ) -> RuntimeComponents:
     """Assemble one runtime with identical extension and safety semantics."""
 
+    require_supported_native_platform()
+
     trusted = (
         is_workspace_trusted(config.workspace_root)
         if workspace_trusted is None
@@ -420,6 +453,8 @@ def build_runtime(
         network=config.sandbox_network,
         backend_preference=config.sandbox_backend,
         docker_image=config.sandbox_docker_image,
+        docker_memory_mb=config.sandbox_docker_memory_mb,
+        docker_cpus=config.sandbox_docker_cpus,
     )
     safety_error = auto_approve_safety_error(
         sandbox,
@@ -451,7 +486,14 @@ def build_runtime(
         config.workspace_root,
         blocklist_commands=runtime_blocklist,
     )
-    active_provider = provider or get_provider_registry().build(config)
+    selected_provider_factory = provider_factory
+    if provider is None:
+        selected_provider_factory = (
+            selected_provider_factory or get_provider_registry().build
+        )
+        active_provider = selected_provider_factory(config)
+    else:
+        active_provider = provider
     plugins = discover_active_plugins(config.workspace_root, include_project=trusted)
     repo_map = build_repo_map(config)
     lsp_manager = None
@@ -462,28 +504,10 @@ def build_runtime(
         lsp_configs = load_lsp_server_configs(
             config.workspace_root,
             include_project=True,
+            project_guard=guard,
         )
         if lsp_configs:
             lsp_manager = LanguageServerManager(config.workspace_root, lsp_configs)
-    tools = build_tools(
-        guard,
-        config.workspace_root,
-        sandbox_manager=sandbox,
-        allow_project_extensions=trusted,
-        provider_factory=(
-            agent_provider_factory
-            if agent_provider_factory is not None
-            else lambda: get_provider_registry().build(config)
-        ),
-        provider_factory_config_backed=agent_provider_factory is None,
-        agent_db_path=config.db_directory / "agents.db",
-        allowed_web_domains=config.allowed_web_domains,
-        repo_map=repo_map,
-        runtime_config=config,
-        active_plugins=plugins,
-        lsp_manager=lsp_manager,
-    )
-
     instruction_current_directory = Path.cwd().expanduser().resolve()
 
     def load_runtime_instructions(current_directories: Sequence[Path]) -> str:
@@ -494,6 +518,7 @@ def build_runtime(
                 include_project=trusted,
                 current_directories=current_directories,
                 diagnostics=instruction_diagnostics,
+                project_guard=guard if trusted else None,
             ),
             instruction_diagnostics,
         )
@@ -506,6 +531,7 @@ def build_runtime(
             cwd=config.workspace_root,
             environment=project_hook_environment,
             trusted_root=Path.home(),
+            cwd_identity=guard.project_root_identity,
         )
     ]
     if trusted:
@@ -515,6 +541,8 @@ def build_runtime(
                 cwd=config.workspace_root,
                 environment=project_hook_environment,
                 trusted_root=config.workspace_root,
+                cwd_identity=guard.project_root_identity,
+                trusted_root_identity=guard.project_root_identity,
             )
         )
     hook_sources.extend(
@@ -523,6 +551,8 @@ def build_runtime(
             cwd=plugin.root,
             environment=(("ASH_PLUGIN_ROOT", str(plugin.root)),),
             trusted_root=plugin.root,
+            cwd_identity=plugin.root_identity,
+            trusted_root_identity=plugin.root_identity,
         )
         for plugin in plugins
         for path in plugin.hook_paths()
@@ -531,13 +561,19 @@ def build_runtime(
 
     mcp_sources: list[MCPConfigSource] = []
     if trusted:
-        mcp_sources.append(MCPConfigSource(config.workspace_root / ".mcp.json"))
+        mcp_sources.append(
+            MCPConfigSource(
+                config.workspace_root / ".mcp.json",
+                source_root=config.workspace_root,
+            )
+        )
     mcp_sources.extend(
         MCPConfigSource(
             path=path,
             namespace=plugin.manifest.name,
             cwd=plugin.root,
             environment=(("ASH_PLUGIN_ROOT", str(plugin.root)),),
+            source_root=plugin.root,
         )
         for plugin in plugins
         for path in plugin.mcp_paths()
@@ -547,6 +583,9 @@ def build_runtime(
         if name in mcp_configs:
             raise ValueError(f"duplicate MCP server name: {name}")
         mcp_configs[name] = mcp_config
+    validate_mcp_server_count(mcp_configs)
+    for mcp_config in mcp_configs.values():
+        mcp_config.ensure_source_current()
 
     supports_interactions = bool(getattr(ui, "supports_mcp_interactions", False))
     if mcp_sampling_review is None and supports_interactions:
@@ -574,84 +613,116 @@ def build_runtime(
         sampling_max_tokens=config.mcp_sampling_max_tokens,
     )
 
-    loop = AshLoop(
-        session_store=store,
-        provider=active_provider,
-        safety_guard=guard,
-        ui=ui,
-        project_root=config.workspace_root,
-        repo_map=repo_map,
-        tools=tools,
-        hooks=hooks,
-        additional_instructions=instructions,
-        additional_instructions_loader=load_runtime_instructions,
-        instruction_scope_directories=(instruction_current_directory,),
-        config=config,
-        max_steering_messages=config.steering_queue_limit,
-        planner=Planner(active_provider) if config.enable_sprint_planning else None,
-        enable_sprint_planning=config.enable_sprint_planning,
-        safety_tier=config.safety_tier,
-        on_tool_approval=approval_callback,
-        mcp_configs=mcp_configs,
-        mcp_interactions=mcp_interactions,
-        enable_semantic_memory=config.memory_backend != "off",
-        memory_backend=config.memory_backend,
-        embedding_provider=config.embedding_provider,
-        openai_api_key=config.openai_api_key,
-        onnx_model_path=config.onnx_model_path,
-        chroma_persist_dir=_memory_persist_directory(config),
-        auto_index_memory=trusted and config.memory_auto_index,
-        auto_index_max_files=config.memory_auto_index_max_files,
-        auto_index_max_bytes_per_file=config.memory_auto_index_max_bytes_per_file,
-    )
-    loop.permission_policy.set_persistent_rules(rules)
-    loop.notify_permission_rules_changed(
-        source="runtime_startup",
-        rule_count=len(rules),
-    )
-    loop.permission_policy.set_managed_rules(managed)
-    spawn_agent_tool = tools.get("spawn_agent")
-    set_policy_provider = getattr(
-        spawn_agent_tool, "set_permission_policy_provider", None
-    )
-    if callable(set_policy_provider):
-        set_policy_provider(lambda: loop.permission_policy)
-    set_foreground_broker = getattr(
-        spawn_agent_tool, "set_foreground_approval_broker", None
-    )
-    if callable(set_foreground_broker) and approval_callback is not None:
-
-        async def approve_foreground_subagent(
-            agent_id: str, tool_name: str, arguments: dict[str, Any]
-        ) -> bool:
-            del agent_id
-            return await approval_callback(tool_name, arguments)
-
-        set_foreground_broker(approve_foreground_subagent)
-    hooks.set_event_sink(loop._emit_event)
-    def checkpoint_context() -> tuple[str, str, str] | None:
-        if loop.current_session is None or loop.turn_context is None:
-            return None
-        return (
-            loop.current_session.session_id,
-            loop.turn_context.turn_id,
-            str(loop.turn_context.get("tool_call_id", "")),
-        )
-
-    loop.tool_middlewares.append(
-        FileCheckpointMiddleware(store, guard, checkpoint_context)
-    )
-    if lsp_manager is not None:
-        from ash.lsp.middleware import LSPDiagnosticsMiddleware
-
-        loop.tool_middlewares.append(LSPDiagnosticsMiddleware(lsp_manager, guard))
-    loop.tool_middlewares.append(SecretRedactionMiddleware())
-    return RuntimeComponents(
-        loop=loop,
-        provider=active_provider,
-        session_store=store,
-        safety_guard=guard,
+    startup_rollback: list[Callable[[], None]] = []
+    tools = build_tools(
+        guard,
+        config.workspace_root,
         sandbox_manager=sandbox,
-        workspace_trusted=trusted,
-        plugins=tuple(plugins),
+        allow_project_extensions=trusted,
+        provider_factory=(
+            agent_provider_factory
+            if agent_provider_factory is not None
+            else lambda: get_provider_registry().build(config)
+        ),
+        provider_factory_config_backed=agent_provider_factory is None,
+        agent_db_path=config.db_directory / "agents.db",
+        allowed_web_domains=config.allowed_web_domains,
+        repo_map=repo_map,
+        runtime_config=config,
+        active_plugins=plugins,
+        lsp_manager=lsp_manager,
+        _startup_rollback=startup_rollback,
     )
+
+    try:
+        loop = AshLoop(
+            session_store=store,
+            provider=active_provider,
+            provider_factory=selected_provider_factory,
+            safety_guard=guard,
+            ui=ui,
+            project_root=config.workspace_root,
+            repo_map=repo_map,
+            tools=tools,
+            hooks=hooks,
+            additional_instructions=instructions,
+            additional_instructions_loader=load_runtime_instructions,
+            instruction_scope_directories=(instruction_current_directory,),
+            config=config,
+            max_steering_messages=config.steering_queue_limit,
+            planner=Planner(active_provider) if config.enable_sprint_planning else None,
+            enable_sprint_planning=config.enable_sprint_planning,
+            safety_tier=config.safety_tier,
+            on_tool_approval=approval_callback,
+            mcp_configs=mcp_configs,
+            mcp_interactions=mcp_interactions,
+            enable_project_memory=config.memory_backend != "off",
+            embedding_provider=config.embedding_provider,
+            openai_api_key=config.openai_api_key,
+            onnx_model_path=config.onnx_model_path,
+            memory_db_path=_memory_database_path(config),
+            auto_index_memory=trusted and config.memory_auto_index,
+            auto_index_max_files=config.memory_auto_index_max_files,
+            auto_index_max_bytes_per_file=config.memory_auto_index_max_bytes_per_file,
+        )
+    except BaseException as primary_error:
+        _rollback_startup_owners(startup_rollback, primary_error)
+        raise
+    try:
+        loop.permission_policy.set_persistent_rules(rules)
+        loop.notify_permission_rules_changed(
+            source="runtime_startup",
+            rule_count=len(rules),
+        )
+        loop.permission_policy.set_managed_rules(managed)
+        spawn_agent_tool = tools.get("spawn_agent")
+        set_policy_provider = getattr(
+            spawn_agent_tool, "set_permission_policy_provider", None
+        )
+        if callable(set_policy_provider):
+            set_policy_provider(lambda: loop.permission_policy)
+        set_foreground_broker = getattr(
+            spawn_agent_tool, "set_foreground_approval_broker", None
+        )
+        if callable(set_foreground_broker) and approval_callback is not None:
+
+            async def approve_foreground_subagent(
+                agent_id: str, tool_name: str, arguments: dict[str, Any]
+            ) -> bool:
+                del agent_id
+                return await approval_callback(tool_name, arguments)
+
+            set_foreground_broker(approve_foreground_subagent)
+        hooks.set_event_sink(loop._emit_event)
+
+        def checkpoint_context() -> tuple[str, str, str] | None:
+            if loop.current_session is None or loop.turn_context is None:
+                return None
+            return (
+                loop.current_session.session_id,
+                loop.turn_context.turn_id,
+                str(loop.turn_context.get("tool_call_id", "")),
+            )
+
+        loop.tool_middlewares.append(
+            FileCheckpointMiddleware(store, guard, checkpoint_context)
+        )
+        if lsp_manager is not None:
+            from ash.lsp.middleware import LSPDiagnosticsMiddleware
+
+            loop.tool_middlewares.append(LSPDiagnosticsMiddleware(lsp_manager, guard))
+        loop.tool_middlewares.append(SecretRedactionMiddleware())
+        runtime = RuntimeComponents(
+            loop=loop,
+            provider=active_provider,
+            session_store=store,
+            safety_guard=guard,
+            sandbox_manager=sandbox,
+            workspace_trusted=trusted,
+            plugins=tuple(plugins),
+        )
+    except BaseException as primary_error:
+        _rollback_startup_owners(startup_rollback, primary_error)
+        raise
+    startup_rollback.clear()
+    return runtime

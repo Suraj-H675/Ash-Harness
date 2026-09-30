@@ -16,6 +16,7 @@ from ash.core.redaction import redact_text
 HookResult = str | None
 HookCallbackResult = str | Awaitable[str] | None
 MAX_INJECTED_CONTEXT_CHARS = 64 * 1024
+MAX_HOOKS_PER_EVENT = 32
 HookEvent = Literal[
     "session_end",
     "turn_start",
@@ -131,16 +132,35 @@ class HookRegistry:
         self._event_sink: Callable[[dict[str, Any]], None] | None = None
 
     def register_pre_tool(self, hook: PreToolUseHook) -> None:
+        if len(self._pre_tool) >= MAX_HOOKS_PER_EVENT:
+            raise ValueError(
+                f"hook event 'pre_tool' exceeds {MAX_HOOKS_PER_EVENT} registered hooks"
+            )
         self._pre_tool.append(hook)
 
     def register_post_tool(self, hook: PostToolUseHook) -> None:
+        if len(self._post_tool) >= MAX_HOOKS_PER_EVENT:
+            raise ValueError(
+                f"hook event 'post_tool' exceeds {MAX_HOOKS_PER_EVENT} registered hooks"
+            )
         self._post_tool.append(hook)
 
     def register_session_start(self, hook: SessionStartHook) -> None:
+        if len(self._session_start) >= MAX_HOOKS_PER_EVENT:
+            raise ValueError(
+                "hook event 'session_start' exceeds "
+                f"{MAX_HOOKS_PER_EVENT} registered hooks"
+            )
         self._session_start.append(hook)
 
     def register_lifecycle(self, hook: LifecycleHook) -> None:
-        self._lifecycle.setdefault(hook.event, []).append(hook)
+        hooks = self._lifecycle.setdefault(hook.event, [])
+        if len(hooks) >= MAX_HOOKS_PER_EVENT:
+            raise ValueError(
+                f"hook event {hook.event!r} exceeds "
+                f"{MAX_HOOKS_PER_EVENT} registered hooks"
+            )
+        hooks.append(hook)
 
     def set_event_sink(self, sink: Callable[[dict[str, Any]], None] | None) -> None:
         self._event_sink = sink

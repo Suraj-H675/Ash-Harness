@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "ash-v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          python-version: "3.12"
+
+      - name: Verify release tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          payload = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          version = payload["project"]["version"]
+          expected = f"ash-v{version}"
+          actual = os.environ["RELEASE_TAG"]
+          if actual != expected:
+              raise SystemExit(
+                  f"release tag {actual!r} does not match package version {expected!r}"
+              )
+          PY
+
+      - run: uv lock --check
+      - run: uv audit --preview-features audit-command --locked
+      - run: uv sync --locked --group dev --extra server --extra browser --extra acp --extra a2a --extra local-embeddings
+      - run: uv run --locked ruff check src tests
+      - run: uv run --locked mypy src/ash
+      - run: uv run --locked pytest -q --timeout=120 --timeout-method=thread
+
+      - name: Build release artifacts from a fresh sdist
+        shell: bash
+        run: |
+          uv build --sdist --out-dir dist --clear
+          sdist="$(printf '%s\n' dist/*.tar.gz)"
+          uv build --wheel "$sdist" --out-dir dist
+          cp src/ash/installer.py dist/install-ash.py
+          sha256sum dist/* > dist/SHA256SUMS
+
+      - name: Verify release artifacts
+        shell: bash
+        run: |
+          uv venv .release-smoke --python 3.12
+          uv pip install --python .release-smoke dist/*.whl
+          .release-smoke/bin/python tests/packaging/smoke_minimal_install.py
+          uv run --python 3.10 --no-project python -I tests/packaging/smoke_standalone_installer_py310.py
+          sha256sum --check dist/SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/install-ash.py
+            dist/SHA256SUMS
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.whl \
+            dist/*.tar.gz \
+            dist/install-ash.py \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME" \
+            --draft
+
+      - name: Publish and verify immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -eu
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+          immutable="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              --jq '.immutable'
+          )"
+          if [ "$immutable" != "true" ]; then
+            gh release delete "$GITHUB_REF_NAME" --yes
+            echo >&2 "Release immutability is not enabled for this repository."
+            echo >&2 "The mutable release was deleted; enable immutable releases before retrying."
+            exit 1
+          fi

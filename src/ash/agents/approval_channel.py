@@ -19,8 +19,30 @@ APPROVAL_PROTOCOL_VERSION = 1
 MAX_APPROVAL_MESSAGE_BYTES = 10 * 1024 * 1024
 MAX_APPROVAL_RULE_DELTAS = 64
 MAX_APPROVAL_CONNECTIONS = 8
+MAX_APPROVAL_REQUESTS_PER_ATTEMPT = 1024
 APPROVAL_AUTH_TIMEOUT_SECONDS = 5.0
 _APPROVAL_CATEGORIES = frozenset({"session_rules", "persistent_rules"})
+
+
+async def _settle_approval_cleanup_task(
+    task: asyncio.Task[None],
+) -> tuple[BaseException | None, bool]:
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, interrupted
+    return None, interrupted
 
 
 class ApprovalChannelError(RuntimeError):
@@ -149,6 +171,7 @@ class ForegroundApprovalServer:
         self._request_lock = asyncio.Lock()
         self._connections: set[asyncio.StreamWriter] = set()
         self._handler_tasks: set[asyncio.Task[Any]] = set()
+        self._close_task: asyncio.Task[None] | None = None
 
     async def start(self) -> ApprovalEndpoint:
         if self._server is not None:
@@ -177,18 +200,42 @@ class ForegroundApprovalServer:
         )
 
     async def aclose(self) -> None:
+        if self._close_task is None or (
+            self._close_task.done() and self._server is not None
+        ):
+            caller = asyncio.current_task()
+            self._close_task = asyncio.create_task(
+                self._close_owned(exclude_task=caller),
+                name="ash-subagent-approval-close",
+            )
+        cleanup_error, interrupted = await _settle_approval_cleanup_task(
+            self._close_task
+        )
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if cleanup_error is not None:
+                cancellation.add_note(
+                    f"subagent approval cleanup failed: {cleanup_error}"
+                )
+            raise cancellation from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    async def _close_owned(
+        self,
+        *,
+        exclude_task: asyncio.Task[Any] | None,
+    ) -> None:
         server = self._server
-        self._server = None
         if server is not None:
             server.close()
         writers = list(self._connections)
         for writer in writers:
             writer.close()
-        current = asyncio.current_task()
         handlers = [
             task
             for task in self._handler_tasks
-            if task is not current and not task.done()
+            if task is not exclude_task and not task.done()
         ]
         for task in handlers:
             task.cancel()
@@ -198,6 +245,8 @@ class ForegroundApprovalServer:
             await asyncio.sleep(0)
         if server is not None:
             await server.wait_closed()
+            if self._server is server:
+                self._server = None
 
     async def _handle_connection(
         self,
@@ -255,6 +304,8 @@ class ForegroundApprovalServer:
             async with self._request_lock:
                 if request_id in self._seen_request_ids:
                     return
+                if len(self._seen_request_ids) >= MAX_APPROVAL_REQUESTS_PER_ATTEMPT:
+                    return
                 self._seen_request_ids.add(request_id)
                 decision = await self._handler(tool_name, arguments)
             response = {
@@ -307,6 +358,7 @@ async def request_foreground_approval(
         )
     except OSError as exc:
         raise ApprovalChannelError("subagent approval channel is unavailable") from exc
+    primary_error: BaseException | None = None
     try:
         writer.write(_encode_message(request))
         await writer.drain()
@@ -362,10 +414,52 @@ async def request_foreground_approval(
             rules=tuple(rules),
         )
     except (BrokenPipeError, ConnectionResetError) as exc:
-        raise ApprovalChannelError("subagent approval channel was interrupted") from exc
+        primary_error = ApprovalChannelError(
+            "subagent approval channel was interrupted"
+        )
+        raise primary_error from exc
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except (ConnectionError, OSError):
-            pass
+        async def close_writer() -> None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+        close_task = asyncio.create_task(
+            close_writer(),
+            name="ash-subagent-approval-client-close",
+        )
+        cleanup_error, interrupted = await _settle_approval_cleanup_task(close_task)
+        if primary_error is not None:
+            if cleanup_error is not None:
+                primary_error.add_note("subagent approval client cleanup failed")
+            if interrupted:
+                if isinstance(primary_error, asyncio.CancelledError):
+                    primary_error.add_note(
+                        "subagent approval client cleanup was interrupted"
+                    )
+                else:
+                    cancellation = asyncio.CancelledError()
+                    cancellation.add_note(
+                        "subagent approval request failed before client cleanup "
+                        "was cancelled"
+                    )
+                    if cleanup_error is not None:
+                        cancellation.add_note(
+                            "subagent approval client cleanup also failed"
+                        )
+                    raise cancellation from primary_error
+        else:
+            if interrupted:
+                cancellation = asyncio.CancelledError()
+                if cleanup_error is not None:
+                    cancellation.add_note(
+                        "subagent approval client cleanup also failed"
+                    )
+                raise cancellation from cleanup_error
+            if cleanup_error is not None:
+                raise cleanup_error

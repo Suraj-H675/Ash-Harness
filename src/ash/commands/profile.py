@@ -8,7 +8,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
-from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.profiles import (
     DEFAULT_PROFILE,
     _read_active_profile_from_directory,

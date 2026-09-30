@@ -15,6 +15,7 @@ from ash.tools.web import _host_allowed, _resolve_public_addresses
 
 MAX_PROXY_HEADER_BYTES = 64 * 1024
 PROXY_READ_CHUNK_BYTES = 64 * 1024
+MAX_BROWSER_PROXY_CONNECTIONS = 256
 LOOPBACK_PROXY_BYPASS_RULE = "<-loopback>"
 
 
@@ -65,11 +66,15 @@ class BrowserPolicyProxy:
         timeout_seconds: float,
         resolver: Resolver | None = None,
         connector: Connector | None = None,
+        max_connections: int = MAX_BROWSER_PROXY_CONNECTIONS,
     ) -> None:
+        if not 1 <= max_connections <= 4096:
+            raise ValueError("browser proxy connection limit must be between 1 and 4096")
         self.allowed_domains = allowed_domains
         self.timeout_seconds = timeout_seconds
         self._resolver = resolver or _resolve_public_addresses
         self._connector = connector or self._connect_numeric
+        self._max_connections = max_connections
         self._server: asyncio.AbstractServer | None = None
         self._connection_tasks: set[asyncio.Task[None]] = set()
         self._writers: set[asyncio.StreamWriter] = set()
@@ -165,6 +170,9 @@ class BrowserPolicyProxy:
         writer: asyncio.StreamWriter,
     ) -> None:
         if self._closed:
+            writer.close()
+            return
+        if len(self._connection_tasks) >= self._max_connections:
             writer.close()
             return
         self._writers.add(writer)

@@ -187,6 +187,47 @@ def test_pull_reports_spawn_failure_without_traceback(monkeypatch, capsys):
     assert "could not start ollama pull" in capsys.readouterr().err
 
 
+def test_pull_cleans_process_tree_after_unexpected_output_failure(monkeypatch):
+    from ash.commands import ollama
+
+    class FailingStdout:
+        async def read(self, size):
+            del size
+            raise RuntimeError("stdout reader failed")
+
+    class FakeProcess:
+        stdout = FailingStdout()
+        returncode = None
+
+        async def wait(self):
+            return self.returncode
+
+    process = FakeProcess()
+    cleaned = False
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    async def cleanup(target, *, plan=None, grace_seconds=1.0):
+        nonlocal cleaned
+        del plan, grace_seconds
+        assert target is process
+        cleaned = True
+        return None, False
+
+    monkeypatch.setattr(
+        ollama, "resolve_host_executable", lambda *args, **kwargs: "/usr/bin/ollama"
+    )
+    monkeypatch.setattr(ollama.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(ollama, "settle_process_tree_after_cancellation", cleanup)
+
+    with pytest.raises(RuntimeError, match="stdout reader failed"):
+        asyncio.run(ollama.pull_model("test-model"))
+
+    assert cleaned is True
+
+
 def test_pull_rejects_workspace_shadowed_ollama(tmp_path, monkeypatch, capsys):
     from ash.commands import ollama
 

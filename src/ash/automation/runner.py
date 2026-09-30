@@ -14,6 +14,7 @@ from typing import Any
 
 from ash.config import AshConfig
 from ash.core.redaction import redact_text
+from ash.json_utils import strict_json_loads
 from ash.safety.trust import is_workspace_trusted
 from ash.sdk import AshClient
 from ash.safe_io import read_bounded_text
@@ -111,17 +112,29 @@ async def _execute(request: dict[str, Any]) -> dict[str, Any]:
         workspace_trusted=True,
         run_maintenance=False,
     )
+    primary_error: BaseException | None = None
     try:
         result = await client.prompt(prompt, user_metadata=metadata)
         return {"ok": True, "result": asdict(result)}
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        await client.close()
+        try:
+            await client.close()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                "automation client cleanup failed: "
+                + redact_text(str(cleanup_error))
+            )
 
 
 def main() -> int:
     try:
         _arm_parent_lifeline()
-        request = json.loads(
+        request = strict_json_loads(
             read_bounded_text(
                 sys.stdin,
                 MAX_AUTOMATION_REQUEST_BYTES,
@@ -135,8 +148,27 @@ def main() -> int:
     except BaseException as exc:  # child must always answer the parent protocol
         payload = {"ok": False, "error": redact_text(str(exc))}
         exit_code = 1
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        payload = {
+            "ok": False,
+            "error": "automation subprocess produced a non-JSON result",
+        }
+        exit_code = 1
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
     print(
-        _RESULT_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        _RESULT_PREFIX + encoded,
         flush=True,
     )
     return exit_code

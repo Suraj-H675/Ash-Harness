@@ -13,9 +13,15 @@ from ash.agents.worktree import WorktreeManager
 from ash.safe_io import strict_json_loads
 
 
-def list_agent_statuses(db_path: str | Path) -> list[dict[str, Any]]:
-    state = SharedState(db_path)
-    try:
+MAX_AGENT_TASK_LIST_PAYLOAD_BYTES = 8 * 1024 * 1024
+
+
+def list_agent_statuses(
+    db_path: str | Path,
+    *,
+    workspace: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    with SharedState(db_path, workspace=workspace) as state:
         return [
             {
                 **asdict(status),
@@ -23,15 +29,17 @@ def list_agent_statuses(db_path: str | Path) -> list[dict[str, Any]]:
             }
             for status in state.list_agents()
         ]
-    finally:
-        state.close()
 
 
-def list_agent_reports(db_path: str | Path, *, limit: int = 20) -> list[dict[str, Any]]:
+def list_agent_reports(
+    db_path: str | Path,
+    *,
+    limit: int = 20,
+    workspace: str | Path | None = None,
+) -> list[dict[str, Any]]:
     if limit < 1:
         raise ValueError("limit must be positive")
-    state = SharedState(db_path)
-    try:
+    with SharedState(db_path, workspace=workspace) as state:
         return [
             {
                 "message_id": message.message_id,
@@ -46,22 +54,28 @@ def list_agent_reports(db_path: str | Path, *, limit: int = 20) -> list[dict[str
             )
             if message.message_type == "agent_report"
         ]
-    finally:
-        state.close()
 
 
 def list_agent_tasks(
     db_path: str | Path,
     *,
+    workspace: str | Path | None = None,
     task_state: TaskState | None = None,
     owner_agent_id: str | None = None,
     graph_id: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    state = SharedState(db_path)
-    try:
-        return [
-            {
+    with SharedState(db_path, workspace=workspace) as state:
+        payloads: list[dict[str, Any]] = []
+        payload_bytes = 0
+        for task in state.tasks.list_tasks(
+            state=task_state,
+            owner_agent_id=owner_agent_id,
+            graph_id=graph_id,
+            workspace=workspace,
+            limit=limit,
+        ):
+            payload = {
                 **asdict(task),
                 "lease_expires_at": (
                     task.lease_expires_at.isoformat()
@@ -75,44 +89,55 @@ def list_agent_tasks(
                         **asdict(artifact),
                         "created_at": artifact.created_at.isoformat(),
                     }
-                    for artifact in state.tasks.list_artifacts(task.task_id)
+                    for artifact in state.tasks.list_artifacts(
+                        task.task_id,
+                        workspace=workspace,
+                    )
                 ],
             }
-            for task in state.tasks.list_tasks(
-                state=task_state,
-                owner_agent_id=owner_agent_id,
-                graph_id=graph_id,
-                limit=limit,
-            )
-        ]
-    finally:
-        state.close()
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+                default=str,
+            ).encode("utf-8")
+            payload_bytes += len(encoded)
+            if payload_bytes > MAX_AGENT_TASK_LIST_PAYLOAD_BYTES:
+                raise ValueError(
+                    "agent task listing exceeds the 8 MiB payload limit"
+                )
+            payloads.append(payload)
+        return payloads
 
 
 def cancel_agent_graph(
     db_path: str | Path,
     *,
+    workspace: str | Path | None = None,
     graph_id: str,
     reason: str = "cancelled by operator",
 ) -> dict[str, Any]:
-    state = SharedState(db_path)
-    try:
-        task_ids = state.tasks.cancel_graph(graph_id, reason=reason)
+    with SharedState(db_path, workspace=workspace) as state:
+        task_ids = state.tasks.cancel_graph(
+            graph_id,
+            reason=reason,
+            workspace=workspace,
+        )
         return {"graph_id": graph_id, "task_ids": task_ids, "reason": reason}
-    finally:
-        state.close()
 
 
 def list_agent_task_events(
     db_path: str | Path,
     *,
+    workspace: str | Path | None = None,
     task_id: str | None = None,
     event_type: str | None = None,
     after_sequence: int = 0,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    state = SharedState(db_path)
-    try:
+    with SharedState(db_path, workspace=workspace) as state:
         return [
             {
                 "sequence": item.sequence,
@@ -122,25 +147,24 @@ def list_agent_task_events(
             for item in state.tasks.list_events(
                 task_id=task_id,
                 event_type=event_type,
+                workspace=workspace,
                 after_sequence=after_sequence,
                 limit=limit,
             )
         ]
-    finally:
-        state.close()
 
 
 def list_agent_messages(
     db_path: str | Path,
     *,
+    workspace: str | Path | None = None,
     recipient_id: str = "lead",
     undelivered_only: bool = True,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     if limit < 1:
         raise ValueError("limit must be positive")
-    state = SharedState(db_path)
-    try:
+    with SharedState(db_path, workspace=workspace) as state:
         return [
             {
                 "message_id": message.message_id,
@@ -157,20 +181,18 @@ def list_agent_messages(
                 limit=limit,
             )
         ]
-    finally:
-        state.close()
 
 
 def list_agent_approvals(
     db_path: str | Path,
     *,
+    workspace: str | Path | None = None,
     pending_only: bool = True,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     if limit < 1:
         raise ValueError("limit must be positive")
-    state = SharedState(db_path)
-    try:
+    with SharedState(db_path, workspace=workspace) as state:
         approvals: list[dict[str, Any]] = []
         for message in state.fetch_messages(
             "lead",
@@ -182,7 +204,11 @@ def list_agent_approvals(
             task_id = content.get("task_id")
             attempt = content.get("attempt")
             agent_id = content.get("agent_id")
-            task = state.tasks.get_task(task_id) if isinstance(task_id, str) else None
+            task = (
+                state.tasks.get_task(task_id, workspace=workspace)
+                if isinstance(task_id, str)
+                else None
+            )
             active = bool(
                 not message.delivered
                 and task is not None
@@ -206,33 +232,30 @@ def list_agent_approvals(
                 }
             )
         return approvals
-    finally:
-        state.close()
 
 
 def resolve_agent_approval(
     db_path: str | Path,
     *,
+    workspace: str | Path | None = None,
     request_id: int,
     approved: bool,
     feedback: str = "",
     resolver_id: str = "lead",
 ) -> dict[str, Any]:
-    state = SharedState(db_path)
-    try:
+    with SharedState(db_path, workspace=workspace) as state:
         return state.resolve_approval_request(
             request_id,
             approved=approved,
             feedback=feedback,
             resolver_id=resolver_id,
         )
-    finally:
-        state.close()
 
 
 def send_agent_message(
     db_path: str | Path,
     *,
+    workspace: str | Path | None = None,
     recipient_id: str,
     content: str,
     sender_id: str = "lead",
@@ -250,8 +273,7 @@ def send_agent_message(
     if not message_type:
         raise ValueError("message type must not be empty")
 
-    state = SharedState(db_path)
-    try:
+    with SharedState(db_path, workspace=workspace) as state:
         if require_registered and state.get_status(recipient_id) is None:
             raise ValueError(
                 f"recipient {recipient_id!r} is not registered; use --force to queue anyway"
@@ -294,8 +316,6 @@ def send_agent_message(
             "message_type": message_type,
             "content": payload,
         }
-    finally:
-        state.close()
 
 
 def render_agent_statuses(

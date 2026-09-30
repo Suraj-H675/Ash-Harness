@@ -21,7 +21,7 @@ from ash.plugins.manifest import (
     PluginToolManifest,
     namespaced_plugin_tool_name,
 )
-from ash.plugins.anchored_fs import (
+from ash.safety.anchored_fs import (
     AnchoredDirectory,
     AnchoredFilesystemError,
     supports_anchored_mutation,
@@ -59,6 +59,7 @@ from ash.tools.base import (
 MAX_PLUGIN_MESSAGE_BYTES = 1024 * 1024
 MAX_PLUGIN_STDERR_BYTES = 64 * 1024
 MAX_PLUGIN_RESULT_TEXT_BYTES = 768 * 1024
+MAX_TOTAL_PLUGIN_RUNTIME_TOOLS = 256
 
 
 class PluginRuntimeError(RuntimeError):
@@ -153,16 +154,34 @@ class PluginHostClient:
                     )
                 raise
             except PluginRuntimeError as primary:
-                try:
-                    await self._discard_process()
-                except PluginRuntimeError as cleanup_error:
+                cleanup_task = asyncio.create_task(self._discard_process())
+                cleanup_error, cleanup_cancelled = (
+                    await _settle_task_after_cancellation(cleanup_task)
+                )
+                if cleanup_error is not None:
                     primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+                if cleanup_cancelled:
+                    cancel_exc = asyncio.CancelledError()
+                    if cleanup_error is not None:
+                        cancel_exc.add_note(
+                            f"Process-tree cleanup failed: {cleanup_error}"
+                        )
+                    raise cancel_exc from primary
                 raise
             except Exception as primary:  # noqa: BLE001
-                try:
-                    await self._discard_process()
-                except PluginRuntimeError as cleanup_error:
+                cleanup_task = asyncio.create_task(self._discard_process())
+                cleanup_error, cleanup_cancelled = (
+                    await _settle_task_after_cancellation(cleanup_task)
+                )
+                if cleanup_error is not None:
                     primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+                if cleanup_cancelled:
+                    cancel_exc = asyncio.CancelledError()
+                    if cleanup_error is not None:
+                        cancel_exc.add_note(
+                            f"Process-tree cleanup failed: {cleanup_error}"
+                        )
+                    raise cancel_exc from primary
                 raise PluginRuntimeError(str(primary)) from primary
 
     async def aclose(self) -> None:
@@ -218,10 +237,12 @@ class PluginHostClient:
         self._stderr_size = 0
         env = _plugin_environment()
         try:
-            if (
-                self.sandbox_manager.backend_name == "docker"
-                and supports_anchored_mutation()
-            ):
+            if self.sandbox_manager.backend_name == "docker":
+                if not supports_anchored_mutation():
+                    raise PluginRuntimeError(
+                        "descriptor-anchored Docker plugin staging is unavailable; "
+                        "refusing a live host bind for executable plugin code"
+                    )
                 self._docker_workspace_volume = (
                     await self._stage_docker_plugin_workspace()
                 )
@@ -348,10 +369,8 @@ class PluginHostClient:
             ) from exc
         try:
             with tempfile.TemporaryFile(prefix="ash-plugin-runtime-") as archive:
-                getuid: Any = getattr(os, "getuid", None)
-                getgid: Any = getattr(os, "getgid", None)
-                uid = int(getuid()) if sys.platform != "win32" and callable(getuid) else 0
-                gid = int(getgid()) if sys.platform != "win32" and callable(getgid) else 0
+                uid = os.getuid()
+                gid = os.getgid()
                 archive_stream = cast(BinaryIO, archive)
                 snapshot.write_tar(archive_stream, uid=uid, gid=gid)
                 archive_stream.flush()
@@ -545,6 +564,9 @@ class PluginRuntimeTool(BaseTool):
     def json_schema(self) -> dict[str, Any]:
         return self.declaration.input_schema
 
+    def search_schema(self) -> dict[str, Any]:
+        return self.declaration.input_schema
+
     async def run(self, **kwargs: Any) -> ToolResult:
         try:
             self._validator.validate(kwargs)
@@ -574,13 +596,27 @@ def build_plugin_runtime_tools(
     *,
     backend_preference: str,
     docker_image: str,
+    docker_memory_mb: int = 4096,
+    docker_cpus: float = 2.0,
     allow_unisolated: bool,
 ) -> list[PluginRuntimeTool]:
     """Create lazy proxies without executing plugin code during discovery."""
 
+    total_tools = 0
+    for plugin in plugins:
+        plugin.ensure_current()
+        if plugin.manifest.runtime is not None:
+            total_tools += len(plugin.manifest.tools)
+    if total_tools > MAX_TOTAL_PLUGIN_RUNTIME_TOOLS:
+        raise ValueError(
+            "active plugins declare too many executable tools: "
+            f"{total_tools} > {MAX_TOTAL_PLUGIN_RUNTIME_TOOLS}"
+        )
+
     tools: list[PluginRuntimeTool] = []
     seen: set[str] = set()
     for plugin in plugins:
+        plugin.ensure_current()
         if plugin.manifest.runtime is None:
             continue
         manager = SandboxManager(
@@ -591,6 +627,8 @@ def build_plugin_runtime_tools(
             timeout_seconds=max(1, int(plugin.manifest.runtime.timeout_seconds)),
             backend_preference=backend_preference,
             docker_image=docker_image,
+            docker_memory_mb=docker_memory_mb,
+            docker_cpus=docker_cpus,
         )
         client = PluginHostClient(
             plugin,

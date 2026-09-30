@@ -5,6 +5,9 @@ import pytest
 from ash.cli import _build_tools
 from ash.plugins.skills import (
     MAX_SKILL_BYTES,
+    MAX_SKILL_FRONTMATTER_BYTES,
+    MAX_SKILL_YAML_DEPTH,
+    MAX_SKILL_YAML_NODES,
     ActivateSkillTool,
     ListSkillsTool,
     ReadSkillResourceTool,
@@ -137,6 +140,60 @@ def test_instruction_skill_rejects_duplicate_frontmatter_keys(tmp_path: Path) ->
         parse_instruction_skill(path)
 
 
+def test_instruction_skill_rejects_yaml_aliases(tmp_path: Path) -> None:
+    path = _write_skill(
+        tmp_path,
+        "review",
+        extra_frontmatter=(
+            "metadata:\n"
+            "  author: &author ash\n"
+            "  copied: *author\n"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="YAML aliases are not allowed"):
+        parse_instruction_skill(path)
+
+
+def test_instruction_skill_rejects_excessive_yaml_depth(tmp_path: Path) -> None:
+    nested = ""
+    for index in range(MAX_SKILL_YAML_DEPTH + 5):
+        nested += ("  " * index) + f"level{index}:\n"
+    nested += ("  " * (MAX_SKILL_YAML_DEPTH + 5)) + "value: terminal\n"
+    path = _write_skill(
+        tmp_path,
+        "review",
+        extra_frontmatter="extra:\n" + nested,
+    )
+
+    with pytest.raises(ValueError, match="maximum nesting depth"):
+        parse_instruction_skill(path)
+
+
+def test_instruction_skill_rejects_excessive_yaml_nodes(tmp_path: Path) -> None:
+    items = ",".join("x" for _ in range(MAX_SKILL_YAML_NODES + 10))
+    path = _write_skill(
+        tmp_path,
+        "review",
+        extra_frontmatter=f"extra: [{items}]\n",
+    )
+
+    with pytest.raises(ValueError, match="maximum node count"):
+        parse_instruction_skill(path)
+
+
+def test_instruction_skill_rejects_oversized_frontmatter(tmp_path: Path) -> None:
+    padding = "x" * (MAX_SKILL_FRONTMATTER_BYTES + 1)
+    path = _write_skill(
+        tmp_path,
+        "review",
+        extra_frontmatter=f"padding: {padding}\n",
+    )
+
+    with pytest.raises(ValueError, match="frontmatter exceeds 64 KiB"):
+        parse_instruction_skill(path)
+
+
 def test_instruction_skill_parses_standard_optional_metadata(tmp_path) -> None:
     path = _write_skill(
         tmp_path,
@@ -170,6 +227,35 @@ def test_instruction_skill_discovery_rejects_oversized_file(tmp_path) -> None:
 
     assert catalog.discover() == []
     assert "exceeds 512 KiB" in catalog.errors[str(path)]
+
+
+def test_instruction_skill_rejects_link_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_skill(tmp_path, "review")
+    outside = tmp_path / "outside.md"
+    outside.write_text(
+        "---\nname: review\ndescription: outside\n---\nOutside instructions.\n",
+        encoding="utf-8",
+    )
+    real_is_symlink = Path.is_symlink
+    swapped = False
+
+    def race_link_check(candidate: Path) -> bool:
+        nonlocal swapped
+        result = real_is_symlink(candidate)
+        if candidate == path and not swapped:
+            path.unlink()
+            path.symlink_to(outside)
+            swapped = True
+            return False
+        return result
+
+    monkeypatch.setattr(Path, "is_symlink", race_link_check)
+    with pytest.raises(ValueError, match="symbolic link"):
+        parse_instruction_skill(path)
+    assert swapped is True
 
 
 def test_instruction_skill_source_namespaces_explicit_paths(tmp_path) -> None:
@@ -220,6 +306,139 @@ async def test_skill_resource_reader_is_scoped_to_skill_package(tmp_path) -> Non
     assert result.output == "Detailed guidance"
     assert traversal.success is False
     assert "traversal" in (traversal.error or "")
+
+
+@pytest.mark.asyncio
+async def test_skill_resource_reader_rejects_replaced_workspace_root(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+
+    path = _write_skill(workspace / ".ash" / "skills", "review")
+    original_resource = path.parent / "references" / "guide.md"
+    original_resource.parent.mkdir()
+    original_resource.write_text("original guidance", encoding="utf-8")
+
+    replacement_skill = _write_skill(replacement / ".ash" / "skills", "review")
+    replacement_resource = replacement_skill.parent / "references" / "guide.md"
+    replacement_resource.parent.mkdir()
+    replacement_resource.write_text(
+        "REPLACEMENT_WORKSPACE_SKILL_SECRET",
+        encoding="utf-8",
+    )
+
+    catalog = SkillCatalog((workspace / ".ash" / "skills",))
+    assert [skill.name for skill in catalog.discover()] == ["review"]
+    tool = ReadSkillResourceTool(SafetyGuard(workspace), catalog)
+
+    workspace.rename(saved)
+    replacement.rename(workspace)
+
+    result = await tool.run(name="review", path="references/guide.md")
+
+    assert result.success is False
+    assert "REPLACEMENT_WORKSPACE_SKILL_SECRET" not in result.output
+    assert "project root identity changed" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_skill_resource_reader_rejects_workspace_swap_after_guard_check(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+
+    path = _write_skill(workspace / ".ash" / "skills", "review")
+    original_resource = path.parent / "references" / "guide.md"
+    original_resource.parent.mkdir()
+    original_resource.write_text("original guidance", encoding="utf-8")
+
+    replacement_skill = _write_skill(replacement / ".ash" / "skills", "review")
+    replacement_resource = replacement_skill.parent / "references" / "guide.md"
+    replacement_resource.parent.mkdir()
+    replacement_resource.write_text("POST_GUARD_REPLACEMENT_SECRET", encoding="utf-8")
+
+    catalog = SkillCatalog((workspace / ".ash" / "skills",))
+    assert [skill.name for skill in catalog.discover()] == ["review"]
+    guard = SafetyGuard(workspace)
+    tool = ReadSkillResourceTool(guard, catalog)
+    real_ensure = guard.ensure_project_root_current
+    swapped = False
+
+    def ensure_then_swap():
+        nonlocal swapped
+        result = real_ensure()
+        if not swapped:
+            workspace.rename(saved)
+            replacement.rename(workspace)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(guard, "ensure_project_root_current", ensure_then_swap)
+
+    result = await tool.run(name="review", path="references/guide.md")
+
+    assert swapped is True
+    assert result.success is False
+    assert "POST_GUARD_REPLACEMENT_SECRET" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_skill_catalog_rejects_aba_swapped_manifest_generation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    _write_skill(workspace / ".ash" / "skills", "review")
+    replacement_manifest = _write_skill(
+        replacement / ".ash" / "skills",
+        "review",
+    )
+    replacement_manifest.write_text(
+        "---\n"
+        "name: review\n"
+        "description: REPLACEMENT_SKILL_DESCRIPTION_SECRET\n"
+        "---\n"
+        "REPLACEMENT_SKILL_INSTRUCTION_SECRET\n",
+        encoding="utf-8",
+    )
+
+    catalog = SkillCatalog((workspace / ".ash" / "skills",))
+    guard = SafetyGuard(workspace)
+    tool = ListSkillsTool(guard, catalog)
+    real_discover = catalog.discover
+    swapped = False
+
+    def discover_during_aba():
+        nonlocal swapped
+        workspace.rename(saved)
+        replacement.rename(workspace)
+        try:
+            discovered = real_discover()
+        finally:
+            workspace.rename(replacement)
+            saved.rename(workspace)
+        swapped = True
+        return discovered
+
+    monkeypatch.setattr(catalog, "discover", discover_during_aba)
+
+    result = await tool.run()
+
+    assert swapped is True
+    assert result.success is False
+    assert "REPLACEMENT_SKILL_DESCRIPTION_SECRET" not in result.output
+    assert "skill package identity changed after discovery" in (result.error or "")
 
 
 @pytest.mark.asyncio

@@ -8,10 +8,18 @@ from ash.sdk import AshEvent, AshEventRecord, AshResult
 from ash.core.session import SessionLineage
 from ash.server.http import (
     MAX_HTTP_BODY_BYTES,
+    MAX_HTTP_IN_FLIGHT_TURNS,
     MAX_HTTP_RATE_LIMIT_KEYS,
     SlidingWindowLimiter,
+    TurnRequest,
+    _sse,
     create_app,
 )
+
+
+def test_sse_rejects_non_finite_json_payload() -> None:
+    with pytest.raises(ValueError, match="Out of range float values"):
+        _sse("metric", {"value": float("nan")})
 
 
 class FakeClient:
@@ -117,9 +125,170 @@ async def test_http_server_requires_auth_and_runs_turn() -> None:
             json={"input": "hello"},
             headers={"Authorization": "Bearer 0123456789abcdef"},
         )
-        assert response.status_code == 200
-        assert response.json()["response"] == "HELLO"
-        assert response.json()["usage"]["cache_read_tokens"] == 0
+    assert response.status_code == 200
+    assert response.json()["response"] == "HELLO"
+    assert response.json()["usage"]["cache_read_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_http_bounds_direct_turns_and_keeps_steering_available() -> None:
+    assert MAX_HTTP_IN_FLIGHT_TURNS >= 2
+
+    class BlockingClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prompt_calls = 0
+            self.started = 0
+            self.two_started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def prompt(self, text):
+            self.prompt_calls += 1
+            self.started += 1
+            if self.started == 2:
+                self.two_started.set()
+            await self.release.wait()
+            return AshResult(text.upper(), "session-1", "fake/model", 2)
+
+    client = BlockingClient()
+    app = create_app(
+        client,  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        requests_per_minute=20,
+        max_in_flight_turns=2,
+    )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        first = asyncio.create_task(
+            http.post("/v1/turn", json={"input": "first"}, headers=headers)
+        )
+        second = asyncio.create_task(
+            http.post("/v1/turn", json={"input": "second"}, headers=headers)
+        )
+        try:
+            await asyncio.wait_for(client.two_started.wait(), timeout=1)
+
+            busy = await http.post(
+                "/v1/turn",
+                json={"input": "third"},
+                headers=headers,
+            )
+            assert busy.status_code == 503
+            assert busy.headers["retry-after"] == "1"
+            assert client.prompt_calls == 2
+
+            steer = await http.post(
+                "/v1/turn/steer",
+                json={"input": "change direction"},
+                headers=headers,
+            )
+            assert steer.status_code == 200
+
+            client.release.set()
+            completed = await asyncio.gather(first, second)
+            assert [response.status_code for response in completed] == [200, 200]
+
+            after = await http.post(
+                "/v1/turn",
+                json={"input": "after"},
+                headers=headers,
+            )
+            assert after.status_code == 200
+            assert client.prompt_calls == 3
+        finally:
+            client.release.set()
+            await asyncio.gather(first, second, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_http_unstarted_stream_response_does_not_consume_turn_capacity() -> None:
+    client = FakeClient()
+    app = create_app(
+        client,  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        max_in_flight_turns=1,
+    )
+    stream_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/v1/turn/stream"
+    )
+    turn_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/v1/turn"
+    )
+
+    response = await stream_endpoint(TurnRequest(input="never-started"))
+    close = getattr(response.body_iterator, "aclose", None)
+    if close is not None:
+        await close()
+
+    result = await turn_endpoint(TurnRequest(input="after"))
+
+    assert result["response"] == "AFTER"
+
+
+@pytest.mark.asyncio
+async def test_http_stream_disconnect_releases_turn_capacity() -> None:
+    started = asyncio.Event()
+
+    class BlockingStreamClient(FakeClient):
+        async def stream_prompt(self, text):
+            started.set()
+            yield AshEvent("turn.started", {})
+            await asyncio.Event().wait()
+
+    client = BlockingStreamClient()
+    app = create_app(
+        client,  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        max_in_flight_turns=1,
+    )
+    stream_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/v1/turn/stream"
+    )
+    turn_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/v1/turn"
+    )
+    response = await stream_endpoint(TurnRequest(input="stream"))
+    disconnect = asyncio.Event()
+
+    async def receive():
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            disconnect.set()
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/turn/stream",
+        "raw_path": b"/v1/turn/stream",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+
+    await asyncio.wait_for(response(scope, receive, send), timeout=1)
+    assert started.is_set()
+
+    result = await turn_endpoint(TurnRequest(input="after-disconnect"))
+
+    assert result["response"] == "AFTER-DISCONNECT"
 
 
 @pytest.mark.asyncio
@@ -570,6 +739,28 @@ async def test_http_lifespan_cancels_jsonrpc_notifications_without_owning_client
 
     assert cancelled.is_set()
     assert closed is False
+
+
+@pytest.mark.asyncio
+async def test_http_lifespan_preserves_body_failure_when_shutdown_fails() -> None:
+    class FailingCloseClient(FakeClient):
+        async def close(self) -> None:
+            raise RuntimeError("client close failure")
+
+    app = create_app(
+        FailingCloseClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        close_client_on_shutdown=True,
+    )
+
+    with pytest.raises(RuntimeError, match="lifespan body failure") as captured:
+        async with app.router.lifespan_context(app):
+            raise RuntimeError("lifespan body failure")
+
+    assert any(
+        "HTTP JSON-RPC shutdown cleanup failed" in note
+        for note in captured.value.__notes__
+    )
 
 
 @pytest.mark.asyncio

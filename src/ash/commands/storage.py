@@ -21,9 +21,10 @@ from ash.core.session import (
     exclusive_database_access,
 )
 from ash.core.redaction import redact_text
-from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.safe_io import descriptor_path, open_unlinked_regular_file
 from ash.safety.environment import resolve_host_executable
+from ash.safety.git import read_only_git_args, read_only_git_environment
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.sandbox.process_utils import (
     ProcessTreeUnavailable,
@@ -374,13 +375,23 @@ def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
     database = config.db_directory / "sessions.db"
     check = check_database(database)
     git_revision = _debug_bundle_git_revision(workspace)
+    redacted_database = _debug_bundle_path(database, workspace=workspace)
+    redacted_messages = tuple(
+        _redact_debug_bundle_text(
+            message,
+            workspace=workspace,
+            database=database,
+            redacted_database=redacted_database,
+        )
+        for message in check.messages
+    )
 
     payload = {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "ash": {
             "config_schema_version": config.config_schema_version,
-            "model": config.model,
+            "model": redact_text(config.model),
             "safety_tier": config.safety_tier,
             "memory_backend": config.memory_backend,
             "session_retention_days": config.session_retention_days,
@@ -389,12 +400,13 @@ def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
             "platform": platform.system(),
             "platform_release": platform.release(),
             "python_version": platform.python_version(),
-            "workspace": str(workspace),
+            "workspace": "<workspace>",
             "git_revision": git_revision,
         },
         "storage": {
             **check.as_dict(),
-            "path": str(database),
+            "path": redacted_database,
+            "messages": redacted_messages,
         },
     }
     serialized = json.dumps(payload, indent=2, sort_keys=True)
@@ -464,6 +476,41 @@ def create_debug_bundle(config, destination: str | Path | None = None) -> Path:
     return destination_path
 
 
+def _debug_bundle_path(path: Path, *, workspace: Path) -> str:
+    """Render a diagnostic path without exposing host/user directory identity."""
+
+    resolved = Path(path).expanduser().resolve()
+    workspace_resolved = workspace.expanduser().resolve()
+    try:
+        relative = resolved.relative_to(workspace_resolved)
+    except ValueError:
+        pass
+    else:
+        return "<workspace>" if not relative.parts else f"<workspace>/{relative.as_posix()}"
+
+    home = Path.home().expanduser().resolve()
+    try:
+        relative = resolved.relative_to(home)
+    except ValueError:
+        return f"<external>/{resolved.name}"
+    return "<home>" if not relative.parts else f"<home>/{relative.as_posix()}"
+
+
+def _redact_debug_bundle_text(
+    value: str,
+    *,
+    workspace: Path,
+    database: Path,
+    redacted_database: str,
+) -> str:
+    """Redact secrets and known local paths in one debug-bundle string."""
+
+    redacted = redact_text(value)
+    redacted = redacted.replace(str(workspace), "<workspace>")
+    redacted = redacted.replace(str(Path(database).expanduser().resolve()), redacted_database)
+    return redacted
+
+
 def _debug_bundle_git_revision(workspace: Path) -> str:
     try:
         opened = os.stat(workspace)
@@ -472,8 +519,9 @@ def _debug_bundle_git_revision(workspace: Path) -> str:
         git = resolve_host_executable("git", workspace_root=workspace, cwd=workspace)
         if git is None:
             return ""
+        environment = read_only_git_environment()
         with prepare_scoped_process_launch(
-            [git, "rev-parse", "--short", "HEAD"],
+            [git, *read_only_git_args(["rev-parse", "--short", "HEAD"])],
             cwd=workspace,
             guard=guard,
             expected_cwd_identity=expected_identity,
@@ -487,6 +535,7 @@ def _debug_bundle_git_revision(workspace: Path) -> str:
                     text=True,
                     timeout=2,
                     check=False,
+                    env=environment,
                 )
             else:
                 result = subprocess.run(
@@ -496,6 +545,7 @@ def _debug_bundle_git_revision(workspace: Path) -> str:
                     text=True,
                     timeout=2,
                     check=False,
+                    env=environment,
                 )
         return redact_text(result.stdout.strip())
     except (

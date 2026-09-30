@@ -1,17 +1,17 @@
 import asyncio
-import hashlib
 import io
 import json
-import os
+import sys
 from pathlib import Path
 
 import pytest
 
 from ash.context.instructions import MAX_INSTRUCTION_FILE_BYTES
-from ash.runtime import _memory_persist_directory, build_runtime, build_tools
+from ash.runtime import _memory_database_path, build_runtime, build_tools
 from ash.context.turn import TurnContext
 from ash.config import AshConfig
 from ash.mcp.server import MCPServerConfig
+from ash.platform_support import UnsupportedPlatformError
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.grants import PermissionRule, RuleEffect
@@ -31,6 +31,377 @@ class RuntimeProvider(ProviderABC):
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         if False:
             yield
+
+
+def test_build_runtime_rejects_unsupported_platform_before_side_effects(
+    tmp_path, monkeypatch
+) -> None:
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+
+    def unsupported() -> None:
+        raise UnsupportedPlatformError("Native Windows requires WSL2")
+
+    monkeypatch.setattr("ash.runtime.require_supported_native_platform", unsupported)
+
+    with pytest.raises(UnsupportedPlatformError, match="WSL2"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            workspace_trusted=False,
+            run_maintenance=False,
+        )
+
+    assert not (tmp_path / "db").exists()
+
+
+def test_build_tools_closes_partial_agent_state_when_plugin_build_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.agents.shared_state import SharedState
+
+    created: list[SharedState] = []
+
+    class TrackingSharedState(SharedState):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    def fail_plugin_tools(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("plugin tool build failed")
+
+    monkeypatch.setattr(
+        "ash.agents.shared_state.SharedState",
+        TrackingSharedState,
+    )
+    monkeypatch.setattr(
+        "ash.plugins.runtime.build_plugin_runtime_tools",
+        fail_plugin_tools,
+    )
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="plugin tool build failed"):
+            build_tools(
+                __import__(
+                    "ash.safety.guard",
+                    fromlist=["SafetyGuard"],
+                ).SafetyGuard(tmp_path),
+                tmp_path,
+                provider_factory=RuntimeProvider,
+                agent_db_path=config.db_directory / "agents.db",
+                runtime_config=config,
+                active_plugins=[],
+            )
+
+        assert len(created) == 2
+        assert all(state._closed for state in created)
+    finally:
+        for state in created:
+            state.close()
+
+
+def test_runtime_failure_does_not_allocate_owned_provider_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.runtime as runtime_module
+    from ash.providers.openai import OpenAIProvider
+
+    sdk_calls = 0
+    http_calls = 0
+
+    def unexpected_sdk_client(**kwargs):
+        nonlocal sdk_calls
+        del kwargs
+        sdk_calls += 1
+        raise AssertionError("runtime assembly must not allocate the SDK client")
+
+    def unexpected_http_client(**kwargs):
+        nonlocal http_calls
+        del kwargs
+        http_calls += 1
+        raise AssertionError("runtime assembly must not allocate the HTTP transport")
+
+    def fail_plugin_discovery(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("plugin discovery failed")
+
+    monkeypatch.setattr(
+        "ash.providers.openai.openai.AsyncOpenAI",
+        unexpected_sdk_client,
+    )
+    monkeypatch.setattr(
+        "ash.providers.openai.openai.DefaultAsyncHttpxClient",
+        unexpected_http_client,
+    )
+    monkeypatch.setattr(runtime_module, "discover_active_plugins", fail_plugin_discovery)
+    config = AshConfig(
+        model="openai/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+
+    with pytest.raises(RuntimeError, match="plugin discovery failed"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider_factory=lambda _config: OpenAIProvider(
+                model_name="runtime-model",
+                api_key="test-key",
+            ),
+            workspace_trusted=False,
+            run_maintenance=False,
+        )
+
+    assert sdk_calls == 0
+    assert http_calls == 0
+
+
+def test_runtime_validates_mcp_before_allocating_stateful_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.runtime as runtime_module
+    from ash.agents.shared_state import SharedState
+
+    created: list[SharedState] = []
+
+    class TrackingSharedState(SharedState):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    def fail_mcp_load(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("MCP validation failed")
+
+    monkeypatch.setattr(
+        "ash.agents.shared_state.SharedState",
+        TrackingSharedState,
+    )
+    monkeypatch.setattr(runtime_module, "discover_active_plugins", lambda *a, **k: [])
+    monkeypatch.setattr(runtime_module, "load_mcp_server_sources", fail_mcp_load)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        automation_enabled=False,
+        lsp_enabled=False,
+        repo_map_enabled=False,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="MCP validation failed"):
+            build_runtime(
+                config,
+                HeadlessUI(output_format="text", stream=io.StringIO()),
+                provider=RuntimeProvider(),
+                workspace_trusted=False,
+                run_maintenance=False,
+            )
+
+        assert created == []
+    finally:
+        for state in created:
+            state.close()
+
+
+def test_runtime_loop_construction_failure_closes_unpublished_stateful_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.runtime as runtime_module
+    from ash.agents.shared_state import SharedState
+
+    created: list[SharedState] = []
+
+    class TrackingSharedState(SharedState):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    def fail_loop(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("loop construction failed")
+
+    monkeypatch.setattr(
+        "ash.agents.shared_state.SharedState",
+        TrackingSharedState,
+    )
+    monkeypatch.setattr(runtime_module, "discover_active_plugins", lambda *a, **k: [])
+    monkeypatch.setattr(runtime_module, "AshLoop", fail_loop)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        automation_enabled=False,
+        lsp_enabled=False,
+        repo_map_enabled=False,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="loop construction failed"):
+            build_runtime(
+                config,
+                HeadlessUI(output_format="text", stream=io.StringIO()),
+                provider=RuntimeProvider(),
+                workspace_trusted=False,
+                run_maintenance=False,
+            )
+
+        assert len(created) == 2
+        assert all(state._closed for state in created)
+    finally:
+        for state in created:
+            state.close()
+
+
+def test_runtime_post_loop_setup_failure_closes_unpublished_stateful_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.runtime as runtime_module
+    from ash.agents.shared_state import SharedState
+    from ash.safety.policy import PermissionPolicy
+
+    created: list[SharedState] = []
+
+    class TrackingSharedState(SharedState):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    def fail_rules(self, rules):
+        del self, rules
+        raise RuntimeError("permission policy setup failed")
+
+    monkeypatch.setattr(
+        "ash.agents.shared_state.SharedState",
+        TrackingSharedState,
+    )
+    monkeypatch.setattr(runtime_module, "discover_active_plugins", lambda *a, **k: [])
+    monkeypatch.setattr(PermissionPolicy, "set_persistent_rules", fail_rules)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        automation_enabled=False,
+        lsp_enabled=False,
+        repo_map_enabled=False,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="permission policy setup failed"):
+            build_runtime(
+                config,
+                HeadlessUI(output_format="text", stream=io.StringIO()),
+                provider=RuntimeProvider(),
+                workspace_trusted=False,
+                run_maintenance=False,
+            )
+
+        assert len(created) == 2
+        assert all(state._closed for state in created)
+    finally:
+        for state in created:
+            state.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_provider_factory_controls_model_switching(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    replacement = RuntimeProvider()
+    requested_models: list[str] = []
+
+    def provider_factory(updated: AshConfig) -> ProviderABC:
+        requested_models.append(updated.model)
+        return replacement
+
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        provider_factory=provider_factory,
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+
+    runtime.loop.switch_model("replacement")
+
+    assert requested_models == ["ollama/replacement"]
+    assert runtime.loop.provider is replacement
+    await runtime.loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_retire_reused_provider_instance(tmp_path) -> None:
+    class CachedProvider(RuntimeProvider):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = CachedProvider()
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=provider,
+        provider_factory=lambda _config: provider,
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+
+    runtime.loop.switch_model("replacement")
+    runtime.loop.switch_provider("ollama", "other")
+    await asyncio.sleep(0)
+
+    assert runtime.loop.provider is provider
+    assert provider.close_calls == 0
+    await runtime.loop.aclose()
+    assert provider.close_calls == 1
 
 
 def test_trusted_runtime_loads_agents_md_project_instructions(
@@ -65,6 +436,293 @@ def test_trusted_runtime_loads_agents_md_project_instructions(
     assert marker in runtime.loop.system_prompt
     assert str(agents) in runtime.loop.system_prompt
     asyncio.run(runtime.loop.aclose())
+
+
+def test_runtime_rejects_aba_swapped_project_plugin_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.runtime as runtime_module
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    (home / ".ash").mkdir(parents=True)
+    original_plugin = workspace / ".ash" / "plugins" / "demo"
+    replacement_plugin = replacement / ".ash" / "plugins" / "demo"
+    original_plugin.mkdir(parents=True)
+    replacement_plugin.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    dormant_hook = original_plugin / "hooks" / "hooks.json"
+    dormant_hook.parent.mkdir(parents=True)
+    dormant_hook.write_text(
+        json.dumps(
+            {
+                "session_start": [
+                    {
+                        "command": [
+                            sys.executable,
+                            "-c",
+                            "print('ABA_PLUGIN_HOOK_MUST_NOT_ACTIVATE')",
+                        ]
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (original_plugin / "plugin.json").write_text(
+        json.dumps({"name": "demo", "version": "1.0.0"}),
+        encoding="utf-8",
+    )
+
+    replacement_hook = replacement_plugin / "hooks" / "hooks.json"
+    replacement_hook.parent.mkdir(parents=True)
+    replacement_hook.write_text(dormant_hook.read_text(encoding="utf-8"), encoding="utf-8")
+    (replacement_plugin / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "demo",
+                "version": "1.0.0",
+                "hooks": ["hooks/hooks.json"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    real_discover = runtime_module.discover_active_plugins
+    swapped = False
+
+    def discover_during_aba(root: Path, *, include_project: bool):
+        nonlocal swapped
+        workspace.rename(saved)
+        replacement.rename(workspace)
+        try:
+            discovered = real_discover(root, include_project=include_project)
+        finally:
+            workspace.rename(replacement)
+            saved.rename(workspace)
+        swapped = True
+        return discovered
+
+    monkeypatch.setattr(runtime_module, "discover_active_plugins", discover_during_aba)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="plugin root identity changed"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            workspace_trusted=True,
+            run_maintenance=False,
+        )
+
+    assert swapped is True
+
+
+def test_runtime_rejects_aba_swapped_project_mcp_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.runtime as runtime_module
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    replacement.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    (replacement / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "transient": {
+                    "command": sys.executable,
+                    "args": ["-c", "print('MCP_REPLACEMENT_MUST_NOT_RUN')"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    real_load = runtime_module.load_mcp_server_sources
+    swapped = False
+
+    def load_during_aba(sources):
+        nonlocal swapped
+        workspace.rename(saved)
+        replacement.rename(workspace)
+        try:
+            loaded = real_load(sources)
+        finally:
+            workspace.rename(replacement)
+            saved.rename(workspace)
+        swapped = True
+        return loaded
+
+    monkeypatch.setattr(runtime_module, "load_mcp_server_sources", load_during_aba)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="MCP config source identity changed"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            workspace_trusted=True,
+            run_maintenance=False,
+        )
+
+    assert swapped is True
+
+
+def test_runtime_rejects_aba_swapped_project_lsp_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.lsp.config as lsp_config_module
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    (replacement / ".ash").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    (replacement / ".ash" / "lsp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "transient": {
+                        "command": [sys.executable, "-c", "print('must-not-run')"],
+                        "extensions": {".py": "python"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    real_load = lsp_config_module.load_lsp_server_configs
+    swapped = False
+
+    def load_during_aba(root: Path, **kwargs):
+        nonlocal swapped
+        workspace.rename(saved)
+        replacement.rename(workspace)
+        swapped = True
+        try:
+            loaded = real_load(root, **kwargs)
+        finally:
+            workspace.rename(replacement)
+            saved.rename(workspace)
+        return loaded
+
+    monkeypatch.setattr(lsp_config_module, "load_lsp_server_configs", load_during_aba)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=True,
+    )
+
+    with pytest.raises(SafetyViolation, match="project root identity changed"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            workspace_trusted=True,
+            run_maintenance=False,
+        )
+
+    assert swapped is True
+
+
+def test_runtime_rejects_aba_swapped_project_hook_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.runtime as runtime_module
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    (replacement / ".ash").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    (replacement / ".ash" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "pre_tool": [
+                    {
+                        "matcher": "read_file",
+                        "command": [sys.executable, "-c", "print('replacement')"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    real_load = runtime_module.load_command_hooks
+    swapped = False
+
+    def load_during_aba(sources, **kwargs):
+        nonlocal swapped
+        workspace.rename(saved)
+        replacement.rename(workspace)
+        swapped = True
+        try:
+            return real_load(sources, **kwargs)
+        finally:
+            workspace.rename(replacement)
+            saved.rename(workspace)
+
+    monkeypatch.setattr(runtime_module, "load_command_hooks", load_during_aba)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="hook config source identity changed"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            workspace_trusted=True,
+            run_maintenance=False,
+        )
+
+    assert swapped is True
 
 
 def test_trusted_runtime_refreshes_changed_project_instructions_each_turn(
@@ -205,6 +863,93 @@ def test_runtime_instruction_refresh_does_not_follow_external_symlink(
             if saved.exists():
                 saved.rename(agents)
         await runtime.loop.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_instruction_refresh_rejects_workspace_swap_after_turn_check(
+    tmp_path, monkeypatch
+) -> None:
+    class InstructionCaptureProvider(ProviderABC):
+        model_name = "instruction-root-race-model"
+
+        def __init__(self) -> None:
+            self.system_prompts: list[str] = []
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.system_prompts.append(str(messages[0]["content"]))
+            yield StreamChunk(content="done", is_done=True)
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    replacement.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    (workspace / "AGENTS.md").write_text(
+        "ORIGINAL_RUNTIME_INSTRUCTION",
+        encoding="utf-8",
+    )
+    (replacement / "AGENTS.md").write_text(
+        "REPLACEMENT_RUNTIME_INSTRUCTION_SECRET",
+        encoding="utf-8",
+    )
+    provider = InstructionCaptureProvider()
+    config = AshConfig(
+        model="ollama/instruction-root-race-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=provider,
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+
+    async def exercise() -> None:
+        await runtime.loop.start_session()
+        real_verify = runtime.loop._verify_project_root_identity
+        swapped = False
+
+        def verify_then_swap() -> None:
+            nonlocal swapped
+            real_verify()
+            if not swapped:
+                workspace.rename(saved)
+                replacement.rename(workspace)
+                swapped = True
+
+        monkeypatch.setattr(
+            runtime.loop,
+            "_verify_project_root_identity",
+            verify_then_swap,
+        )
+        try:
+            with pytest.raises(
+                SafetyViolation,
+                match="project root identity changed",
+            ):
+                await runtime.loop.run_turn("check instructions")
+            assert swapped is True
+            assert provider.system_prompts == []
+        finally:
+            if workspace.exists():
+                workspace.rename(replacement)
+            if saved.exists():
+                saved.rename(workspace)
+            await runtime.loop.aclose()
 
     asyncio.run(exercise())
 
@@ -677,21 +1422,24 @@ def test_runtime_passes_user_owned_cdp_settings_to_browser_tools(tmp_path, monke
     assert captured["profile_path"] is None
 
 
-def test_runtime_anchors_relative_memory_storage_to_workspace(tmp_path, monkeypatch) -> None:
+def test_runtime_memory_storage_is_ash_owned_and_cwd_independent(
+    tmp_path, monkeypatch
+) -> None:
     launcher = tmp_path / "launcher"
     workspace = tmp_path / "workspace"
+    database_root = tmp_path / "ash-db"
     launcher.mkdir()
     workspace.mkdir()
     monkeypatch.chdir(launcher)
     config = AshConfig(
         model="ollama/runtime-model",
         workspace_root=workspace,
-        db_directory=tmp_path / "db",
-        memory_backend="fts5",
-        chroma_persist_dir=Path(".ash/chroma"),
+        db_directory=database_root,
+        memory_backend="sqlite",
         repo_map_enabled=False,
     )
 
+    expected = _memory_database_path(config)
     runtime = build_runtime(
         config,
         HeadlessUI(output_format="text", stream=io.StringIO()),
@@ -700,16 +1448,18 @@ def test_runtime_anchors_relative_memory_storage_to_workspace(tmp_path, monkeypa
         run_maintenance=False,
     )
     try:
-        lexical = runtime.loop._vector_pipeline.lexical_index
-        assert lexical is not None
-        assert Path(lexical._index.db_path) == workspace / ".ash" / "memory-fts5.db"
-        assert not (launcher / ".ash" / "memory-fts5.db").exists()
+        pipeline = runtime.loop._memory_pipeline
+        assert pipeline is not None
+        assert pipeline.index.db_path == expected
+        assert expected.is_relative_to(database_root.resolve())
+        assert not expected.is_relative_to(workspace.resolve())
+        assert not (launcher / ".ash").exists()
     finally:
         asyncio.run(runtime.loop.aclose())
 
 
-def test_runtime_namespaces_absolute_memory_storage_per_workspace(tmp_path) -> None:
-    shared = tmp_path / "shared" / "chroma"
+def test_runtime_namespaces_memory_by_workspace_under_shared_db_root(tmp_path) -> None:
+    database_root = tmp_path / "ash-db"
     workspace_a = tmp_path / "workspace-a"
     workspace_b = tmp_path / "workspace-b"
     workspace_a.mkdir()
@@ -718,169 +1468,25 @@ def test_runtime_namespaces_absolute_memory_storage_per_workspace(tmp_path) -> N
     config_a = AshConfig(
         model="ollama/runtime-model",
         workspace_root=workspace_a,
-        db_directory=tmp_path / "db-a",
-        memory_backend="fts5",
-        chroma_persist_dir=shared,
+        db_directory=database_root,
+        memory_backend="sqlite",
         repo_map_enabled=False,
     )
-    config_b = config_a.model_copy(
-        update={
-            "workspace_root": workspace_b,
-            "db_directory": tmp_path / "db-b",
-        }
-    )
+    config_b = config_a.model_copy(update={"workspace_root": workspace_b})
 
-    resolved_a = _memory_persist_directory(config_a)
-    resolved_b = _memory_persist_directory(config_b)
-    digest_a = hashlib.sha256(
-        os.fsencode(os.path.normcase(str(workspace_a.resolve())))
-    ).hexdigest()
-    digest_b = hashlib.sha256(
-        os.fsencode(os.path.normcase(str(workspace_b.resolve())))
-    ).hexdigest()
+    resolved_a = _memory_database_path(config_a)
+    resolved_b = _memory_database_path(config_b)
 
-    assert resolved_a == shared.parent / ".ash-workspaces" / f"v1-{digest_a}" / "chroma"
-    assert resolved_b == shared.parent / ".ash-workspaces" / f"v1-{digest_b}" / "chroma"
     assert resolved_a != resolved_b
+    assert resolved_a.parent.parent.parent == database_root.resolve()
+    assert resolved_b.parent.parent.parent == database_root.resolve()
+    assert resolved_a.name == resolved_b.name == "memory.db"
     assert str(workspace_a.resolve()) not in str(resolved_a)
     assert str(workspace_b.resolve()) not in str(resolved_b)
 
-    runtime_a = build_runtime(
-        config_a,
-        HeadlessUI(output_format="text", stream=io.StringIO()),
-        provider=RuntimeProvider(),
-        workspace_trusted=True,
-        run_maintenance=False,
-    )
-    runtime_b = build_runtime(
-        config_b,
-        HeadlessUI(output_format="text", stream=io.StringIO()),
-        provider=RuntimeProvider(),
-        workspace_trusted=True,
-        run_maintenance=False,
-    )
-    try:
-        lexical_a = runtime_a.loop._vector_pipeline.lexical_index
-        lexical_b = runtime_b.loop._vector_pipeline.lexical_index
-        assert lexical_a is not None
-        assert lexical_b is not None
-        assert Path(lexical_a._index.db_path) == resolved_a.parent / "memory-fts5.db"
-        assert Path(lexical_b._index.db_path) == resolved_b.parent / "memory-fts5.db"
-        assert lexical_a._index.db_path != lexical_b._index.db_path
-    finally:
-        asyncio.run(runtime_a.loop.aclose())
-        asyncio.run(runtime_b.loop.aclose())
 
-
-def test_runtime_normalizes_absolute_memory_parent_segments(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    configured = tmp_path / "shared" / "chroma" / ".."
-    config = AshConfig(
-        model="ollama/runtime-model",
-        workspace_root=workspace,
-        db_directory=tmp_path / "db",
-        memory_backend="fts5",
-        chroma_persist_dir=configured,
-        repo_map_enabled=False,
-    )
-
-    resolved = _memory_persist_directory(config)
-    digest = hashlib.sha256(
-        os.fsencode(os.path.normcase(str(workspace.resolve())))
-    ).hexdigest()
-    expected = tmp_path / ".ash-workspaces" / f"v1-{digest}" / "shared"
-    assert resolved == expected
-
-    runtime = build_runtime(
-        config,
-        HeadlessUI(output_format="text", stream=io.StringIO()),
-        provider=RuntimeProvider(),
-        workspace_trusted=True,
-        run_maintenance=False,
-    )
-    try:
-        lexical = runtime.loop._vector_pipeline.lexical_index
-        assert lexical is not None
-        assert Path(lexical._index.db_path) == expected.parent / "memory-fts5.db"
-    finally:
-        asyncio.run(runtime.loop.aclose())
-
-
-def test_runtime_rejects_memory_paths_that_escape_or_collapse_to_root(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    relative_escape = AshConfig(
-        model="ollama/runtime-model",
-        workspace_root=workspace,
-        db_directory=tmp_path / "db-relative",
-        chroma_persist_dir=Path("../shared/chroma"),
-        repo_map_enabled=False,
-    )
-    root_target = AshConfig(
-        model="ollama/runtime-model",
-        workspace_root=workspace,
-        db_directory=tmp_path / "db-root",
-        chroma_persist_dir=Path(workspace.anchor),
-        repo_map_enabled=False,
-    )
-
-    with pytest.raises(ValueError, match="escapes the workspace"):
-        _memory_persist_directory(relative_escape)
-    with pytest.raises(ValueError, match="below the filesystem root"):
-        _memory_persist_directory(root_target)
-
-
-def test_runtime_rejects_relative_memory_symlink_escape(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    outside = tmp_path / "outside"
-    workspace.mkdir()
-    outside.mkdir()
-    alias = workspace / "alias"
-    try:
-        alias.symlink_to(outside, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"symlink creation is unavailable: {exc}")
-
-    config = AshConfig(
-        model="ollama/runtime-model",
-        workspace_root=workspace,
-        db_directory=tmp_path / "db",
-        chroma_persist_dir=Path("alias/deep/chroma"),
-        repo_map_enabled=False,
-    )
-
-    with pytest.raises(ValueError, match="escapes the workspace"):
-        _memory_persist_directory(config)
-    assert not (outside / "deep" / "chroma").exists()
-
-
-def test_runtime_rejects_absolute_memory_symlink_ancestor(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    outside = tmp_path / "outside"
-    workspace.mkdir()
-    outside.mkdir()
-    linked = tmp_path / "linked"
-    try:
-        linked.symlink_to(outside, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"symlink creation is unavailable: {exc}")
-
-    config = AshConfig(
-        model="ollama/runtime-model",
-        workspace_root=workspace,
-        db_directory=tmp_path / "db",
-        chroma_persist_dir=linked / "deep" / "chroma",
-        repo_map_enabled=False,
-    )
-
-    with pytest.raises(ValueError, match="symlink or junction"):
-        _memory_persist_directory(config)
-    assert not (outside / "deep" / ".ash-workspaces").exists()
-
-
-def test_absolute_memory_store_isolates_same_named_workspace_documents(tmp_path) -> None:
-    shared = tmp_path / "shared" / "chroma"
+def test_memory_store_isolates_same_named_workspace_documents(tmp_path) -> None:
+    database_root = tmp_path / "ash-db"
     workspace_a = tmp_path / "workspace-a"
     workspace_b = tmp_path / "workspace-b"
     workspace_a.mkdir()
@@ -890,25 +1496,24 @@ def test_absolute_memory_store_isolates_same_named_workspace_documents(tmp_path)
     file_a.write_text("workspace_alpha_memory_marker\n", encoding="utf-8")
     file_b.write_text("workspace_beta_memory_marker\n", encoding="utf-8")
 
-    def config(workspace: Path, db_name: str) -> AshConfig:
+    def config(workspace: Path) -> AshConfig:
         return AshConfig(
             model="ollama/runtime-model",
             workspace_root=workspace,
-            db_directory=tmp_path / db_name,
-            memory_backend="fts5",
-            chroma_persist_dir=shared,
+            db_directory=database_root,
+            memory_backend="sqlite",
             repo_map_enabled=False,
         )
 
     runtime_a = build_runtime(
-        config(workspace_a, "db-a"),
+        config(workspace_a),
         HeadlessUI(output_format="text", stream=io.StringIO()),
         provider=RuntimeProvider(),
         workspace_trusted=True,
         run_maintenance=False,
     )
     runtime_b = build_runtime(
-        config(workspace_b, "db-b"),
+        config(workspace_b),
         HeadlessUI(output_format="text", stream=io.StringIO()),
         provider=RuntimeProvider(),
         workspace_trusted=True,
@@ -920,10 +1525,18 @@ def test_absolute_memory_store_isolates_same_named_workspace_documents(tmp_path)
             assert await runtime_a.loop.index_project_memory(max_files=10) == 1
             assert await runtime_b.loop.index_project_memory(max_files=10) == 1
 
-            alpha_a = await runtime_a.loop.semantic_search("workspace_alpha_memory_marker")
-            alpha_b = await runtime_b.loop.semantic_search("workspace_alpha_memory_marker")
-            beta_a = await runtime_a.loop.semantic_search("workspace_beta_memory_marker")
-            beta_b = await runtime_b.loop.semantic_search("workspace_beta_memory_marker")
+            alpha_a = await runtime_a.loop.search_memory(
+                "workspace_alpha_memory_marker"
+            )
+            alpha_b = await runtime_b.loop.search_memory(
+                "workspace_alpha_memory_marker"
+            )
+            beta_a = await runtime_a.loop.search_memory(
+                "workspace_beta_memory_marker"
+            )
+            beta_b = await runtime_b.loop.search_memory(
+                "workspace_beta_memory_marker"
+            )
             assert alpha_a and alpha_a[0].file_path == "same.py"
             assert alpha_b == []
             assert beta_a == []
@@ -931,7 +1544,9 @@ def test_absolute_memory_store_isolates_same_named_workspace_documents(tmp_path)
 
             file_a.unlink()
             assert await runtime_a.loop.index_project_memory(max_files=10) == 0
-            assert await runtime_b.loop.semantic_search("workspace_beta_memory_marker")
+            assert await runtime_b.loop.search_memory(
+                "workspace_beta_memory_marker"
+            )
         finally:
             await runtime_a.loop.aclose()
             await runtime_b.loop.aclose()
@@ -946,8 +1561,7 @@ def test_runtime_defers_auto_memory_index_until_async_session_start(tmp_path) ->
         model="ollama/runtime-model",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend="fts5",
-        chroma_persist_dir=tmp_path / "memory",
+        memory_backend="sqlite",
         memory_auto_index=True,
         memory_auto_index_max_files=10,
         memory_auto_index_max_bytes_per_file=4096,
@@ -969,8 +1583,57 @@ def test_runtime_defers_auto_memory_index_until_async_session_start(tmp_path) ->
         task = runtime.loop._memory_auto_index_task
         assert task is not None
         assert await task == 1
-        hits = await runtime.loop.semantic_search("startup sentinel")
+        hits = await runtime.loop.search_memory("startup sentinel")
         assert hits and hits[0].file_path.endswith("memory-note.py")
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_auto_memory_index_failure_is_nonfatal_and_logged(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="sqlite",
+        memory_auto_index=True,
+        repo_map_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+    warnings: list[str] = []
+
+    async def fail_index(
+        *,
+        max_files: int = 100,
+        max_bytes_per_file: int = 128_000,
+    ) -> int:
+        del max_files, max_bytes_per_file
+        raise RuntimeError("auto-index failed")
+
+    def capture_warning(message: str, *args) -> None:
+        warnings.append(message.format(*args))
+
+    runtime.loop.index_project_memory = fail_index  # type: ignore[method-assign]
+    monkeypatch.setattr("ash.core.loop._log.warning", capture_warning)
+
+    async def exercise() -> None:
+        session = await runtime.loop.start_session()
+        assert runtime.loop.current_session is session
+        task = runtime.loop._memory_auto_index_task
+        assert task is not None
+        with pytest.raises(RuntimeError, match="auto-index failed"):
+            await task
+        await asyncio.sleep(0)
+        assert warnings == ["Project memory auto-index failed: auto-index failed"]
         await runtime.loop.aclose()
 
     asyncio.run(exercise())
@@ -1263,6 +1926,70 @@ def test_runtime_registers_only_trusted_configured_remote_agents(
         "review",
         "project",
     }
+
+
+def test_runtime_rejects_aba_swapped_project_remote_agent_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.a2a_remote as a2a_remote_module
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    (replacement / ".ash").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    (replacement / ".ash" / "a2a.json").write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "transient": {
+                        "url": "https://replacement-agent.example.test"
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    real_load = a2a_remote_module.load_remote_agent_configs
+    swapped = False
+
+    def load_during_aba(root: Path, **kwargs):
+        nonlocal swapped
+        workspace.rename(saved)
+        replacement.rename(workspace)
+        swapped = True
+        try:
+            return real_load(root, **kwargs)
+        finally:
+            workspace.rename(replacement)
+            saved.rename(workspace)
+
+    monkeypatch.setattr(a2a_remote_module, "load_remote_agent_configs", load_during_aba)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+
+    with pytest.raises(SafetyViolation, match="project root identity changed"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            workspace_trusted=True,
+            run_maintenance=False,
+        )
+
+    assert swapped is True
 
 
 def test_runtime_preserves_explicit_managed_permission_rules(tmp_path) -> None:

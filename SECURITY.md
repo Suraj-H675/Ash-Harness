@@ -38,6 +38,15 @@ same OS credentials as the Ash process. Such an attacker can interfere with
 substantially more than plugin lifecycle operations and is outside this local
 application boundary.
 
+Workspace confinement is defined by reachable directory entries under the
+selected workspace root. A pre-existing hardlink inside that root is therefore
+the same file as every other name for that inode and is treated as a workspace
+file. Ash does not reject every file with multiple hardlinks: link-count alone
+cannot distinguish an outside alias from two legitimate in-workspace names.
+A security report that relies on an attacker first creating or replacing such
+a hardlink using the same host account must also identify the separate
+untrusted boundary that grants that filesystem authority.
+
 This boundary does not make plugin code or plugin inputs trusted. Malicious
 plugin sources, remote Git repositories, generated content, manifests,
 symlinks, path tricks, malformed metadata, oversized files, and dependency

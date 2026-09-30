@@ -10,6 +10,7 @@ from typing import Any, Callable, TextIO
 from rich.console import Console
 
 from ash.core.events import envelope_event
+from ash.ui.safe_text import terminal_safe_text
 
 
 class HeadlessUI:
@@ -130,7 +131,11 @@ class HeadlessUI:
             event = self._prepare({"type": "turn.completed", **payload})
             self._emit(event)
         else:
-            print(payload["response"], file=self.stream, flush=True)
+            print(
+                terminal_safe_text(str(payload["response"])),
+                file=self.stream,
+                flush=True,
+            )
 
     def emit_error(self, payload: dict[str, Any]) -> None:
         event = self._prepare({"type": "error", "error": payload})
@@ -138,12 +143,20 @@ class HeadlessUI:
         if self.output_format in {"json", "stream-json"}:
             self._emit(event)
         else:
-            message = payload.get("message") or "Unknown error"
-            category = payload.get("category") or "internal"
+            message = terminal_safe_text(
+                str(payload.get("message") or "Unknown error"), single_line=True
+            )
+            category = terminal_safe_text(
+                str(payload.get("category") or "internal"), single_line=True
+            )
             remedy = payload.get("remedy")
             print(f"Error [{category}]: {message}", file=sys.stderr)
             if remedy:
-                print(f"Remedy: {remedy}", file=sys.stderr)
+                print(
+                    "Remedy: "
+                    + terminal_safe_text(str(remedy), single_line=True),
+                    file=sys.stderr,
+                )
 
     def emit_event(self, payload: dict[str, Any]) -> None:
         event = self._prepare(payload)

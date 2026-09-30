@@ -60,7 +60,10 @@ def test_build_sandbox_image_uses_packaged_dockerfile() -> None:
             "ash.commands.sandbox.resolve_host_executable",
             return_value="/usr/bin/docker",
         ),
-        patch("ash.commands.sandbox.subprocess.run", return_value=completed) as run,
+        patch(
+            "ash.commands.sandbox.run_docker_cli_sync",
+            return_value=completed,
+        ) as run,
     ):
         assert build_sandbox_image("ash-sandbox:test") == 0
 
@@ -72,6 +75,7 @@ def test_build_sandbox_image_uses_packaged_dockerfile() -> None:
         "ash-sandbox:test",
     ]
     assert argv[argv.index("--file") + 1].endswith("sandbox/Dockerfile")
+    assert run.call_args.kwargs["workspace_root"] == Path.cwd().resolve()
 
 
 def test_build_sandbox_image_requires_docker() -> None:

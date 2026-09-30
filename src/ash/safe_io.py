@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import secrets
 import stat
@@ -10,7 +9,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, TextIO
 
+from ash.json_utils import strict_json_loads as _strict_json_loads
 from ash.safety.path_scope import lexical_target_path, path_has_link_component
+
+
+strict_json_loads = _strict_json_loads
 
 
 def _directory_open_flag() -> int:
@@ -84,27 +87,6 @@ def _open_windows_replaceable_regular_file(path: Path) -> int:
         close_handle: Any = kernel32.CloseHandle
         close_handle(wintypes.HANDLE(handle))
         raise
-
-
-def strict_json_loads(value: str | bytes | bytearray) -> Any:
-    """Parse JSON while rejecting duplicate object keys and invalid constants."""
-
-    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError(f"duplicate JSON object key: {key!r}")
-            result[key] = item
-        return result
-
-    def reject_constant(raw: str) -> None:
-        raise ValueError(f"invalid JSON constant: {raw}")
-
-    return json.loads(
-        value,
-        object_pairs_hook=unique_object,
-        parse_constant=reject_constant,
-    )
 
 
 def validate_unlinked_path(

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import tarfile
@@ -12,7 +13,7 @@ from ash.config import AshConfig
 from ash.core.loop import AshLoop, _execute_tool_once
 from ash.core.session import SessionStore
 from ash.plugins.manifest import PluginManifest
-from ash.plugins.anchored_fs import supports_anchored_mutation
+from ash.safety.anchored_fs import supports_anchored_mutation
 from ash.plugins.registry import DiscoveredPlugin
 from ash.plugins.runtime import (
     PluginHostClient,
@@ -31,6 +32,8 @@ from ash.sandbox import (
     SandboxManager,
     has_bwrap,
 )
+from ash.tools.base import BaseTool, ToolResult
+from ash.tools.tool_search import SearchToolsTool
 
 
 HOST_SOURCE = r"""
@@ -170,6 +173,54 @@ def _tool(
     )
 
 
+def test_plugin_runtime_tools_have_aggregate_active_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugins = [_plugin(tmp_path / f"plugin-{index}") for index in range(3)]
+    monkeypatch.setattr(
+        "ash.plugins.runtime.MAX_TOTAL_PLUGIN_RUNTIME_TOOLS",
+        2,
+    )
+
+    with pytest.raises(ValueError, match=r"too many executable tools: 3 > 2"):
+        build_plugin_runtime_tools(
+            plugins,
+            SafetyGuard(tmp_path),
+            backend_preference="direct",
+            docker_image="python:3.12-slim",
+            allow_unisolated=True,
+        )
+
+
+class _ReloadLifecycleTool(BaseTool):
+    description = "reload lifecycle test tool"
+    args_schema = None
+
+    def __init__(
+        self,
+        guard: SafetyGuard,
+        *,
+        name: str,
+        plugin_runtime_tool: bool,
+        fail_close_times: int = 0,
+    ) -> None:
+        super().__init__(guard)
+        self.name = name
+        self.plugin_runtime_tool = plugin_runtime_tool
+        self.fail_close_times = fail_close_times
+        self.close_calls = 0
+
+    async def run(self, **kwargs) -> ToolResult:
+        del kwargs
+        return ToolResult(success=True, output=self.name)
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        if self.close_calls <= self.fail_close_times:
+            raise RuntimeError(f"{self.name} close failed")
+
+
 @pytest.mark.asyncio
 async def test_real_plugin_host_handshake_call_and_close(tmp_path: Path) -> None:
     tool = _tool(tmp_path)
@@ -250,7 +301,6 @@ async def test_isolated_plugin_host_pins_root_across_path_swap(
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd identity regression")
 async def test_direct_plugin_host_refuses_root_swap_before_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -418,7 +468,7 @@ async def test_docker_plugin_volume_cleanup_is_retryable(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_docker_plugin_keeps_bind_launch_when_snapshot_anchors_unavailable(
+async def test_docker_plugin_refuses_bind_fallback_when_snapshot_anchors_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plugin = _plugin(tmp_path / "plugin")
@@ -426,29 +476,22 @@ async def test_docker_plugin_keeps_bind_launch_when_snapshot_anchors_unavailable
     manager.backend_name = "docker"
     manager.is_fully_isolated.return_value = True
     manager.stage_docker_workspace = AsyncMock(return_value="ash-plugin-unused")
-    manager.prepare_launch.return_value = nullcontext(
-        SandboxInvocation(
-            (sys.executable, "-c", HOST_SOURCE),
-            None,
-            SANDBOX_TIER_DOCKER,
-            "docker",
-        )
-    )
     monkeypatch.setattr(
         "ash.plugins.runtime.supports_anchored_mutation",
         lambda: False,
     )
     client = PluginHostClient(plugin, manager, allow_unisolated=False)
 
-    result = await client.call_tool("echo", {"text": "portable"})
+    with pytest.raises(
+        PluginRuntimeError,
+        match="descriptor-anchored Docker plugin staging is unavailable",
+    ):
+        await client.call_tool("echo", {"text": "must-not-run"})
 
-    assert result.success is True
-    assert result.output == "portable"
     manager.stage_docker_workspace.assert_not_awaited()
-    manager.prepare_launch.assert_called_once_with(
-        plugin.manifest.runtime.command,
-        cwd=plugin.root,
-    )
+    manager.prepare_launch.assert_not_called()
+    manager.prepare_docker_volume_launch.assert_not_called()
+    assert client.running is False
     await client.aclose()
 
 
@@ -582,6 +625,44 @@ async def test_plugin_timeout_terminates_host(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_plugin_failure_cleanup_survives_late_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = _tool(tmp_path)
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def fail_exchange(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise PluginRuntimeError("protocol failure")
+
+    async def blocked_cleanup() -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        cleanup_finished.set()
+
+    monkeypatch.setattr(tool.client, "_ensure_started", AsyncMock(return_value=None))
+    monkeypatch.setattr(tool.client, "_exchange", fail_exchange)
+    monkeypatch.setattr(tool.client, "_discard_process", blocked_cleanup)
+
+    task = asyncio.create_task(tool.client.call_tool("echo", {}))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert not task.done()
+    assert not cleanup_finished.is_set()
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert cleanup_finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_dry_run_denies_plugin_before_process_start(tmp_path: Path) -> None:
     tool = _tool(tmp_path)
     loop = AshLoop(
@@ -650,6 +731,441 @@ async def test_reload_replaces_and_closes_old_plugin_host(tmp_path: Path) -> Non
     await loop.aclose()
 
 
+@pytest.mark.asyncio
+async def test_reload_forgets_lifecycle_ids_for_unpublished_plugin_tools(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    old = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__old",
+        plugin_runtime_tool=True,
+    )
+    replacement = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__replacement",
+        plugin_runtime_tool=True,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-lifecycle-ids.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        tmp_path,
+        tools={old.name: old},
+    )
+    loop._started_tool_ids.add(id(old))
+    loop._closed_tool_ids.add(id(old))
+
+    await loop.reload_plugin_runtime_tools([replacement])
+
+    assert id(old) not in loop._started_tool_ids
+    assert id(old) not in loop._closed_tool_ids
+    assert loop.tools[replacement.name] is replacement
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_plugin_family_cleanup_forgets_ids_for_unpublished_tools(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    failing = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__failing",
+        plugin_runtime_tool=True,
+        fail_close_times=1,
+    )
+    closed = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__closed",
+        plugin_runtime_tool=True,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-failed-family-ids.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        tmp_path,
+        tools={failing.name: failing, closed.name: closed},
+    )
+    loop._started_tool_ids.update({id(failing), id(closed)})
+
+    with pytest.raises(RuntimeError, match="failed to close 1 executable plugin tool"):
+        await loop.reload_plugin_runtime_tools([])
+
+    assert failing.name not in loop.tools
+    assert closed.name not in loop.tools
+    assert id(failing) not in loop._started_tool_ids
+    assert id(closed) not in loop._started_tool_ids
+    assert id(closed) not in loop._closed_tool_ids
+    assert failing in loop._retired_plugin_tools
+
+    await loop.reload_plugin_runtime_tools([])
+    assert failing not in loop._retired_plugin_tools
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_retains_rejected_candidate_until_cleanup_retry(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    occupied = _ReloadLifecycleTool(
+        guard,
+        name="collision",
+        plugin_runtime_tool=False,
+    )
+    candidate = _ReloadLifecycleTool(
+        guard,
+        name="collision",
+        plugin_runtime_tool=True,
+        fail_close_times=1,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-collision.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        tmp_path,
+        tools={occupied.name: occupied},
+    )
+
+    with pytest.raises(ValueError, match="collides with an existing tool") as exc_info:
+        await loop.reload_plugin_runtime_tools([candidate])
+
+    assert candidate.close_calls == 1
+    assert candidate in loop._retired_plugin_tools
+    assert any("cleanup remains unresolved" in note for note in exc_info.value.__notes__)
+
+    await loop.reload_plugin_runtime_tools([])
+
+    assert candidate.close_calls == 2
+    assert candidate not in loop._retired_plugin_tools
+    assert loop.tools[occupied.name] is occupied
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_closes_all_duplicate_candidates_and_retains_cleanup_failures(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    first = _ReloadLifecycleTool(
+        guard,
+        name="plugin_duplicate__echo",
+        plugin_runtime_tool=True,
+        fail_close_times=1,
+    )
+    second = _ReloadLifecycleTool(
+        guard,
+        name="plugin_duplicate__echo",
+        plugin_runtime_tool=True,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-duplicate.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        tmp_path,
+        tools={},
+    )
+
+    with pytest.raises(ValueError, match="duplicate executable plugin tool name"):
+        await loop.reload_plugin_runtime_tools([first, second])
+
+    assert first.close_calls == 1
+    assert second.close_calls == 1
+    assert first in loop._retired_plugin_tools
+    assert second not in loop._retired_plugin_tools
+
+    await loop.reload_plugin_runtime_tools([])
+
+    assert first.close_calls == 2
+    assert not loop._retired_plugin_tools
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_refuses_active_turn_and_closes_unpublished_candidate(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    old = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+    )
+    candidate = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-active-turn.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        tmp_path,
+        tools={old.name: old},
+    )
+    loop._turn_running = True
+
+    with pytest.raises(RuntimeError, match="while a turn is running"):
+        await loop.reload_plugin_runtime_tools([candidate])
+
+    assert candidate.close_calls == 1
+    assert loop.tools[old.name] is old
+    assert old.close_calls == 0
+    loop._turn_running = False
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_plugin_reload_refuses_replaced_workspace_and_closes_candidate(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    guard = SafetyGuard(workspace)
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-root-swap.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        workspace,
+        tools={},
+    )
+    candidate = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+    )
+
+    workspace.rename(saved)
+    replacement.rename(workspace)
+
+    with pytest.raises(RuntimeError, match="workspace root changed after runtime startup"):
+        await loop.reload_plugin_runtime_tools([candidate])
+
+    assert candidate.close_calls == 1
+    assert candidate.name not in loop.tools
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_plugin_reloads_serialize_lifecycle_replacement(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    class BlockingCloseTool(_ReloadLifecycleTool):
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            close_started.set()
+            await allow_close.wait()
+
+    old = BlockingCloseTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+    )
+    first = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+    )
+    second = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-overlap.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        tmp_path,
+        tools={old.name: old},
+    )
+
+    first_reload = asyncio.create_task(loop.reload_plugin_runtime_tools([first]))
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    second_reload = asyncio.create_task(loop.reload_plugin_runtime_tools([second]))
+    await asyncio.sleep(0)
+
+    assert not second_reload.done()
+    assert first.close_calls == 0
+    assert second.close_calls == 0
+
+    allow_close.set()
+    await first_reload
+    await second_reload
+
+    assert old.close_calls == 1
+    assert first.close_calls == 1
+    assert loop.tools[second.name] is second
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reload_retries_failed_candidate_cleanup_before_replacing_old_host(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    old = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+        fail_close_times=1,
+    )
+    candidate = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+        fail_close_times=1,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-retry.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        tmp_path,
+        tools={old.name: old},
+    )
+
+    with pytest.raises(RuntimeError, match="failed to close 1 executable plugin tool"):
+        await loop.reload_plugin_runtime_tools([candidate])
+
+    assert old.name not in loop.tools
+    assert old.close_calls == 1
+    assert candidate.close_calls == 1
+    assert old in loop._retired_plugin_tools
+    assert candidate in loop._retired_plugin_tools
+
+    replacement = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+    )
+    await loop.reload_plugin_runtime_tools([replacement])
+
+    assert candidate.close_calls == 2
+    assert old.close_calls == 2
+    assert not loop._retired_plugin_tools
+    assert loop.tools[replacement.name] is replacement
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_old_plugin_cleanup_prunes_deferred_tool_activation(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    old = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+        fail_close_times=1,
+    )
+    search = SearchToolsTool(guard, lambda: {}, threshold=1)
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-search-prune.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        tmp_path,
+        tools={search.name: search, old.name: old},
+    )
+    search.activated_names.add(old.name)
+    candidate = _ReloadLifecycleTool(
+        guard,
+        name=old.name,
+        plugin_runtime_tool=True,
+    )
+
+    with pytest.raises(RuntimeError, match="failed to close 1 executable plugin tool"):
+        await loop.reload_plugin_runtime_tools([candidate])
+
+    assert old.name not in loop.tools
+    assert old.name not in search.activated_names
+    assert old in loop._retired_plugin_tools
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_successful_plugin_tool_removal_prunes_deferred_activation(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    old = _ReloadLifecycleTool(
+        guard,
+        name="plugin_example__echo",
+        plugin_runtime_tool=True,
+    )
+    search = SearchToolsTool(guard, lambda: {}, threshold=1)
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-search-success.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        tmp_path,
+        tools={search.name: search, old.name: old},
+    )
+    search.activated_names.add(old.name)
+
+    await loop.reload_plugin_runtime_tools([])
+
+    assert old.close_calls == 1
+    assert old.name not in loop.tools
+    assert old.name not in search.activated_names
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retries_retired_plugin_candidate_cleanup(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    occupied = _ReloadLifecycleTool(
+        guard,
+        name="collision",
+        plugin_runtime_tool=False,
+    )
+    candidate = _ReloadLifecycleTool(
+        guard,
+        name="collision",
+        plugin_runtime_tool=True,
+        fail_close_times=2,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "reload-shutdown.db"),
+        NoopProvider(),
+        guard,
+        NoopUI(),
+        tmp_path,
+        tools={occupied.name: occupied},
+    )
+    with pytest.raises(ValueError, match="collides with an existing tool"):
+        await loop.reload_plugin_runtime_tools([candidate])
+
+    with pytest.raises(RuntimeError, match="retired plugin tool"):
+        await loop.aclose()
+
+    assert candidate.close_calls == 2
+    assert candidate in loop._retired_plugin_tools
+
+    await loop.aclose()
+
+    assert candidate.close_calls == 3
+    assert not loop._retired_plugin_tools
+
+
 def test_runtime_tool_names_are_portable_and_collisions_are_rejected(
     tmp_path: Path,
 ) -> None:
@@ -678,6 +1194,8 @@ async def test_standard_runtime_assembly_executes_through_loop_and_persists(
         model="ollama/test",
         workspace_root=tmp_path,
         sandbox_backend="direct",
+        sandbox_docker_memory_mb=1536,
+        sandbox_docker_cpus=1.25,
         allow_unsafe_plugin_runtime=True,
     )
 
@@ -694,6 +1212,8 @@ async def test_standard_runtime_assembly_executes_through_loop_and_persists(
     assert isinstance(plugin_tool, PluginRuntimeTool)
     assert plugin_tool.client.sandbox_manager.workspace_read_only is True
     assert plugin_tool.client.sandbox_manager.require_read_isolation is True
+    assert plugin_tool.client.sandbox_manager.docker_memory_mb == 1536
+    assert plugin_tool.client.sandbox_manager.docker_cpus == 1.25
     store = SessionStore(tmp_path / "assembled.db")
     loop = AshLoop(
         store,

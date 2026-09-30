@@ -19,6 +19,7 @@ from ash.safety.grants import (
     build_exact_scope_matchers,
 )
 from ash.safety.policy import PolicyAction
+from ash.tools.base import sensitive_tool_argument_fields
 from ash.ui.notifications import NotificationEvent, NotificationSink
 
 if TYPE_CHECKING:
@@ -297,15 +298,23 @@ class InteractiveTurnController:
             if answer in {"y", "yes"}:
                 return True
             if answer in {"a", "always", "session", "tool"}:
-                self.loop.permission_policy.add_session_rule(
-                    PermissionRule.create(RuleEffect.ALLOW, tool_name)
-                )
+                try:
+                    self.loop.permission_policy.add_session_rule(
+                        PermissionRule.create(RuleEffect.ALLOW, tool_name)
+                    )
+                except OverflowError as exc:
+                    self.write_status(f"Session approval denied: {exc}.")
+                    return False
                 self.ui.approve_tool_for_session(tool_name)
                 self.write_status(f"Allowed {tool_name} for this session.")
                 return True
             if answer in {"s", "scope"}:
                 rule = self._exact_scope_rule(RuleEffect.ALLOW, tool_name, arguments)
-                self.loop.permission_policy.add_session_rule(rule)
+                try:
+                    self.loop.permission_policy.add_session_rule(rule)
+                except OverflowError as exc:
+                    self.write_status(f"Session approval denied: {exc}.")
+                    return False
                 self.write_status(
                     f"Allowed scoped {tool_name} calls for this session ({rule.rule_id})."
                 )
@@ -315,7 +324,7 @@ class InteractiveTurnController:
                 self._persist_rule(rule)
                 return True
             if answer in {"e", "edit"}:
-                scoped_arguments = await self._edit_exact_scope(arguments)
+                scoped_arguments = await self._edit_exact_scope(tool_name, arguments)
                 if scoped_arguments is None:
                     return False
                 rule = self._exact_scope_rule(
@@ -379,25 +388,48 @@ class InteractiveTurnController:
             self._approval_active = False
             self._approval_complete.set()
 
-    @staticmethod
     def _exact_scope_rule(
+        self,
         effect: RuleEffect,
         tool_name: str,
         arguments: dict[str, object],
     ) -> PermissionRule:
+        sensitive = self._sensitive_scope_fields(tool_name, arguments)
+        if sensitive:
+            raise PermissionGrantError(
+                "sensitive tool arguments cannot be persisted in an exact scope: "
+                + ", ".join(sorted(sensitive))
+            )
         return PermissionRule.create(
             effect,
             tool_name,
             build_exact_scope_matchers(arguments),
         )
 
+    def _sensitive_scope_fields(
+        self,
+        tool_name: str,
+        arguments: dict[str, object],
+    ) -> set[str]:
+        tool = self.loop.tools.get(tool_name)
+        if tool is None:
+            return set()
+        return set(sensitive_tool_argument_fields(tool)).intersection(arguments)
+
     async def _edit_exact_scope(
         self,
+        tool_name: str,
         arguments: dict[str, object],
     ) -> dict[str, object] | None:
         """Full-screen editor flow for selecting exact argument scopes."""
 
-        keys = sorted(arguments)
+        sensitive = self._sensitive_scope_fields(tool_name, arguments)
+        if sensitive:
+            self.write_status(
+                "Sensitive argument fields cannot be persisted and were excluded "
+                "from the editable scope: " + ", ".join(sorted(sensitive))
+            )
+        keys = sorted(set(arguments) - sensitive)
         if not keys:
             self.write_status("No exact arguments are available to scope.")
             return None

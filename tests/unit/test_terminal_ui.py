@@ -1,9 +1,113 @@
 # tests/unit/test_terminal_ui.py
+import os
+from pathlib import Path
+
+from ash.ui import terminal as terminal_module
 from ash.ui.terminal import TerminalUI
+from ash.ui.safe_text import terminal_safe_text
 from io import StringIO
 import pytest
 from rich.console import Console
 from types import SimpleNamespace
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
+def test_editor_launch_skips_workspace_shadowed_bare_editor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    workspace.mkdir()
+    host_bin.mkdir()
+    for directory, marker in ((workspace, "workspace"), (host_bin, "host")):
+        executable = directory / "editorprobe"
+        executable.write_text(f"#!/bin/sh\necho {marker}\n", encoding="utf-8")
+        executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{workspace}{os.pathsep}{host_bin}")
+
+    command, _environment = terminal_module._editor_launch(
+        "editorprobe --wait",
+        workspace=workspace,
+    )
+
+    assert Path(command[0]).resolve() == (host_bin / "editorprobe").resolve()
+    assert command[1:] == ["--wait"]
+
+
+def test_editor_launch_scrubs_parent_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    editor = tmp_path / "editor"
+    editor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    editor.chmod(0o755)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-openai-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-anthropic-secret")
+    monkeypatch.setenv("DISPLAY", ":77")
+
+    _command, environment = terminal_module._editor_launch(
+        str(editor),
+        workspace=tmp_path,
+    )
+
+    assert "OPENAI_API_KEY" not in environment
+    assert "ANTHROPIC_API_KEY" not in environment
+    assert environment["DISPLAY"] == ":77"
+    assert "PATH" in environment
+    assert "HOME" in environment
+
+
+def test_editor_launch_allows_explicit_workspace_editor(tmp_path: Path) -> None:
+    editor = tmp_path / "local-editor"
+    editor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    editor.chmod(0o755)
+
+    command, _environment = terminal_module._editor_launch(
+        "./local-editor --flag",
+        workspace=tmp_path,
+    )
+
+    assert Path(command[0]).resolve() == editor.resolve()
+    assert command[1:] == ["--flag"]
+
+
+def test_edit_plan_passes_scrubbed_environment_to_editor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    editor = tmp_path / "editor"
+    editor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    editor.chmod(0o755)
+    monkeypatch.setenv("EDITOR", str(editor))
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-cross")
+    monkeypatch.setattr(
+        "ash.core.planner.render_sprint_markdown",
+        lambda execution: "plan text\n",
+    )
+    observed: dict[str, object] = {}
+
+    def fake_run(command, *, check, env):
+        observed["command"] = command
+        observed["check"] = check
+        observed["env"] = env
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(terminal_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        "ash.core.planner.apply_sprint_markdown_edit",
+        lambda execution, markdown: observed.update(markdown=markdown),
+    )
+    ui = TerminalUI(workspace_root=tmp_path)
+
+    ui._edit_plan(SimpleNamespace())
+
+    environment = observed["env"]
+    assert isinstance(environment, dict)
+    assert "OPENAI_API_KEY" not in environment
+    assert observed["check"] is False
+    assert observed["markdown"] == "plan text\n"
 
 
 def test_terminal_ui_initializes_with_safety_tier():
@@ -12,6 +116,12 @@ def test_terminal_ui_initializes_with_safety_tier():
 
     ui2 = TerminalUI(safety_tier="auto_approve")
     assert ui2.safety_tier == "auto_approve"
+
+
+def test_single_line_terminal_text_escapes_unicode_line_separators() -> None:
+    rendered = terminal_safe_text("left\u2028middle\u2029right", single_line=True)
+
+    assert rendered == "left\\u2028middle\\u2029right"
 
 
 def test_terminal_ui_supports_no_color_and_reduced_motion():

@@ -36,11 +36,17 @@ from ash.sandbox._base import (
     SandboxTier,
 )
 from ash.sandbox.bwrap import BubblewrapSandbox, probe_bwrap
-from ash.sandbox.docker import DEFAULT_IMAGE, DockerSandbox, probe_docker
+from ash.sandbox.docker import (
+    DEFAULT_IMAGE,
+    DockerSandbox,
+    docker_cli_environment,
+    probe_docker,
+)
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     ProcessStreamCallback,
     ProcessTreeError,
+    ProcessTreePlan,
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
@@ -77,6 +83,29 @@ SANDBOX_TIER_SANDBOX_EXEC: int = SANDBOX_TIER_BWRAP
 # backends whose current semantics also prevent arbitrary host file reads.
 _FULL_ISOLATION_BACKENDS = frozenset({"bubblewrap", "docker"})
 _ASH_PLUGIN_VOLUME = re.compile(r"^ash-plugin-[0-9a-f]{24}$")
+
+
+async def _settle_unexpected_process_failure(
+    process: asyncio.subprocess.Process,
+    *,
+    plan: ProcessTreePlan,
+    primary_error: Exception,
+    label: str,
+) -> None:
+    cleanup_error, cleanup_cancelled = await settle_process_tree_after_cancellation(
+        process,
+        plan=plan,
+    )
+    if cleanup_error is not None:
+        primary_error.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+    if cleanup_cancelled:
+        cancellation = asyncio.CancelledError()
+        cancellation.add_note(
+            f"{label} failed before process-tree cleanup was cancelled"
+        )
+        if cleanup_error is not None:
+            cancellation.add_note("Process-tree cleanup also failed")
+        raise cancellation from primary_error
 
 
 @dataclass(frozen=True)
@@ -203,6 +232,7 @@ class SandboxManager:
     """
 
     workspace_root: Path | None = None
+    expected_workspace_identity: tuple[int, int] | None = None
     preferred_tier: SandboxTier = SANDBOX_TIER_DOCKER
     network: bool = False
     timeout_seconds: int = 300
@@ -212,7 +242,10 @@ class SandboxManager:
     allow_scoped_fallback: bool = False
     backend_preference: str = "auto"
     docker_image: str = DEFAULT_IMAGE
+    docker_memory_mb: int = 4096
+    docker_cpus: float = 2.0
     _selected_backend: str = field(init=False, repr=False, default="scoped")
+    _selection_error: str | None = field(init=False, repr=False, default=None)
     _workspace_identity: tuple[int, int] | None = field(
         init=False, repr=False, default=None
     )
@@ -234,14 +267,41 @@ class SandboxManager:
             )
         if not self.docker_image.strip():
             raise ValueError("docker_image must not be empty")
+        if (
+            self.docker_memory_mb < 0
+            or 0 < self.docker_memory_mb < 6
+            or self.docker_memory_mb > 1_048_576
+        ):
+            raise ValueError("docker_memory_mb must be 0 or at least 6 MiB")
+        if not 0 <= self.docker_cpus <= 1024:
+            raise ValueError("docker_cpus must be between 0 and 1024")
         if self.workspace_root is not None:
             self.workspace_root = Path(self.workspace_root).expanduser().resolve()
             try:
                 metadata = self.workspace_root.stat()
-            except OSError:
-                pass
+            except OSError as exc:
+                if self.expected_workspace_identity is not None:
+                    raise SandboxBackendUnavailable(
+                        "sandbox workspace identity changed"
+                    ) from exc
             else:
-                self._workspace_identity = (metadata.st_dev, metadata.st_ino)
+                observed_identity = (metadata.st_dev, metadata.st_ino)
+                if (
+                    self.expected_workspace_identity is not None
+                    and observed_identity != self.expected_workspace_identity
+                ):
+                    raise SandboxBackendUnavailable(
+                        "sandbox workspace identity changed"
+                    )
+                self._workspace_identity = (
+                    self.expected_workspace_identity
+                    if self.expected_workspace_identity is not None
+                    else observed_identity
+                )
+        elif self.expected_workspace_identity is not None:
+            raise ValueError(
+                "expected_workspace_identity requires a sandbox workspace_root"
+            )
         read_only_identities: list[tuple[Path, tuple[int, int]]] = []
         for raw_path in self.extra_read_only_paths:
             resolved = Path(raw_path).expanduser().resolve()
@@ -284,15 +344,51 @@ class SandboxManager:
         """Return stable, user-facing enforcement and backend diagnostics."""
 
         isolated = self.is_fully_isolated()
-        if isolated:
+        explicit_unavailable = self._selection_error is not None
+        if explicit_unavailable and not self.allow_scoped_fallback:
+            filesystem = "unavailable"
+            network = "unavailable"
+            detail = (
+                f"{self._selection_error} Commands are refused until the requested "
+                "sandbox becomes available."
+            )
+        elif explicit_unavailable:
+            filesystem = "host"
+            network = "host"
+            detail = (
+                f"{self._selection_error} Explicit scoped fallback is enabled, so "
+                "commands may run as the current user without OS isolation."
+            )
+        elif isolated:
             filesystem = (
                 "workspace-read" if self.workspace_read_only else "workspace-write"
             )
             network = "enabled" if self.network else "blocked"
-            detail = (
-                "Commands are isolated to the workspace and temporary storage; "
-                f"network access is {network}."
-            )
+            if self.backend_name == "docker":
+                memory = (
+                    f"{self.docker_memory_mb} MiB"
+                    if self.docker_memory_mb > 0
+                    else "unlimited"
+                )
+                cpus = (
+                    f"{self.docker_cpus:g}"
+                    if self.docker_cpus > 0
+                    else "unlimited"
+                )
+                detail = (
+                    "Commands run inside Docker with host access restricted to the "
+                    "workspace bind and temporary storage; network access is "
+                    f"{network}. Docker resources are bounded to memory={memory}, "
+                    f"cpus={cpus}, and pids=256. The ordinary mutable workspace bind is resolved by "
+                    "the Docker daemon from its host pathname, so this mode assumes "
+                    "the local OS account and daemon host are not concurrently "
+                    "replacing that path."
+                )
+            else:
+                detail = (
+                    "Commands are isolated to the workspace and temporary storage; "
+                    f"network access is {network}."
+                )
         elif self.backend_name == "sandbox-exec":
             filesystem = (
                 "host-read;workspace-read"
@@ -314,7 +410,11 @@ class SandboxManager:
             )
         return {
             "requested_backend": self.backend_preference,
-            "backend": self.backend_name,
+            "backend": (
+                "unavailable"
+                if explicit_unavailable and not self.allow_scoped_fallback
+                else self.backend_name
+            ),
             "tier": self.tier,
             "isolated": isolated,
             "filesystem": filesystem,
@@ -396,6 +496,7 @@ class SandboxManager:
                     env=env,
                     stream_callback=stream_callback,
                     expected_cwd_identity=expected_cwd_identity,
+                    expected_workspace_identity=self._workspace_identity,
                 )
 
             return await _run_subprocess(
@@ -409,6 +510,11 @@ class SandboxManager:
                 stream_callback=stream_callback,
                 pass_fds=invocation.pass_fds,
                 expected_cwd_identity=expected_cwd_identity,
+                expected_workspace_identity=(
+                    None
+                    if invocation.backend_name == "bubblewrap"
+                    else self._workspace_identity
+                ),
             )
 
     @contextmanager
@@ -435,7 +541,10 @@ class SandboxManager:
                 _, workspace_fd = stack.enter_context(
                     open_scoped_directory(
                         self.workspace_root,
-                        SafetyGuard(self.workspace_root),
+                        SafetyGuard(
+                            self.workspace_root,
+                            expected_project_root_identity=self._workspace_identity,
+                        ),
                     )
                 )
                 opened = os.fstat(workspace_fd)
@@ -557,6 +666,12 @@ class SandboxManager:
                 workspace_root=self.workspace_root,
                 network=False,
                 workspace_read_only=False,
+                memory_limit=(
+                    f"{self.docker_memory_mb}m"
+                    if self.docker_memory_mb > 0
+                    else None
+                ),
+                cpus=self.docker_cpus if self.docker_cpus > 0 else None,
                 docker_path=backend.docker_path,
                 run_as_host_user=False,
             )
@@ -610,6 +725,16 @@ class SandboxManager:
 
         if not command:
             raise ValueError("command must be a non-empty sequence")
+        if self._selection_error is not None:
+            if not self.allow_scoped_fallback:
+                raise SandboxBackendUnavailable(self._selection_error)
+            return SandboxInvocation(
+                tuple(command),
+                cwd,
+                SANDBOX_TIER_SCOPED,
+                "scoped",
+                fallback_used=True,
+            )
         try:
             backend = self._build_backend(self._tier)
             if isinstance(backend, BubblewrapSandbox):
@@ -678,6 +803,15 @@ class SandboxManager:
         ):
             self._selected_backend = "docker"
             return SANDBOX_TIER_DOCKER
+        if self.backend_preference in {"native", "docker"}:
+            requested = self.backend_preference
+            self._selection_error = (
+                f"Requested {requested} sandbox backend is unavailable. "
+                + _sandbox_remediation(
+                    preference=requested,
+                    docker_image=self.docker_image,
+                )
+            )
         self._selected_backend = "scoped"
         return SANDBOX_TIER_SCOPED
 
@@ -703,6 +837,12 @@ class SandboxManager:
                 network=self.network,
                 image=self.docker_image,
                 workspace_read_only=self.workspace_read_only,
+                memory_limit=(
+                    f"{self.docker_memory_mb}m"
+                    if self.docker_memory_mb > 0
+                    else None
+                ),
+                cpus=self.docker_cpus if self.docker_cpus > 0 else None,
             )
             # Docker can disappear after startup (daemon stopped, Desktop
             # restarting, or the configured image removed).  Re-probe here so
@@ -777,6 +917,7 @@ async def _run_scoped(
     env: dict[str, str] | None = None,
     stream_callback: ProcessStreamCallback | None = None,
     expected_cwd_identity: tuple[int, int] | None = None,
+    expected_workspace_identity: tuple[int, int] | None = None,
 ) -> SandboxResult:
     """Execute the command directly via asyncio.create_subprocess_exec."""
 
@@ -786,8 +927,13 @@ async def _run_scoped(
     except ProcessTreeUnavailable as exc:
         raise SandboxBackendUnavailable(str(exc)) from exc
     child_env = env if env is not None else {"PATH": os.defpath}
-    guard = SafetyGuard(workspace_root or cwd or Path.cwd())
     try:
+        guard = SafetyGuard(
+            workspace_root or cwd or Path.cwd(),
+            expected_project_root_identity=(
+                expected_workspace_identity if workspace_root is not None else None
+            ),
+        )
         with prepare_scoped_process_launch(
             command,
             cwd=cwd,
@@ -807,8 +953,14 @@ async def _run_scoped(
                 **spawn_options,
             )
     except (ProcessTreeUnavailable, SafetyViolation, OSError) as exc:
+        detail = str(exc)
+        if (
+            isinstance(exc, SafetyViolation)
+            and "Project root identity changed before guard initialization" in detail
+        ):
+            detail = "working directory identity changed"
         raise SandboxBackendUnavailable(
-            f"sandbox cwd became unavailable before launch: {exc}"
+            f"sandbox cwd became unavailable before launch: {detail}"
         ) from exc
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -866,6 +1018,14 @@ async def _run_scoped(
             duration_seconds=time.monotonic() - start,
             output_truncated=True,
         )
+    except Exception as primary_error:
+        await _settle_unexpected_process_failure(
+            process,
+            plan=process_tree_plan,
+            primary_error=primary_error,
+            label="sandbox command",
+        )
+        raise
     return SandboxResult(
         exit_code=process.returncode if process.returncode is not None else -1,
         stdout=stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else "",
@@ -889,6 +1049,7 @@ async def _run_subprocess(
     stream_callback: ProcessStreamCallback | None = None,
     pass_fds: tuple[int, ...] = (),
     expected_cwd_identity: tuple[int, int] | None = None,
+    expected_workspace_identity: tuple[int, int] | None = None,
 ) -> SandboxResult:
     """Execute a pre-wrapped argv (e.g. bwrap or docker run) directly."""
 
@@ -897,8 +1058,13 @@ async def _run_subprocess(
         process_tree_plan = prepare_process_tree(workspace_root=workspace_root or cwd)
     except ProcessTreeUnavailable as exc:
         raise SandboxBackendUnavailable(str(exc)) from exc
-    guard = SafetyGuard(workspace_root or cwd or Path.cwd())
     try:
+        guard = SafetyGuard(
+            workspace_root or cwd or Path.cwd(),
+            expected_project_root_identity=(
+                expected_workspace_identity if workspace_root is not None else None
+            ),
+        )
         with prepare_scoped_process_launch(
             argv,
             cwd=cwd,
@@ -919,8 +1085,14 @@ async def _run_subprocess(
                 **spawn_options,
             )
     except (ProcessTreeUnavailable, SafetyViolation, OSError) as exc:
+        detail = str(exc)
+        if (
+            isinstance(exc, SafetyViolation)
+            and "Project root identity changed before guard initialization" in detail
+        ):
+            detail = "working directory identity changed"
         raise SandboxBackendUnavailable(
-            f"sandbox cwd became unavailable before launch: {exc}"
+            f"sandbox cwd became unavailable before launch: {detail}"
         ) from exc
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -978,6 +1150,14 @@ async def _run_subprocess(
             duration_seconds=time.monotonic() - start,
             output_truncated=True,
         )
+    except Exception as primary_error:
+        await _settle_unexpected_process_failure(
+            process,
+            plan=process_tree_plan,
+            primary_error=primary_error,
+            label="sandbox command",
+        )
+        raise
     return SandboxResult(
         exit_code=process.returncode if process.returncode is not None else -1,
         stdout=stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else "",
@@ -1032,6 +1212,7 @@ async def _run_docker_control(
             stdin=stdin if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=docker_cli_environment(),
             **process_tree_plan.spawn_options,
         )
     except OSError as exc:
@@ -1075,6 +1256,14 @@ async def _run_docker_control(
         if exc.cleanup_error is not None:
             detail += f"; process-tree cleanup failed: {exc.cleanup_error}"
         raise SandboxBackendUnavailable(detail) from exc
+    except Exception as primary_error:
+        await _settle_unexpected_process_failure(
+            process,
+            plan=process_tree_plan,
+            primary_error=primary_error,
+            label="Docker control command",
+        )
+        raise
     if process.returncode != 0:
         error = stderr.decode("utf-8", errors="replace").strip()[-4096:]
         detail = f"Docker control command failed with status {process.returncode}"
@@ -1213,11 +1402,5 @@ def _sandbox_remediation(*, preference: str, docker_image: str) -> str:
         return (
             "Ensure /usr/bin/sandbox-exec is available, or start Docker and provide "
             f"the {docker_image} image."
-        )
-    if sys.platform == "win32":
-        return (
-            "Start Docker Desktop and provide the "
-            f"{docker_image} image; native Windows isolation is not "
-            "currently available."
         )
     return f"Start Docker and provide the {docker_image} image."

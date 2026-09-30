@@ -3,14 +3,124 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
+from ash.core.redaction import find_secret_candidates
 from ash.mcp.client import MCPClient
 from ash.mcp.diagnostics import safe_mcp_diagnostic
 from ash.mcp.server import MCPServerConfig
 from ash.mcp.oauth import MCPOAuthTokenStore
 from ash.ui.safe_text import terminal_safe_text
+
+
+_ENV_REFERENCE = re.compile(r"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)")
+_DIRECT_ENV_REFERENCE = re.compile(
+    r"^\s*\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)\s*$"
+)
+_AUTH_HEADER_REFERENCE = re.compile(
+    r"^\s*(?:[A-Za-z][A-Za-z0-9._-]*\s+)?"
+    r"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)\s*$"
+)
+_CREDENTIAL_HEADER_NAMES = frozenset(
+    {"authorization", "proxy-authorization", "x-api-key"}
+)
+_SECRET_NAME_COMPONENTS = frozenset(
+    {"authorization", "credential", "key", "password", "secret", "token"}
+)
+
+
+def _normalized_name_components(value: str) -> tuple[str, ...]:
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    return tuple(
+        component
+        for component in re.sub(r"[^A-Za-z0-9]+", "_", normalized)
+        .casefold()
+        .split("_")
+        if component
+    )
+
+
+def _secret_like_name(value: str) -> bool:
+    return bool(_SECRET_NAME_COMPONENTS.intersection(_normalized_name_components(value)))
+
+
+def _reject_obvious_literal_secret(value: str, *, label: str) -> None:
+    if _ENV_REFERENCE.search(value):
+        return
+    if find_secret_candidates(value):
+        raise ValueError(
+            f"{label} appears to contain a literal credential; reference an "
+            "environment variable instead"
+        )
+
+
+def validate_persisted_mcp_credentials(
+    *,
+    env: dict[str, str],
+    headers: dict[str, str],
+    command_parts: list[str],
+) -> None:
+    """Prevent CLI-created repo-local MCP configs from embedding credentials."""
+
+    for key, value in env.items():
+        if _secret_like_name(key) and _DIRECT_ENV_REFERENCE.fullmatch(value) is None:
+            raise ValueError(
+                f"--env {key} looks credential-bearing; use an environment "
+                "variable reference ($VAR or ${VAR}) so the secret is not written "
+                "to .mcp.json"
+            )
+        _reject_obvious_literal_secret(value, label=f"--env {key}")
+
+    for key, value in headers.items():
+        if (
+            key.casefold() in _CREDENTIAL_HEADER_NAMES
+            and _AUTH_HEADER_REFERENCE.fullmatch(value) is None
+        ):
+            raise ValueError(
+                f"--header {key} is credential-bearing; use an environment "
+                "variable reference so the secret is not written to .mcp.json"
+            )
+        _reject_obvious_literal_secret(value, label=f"--header {key}")
+
+    pending_sensitive_option: str | None = None
+    for argument in command_parts:
+        if pending_sensitive_option is not None:
+            if _DIRECT_ENV_REFERENCE.fullmatch(argument) is None:
+                raise ValueError(
+                    f"MCP command option {pending_sensitive_option} looks "
+                    "credential-bearing; use $VAR or ${{VAR}} instead"
+                )
+            pending_sensitive_option = None
+            continue
+
+        if argument.startswith("--"):
+            option, separator, value = argument.partition("=")
+            if _secret_like_name(option.lstrip("-")):
+                if separator:
+                    if _DIRECT_ENV_REFERENCE.fullmatch(value) is None:
+                        raise ValueError(
+                            f"MCP command option {option} looks credential-bearing; "
+                            "use $VAR or ${{VAR}} instead"
+                        )
+                else:
+                    pending_sensitive_option = option
+                continue
+
+        findings = [
+            finding
+            for finding in find_secret_candidates(argument)
+            if finding.kind != "secret assignment"
+        ]
+        if findings and _ENV_REFERENCE.search(argument) is None:
+            raise ValueError(
+                "MCP command arguments appear to contain a literal credential; "
+                "reference an environment variable instead"
+            )
+
+    if pending_sensitive_option is not None:
+        raise ValueError(f"MCP command option {pending_sensitive_option} requires a value")
 
 
 def parse_key_value_options(values: list[str] | None, *, label: str) -> dict[str, str]:
@@ -57,6 +167,11 @@ def _oauth_credential_state(config: MCPServerConfig) -> str | None:
         return store.credential_state(config.resolved_url, issuer=issuer)
     except ValueError as exc:
         return f"invalid configuration: {exc}"
+
+
+def _redact_probe_value(client: object, value: Any) -> Any:
+    sanitizer = getattr(client, "redact_remote_output", None)
+    return sanitizer(value) if callable(sanitizer) else value
 
 
 def render_mcp_servers(
@@ -119,7 +234,12 @@ async def probe_mcp_server(
         resources = capabilities.get("resources")
         prompts = capabilities.get("prompts")
         tool_capability = capabilities.get("tools")
-        server_info = client.server_info if isinstance(client.server_info, dict) else {}
+        server_info = _redact_probe_value(
+            client,
+            client.server_info if isinstance(client.server_info, dict) else {},
+        )
+        if not isinstance(server_info, dict):
+            server_info = {}
         payload = {
             "name": config.name,
             "transport": config.transport,
@@ -159,7 +279,9 @@ async def probe_mcp_server(
         except BaseException as cleanup_error:
             primary.add_note(
                 "MCP probe disconnect cleanup failed: "
-                + safe_mcp_diagnostic(cleanup_error)
+                + safe_mcp_diagnostic(
+                    _redact_probe_value(client, str(cleanup_error))
+                )
             )
         raise
     await client.disconnect()

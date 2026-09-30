@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import inspect
 import ipaddress
 import os
 import shutil
@@ -17,7 +18,8 @@ _TEST_HOME: Path | None = None
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 _ORIGINAL_CONNECT = socket.socket.connect
 _ORIGINAL_CONNECT_EX = socket.socket.connect_ex
-_ORIGINAL_PATH_HOME = Path.__dict__["home"]
+_PATH_HOME_WAS_OWNED = "home" in Path.__dict__
+_ORIGINAL_PATH_HOME = inspect.getattr_static(Path, "home")
 
 
 def _remember_and_set(name: str, value: str) -> None:
@@ -69,6 +71,19 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     """Establish deterministic home/network isolation before test collection."""
 
     global _TEST_HOME
+    original_home = Path.home().resolve()
+    original_cache_home = Path(
+        os.environ.get("XDG_CACHE_HOME", original_home / ".cache")
+    ).expanduser().resolve()
+    playwright_browser_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if (
+        os.environ.get("ASH_RUN_BROWSER_TESTS") == "1"
+        and not playwright_browser_path
+    ):
+        installed_browsers = original_cache_home / "ms-playwright"
+        if installed_browsers.is_dir():
+            _remember_and_set("PLAYWRIGHT_BROWSERS_PATH", str(installed_browsers))
+
     _TEST_HOME = Path(tempfile.mkdtemp(prefix="ash-pytest-home-")).resolve()
     config_home = _TEST_HOME / ".config"
     data_home = _TEST_HOME / ".local" / "share"
@@ -122,7 +137,13 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     socket.getaddrinfo = _ORIGINAL_GETADDRINFO  # type: ignore[assignment]
     socket.socket.connect = _ORIGINAL_CONNECT  # type: ignore[method-assign]
     socket.socket.connect_ex = _ORIGINAL_CONNECT_EX  # type: ignore[method-assign]
-    Path.home = _ORIGINAL_PATH_HOME  # type: ignore[method-assign]
+    if _PATH_HOME_WAS_OWNED:
+        Path.home = _ORIGINAL_PATH_HOME  # type: ignore[method-assign]
+    else:
+        try:
+            delattr(Path, "home")
+        except AttributeError:
+            pass
     for name, previous in _ORIGINAL_ENV.items():
         if previous is None:
             os.environ.pop(name, None)

@@ -9,7 +9,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -28,7 +30,12 @@ from ash.sandbox import (
     has_sandbox_exec,
 )
 from ash.sandbox.bwrap import probe_bwrap
-from ash.sandbox.docker import DEFAULT_IMAGE, probe_docker
+from ash.sandbox.docker import (
+    DEFAULT_IMAGE,
+    docker_cli_environment,
+    probe_docker,
+    run_docker_cli_sync,
+)
 from ash.safety.environment import resolve_host_executable
 from ash.tools.command import RunCommandTool
 
@@ -56,6 +63,53 @@ def test_has_sandbox_exec_only_on_macos() -> None:
         assert has_sandbox_exec() is (
             resolve_host_executable("sandbox-exec") is not None
         )
+
+
+@pytest.mark.parametrize(
+    ("version_output", "expected_available"),
+    [
+        (b"bubblewrap 0.11.0\n", False),
+        (b"bubblewrap 0.12.0\n", True),
+        (b"bubblewrap 0.13.0\n", True),
+        (b"unexpected version output\n", False),
+    ],
+)
+def test_probe_bwrap_requires_security_supported_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version_output: bytes,
+    expected_available: bool,
+) -> None:
+    fake = tmp_path / "bwrap"
+    fake.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-provider-secret")
+    calls: list[list[str]] = []
+    environments: list[dict[str, str]] = []
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        environments.append(dict(kwargs["env"]))
+        if argv[1:] == ["--version"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=version_output, stderr=b"")
+        return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(
+        "ash.sandbox.bwrap.resolve_host_executable",
+        lambda *args, **kwargs: str(fake),
+    )
+    monkeypatch.setattr("ash.sandbox.bwrap.subprocess.run", run)
+    monkeypatch.setattr("ash.sandbox.bwrap.sys.platform", "linux")
+
+    available = probe_bwrap(workspace_root=tmp_path)
+
+    assert (available is not None) is expected_available
+    assert calls[0][1:] == ["--version"]
+    assert all("OPENAI_API_KEY" not in environment for environment in environments)
+    if expected_available:
+        assert len(calls) == 2
+    else:
+        assert len(calls) == 1
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
@@ -138,6 +192,57 @@ async def test_manager_run_refuses_replaced_workspace_root(
 
     assert not (saved / "marker.txt").exists()
     assert not (workspace / "marker.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
+@pytest.mark.asyncio
+async def test_manager_run_refuses_replaced_workspace_root_for_nested_cwd(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    nested = workspace / "nested"
+    nested.mkdir(parents=True)
+    saved = tmp_path / "workspace-saved"
+    replacement = tmp_path / "replacement"
+    replacement_nested = replacement / "nested"
+    replacement_nested.mkdir(parents=True)
+    manager = SandboxManager(workspace_root=workspace, backend_preference="direct")
+    workspace.rename(saved)
+    replacement.rename(workspace)
+
+    with pytest.raises(
+        SandboxBackendUnavailable,
+        match="working directory identity changed",
+    ):
+        await manager.run(
+            ["/bin/sh", "-c", "printf unsafe > marker.txt"],
+            cwd=workspace / "nested",
+            timeout=5,
+        )
+
+    assert not (saved / "nested" / "marker.txt").exists()
+    assert not (workspace / "nested" / "marker.txt").exists()
+
+
+def test_manager_rejects_unexpected_initial_workspace_identity(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = workspace.stat()
+    expected_identity = (metadata.st_dev, metadata.st_ino)
+    workspace.rename(tmp_path / "workspace-original")
+    workspace.mkdir()
+
+    with pytest.raises(
+        SandboxBackendUnavailable,
+        match="sandbox workspace identity changed",
+    ):
+        SandboxManager(
+            workspace_root=workspace,
+            expected_workspace_identity=expected_identity,
+            backend_preference="direct",
+        )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor cwd")
@@ -271,10 +376,17 @@ def test_manager_does_not_trust_workspace_shadowed_bwrap(
     host_bin = tmp_path / "host-bin"
     workspace.mkdir()
     host_bin.mkdir()
-    for directory in (workspace, host_bin):
-        executable = directory / "bwrap"
-        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        executable.chmod(0o755)
+    workspace_bwrap = workspace / "bwrap"
+    workspace_bwrap.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    workspace_bwrap.chmod(0o755)
+    host_bwrap = host_bin / "bwrap"
+    host_bwrap.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then echo "bubblewrap 0.13.0"; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    host_bwrap.chmod(0o755)
     monkeypatch.setenv("PATH", os.pathsep.join((str(workspace), str(host_bin))))
 
     manager = SandboxManager(workspace_root=workspace, backend_preference="native")
@@ -313,16 +425,6 @@ def test_manager_prefers_native_backend_when_docker_is_also_available(
         mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.tier == SANDBOX_TIER_BWRAP
         assert mgr.backend_name == "bubblewrap"
-
-
-def test_manager_uses_docker_as_windows_isolation_backend(tmp_path: Path) -> None:
-    with (
-        patch("ash.sandbox.manager.sys.platform", "win32"),
-        patch("ash.sandbox.manager.has_docker", return_value=True),
-    ):
-        mgr = SandboxManager(workspace_root=tmp_path)
-        assert mgr.tier == SANDBOX_TIER_DOCKER
-        assert mgr.backend_name == "docker"
 
 
 def test_manager_uses_sandbox_exec_on_macos(tmp_path: Path) -> None:
@@ -396,18 +498,6 @@ def test_sandbox_exec_disappearance_uses_only_explicit_scoped_fallback(
     assert invocation.fallback_used is True
 
 
-def test_manager_reports_unisolated_windows_without_docker(tmp_path: Path) -> None:
-    with (
-        patch("ash.sandbox.manager.sys.platform", "win32"),
-        patch("ash.sandbox.manager.has_docker", return_value=False),
-    ):
-        mgr = SandboxManager(workspace_root=tmp_path)
-        status = mgr.status()
-        assert status["isolated"] is False
-        assert status["filesystem"] == "host"
-        assert "Docker Desktop" in str(status["remediation"])
-
-
 def test_manager_falls_back_to_scoped_when_nothing_available(tmp_path: Path) -> None:
     with (
         patch("ash.sandbox.manager.has_docker", return_value=False),
@@ -452,20 +542,45 @@ def test_manager_explicit_direct_does_not_probe_backends(tmp_path: Path) -> None
     docker.assert_not_called()
 
 
-def test_manager_explicit_native_does_not_fall_back_to_docker(
+def test_manager_explicit_unavailable_backend_fails_closed(
     tmp_path: Path,
 ) -> None:
     with (
-        patch("ash.sandbox.manager.sys.platform", "win32"),
-        patch("ash.sandbox.manager.has_docker") as docker,
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False) as bwrap,
+        patch("ash.sandbox.manager.has_docker", return_value=False) as docker,
     ):
-        manager = SandboxManager(
+        native = SandboxManager(
             workspace_root=tmp_path,
             backend_preference="native",
         )
+        requested_docker = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+        )
+        docker_fallback = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            allow_scoped_fallback=True,
+        )
 
-    assert manager.tier == SANDBOX_TIER_SCOPED
-    docker.assert_not_called()
+    assert native.tier == SANDBOX_TIER_SCOPED
+    assert requested_docker.tier == SANDBOX_TIER_SCOPED
+    assert native.status()["backend"] == "unavailable"
+    assert requested_docker.status()["backend"] == "unavailable"
+    assert native.status()["fail_closed"] is True
+    assert requested_docker.status()["fail_closed"] is True
+    with pytest.raises(SandboxBackendUnavailable, match="native sandbox backend"):
+        native.prepare(["true"])
+    with pytest.raises(SandboxBackendUnavailable, match="docker sandbox backend"):
+        requested_docker.prepare(["true"])
+    fallback = docker_fallback.prepare(["true"])
+    assert fallback.backend_name == "scoped"
+    assert fallback.fallback_used is True
+    assert docker_fallback.status()["backend"] == "scoped"
+    bwrap.assert_called_once_with(tmp_path)
+    assert docker.call_count == 2
+    docker.assert_called_with(DEFAULT_IMAGE, workspace_root=tmp_path)
 
 
 def test_manager_explicit_docker_uses_configured_image(tmp_path: Path) -> None:
@@ -478,13 +593,63 @@ def test_manager_explicit_docker_uses_configured_image(tmp_path: Path) -> None:
             workspace_root=tmp_path,
             backend_preference="docker",
             docker_image="company/ash-sandbox:v2",
+            docker_memory_mb=2048,
+            docker_cpus=1.5,
         )
+        backend = manager._build_backend(manager.tier)
+        bwrap.assert_not_called()
+        status = manager.status()
 
     assert manager.tier == SANDBOX_TIER_DOCKER
-    bwrap.assert_not_called()
-    docker.assert_called_once_with(
+    assert manager.is_fully_isolated() is True
+    assert isinstance(backend, DockerSandbox)
+    assert backend.memory_limit == "2048m"
+    assert backend.cpus == 1.5
+    assert "memory=2048 MiB" in status["detail"]
+    assert "cpus=1.5" in status["detail"]
+    docker.assert_called_with(
         "company/ash-sandbox:v2", workspace_root=tmp_path
     )
+
+
+def test_manager_can_disable_docker_cpu_and_memory_limits(tmp_path: Path) -> None:
+    with patch("ash.sandbox.manager.has_docker", return_value=True):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            docker_memory_mb=0,
+            docker_cpus=0,
+        )
+        backend = manager._build_backend(manager.tier)
+        status = manager.status()
+
+    assert isinstance(backend, DockerSandbox)
+    assert backend.memory_limit is None
+    assert backend.cpus is None
+    assert "memory=unlimited" in status["detail"]
+    assert "cpus=unlimited" in status["detail"]
+
+
+def test_manager_rejects_docker_memory_below_engine_minimum(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="0 or at least 6 MiB"):
+        SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="direct",
+            docker_memory_mb=5,
+        )
+
+    with pytest.raises(ValueError, match="docker_memory_mb"):
+        SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="direct",
+            docker_memory_mb=1_048_577,
+        )
+    with pytest.raises(ValueError, match="docker_cpus"):
+        SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="direct",
+            docker_cpus=1025,
+        )
 
 
 def test_manager_capabilities_reports_each_backend(tmp_path: Path) -> None:
@@ -522,17 +687,6 @@ def test_manager_is_fully_isolated_only_at_tier_2_plus(tmp_path: Path) -> None:
     ):
         mgr = SandboxManager(workspace_root=tmp_path)
         assert mgr.is_fully_isolated() is False
-
-
-def test_manager_keeps_docker_as_full_isolation_backend(tmp_path: Path) -> None:
-    with (
-        patch("ash.sandbox.manager.sys.platform", "win32"),
-        patch("ash.sandbox.manager.has_docker", return_value=True),
-    ):
-        mgr = SandboxManager(workspace_root=tmp_path)
-
-    assert mgr.backend_name == "docker"
-    assert mgr.is_fully_isolated() is True
 
 
 def test_manager_status_describes_enforcement(tmp_path: Path) -> None:
@@ -602,9 +756,13 @@ def test_bubblewrap_wrap_includes_namespace_flags(tmp_path: Path) -> None:
     # First element is the bwrap binary path.
     assert Path(argv[0]).name == "bwrap"
     # Required namespace isolation flags are present.
+    assert "--unshare-user" in argv
+    assert "--unshare-user-try" not in argv
     assert "--unshare-pid" in argv
     assert "--unshare-uts" in argv
     assert "--unshare-ipc" in argv
+    assert "--disable-userns" in argv
+    assert "--assert-userns-disabled" in argv
     assert "--die-with-parent" in argv
     assert "--proc" in argv
     assert argv[argv.index("--proc") + 1] == "/proc"
@@ -618,6 +776,22 @@ def test_bubblewrap_wrap_includes_namespace_flags(tmp_path: Path) -> None:
     # Command separator and the actual command are at the tail.
     assert "--" in argv
     assert argv[-2:] == ["echo", "hi"]
+
+
+def test_bubblewrap_does_not_mount_entire_host_etc(tmp_path: Path) -> None:
+    if not has_bwrap():
+        pytest.skip("bwrap not installed on this host")
+    backend = BubblewrapSandbox(workspace_root=tmp_path, network=False)
+
+    argv = backend.wrap(["echo", "hi"])
+
+    mount_pairs = {
+        (argv[index + 1], argv[index + 2])
+        for index, value in enumerate(argv[:-2])
+        if value in {"--ro-bind", "--bind"}
+    }
+    assert ("/etc", "/etc") not in mount_pairs
+    assert "/etc/machine-id" not in argv
 
 
 def test_bubblewrap_with_network_omits_unshare_net(tmp_path: Path) -> None:
@@ -764,6 +938,24 @@ def test_docker_wrap_includes_security_flags(tmp_path: Path) -> None:
     assert argv[-2:] == ["echo", "hi"]
 
 
+def test_docker_wrap_emits_cpu_and_memory_limits(tmp_path: Path) -> None:
+    fake = tmp_path / "docker"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    backend = DockerSandbox(
+        workspace_root=tmp_path,
+        docker_path=str(fake),
+        memory_limit="2048m",
+        cpus=1.5,
+    )
+
+    argv = backend.wrap(["echo", "bounded"])
+
+    assert argv[argv.index("--memory") + 1] == "2048m"
+    assert argv[argv.index("--cpus") + 1] == "1.5"
+    assert "--pids-limit=256" in argv
+
+
 def test_docker_can_mount_workspace_read_only(tmp_path: Path) -> None:
     fake = tmp_path / "docker"
     fake.write_text("#!/bin/sh\n")
@@ -842,6 +1034,8 @@ async def test_manager_stages_docker_workspace_without_host_bind(
             workspace_root=tmp_path,
             backend_preference="docker",
             workspace_read_only=True,
+            docker_memory_mb=1024,
+            docker_cpus=0.75,
         )
         volume = await manager.stage_docker_workspace(archive)
 
@@ -851,6 +1045,9 @@ async def test_manager_stages_docker_workspace_without_host_bind(
     assert create_argv == [str(fake_docker), "volume", "create", volume]
     stage_argv = docker_control.await_args_list[1].args[0]
     assert "run" in stage_argv
+    assert stage_argv[stage_argv.index("--memory") + 1] == "1024m"
+    assert stage_argv[stage_argv.index("--cpus") + 1] == "0.75"
+    assert "--pids-limit=256" in stage_argv
     assert f"source={tmp_path}" not in " ".join(stage_argv)
     mount = stage_argv[stage_argv.index("--mount") + 1]
     assert mount == (
@@ -976,10 +1173,190 @@ def test_probe_docker_requires_daemon_and_image() -> None:
             "ash.sandbox.docker.resolve_host_executable",
             return_value="/usr/bin/docker",
         ),
-        patch("ash.sandbox.docker.subprocess.run", side_effect=[ready, image]) as run,
+        patch(
+            "ash.sandbox.docker.run_docker_cli_sync",
+            side_effect=[ready, image],
+        ) as run,
     ):
         assert probe_docker() == "/usr/bin/docker"
     assert run.call_args_list[1].args[0][-1] == DEFAULT_IMAGE
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group regression")
+def test_sync_docker_cli_timeout_terminates_descendants(tmp_path: Path) -> None:
+    marker = tmp_path / "child-survived"
+    child = (
+        "import time; "
+        "time.sleep(0.35); "
+        f"open({str(marker)!r}, 'w').write('survived'); "
+        "time.sleep(5)"
+    )
+    parent = (
+        "import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+        "time.sleep(30)"
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_docker_cli_sync(
+            [sys.executable, "-c", parent],
+            workspace_root=tmp_path,
+            timeout=0.1,
+        )
+    time.sleep(0.5)
+
+    assert not marker.exists()
+
+
+def test_docker_cli_environment_preserves_context_without_provider_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DOCKER_CONTEXT", "remote-builder")
+    monkeypatch.setenv("DOCKER_HOST", "ssh://docker.example")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-provider-secret")
+
+    environment = docker_cli_environment()
+
+    assert environment["DOCKER_CONTEXT"] == "remote-builder"
+    assert environment["DOCKER_HOST"] == "ssh://docker.example"
+    assert environment["SSH_AUTH_SOCK"] == "/tmp/ssh-agent.sock"
+    assert environment["HTTPS_PROXY"] == "http://proxy.example:8080"
+    assert "OPENAI_API_KEY" not in environment
+
+
+@pytest.mark.asyncio
+async def test_docker_control_uses_scrubbed_docker_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox import manager as manager_module
+
+    monkeypatch.setenv("DOCKER_CONTEXT", "remote-builder")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-provider-secret")
+    process = SimpleNamespace(returncode=0)
+    create = AsyncMock(return_value=process)
+    monkeypatch.setattr(manager_module.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(
+        manager_module,
+        "prepare_process_tree",
+        lambda: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(
+        manager_module,
+        "communicate_process",
+        AsyncMock(return_value=(b"ok", b"")),
+    )
+
+    result = await manager_module._run_docker_control(["/usr/bin/docker", "version"])
+
+    assert result == b"ok"
+    call = create.await_args
+    assert call is not None
+    environment = call.kwargs["env"]
+    assert environment["DOCKER_CONTEXT"] == "remote-builder"
+    assert "OPENAI_API_KEY" not in environment
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner", ["scoped", "wrapped", "docker_control"])
+async def test_sandbox_runners_clean_process_tree_after_unexpected_io_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: str,
+) -> None:
+    from contextlib import nullcontext
+
+    from ash.sandbox import manager as manager_module
+
+    process = SimpleNamespace(returncode=None)
+    cleanup = AsyncMock(return_value=(None, False))
+    monkeypatch.setattr(
+        manager_module,
+        "prepare_process_tree",
+        lambda *args, **kwargs: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(
+        manager_module.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    monkeypatch.setattr(
+        manager_module,
+        "communicate_process",
+        AsyncMock(side_effect=RuntimeError("sandbox stream failed")),
+    )
+    monkeypatch.setattr(
+        manager_module,
+        "settle_process_tree_after_cancellation",
+        cleanup,
+    )
+    monkeypatch.setattr(
+        manager_module,
+        "prepare_scoped_process_launch",
+        lambda *args, **kwargs: nullcontext(
+            SimpleNamespace(argv=("sandbox-command",), pass_fds=(), cwd=str(tmp_path))
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="sandbox stream failed"):
+        if runner == "scoped":
+            await manager_module._run_scoped(
+                manager_module._ScopedBackend(),
+                ["sandbox-command"],
+                tmp_path,
+                5,
+                workspace_root=tmp_path,
+                fallback=False,
+            )
+        elif runner == "wrapped":
+            await manager_module._run_subprocess(
+                ["sandbox-command"],
+                cwd=tmp_path,
+                deadline=5,
+                tier=SANDBOX_TIER_BWRAP,
+                backend_name="test",
+                workspace_root=tmp_path,
+            )
+        else:
+            await manager_module._run_docker_control(["docker", "version"])
+
+    cleanup.assert_awaited_once()
+    assert cleanup.await_args is not None
+    assert cleanup.await_args.args[0] is process
+
+
+@pytest.mark.asyncio
+async def test_wrapped_sandbox_rejects_replaced_workspace_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.sandbox import manager as manager_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    metadata = workspace.stat()
+    expected_identity = (metadata.st_dev, metadata.st_ino)
+    workspace.rename(tmp_path / "workspace-original")
+    workspace.mkdir()
+    create = AsyncMock()
+    monkeypatch.setattr(manager_module.asyncio, "create_subprocess_exec", create)
+
+    with pytest.raises(
+        SandboxBackendUnavailable,
+        match="working directory identity changed",
+    ):
+        await manager_module._run_subprocess(
+            ["wrapped-sandbox-command"],
+            cwd=None,
+            deadline=5,
+            tier=SANDBOX_TIER_DOCKER,
+            backend_name="docker",
+            workspace_root=workspace,
+            expected_workspace_identity=expected_identity,
+        )
+
+    create.assert_not_awaited()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
@@ -1017,7 +1394,7 @@ def test_probe_docker_rejects_unreachable_daemon_or_missing_image() -> None:
             "ash.sandbox.docker.resolve_host_executable",
             return_value="/usr/bin/docker",
         ),
-        patch("ash.sandbox.docker.subprocess.run", return_value=failed),
+        patch("ash.sandbox.docker.run_docker_cli_sync", return_value=failed),
     ):
         assert probe_docker() is None
     with (
@@ -1025,7 +1402,10 @@ def test_probe_docker_rejects_unreachable_daemon_or_missing_image() -> None:
             "ash.sandbox.docker.resolve_host_executable",
             return_value="/usr/bin/docker",
         ),
-        patch("ash.sandbox.docker.subprocess.run", side_effect=[ready, failed]),
+        patch(
+            "ash.sandbox.docker.run_docker_cli_sync",
+            side_effect=[ready, failed],
+        ),
     ):
         assert probe_docker() is None
 
@@ -1158,6 +1538,32 @@ def test_run_with_real_bwrap_hides_outside_file_contents(tmp_path: Path) -> None
     finally:
         outside.unlink(missing_ok=True)
         outside_dir.rmdir()
+
+
+def test_run_with_real_bwrap_hides_host_machine_identity(tmp_path: Path) -> None:
+    """A full-isolation backend must not expose host identity files by default."""
+
+    machine_id = Path("/etc/machine-id")
+    if not has_bwrap():
+        pytest.skip("bwrap not installed on this host")
+    if not machine_id.is_file() or not os.access(machine_id, os.R_OK):
+        pytest.skip("host machine-id is unavailable")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SandboxManager(
+        workspace_root=workspace,
+        preferred_tier=SANDBOX_TIER_BWRAP,
+        backend_preference="native",
+    )
+    assert manager.backend_name == "bubblewrap"
+
+    result = asyncio.run(
+        manager.run(["/bin/cat", "/etc/machine-id"], cwd=workspace, timeout=15)
+    )
+
+    assert result.exit_code != 0
+    assert machine_id.read_text(encoding="utf-8").strip() not in result.stdout
 
 
 def test_run_with_real_bwrap_pins_workspace_across_path_swap(

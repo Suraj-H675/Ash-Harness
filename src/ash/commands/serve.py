@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from ash.core.redaction import redact_text
 from ash.sdk import AshClient
 from ash.exceptions import AshError, ErrorCategory
 
@@ -52,6 +53,7 @@ async def serve_http(args) -> int:
             raise
         raise _server_dependency_error() from exc
     client = await AshClient.create()
+    primary_error: BaseException | None = None
     try:
         app = create_app(
             client,
@@ -70,8 +72,19 @@ async def serve_http(args) -> int:
         )
         await server.serve()
         return 0
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        await client.close()
+        try:
+            await client.close()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                "HTTP server client cleanup failed: "
+                + redact_text(str(cleanup_error))
+            )
 
 
 def _server_dependency_error() -> AshError:

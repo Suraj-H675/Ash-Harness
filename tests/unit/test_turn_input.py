@@ -12,10 +12,11 @@ from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
-from ash.safety.grants import RuleEffect, load_permission_rules
+from ash.safety.grants import PermissionRule, RuleEffect, load_permission_rules
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PolicyAction
 from ash.tools.agent import SpawnAgentTool
+from ash.tools.browser import BrowserTypeTool
 from ash.tools.filesystem import WriteFileTool
 from ash.ui.terminal import TerminalUI
 from ash.ui.notifications import NotificationEvent
@@ -217,6 +218,47 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
         (NotificationEvent.APPROVAL_REQUIRED, "Ash needs approval: write_file"),
         (NotificationEvent.TURN_COMPLETE, "Ash turn complete."),
     ]
+
+
+@pytest.mark.asyncio
+async def test_session_approval_limit_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.safety.policy as policy_module
+
+    monkeypatch.setattr(policy_module, "MAX_SESSION_PERMISSION_RULES", 1)
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("a")
+    statuses: list[str] = []
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        WriteProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    loop.permission_policy.add_session_rule(
+        PermissionRule.create(RuleEffect.ALLOW, "run_command")
+    )
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+
+    approved = await controller._prompt_tool_approval(
+        "write_file",
+        {"file_path": "blocked.txt", "content": "not written"},
+    )
+
+    assert approved is False
+    assert statuses == [
+        "Session approval denied: session permission rule limit reached (1)."
+    ]
+    assert ui.is_tool_approved_for_session("write_file") is False
 
 
 @pytest.mark.asyncio
@@ -581,6 +623,51 @@ async def test_approval_can_allow_exact_session_scope(
         ).action
         == PolicyAction.ASK
     )
+
+
+@pytest.mark.asyncio
+async def test_sensitive_tool_arguments_cannot_be_persisted_in_exact_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    secret = "tiny-k"
+    prompt = RoutedPrompt()
+    await prompt.approvals.put("p")
+    statuses: list[str] = []
+    ui = make_ui()
+    guard = SafetyGuard(tmp_path)
+    browser_type = BrowserTypeTool(guard, SimpleNamespace())  # type: ignore[arg-type]
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        BlockingProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={browser_type.name: browser_type},
+    )
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+
+    approved = await controller._request_approval(
+        "browser_type",
+        {
+            "ref": "tdeadbeef-1:s1:e1",
+            "text": secret,
+            "submit": False,
+            "clear": True,
+        },
+    )
+
+    assert approved is False
+    assert load_permission_rules(tmp_path) == []
+    assert statuses and statuses[0].startswith("Permission scope rejected:")
+    assert "text" in statuses[0]
+    assert secret not in repr(statuses)
 
 
 @pytest.mark.asyncio

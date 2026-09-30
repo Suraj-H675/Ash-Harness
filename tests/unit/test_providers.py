@@ -466,7 +466,8 @@ def test_loop_drives_provider_through_tool_callbacks() -> None:
             safety_tier="auto_approve",
             console=Console(file=io.StringIO(), force_terminal=False, width=120),
         )
-        guard = SafetyGuard(project_root=_tmp_workspace())
+        workspace = _tmp_workspace()
+        guard = SafetyGuard(project_root=workspace)
         store = SessionStore(_tmp_db())
         echo = _EchoTool(guard)
         loop = AshLoop(
@@ -474,7 +475,7 @@ def test_loop_drives_provider_through_tool_callbacks() -> None:
             provider=provider,
             safety_guard=guard,
             ui=ui,
-            project_root=_tmp_workspace(),
+            project_root=workspace,
             tools={echo.name: echo},
         )
         await loop.start_session()
@@ -535,7 +536,10 @@ def test_anonymous_openai_injected_client_does_not_allocate_http_client(
     def unexpected_http_client(*args: object, **kwargs: object) -> object:
         raise AssertionError("injected provider client must not allocate an HTTP client")
 
-    monkeypatch.setattr("ash.providers.openai.httpx.AsyncClient", unexpected_http_client)
+    monkeypatch.setattr(
+        "ash.providers.openai.openai.DefaultAsyncHttpxClient",
+        unexpected_http_client,
+    )
     injected = SimpleNamespace()
 
     provider = OpenAIProvider(
@@ -559,6 +563,8 @@ def test_ash_owned_sdk_clients_disable_nested_retries(monkeypatch) -> None:
 
     openai_calls: list[dict[str, Any]] = []
     anthropic_calls: list[dict[str, Any]] = []
+    openai_http_calls: list[dict[str, Any]] = []
+    anthropic_http_calls: list[dict[str, Any]] = []
 
     def openai_client(**kwargs):
         openai_calls.append(kwargs)
@@ -568,23 +574,76 @@ def test_ash_owned_sdk_clients_disable_nested_retries(monkeypatch) -> None:
         anthropic_calls.append(kwargs)
         return SimpleNamespace()
 
+    def openai_http_client(**kwargs):
+        openai_http_calls.append(kwargs)
+        return SimpleNamespace(kind="openai-http")
+
+    def anthropic_http_client(**kwargs):
+        anthropic_http_calls.append(kwargs)
+        return SimpleNamespace(kind="anthropic-http")
+
     monkeypatch.setattr("ash.providers.openai.openai.AsyncOpenAI", openai_client)
+    monkeypatch.setattr(
+        "ash.providers.openai.openai.DefaultAsyncHttpxClient",
+        openai_http_client,
+    )
     monkeypatch.setattr("ash.providers.deepseek.openai.AsyncOpenAI", openai_client)
     monkeypatch.setattr("ash.providers.groq.openai.AsyncOpenAI", openai_client)
     monkeypatch.setitem(
         sys.modules,
         "anthropic",
-        SimpleNamespace(AsyncAnthropic=anthropic_client),
+        SimpleNamespace(
+            AsyncAnthropic=anthropic_client,
+            DefaultAsyncHttpxClient=anthropic_http_client,
+        ),
     )
 
-    OpenAIProvider(model_name="gpt", api_key="key")
-    DeepSeekProvider(model_name="deepseek", api_key="key")
-    GroqProvider(model_name="groq", api_key="key")
-    AnthropicProvider(model_name="claude", api_key="key")._resolve_client()
+    openai_provider = OpenAIProvider(model_name="gpt", api_key="key")
+    deepseek_provider = DeepSeekProvider(model_name="deepseek", api_key="key")
+    groq_provider = GroqProvider(model_name="groq", api_key="key")
+    anthropic_provider = AnthropicProvider(model_name="claude", api_key="key")
+
+    assert openai_calls == []
+    assert openai_http_calls == []
+    assert anthropic_calls == []
+    assert anthropic_http_calls == []
+
+    openai_provider._resolve_client()
+    deepseek_provider._resolve_client()
+    groq_provider._resolve_client()
+    anthropic_provider._resolve_client()
 
     assert len(openai_calls) == 3
     assert all(call["max_retries"] == 0 for call in openai_calls)
-    assert anthropic_calls == [{"max_retries": 0, "api_key": "key"}]
+    assert all("http_client" in call for call in openai_calls)
+    assert openai_http_calls == [{"follow_redirects": False}] * 3
+    assert anthropic_http_calls == [{"follow_redirects": False}]
+    assert len(anthropic_calls) == 1
+    assert anthropic_calls[0]["max_retries"] == 0
+    assert anthropic_calls[0]["api_key"] == "key"
+    assert anthropic_calls[0]["http_client"].kind == "anthropic-http"
+
+
+def test_ollama_owned_http_client_is_lazy(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ash.providers.ollama import OllamaProvider
+
+    calls: list[dict[str, Any]] = []
+    client = SimpleNamespace()
+
+    def build_client(**kwargs):
+        calls.append(kwargs)
+        return client
+
+    monkeypatch.setattr("ash.providers.ollama.httpx.AsyncClient", build_client)
+
+    provider = OllamaProvider(model_name="local")
+
+    assert calls == []
+    assert provider._client is None
+    assert provider._resolve_client() is client
+    assert calls == [{"timeout": 60.0}]
+    assert provider._resolve_client() is client
+    assert calls == [{"timeout": 60.0}]
 
 
 def test_openai_message_translation_preserves_tool_call_ids():
@@ -721,6 +780,122 @@ class _FakeOpenAIClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _FailingOpenAICompletions:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    async def create(self, **kwargs: Any) -> Any:
+        del kwargs
+        raise RuntimeError(self.message)
+
+
+def _failing_openai_client(message: str) -> Any:
+    completions = _FailingOpenAICompletions(message)
+    return SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+
+@pytest.mark.asyncio
+async def test_provider_errors_redact_exact_configured_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.anthropic import AnthropicProvider
+    from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.groq import GroqProvider
+    from ash.providers.openai import OpenAIProvider
+
+    api_key = "tiny-k"
+    header_secret = "hdr-42"
+
+    openai_provider = OpenAIProvider(
+        model_name="gpt-test",
+        api_key=api_key,
+        default_headers={"X-Api-Key": header_secret},
+        client=_failing_openai_client(
+            f"upstream echoed {api_key} and {header_secret}"
+        ),
+    )
+    with pytest.raises(RuntimeError) as openai_error:
+        _ = [chunk async for chunk in openai_provider.stream_chat([])]
+    openai_message = str(openai_error.value)
+    assert api_key not in openai_message
+    assert header_secret not in openai_message
+    assert "[REDACTED]" in openai_message
+
+    monkeypatch.setattr(
+        "ash.providers.deepseek.openai.DefaultAsyncHttpxClient",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "ash.providers.deepseek.openai.AsyncOpenAI",
+        lambda **kwargs: _failing_openai_client(f"upstream echoed {api_key}"),
+    )
+    deepseek_provider = DeepSeekProvider("deepseek-test", api_key)
+    with pytest.raises(RuntimeError) as deepseek_error:
+        _ = [chunk async for chunk in deepseek_provider.stream_chat([])]
+    assert api_key not in str(deepseek_error.value)
+    assert "[REDACTED]" in str(deepseek_error.value)
+
+    monkeypatch.setattr(
+        "ash.providers.groq.openai.DefaultAsyncHttpxClient",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "ash.providers.groq.openai.AsyncOpenAI",
+        lambda **kwargs: _failing_openai_client(f"upstream echoed {api_key}"),
+    )
+    groq_provider = GroqProvider("groq-test", api_key)
+    with pytest.raises(RuntimeError) as groq_error:
+        _ = [chunk async for chunk in groq_provider.stream_chat([])]
+    assert api_key not in str(groq_error.value)
+    assert "[REDACTED]" in str(groq_error.value)
+
+    class FailingAnthropicMessages:
+        def stream(self, **kwargs: Any) -> Any:
+            del kwargs
+            raise RuntimeError(f"upstream echoed {api_key}")
+
+    anthropic_provider = AnthropicProvider(
+        model_name="claude-test",
+        api_key=api_key,
+        client=SimpleNamespace(messages=FailingAnthropicMessages()),
+    )
+    with pytest.raises(RuntimeError) as anthropic_error:
+        _ = [chunk async for chunk in anthropic_provider.stream_chat([])]
+    assert api_key not in str(anthropic_error.value)
+    assert "[REDACTED]" in str(anthropic_error.value)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_provider_error_redacts_ambient_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del tmp_path
+    from ash.providers.anthropic import AnthropicProvider
+
+    ambient_key = "ambient-short"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", ambient_key)
+
+    class FailingAnthropicMessages:
+        def stream(self, **kwargs: Any) -> Any:
+            del kwargs
+            raise RuntimeError(f"upstream echoed {ambient_key}")
+
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        api_key="",
+        client=SimpleNamespace(messages=FailingAnthropicMessages()),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _ = [chunk async for chunk in provider.stream_chat([])]
+
+    assert ambient_key not in str(exc_info.value)
+    assert "[REDACTED]" in str(exc_info.value)
 
 
 def _openai_chunk(
@@ -996,6 +1171,28 @@ class _FakeAnthropicMessages:
 
 
 @pytest.mark.asyncio
+async def test_anthropic_does_not_forward_deprecated_temperature() -> None:
+    from ash.providers.anthropic import AnthropicProvider
+
+    messages = _FakeAnthropicMessages(SimpleNamespace())
+    provider = AnthropicProvider(
+        model_name="claude-test",
+        api_key="test-key",
+        client=SimpleNamespace(messages=messages),
+    )
+
+    _ = [
+        chunk
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "hello"}],
+            temperature=0.2,
+        )
+    ]
+
+    assert "temperature" not in messages.kwargs
+
+
+@pytest.mark.asyncio
 async def test_anthropic_custom_endpoint_does_not_inherit_ambient_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1095,6 +1292,7 @@ async def test_anthropic_default_endpoint_preserves_sdk_api_key_fallback(
     monkeypatch.setenv("ANTHROPIC_API_KEY", ambient_key)
     sdk_calls: list[dict[str, Any]] = []
     inherited_keys: list[str] = []
+    http_calls: list[dict[str, Any]] = []
 
     def fake_async_anthropic(**kwargs: Any) -> Any:
         sdk_calls.append(kwargs)
@@ -1102,10 +1300,17 @@ async def test_anthropic_default_endpoint_preserves_sdk_api_key_fallback(
             inherited_keys.append(os.environ["ANTHROPIC_API_KEY"])
         return SimpleNamespace(messages=_FakeAnthropicMessages(SimpleNamespace()))
 
+    def fake_default_http_client(**kwargs: Any) -> Any:
+        http_calls.append(kwargs)
+        return SimpleNamespace(kind="anthropic-http")
+
     monkeypatch.setitem(
         sys.modules,
         "anthropic",
-        SimpleNamespace(AsyncAnthropic=fake_async_anthropic),
+        SimpleNamespace(
+            AsyncAnthropic=fake_async_anthropic,
+            DefaultAsyncHttpxClient=fake_default_http_client,
+        ),
     )
 
     provider = AnthropicProvider(model_name="claude-test", api_key="")
@@ -1117,7 +1322,10 @@ async def test_anthropic_default_endpoint_preserves_sdk_api_key_fallback(
     ]
 
     assert "".join(chunk.content for chunk in chunks) == "hello"
-    assert sdk_calls == [{"max_retries": 0}]
+    assert http_calls == [{"follow_redirects": False}]
+    assert len(sdk_calls) == 1
+    assert sdk_calls[0]["max_retries"] == 0
+    assert sdk_calls[0]["http_client"].kind == "anthropic-http"
     assert inherited_keys == [ambient_key]
 
 

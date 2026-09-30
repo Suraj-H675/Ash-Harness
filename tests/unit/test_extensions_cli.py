@@ -11,7 +11,8 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from ash.cli import main
-from ash.commands.extensions import discover_extensions, render_extension_inventory
+from ash.commands.extensions import render_extension_inventory, render_plugin_action
+from ash.plugins.inventory import discover_extensions
 from ash.plugins.catalog import sign_catalog
 from ash.safety.trust import set_workspace_trusted
 
@@ -126,6 +127,27 @@ def test_extensions_cli_reports_invalid_hook_config(
     assert "pre_tool hooks must be a list" in payload["errors"][0]
 
 
+def test_extensions_inventory_rejects_duplicate_hook_config_fields(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    hook_path = home / ".ash" / "hooks.json"
+    hook_path.parent.mkdir(parents=True)
+    hook_path.write_text(
+        '{"turn_end":[],"turn_end":[{"command":["echo","duplicate"]}]}',
+        encoding="utf-8",
+    )
+
+    inventory = discover_extensions(workspace)
+
+    assert inventory.hooks == ()
+    assert any("duplicate JSON object key" in error for error in inventory.errors)
+
+
 def test_extension_inventory_validates_new_lifecycle_hook_commands(
     tmp_path: Path,
     monkeypatch,
@@ -191,6 +213,24 @@ def test_extensions_inventory_keeps_disabled_plugin_but_removes_its_skills(
     assert inventory.skills == ()
 
 
+def test_plugin_action_human_rendering_neutralizes_terminal_controls() -> None:
+    result = {
+        "action": "install",
+        "name": "demo",
+        "version": "1.0.0",
+        "root": "/tmp/plugin\x1b[2J\u202ehidden\u202c\nforged",
+        "enabled": True,
+    }
+
+    rendered = render_plugin_action(result, json_output=False)
+
+    assert "\x1b[2J" not in rendered
+    assert "\u202e" not in rendered
+    assert "\n" not in rendered
+    assert "/tmp/plugin\\x1b[2J\\u202ehidden\\u202c\\x0aforged" in rendered
+    assert json.loads(render_plugin_action(result, json_output=True))["root"] == result["root"]
+
+
 def test_extensions_inventory_reports_invalid_lifecycle_state(
     tmp_path: Path,
     monkeypatch,
@@ -243,6 +283,42 @@ def test_extensions_cli_installs_disables_enables_and_uninstalls_local_plugin(
     removed = json.loads(capsys.readouterr().out)
     assert removed["removed"] is True
     assert not (home / ".ash" / "plugins" / "source").exists()
+
+
+def test_replace_rolls_back_previous_plugin_when_activation_state_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import ash.plugins.state as plugin_state
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_plugin(tmp_path, "source")
+    source = tmp_path / "source"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert main(["extensions", "install", str(source)]) == 0
+    capsys.readouterr()
+    installed_manifest = home / ".ash" / "plugins" / "source" / "plugin.json"
+    before = installed_manifest.read_bytes()
+    payload = json.loads((source / "plugin.json").read_text(encoding="utf-8"))
+    payload["version"] = "2.0.0"
+    (source / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    def fail_state_write(*args, **kwargs):
+        del args, kwargs
+        raise OSError("injected activation-state failure")
+
+    monkeypatch.setattr(plugin_state, "_save_extension_state_at", fail_state_write)
+
+    assert main(["extensions", "install", str(source), "--replace"]) == 2
+    captured = capsys.readouterr()
+
+    assert "activation-state failure" in captured.err
+    assert installed_manifest.read_bytes() == before
 
 
 def test_extensions_cli_requires_management_target(capsys) -> None:
@@ -333,7 +409,7 @@ def test_extensions_cli_rejects_non_https_and_missing_git_ref(capsys) -> None:
         )
         == 2
     )
-    assert "HTTPS URL" in capsys.readouterr().err
+    assert "HTTPS or a local file URI" in capsys.readouterr().err
     assert main(["extensions", "install", "https://plugins.example/plugin.git"]) == 2
     assert "requires an explicit --ref" in capsys.readouterr().err
 
@@ -423,6 +499,281 @@ def test_extensions_enforces_enabled_plugin_dependencies(
     assert "Missing dependency: base" in capsys.readouterr().err
     assert main(["extensions", "uninstall", "base", "--yes"]) == 2
     assert "required by: dependent" in capsys.readouterr().err
+
+
+def test_disable_dependency_check_serializes_against_concurrent_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    import ash.commands.extensions as extension_commands
+    import ash.plugins.lifecycle as lifecycle
+    from ash.plugins.errors import PluginLifecycleError
+    from ash.plugins.lifecycle import user_plugin_root
+    from ash.plugins.state import load_extension_state
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    base = tmp_path / "base"
+    dependent = tmp_path / "dependent"
+    _write_plugin(tmp_path, "base")
+    _write_plugin(tmp_path, "dependent")
+    dependent_manifest = json.loads((dependent / "plugin.json").read_text())
+    dependent_manifest["dependencies"] = [{"name": "base", "version": ">=1"}]
+    (dependent / "plugin.json").write_text(
+        json.dumps(dependent_manifest), encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    extension_commands.manage_local_plugin("install", str(base))
+
+    original_manifests = lifecycle._installed_plugin_manifests_strict_at
+    checked = threading.Event()
+    release_check = threading.Event()
+    disable_errors: list[BaseException] = []
+    install_errors: list[BaseException] = []
+    paused = False
+
+    def paused_manifests(directory, *, excluding=None):
+        nonlocal paused
+        result = original_manifests(directory, excluding=excluding)
+        if not paused and excluding is None and set(result) == {"base"}:
+            paused = True
+            checked.set()
+            assert release_check.wait(5)
+        return result
+
+    monkeypatch.setattr(lifecycle, "_installed_plugin_manifests_strict_at", paused_manifests)
+
+    def disable_base() -> None:
+        try:
+            extension_commands.manage_local_plugin("disable", "base")
+        except BaseException as exc:
+            disable_errors.append(exc)
+
+    def install_dependent() -> None:
+        try:
+            extension_commands.manage_local_plugin("install", str(dependent))
+        except BaseException as exc:
+            install_errors.append(exc)
+
+    disable_thread = threading.Thread(target=disable_base)
+    install_thread = threading.Thread(target=install_dependent)
+    disable_thread.start()
+    assert checked.wait(5)
+    install_thread.start()
+    release_check.set()
+    disable_thread.join(5)
+    install_thread.join(5)
+
+    assert not disable_thread.is_alive()
+    assert not install_thread.is_alive()
+    assert disable_errors == []
+    assert len(install_errors) == 1
+    assert isinstance(install_errors[0], PluginLifecycleError)
+    assert "Missing dependency: base" in str(install_errors[0])
+    assert "base" in load_extension_state().disabled_plugins
+    assert not (user_plugin_root() / "dependent").exists()
+
+
+def test_uninstall_dependency_check_serializes_against_concurrent_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    import ash.commands.extensions as extension_commands
+    import ash.plugins.lifecycle as lifecycle
+    from ash.plugins.errors import PluginLifecycleError
+    from ash.plugins.lifecycle import user_plugin_root
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    base = tmp_path / "base"
+    dependent = tmp_path / "dependent"
+    _write_plugin(tmp_path, "base")
+    _write_plugin(tmp_path, "dependent")
+    dependent_manifest = json.loads((dependent / "plugin.json").read_text())
+    dependent_manifest["dependencies"] = [{"name": "base", "version": ">=1"}]
+    (dependent / "plugin.json").write_text(
+        json.dumps(dependent_manifest), encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    extension_commands.manage_local_plugin("install", str(base))
+
+    original_manifests = lifecycle._installed_plugin_manifests_strict_at
+    checked = threading.Event()
+    release_check = threading.Event()
+    uninstall_errors: list[BaseException] = []
+    install_errors: list[BaseException] = []
+    paused = False
+
+    def paused_manifests(directory, *, excluding=None):
+        nonlocal paused
+        result = original_manifests(directory, excluding=excluding)
+        if not paused and excluding is None and set(result) == {"base"}:
+            paused = True
+            checked.set()
+            assert release_check.wait(5)
+        return result
+
+    monkeypatch.setattr(lifecycle, "_installed_plugin_manifests_strict_at", paused_manifests)
+
+    def uninstall_base() -> None:
+        try:
+            extension_commands.manage_local_plugin(
+                "uninstall",
+                "base",
+                confirmed=True,
+            )
+        except BaseException as exc:
+            uninstall_errors.append(exc)
+
+    def install_dependent() -> None:
+        try:
+            extension_commands.manage_local_plugin("install", str(dependent))
+        except BaseException as exc:
+            install_errors.append(exc)
+
+    uninstall_thread = threading.Thread(target=uninstall_base)
+    install_thread = threading.Thread(target=install_dependent)
+    uninstall_thread.start()
+    assert checked.wait(5)
+    install_thread.start()
+    release_check.set()
+    uninstall_thread.join(5)
+    install_thread.join(5)
+
+    assert not uninstall_thread.is_alive()
+    assert not install_thread.is_alive()
+    assert uninstall_errors == []
+    assert len(install_errors) == 1
+    assert isinstance(install_errors[0], PluginLifecycleError)
+    assert "Missing dependency: base" in str(install_errors[0])
+    assert not (user_plugin_root() / "base").exists()
+    assert not (user_plugin_root() / "dependent").exists()
+
+
+def test_enable_dependency_check_serializes_against_concurrent_disable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    import ash.commands.extensions as extension_commands
+    import ash.plugins.lifecycle as lifecycle
+    from ash.plugins.errors import PluginLifecycleError
+    from ash.plugins.state import load_extension_state
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    base = tmp_path / "base"
+    dependent = tmp_path / "dependent"
+    _write_plugin(tmp_path, "base")
+    _write_plugin(tmp_path, "dependent")
+    dependent_manifest = json.loads((dependent / "plugin.json").read_text())
+    dependent_manifest["dependencies"] = [{"name": "base", "version": ">=1"}]
+    (dependent / "plugin.json").write_text(
+        json.dumps(dependent_manifest), encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    extension_commands.manage_local_plugin("install", str(base))
+    extension_commands.manage_local_plugin("install", str(dependent))
+    extension_commands.manage_local_plugin("disable", "dependent")
+
+    original_transition = lifecycle._transition_extension_state_checked
+    checked = threading.Event()
+    release_check = threading.Event()
+    enable_errors: list[BaseException] = []
+    disable_errors: list[BaseException] = []
+    paused = False
+
+    def paused_transition(name, *, enabled, path=None, validator=None):
+        nonlocal paused
+
+        def wrapped_validator(state) -> None:
+            nonlocal paused
+            if validator is not None:
+                validator(state)
+            if name == "dependent" and enabled and not paused:
+                paused = True
+                checked.set()
+                assert release_check.wait(5)
+
+        return original_transition(
+            name,
+            enabled=enabled,
+            path=path,
+            validator=wrapped_validator,
+        )
+
+    monkeypatch.setattr(lifecycle, "_transition_extension_state_checked", paused_transition)
+
+    def enable_dependent() -> None:
+        try:
+            extension_commands.manage_local_plugin("enable", "dependent")
+        except BaseException as exc:
+            enable_errors.append(exc)
+
+    def disable_base() -> None:
+        try:
+            extension_commands.manage_local_plugin("disable", "base")
+        except BaseException as exc:
+            disable_errors.append(exc)
+
+    enable_thread = threading.Thread(target=enable_dependent)
+    disable_thread = threading.Thread(target=disable_base)
+    enable_thread.start()
+    assert checked.wait(5)
+    disable_thread.start()
+    release_check.set()
+    enable_thread.join(5)
+    disable_thread.join(5)
+
+    assert not enable_thread.is_alive()
+    assert not disable_thread.is_alive()
+    assert enable_errors == []
+    assert len(disable_errors) == 1
+    assert isinstance(disable_errors[0], PluginLifecycleError)
+    assert "required by: dependent" in str(disable_errors[0])
+    disabled = load_extension_state().disabled_plugins
+    assert "base" not in disabled
+    assert "dependent" not in disabled
+
+
+def test_enable_does_not_accept_dependency_from_mismatched_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.plugins.lifecycle import set_plugin_enabled
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    plugin_root = home / ".ash" / "plugins"
+    _write_plugin(plugin_root, "impostor")
+    impostor_manifest = plugin_root / "impostor" / "plugin.json"
+    payload = json.loads(impostor_manifest.read_text(encoding="utf-8"))
+    payload["name"] = "base"
+    impostor_manifest.write_text(json.dumps(payload), encoding="utf-8")
+    _write_plugin(plugin_root, "dependent")
+    dependent_manifest = plugin_root / "dependent" / "plugin.json"
+    payload = json.loads(dependent_manifest.read_text(encoding="utf-8"))
+    payload["dependencies"] = [{"name": "base", "version": ">=1"}]
+    dependent_manifest.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    set_plugin_enabled("dependent", enabled=False)
+
+    assert main(["extensions", "enable", "dependent"]) == 2
+    assert "directory 'impostor' contains manifest 'base'" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -606,10 +957,10 @@ def test_catalog_search_human_output_sanitizes_signed_terminal_controls(
         filename="control-catalog.json",
         publisher="alpha",
         name="demo",
-        source=f"https://plugins.example/demo.git{marker}",
+        source="https://plugins.example/demo.git",
         digest="a" * 64,
         private_key=private_key,
-        version=f"1.0.0{marker}",
+        version="1.0.0",
         ref=f"v1.0.0{marker}",
     )
     monkeypatch.setenv("ASH_CATALOG_KEYS", str(keys))
@@ -634,8 +985,8 @@ def test_catalog_search_human_output_sanitizes_signed_terminal_controls(
     )
     payload = json.loads(capsys.readouterr().out)
     plugin = payload["plugins"][0]
-    assert marker in plugin["version"]
-    assert marker in plugin["source"]
+    assert plugin["version"] == "1.0.0"
+    assert plugin["source"] == "https://plugins.example/demo.git"
     assert marker in plugin["ref"]
 
 
@@ -736,6 +1087,37 @@ async def test_https_catalog_is_cached_and_verified_for_search(
     assert catalogs[0].publisher is None
     assert entries[0].name == "remote"
     assert (home / ".ash" / "cache" / "catalogs").is_dir()
+
+
+def test_remote_catalog_rejects_local_file_plugin_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import extensions
+    from ash.plugins.lifecycle import PluginLifecycleError
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    catalog = _write_signed_catalog(
+        tmp_path,
+        source=repository.as_uri(),
+        digest="a" * 40,
+    )
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(
+        extensions,
+        "fetch_catalog",
+        lambda url, *, transport=None: catalog,
+    )
+
+    with pytest.raises(
+        PluginLifecycleError,
+        match="remotely fetched plugin catalogs may only reference HTTPS",
+    ):
+        extensions.search_catalog_plugins(
+            "demo",
+            catalog="https://catalog.example/plugins.json",
+        )
 
 
 def test_extensions_cli_preserves_https_catalog_url(
@@ -1009,9 +1391,6 @@ def test_publisher_qualified_install_uses_exact_signed_entry(
         "ash.commands.extensions.load_extension_state",
         lambda: SimpleNamespace(disabled_plugins=frozenset()),
     )
-    monkeypatch.setattr(
-        "ash.commands.extensions.set_plugin_enabled", lambda *args, **kwargs: None
-    )
     observed: dict[str, object] = {}
 
     def install(source_arg: str, **kwargs):
@@ -1192,9 +1571,6 @@ def test_direct_url_install_uses_matching_signed_catalog_entry(
         return InstalledPlugin("demo", "1.2.3", tmp_path / "installed" / "demo")
 
     monkeypatch.setattr("ash.commands.extensions.install_git_plugin", install)
-    monkeypatch.setattr(
-        "ash.commands.extensions.set_plugin_enabled", lambda *args, **kwargs: None
-    )
 
     result = manage_local_plugin(
         "install",
@@ -1274,6 +1650,93 @@ def test_extensions_inventory_validates_enabled_plugin_hooks(
     inventory = discover_extensions(workspace)
 
     assert "pre_tool hooks must be a list" in inventory.errors[0]
+
+
+def test_enable_rejects_semantically_invalid_disabled_plugin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.plugins.lifecycle import set_plugin_enabled
+    from ash.plugins.state import load_extension_state
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    plugin = home / ".ash" / "plugins" / "example"
+    hook = plugin / "hooks" / "hooks.json"
+    hook.parent.mkdir(parents=True)
+    hook.write_text('{"pre_tool": []}', encoding="utf-8")
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example", "version": "1.0.0"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    set_plugin_enabled("example", enabled=False)
+    hook.write_text('{"pre_tool": "invalid"}', encoding="utf-8")
+
+    assert main(["extensions", "enable", "example"]) == 2
+    captured = capsys.readouterr()
+
+    assert "Hook event 'pre_tool' must be a list" in captured.err
+    assert "example" in load_extension_state().disabled_plugins
+
+
+def test_enable_rejects_visible_plugin_substitution_after_snapshot_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import ash.plugins.lifecycle as lifecycle
+    from ash.plugins.lifecycle import set_plugin_enabled
+    from ash.plugins.state import load_extension_state
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    plugin = home / ".ash" / "plugins" / "example"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example", "version": "1.0.0"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    set_plugin_enabled("example", enabled=False)
+
+    displaced = plugin.parent / ".example-displaced"
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    (attacker / "plugin.json").write_text(
+        json.dumps({"name": "example", "version": "9.0.0"}),
+        encoding="utf-8",
+    )
+    original_validate = lifecycle.validate_plugin_contents_at
+    swapped = False
+
+    def swap_after_validation(snapshot, manifest) -> None:
+        nonlocal swapped
+        original_validate(snapshot, manifest)
+        if not swapped:
+            plugin.rename(displaced)
+            attacker.rename(plugin)
+            swapped = True
+
+    monkeypatch.setattr(lifecycle, "validate_plugin_contents_at", swap_after_validation)
+
+    assert main(["extensions", "enable", "example"]) == 2
+    captured = capsys.readouterr()
+
+    assert swapped is True
+    assert "changed while enablement was checked" in captured.err
+    assert "example" in load_extension_state().disabled_plugins
+    assert json.loads((plugin / "plugin.json").read_text(encoding="utf-8"))[
+        "version"
+    ] == "9.0.0"
+    assert json.loads((displaced / "plugin.json").read_text(encoding="utf-8"))[
+        "version"
+    ] == "1.0.0"
 
 
 def test_extensions_inventory_validates_enabled_plugin_mcp(

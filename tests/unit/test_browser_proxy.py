@@ -315,6 +315,47 @@ async def test_browser_proxy_registers_accepted_connection_before_handler_runs(
 
 
 @pytest.mark.asyncio
+async def test_browser_proxy_bounds_accepted_connection_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proxy = BrowserPolicyProxy((), timeout_seconds=1, max_connections=1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Writer:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def blocked_handler(
+        _reader: asyncio.StreamReader, _writer: object
+    ) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(proxy, "_handle_client", blocked_handler)
+    first_writer = Writer()
+    second_writer = Writer()
+    proxy._accept_client(asyncio.StreamReader(), first_writer)  # type: ignore[arg-type]
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    proxy._accept_client(asyncio.StreamReader(), second_writer)  # type: ignore[arg-type]
+
+    assert len(proxy._connection_tasks) == 1
+    assert first_writer in proxy._writers
+    assert second_writer.closed is True
+    assert second_writer not in proxy._writers
+
+    release.set()
+    await asyncio.gather(*tuple(proxy._connection_tasks))
+    await asyncio.sleep(0)
+    assert not proxy._connection_tasks
+    assert not proxy._writers
+
+
+@pytest.mark.asyncio
 async def test_browser_proxy_close_settles_accepted_connections() -> None:
     proxy = BrowserPolicyProxy((), timeout_seconds=1)
     await proxy.start()

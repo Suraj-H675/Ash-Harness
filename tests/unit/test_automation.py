@@ -40,6 +40,7 @@ from ash.automation.runner import (
     _execute as execute_automation_subprocess_request,
 )
 from ash.automation.store import (
+    AUTOMATION_EVENT_RETENTION_DAYS,
     AUTOMATION_SCHEMA_VERSION,
     AutomationError,
     AutomationRestartRequired,
@@ -194,6 +195,44 @@ async def test_subprocess_runner_resolves_relative_workspace_from_child_cwd(
         )
 
 
+@pytest.mark.asyncio
+async def test_subprocess_runner_preserves_prompt_failure_when_client_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    config = AshConfig(workspace_root=workspace)
+    monkeypatch.setattr("ash.automation.runner.is_workspace_trusted", lambda path: True)
+
+    class Client:
+        async def prompt(self, _prompt: str, *, user_metadata=None):
+            raise RuntimeError("prompt failure")
+
+        async def close(self) -> None:
+            raise RuntimeError("client close failure")
+
+    async def create_client(**_kwargs):
+        return Client()
+
+    monkeypatch.setattr("ash.automation.runner.AshClient.create", create_client)
+
+    with pytest.raises(RuntimeError, match="prompt failure") as captured:
+        await execute_automation_subprocess_request(
+            {
+                "config": config.model_dump(mode="json"),
+                "workspace": str(workspace),
+                "prompt": "run",
+                "user_metadata": None,
+            }
+        )
+
+    assert any(
+        "automation client cleanup failed" in note
+        for note in captured.value.__notes__
+    )
+
+
 def test_automation_runner_rejects_oversized_protocol_input(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -208,6 +247,80 @@ def test_automation_runner_rejects_oversized_protocol_input(
 
     assert main() == 1
     assert "automation request exceeds" in capsys.readouterr().out
+
+
+def test_automation_runner_rejects_duplicate_protocol_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.automation.runner import main
+
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO('{"prompt":"first","prompt":"second"}'),
+    )
+
+    assert main() == 1
+    assert "duplicate JSON object key" in capsys.readouterr().out
+
+
+def test_automation_maintenance_rejects_duplicate_protocol_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.automation.maintenance import main
+
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO('{"workspace":"/one","workspace":"/two"}'),
+    )
+
+    assert main() == 1
+    assert "duplicate JSON object key" in capsys.readouterr().err
+
+
+def test_automation_parent_rejects_duplicate_child_result_fields(
+    tmp_path: Path,
+) -> None:
+    from ash.automation.worker import _SubprocessAutomationClient
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    client = _SubprocessAutomationClient(
+        AshConfig(workspace_root=workspace),
+        workspace,
+    )
+
+    with pytest.raises(RuntimeError, match="malformed JSON"):
+        client._parse_payload(
+            b'ASH_AUTOMATION_RESULT={"ok":true,"ok":false}\n'
+        )
+
+
+def test_automation_runner_returns_valid_error_for_non_json_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import ash.automation.runner as runner_module
+
+    async def fake_execute(request):
+        del request
+        return {"ok": True, "metric": float("nan")}
+
+    monkeypatch.setattr(runner_module, "_arm_parent_lifeline", lambda: None)
+    monkeypatch.setattr(runner_module, "_execute", fake_execute)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+
+    assert runner_module.main() == 1
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("ASH_AUTOMATION_RESULT=")
+    payload = json.loads(line.removeprefix("ASH_AUTOMATION_RESULT="))
+    assert payload == {
+        "ok": False,
+        "error": "automation subprocess produced a non-JSON result",
+    }
 
 
 @pytest.mark.asyncio
@@ -747,7 +860,7 @@ async def test_automation_subprocess_refuses_workspace_replaced_before_prompt(
         create,
     )
 
-    with pytest.raises(AutomationError, match="working directory identity changed"):
+    with pytest.raises(AutomationError, match="project root identity changed"):
         await client.prompt("run")
 
     create.assert_not_awaited()
@@ -1713,6 +1826,51 @@ def test_run_retention_preserves_event_ledger(
     assert linked_count == 0
 
 
+def test_run_retention_prunes_expired_orphan_event_history_per_workspace(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+) -> None:
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    jobs: list[AutomationJob] = []
+    for index, workspace in enumerate((first_workspace, second_workspace)):
+        job = store.create_job(
+            name=f"audit-{index}",
+            prompt="Finish",
+            workspace=workspace,
+            schedule=build_schedule(every="1h", now=now),
+            enabled=False,
+        )
+        claim = store.claim_manual(
+            job.job_id,
+            workspace=workspace,
+            worker_id=f"worker-{index}",
+        )
+        store.finish_run(claim.run.run_id, claim.token, status="succeeded")
+        jobs.append(job)
+
+    clock[0] += (AUTOMATION_EVENT_RETENTION_DAYS + 2) * 86400
+
+    assert store.prune_runs(workspace=first_workspace, older_than_days=1) == 1
+
+    with sqlite3.connect(store.db_path) as connection:
+        first_events = connection.execute(
+            "SELECT COUNT(*) FROM automation_events WHERE job_id = ?",
+            (jobs[0].job_id,),
+        ).fetchone()[0]
+        second_events = connection.execute(
+            "SELECT COUNT(*) FROM automation_events WHERE job_id = ?",
+            (jobs[1].job_id,),
+        ).fetchone()[0]
+
+    assert first_events == 0
+    assert second_events >= 3
+
+
 def test_retention_is_scoped_to_one_workspace(
     tmp_path: Path, clock: list[float], store: AutomationStore
 ) -> None:
@@ -1740,6 +1898,66 @@ def test_retention_is_scoped_to_one_workspace(
     assert store.prune_runs(workspace=first_workspace, older_than_days=1) == 1
     assert store.get_run(run_ids[0]) is None
     assert store.get_run(run_ids[1]) is not None
+
+
+def test_automation_job_count_is_bounded_per_workspace_and_removal_frees_capacity(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.automation.store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_AUTOMATION_JOBS_PER_WORKSPACE", 2)
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    schedule = build_schedule(every="1h", now=now)
+
+    first = store.create_job(
+        name="first",
+        prompt="one",
+        workspace=first_workspace,
+        schedule=schedule,
+        enabled=False,
+    )
+    store.create_job(
+        name="second",
+        prompt="two",
+        workspace=first_workspace,
+        schedule=schedule,
+        enabled=False,
+    )
+
+    with pytest.raises(AutomationError, match="job limit reached.*maximum 2"):
+        store.create_job(
+            name="third",
+            prompt="three",
+            workspace=first_workspace,
+            schedule=schedule,
+            enabled=False,
+        )
+
+    other = store.create_job(
+        name="other",
+        prompt="other",
+        workspace=second_workspace,
+        schedule=schedule,
+        enabled=False,
+    )
+    assert other.workspace == str(second_workspace.resolve())
+
+    store.remove_job(first.job_id, workspace=first_workspace)
+    replacement = store.create_job(
+        name="replacement",
+        prompt="replacement",
+        workspace=first_workspace,
+        schedule=schedule,
+        enabled=False,
+    )
+    assert replacement.name == "replacement"
 
 
 def test_expired_run_is_recovered_before_cancel_or_remove(
@@ -3194,6 +3412,73 @@ async def test_worker_timeout_does_not_wait_forever_for_ignored_cancellation(
 
 
 @pytest.mark.asyncio
+async def test_worker_blocks_new_runtime_while_deferred_cleanup_is_active(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    first_job = store.create_job(
+        name="first deferred cleanup",
+        prompt="Wait forever",
+        workspace=workspace,
+        schedule=build_schedule(every="1h", now=now),
+        enabled=False,
+        timeout_seconds=1,
+    )
+    second_job = store.create_job(
+        name="second blocked cleanup",
+        prompt="Must not start yet",
+        workspace=workspace,
+        schedule=build_schedule(every="1h", now=now),
+        enabled=False,
+    )
+    first_client = _CancellationResistantClient()
+    second_client = _FakeClient()
+    create_calls = 0
+
+    async def factory(config, root):
+        nonlocal create_calls
+        del config, root
+        create_calls += 1
+        return first_client if create_calls == 1 else second_client
+
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+    worker = AutomationWorkerService(
+        store,
+        workspace,
+        client_factory=factory,
+        max_concurrent_runs=1,
+    )
+
+    first = await worker.run_manual(first_job.job_id)
+
+    assert first.status == "failed"
+    assert len(worker._deferred_cleanup_tasks) == 1
+    assert create_calls == 1
+
+    second = await worker.run_manual(second_job.job_id)
+
+    assert second.status == "failed"
+    assert "cleanup remains active" in (second.error or "")
+    assert create_calls == 1
+    assert second_client.started.is_set() is False
+    assert len(worker._deferred_cleanup_tasks) == 1
+
+    first_client.release.set()
+    for _ in range(20):
+        if first_client.closed and not worker._deferred_cleanup_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert first_client.closed is True
+    assert worker._deferred_cleanup_tasks == set()
+
+
+@pytest.mark.asyncio
 async def test_worker_defers_late_client_close_until_factory_operation_settles(
     tmp_path: Path,
     clock: list[float],
@@ -3291,6 +3576,188 @@ async def test_worker_retains_client_close_after_repeated_cancellation(
 
 
 @pytest.mark.asyncio
+async def test_worker_aclose_refuses_success_while_deferred_cleanup_is_owned(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    job = store.create_job(
+        name="close shutdown ownership",
+        prompt="Complete promptly",
+        workspace=workspace,
+        schedule=build_schedule(every="1h", now=now),
+        enabled=False,
+    )
+    client = _CloseResistantClient()
+
+    async def factory(config, root):
+        del config, root
+        return client
+
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+    claim = store.claim_manual(job.job_id, workspace=workspace, worker_id="close-worker")
+    worker = AutomationWorkerService(store, workspace, client_factory=factory)
+    execution = asyncio.create_task(worker.execute(claim))
+    await client.close_started.wait()
+
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    assert len(worker._deferred_cleanup_tasks) == 1
+
+    with pytest.raises(RuntimeError, match="automation cleanup remains active"):
+        await worker.aclose()
+
+    assert len(worker._deferred_cleanup_tasks) == 1
+    assert client.closed is False
+
+    client.release_close.set()
+    for _ in range(20):
+        if client.closed and not worker._deferred_cleanup_tasks:
+            break
+        await asyncio.sleep(0)
+
+    await worker.aclose()
+
+    assert client.closed is True
+    assert worker._deferred_cleanup_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_worker_retains_failed_client_close_for_shutdown_retry(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    job = store.create_job(
+        name="retry failed close",
+        prompt="Complete promptly",
+        workspace=workspace,
+        schedule=build_schedule(every="1h", now=now),
+        enabled=False,
+    )
+
+    class FlakyCloseClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("automation client close failed once")
+            await super().close()
+
+    client = FlakyCloseClient()
+
+    async def factory(config, root):
+        del config, root
+        return client
+
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+    worker = AutomationWorkerService(store, workspace, client_factory=factory)
+
+    result = await worker.run_manual(job.job_id)
+
+    assert result.status == "succeeded"
+    assert client.close_calls == 1
+    assert client in worker._retired_clients
+
+    await worker.aclose()
+
+    assert client.close_calls == 2
+    assert client.closed is True
+    assert not worker._retired_clients
+
+
+@pytest.mark.asyncio
+async def test_worker_blocks_new_runtime_while_retired_cleanup_still_fails(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    first_job = store.create_job(
+        name="first cleanup debt",
+        prompt="First",
+        workspace=workspace,
+        schedule=build_schedule(every="1h", now=now),
+        enabled=False,
+    )
+    second_job = store.create_job(
+        name="second blocked run",
+        prompt="Second",
+        workspace=workspace,
+        schedule=build_schedule(every="1h", now=now),
+        enabled=False,
+    )
+
+    class PersistentCloseFailureClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+            self.allow_close = False
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if not self.allow_close:
+                raise RuntimeError("automation cleanup still failing")
+            await super().close()
+
+    client = PersistentCloseFailureClient()
+    create_calls = 0
+
+    async def factory(config, root):
+        nonlocal create_calls
+        del config, root
+        create_calls += 1
+        return client
+
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+    worker = AutomationWorkerService(store, workspace, client_factory=factory)
+    first_claim = store.claim_manual(
+        first_job.job_id, workspace=workspace, worker_id="cleanup-worker"
+    )
+
+    first = await worker.execute(first_claim)
+
+    assert first.status == "succeeded"
+    assert create_calls == 1
+    assert client.close_calls == 1
+    assert client in worker._retired_clients
+
+    second_claim = store.claim_manual(
+        second_job.job_id, workspace=workspace, worker_id="cleanup-worker"
+    )
+    second = await worker.execute(second_claim)
+
+    assert second.status == "failed"
+    assert "cleanup remains incomplete" in (second.error or "")
+    assert create_calls == 1
+    assert client.close_calls == 2
+    assert client in worker._retired_clients
+
+    client.allow_close = True
+    await worker.aclose()
+
+    assert client.close_calls == 3
+    assert client.closed is True
+    assert not worker._retired_clients
+
+
+@pytest.mark.asyncio
 async def test_once_worker_stop_cancels_in_flight_batch(
     tmp_path: Path,
     clock: list[float],
@@ -3323,6 +3790,90 @@ async def test_once_worker_stop_cancels_in_flight_batch(
     assert summary.cancelled == 1
     assert summary.ok is False
     assert store.list_runs(workspace=workspace, job_id=job.job_id)[0].status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_active_run_shutdown_settles_before_propagating_worker_cancellation(
+    tmp_path: Path,
+    store: AutomationStore,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    worker = AutomationWorkerService(store, workspace)
+    cancel_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_seen.set()
+            await release.wait()
+
+    child = asyncio.create_task(resistant_run())
+    worker._tasks["synthetic-run"] = child
+    summary = AutomationWorkerSummary()
+    stopping = asyncio.create_task(worker._stop_active_runs(summary))
+    await asyncio.wait_for(cancel_seen.wait(), timeout=1)
+
+    try:
+        stopping.cancel()
+        await asyncio.sleep(0)
+
+        assert stopping.done() is False
+        assert "synthetic-run" in worker._tasks
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(stopping, timeout=1)
+
+        assert child.done() is True
+        assert worker._tasks == {}
+    finally:
+        release.set()
+        if not child.done():
+            child.cancel()
+            await asyncio.gather(child, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_worker_cancel_task_settles_before_propagating_cancellation(
+    tmp_path: Path,
+    store: AutomationStore,
+) -> None:
+    workspace = tmp_path / "repo-cancel-task"
+    workspace.mkdir()
+    worker = AutomationWorkerService(store, workspace)
+    cancel_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_task() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_seen.set()
+            await release.wait()
+
+    child = asyncio.create_task(resistant_task())
+    cleanup = asyncio.create_task(worker._cancel_task(child, timeout=1.0))
+    await asyncio.wait_for(cancel_seen.wait(), timeout=1)
+
+    try:
+        cleanup.cancel()
+        await asyncio.sleep(0)
+
+        assert cleanup.done() is False
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(cleanup, timeout=1)
+
+        assert child.done() is True
+    finally:
+        release.set()
+        if not child.done():
+            child.cancel()
+            await asyncio.gather(child, return_exceptions=True)
 
 
 @pytest.mark.asyncio

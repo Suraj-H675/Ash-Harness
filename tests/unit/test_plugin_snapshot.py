@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ash.plugins.anchored_fs import AnchoredDirectory, supports_anchored_mutation
+from ash.safety.anchored_fs import AnchoredDirectory, supports_anchored_mutation
 from ash.plugins.snapshot import PluginSnapshot
 
 

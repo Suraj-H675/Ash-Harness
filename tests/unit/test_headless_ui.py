@@ -49,6 +49,45 @@ def test_runtime_bound_stream_json_does_not_duplicate_turn_completion() -> None:
     assert [event["type"] for event in events] == ["turn.completed"]
 
 
+def test_runtime_bound_headless_events_share_text_bound(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import ash.core.loop as loop_module
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.providers.base import ProviderABC
+    from ash.safety.guard import SafetyGuard
+
+    class IdleProvider(ProviderABC):
+        model_name = "idle"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            if False:
+                yield
+
+    monkeypatch.setattr(loop_module, "MAX_RUNTIME_EVENT_TEXT_BYTES", 8)
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="stream-json", stream=stream)
+    AshLoop(
+        SessionStore(tmp_path / "events.db"),
+        IdleProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+
+    ui.show_plan(
+        SimpleNamespace(contract=SimpleNamespace(contract_id="plan-1"))
+    )
+
+    event = json.loads(stream.getvalue())
+    assert event["reason"] == "headless"
+    assert event["event_text_truncated"] is True
+
+
 @pytest.mark.asyncio
 async def test_one_shot_stream_json_has_one_authoritative_completion(tmp_path) -> None:
     from ash.cli import _bootstrap_and_headless
@@ -256,6 +295,38 @@ def test_json_error_is_structured_machine_readable_event() -> None:
 def test_headless_approval_fails_closed() -> None:
     ui = HeadlessUI(output_format="text", stream=io.StringIO())
     assert ui.request_tool_approval("run_command", {"command": "x"}) is False
+
+
+def test_headless_text_result_neutralizes_terminal_controls() -> None:
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="text", stream=stream)
+
+    ui.emit_result({"response": "safe\x1b[2J\u202ehidden\u202c", "session_id": "s1"})
+
+    rendered = stream.getvalue()
+    assert "\x1b[2J" not in rendered
+    assert "\u202e" not in rendered
+    assert "safe\\x1b[2J\\u202ehidden\\u202c" in rendered
+
+
+def test_headless_text_error_neutralizes_terminal_controls(capsys) -> None:
+    ui = HeadlessUI(output_format="text", stream=io.StringIO())
+
+    ui.emit_error(
+        {
+            "category": "provider\nforged",
+            "message": "bad\x1b]0;owned\x07\u202ehidden\u202c",
+            "remedy": "retry\x1b[2J",
+        }
+    )
+
+    rendered = capsys.readouterr().err
+    assert "\x1b]0;" not in rendered
+    assert "\x1b[2J" not in rendered
+    assert "\u202e" not in rendered
+    assert "provider\\x0aforged" in rendered
+    assert "bad\\x1b]0;owned\\x07\\u202ehidden\\u202c" in rendered
+    assert "retry\\x1b[2J" in rendered
 
 
 def test_stream_json_emits_tool_lifecycle_events() -> None:

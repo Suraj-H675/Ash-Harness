@@ -9,13 +9,15 @@ import re
 import stat
 import sys
 import tomllib
+from contextlib import contextmanager
+from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
-from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.profiles import active_profile_name, profile_directory
 from ash.safe_io import (
     atomic_write_unlinked_bytes,
@@ -34,8 +36,8 @@ ENV_FILE = ASH_DIR / ".env"
 CONFIG_FILE = ASH_DIR / "ash.toml"
 _INITIAL_PATHS = (ASH_DIR, ENV_FILE, CONFIG_FILE)
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_FILE_BACKED_ENV_VALUES: dict[str, tuple[str, str]] = {}
 _BACKUP_LABEL = re.compile(r"^[A-Za-z0-9_.-]+$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _NON_SECRET_TOKEN_KEYS = frozenset(
     {
         "max_context_tokens",
@@ -127,11 +129,10 @@ def _write_anchored_private_file(
             directory.sync()
         completed = True
     finally:
-        if not completed:
-            cleanup_name = name if renamed else temporary_name
+        if not completed and not renamed:
             try:
                 directory.unlink(
-                    cleanup_name,
+                    temporary_name,
                     missing_ok=True,
                     expected_descriptor=descriptor,
                 )
@@ -176,7 +177,12 @@ def get_config_path() -> Path:
     return _paths()[2]
 
 
-def backup_config_file(path: str | Path, *, label: str) -> Path:
+def backup_config_file(
+    path: str | Path,
+    *,
+    label: str,
+    expected_sha256: str | None = None,
+) -> Path:
     """Create and verify a private immutable copy of a config file."""
 
     source = Path(path).expanduser()
@@ -195,7 +201,13 @@ def backup_config_file(path: str | Path, *, label: str) -> Path:
         MAX_CONFIG_FILE_BYTES,
         label="config backup source",
     )
-    source_digest = hashlib.sha256(contents).digest()
+    source_digest = hashlib.sha256(contents).hexdigest()
+    if expected_sha256 is not None:
+        normalized_expected = expected_sha256.casefold()
+        if not _SHA256_HEX.fullmatch(normalized_expected):
+            raise ValueError("expected config SHA-256 must be 64 lowercase hex digits")
+        if source_digest != normalized_expected:
+            raise OSError(f"config changed before it could be backed up: {source}")
     ash_dir = ensure_ash_dir()
     trusted_root = _state_trusted_root(ash_dir)
     backup_dir = ensure_anchored_directory(
@@ -226,7 +238,7 @@ def backup_config_file(path: str | Path, *, label: str) -> Path:
             label="config backup",
             trusted_root=trusted_root,
         )
-    ).digest()
+    ).hexdigest()
     if copied_digest != source_digest:
         raise OSError(f"config backup verification failed: {source}")
     return destination
@@ -249,7 +261,7 @@ def migration_state_path() -> Path:
 def is_config_migration_recorded(path: str | Path) -> bool:
     """Return whether this exact source has a matching verified backup record."""
 
-    source = Path(path).expanduser().resolve()
+    source = Path(os.path.abspath(Path(path).expanduser()))
     state = _load_migration_state()
     record = state["migrations"].get(os.path.normcase(str(source)))
     if not isinstance(record, dict):
@@ -265,12 +277,22 @@ def is_config_migration_recorded(path: str | Path) -> bool:
         return False
 
 
-def record_config_migration(path: str | Path, backup: str | Path) -> None:
+def record_config_migration(
+    path: str | Path,
+    backup: str | Path,
+    *,
+    source_sha256: str | None = None,
+) -> None:
     """Atomically record a completed migration after checking its backup."""
 
-    source = Path(path).expanduser().resolve()
+    source = Path(os.path.abspath(Path(path).expanduser()))
     backup_path = Path(backup).expanduser().resolve()
-    source_digest = config_file_digest(source)
+    if source_sha256 is None:
+        source_digest = config_file_digest(source)
+    else:
+        source_digest = source_sha256.casefold()
+        if not _SHA256_HEX.fullmatch(source_digest):
+            raise ValueError("source SHA-256 must be 64 lowercase hex digits")
     if config_file_digest(backup_path) != source_digest:
         raise OSError("refusing to record a migration with a mismatched backup")
     state = _load_migration_state()
@@ -327,14 +349,15 @@ def _save_migration_state(state: dict[str, Any]) -> None:
 def save_env_value(key: str, value: str) -> None:
     """Atomically write key=value to ~/.ash/.env.
 
-    Preserves existing keys. Sets os.environ[key] = value so providers
-    pick up the change immediately.
+    Preserves existing keys. Runtime environment publication is handled by
+    ``AshConfig.load()`` so persisted profile state cannot override an
+    operator-owned process environment.
     """
     save_env_values({key: value})
 
 
 def save_env_values(values: dict[str, str]) -> None:
-    """Atomically persist multiple dotenv values and then publish them in-process."""
+    """Atomically persist multiple dotenv values without mutating ``os.environ``."""
 
     if not values:
         return
@@ -348,7 +371,6 @@ def save_env_values(values: dict[str, str]) -> None:
                 f"environment value for {key} contains a forbidden newline or NUL"
             )
 
-    ensure_ash_dir()
     env_file = get_env_path()
     try:
         with AnchoredDirectory.open(
@@ -356,7 +378,7 @@ def save_env_values(values: dict[str, str]) -> None:
             create=True,
             private=True,
             pin_path=True,
-        ) as directory:
+        ) as directory, directory.lock(f".{env_file.name}.lock"):
             directory.validation_path()
             raw = directory.read_file(env_file.name, max_bytes=MAX_ENV_FILE_BYTES)
             lines: list[str] = []
@@ -383,22 +405,12 @@ def save_env_values(values: dict[str, str]) -> None:
                 label="dotenv file",
             )
     except AnchoredFilesystemError as exc:
+        if "link" in str(exc).casefold():
+            raise ValueError(
+                f"cannot persist dotenv file {env_file}: "
+                "state path contains a symlink or junction"
+            ) from exc
         raise ValueError(f"cannot persist dotenv file {env_file}: {exc}") from exc
-    os.environ.update(values)
-    _FILE_BACKED_ENV_VALUES.update(
-        {key: (str(env_file), value) for key, value in values.items()}
-    )
-
-
-def file_backed_env_values(path: Path) -> dict[str, str]:
-    """Return values published by this process after an atomic dotenv write."""
-
-    selected_path = str(path)
-    return {
-        key: value
-        for key, (source_path, value) in _FILE_BACKED_ENV_VALUES.items()
-        if source_path == selected_path
-    }
 
 
 def get_env_value(key: str) -> str | None:
@@ -452,33 +464,110 @@ def load_env() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def save_config(config: dict[str, Any]) -> None:
-    """Save a dict (typically custom_providers) to ~/.ash/ash.toml.
-    """
-    ensure_ash_dir()
-    config_file = get_config_path()
+def _read_config_at(directory: AnchoredDirectory, config_file: Path) -> dict[str, Any]:
+    raw = directory.read_file(config_file.name, max_bytes=MAX_CONFIG_FILE_BYTES)
+    if raw is None:
+        return {}
+    value = tomllib.loads(raw.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("user configuration must contain a TOML table")
+    return value
+
+
+def _write_config_at(
+    directory: AnchoredDirectory,
+    config_file: Path,
+    config: dict[str, Any],
+) -> None:
     import toml  # type: ignore[import-untyped]
 
-    # Serialize to string via toml library
     toml_str = toml.dumps(config)
+    _write_anchored_private_file(
+        directory,
+        config_file.name,
+        toml_str.encode("utf-8"),
+        label="user TOML config",
+    )
 
+
+@dataclass
+class UserConfigTransaction:
+    """One locked read-modify-write transaction over the user TOML config."""
+
+    config: dict[str, Any]
+    _directory: AnchoredDirectory
+    _path: Path
+    _original: dict[str, Any]
+
+    def save(self) -> None:
+        """Persist the current transaction value while the config lock is held."""
+
+        if self.config == self._original:
+            return
+        _write_config_at(self._directory, self._path, self.config)
+        self._original = deepcopy(self.config)
+
+
+@contextmanager
+def user_config_transaction() -> Iterator[UserConfigTransaction]:
+    """Hold the user-config lock across a complete read-modify-write operation."""
+
+    ensure_ash_dir()
+    config_file = get_config_path()
     try:
-        with AnchoredDirectory.open(
-            config_file.parent,
-            create=True,
-            private=True,
-            pin_path=True,
-        ) as directory:
+        with (
+            AnchoredDirectory.open(
+                config_file.parent,
+                create=True,
+                private=True,
+                pin_path=True,
+            ) as directory,
+            directory.lock(f".{config_file.name}.lock"),
+        ):
             directory.validation_path()
-            _write_anchored_private_file(
-                directory,
-                config_file.name,
-                toml_str.encode("utf-8"),
-                label="user TOML config",
+            config = _read_config_at(directory, config_file)
+            transaction = UserConfigTransaction(
+                config=config,
+                _directory=directory,
+                _path=config_file,
+                _original=deepcopy(config),
             )
+            yield transaction
             directory.validation_path()
     except AnchoredFilesystemError as exc:
-        raise ValueError(f"cannot persist user TOML config {config_file}: {exc}") from exc
+        raise ValueError(f"cannot access user TOML config {config_file}: {exc}") from exc
+
+
+def mutate_config(mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    """Apply one serialized mutation without dropping concurrent user settings."""
+
+    with user_config_transaction() as transaction:
+        mutator(transaction.config)
+        transaction.save()
+        return deepcopy(transaction.config)
+
+
+def replace_config_if_current(
+    expected: dict[str, Any],
+    updated: dict[str, Any],
+) -> None:
+    """Replace the user config only if it still matches a previously read snapshot."""
+
+    with user_config_transaction() as transaction:
+        if transaction.config != expected:
+            raise ValueError("user configuration changed while the operation was in progress")
+        transaction.config.clear()
+        transaction.config.update(deepcopy(updated))
+        transaction.save()
+
+
+def save_config(config: dict[str, Any]) -> None:
+    """Replace the complete user config under the shared mutation lock."""
+
+    with user_config_transaction() as transaction:
+        transaction.config.clear()
+        transaction.config.update(deepcopy(config))
+        transaction.save()
 
 
 def load_config(*, strict: bool = False) -> dict[str, Any]:

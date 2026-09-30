@@ -72,6 +72,104 @@ async def test_tool_search_ranks_activates_and_resets_exact_schemas(tmp_path) ->
         await search.run(query="   ")
 
 
+@pytest.mark.asyncio
+async def test_tool_search_activations_use_bounded_lru_window(tmp_path) -> None:
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(
+        guard,
+        lambda: catalog,
+        threshold=1,
+        max_activations=2,
+    )
+    first = DummyTool(guard, "first_database", "First database integration")
+    second = DummyTool(guard, "second_database", "Second database integration")
+    third = DummyTool(guard, "third_database", "Third database integration")
+    catalog.update(
+        {
+            search.name: search,
+            first.name: first,
+            second.name: second,
+            third.name: third,
+        }
+    )
+
+    await search.run(query="first database", limit=1)
+    await search.run(query="second database", limit=1)
+    await search.run(query="first database", limit=1)
+    await search.run(query="third database", limit=1)
+
+    assert search.activated_names == {first.name, third.name}
+    assert set(search.visible_tools(catalog)) == {
+        search.name,
+        first.name,
+        third.name,
+    }
+
+
+@pytest.mark.asyncio
+async def test_tool_search_uses_bounded_search_schema_and_summarizes_large_match(
+    tmp_path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+
+    class LargeSchemaTool(DummyTool):
+        def __init__(self) -> None:
+            super().__init__(guard, "large_remote", "Large remote integration")
+            self._schema = {
+                "type": "object",
+                "properties": {
+                    "needle_field": {
+                        "type": "string",
+                        "description": "needle searchable metadata",
+                    },
+                    "payload": {
+                        "type": "string",
+                        "description": "x" * 20_000,
+                    },
+                },
+                "required": ["needle_field"],
+            }
+
+        def search_schema(self) -> dict[str, Any]:
+            return self._schema
+
+        def json_schema(self) -> dict[str, Any]:
+            raise AssertionError("search must not copy the provider-facing schema")
+
+    tool = LargeSchemaTool()
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=1)
+    catalog.update({search.name: search, tool.name: tool})
+
+    result = await search.run(query="needle", limit=1)
+    payload = json.loads(result.output)
+
+    assert result.success is True
+    assert payload["tools"] == [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "schema_truncated": True,
+            "schema_summary": {
+                "type": "object",
+                "properties": ["needle_field", "payload"],
+                "required": ["needle_field"],
+            },
+        }
+    ]
+    assert tool.name in search.activated_names
+    assert tool.name in search.visible_tools(catalog)
+    assert len(result.output.encode("utf-8")) < 16_000
+
+
+def test_tool_search_rejects_invalid_activation_limit(tmp_path) -> None:
+    guard = SafetyGuard(tmp_path)
+
+    with pytest.raises(ValueError, match="activation limit"):
+        SearchToolsTool(guard, lambda: {}, max_activations=0)
+
+
 class SearchFlowProvider(ProviderABC):
     model_name = "search-flow"
     _ash_declared_capabilities = ProviderCapabilities(native_tools=True)

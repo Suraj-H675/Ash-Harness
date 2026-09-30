@@ -1,33 +1,21 @@
-"""Long-term memory and search indices for Ash."""
+"""Durable project-memory storage, retrieval, and optional embeddings."""
 
-from ash.memory.vector import (
-    VectorSearchPipeline,
-    VectorHit,
-    InMemoryVectorIndex,
-    ChromaIndex,
+from ash.memory.embeddings import (
     EmbeddingAdapter,
-    DeterministicEmbedding,
+    EmbeddingBackendUnavailable,
     ONNXLocalEmbedding,
     OpenAIEmbedding,
-    EmbeddingBackendUnavailable,
-    VectorBackendUnavailable,
-    FTS5FallbackIndex,
 )
-from ash.memory.markdown_store import MarkdownMemoryStore
-from ash.memory.fts5 import FTS5Index
+from ash.memory.pipeline import MemoryHit, MemorySearchPipeline
+from ash.memory.sqlite_index import MemoryIndexError, SQLiteMemoryIndex
 
 __all__ = [
-    "VectorSearchPipeline",
-    "VectorHit",
-    "InMemoryVectorIndex",
-    "ChromaIndex",
     "EmbeddingAdapter",
-    "DeterministicEmbedding",
+    "EmbeddingBackendUnavailable",
+    "MemoryHit",
+    "MemoryIndexError",
+    "MemorySearchPipeline",
     "ONNXLocalEmbedding",
     "OpenAIEmbedding",
-    "EmbeddingBackendUnavailable",
-    "VectorBackendUnavailable",
-    "FTS5FallbackIndex",
-    "MarkdownMemoryStore",
-    "FTS5Index",
+    "SQLiteMemoryIndex",
 ]

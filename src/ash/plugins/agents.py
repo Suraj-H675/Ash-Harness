@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
 from ash.agents.subprocess_agent import AGENT_ROLES
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 
 MAX_AGENT_BYTES = 256 * 1024
 MAX_AGENT_DISCOVERY_ENTRIES = 100_000
@@ -20,6 +22,26 @@ class AgentDefinition:
     path: Path
     base_role: str = "general"
     allowed_tools: tuple[str, ...] = ()
+    source_identity: tuple[int, int] | None = None
+
+    def ensure_current(self) -> None:
+        """Reject a discovered definition whose source file changed identity."""
+
+        if self.source_identity is None:
+            return
+        try:
+            metadata = self.path.lstat()
+        except OSError as exc:
+            raise ValueError(
+                f"agent definition identity changed after discovery: {self.path}"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode) or (
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+        ) != self.source_identity:
+            raise ValueError(
+                f"agent definition identity changed after discovery: {self.path}"
+            )
 
 
 @dataclass(frozen=True)
@@ -62,11 +84,37 @@ class AgentCatalog:
 def parse_agent_definition(path: Path, *, namespace: str = "") -> AgentDefinition:
     if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
         raise ValueError("agent definition cannot be a link")
-    with path.open("rb") as handle:
-        raw = handle.read(MAX_AGENT_BYTES + 1)
-    if len(raw) > MAX_AGENT_BYTES:
-        raise ValueError("agent definition exceeds 256 KiB")
-    return parse_agent_definition_bytes(raw, path, namespace=namespace)
+    try:
+        with AnchoredDirectory.open(
+            path.parent,
+            create=False,
+            private=False,
+        ) as directory:
+            metadata = directory.stat(path.name)
+            if metadata is None:
+                raise ValueError("agent definition does not exist")
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("agent definition cannot be a link")
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("agent definition must be a regular file")
+            raw = directory.read_file(path.name, max_bytes=MAX_AGENT_BYTES)
+            if raw is None:
+                raise ValueError("agent definition does not exist")
+            directory.validation_path()
+            source_identity = (int(metadata.st_dev), int(metadata.st_ino))
+    except (AnchoredFilesystemError, ValueError) as exc:
+        message = str(exc).casefold()
+        if "symlink" in message or "junction" in message:
+            raise ValueError("agent definition cannot be a link") from exc
+        if "exceeds" in message and str(MAX_AGENT_BYTES) in message:
+            raise ValueError("agent definition exceeds 256 KiB") from exc
+        raise
+    return parse_agent_definition_bytes(
+        raw,
+        path,
+        namespace=namespace,
+        source_identity=source_identity,
+    )
 
 
 def parse_agent_definition_bytes(
@@ -74,6 +122,7 @@ def parse_agent_definition_bytes(
     path: Path,
     *,
     namespace: str = "",
+    source_identity: tuple[int, int] | None = None,
 ) -> AgentDefinition:
     """Parse one bounded agent definition from immutable bytes."""
 
@@ -136,6 +185,7 @@ def parse_agent_definition_bytes(
         path=path,
         base_role=base_role,
         allowed_tools=tools,
+        source_identity=source_identity,
     )
 
 

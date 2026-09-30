@@ -34,6 +34,25 @@ from ash.ui.headless import HeadlessUI
 
 
 ApprovalCallback = Callable[[str, dict], Awaitable[bool]]
+SDK_STREAM_EVENT_QUEUE_MAX = 4096
+SDK_STREAM_EVENT_QUEUE_MAX_BYTES = 8 * 1024 * 1024
+SDK_STREAM_BACKPRESSURE_ERROR = (
+    "SDK event stream consumer fell behind; turn cancelled to preserve bounded memory"
+)
+
+
+def _estimate_sdk_event_size(event: "AshEvent") -> int:
+    try:
+        return len(
+            json.dumps(
+                event.to_wire(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception:  # noqa: BLE001 - accounting must never break streaming
+        return SDK_STREAM_EVENT_QUEUE_MAX_BYTES + 1
 
 
 def _metadata_has_image_content(user_metadata: dict[str, Any] | None) -> bool:
@@ -196,6 +215,10 @@ class AshClient:
         self._started = False
         self._turn_lock = asyncio.Lock()
 
+    def _require_runtime_open(self) -> None:
+        if self.loop._closing or self.loop._closed:
+            raise RuntimeError("Ash client runtime is closed")
+
     @classmethod
     async def create(
         cls,
@@ -203,6 +226,7 @@ class AshClient:
         config: AshConfig | None = None,
         workspace: Path | None = None,
         provider: ProviderABC | None = None,
+        provider_factory: Callable[[AshConfig], ProviderABC] | None = None,
         agent_provider_factory: Callable[[], ProviderABC] | None = None,
         approval_callback: ApprovalCallback | None = None,
         workspace_trusted: bool | None = None,
@@ -223,6 +247,7 @@ class AshClient:
             runtime_config,
             ui=HeadlessUI(output_format="text", stream=io.StringIO()),
             provider=provider,
+            provider_factory=provider_factory,
             agent_provider_factory=agent_provider_factory,
             workspace_trusted=workspace_trusted,
             approval_callback=approval_callback,
@@ -234,8 +259,14 @@ class AshClient:
         client = cls(runtime.loop, runtime_config)
         try:
             await client.start(session_id)
-        except BaseException:
-            await runtime.loop.aclose()
+        except BaseException as primary_error:
+            try:
+                await runtime.loop.aclose()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    "Ash SDK runtime cleanup failed during client creation: "
+                    + redact_text(str(cleanup_error))
+                )
             raise
         return client
 
@@ -244,6 +275,7 @@ class AshClient:
             return await self._start_unlocked(session_id)
 
     async def _start_unlocked(self, session_id: str | None = None) -> str:
+        self._require_runtime_open()
         if self._started and self.loop.current_session is not None:
             return self.loop.current_session.session_id
         session = await self.loop.start_session(session_id)
@@ -262,6 +294,7 @@ class AshClient:
     async def steer(self, text: str) -> int:
         """Queue guidance for the currently running turn without waiting on it."""
 
+        self._require_runtime_open()
         if not self.loop.is_turn_running:
             raise RuntimeError("no turn is currently running")
         return self.loop.queue_steering(text)
@@ -272,6 +305,7 @@ class AshClient:
         *,
         user_metadata: dict[str, Any] | None = None,
     ) -> AshResult:
+        self._require_runtime_open()
         if not _prompt_has_content(text, user_metadata):
             raise ValueError("prompt cannot be empty")
         if not self._started:
@@ -304,21 +338,71 @@ class AshClient:
     ) -> AsyncIterator[AshEvent]:
         """Yield real runtime deltas and one terminal completion/error event."""
 
+        self._require_runtime_open()
         if not _prompt_has_content(text, user_metadata):
             raise ValueError("prompt cannot be empty")
         async with self._turn_lock:
             ui = self.loop.ui
             if not isinstance(ui, HeadlessUI):
                 raise RuntimeError("stream_prompt requires Ash's headless event UI")
-            queue: asyncio.Queue[AshEvent] = asyncio.Queue()
+            queue: asyncio.Queue[tuple[AshEvent, int]] = asyncio.Queue(
+                maxsize=max(1, SDK_STREAM_EVENT_QUEUE_MAX)
+            )
+            queued_bytes = 0
             terminal_seen = False
+            overflowed = False
+            overflow_event: AshEvent | None = None
+            task: asyncio.Task[None] | None = None
 
-            def receive(payload: dict[str, Any]) -> None:
-                nonlocal terminal_seen
-                event = AshEvent.from_wire(payload)
+            def mark_overflow(event: AshEvent) -> None:
+                nonlocal overflowed, overflow_event
+                if overflowed:
+                    return
+                overflowed = True
+                overflow_event = AshEvent(
+                    "turn.error",
+                    {
+                        "error": SDK_STREAM_BACKPRESSURE_ERROR,
+                        "category": "backpressure",
+                    },
+                    session_id=event.session_id,
+                    turn_id=event.turn_id,
+                    operation_id=event.operation_id,
+                    parent_event_id=event.parent_event_id,
+                )
+                try:
+                    queue.put_nowait((overflow_event, 0))
+                except asyncio.QueueFull:
+                    pass
+                if task is not None and not task.done():
+                    task.cancel()
+
+            def enqueue_event(event: AshEvent) -> bool:
+                nonlocal queued_bytes, terminal_seen
+                if overflowed:
+                    return False
+                event_size = _estimate_sdk_event_size(event)
+                if (
+                    event_size > SDK_STREAM_EVENT_QUEUE_MAX_BYTES
+                    or queued_bytes + event_size > SDK_STREAM_EVENT_QUEUE_MAX_BYTES
+                ):
+                    mark_overflow(event)
+                    return False
+                try:
+                    queue.put_nowait((event, event_size))
+                except asyncio.QueueFull:
+                    mark_overflow(event)
+                    return False
+                queued_bytes += event_size
                 if event.type in {"turn.completed", "turn.error", "turn.cancelled"}:
                     terminal_seen = True
-                queue.put_nowait(event)
+                return True
+
+            def receive(payload: dict[str, Any]) -> None:
+                if overflowed:
+                    return
+                event = AshEvent.from_wire(payload)
+                enqueue_event(event)
 
             unsubscribe = ui.subscribe(receive)
 
@@ -330,13 +414,13 @@ class AshClient:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    if not terminal_seen:
-                        queue.put_nowait(
+                    if not terminal_seen and not overflowed:
+                        enqueue_event(
                             AshEvent("turn.error", {"error": redact_text(str(exc))})
                         )
                     return
-                if not terminal_seen:
-                    queue.put_nowait(
+                if not terminal_seen and not overflowed:
+                    enqueue_event(
                         AshEvent(
                             "turn.completed",
                             {
@@ -352,7 +436,12 @@ class AshClient:
             task = asyncio.create_task(run())
             try:
                 while True:
-                    event = await queue.get()
+                    if overflowed and queue.empty():
+                        assert overflow_event is not None
+                        yield overflow_event
+                        break
+                    event, event_size = await queue.get()
+                    queued_bytes = max(0, queued_bytes - event_size)
                     yield event
                     if event.type in {
                         "turn.completed",
@@ -577,16 +666,17 @@ class AshClient:
     ) -> list[AgentTask]:
         """Return durable subagent tasks from the shared coordination store."""
 
-        shared = SharedState(self.config.db_directory / "agents.db")
-        try:
+        with SharedState(
+            self.config.db_directory / "agents.db",
+            workspace=self.loop.project_root,
+        ) as shared:
             return shared.tasks.list_tasks(
                 state=state,
                 owner_agent_id=owner_agent_id,
                 graph_id=graph_id,
+                workspace=self.loop.project_root,
                 limit=limit,
             )
-        finally:
-            shared.close()
 
     def cancel_agent_graph(
         self,
@@ -596,11 +686,15 @@ class AshClient:
     ) -> list[str]:
         """Cancel all nonterminal work in a durable delegated graph."""
 
-        shared = SharedState(self.config.db_directory / "agents.db")
-        try:
-            return shared.tasks.cancel_graph(graph_id, reason=reason)
-        finally:
-            shared.close()
+        with SharedState(
+            self.config.db_directory / "agents.db",
+            workspace=self.loop.project_root,
+        ) as shared:
+            return shared.tasks.cancel_graph(
+                graph_id,
+                reason=reason,
+                workspace=self.loop.project_root,
+            )
 
     async def delegate_agents(
         self,
@@ -611,31 +705,39 @@ class AshClient:
     ) -> AshDelegationResult:
         """Submit a durable provider-backed task DAG through the runtime tool."""
 
+        self._require_runtime_open()
         async with self._turn_lock:
             if not self._started:
                 await self._start_unlocked()
-            tool = self.loop.tools.get("delegate_agents")
-            if tool is None:
-                raise RuntimeError("delegate_agents is unavailable in this runtime")
-            result = await tool.run(goal=goal, tasks=tasks, background=background)
-        if not result.output:
-            raise RuntimeError(result.error or "delegated graph submission failed")
-        payload = json.loads(result.output)
+            result = await self.loop.execute_tool(
+                "delegate_agents",
+                {"goal": goal, "tasks": tasks, "background": background},
+            )
+        output = str(result.get("output", ""))
+        error = result.get("error")
+        if not output:
+            raise RuntimeError(
+                str(error) if error is not None else "delegated graph submission failed"
+            )
+        payload = json.loads(output)
         return AshDelegationResult(
             graph_id=str(payload["graph_id"]),
             tasks=tuple(payload["tasks"]),
-            success=result.success,
-            error=result.error,
+            success=bool(result.get("success", False)),
+            error=str(error) if error is not None else None,
         )
 
     def agent_artifacts(self, task_id: str) -> list[AgentArtifact]:
         """Return durable artifacts produced for one subagent task."""
 
-        shared = SharedState(self.config.db_directory / "agents.db")
-        try:
-            return shared.tasks.list_artifacts(task_id)
-        finally:
-            shared.close()
+        with SharedState(
+            self.config.db_directory / "agents.db",
+            workspace=self.loop.project_root,
+        ) as shared:
+            return shared.tasks.list_artifacts(
+                task_id,
+                workspace=self.loop.project_root,
+            )
 
     def agent_task_events(
         self,
@@ -647,16 +749,17 @@ class AshClient:
     ) -> list[AgentTaskEvent]:
         """Replay versioned durable subagent task events."""
 
-        shared = SharedState(self.config.db_directory / "agents.db")
-        try:
+        with SharedState(
+            self.config.db_directory / "agents.db",
+            workspace=self.loop.project_root,
+        ) as shared:
             return shared.tasks.list_events(
                 task_id=task_id,
                 event_type=event_type,
+                workspace=self.loop.project_root,
                 after_sequence=after_sequence,
                 limit=limit,
             )
-        finally:
-            shared.close()
 
     def events(
         self,
@@ -688,12 +791,14 @@ class AshClient:
         ]
 
     async def resume(self, session_id: str) -> str:
+        self._require_runtime_open()
         async with self._turn_lock:
             session = await self.loop.start_session(session_id)
             self._started = True
             return session.session_id
 
     async def new_session(self) -> str:
+        self._require_runtime_open()
         async with self._turn_lock:
             session = await self.loop.start_session()
             self._started = True
@@ -709,6 +814,7 @@ class AshClient:
     ) -> str:
         """Fork a session at a complete turn boundary and activate the child."""
 
+        self._require_runtime_open()
         async with self._turn_lock:
             active_session = self.loop.current_session
             resolved_session_id = session_id or (

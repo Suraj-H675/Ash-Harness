@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import hashlib
 import os
 import secrets
 import stat
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.safety.guard import SafetyGuard, SafetyViolation
 
 
@@ -21,6 +24,11 @@ class ScopedIOError(OSError):
 
 class ScopedFileChanged(ScopedIOError):
     """The destination changed between validation and mutation."""
+
+
+_MUTATION_STATE_GUARD = threading.Lock()
+_MUTATION_OWNER: tuple[str, int] | None = None
+_MUTATION_DEPTH = 0
 
 
 @dataclass(frozen=True)
@@ -128,6 +136,7 @@ def stat_scoped_path(
             except OSError as exc:
                 raise _scoped_open_error(target, exc) from exc
             try:
+                guard.verify_project_root_descriptor(directory_fd)
                 return target, os.fstat(directory_fd)
             finally:
                 os.close(directory_fd)
@@ -170,6 +179,11 @@ def list_scoped_directory(
                 | _flag("O_NOFOLLOW")
             )
             directory_fd = os.open(guard.project_root, flags)
+            try:
+                guard.verify_project_root_descriptor(directory_fd)
+            except BaseException:
+                os.close(directory_fd)
+                raise
         else:
             with _open_parent(target, guard, create=False) as (parent_fd, name):
                 flags = (
@@ -233,6 +247,7 @@ def open_scoped_directory(
                 directory_fd = os.open(guard.project_root, flags)
             except OSError as exc:
                 raise _scoped_open_error(target, exc) from exc
+            guard.verify_project_root_descriptor(directory_fd)
         else:
             with _open_parent(target, guard, create=False) as (parent_fd, name):
                 try:
@@ -276,6 +291,25 @@ def atomic_write_scoped_text(
     )
 
 
+def atomic_write_scoped_text_chunks(
+    path: str | Path,
+    chunks: Iterable[str],
+    guard: SafetyGuard,
+    *,
+    overwrite: bool,
+    expected_sha256: str | None = None,
+) -> Path:
+    """Atomically write streamed UTF-8 text with the same scoped guarantees."""
+
+    return atomic_write_scoped_chunks(
+        path,
+        (chunk.encode("utf-8") for chunk in chunks),
+        guard,
+        overwrite=overwrite,
+        expected_sha256=expected_sha256,
+    )
+
+
 def atomic_write_scoped_bytes(
     path: str | Path,
     payload: bytes,
@@ -286,23 +320,43 @@ def atomic_write_scoped_bytes(
 ) -> Path:
     """Atomically write bytes while retaining a workspace directory anchor."""
 
+    return atomic_write_scoped_chunks(
+        path,
+        (payload,),
+        guard,
+        overwrite=overwrite,
+        expected_sha256=expected_sha256,
+    )
+
+
+def atomic_write_scoped_chunks(
+    path: str | Path,
+    chunks: Iterable[bytes],
+    guard: SafetyGuard,
+    *,
+    overwrite: bool,
+    expected_sha256: str | None = None,
+) -> Path:
+    """Atomically write byte chunks while retaining a workspace directory anchor."""
+
     target = guard.validate_mutation_path(path)
-    if _supports_anchored_io():
-        _anchored_atomic_write(
-            target,
-            payload,
-            guard,
-            overwrite=overwrite,
-            expected_sha256=expected_sha256,
-        )
-    else:
-        _fallback_atomic_write(
-            target,
-            payload,
-            guard,
-            overwrite=overwrite,
-            expected_sha256=expected_sha256,
-        )
+    with workspace_mutation_lock():
+        if _supports_anchored_io():
+            _anchored_atomic_write_chunks(
+                target,
+                chunks,
+                guard,
+                overwrite=overwrite,
+                expected_sha256=expected_sha256,
+            )
+        else:
+            _fallback_atomic_write_chunks(
+                target,
+                chunks,
+                guard,
+                overwrite=overwrite,
+                expected_sha256=expected_sha256,
+            )
     return target
 
 
@@ -320,24 +374,25 @@ def restore_scoped_file(
     if max_bytes is not None and max_bytes < 0:
         raise ValueError("max_bytes cannot be negative")
     target = guard.validate_mutation_path(path)
-    if _supports_anchored_io():
-        _anchored_restore(
-            target,
-            payload,
-            guard,
-            expected_sha256=expected_sha256,
-            mode=mode,
-            max_bytes=max_bytes,
-        )
-    else:
-        _fallback_restore(
-            target,
-            payload,
-            guard,
-            expected_sha256=expected_sha256,
-            mode=mode,
-            max_bytes=max_bytes,
-        )
+    with workspace_mutation_lock():
+        if _supports_anchored_io():
+            _anchored_restore(
+                target,
+                payload,
+                guard,
+                expected_sha256=expected_sha256,
+                mode=mode,
+                max_bytes=max_bytes,
+            )
+        else:
+            _fallback_restore(
+                target,
+                payload,
+                guard,
+                expected_sha256=expected_sha256,
+                mode=mode,
+                max_bytes=max_bytes,
+            )
     return target
 
 
@@ -353,21 +408,81 @@ def remove_scoped_file(
     if max_bytes is not None and max_bytes < 0:
         raise ValueError("max_bytes cannot be negative")
     target = guard.validate_mutation_path(path)
-    if _supports_anchored_io():
-        _anchored_remove(
-            target,
-            guard,
-            expected_sha256=expected_sha256,
-            max_bytes=max_bytes,
-        )
-    else:
-        _fallback_remove(
-            target,
-            guard,
-            expected_sha256=expected_sha256,
-            max_bytes=max_bytes,
-        )
+    with workspace_mutation_lock():
+        if _supports_anchored_io():
+            _anchored_remove(
+                target,
+                guard,
+                expected_sha256=expected_sha256,
+                max_bytes=max_bytes,
+            )
+        else:
+            _fallback_remove(
+                target,
+                guard,
+                expected_sha256=expected_sha256,
+                max_bytes=max_bytes,
+            )
     return target
+
+
+def _mutation_owner() -> tuple[str, int]:
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    if task is not None:
+        return ("task", id(task))
+    return ("thread", threading.get_ident())
+
+
+@contextmanager
+def workspace_mutation_lock() -> Iterator[None]:
+    """Serialize participating Ash workspace mutations across tasks/processes."""
+
+    global _MUTATION_DEPTH, _MUTATION_OWNER
+
+    owner = _mutation_owner()
+    nested = False
+    with _MUTATION_STATE_GUARD:
+        if _MUTATION_OWNER == owner:
+            _MUTATION_DEPTH += 1
+            nested = True
+        elif _MUTATION_OWNER is not None:
+            raise ScopedIOError(
+                "another Ash workspace mutation is already active in this process"
+            )
+        else:
+            _MUTATION_OWNER = owner
+            _MUTATION_DEPTH = 1
+
+    if nested:
+        try:
+            yield
+        finally:
+            with _MUTATION_STATE_GUARD:
+                _MUTATION_DEPTH -= 1
+        return
+
+    try:
+        lock_root = Path.home() / ".ash" / "locks"
+        with AnchoredDirectory.open(
+            lock_root,
+            create=True,
+            private=True,
+            pin_path=True,
+        ) as directory:
+            with directory.lock("workspace-mutations.lock", blocking=False):
+                yield
+    except AnchoredFilesystemError as exc:
+        raise ScopedIOError(
+            f"workspace mutation lock is unavailable: {exc}"
+        ) from exc
+    finally:
+        with _MUTATION_STATE_GUARD:
+            if _MUTATION_OWNER == owner:
+                _MUTATION_OWNER = None
+                _MUTATION_DEPTH = 0
 
 
 def _supports_anchored_io() -> bool:
@@ -399,6 +514,7 @@ def _open_parent(
     )
     current_fd = os.open(guard.project_root, flags)
     try:
+        guard.verify_project_root_descriptor(current_fd)
         for component in relative_parent.parts:
             try:
                 next_fd = os.open(component, flags, dir_fd=current_fd)
@@ -419,9 +535,9 @@ def _open_parent(
         os.close(current_fd)
 
 
-def _anchored_atomic_write(
+def _anchored_atomic_write_chunks(
     target: Path,
-    payload: bytes,
+    chunks: Iterable[bytes],
     guard: SafetyGuard,
     *,
     overwrite: bool,
@@ -450,7 +566,10 @@ def _anchored_atomic_write(
             temp_fd = os.open(temp_name, flags, 0o666, dir_fd=parent_fd)
             if existing is not None and hasattr(os, "fchmod"):
                 os.fchmod(temp_fd, stat.S_IMODE(existing.st_mode) & 0o777)
-            _write_all(temp_fd, payload)
+            for chunk in chunks:
+                if not isinstance(chunk, bytes):
+                    raise TypeError("atomic write chunks must be bytes")
+                _write_all(temp_fd, chunk)
             os.fsync(temp_fd)
             os.close(temp_fd)
             temp_fd = -1
@@ -530,7 +649,28 @@ def _anchored_restore(
                 expected_sha256,
                 target,
             )
-            os.rename(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            if expected_sha256.casefold() == "missing":
+                try:
+                    os.link(
+                        temp_name,
+                        name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError as exc:
+                    raise ScopedFileChanged(
+                        f"file appeared before checkpoint restore: {target}"
+                    ) from exc
+                os.unlink(temp_name, dir_fd=parent_fd)
+                temp_name = ""
+            else:
+                os.rename(
+                    temp_name,
+                    name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
             os.fsync(parent_fd)
         finally:
             if temp_fd >= 0:
@@ -556,6 +696,8 @@ def _anchored_remove(
                 expected_sha256,
                 target,
             )
+            if expected_sha256.casefold() == "missing":
+                return
             os.unlink(name, dir_fd=parent_fd)
             os.fsync(parent_fd)
     except FileNotFoundError:
@@ -628,9 +770,9 @@ def _fallback_snapshot(
     )
 
 
-def _fallback_atomic_write(
+def _fallback_atomic_write_chunks(
     target: Path,
-    payload: bytes,
+    chunks: Iterable[bytes],
     guard: SafetyGuard,
     *,
     overwrite: bool,
@@ -659,7 +801,10 @@ def _fallback_atomic_write(
         try:
             if existing is not None and hasattr(os, "fchmod"):
                 os.fchmod(fd, stat.S_IMODE(existing.st_mode) & 0o777)
-            _write_all(fd, payload)
+            for chunk in chunks:
+                if not isinstance(chunk, bytes):
+                    raise TypeError("atomic write chunks must be bytes")
+                _write_all(fd, chunk)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -718,7 +863,16 @@ def _fallback_restore(
             expected_sha256,
             target,
         )
-        os.replace(temp, target)
+        if expected_sha256.casefold() == "missing":
+            try:
+                os.link(temp, target, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise ScopedFileChanged(
+                    f"file appeared before checkpoint restore: {target}"
+                ) from exc
+            temp.unlink()
+        else:
+            os.replace(temp, target)
     finally:
         try:
             temp.unlink()
@@ -739,6 +893,8 @@ def _fallback_remove(
         expected_sha256,
         target,
     )
+    if expected_sha256.casefold() == "missing":
+        return
     if _fallback_identity(target, missing_ok=True) is not None:
         target.unlink()
     guard.validate_mutation_path(target)

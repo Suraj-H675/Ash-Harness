@@ -7,6 +7,7 @@ import sys
 from typing import Any, TextIO
 
 from ash.ui.terminal import TerminalUI
+from ash.ui.safe_text import terminal_safe_text
 
 
 class ReplPrinter:
@@ -19,16 +20,24 @@ class ReplPrinter:
     def __call__(
         self,
         *values: Any,
-        sep: str = " ",
-        end: str = "\n",
+        sep: str | None = " ",
+        end: str | None = "\n",
         file: TextIO | None = None,
         flush: bool = False,
     ) -> None:
+        normalized_sep = " " if sep is None else sep
+        normalized_end = "\n" if end is None else end
         if not self.viewport:
-            builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
+            builtins.print(
+                *(terminal_safe_text(str(value)) for value in values),
+                sep=terminal_safe_text(normalized_sep),
+                end=terminal_safe_text(normalized_end),
+                file=file,
+                flush=flush,
+            )
             return
 
-        text = sep.join(str(value) for value in values) + end
+        text = normalized_sep.join(str(value) for value in values) + normalized_end
         text = text.removesuffix("\n").removesuffix("\r")
         if not text:
             return

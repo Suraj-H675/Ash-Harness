@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from ash.core.session import SessionLineage, SessionStore, SessionSummary
+from ash.ui.safe_text import terminal_safe_text
 
 
 @dataclass(frozen=True)
@@ -124,11 +125,13 @@ def render_session_summaries(
         return "No matching sessions."
     lines: list[str] = []
     for session in sessions:
-        title = session.title or "(untitled)"
-        model = session.model or "unknown"
+        session_id = terminal_safe_text(session.session_id, single_line=True)
+        title = terminal_safe_text(session.title or "(untitled)", single_line=True)
+        model = terminal_safe_text(session.model or "unknown", single_line=True)
+        project_path = terminal_safe_text(session.project_path, single_line=True)
         lines.append(
-            f"{session.session_id}  {title}  {session.message_count} messages  "
-            f"{model}  {session.updated_at.isoformat()}  {session.project_path}"
+            f"{session_id}  {title}  {session.message_count} messages  "
+            f"{model}  {session.updated_at.isoformat()}  {project_path}"
         )
     return "\n".join(lines)
 
@@ -145,8 +148,12 @@ def render_session_tree(
         )
     lines: list[str] = []
     for node in tree:
-        label = node.branch_name or (
-            "root" if node.parent_session_id is None else "branch"
+        session_id = terminal_safe_text(node.session_id, single_line=True)
+        label = terminal_safe_text(
+            node.branch_name or (
+                "root" if node.parent_session_id is None else "branch"
+            ),
+            single_line=True,
         )
-        lines.append(f"{'  ' * node.depth}{node.session_id}  {label}")
+        lines.append(f"{'  ' * node.depth}{session_id}  {label}")
     return "\n".join(lines)

@@ -1,6 +1,7 @@
 import asyncio
 import codecs
 import hashlib
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -14,10 +15,9 @@ from ash.tools.command import (
     MAX_COMMAND_TIMEOUT_SECONDS,
     RunCommandArgs,
     RunCommandTool,
-    contains_forbidden_windows_chain,
     decode_stream,
-    quote_powershell_literal_path,
 )
+from ash.tools.base import ToolResult
 from ash.tools.filesystem import (
     BINARY_FILE_ERROR,
     EXISTS_ERROR,
@@ -52,6 +52,51 @@ def test_run_command_schema_rejects_oversized_command_and_cwd() -> None:
         RunCommandArgs(
             command_line="echo ok",
             timeout_seconds=MAX_COMMAND_TIMEOUT_SECONDS + 1,
+        )
+
+
+def test_tool_result_structured_metadata_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.base as base_module
+
+    with pytest.raises(ValueError, match="at most 256 items"):
+        ToolResult(success=True, output="ok", diagnostics=[{}] * 257)
+
+    monkeypatch.setattr(base_module, "MAX_TOOL_RESULT_STRUCTURED_BYTES", 128)
+    with pytest.raises(ValueError, match="structured metadata exceeds 128"):
+        ToolResult(
+            success=True,
+            output="ok",
+            citations=[{"url": "https://example.com/" + "x" * 256}],
+        )
+
+    monkeypatch.setattr(base_module, "MAX_TOOL_RESULT_IMAGE_DATA_BYTES", 8)
+    with pytest.raises(ValueError, match="image data exceeds 8"):
+        ToolResult(
+            success=True,
+            output="ok",
+            image_blocks=[
+                {"type": "image", "media_type": "image/png", "data": "123456789"}
+            ],
+        )
+
+    monkeypatch.setattr(base_module, "MAX_TOOL_RESULT_TEXT_BYTES", 8)
+    with pytest.raises(ValueError, match="tool-result text exceeds 8"):
+        ToolResult(success=True, output="123456789")
+
+    with pytest.raises(ValueError, match="structured metadata must be serializable"):
+        ToolResult(
+            success=True,
+            output="ok",
+            diagnostics=[{"value": object()}],
+        )
+
+    with pytest.raises(ValueError, match="structured metadata must be serializable"):
+        ToolResult(
+            success=True,
+            output="ok",
+            diagnostics=[{"value": float("nan")}],
         )
 
 
@@ -881,6 +926,40 @@ async def test_run_command_forwards_only_explicitly_allowlisted_environment(
     assert result.output.splitlines() == ["nightly", "missing"]
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX executable PATH semantics")
+@pytest.mark.asyncio
+async def test_run_command_workspace_path_requires_explicit_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    host_bin = tmp_path / "host-bin"
+    workspace.mkdir()
+    host_bin.mkdir()
+    workspace_helper = workspace / "helper"
+    host_helper = host_bin / "helper"
+    workspace_helper.write_text("#!/bin/sh\nprintf WORKSPACE\n", encoding="utf-8")
+    host_helper.write_text("#!/bin/sh\nprintf HOST\n", encoding="utf-8")
+    workspace_helper.chmod(0o755)
+    host_helper.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(workspace), str(host_bin))))
+    guard = SafetyGuard(workspace)
+
+    default_result = await RunCommandTool(guard, project_root=workspace).run(
+        command_line="helper"
+    )
+    opted_in_result = await RunCommandTool(
+        guard,
+        project_root=workspace,
+        environment_allowlist=["PATH"],
+    ).run(command_line="helper")
+
+    assert default_result.success is True
+    assert default_result.output == "HOST"
+    assert opted_in_result.success is True
+    assert opted_in_result.output == "WORKSPACE"
+
+
 @pytest.mark.asyncio
 async def test_run_command_enforces_timeout(guard: SafetyGuard) -> None:
     command = (
@@ -891,6 +970,77 @@ async def test_run_command_enforces_timeout(guard: SafetyGuard) -> None:
 
     assert result.success is False
     assert result.error == "Error: Command timed out after 1 seconds."
+
+
+@pytest.mark.asyncio
+async def test_run_command_cleans_process_tree_after_unexpected_io_failure(
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import ash.tools.command as command_module
+
+    class FakeProcess:
+        returncode = None
+
+    process = FakeProcess()
+    cleaned = False
+
+    @contextmanager
+    def launch_context():
+        yield SimpleNamespace(
+            argv=("/bin/sh", "-c", "printf ok"),
+            pass_fds=(),
+            cwd=str(project_root),
+        )
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    async def fail_communicate(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("command stream failed")
+
+    async def cleanup(target, *, plan=None, grace_seconds=1.0):
+        nonlocal cleaned
+        del plan, grace_seconds
+        assert target is process
+        cleaned = True
+        return None, False
+
+    monkeypatch.setattr(
+        command_module,
+        "prepare_process_tree",
+        lambda *args, **kwargs: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(
+        command_module,
+        "prepare_scoped_process_launch",
+        lambda *args, **kwargs: launch_context(),
+    )
+    monkeypatch.setattr(command_module.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(command_module, "communicate_process", fail_communicate)
+    monkeypatch.setattr(
+        command_module,
+        "settle_process_tree_after_cancellation",
+        cleanup,
+    )
+    tool = RunCommandTool(SafetyGuard(project_root), project_root=project_root)
+
+    with pytest.raises(RuntimeError, match="command stream failed"):
+        await tool._run_scoped(
+            "printf ok",
+            5,
+            None,
+            env={"PATH": os.defpath},
+            stream_callback=lambda *_args: None,  # type: ignore[arg-type]
+            expected_cwd_identity=None,
+        )
+
+    assert cleaned is True
 
 
 @pytest.mark.asyncio
@@ -1085,81 +1235,8 @@ async def test_run_command_fails_closed_without_descriptor_cwd(
     assert "race-resistant cwd launch unavailable" in (result.error or "")
 
 
-@pytest.mark.asyncio
-async def test_run_command_requires_literal_path_for_windows_file_cmdlets(
-    guard: SafetyGuard,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("ash.tools.command.platform.system", lambda: "Windows")
-
-    with pytest.raises(SafetyViolation, match="-LiteralPath"):
-        await RunCommandTool(guard).run(
-            command_line="Get-Content 'C:\\Program Files (x86)\\app.txt'"
-        )
-
-
-@pytest.mark.asyncio
-async def test_run_command_rejects_workspace_shadowed_powershell(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    fake = tmp_path / "powershell.exe"
-    marker = tmp_path / "marker"
-    fake.write_text(
-        f"#!/bin/sh\nprintf owned > {marker}\nexit 0\n",
-        encoding="utf-8",
-    )
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tmp_path))
-    monkeypatch.setattr("ash.tools.command.platform.system", lambda: "Windows")
-
-    result = await RunCommandTool(
-        SafetyGuard(project_root=tmp_path), project_root=tmp_path
-    ).run(command_line="echo safe")
-
-    assert result.success is False
-    assert "PowerShell executable" in (result.error or "")
-    assert not marker.exists()
-
-
 def test_decode_stream_falls_back_to_cp1252() -> None:
     assert decode_stream(b"\x93quoted\x94") == "\u201cquoted\u201d"
-
-
-def test_quote_powershell_literal_path_escapes_single_quotes() -> None:
-    assert quote_powershell_literal_path("C:\\Users\\O'Brien\\file.txt") == (
-        "-LiteralPath 'C:\\Users\\O''Brien\\file.txt'"
-    )
-
-
-def test_windows_chain_detection_ignores_quoted_separators() -> None:
-    assert (
-        contains_forbidden_windows_chain(
-            'python3 -c "import module; print(module.VALUE)"'
-        )
-        is False
-    )
-    assert contains_forbidden_windows_chain("python -c 'a && b || c; d'") is False
-    assert contains_forbidden_windows_chain('Write-Output "left;right"') is False
-
-
-def test_windows_chain_detection_blocks_unquoted_control_flow() -> None:
-    assert contains_forbidden_windows_chain("python -m pytest; Remove-Item marker") is True
-    assert (
-        contains_forbidden_windows_chain("python -m pytest && Remove-Item marker")
-        is True
-    )
-    assert contains_forbidden_windows_chain("echo first || echo second") is True
-
-
-def test_windows_chain_detection_limits_compiler_chain_exception() -> None:
-    assert contains_forbidden_windows_chain("python -m pytest && uv run ruff check") is False
-    assert contains_forbidden_windows_chain("npm test || pnpm test") is False
-    assert (
-        contains_forbidden_windows_chain(
-            "python -m pytest && uv run ruff check; Remove-Item marker"
-        )
-        is True
-    )
 
 
 @pytest.mark.asyncio

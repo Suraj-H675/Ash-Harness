@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shlex
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,8 +23,27 @@ class CustomCommand:
     template: str
     path: Path
     source: str
+    source_identity: tuple[int, int] | None = None
+
+    def ensure_current(self) -> None:
+        if self.source_identity is None:
+            return
+        try:
+            metadata = self.path.lstat()
+        except OSError as exc:
+            raise ValueError(
+                f"command source identity changed after discovery: {self.path}"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode) or (
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+        ) != self.source_identity:
+            raise ValueError(
+                f"command source identity changed after discovery: {self.path}"
+            )
 
     def expand(self, arguments: list[str]) -> str:
+        self.ensure_current()
         output = self.template.replace("$ARGUMENTS", " ".join(arguments))
         for index, argument in reversed(list(enumerate(arguments, 1))):
             output = output.replace(f"${index}", argument)
@@ -85,7 +105,9 @@ class CustomCommandCatalog:
             raise ValueError(f"Invalid custom command syntax: {exc}") from exc
         if not parts or parts[0] not in self._commands:
             return None
-        return self._commands[parts[0]], parts[1:]
+        command = self._commands[parts[0]]
+        command.ensure_current()
+        return command, parts[1:]
 
 
 def _command_paths(paths: tuple[Path, ...]) -> list[tuple[Path, Path]]:
@@ -139,19 +161,23 @@ def _parse(
     if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
         raise ValueError("command file cannot be a link")
     try:
-        _, raw = read_scoped_bytes(
+        resolved, raw = read_scoped_bytes(
             path,
             SafetyGuard(root),
             max_bytes=MAX_COMMAND_BYTES + 1,
         )
     except SafetyViolation as exc:
         raise ValueError(str(exc)) from exc
+    metadata = resolved.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("command file must remain a regular file")
     return parse_custom_command_bytes(
         raw,
         path,
         root,
         source,
         namespace=namespace,
+        source_identity=(int(metadata.st_dev), int(metadata.st_ino)),
     )
 
 
@@ -162,6 +188,7 @@ def parse_custom_command_bytes(
     source: str,
     *,
     namespace: str = "",
+    source_identity: tuple[int, int] | None = None,
 ) -> CustomCommand:
     """Parse one bounded custom command from immutable bytes."""
 
@@ -197,4 +224,11 @@ def parse_custom_command_bytes(
         raise ValueError("command template is empty")
     if namespace:
         name = f"{namespace}:{name}"
-    return CustomCommand(name, description, body.strip(), path, source)
+    return CustomCommand(
+        name,
+        description,
+        body.strip(),
+        path,
+        source,
+        source_identity,
+    )

@@ -23,13 +23,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 from ash.safe_io import read_bounded_bytes, read_bounded_text, strict_json_loads
 from ash.mcp.diagnostics import safe_mcp_diagnostic
-from ash.safety.scoped_io import atomic_write_scoped_text
+from ash.safety.scoped_io import atomic_write_scoped_text_chunks
 from ash.ui.safe_text import terminal_safe_text
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
     from ash.core.loop import AshLoop
-    from ash.providers.base import ProviderABC
     from ash.safety.guard import SafetyGuard
 
 
@@ -189,12 +188,6 @@ def _parse_model_string(model: str) -> tuple[str, str]:
     return parse_model_string(model)
 
 
-def _build_provider(config: AshConfig) -> ProviderABC:
-    from ash.providers.registry import get_provider_registry
-
-    return get_provider_registry().build(config)
-
-
 def _prompt_cache_key(config: AshConfig) -> str:
     from ash.providers.registry import prompt_cache_key
 
@@ -346,7 +339,7 @@ def _render_context_provenance(report: Any | None) -> str:
 
 
 def _render_memory_hit(hit: Any) -> str:
-    """Render one semantic-memory hit without trusting workspace terminal text."""
+    """Render one project-memory hit without trusting workspace terminal text."""
 
     path = terminal_safe_text(str(hit.file_path), single_line=True)
     content = terminal_safe_text(str(hit.content)[:300], single_line=True)
@@ -629,7 +622,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     if is_workspace_trusted(loop.project_root):
         command_roots.append((loop.project_root / ".ash" / "commands", "project"))
         plugin_roots.append((loop.project_root / ".ash" / "plugins", "project"))
-    from ash.plugins.lifecycle import load_extension_state
+    from ash.plugins.state import load_extension_state
     from ash.plugins.registry import PluginCatalog
 
     active_plugins = PluginCatalog(
@@ -806,6 +799,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             loop.safety_guard,
             backend_preference=config.sandbox_backend,
             docker_image=config.sandbox_docker_image,
+            docker_memory_mb=config.sandbox_docker_memory_mb,
+            docker_cpus=config.sandbox_docker_cpus,
             allow_unisolated=config.allow_unsafe_plugin_runtime,
         )
 
@@ -818,19 +813,22 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             or not isinstance(read_skill_resource_tool, ReadSkillResourceTool)
         ):
             raise RuntimeError("skill tools are unavailable")
+        spawn_tool = loop.tools.get("spawn_agent")
+        next_hooks.set_event_sink(loop._emit_event)
+        await loop.reload_plugin_runtime_tools(next_plugin_tools)
+        previous_mcp_runtime = loop._mcp_runtime
+        try:
+            mcp_errors = await loop.reload_mcp_servers(next_mcp)
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            mcp_errors = {"reload": safe_mcp_diagnostic(exc)}
         list_skills_tool.catalog = next_skills
         activate_skill_tool.catalog = next_skills
         read_skill_resource_tool.catalog = next_skills
-        spawn_tool = loop.tools.get("spawn_agent")
         if isinstance(spawn_tool, SpawnAgentTool):
             spawn_tool.set_custom_agents(
                 {agent.name: agent for agent in discovered_agents}
             )
-        next_hooks.set_event_sink(loop._emit_event)
         loop.hooks = next_hooks
-        await loop.reload_plugin_runtime_tools(next_plugin_tools)
-        previous_mcp_runtime = loop._mcp_runtime
-        mcp_errors = await loop.reload_mcp_servers(next_mcp)
         custom_commands = next_commands
         discovered_commands = next_discovered_commands
         prompt_input.set_extra_commands(
@@ -902,6 +900,19 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             user_input = custom_command.expand(custom_arguments)
             parsed_command = None
             expand_mentions = True
+
+        safe_displaced_commands = {"exit", "help", "status"}
+        if not (
+            parsed_command is not None
+            and parsed_command[0].name in safe_displaced_commands
+        ):
+            verify_project_root = getattr(loop, "_verify_project_root_identity", None)
+            if callable(verify_project_root):
+                try:
+                    verify_project_root()
+                except RuntimeError as exc:
+                    print(f"Error: {exc}", file=sys.stderr, flush=True)
+                    continue
 
         if parsed_command is not None:
             command, arguments = parsed_command
@@ -1199,12 +1210,12 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     else f"ash-session-{loop.current_session.session_id[:8]}{suffix}"
                 )
                 try:
-                    content = loop.session_store.export_session(
-                        loop.current_session.session_id, format=export_format
-                    )
-                    output_path = atomic_write_scoped_text(
+                    output_path = atomic_write_scoped_text_chunks(
                         raw_path,
-                        content,
+                        loop.session_store.iter_session_export(
+                            loop.current_session.session_id,
+                            format=export_format,
+                        ),
                         loop.safety_guard,
                         overwrite=True,
                     )
@@ -1309,11 +1320,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     update_all_local_plugins,
                     update_local_plugin,
                 )
-                from ash.plugins.lifecycle import PluginLifecycleError
-                from ash.plugins.lifecycle import load_extension_state
+                from ash.plugins.errors import PluginLifecycleError
+                from ash.plugins.state import load_extension_state
                 from ash.plugins.registry import PluginCatalog
                 from ash.safety.trust import is_workspace_trusted
-                from ash.plugins.catalog import default_catalog_path
+                from ash.plugins.catalog import default_catalog_source
 
                 if arguments:
                     action = arguments[0]
@@ -1336,7 +1347,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         and (index := arguments.index("--ref")) + 1 < len(arguments)
                         else None
                     )
-                    catalog: CatalogSelection = default_catalog_path()
+                    catalog: CatalogSelection = default_catalog_source()
                     if action in {"install", "update"} and catalog is None:
                         from ash.commands.marketplace import (
                             registered_marketplace_selection,
@@ -1381,21 +1392,33 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                                 git_ref=ref,
                                 catalog=catalog,
                             )
-                        reload_result = (
-                            await reload_plugin_components()
-                            if action != "update"
-                            or plugin_result.get("status") == "updated"
-                            or plugin_result.get("updated", 0) > 0
-                            else None
-                        )
-                    except (OSError, PluginLifecycleError, ValueError) as exc:
+                    except (OSError, PluginLifecycleError, RuntimeError, ValueError) as exc:
                         print(f"Error: {safe_plugin_diagnostic(exc)}", file=sys.stderr)
                         continue
+                    reload_result = None
+                    reload_error: BaseException | None = None
+                    if (
+                        action != "update"
+                        or plugin_result.get("status") == "updated"
+                        or plugin_result.get("updated", 0) > 0
+                    ):
+                        try:
+                            reload_result = await reload_plugin_components()
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            reload_error = exc
                     print(
                         render_plugin_update_all(plugin_result, json_output=False)
                         if update_all
                         else render_plugin_action(plugin_result, json_output=False)
                     )
+                    if reload_error is not None:
+                        print(
+                            "Warning: plugin state was persisted, but live reload failed: "
+                            f"{safe_plugin_diagnostic(reload_error)}. "
+                            "Run /reload-plugins to retry.",
+                            file=sys.stderr,
+                        )
+                        continue
                     if reload_result is not None:
                         print(reload_result.summary)
                         _print_mcp_reload_errors(reload_result.mcp_errors)
@@ -1429,17 +1452,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     reload_result = await reload_plugin_components()
                     print(reload_result.summary, flush=True)
                     _print_mcp_reload_errors(reload_result.mcp_errors)
-                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                     print(
                         f"Error reloading plugins: {safe_mcp_diagnostic(exc)}",
                         file=sys.stderr,
                     )
                 continue
             if command.name == "hooks":
-                from ash.commands.extensions import (
-                    discover_extensions,
-                    render_extension_inventory,
-                )
+                from ash.commands.extensions import render_extension_inventory
+                from ash.plugins.inventory import discover_extensions
 
                 inventory = discover_extensions(loop.project_root)
                 print(
@@ -1658,6 +1679,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     if safety_error:
                         print(f"Error: {safety_error}", file=sys.stderr)
                         continue
+                previous_mode = loop.permission_policy.mode.value
                 loop.permission_policy = PermissionPolicy(
                     mode,
                     managed_rules=loop.permission_policy.managed_rules,
@@ -1678,11 +1700,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         action_type="permission_mode",
                         target_resource=mode.value,
                         details={
-                            "previous_mode": (
-                                config.safety_tier
-                                if config.safety_tier != mode.value
-                                else mode.value
-                            ),
+                            "previous_mode": previous_mode,
                             "mode": mode.value,
                         },
                         result="SUCCESS",
@@ -1954,9 +1972,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 action = arguments[0] if arguments else "status"
                 if action == "status" and len(arguments) == 1 or not arguments:
                     state = (
-                        "enabled" if loop._vector_pipeline is not None else "disabled"
+                        "enabled" if loop._memory_pipeline is not None else "disabled"
                     )
-                    print(f"Memory: {state}; backend={config.memory_backend}")
+                    print(
+                        "Memory: "
+                        f"{state}; backend={config.memory_backend}; "
+                        f"embeddings={config.embedding_provider}"
+                    )
                     continue
                 if action == "index" and len(arguments) == 2:
                     memory_path = loop.safety_guard.validate_path(arguments[1])
@@ -2004,25 +2026,25 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     print(f"Indexed {indexed} workspace file(s).")
                     continue
                 if action == "search" and len(arguments) >= 2:
-                    hits = await loop.semantic_search(" ".join(arguments[1:]))
+                    hits = await loop.search_memory(" ".join(arguments[1:]))
                     if not hits:
                         print("No memory matches.")
                     for hit in hits:
                         print(_render_memory_hit(hit))
                     continue
                 if action == "export" and len(arguments) == 1:
-                    if loop._vector_pipeline is None:
+                    if loop._memory_pipeline is None:
                         print("Memory is disabled.")
                     else:
                         print(
-                            json.dumps(loop._vector_pipeline.export(), sort_keys=True)
+                            json.dumps(loop._memory_pipeline.export(), sort_keys=True)
                         )
                     continue
                 if action == "clear" and len(arguments) == 1:
-                    if loop._vector_pipeline is None:
+                    if loop._memory_pipeline is None:
                         print("Memory is disabled.")
                     else:
-                        loop._vector_pipeline.clear()
+                        loop._memory_pipeline.clear()
                         print("Project memory index cleared.")
                     continue
                 print(f"Usage: {command.usage}", file=sys.stderr)
@@ -2121,6 +2143,20 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run one CLI invocation without leaking a one-shot profile override."""
+
+    missing = object()
+    previous_profile: str | object = os.environ.get("ASH_PROFILE", missing)
+    try:
+        return _main_impl(argv)
+    finally:
+        if previous_profile is missing:
+            os.environ.pop("ASH_PROFILE", None)
+        else:
+            os.environ["ASH_PROFILE"] = str(previous_profile)
+
+
+def _main_impl(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ash", description="Ash coding harness REPL")
     try:
         version = importlib.metadata.version("ash-ai")
@@ -2291,7 +2327,7 @@ def main(argv: list[str] | None = None) -> int:
     update_parser.add_argument(
         "--apply",
         action="store_true",
-        help="Reinstall the current Ash checkout through pipx",
+        help="Install the latest published Ash release through the managed installer",
     )
     storage_parser = subparsers.add_parser(
         "storage", help="Check, back up, or restore the session database"
@@ -2780,8 +2816,24 @@ def main(argv: list[str] | None = None) -> int:
         "--transport", choices=["stdio", "http", "sse"], default="stdio"
     )
     mcp_add.add_argument("--url", default="")
-    mcp_add.add_argument("--env", action="append", default=[])
-    mcp_add.add_argument("--header", action="append", default=[])
+    mcp_add.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        help=(
+            "Server environment KEY=VALUE; credential-bearing keys must use "
+            "$VAR or ${VAR} rather than a literal secret"
+        ),
+    )
+    mcp_add.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        help=(
+            "HTTP header KEY=VALUE; Authorization/API-key headers must use an "
+            "environment-variable reference"
+        ),
+    )
     mcp_add.add_argument("--auth", choices=["none", "oauth"], default="none")
     mcp_add.add_argument("--oauth-client-id", default="")
     mcp_add.add_argument("--oauth-client-metadata-url", default="")
@@ -2861,7 +2913,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run without interactive prompts or ANSI; defaults one-shot output to stream-json.",
     )
-    args, unknown_args = parser.parse_known_args(argv)
+    args, unknown_args = parser.parse_known_args(raw_argv)
+    if args.command != "doctor":
+        from ash.platform_support import platform_support_error
+
+        unsupported_platform = platform_support_error()
+        if unsupported_platform is not None:
+            if (
+                args.prompt is not None
+                and args.output_format in {"json", "stream-json"}
+            ):
+                from ash.exceptions import AshConfigError
+
+                return _report_cli_error(
+                    AshConfigError(unsupported_platform),
+                    event_output=True,
+                )
+            print(f"Error: {unsupported_platform}", file=sys.stderr)
+            return 2
     if args.profile:
         from ash.profiles import validate_profile_name
 
@@ -2869,15 +2938,39 @@ def main(argv: list[str] | None = None) -> int:
             os.environ["ASH_PROFILE"] = validate_profile_name(args.profile)
         except ValueError as exc:
             parser.error(str(exc))
-    if unknown_args:
-        if args.command == "mcp" and getattr(args, "action", None) == "add":
-            args.server_command = unknown_args
+    if args.command == "mcp" and getattr(args, "action", None) == "add":
+        if "--" in raw_argv:
+            separator_index = raw_argv.index("--")
+            args, prefix_unknown = parser.parse_known_args(raw_argv[:separator_index])
+            if prefix_unknown:
+                print(
+                    f"Error: unrecognized arguments: {' '.join(prefix_unknown)}",
+                    file=sys.stderr,
+                )
+                return 2
+            args.server_command = raw_argv[separator_index + 1 :]
         else:
-            parser.error(f"unrecognized arguments: {' '.join(unknown_args)}")
-    elif args.command == "mcp" and getattr(args, "action", None) == "add":
-        args.server_command = []
+            args.server_command = []
+            if unknown_args:
+                if args.transport == "stdio":
+                    print(
+                        "Error: stdio MCP add requires '-- command [args...]'.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"Error: unrecognized arguments: {' '.join(unknown_args)}",
+                        file=sys.stderr,
+                    )
+                return 2
+    elif unknown_args:
+        parser.error(f"unrecognized arguments: {' '.join(unknown_args)}")
     if args.json_schema is not None and args.prompt is None:
         parser.error("--json-schema requires --prompt")
+    early_event_output = (
+        args.prompt is not None
+        and args.output_format in {"json", "stream-json"}
+    )
     try:
         if args.prompt == "-":
             args.prompt = read_bounded_text(
@@ -2897,8 +2990,17 @@ def main(argv: list[str] | None = None) -> int:
             if piped_prompt.strip():
                 args.prompt = piped_prompt
     except (OSError, ValueError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 2
+        from ash.exceptions import AshError, ErrorCategory
+
+        return _report_cli_error(
+            AshError(
+                str(exc),
+                category=ErrorCategory.IO,
+                remedy="Provide a readable prompt within the CLI input size limit.",
+                exit_code=2,
+            ),
+            event_output=early_event_output,
+        )
     if args.ci:
         if args.command is None and args.prompt is None:
             print(
@@ -2908,10 +3010,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if args.prompt is not None and "--output-format" not in raw_argv:
             args.output_format = "stream-json"
+        if args.command == "setup":
+            args.non_interactive = True
 
     from ash.config import AshConfig
     from ash.core.session import SessionStore
-    from ash.exceptions import classify_exception, format_error
+    from ash.exceptions import AshConfigError, classify_exception, format_error
     from ash.logging import configure_logging
 
     if (
@@ -2953,8 +3057,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Removed profile: {remove_profile(args.name, confirmed=args.yes)}")
                 return 0
         except (OSError, ValueError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 2
+            return _report_cli_error(
+                AshConfigError(str(exc)),
+                json_output=getattr(args, "json", False),
+            )
         parser.error(f"unsupported profile action: {args.profile_action}")
 
     if args.command == "providers":
@@ -3162,20 +3268,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"unsupported marketplace action: {args.marketplace_action}")
 
     if args.command == "diff-mode":
-        from ash.commands.config import load_config, save_config
+        from ash.commands.config import mutate_config
 
         try:
-            config = AshConfig.load(
+            diff_mode_config = AshConfig.load(
                 _override_source="cli",
                 _override_detail="command-line option",
                 **_config_overrides_from_args(args),
             )
-            user_config = load_config(strict=True)
-            if not isinstance(user_config, dict):
-                raise ValueError("user configuration must contain a TOML table")
-            user_config["approval_diff_mode"] = config.approval_diff_mode
-            save_config(user_config)
-            print(f"Approval diff mode saved: {config.approval_diff_mode}")
+            approval_diff_mode = diff_mode_config.approval_diff_mode
+            mutate_config(
+                lambda user_config: user_config.__setitem__(
+                    "approval_diff_mode", approval_diff_mode
+                )
+            )
+            print(f"Approval diff mode saved: {approval_diff_mode}")
             return 0
         except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
             error = classify_exception(exc)
@@ -3217,7 +3324,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         confirmed = args.yes
-        if not confirmed and sys.stdin.isatty():
+        if not confirmed and not args.ci and sys.stdin.isatty():
             confirmed = input(
                 "Remove selected Ash local state? [y/N] "
             ).strip().casefold() in {"y", "yes"}
@@ -3241,9 +3348,9 @@ def main(argv: list[str] | None = None) -> int:
         from ash.commands.update import apply_update, check_for_update, render_update_status
 
         try:
-            if args.apply:
-                return apply_update()
             update_status = check_for_update(current_version=version)
+            if args.apply:
+                return apply_update(update_status, json_output=args.json)
         except ValueError as exc:
             if args.json:
                 print(json.dumps({"error": str(exc)}, sort_keys=True))
@@ -3305,7 +3412,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Backup created: {backup_path}")
             return 0
         confirmed = args.yes
-        if not confirmed and sys.stdin.isatty():
+        if not confirmed and not args.ci and sys.stdin.isatty():
             confirmed = input(
                 "Stop other Ash processes and restore this session backup? [y/N] "
             ).strip().casefold() in {"y", "yes"}
@@ -3318,12 +3425,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Restored: {restored}")
         for path in preserved:
             print(f"Preserved previous data: {path}")
+        print(
+            "Restart any Ash process that had this session database open before "
+            "the restore."
+        )
         return 0
 
     if args.command == "audit":
         from ash.commands.audit import (
             export_audit_log,
-            render_audit_records,
+            iter_render_audit_records,
             render_audit_verification,
         )
 
@@ -3334,22 +3445,21 @@ def main(argv: list[str] | None = None) -> int:
                 **_config_overrides_from_args(args),
             )
             store = SessionStore(audit_config.db_directory / "sessions.db")
-            try:
-                store.load_session(args.audit_session)
-            except KeyError:
+            if not store.session_exists(args.audit_session):
                 print(
                     f"Error: session not found: {args.audit_session}",
                     file=sys.stderr,
                 )
                 return 1
             if args.audit_action == "list":
-                print(
-                    render_audit_records(
-                        args.audit_session,
-                        store.list_audit_logs(args.audit_session),
-                        json_output=args.json,
-                    )
-                )
+                for chunk in iter_render_audit_records(
+                    args.audit_session,
+                    store.iter_audit_logs(args.audit_session),
+                    json_output=args.json,
+                ):
+                    sys.stdout.write(chunk)
+                sys.stdout.write("\n")
+                sys.stdout.flush()
                 return 0
             if args.audit_action == "verify":
                 errors = store.verify_audit_log(args.audit_session)
@@ -3525,7 +3635,7 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
                 if args.cron_action == "remove":
                     confirmed = args.yes
-                    if not confirmed and sys.stdin.isatty():
+                    if not confirmed and not args.ci and sys.stdin.isatty():
                         confirmed = input(
                             f"Remove automation {args.job}? [y/N] "
                         ).strip().casefold() in {"y", "yes"}
@@ -3706,8 +3816,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             store = SessionStore(plans_config.db_directory / "sessions.db")
             if args.plans_action == "list":
-                if args.limit < 1:
-                    print("Error: limit must be positive", file=sys.stderr)
+                if not 1 <= args.limit <= 1000:
+                    print("Error: limit must be between 1 and 1000", file=sys.stderr)
                     return 2
                 print(
                     render_plan_summaries(
@@ -3796,7 +3906,7 @@ def main(argv: list[str] | None = None) -> int:
                 rules = remove_cli_permission_rule(workspace, args.rule_id)
             elif action == "clear":
                 confirmed = args.yes
-                if not confirmed and sys.stdin.isatty():
+                if not confirmed and not args.ci and sys.stdin.isatty():
                     confirmed = input(
                         f"Clear persistent grants for {workspace.resolve()}? [y/N] "
                     ).strip().casefold() in {"y", "yes"}
@@ -3860,14 +3970,21 @@ def main(argv: list[str] | None = None) -> int:
             if args.agents_action == "list":
                 print(
                     render_agent_statuses(
-                        list_agent_statuses(database),
+                        list_agent_statuses(
+                            database,
+                            workspace=agents_config.workspace_root,
+                        ),
                         json_output=json_output,
                     )
                 )
             elif args.agents_action == "reports":
                 print(
                     render_agent_reports(
-                        list_agent_reports(database, limit=args.limit),
+                        list_agent_reports(
+                            database,
+                            limit=args.limit,
+                            workspace=agents_config.workspace_root,
+                        ),
                         json_output=json_output,
                     )
                 )
@@ -3876,6 +3993,7 @@ def main(argv: list[str] | None = None) -> int:
                     render_agent_tasks(
                         list_agent_tasks(
                             database,
+                            workspace=agents_config.workspace_root,
                             task_state=args.state,
                             owner_agent_id=args.owner,
                             graph_id=args.graph_id,
@@ -3895,6 +4013,7 @@ def main(argv: list[str] | None = None) -> int:
                     render_cancelled_agent_graph(
                         cancel_agent_graph(
                             database,
+                            workspace=agents_config.workspace_root,
                             graph_id=args.graph_id,
                             reason=args.reason,
                         ),
@@ -3906,6 +4025,7 @@ def main(argv: list[str] | None = None) -> int:
                     render_agent_task_events(
                         list_agent_task_events(
                             database,
+                            workspace=agents_config.workspace_root,
                             task_id=args.task_id,
                             event_type=args.event_type,
                             after_sequence=args.after_sequence,
@@ -3965,6 +4085,7 @@ def main(argv: list[str] | None = None) -> int:
                         render_agent_messages(
                             list_agent_messages(
                                 database,
+                                workspace=agents_config.workspace_root,
                                 recipient_id=args.recipient,
                                 undelivered_only=not args.all_messages,
                                 limit=args.limit,
@@ -3977,6 +4098,7 @@ def main(argv: list[str] | None = None) -> int:
                         render_agent_approvals(
                             list_agent_approvals(
                                 database,
+                                workspace=agents_config.workspace_root,
                                 pending_only=not args.all_approvals,
                                 limit=args.limit,
                             ),
@@ -3988,6 +4110,7 @@ def main(argv: list[str] | None = None) -> int:
                         render_resolved_agent_approval(
                             resolve_agent_approval(
                                 database,
+                                workspace=agents_config.workspace_root,
                                 request_id=args.request_id,
                                 approved=args.agents_action == "approve",
                                 feedback=(
@@ -4002,6 +4125,7 @@ def main(argv: list[str] | None = None) -> int:
                         render_sent_agent_message(
                             send_agent_message(
                                 database,
+                                workspace=agents_config.workspace_root,
                                 recipient_id=args.recipient,
                                 sender_id=args.sender,
                                 message_type=args.message_type,
@@ -4021,7 +4145,6 @@ def main(argv: list[str] | None = None) -> int:
         from ash.commands.extensions import (
             render_catalog_search,
             search_catalog_plugins,
-            discover_extensions,
             manage_local_plugin,
             render_plugin_update_all,
             safe_plugin_diagnostic,
@@ -4030,7 +4153,8 @@ def main(argv: list[str] | None = None) -> int:
             render_extension_inventory,
             render_plugin_action,
         )
-        from ash.plugins.lifecycle import PluginLifecycleError
+        from ash.plugins.inventory import discover_extensions
+        from ash.plugins.errors import PluginLifecycleError
 
         action = args.extensions_action
         if action in {"search", "install", "update", "enable", "disable", "uninstall"}:
@@ -4233,6 +4357,7 @@ def main(argv: list[str] | None = None) -> int:
             probe_mcp_server,
             render_mcp_probe,
             render_mcp_servers,
+            validate_persisted_mcp_credentials,
         )
         from ash.mcp.server import MCPServerConfig, load_mcp_servers, save_mcp_servers
 
@@ -4241,8 +4366,6 @@ def main(argv: list[str] | None = None) -> int:
         try:
             servers = load_mcp_servers(path)
         except (OSError, ValueError) as exc:
-            from ash.exceptions import AshConfigError
-
             return _report_cli_error(
                 AshConfigError(f"invalid MCP configuration: {exc}"),
                 json_output=json_output,
@@ -4381,6 +4504,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             env = parse_key_value_options(args.env, label="--env")
             headers = parse_key_value_options(args.header, label="--header")
+            validate_persisted_mcp_credentials(
+                env=env,
+                headers=headers,
+                command_parts=command_parts,
+            )
             secret_env = args.oauth_client_secret_env.strip()
             if secret_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", secret_env):
                 raise ValueError(
@@ -4483,11 +4611,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if not _has_provider_configured(config):
         if args.prompt is not None or not sys.stdin.isatty():
-            print(
-                "Error: Ash is not configured. Run 'ash setup' in an interactive terminal.",
-                file=sys.stderr,
+            return _report_cli_error(
+                AshConfigError(
+                    "Ash is not configured. Run 'ash setup' in an interactive terminal."
+                ),
+                event_output=runtime_event_output,
             )
-            return 2
         print(
             "Ash is not configured yet. "
             "Run 'ash setup' to configure your provider and API key.",
@@ -4529,8 +4658,10 @@ def main(argv: list[str] | None = None) -> int:
         permission_rules = load_permission_rules(config.workspace_root)
         managed_permission_rules = load_managed_permission_rules(config.workspace_root)
     except PermissionGrantError as exc:
-        print(f"Error: invalid permission policy: {exc}", file=sys.stderr)
-        return 2
+        return _report_cli_error(
+            PermissionGrantError(f"invalid permission policy: {exc}"),
+            event_output=runtime_event_output,
+        )
 
     db_path = config.db_directory / "sessions.db"
     try:
@@ -4569,8 +4700,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         except (KeyError, ValueError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 2
+            return _report_cli_error(exc, event_output=runtime_event_output)
         except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
             return _report_cli_error(
                 exc,
@@ -4610,8 +4740,7 @@ def main(argv: list[str] | None = None) -> int:
             run_maintenance=False,
         )
     except (OSError, ValueError, SandboxBackendUnavailable) as exc:
-        print(f"Error initializing runtime: {exc}", file=sys.stderr)
-        return 2
+        return _report_cli_error(exc, event_output=runtime_event_output)
     loop = runtime.loop
     sandbox_manager = runtime.sandbox_manager
 
@@ -4652,7 +4781,9 @@ async def _bootstrap_and_repl(
     session_id: str | None,
 ) -> int:
     from ash.exceptions import classify_exception, format_error
+    from ash.logging import get_logger
 
+    primary_error: BaseException | None = None
     try:
         await loop.start_session(session_id)
         if loop.recovery_summary is not None and loop.recovered_turns:
@@ -4667,12 +4798,24 @@ async def _bootstrap_and_repl(
                 flush=True,
             )
         return await _repl(loop, config, sandbox_manager)
+    except asyncio.CancelledError as exc:
+        primary_error = exc
+        raise
     except Exception as exc:  # noqa: BLE001
+        primary_error = exc
         error = classify_exception(exc)
         print(format_error(error), file=sys.stderr)
         return error.exit_code
     finally:
-        await loop.aclose()
+        try:
+            await loop.aclose()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            get_logger(__name__).warning(
+                "CLI runtime cleanup failed after an earlier REPL failure: {}",
+                cleanup_error,
+            )
 
 
 async def _bootstrap_and_headless(
@@ -4686,7 +4829,9 @@ async def _bootstrap_and_headless(
 ) -> int:
     from ash.exceptions import classify_exception, format_error
     from ash.commands.attachments import PreparedAttachments, prepare_file_mentions
+    from ash.logging import get_logger
 
+    primary_error: BaseException | None = None
     try:
         session = await loop.start_session(session_id)
         safety_guard = getattr(loop, "safety_guard", None)
@@ -4732,7 +4877,11 @@ async def _bootstrap_and_headless(
             payload["structured_output"] = validate_structured_output(response, schema)
         ui.emit_result(payload)
         return 0
+    except asyncio.CancelledError as exc:
+        primary_error = exc
+        raise
     except Exception as exc:  # noqa: BLE001
+        primary_error = exc
         error = classify_exception(exc)
         if hasattr(ui, "emit_error"):
             ui.emit_error(error.to_dict())
@@ -4742,7 +4891,15 @@ async def _bootstrap_and_headless(
             print(format_error(error), file=sys.stderr)
         return error.exit_code
     finally:
-        await loop.aclose()
+        try:
+            await loop.aclose()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            get_logger(__name__).warning(
+                "CLI runtime cleanup failed after an earlier headless failure: {}",
+                cleanup_error,
+            )
 
 
 def _load_json_schema(path: Path) -> dict[str, Any]:

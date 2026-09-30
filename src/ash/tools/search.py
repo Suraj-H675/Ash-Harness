@@ -17,7 +17,7 @@ from ash.safety.scoped_io import (
     read_scoped_bytes,
     stat_scoped_path,
 )
-from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from ash.tools.base import BaseTool, ToolExecutionContract, ToolResult, count_output_tokens
 
 
 DEFAULT_MAX_RESULTS = 200
@@ -78,6 +78,7 @@ class ListDirectoryArgs(BaseModel):
 
 class ListDirectoryTool(BaseTool):
     name = "list_dir"
+    execution_contract = ToolExecutionContract(parallel_safe=True)
     description = "List workspace files and directories with bounded output."
     args_schema = ListDirectoryArgs
 
@@ -121,6 +122,7 @@ class GlobFilesArgs(BaseModel):
 
 class GlobFilesTool(BaseTool):
     name = "glob_files"
+    execution_contract = ToolExecutionContract(parallel_safe=True)
     description = "Find workspace files by a glob pattern such as '**/*.py'."
     args_schema = GlobFilesArgs
 
@@ -185,7 +187,8 @@ class SearchTextArgs(BaseModel):
 
 class SearchTextTool(BaseTool):
     name = "search_text"
-    description = "Search workspace text using ripgrep with file and line locations."
+    execution_contract = ToolExecutionContract(parallel_safe=True)
+    description = "Search bounded workspace text with file and line locations."
     args_schema = SearchTextArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:

@@ -7,7 +7,7 @@ name = "ash-ai"
 version = "0.1.0"
 description = "Extensible local AI agent harness"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.15"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Suraj-H675" }]
@@ -17,11 +17,11 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: MacOS",
-    "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
@@ -34,14 +34,14 @@ dependencies = [
     "openai>=1.82,<3",
     "packaging>=24.0",
     "pydantic>=2.0",
-    "pydantic-settings>=2.0",
+    "pydantic-settings>=2.5",
     "prompt-toolkit>=3.0.51",
-    "pyyaml>=6.0",
+    "python-dotenv>=1.0,<2",
+    "pyyaml>=6.0.1",
     "referencing>=0.35",
     "rich>=13.0",
-    "tiktoken>=0.7",
     "toml>=0.10",
-    "tree-sitter>=0.23",
+    "tree-sitter>=0.23.1",
     "tree-sitter-c>=0.23",
     "tree-sitter-c-sharp>=0.23",
     "tree-sitter-cpp>=0.23",
@@ -78,15 +78,17 @@ ash = ["py.typed"]
 
 [tool.uv]
 package = true
+required-version = "==0.12.17"
 
 [project.optional-dependencies]
 server = [
     "fastapi>=0.115",
+    "starlette>=0.40,<2",
     "uvicorn>=0.34",
 ]
-vector = [
-    "chromadb>=1.0",
-    "onnxruntime>=1.16",
+local-embeddings = [
+    "onnxruntime>=1.25,<2",
+    "tokenizers>=0.21,<1",
 ]
 browser = [
     "playwright>=1.61.0",
@@ -95,7 +97,11 @@ acp = [
     "agent-client-protocol>=0.11,<0.12",
 ]
 a2a = [
-    "a2a-sdk[http-server,sqlite]>=1.1,<1.2",
+    "a2a-sdk[http-server,sqlite]>=1.1.2,<1.2",
+    "aiosqlite>=0.20,<1",
+    "protobuf>=5.29.5,<8",
+    "sqlalchemy[asyncio]>=2.0.16,<3",
+    "starlette>=0.40,<2",
     "uvicorn>=0.34",
 ]
 
@@ -121,3 +127,6 @@ addopts = ["--import-mode=importlib"]
 
 [tool.ruff]
 extend-exclude = ["project", "ref"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

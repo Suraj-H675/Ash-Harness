@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ash.core.redaction import redact_text
 from ash.safe_io import strict_json_loads
 from ash.agents.approval_channel import (
     ApprovalChannelError,
@@ -144,28 +145,38 @@ async def _run_durable_task(spec: dict[str, Any]) -> int:
         else None
     )
 
-    shared_state = SharedState(Path(db_path))
-    if approval_endpoint is not None:
-        durable_task = shared_state.tasks.get_task(task_id)
-        if durable_task is None:
-            raise ValueError("subagent approval endpoint task does not exist")
-        if (
-            approval_endpoint.task_id != task_id
-            or durable_task.metadata.get("agent_id") != approval_endpoint.agent_id
-            or approval_endpoint.attempt != durable_task.attempt + 1
-        ):
-            raise ValueError("subagent approval endpoint does not match durable task")
+    shared_state = SharedState(Path(db_path), workspace=workspace)
+    try:
+        if approval_endpoint is not None:
+            durable_task = shared_state.tasks.get_task(task_id)
+            if durable_task is None:
+                raise ValueError("subagent approval endpoint task does not exist")
+            if (
+                approval_endpoint.task_id != task_id
+                or durable_task.metadata.get("agent_id") != approval_endpoint.agent_id
+                or approval_endpoint.attempt != durable_task.attempt + 1
+            ):
+                raise ValueError("subagent approval endpoint does not match durable task")
 
-    tool = SpawnAgentTool(
-        SafetyGuard(workspace),
-        shared_state,
-        lambda: get_provider_registry().build(config),
-        max_return_chars=max_return_chars,
-        config=config,
-        max_turn_iterations=max_turn_iterations,
-        custom_agents=custom_agents,
-        provider_config_backed=False,
-    )
+        tool = SpawnAgentTool(
+            SafetyGuard(workspace),
+            shared_state,
+            lambda: get_provider_registry().build(config),
+            max_return_chars=max_return_chars,
+            config=config,
+            max_turn_iterations=max_turn_iterations,
+            custom_agents=custom_agents,
+            provider_config_backed=False,
+        )
+    except BaseException as primary_error:
+        try:
+            shared_state.close()
+        except BaseException as cleanup_error:
+            primary_error.add_note(
+                "subagent driver shared-state cleanup failed: "
+                + redact_text(str(cleanup_error))
+            )
+        raise
     tool.set_permission_policy_provider(lambda: policy)
 
     if approval_endpoint is not None:
@@ -193,6 +204,7 @@ async def _run_durable_task(spec: dict[str, Any]) -> int:
             return decision.feedback or False
 
         tool.set_foreground_approval_broker(approve_foreground_tool)
+    run_error: BaseException | None = None
     try:
         result = await tool.run_queued_task(
             task_id,
@@ -201,8 +213,19 @@ async def _run_durable_task(spec: dict[str, Any]) -> int:
             approval_mode="live" if approval_endpoint is not None else "durable",
         )
         return 0 if result.success else 1
+    except BaseException as exc:
+        run_error = exc
+        raise
     finally:
-        await tool.aclose()
+        try:
+            await tool.aclose()
+        except BaseException as cleanup_error:
+            if run_error is None:
+                raise
+            run_error.add_note(
+                "subagent driver cleanup failed: "
+                + redact_text(str(cleanup_error))
+            )
 
 
 def _run_simple_spec(spec: dict[str, Any]) -> int:
@@ -226,14 +249,16 @@ def _run_simple_spec(spec: dict[str, Any]) -> int:
     workspace_value = spec.get("workspace_root", "")
     if not isinstance(workspace_value, str):
         raise ValueError("subagent specification workspace_root must be text")
+    workspace = (
+        Path(workspace_value).expanduser().resolve() if workspace_value else None
+    )
     allow_custom_role = spec.get("allow_custom_role", False)
     if type(allow_custom_role) is not bool:
         raise ValueError("subagent specification allow_custom_role must be boolean")
     token_budget = _optional_positive_int(spec, "token_budget", 4000)
     return_budget = _optional_positive_int(spec, "return_budget", 2000)
 
-    shared_state = SharedState(Path(db_path))
-    try:
+    with SharedState(Path(db_path), workspace=workspace) as shared_state:
         agent = SubprocessAgent(
             agent_id=agent_id,
             role=role,
@@ -245,13 +270,11 @@ def _run_simple_spec(spec: dict[str, Any]) -> int:
             return_budget=return_budget,
             metadata=dict(metadata),
             sandbox_tier=sandbox_tier,
-            workspace_root=Path(workspace_value) if workspace_value else None,
+            workspace_root=workspace,
             allow_custom_role=allow_custom_role,
         )
         report = asyncio.run(agent.run_in_process())
         return 0 if report.success else 1
-    finally:
-        shared_state.close()
 
 
 def main(argv: list[str] | None = None) -> int:

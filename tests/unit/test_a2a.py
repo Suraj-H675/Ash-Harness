@@ -22,6 +22,7 @@ from a2a.client import ClientConfig, ClientFactory
 from a2a.server.agent_execution import RequestContext
 from a2a.server.context import ServerCallContext
 from a2a.server.events.event_queue_v2 import EventQueueSource
+from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
 from a2a.types.a2a_pb2 import (
     CancelTaskRequest,
@@ -34,6 +35,7 @@ from a2a.types.a2a_pb2 import (
     Role,
     SendMessageRequest,
     Task,
+    TaskStatusUpdateEvent,
     TaskStatus,
     TaskState,
 )
@@ -47,6 +49,7 @@ from ash.agents.a2a_remote import (
     ListRemoteAgentsTool,
     RecoverRemoteAgentTaskTool,
     RemoteAgentConfig,
+    RemoteAgentResult,
     RemoteAgentTaskCancelTool,
     RemoteAgentTaskStatusTool,
     cancel_remote_agent_task,
@@ -61,6 +64,7 @@ from ash.config import AshConfig
 from ash.safety.guard import SafetyGuard
 from ash.server.a2a import (
     MAX_A2A_BODY_BYTES,
+    MAX_A2A_IN_FLIGHT_TASKS,
     MAX_A2A_INPUT_BYTES,
     A2AAuthMiddleware,
     A2ASessionRegistry,
@@ -426,6 +430,206 @@ async def test_remote_task_recovery_refuses_ambiguous_context(
 
 
 @pytest.mark.asyncio
+async def test_remote_task_lookup_attempts_all_cleanup_and_preserves_primary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.a2a_remote as remote_module
+
+    class FailingClient:
+        async def get_task(self, _request: Any) -> Any:
+            raise RuntimeError("remote task lookup failed")
+
+        async def close(self) -> None:
+            raise RuntimeError("A2A client close failed")
+
+    class TrackingHTTP:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    client = FailingClient()
+    http = TrackingHTTP()
+
+    async def open_client(*args: Any, **kwargs: Any) -> tuple[Any, Any]:
+        del args, kwargs
+        return http, client
+
+    monkeypatch.setattr(remote_module, "_open_remote_agent_client", open_client)
+
+    with pytest.raises(RuntimeError, match="remote task lookup failed") as captured:
+        await get_remote_agent_task(
+            RemoteAgentConfig(name="remote", url="https://example.test"),
+            "remote-task",
+        )
+
+    assert http.closed is True
+    assert any("A2A client cleanup failed" in note for note in captured.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_remote_send_attempts_all_cleanup_and_preserves_primary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.a2a_remote as remote_module
+    from a2a import client as a2a_client
+
+    class TrackingHTTP:
+        def __init__(self, **_kwargs: Any) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class FakeResolver:
+        def __init__(self, _http: Any, _url: str) -> None:
+            pass
+
+        async def get_agent_card(self) -> Any:
+            return SimpleNamespace(
+                supported_interfaces=[
+                    AgentInterface(
+                        url="https://example.test",
+                        protocol_binding="JSONRPC",
+                    )
+                ]
+            )
+
+    class FailingClient:
+        async def send_message(self, _request: SendMessageRequest):
+            raise RuntimeError("remote send failed")
+            yield
+
+        async def close(self) -> None:
+            raise RuntimeError("A2A client close failed")
+
+    class FakeFactory:
+        def __init__(self, _config: Any) -> None:
+            pass
+
+        def create(self, _card: Any) -> FailingClient:
+            return FailingClient()
+
+    http = TrackingHTTP()
+    monkeypatch.setattr(remote_module.httpx, "AsyncClient", lambda **kwargs: http)
+    monkeypatch.setattr(a2a_client, "A2ACardResolver", FakeResolver)
+    monkeypatch.setattr(a2a_client, "ClientConfig", lambda **kwargs: object())
+    monkeypatch.setattr(a2a_client, "ClientFactory", FakeFactory)
+
+    with pytest.raises(RuntimeError, match="remote send failed") as captured:
+        await send_remote_agent(
+            RemoteAgentConfig(name="remote", url="https://example.test"),
+            "prompt",
+        )
+
+    assert http.closed is True
+    assert any("A2A client cleanup failed" in note for note in captured.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_remote_task_lookup_settles_all_cleanup_before_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.a2a_remote as remote_module
+
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    client_closed = asyncio.Event()
+    http_closed = asyncio.Event()
+
+    class BlockingClient:
+        async def get_task(self, _request: Any) -> Task:
+            return Task(
+                id="remote-task",
+                context_id="remote-context",
+                status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
+            )
+
+        async def close(self) -> None:
+            close_started.set()
+            await release_close.wait()
+            client_closed.set()
+
+    class TrackingHTTP:
+        async def aclose(self) -> None:
+            http_closed.set()
+
+    client = BlockingClient()
+    http = TrackingHTTP()
+
+    async def open_client(*args: Any, **kwargs: Any) -> tuple[Any, Any]:
+        del args, kwargs
+        return http, client
+
+    monkeypatch.setattr(remote_module, "_open_remote_agent_client", open_client)
+    task = asyncio.create_task(
+        get_remote_agent_task(
+            RemoteAgentConfig(name="remote", url="https://example.test"),
+            "remote-task",
+        )
+    )
+    try:
+        await asyncio.wait_for(close_started.wait(), timeout=1)
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        assert client_closed.is_set() is False
+
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+        assert client_closed.is_set() is True
+        assert http_closed.is_set() is True
+    finally:
+        release_close.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_remote_client_open_preserves_setup_error_when_http_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.a2a_remote as remote_module
+    from a2a import client as a2a_client
+
+    class FailingHTTP:
+        async def aclose(self) -> None:
+            raise RuntimeError("A2A HTTP close failed")
+
+    http = FailingHTTP()
+
+    class FailingResolver:
+        def __init__(self, _http: Any, _url: str) -> None:
+            pass
+
+        async def get_agent_card(self) -> Any:
+            raise RuntimeError("A2A card discovery failed")
+
+    monkeypatch.setattr(
+        remote_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: http,
+    )
+    monkeypatch.setattr(a2a_client, "A2ACardResolver", FailingResolver)
+
+    with pytest.raises(RuntimeError, match="A2A card discovery failed") as captured:
+        await remote_module._open_remote_agent_client(
+            RemoteAgentConfig(name="remote", url="https://example.test"),
+            transport=None,
+        )
+
+    assert any(
+        "A2A HTTP client cleanup failed" in note
+        for note in captured.value.__notes__
+    )
+
+
+@pytest.mark.asyncio
 async def test_remote_task_persistence_failure_cancels_known_remote_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -572,6 +776,153 @@ def test_remote_task_store_is_workspace_scoped_and_rejects_symlinked_database(
     linked.symlink_to(target)
     with pytest.raises(ValueError, match="symlink|junction"):
         RemoteTaskStore(linked, first_workspace)
+
+
+def test_remote_task_store_bounds_live_tracking_and_terminal_history_per_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.a2a_tasks as task_store_module
+
+    monkeypatch.setattr(
+        task_store_module,
+        "MAX_NONTERMINAL_REMOTE_TASKS_PER_WORKSPACE",
+        2,
+    )
+    monkeypatch.setattr(
+        task_store_module,
+        "MAX_TERMINAL_REMOTE_TASK_HISTORY_PER_WORKSPACE",
+        2,
+    )
+    database = tmp_path / "remote-tasks.db"
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    first = RemoteTaskStore(database, first_workspace)
+    second = RemoteTaskStore(database, second_workspace)
+    try:
+        first.save_intent(
+            agent="remote",
+            endpoint="https://example.test",
+            context_id="context-1",
+        )
+        first.save_intent(
+            agent="remote",
+            endpoint="https://example.test",
+            context_id="context-2",
+        )
+        with pytest.raises(ValueError, match="tracking limit reached"):
+            first.save_intent(
+                agent="remote",
+                endpoint="https://example.test",
+                context_id="context-3",
+            )
+
+        second.save_intent(
+            agent="remote",
+            endpoint="https://example.test",
+            context_id="other-workspace",
+        )
+
+        first.save(
+            agent="remote",
+            endpoint="https://example.test",
+            task_id="task-1",
+            context_id="context-1",
+            state="TASK_STATE_WORKING",
+        )
+        assert [intent.context_id for intent in first.list_intents()] == [
+            "context-2"
+        ]
+        with pytest.raises(ValueError, match="tracking limit reached"):
+            first.save_intent(
+                agent="remote",
+                endpoint="https://example.test",
+                context_id="context-3",
+            )
+
+        first.save(
+            agent="remote",
+            endpoint="https://example.test",
+            task_id="task-1",
+            context_id="context-1",
+            state="TASK_STATE_COMPLETED",
+        )
+        first.save_intent(
+            agent="remote",
+            endpoint="https://example.test",
+            context_id="context-3",
+        )
+
+        first.save(
+            agent="remote",
+            endpoint="https://example.test",
+            task_id="task-2",
+            context_id="",
+            state="TASK_STATE_COMPLETED",
+        )
+        first.save(
+            agent="remote",
+            endpoint="https://example.test",
+            task_id="task-3",
+            context_id="",
+            state="TASK_STATE_FAILED",
+        )
+
+        assert {handle.task_id for handle in first.list()} == {"task-2", "task-3"}
+        assert [intent.context_id for intent in second.list_intents()] == [
+            "other-workspace"
+        ]
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_delegation_refuses_before_dispatch_when_tracking_is_full(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.a2a_tasks as task_store_module
+
+    monkeypatch.setattr(
+        task_store_module,
+        "MAX_NONTERMINAL_REMOTE_TASKS_PER_WORKSPACE",
+        1,
+    )
+    store = RemoteTaskStore(tmp_path / "remote-tasks.db", tmp_path)
+    store.save_intent(
+        agent="remote",
+        endpoint="https://example.test",
+        context_id="existing-context",
+    )
+    config = RemoteAgentConfig(name="remote", url="https://example.test")
+    tool = DelegateRemoteAgentTool(
+        SafetyGuard(tmp_path),
+        {"remote": config},
+        store,
+    )
+    dispatch_calls = 0
+
+    async def forbidden_dispatch(*args: Any, **kwargs: Any) -> Any:
+        nonlocal dispatch_calls
+        del args, kwargs
+        dispatch_calls += 1
+        raise AssertionError("full remote tracking must fail before dispatch")
+
+    monkeypatch.setattr(
+        "ash.agents.a2a_remote.send_remote_agent",
+        forbidden_dispatch,
+    )
+    try:
+        result = await tool.run(agent="remote", prompt="new work")
+
+        assert result.success is False
+        assert "tracking limit reached" in (result.error or "")
+        assert dispatch_calls == 0
+    finally:
+        await tool.aclose()
 
 
 def test_remote_task_store_rejects_newer_schema(tmp_path: Path) -> None:
@@ -779,12 +1130,14 @@ async def test_a2a_task_engine_rechecks_link_before_lazy_connect(tmp_path: Path)
     import sqlite3
 
     database = tmp_path / "a2a_tasks.db"
+    original = tmp_path / "a2a_tasks-original.db"
     target = tmp_path / "target.db"
     engine = _create_a2a_task_engine(database)
     try:
         with sqlite3.connect(target) as connection:
             connection.execute("CREATE TABLE marker(value TEXT)")
         try:
+            database.rename(original)
             database.symlink_to(target)
         except OSError as exc:
             pytest.skip(f"symlinks are unavailable: {exc}")
@@ -794,6 +1147,10 @@ async def test_a2a_task_engine_rechecks_link_before_lazy_connect(tmp_path: Path)
                 pass
     finally:
         await engine.dispose()
+        if database.is_symlink():
+            database.unlink()
+        if original.exists():
+            original.rename(database)
 
     with sqlite3.connect(target) as connection:
         assert connection.execute(
@@ -1308,6 +1665,71 @@ async def test_remote_task_tool_redacts_signed_url_from_protocol_error(
 
 
 @pytest.mark.asyncio
+async def test_remote_task_tool_redacts_exact_configured_bearer_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "tiny-k"
+    monkeypatch.setenv("REMOTE_A2A_TOKEN", token)
+    config = RemoteAgentConfig(
+        name="local",
+        url="https://agent.example.com",
+        token_env="REMOTE_A2A_TOKEN",
+    )
+
+    async def echoed_token(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise RuntimeError(f"remote echoed bearer credential {token}")
+
+    monkeypatch.setattr("ash.agents.a2a_remote.get_remote_agent_task", echoed_token)
+    tool = RemoteAgentTaskStatusTool(
+        SafetyGuard(tmp_path),
+        {"local": config},
+    )
+
+    result = await tool.run(agent="local", task_id="task-1")
+
+    assert result.success is False
+    assert token not in (result.error or "")
+    assert "[REDACTED]" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_remote_delegate_redacts_exact_bearer_token_from_success_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "tiny-k"
+    monkeypatch.setenv("REMOTE_A2A_TOKEN", token)
+    config = RemoteAgentConfig(
+        name="local",
+        url="https://agent.example.com",
+        token_env="REMOTE_A2A_TOKEN",
+    )
+
+    async def echoed_token(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        return RemoteAgentResult(
+            response=f"remote output {token}",
+            task_id="task-1",
+            context_id="context-1",
+            state="TASK_STATE_COMPLETED",
+        )
+
+    monkeypatch.setattr("ash.agents.a2a_remote.send_remote_agent", echoed_token)
+    tool = DelegateRemoteAgentTool(
+        SafetyGuard(tmp_path),
+        {"local": config},
+    )
+
+    result = await tool.run(agent="local", prompt="probe")
+
+    assert result.success is True
+    assert token not in result.output
+    assert "[REDACTED]" in result.output
+
+
+@pytest.mark.asyncio
 async def test_a2a_server_redacts_signed_url_from_failed_task_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1578,6 +2000,73 @@ async def test_a2a_rate_limits_authenticated_operations(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a2a_lifespan_closes_handler_even_when_body_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    close_calls = 0
+
+    async def close_handler(_handler: DefaultRequestHandler) -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    monkeypatch.setattr(DefaultRequestHandler, "aclose", close_handler)
+    app = create_a2a_app(
+        config,
+        public_url="http://testserver",
+        bearer_token="0123456789abcdef",
+        task_store=InMemoryTaskStore(),
+    )
+
+    with pytest.raises(RuntimeError, match="lifespan body failed"):
+        async with app.router.lifespan_context(app):
+            raise RuntimeError("lifespan body failed")
+
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a2a_lifespan_preserves_body_failure_when_shutdown_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+
+    async def fail_handler_close(_handler: DefaultRequestHandler) -> None:
+        raise RuntimeError("handler shutdown failed")
+
+    monkeypatch.setattr(DefaultRequestHandler, "aclose", fail_handler_close)
+    app = create_a2a_app(
+        config,
+        public_url="http://testserver",
+        bearer_token="0123456789abcdef",
+        task_store=InMemoryTaskStore(),
+    )
+
+    with pytest.raises(RuntimeError, match="lifespan body failed") as captured:
+        async with app.router.lifespan_context(app):
+            raise RuntimeError("lifespan body failed")
+
+    assert any(
+        "A2A shutdown cleanup also failed" in note
+        for note in captured.value.__notes__
+    )
+
+
+@pytest.mark.asyncio
 async def test_a2a_registry_rejects_cross_workspace_context(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -1757,6 +2246,385 @@ async def test_a2a_executor_settles_client_close_before_cancelled_execute_return
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(execution, timeout=1)
     assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a2a_executor_retains_close_failure_after_completed_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+
+    class CloseFailClient:
+        def __init__(self) -> None:
+            self.loop = SimpleNamespace(
+                current_session=SimpleNamespace(session_id="completed-session")
+            )
+            self.close_calls = 0
+            self.closed = False
+
+        async def stream_prompt(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[AshEvent]:
+            yield AshEvent("assistant.delta", {"text": "done"})
+            yield AshEvent("turn.completed", {"response": "done"})
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("A2A client cleanup failed after completion")
+            self.closed = True
+
+    client = CloseFailClient()
+
+    async def create_client(**kwargs: Any) -> CloseFailClient:
+        return client
+
+    class Registry:
+        async def get(self, context_id: str) -> None:
+            return None
+
+        async def bind(self, context_id: str, session_id: str) -> None:
+            return None
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    executor = AshA2AExecutor(config, Registry())
+    request = SendMessageRequest(
+        message=Message(
+            message_id="completed-message",
+            role=Role.ROLE_USER,
+            parts=[Part(text="complete then fail cleanup")],
+        )
+    )
+    context = RequestContext(
+        call_context=ServerCallContext(),
+        request=request,
+        task_id="completed-task",
+        context_id="completed-context",
+    )
+    event_queue = EventQueueSource()
+    try:
+        await executor.execute(context, event_queue)
+
+        await event_queue.test_only_join_incoming_queue()
+        events = []
+        while not event_queue.queue.empty():
+            event = await event_queue.dequeue_event()
+            events.append(event)
+            event_queue.task_done()
+        assert any(
+            isinstance(event, TaskStatusUpdateEvent)
+            and event.status.state == TaskState.TASK_STATE_COMPLETED
+            for event in events
+        )
+        assert client.close_calls == 1
+        assert client in executor._retired_clients
+
+        await executor.aclose()
+
+        assert client.close_calls == 2
+        assert client.closed is True
+        assert not executor._retired_clients
+    finally:
+        await event_queue.close(immediate=True)
+
+
+@pytest.mark.asyncio
+async def test_a2a_executor_retains_failed_client_during_cleanup_contention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    prompt_started = asyncio.Event()
+    release_prompt = asyncio.Event()
+    close_called = asyncio.Event()
+
+    class CloseFailClient:
+        loop = SimpleNamespace(
+            current_session=SimpleNamespace(session_id="contention-session")
+        )
+
+        async def stream_prompt(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[AshEvent]:
+            prompt_started.set()
+            await release_prompt.wait()
+            yield AshEvent("turn.completed", {"response": "done"})
+
+        async def close(self) -> None:
+            close_called.set()
+            raise RuntimeError("close failed under cleanup contention")
+
+    client = CloseFailClient()
+
+    async def create_client(**kwargs: Any) -> CloseFailClient:
+        return client
+
+    class Registry:
+        async def get(self, context_id: str) -> None:
+            return None
+
+        async def bind(self, context_id: str, session_id: str) -> None:
+            return None
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    executor = AshA2AExecutor(config, Registry())
+    request = SendMessageRequest(
+        message=Message(
+            message_id="contention-message",
+            role=Role.ROLE_USER,
+            parts=[Part(text="finish while cleanup is busy")],
+        )
+    )
+    context = RequestContext(
+        call_context=ServerCallContext(),
+        request=request,
+        task_id="contention-task",
+        context_id="contention-context",
+    )
+    event_queue = EventQueueSource()
+    execution = asyncio.create_task(executor.execute(context, event_queue))
+    try:
+        await asyncio.wait_for(prompt_started.wait(), timeout=1)
+        await executor._cleanup_lock.acquire()
+        release_prompt.set()
+        await asyncio.wait_for(close_called.wait(), timeout=1)
+        for _ in range(10):
+            if client in executor._retired_clients:
+                break
+            await asyncio.sleep(0)
+
+        execution.cancel()
+        assert client in executor._retired_clients
+    finally:
+        if executor._cleanup_lock.locked():
+            executor._cleanup_lock.release()
+        await asyncio.gather(execution, return_exceptions=True)
+        await event_queue.close(immediate=True)
+
+
+@pytest.mark.asyncio
+async def test_a2a_executor_blocks_new_client_while_cleanup_remains_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+
+    class PersistentCloseFailClient:
+        def __init__(self) -> None:
+            self.loop = SimpleNamespace(
+                current_session=SimpleNamespace(session_id="cleanup-session")
+            )
+            self.close_calls = 0
+            self.allow_close = False
+
+        async def stream_prompt(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[AshEvent]:
+            yield AshEvent("turn.completed", {"response": "done"})
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if not self.allow_close:
+                raise RuntimeError("A2A cleanup still failing")
+
+    client = PersistentCloseFailClient()
+    create_calls = 0
+
+    async def create_client(**kwargs: Any) -> PersistentCloseFailClient:
+        nonlocal create_calls
+        create_calls += 1
+        return client
+
+    class Registry:
+        async def get(self, context_id: str) -> None:
+            return None
+
+        async def bind(self, context_id: str, session_id: str) -> None:
+            return None
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    executor = AshA2AExecutor(config, Registry())
+
+    def request(task_id: str, context_id: str) -> tuple[RequestContext, EventQueueSource]:
+        queue = EventQueueSource()
+        return (
+            RequestContext(
+                call_context=ServerCallContext(),
+                request=SendMessageRequest(
+                    message=Message(
+                        message_id=f"message-{task_id}",
+                        role=Role.ROLE_USER,
+                        parts=[Part(text="work")],
+                    )
+                ),
+                task_id=task_id,
+                context_id=context_id,
+            ),
+            queue,
+        )
+
+    first_context, first_queue = request("first-task", "first-context")
+    second_context, second_queue = request("second-task", "second-context")
+    try:
+        await executor.execute(first_context, first_queue)
+        assert create_calls == 1
+        assert client.close_calls == 1
+        assert client in executor._retired_clients
+
+        await executor.execute(second_context, second_queue)
+
+        assert create_calls == 1
+        assert client.close_calls == 2
+        assert client in executor._retired_clients
+        await second_queue.test_only_join_incoming_queue()
+        second_events = []
+        while not second_queue.queue.empty():
+            event = await second_queue.dequeue_event()
+            second_events.append(event)
+            second_queue.task_done()
+        assert any(
+            isinstance(event, TaskStatusUpdateEvent)
+            and event.status.state == TaskState.TASK_STATE_FAILED
+            for event in second_events
+        )
+
+        client.allow_close = True
+        await executor.aclose()
+        assert client.close_calls == 3
+        assert not executor._retired_clients
+    finally:
+        await first_queue.close(immediate=True)
+        await second_queue.close(immediate=True)
+
+
+@pytest.mark.asyncio
+async def test_a2a_executor_bounds_concurrent_ash_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    create_calls = 0
+    started = 0
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingAshClient:
+        def __init__(self, index: int) -> None:
+            self.loop = SimpleNamespace(
+                current_session=SimpleNamespace(session_id=f"session-{index}")
+            )
+
+        async def stream_prompt(
+            self, *args: Any, **kwargs: Any
+        ) -> AsyncIterator[AshEvent]:
+            nonlocal started
+            started += 1
+            if started == 2:
+                both_started.set()
+            await release.wait()
+            yield AshEvent("turn.completed", {"response": "done"})
+
+        async def close(self) -> None:
+            return None
+
+    async def create_client(**kwargs: Any) -> BlockingAshClient:
+        nonlocal create_calls
+        create_calls += 1
+        return BlockingAshClient(create_calls)
+
+    class Registry:
+        async def get(self, context_id: str) -> None:
+            return None
+
+        async def bind(self, context_id: str, session_id: str) -> None:
+            return None
+
+    def request(task_id: str) -> tuple[RequestContext, EventQueueSource]:
+        queue = EventQueueSource()
+        return (
+            RequestContext(
+                call_context=ServerCallContext(),
+                request=SendMessageRequest(
+                    message=Message(
+                        message_id=f"message-{task_id}",
+                        role=Role.ROLE_USER,
+                        parts=[Part(text="hold")],
+                    )
+                ),
+                task_id=task_id,
+                context_id=f"context-{task_id}",
+            ),
+            queue,
+        )
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    default_executor = AshA2AExecutor(config, Registry())
+    assert default_executor._max_in_flight_tasks == MAX_A2A_IN_FLIGHT_TASKS
+    executor = AshA2AExecutor(config, Registry(), max_in_flight_tasks=2)
+    first_context, first_queue = request("first")
+    second_context, second_queue = request("second")
+    third_context, third_queue = request("third")
+    first = asyncio.create_task(executor.execute(first_context, first_queue))
+    second = asyncio.create_task(executor.execute(second_context, second_queue))
+    try:
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        assert create_calls == 2
+        assert executor._active_tasks == 2
+
+        await executor.execute(third_context, third_queue)
+        assert create_calls == 2
+        assert executor._active_tasks == 2
+
+        await third_queue.test_only_join_incoming_queue()
+        third_events = []
+        while not third_queue.queue.empty():
+            event = await third_queue.dequeue_event()
+            third_events.append(event)
+            third_queue.task_done()
+        assert any(
+            isinstance(event, TaskStatusUpdateEvent)
+            and event.status.state == TaskState.TASK_STATE_FAILED
+            for event in third_events
+        )
+
+        release.set()
+        await asyncio.gather(first, second)
+        assert executor._active_tasks == 0
+    finally:
+        release.set()
+        await asyncio.gather(first, second, return_exceptions=True)
+        await first_queue.close(immediate=True)
+        await second_queue.close(immediate=True)
+        await third_queue.close(immediate=True)
 
 
 @pytest.mark.asyncio

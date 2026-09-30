@@ -15,6 +15,15 @@ _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _FCHMOD = getattr(os, "fchmod", None)
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - native Windows is unsupported.
+    fcntl = None  # type: ignore[assignment]
+
+_FLOCK = getattr(fcntl, "flock", None) if fcntl is not None else None
+_LOCK_EX = getattr(fcntl, "LOCK_EX", None) if fcntl is not None else None
+_LOCK_UN = getattr(fcntl, "LOCK_UN", None) if fcntl is not None else None
+
 
 PRIVATE_STORE_UNAVAILABLE_MESSAGE = (
     "secure MCP OAuth credential persistence is unavailable on this platform/build"
@@ -52,6 +61,9 @@ def secure_private_store_available() -> bool:
         or not os.O_CREAT
         or not os.O_EXCL
         or _FCHMOD is None
+        or _FLOCK is None
+        or _LOCK_EX is None
+        or _LOCK_UN is None
     ):
         return False
     if not all(
@@ -158,7 +170,8 @@ class PrivateStore:
             raise TypeError("private-store payload must be bytes")
         try:
             with self.opened() as store_descriptor:
-                _atomic_replace(store_descriptor, name, payload)
+                with _record_mutation_lock(store_descriptor, name):
+                    _atomic_replace(store_descriptor, name, payload)
         except PrivateStoreError:
             raise
         except OSError as exc:
@@ -181,32 +194,33 @@ class PrivateStore:
         _validate_name(name)
         try:
             with self.opened() as store_descriptor:
-                current: bytes | None = None
-                flags = os.O_RDONLY | _close_on_exec_flag() | _nofollow_flag()
-                try:
-                    descriptor = os.open(name, flags, dir_fd=store_descriptor)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    raise _record_open_error(exc) from exc
-                else:
+                with _record_mutation_lock(store_descriptor, name):
+                    current: bytes | None = None
+                    flags = os.O_RDONLY | _close_on_exec_flag() | _nofollow_flag()
                     try:
-                        metadata = os.fstat(descriptor)
-                        if not stat.S_ISREG(metadata.st_mode):
-                            raise PrivateStoreError(
-                                "MCP OAuth token record is not a regular file"
-                            )
-                        if metadata.st_size > max_bytes:
-                            raise PrivateStoreError(
-                                "MCP OAuth token record exceeded 1 MB"
-                            )
-                        current = _read_bounded(descriptor, max_bytes)
-                    finally:
-                        os.close(descriptor)
-                payload = updater(current)
-                if not isinstance(payload, bytes):
-                    raise TypeError("private-store updater must return bytes")
-                _atomic_replace(store_descriptor, name, payload)
+                        descriptor = os.open(name, flags, dir_fd=store_descriptor)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        raise _record_open_error(exc) from exc
+                    else:
+                        try:
+                            metadata = os.fstat(descriptor)
+                            if not stat.S_ISREG(metadata.st_mode):
+                                raise PrivateStoreError(
+                                    "MCP OAuth token record is not a regular file"
+                                )
+                            if metadata.st_size > max_bytes:
+                                raise PrivateStoreError(
+                                    "MCP OAuth token record exceeded 1 MB"
+                                )
+                            current = _read_bounded(descriptor, max_bytes)
+                        finally:
+                            os.close(descriptor)
+                    payload = updater(current)
+                    if not isinstance(payload, bytes):
+                        raise TypeError("private-store updater must return bytes")
+                    _atomic_replace(store_descriptor, name, payload)
         except PrivateStoreError:
             raise
         except OSError as exc:
@@ -221,14 +235,15 @@ class PrivateStore:
         _validate_name(name)
         try:
             with self.opened(create=False) as store_descriptor:
-                if _require_regular_or_missing(store_descriptor, name) is None:
-                    return False
-                try:
-                    os.unlink(name, dir_fd=store_descriptor)
-                except FileNotFoundError:
-                    return False
-                _sync_directory(store_descriptor)
-                return True
+                with _record_mutation_lock(store_descriptor, name):
+                    if _require_regular_or_missing(store_descriptor, name) is None:
+                        return False
+                    try:
+                        os.unlink(name, dir_fd=store_descriptor)
+                    except FileNotFoundError:
+                        return False
+                    _sync_directory(store_descriptor)
+                    return True
         except FileNotFoundError:
             return False
         except PrivateStoreError:
@@ -439,6 +454,57 @@ def _require_regular_or_missing(
     if not stat.S_ISREG(metadata.st_mode):
         raise PrivateStoreError("MCP OAuth token record is not a regular file")
     return metadata
+
+
+@contextmanager
+def _record_mutation_lock(store_descriptor: int, name: str) -> Iterator[None]:
+    """Serialize one record's mutations across Ash processes."""
+
+    if _FLOCK is None or _LOCK_EX is None or _LOCK_UN is None:
+        raise PrivateStoreUnavailable(PRIVATE_STORE_UNAVAILABLE_MESSAGE)
+    lock_name = f".{name}.lock"
+    _validate_name(lock_name)
+    descriptor = -1
+    try:
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | _close_on_exec_flag()
+            | _nofollow_flag()
+        )
+        try:
+            descriptor = os.open(
+                lock_name,
+                flags,
+                0o600,
+                dir_fd=store_descriptor,
+            )
+        except OSError as exc:
+            raise _record_open_error(exc) from exc
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PrivateStoreError("MCP OAuth mutation lock is not a regular file")
+        _fchmod(descriptor, 0o600)
+        _FLOCK(descriptor, _LOCK_EX)
+        current = os.stat(
+            lock_name,
+            dir_fd=store_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != metadata.st_dev
+            or current.st_ino != metadata.st_ino
+        ):
+            raise PrivateStoreError("MCP OAuth mutation lock changed while acquiring")
+        yield
+    finally:
+        if descriptor >= 0:
+            try:
+                if _FLOCK is not None and _LOCK_UN is not None:
+                    _FLOCK(descriptor, _LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _atomic_replace(store_descriptor: int, name: str, payload: bytes) -> None:

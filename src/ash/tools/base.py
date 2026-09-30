@@ -6,10 +6,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
+import json
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 
+from ash.core.redaction import redact_value
 from ash.safety.guard import SafetyGuard
 
 
@@ -20,6 +22,14 @@ class ToolExecutionOutcome(StrEnum):
     UNKNOWN = "unknown"
 
 
+MAX_TOOL_RESULT_STRUCTURED_ITEMS = 256
+MAX_TOOL_RESULT_SUMMARY_FIELDS = 64
+MAX_TOOL_RESULT_STRUCTURED_BYTES = 2 * 1024 * 1024
+MAX_TOOL_RESULT_IMAGE_BLOCKS = 16
+MAX_TOOL_RESULT_IMAGE_DATA_BYTES = 16 * 1024 * 1024
+MAX_TOOL_RESULT_TEXT_BYTES = 16 * 1024 * 1024
+
+
 class ToolResult(BaseModel):
     success: bool
     output: str
@@ -27,11 +37,92 @@ class ToolResult(BaseModel):
     token_count: int = 0
     truncated: bool = False
     outcome: ToolExecutionOutcome = ToolExecutionOutcome.COMPLETED
-    diagnostics: list[dict[str, Any]] = []
-    diagnostic_summary: dict[str, int] = {}
-    citations: list[dict[str, Any]] = []
-    images: list[dict[str, str]] = []
-    image_blocks: list[dict[str, str]] = []
+    diagnostics: list[dict[str, Any]] = Field(
+        default_factory=list,
+        max_length=MAX_TOOL_RESULT_STRUCTURED_ITEMS,
+    )
+    diagnostic_summary: dict[str, int] = Field(
+        default_factory=dict,
+        max_length=MAX_TOOL_RESULT_SUMMARY_FIELDS,
+    )
+    citations: list[dict[str, Any]] = Field(
+        default_factory=list,
+        max_length=MAX_TOOL_RESULT_STRUCTURED_ITEMS,
+    )
+    images: list[dict[str, str]] = Field(
+        default_factory=list,
+        max_length=MAX_TOOL_RESULT_STRUCTURED_ITEMS,
+    )
+    image_blocks: list[dict[str, str]] = Field(
+        default_factory=list,
+        max_length=MAX_TOOL_RESULT_IMAGE_BLOCKS,
+    )
+
+    @model_validator(mode="after")
+    def validate_text_bytes(self) -> "ToolResult":
+        total = 0
+        for label, value in (("output", self.output), ("error", self.error or "")):
+            try:
+                total += len(value.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise ValueError(f"tool-result {label} must be valid UTF-8") from exc
+            if total > MAX_TOOL_RESULT_TEXT_BYTES:
+                raise ValueError(
+                    "tool-result text exceeds "
+                    f"{MAX_TOOL_RESULT_TEXT_BYTES} UTF-8 bytes"
+                )
+        return self
+
+    @field_validator("image_blocks")
+    @classmethod
+    def validate_image_block_bytes(
+        cls,
+        value: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        total = 0
+        for block in value:
+            data = block.get("data", "")
+            try:
+                total += len(data.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise ValueError("tool-result image data must be valid UTF-8") from exc
+            if total > MAX_TOOL_RESULT_IMAGE_DATA_BYTES:
+                raise ValueError(
+                    "tool-result image data exceeds "
+                    f"{MAX_TOOL_RESULT_IMAGE_DATA_BYTES} UTF-8 bytes"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def validate_structured_metadata_bytes(self) -> "ToolResult":
+        structured = {
+            "diagnostics": self.diagnostics,
+            "diagnostic_summary": self.diagnostic_summary,
+            "citations": self.citations,
+            "images": self.images,
+            "image_blocks": [
+                {key: value for key, value in block.items() if key != "data"}
+                for block in self.image_blocks
+            ],
+        }
+        try:
+            size = len(
+                json.dumps(
+                    structured,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("tool-result structured metadata must be serializable") from exc
+        if size > MAX_TOOL_RESULT_STRUCTURED_BYTES:
+            raise ValueError(
+                "tool-result structured metadata exceeds "
+                f"{MAX_TOOL_RESULT_STRUCTURED_BYTES} UTF-8 bytes"
+            )
+        return self
 
 
 class ToolReplayPolicy(StrEnum):
@@ -45,12 +136,14 @@ class ToolExecutionContract:
     """Fail-closed execution semantics shared by built-in and extension tools."""
 
     replay_policy: ToolReplayPolicy = ToolReplayPolicy.NEVER
+    parallel_safe: bool = False
 
 
 class BaseTool(ABC):
     name: str
     description: str
     args_schema: type[BaseModel] | None
+    sensitive_argument_fields: frozenset[str] = frozenset()
     execution_contract = ToolExecutionContract()
 
     def __init__(self, safety_guard: SafetyGuard) -> None:
@@ -80,6 +173,11 @@ class BaseTool(ABC):
         if hasattr(args_schema, "schema"):
             return args_schema.schema()
         return {}
+
+    def search_schema(self) -> dict[str, Any]:
+        """Return schema metadata for discovery without changing provider semantics."""
+
+        return self.json_schema()
 
     async def aclose(self) -> None:
         """Release optional tool resources."""
@@ -112,6 +210,38 @@ class BaseTool(ABC):
         """Return a copy of the current per-invocation event context."""
 
         return dict(self._event_context.get() or {})
+
+
+def redact_tool_arguments(
+    tool: BaseTool | None,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Redact generic secrets plus declaratively sensitive tool fields."""
+
+    redacted = redact_value(arguments)
+    if not isinstance(redacted, dict):
+        return {}
+    sensitive = sensitive_tool_argument_fields(tool)
+    for field in sensitive:
+        if field in redacted:
+            redacted[field] = "[REDACTED]"
+    return redacted
+
+
+def sensitive_tool_argument_fields(tool: BaseTool | None) -> frozenset[str]:
+    """Return validated class-declared sensitive fields without invoking tool code."""
+
+    if tool is None:
+        return frozenset()
+    declared: object = getattr(type(tool), "sensitive_argument_fields", frozenset())
+    if not isinstance(declared, frozenset):
+        return frozenset()
+    validated = frozenset(
+        field for field in declared if isinstance(field, str) and field
+    )
+    if len(validated) != len(declared):
+        return frozenset()
+    return validated
 
 
 class ToolMiddleware(ABC):

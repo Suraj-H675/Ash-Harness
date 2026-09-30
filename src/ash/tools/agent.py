@@ -49,7 +49,7 @@ from ash.sandbox.process_utils import (
     ProcessTreeError,
     communicate_process,
     prepare_process_tree,
-    terminate_process_tree,
+    settle_process_tree_after_cancellation,
 )
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.ui.headless import HeadlessUI
@@ -98,11 +98,32 @@ async def _settle_spawn_cleanup_task(
             current = asyncio.current_task()
             if current is not None:
                 current.uncancel()
+        except BaseException:
+            break
     try:
         task.result()
     except BaseException as exc:
         return exc, interrupted
     return None, interrupted
+
+
+async def _settle_worktree_remove(
+    manager: WorktreeManager,
+    lease: WorktreeLease,
+    *,
+    keep_branch: bool,
+    expected_head: str,
+    name: str,
+) -> tuple[BaseException | None, bool]:
+    cleanup = asyncio.create_task(
+        manager.remove(
+            lease,
+            keep_branch=keep_branch,
+            expected_head=expected_head,
+        ),
+        name=name,
+    )
+    return await _settle_spawn_cleanup_task(cleanup)
 
 
 class _AgentLeaseHeartbeat:
@@ -302,7 +323,11 @@ class SpawnAgentTool(BaseTool):
         self._tasks: dict[str, asyncio.Task[AgentReport]] = {}
         self._subprocess_tasks: dict[str, asyncio.Task[ToolResult]] = {}
         self._subprocess_task_ids: set[str] = set()
+        self._active_agent_ids: set[str] = set()
+        self._retired_approval_servers: set[ForegroundApprovalServer] = set()
         self._dispatcher_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._closed = False
 
     def set_custom_agents(self, agents: dict[str, "AgentDefinition"]) -> None:
         self._custom_agents = dict(agents)
@@ -582,12 +607,11 @@ class SpawnAgentTool(BaseTool):
                 reason="subagent subprocess cancelled before launch",
             )
             if approval_server is not None:
-                close_task = asyncio.create_task(
-                    approval_server.aclose(),
-                    name="ash-subagent-approval-close-before-launch",
-                )
-                approval_cleanup_error, cleanup_interrupted = await _settle_spawn_cleanup_task(
-                    close_task
+                approval_cleanup_error, cleanup_interrupted = (
+                    await self._close_approval_server(
+                        approval_server,
+                        task_name="ash-subagent-approval-close-before-launch",
+                    )
                 )
                 if approval_cleanup_error is not None:
                     cancellation.add_note(
@@ -605,12 +629,11 @@ class SpawnAgentTool(BaseTool):
             )
             cleanup_note = ""
             if approval_server is not None:
-                close_task = asyncio.create_task(
-                    approval_server.aclose(),
-                    name="ash-subagent-approval-close-start-error",
-                )
-                approval_cleanup_error, cleanup_interrupted = await _settle_spawn_cleanup_task(
-                    close_task
+                approval_cleanup_error, cleanup_interrupted = (
+                    await self._close_approval_server(
+                        approval_server,
+                        task_name="ash-subagent-approval-close-start-error",
+                    )
                 )
                 if approval_cleanup_error is not None:
                     cleanup_note = (
@@ -648,24 +671,28 @@ class SpawnAgentTool(BaseTool):
                 cancellation.add_note("subagent process launch cleanup was interrupted")
             if launch_error is None:
                 process = launch.result()
-                try:
-                    await terminate_process_tree(process, plan=plan)
-                except BaseException as process_tree_cleanup_error:
+                cleanup_error, cleanup_cancelled = (
+                    await settle_process_tree_after_cancellation(process, plan=plan)
+                )
+                if cleanup_error is not None:
                     cancellation.add_note(
                         "subagent subprocess cleanup failed: "
-                        f"{process_tree_cleanup_error}"
+                        f"{cleanup_error}"
+                    )
+                if cleanup_cancelled:
+                    cancellation.add_note(
+                        "subagent subprocess cleanup was interrupted by cancellation"
                     )
             self._cancel_active_subprocess_task(
                 durable_task.task_id,
                 reason="subagent subprocess cancelled during launch",
             )
             if approval_server is not None:
-                close_task = asyncio.create_task(
-                    approval_server.aclose(),
-                    name="ash-subagent-approval-close-launch-cancel",
-                )
-                approval_cleanup_error, cleanup_interrupted = await _settle_spawn_cleanup_task(
-                    close_task
+                approval_cleanup_error, cleanup_interrupted = (
+                    await self._close_approval_server(
+                        approval_server,
+                        task_name="ash-subagent-approval-close-launch-cancel",
+                    )
                 )
                 if approval_cleanup_error is not None:
                     cancellation.add_note(
@@ -683,12 +710,11 @@ class SpawnAgentTool(BaseTool):
             )
             cleanup_note = ""
             if approval_server is not None:
-                close_task = asyncio.create_task(
-                    approval_server.aclose(),
-                    name="ash-subagent-approval-close-launch-error",
-                )
-                approval_cleanup_error, cleanup_interrupted = await _settle_spawn_cleanup_task(
-                    close_task
+                approval_cleanup_error, cleanup_interrupted = (
+                    await self._close_approval_server(
+                        approval_server,
+                        task_name="ash-subagent-approval-close-launch-error",
+                    )
                 )
                 if approval_cleanup_error is not None:
                     cleanup_note = (
@@ -703,6 +729,7 @@ class SpawnAgentTool(BaseTool):
             )
 
         assert process is not None
+        primary_error: BaseException | None = None
         try:
             stderr = b""
             try:
@@ -713,12 +740,18 @@ class SpawnAgentTool(BaseTool):
                     process_tree_plan=plan,
                 )
             except asyncio.CancelledError as cancellation:
-                try:
-                    await terminate_process_tree(process, plan=plan)
-                except BaseException as process_tree_cleanup_error:
+                primary_error = cancellation
+                cleanup_error, cleanup_cancelled = (
+                    await settle_process_tree_after_cancellation(process, plan=plan)
+                )
+                if cleanup_error is not None:
                     cancellation.add_note(
                         "subagent subprocess cleanup failed: "
-                        f"{process_tree_cleanup_error}"
+                        f"{cleanup_error}"
+                    )
+                if cleanup_cancelled:
+                    cancellation.add_note(
+                        "subagent subprocess cleanup was interrupted by cancellation"
                     )
                 self._cancel_active_subprocess_task(
                     durable_task.task_id,
@@ -745,6 +778,38 @@ class SpawnAgentTool(BaseTool):
                         + _subprocess_stderr_suffix(stderr)
                     ),
                 )
+            except Exception as communication_error:
+                current = self._shared_state.tasks.get_task(durable_task.task_id)
+                if current is not None and current.state not in {
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                }:
+                    self._cancel_active_subprocess_task(
+                        durable_task.task_id,
+                        reason="subagent subprocess communication failed",
+                    )
+                cleanup_error, cleanup_cancelled = (
+                    await settle_process_tree_after_cancellation(process, plan=plan)
+                )
+                if cleanup_error is not None:
+                    communication_error.add_note(
+                        f"subagent process-tree cleanup failed: {cleanup_error}"
+                    )
+                if cleanup_cancelled:
+                    cleanup_cancellation = asyncio.CancelledError()
+                    cleanup_cancellation.add_note(
+                        "subagent communication failed before process-tree cleanup "
+                        "was cancelled"
+                    )
+                    if cleanup_error is not None:
+                        cleanup_cancellation.add_note(
+                            "subagent process-tree cleanup also failed"
+                        )
+                    primary_error = cleanup_cancellation
+                    raise cleanup_cancellation from communication_error
+                primary_error = communication_error
+                raise
 
             current = self._shared_state.tasks.get_task(durable_task.task_id)
             child_died_before_claim = (
@@ -768,7 +833,83 @@ class SpawnAgentTool(BaseTool):
             return self._subprocess_task_result(durable_task.task_id)
         finally:
             if approval_server is not None:
-                await approval_server.aclose()
+                approval_cleanup_error, cleanup_interrupted = (
+                    await self._close_approval_server(
+                        approval_server,
+                        task_name="ash-subagent-approval-close-after-run",
+                    )
+                )
+                if primary_error is not None:
+                    if approval_cleanup_error is not None:
+                        primary_error.add_note(
+                            "subagent approval cleanup failed: "
+                            + redact_text(str(approval_cleanup_error))[:500]
+                        )
+                    if cleanup_interrupted:
+                        if isinstance(primary_error, asyncio.CancelledError):
+                            primary_error.add_note(
+                                "subagent approval cleanup was interrupted"
+                            )
+                        else:
+                            cleanup_cancellation = asyncio.CancelledError()
+                            cleanup_cancellation.add_note(
+                                "subagent execution failed before approval cleanup "
+                                "was cancelled"
+                            )
+                            if approval_cleanup_error is not None:
+                                cleanup_cancellation.add_note(
+                                    "subagent approval cleanup also failed"
+                                )
+                            raise cleanup_cancellation from primary_error
+                else:
+                    if cleanup_interrupted:
+                        cleanup_cancellation = asyncio.CancelledError()
+                        if approval_cleanup_error is not None:
+                            cleanup_cancellation.add_note(
+                                "subagent approval cleanup failed while cancellation "
+                                "was pending"
+                            )
+                        raise cleanup_cancellation from approval_cleanup_error
+                    if approval_cleanup_error is not None:
+                        raise approval_cleanup_error
+
+    async def _close_approval_server(
+        self,
+        server: ForegroundApprovalServer,
+        *,
+        task_name: str,
+    ) -> tuple[BaseException | None, bool]:
+        close_task = asyncio.create_task(server.aclose(), name=task_name)
+        cleanup_error, interrupted = await _settle_spawn_cleanup_task(close_task)
+        if cleanup_error is None:
+            self._retired_approval_servers.discard(server)
+        else:
+            self._retired_approval_servers.add(server)
+        return cleanup_error, interrupted
+
+    async def _close_retired_approval_servers(self) -> None:
+        failures: list[BaseException] = []
+        interrupted = False
+        for server in tuple(self._retired_approval_servers):
+            cleanup_error, cleanup_interrupted = await self._close_approval_server(
+                server,
+                task_name="ash-subagent-retired-approval-close",
+            )
+            interrupted = interrupted or cleanup_interrupted
+            if cleanup_error is not None:
+                failures.append(cleanup_error)
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if failures:
+                cancellation.add_note(
+                    "retired subagent approval cleanup also failed"
+                )
+            raise cancellation from (failures[0] if failures else None)
+        if failures:
+            primary = failures[0]
+            for _failure in failures[1:]:
+                primary.add_note("another retired subagent approval cleanup also failed")
+            raise primary
 
     async def _run_subprocess_task(
         self,
@@ -1070,10 +1211,58 @@ class SpawnAgentTool(BaseTool):
         wait_background: bool = False,
         approval_mode: ApprovalMode = "auto",
     ) -> ToolResult:
+        agent_id = args.agent_id or f"spawned-{uuid.uuid4().hex[:8]}"
+        existing = self._shared_state.get_status(agent_id)
+        if (
+            agent_id in self._active_agent_ids
+            or existing is not None
+            and existing.status in {"idle", "working"}
+        ):
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Subagent {agent_id!r} is already running.",
+            )
+
+        # This mutation happens before the first await in the owned execution
+        # body, so same-loop concurrent launches cannot both pass admission.
+        self._active_agent_ids.add(agent_id)
+        ownership_transferred = False
+        try:
+            result = await self._run_args_owned(
+                args,
+                durable_task=durable_task,
+                wait_background=wait_background,
+                approval_mode=approval_mode,
+                agent_id=agent_id,
+            )
+            if args.background and result.success and (
+                agent_id in self._tasks or agent_id in self._subprocess_tasks
+            ):
+                ownership_transferred = True
+            return result
+        finally:
+            if not ownership_transferred:
+                self._active_agent_ids.discard(agent_id)
+
+    async def _run_args_owned(
+        self,
+        args: SpawnAgentArgs,
+        *,
+        durable_task: AgentTask | None = None,
+        wait_background: bool = False,
+        approval_mode: ApprovalMode = "auto",
+        agent_id: str,
+    ) -> ToolResult:
         if approval_mode not in {"auto", "live", "durable"}:
             raise ValueError(f"unsupported subagent approval mode: {approval_mode}")
         created_here = durable_task is None
         agent_definition = self._custom_agents.get(args.role)
+        if agent_definition is not None:
+            try:
+                agent_definition.ensure_current()
+            except ValueError as exc:
+                return ToolResult(success=False, output="", error=str(exc))
         if args.role not in AGENT_ROLES and agent_definition is None:
             expected = (*AGENT_ROLES, *sorted(self._custom_agents))
             return ToolResult(
@@ -1084,15 +1273,6 @@ class SpawnAgentTool(BaseTool):
         execution_role = (
             agent_definition.base_role if agent_definition is not None else args.role
         )
-
-        agent_id = args.agent_id or f"spawned-{uuid.uuid4().hex[:8]}"
-        existing = self._shared_state.get_status(agent_id)
-        if existing is not None and existing.status in {"idle", "working"}:
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Subagent {agent_id!r} is already running.",
-            )
 
         if durable_task is None:
             try:
@@ -1182,32 +1362,71 @@ class SpawnAgentTool(BaseTool):
                     "wait for active work or dependencies to finish."
                 ),
             )
-        self._emit_task_lifecycle(
-            "agent.task.leased",
-            durable_task.task_id,
-            state="leased",
-            owner_agent_id=agent_id,
-            attempt=durable_lease.task.attempt,
-        )
-        self._shared_state.tasks.start_task(durable_task.task_id, durable_lease.token)
-        self._emit_task_lifecycle(
-            "agent.task.running",
-            durable_task.task_id,
-            state="running",
-            owner_agent_id=agent_id,
-            attempt=durable_lease.task.attempt,
-        )
-        lease_heartbeat = _AgentLeaseHeartbeat(
-            self._shared_state.tasks,
-            durable_task.task_id,
-            durable_lease.token,
-            lease_seconds=self._task_lease_seconds,
-        )
-        supervisor_task = asyncio.current_task()
-        if supervisor_task is None:  # pragma: no cover - async runtime invariant
-            raise RuntimeError("subagent execution requires an asyncio task")
-        lease_heartbeat.bind(supervisor_task)
-        lease_heartbeat.start()
+        lease_heartbeat: _AgentLeaseHeartbeat | None = None
+        try:
+            self._emit_task_lifecycle(
+                "agent.task.leased",
+                durable_task.task_id,
+                state="leased",
+                owner_agent_id=agent_id,
+                attempt=durable_lease.task.attempt,
+            )
+            self._shared_state.tasks.start_task(
+                durable_task.task_id,
+                durable_lease.token,
+            )
+            self._emit_task_lifecycle(
+                "agent.task.running",
+                durable_task.task_id,
+                state="running",
+                owner_agent_id=agent_id,
+                attempt=durable_lease.task.attempt,
+            )
+            lease_heartbeat = _AgentLeaseHeartbeat(
+                self._shared_state.tasks,
+                durable_task.task_id,
+                durable_lease.token,
+                lease_seconds=self._task_lease_seconds,
+            )
+            supervisor_task = asyncio.current_task()
+            if supervisor_task is None:  # pragma: no cover - async runtime invariant
+                raise RuntimeError("subagent execution requires an asyncio task")
+            lease_heartbeat.bind(supervisor_task)
+            lease_heartbeat.start()
+        except BaseException as setup_error:
+            diagnostic = redact_text(str(setup_error))[:_SUBAGENT_DIAGNOSTIC_CHARS]
+
+            def release_claim() -> AgentTask:
+                return self._shared_state.tasks.fail_task(
+                    durable_task.task_id,
+                    durable_lease.token,
+                    f"subagent startup failed: {diagnostic}",
+                    retryable=not created_here,
+                )
+
+            try:
+                if lease_heartbeat is None:
+                    release_claim()
+                else:
+                    lease_heartbeat.finalize(release_claim)
+            except BaseException as rollback_error:
+                setup_error.add_note(
+                    "subagent startup lease rollback failed: "
+                    + redact_text(str(rollback_error))[:_SUBAGENT_DIAGNOSTIC_CHARS]
+                )
+            if lease_heartbeat is not None:
+                try:
+                    await lease_heartbeat.aclose()
+                except BaseException as heartbeat_cleanup_error:
+                    setup_error.add_note(
+                        "subagent startup heartbeat cleanup failed: "
+                        + redact_text(str(heartbeat_cleanup_error))[
+                            :_SUBAGENT_DIAGNOSTIC_CHARS
+                        ]
+                    )
+            raise
+
+        assert lease_heartbeat is not None
 
         isolation = args.isolation
         if isolation == "auto":
@@ -1220,6 +1439,7 @@ class SpawnAgentTool(BaseTool):
         if durable_task.metadata.get("accept_git_artifacts") is not True:
             dependency_git_artifacts = []
         worker_workspace = Path(self.safety_guard.project_root)
+        worker_workspace_identity = self.safety_guard.project_root_identity
         worktree_manager: WorktreeManager | None = None
         lease: WorktreeLease | None = None
         accepted_commit: str | None = None
@@ -1235,16 +1455,21 @@ class SpawnAgentTool(BaseTool):
                     lease,
                     dependency_git_artifacts,
                 )
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancellation:
                 if lease is not None:
-                    try:
-                        await worktree_manager.remove(
-                            lease,
-                            keep_branch=False,
-                            expected_head=accepted_commit or lease.base_commit,
+                    cleanup_error, cleanup_interrupted = await _settle_worktree_remove(
+                        worktree_manager,
+                        lease,
+                        keep_branch=False,
+                        expected_head=accepted_commit or lease.base_commit,
+                        name=f"ash-subagent-worktree-create-cleanup-{agent_id}",
+                    )
+                    if cleanup_error is not None:
+                        cancellation.add_note("subagent worktree cleanup failed")
+                    if cleanup_interrupted:
+                        cancellation.add_note(
+                            "subagent worktree cleanup was interrupted by cancellation"
                         )
-                    except WorktreeError:
-                        pass
                 cancelled = False
                 try:
                     lease_heartbeat.finalize(
@@ -1258,7 +1483,17 @@ class SpawnAgentTool(BaseTool):
                 except AgentTaskError:
                     pass
                 finally:
-                    await lease_heartbeat.aclose()
+                    try:
+                        await lease_heartbeat.aclose()
+                    except asyncio.CancelledError:
+                        cancellation.add_note(
+                            "subagent lease-heartbeat cleanup was interrupted"
+                        )
+                    except BaseException as cleanup_error:
+                        cancellation.add_note(
+                            "subagent lease-heartbeat cleanup failed: "
+                            + redact_text(str(cleanup_error))[:500]
+                        )
                 if cancelled:
                     self._emit_task_lifecycle(
                         "agent.task.cancelled",
@@ -1266,18 +1501,18 @@ class SpawnAgentTool(BaseTool):
                         state="cancelled",
                         reason="subagent spawn cancelled during worktree creation",
                     )
-                raise
+                raise cancellation
             except WorktreeError as exc:
                 failure_reason = f"worktree preparation failed: {exc}"
+                cleanup_interrupted = False
                 if lease is not None:
-                    try:
-                        await worktree_manager.remove(
-                            lease,
-                            keep_branch=False,
-                            expected_head=accepted_commit or lease.base_commit,
-                        )
-                    except WorktreeError:
-                        pass
+                    _cleanup_error, cleanup_interrupted = await _settle_worktree_remove(
+                        worktree_manager,
+                        lease,
+                        keep_branch=False,
+                        expected_head=accepted_commit or lease.base_commit,
+                        name=f"ash-subagent-worktree-error-cleanup-{agent_id}",
+                    )
                 try:
                     failed = lease_heartbeat.finalize(
                         lambda: self._shared_state.tasks.fail_task(
@@ -1289,6 +1524,12 @@ class SpawnAgentTool(BaseTool):
                     )
                 finally:
                     await lease_heartbeat.aclose()
+                if cleanup_interrupted:
+                    cleanup_cancellation = asyncio.CancelledError()
+                    cleanup_cancellation.add_note(
+                        "subagent worktree preparation failed before cleanup was cancelled"
+                    )
+                    raise cleanup_cancellation from exc
                 self._emit_task_lifecycle(
                     (
                         "agent.task.retrying"
@@ -1305,6 +1546,7 @@ class SpawnAgentTool(BaseTool):
                     error=f"Could not prepare isolated subagent worktree: {exc}",
                 )
             worker_workspace = lease.path
+            worker_workspace_identity = lease.path_identity
 
         branch_state: dict[str, str | None] = {"commit": None}
         attempt_state = {"side_effect_dispatched": False}
@@ -1340,6 +1582,7 @@ class SpawnAgentTool(BaseTool):
                     agent_definition=agent_definition,
                     task=context["task"],
                     workspace=worker_workspace,
+                    workspace_identity=worker_workspace_identity,
                     agent_id=context["agent_id"],
                     durable_task_id=durable_task.task_id,
                     durable_lease_token=durable_lease.token,
@@ -1589,22 +1832,51 @@ class SpawnAgentTool(BaseTool):
                         pass
                 raise
             finally:
+                primary_error = sys.exception()
+                cleanup_interrupted = False
                 if (
                     lease is not None
                     and worktree_manager is not None
                     and not cleanup_state["done"]
                 ):
-                    try:
-                        await worktree_manager.remove(
-                            lease,
-                            keep_branch=branch_state["commit"] is not None,
-                            expected_head=accepted_commit or lease.base_commit,
+                    cleanup_error, cleanup_interrupted = await _settle_worktree_remove(
+                        worktree_manager,
+                        lease,
+                        keep_branch=branch_state["commit"] is not None,
+                        expected_head=accepted_commit or lease.base_commit,
+                        name=f"ash-subagent-worktree-finalize-{agent_id}",
+                    )
+                    if cleanup_error is not None and not isinstance(
+                        cleanup_error, WorktreeError
+                    ):
+                        if primary_error is None:
+                            raise cleanup_error
+                        primary_error.add_note(
+                            "subagent worktree cleanup failed: "
+                            + redact_text(str(cleanup_error))[:500]
                         )
-                    except WorktreeError:
-                        # Preserve the original worker failure/cancellation. The
-                        # locked worktree remains visible to `git worktree list`.
-                        pass
-                await lease_heartbeat.aclose()
+                try:
+                    await lease_heartbeat.aclose()
+                except asyncio.CancelledError:
+                    cleanup_interrupted = True
+                except BaseException as cleanup_error:
+                    if primary_error is None:
+                        raise
+                    primary_error.add_note(
+                        "subagent lease-heartbeat cleanup failed: "
+                        + redact_text(str(cleanup_error))[:500]
+                    )
+                if cleanup_interrupted:
+                    if isinstance(primary_error, asyncio.CancelledError):
+                        primary_error.add_note(
+                            "subagent cleanup was interrupted by repeated cancellation"
+                        )
+                    else:
+                        cancellation = asyncio.CancelledError()
+                        cancellation.add_note(
+                            "subagent cleanup completed after caller cancellation"
+                        )
+                        raise cancellation from primary_error
 
         if args.background:
             if wait_background:
@@ -1656,6 +1928,7 @@ class SpawnAgentTool(BaseTool):
         agent_definition: "AgentDefinition | None",
         task: str,
         workspace: Path,
+        workspace_identity: tuple[int, int] | None,
         agent_id: str,
         durable_task_id: str,
         durable_lease_token: str,
@@ -1668,10 +1941,13 @@ class SpawnAgentTool(BaseTool):
         durable_attempt: int,
         attempt_state: dict[str, bool],
     ) -> tuple[str, int, float]:
-        provider = self._provider_factory()
-        guard = SafetyGuard(workspace)
+        guard = SafetyGuard(
+            workspace,
+            expected_project_root_identity=workspace_identity,
+        )
         sandbox = SandboxManager(
             workspace_root=workspace,
+            expected_workspace_identity=workspace_identity,
             network=False,
             backend_preference=(
                 self._config.sandbox_backend if self._config is not None else "auto"
@@ -1680,6 +1956,16 @@ class SpawnAgentTool(BaseTool):
                 self._config.sandbox_docker_image
                 if self._config is not None
                 else "ash-sandbox:latest"
+            ),
+            docker_memory_mb=(
+                self._config.sandbox_docker_memory_mb
+                if self._config is not None
+                else 4096
+            ),
+            docker_cpus=(
+                self._config.sandbox_docker_cpus
+                if self._config is not None
+                else 2.0
             ),
         )
         tools = _worker_tools(execution_role, guard, sandbox)
@@ -1749,19 +2035,51 @@ class SpawnAgentTool(BaseTool):
                 attempt_state["side_effect_dispatched"] = True
 
         worker_ui.subscribe(observe_worker_event)
-        loop = AshLoop(
-            session_store=worker_store,
-            provider=provider,
-            safety_guard=guard,
-            ui=worker_ui,
-            project_root=workspace,
-            tools=tools,
-            safety_tier=worker_safety_tier,
-            system_prompt=instructions,
-            max_turn_iterations=self._max_turn_iterations,
-            config=worker_config,
-            enable_semantic_memory=False,
-        )
+        provider = self._provider_factory()
+        try:
+            loop = AshLoop(
+                session_store=worker_store,
+                provider=provider,
+                safety_guard=guard,
+                ui=worker_ui,
+                project_root=workspace,
+                tools=tools,
+                safety_tier=worker_safety_tier,
+                system_prompt=instructions,
+                max_turn_iterations=self._max_turn_iterations,
+                config=worker_config,
+                enable_project_memory=False,
+            )
+        except BaseException as primary_error:
+            close_task = asyncio.create_task(
+                provider.aclose(),
+                name=f"ash-subagent-provider-close-{agent_id}",
+            )
+            close_error, close_interrupted = await _settle_spawn_cleanup_task(
+                close_task
+            )
+            if close_error is not None and not isinstance(
+                close_error, asyncio.CancelledError
+            ):
+                primary_error.add_note(
+                    "subagent provider cleanup failed: "
+                    + redact_text(str(close_error))[:500]
+                )
+            if close_interrupted and not isinstance(
+                primary_error, asyncio.CancelledError
+            ):
+                cancellation = asyncio.CancelledError()
+                cancellation.add_note(
+                    "subagent worker setup failed before provider cleanup was cancelled: "
+                    + redact_text(str(primary_error))[:500]
+                )
+                if close_error is not None:
+                    cancellation.add_note(
+                        "subagent provider cleanup also failed: "
+                        + redact_text(str(close_error))[:500]
+                    )
+                raise cancellation from primary_error
+            raise
         loop.permission_policy = worker_policy
         if approval_broker is not None:
 
@@ -2131,6 +2449,32 @@ class SpawnAgentTool(BaseTool):
             await asyncio.sleep(0.1)
 
     async def aclose(self) -> None:
+        if self._closed:
+            return
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_owned(),
+                name="ash-spawn-agent-close",
+            )
+        cleanup_error, interrupted = await _settle_spawn_cleanup_task(
+            self._close_task
+        )
+        if cleanup_error is None:
+            self._closed = True
+        else:
+            self._close_task = None
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if cleanup_error is not None:
+                cancellation.add_note(
+                    "spawn-agent cleanup failed while cancellation was pending: "
+                    + redact_text(str(cleanup_error))[:500]
+                )
+            raise cancellation from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    async def _close_owned(self) -> None:
         if self._dispatcher_task is not None:
             self._dispatcher_task.cancel()
             await asyncio.gather(self._dispatcher_task, return_exceptions=True)
@@ -2139,6 +2483,7 @@ class SpawnAgentTool(BaseTool):
         for agent_task in tasks:
             agent_task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
         subprocess_tasks = list(self._subprocess_tasks.items())
         if subprocess_tasks:
             await asyncio.gather(
@@ -2150,6 +2495,8 @@ class SpawnAgentTool(BaseTool):
             )
         self._subprocess_tasks.clear()
         self._subprocess_task_ids.clear()
+        self._active_agent_ids.clear()
+        await self._close_retired_approval_servers()
         self._shared_state.close()
 
     def _finish_background_task(
@@ -2158,6 +2505,7 @@ class SpawnAgentTool(BaseTool):
         task: asyncio.Task[AgentReport],
     ) -> None:
         self._tasks.pop(agent_id, None)
+        self._active_agent_ids.discard(agent_id)
         if task.cancelled():
             return
         error = task.exception()
@@ -2177,6 +2525,7 @@ class SpawnAgentTool(BaseTool):
         if self._subprocess_tasks.get(agent_id) is task:
             self._subprocess_tasks.pop(agent_id, None)
         self._subprocess_task_ids.discard(task_id)
+        self._active_agent_ids.discard(agent_id)
         if task.cancelled():
             return
         try:
@@ -2216,25 +2565,50 @@ class SpawnAgentTool(BaseTool):
         *,
         grace_seconds: float = 2.0,
     ) -> None:
-        await self._shared_state.send_message_async(
-            "lead",
-            agent_id,
-            "stop",
-            {},
-        )
+        interrupted = False
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=grace_seconds)
-            return
-        except asyncio.TimeoutError:
-            pass
+            await self._shared_state.send_message_async(
+                "lead",
+                agent_id,
+                "stop",
+                {},
+            )
         except asyncio.CancelledError:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            raise
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
         except Exception:
-            return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+            # Graceful signaling is advisory. Forced task cancellation below
+            # remains the authoritative cleanup path when persistence fails.
+            pass
+        else:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=grace_seconds)
+                return
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                interrupted = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+            except Exception:
+                return
+        if not task.done():
+            task.cancel()
+        task_error, task_interrupted = await _settle_spawn_cleanup_task(task)
+        interrupted = interrupted or task_interrupted
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if task_error is not None and not isinstance(
+                task_error, asyncio.CancelledError
+            ):
+                cancellation.add_note(
+                    "subprocess monitor cleanup failed: "
+                    + redact_text(str(task_error))[:500]
+                )
+            raise cancellation from task_error
 
     async def stop(self, agent_id: str) -> bool:
         task = self._tasks.get(agent_id)

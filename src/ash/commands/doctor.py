@@ -10,14 +10,14 @@ import platform
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Any
 
 from ash.config import AshConfig
 from ash.mcp.server import load_mcp_servers
+from ash.platform_support import platform_support_error
 from ash.providers.readiness import (
     ProviderConfigurationError,
     ProviderVerificationError,
@@ -26,7 +26,9 @@ from ash.providers.readiness import (
 )
 from ash.safe_io import validate_unlinked_file_path
 from ash.sandbox import SandboxManager
+from ash.safety.browser_process import run_browser_subprocess
 from ash.safety.environment import resolve_host_executable
+from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
 from ash.ui.safe_text import terminal_safe_text
 
 
@@ -136,7 +138,7 @@ async def main() -> None:
 asyncio.run(main())
 """
         try:
-            completed = subprocess.run(
+            completed = run_browser_subprocess(
                 [sys.executable, "-I", "-c", probe, cdp_url],
                 check=False,
                 capture_output=True,
@@ -158,7 +160,7 @@ asyncio.run(main())
             "Start the configured Chromium-family browser with remote debugging, or clear browser_cdp_url.",
         )
     try:
-        completed = subprocess.run(
+        completed = run_browser_subprocess(
             [sys.executable, "-I", "-m", "playwright", "install", "--list"],
             check=False,
             capture_output=True,
@@ -183,25 +185,19 @@ asyncio.run(main())
 
 
 def _check_storage(config: AshConfig) -> DoctorCheck:
-    temporary_directory: Path | None = None
-    database: Path | None = None
+    pinned: PinnedSQLiteDatabase | None = None
     connection: sqlite3.Connection | None = None
     result = DoctorCheck("storage", "fail", "Storage check did not complete")
     try:
-        probe_anchor = validate_unlinked_file_path(
-            config.db_directory / "probe.sqlite3", label="database probe"
+        database = config.db_directory / f".doctor-{uuid.uuid4().hex}.sqlite3"
+        pinned = PinnedSQLiteDatabase.prepare(
+            database,
+            label="database probe",
         )
-        database_directory = probe_anchor.parent
-        database_directory.mkdir(parents=True, exist_ok=True)
-        probe_anchor = validate_unlinked_file_path(
-            database_directory / "probe.sqlite3", label="database probe"
+        connection = pinned.connect(
+            label="database probe",
+            check_same_thread=True,
         )
-        database_directory = probe_anchor.parent
-        temporary_directory = Path(
-            tempfile.mkdtemp(prefix=".doctor-", dir=database_directory)
-        )
-        database = temporary_directory / "probe.sqlite3"
-        connection = sqlite3.connect(database)
         connection.execute("CREATE TABLE doctor_probe (value TEXT NOT NULL)")
         connection.execute("INSERT INTO doctor_probe VALUES (?)", ("ok",))
         connection.commit()
@@ -209,8 +205,9 @@ def _check_storage(config: AshConfig) -> DoctorCheck:
             raise sqlite3.DatabaseError("SQLite round-trip verification failed")
         if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
             raise sqlite3.DatabaseError("SQLite integrity check failed")
-        result = DoctorCheck("storage", "pass", str(database_directory))
-    except (OSError, sqlite3.Error, ValueError) as exc:
+        pinned.verify(label="database probe")
+        result = DoctorCheck("storage", "pass", str(pinned.path.parent))
+    except (OSError, sqlite3.Error, ValueError, SQLitePathError) as exc:
         result = DoctorCheck(
             "storage", "fail", f"Database directory is not writable: {exc}"
         )
@@ -221,21 +218,26 @@ def _check_storage(config: AshConfig) -> DoctorCheck:
             connection.close()
         except (OSError, sqlite3.Error) as exc:
             cleanup_errors.append(str(exc))
-    if database is not None:
-        for path in (
-            database,
-            Path(f"{database}-journal"),
-            Path(f"{database}-wal"),
-            Path(f"{database}-shm"),
-        ):
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as exc:
-                cleanup_errors.append(str(exc))
-    if temporary_directory is not None:
+    if pinned is not None:
         try:
-            temporary_directory.rmdir()
-        except OSError as exc:
+            with pinned.parent_directory(label="database probe") as directory:
+                for suffix in ("-journal", "-wal", "-shm"):
+                    name = f"{pinned.path.name}{suffix}"
+                    metadata = directory.stat(name)
+                    if metadata is not None:
+                        directory.unlink(name, expected=metadata)
+                metadata = directory.stat(pinned.path.name)
+                if metadata is not None:
+                    if (
+                        int(metadata.st_dev) != pinned.file_device
+                        or int(metadata.st_ino) != pinned.file_inode
+                    ):
+                        raise SQLitePathError(
+                            "database probe file identity changed during cleanup"
+                        )
+                    directory.unlink(pinned.path.name, expected=metadata)
+                directory.sync()
+        except (OSError, SQLitePathError) as exc:
             cleanup_errors.append(str(exc))
     if cleanup_errors:
         result = DoctorCheck(
@@ -383,7 +385,7 @@ def _check_mcp(config: AshConfig) -> DoctorCheck:
 
 
 def _check_extensions(config: AshConfig) -> DoctorCheck:
-    from ash.commands.extensions import discover_extensions
+    from ash.plugins.inventory import discover_extensions
 
     inventory = discover_extensions(config.workspace_root)
     if inventory.errors:
@@ -522,12 +524,27 @@ async def _check_connectivity(config: AshConfig) -> DoctorCheck:
 
 
 async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
+    platform_error = platform_support_error()
     checks: list[DoctorCheck] = [
         DoctorCheck(
+            "platform",
+            "fail" if platform_error else "pass",
+            f"{platform.system()} {platform.machine()}",
+            platform_error or "",
+        ),
+        DoctorCheck(
             "runtime",
-            "pass" if sys.version_info >= (3, 11) else "fail",
-            f"Python {platform.python_version()} on {platform.system()} {platform.machine()}",
-            "Install Python 3.11 or newer." if sys.version_info < (3, 11) else "",
+            (
+                "pass"
+                if (3, 12) <= sys.version_info[:2] < (3, 15)
+                else "fail"
+            ),
+            f"Python {platform.python_version()}",
+            (
+                "Install a supported Python runtime (3.12 through 3.14)."
+                if sys.version_info < (3, 12) or sys.version_info >= (3, 15)
+                else ""
+            ),
         )
     ]
     try:
@@ -545,9 +562,6 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
     git = resolve_host_executable(
         "git", workspace_root=config.workspace_root, cwd=config.workspace_root
     )
-    ripgrep = resolve_host_executable(
-        "rg", workspace_root=config.workspace_root, cwd=config.workspace_root
-    )
     checks.extend(
         [
             DoctorCheck(
@@ -564,11 +578,6 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
                 "pass" if git else "warn",
                 git or "git is not installed",
             ),
-            DoctorCheck(
-                "ripgrep",
-                "pass" if ripgrep else "warn",
-                ripgrep or "rg is unavailable; Python search fallback will be used",
-            ),
         ]
     )
     sandbox = SandboxManager(
@@ -576,6 +585,8 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
         network=config.sandbox_network,
         backend_preference=config.sandbox_backend,
         docker_image=config.sandbox_docker_image,
+        docker_memory_mb=config.sandbox_docker_memory_mb,
+        docker_cpus=config.sandbox_docker_cpus,
     )
     sandbox_status = sandbox.status()
     checks.append(

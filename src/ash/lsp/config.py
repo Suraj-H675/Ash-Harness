@@ -9,8 +9,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from ash.json_utils import strict_json_loads
 from ash.safe_io import read_bounded_bytes
 from ash.safety.environment import resolve_host_executable
+from ash.safety.guard import SafetyGuard
+from ash.safety.scoped_io import ScopedIOError, snapshot_scoped_file
 
 
 MAX_LSP_CONFIG_BYTES = 256 * 1024
@@ -109,6 +112,7 @@ def load_lsp_server_configs(
     *,
     include_project: bool,
     detect_builtins: bool = True,
+    project_guard: SafetyGuard | None = None,
 ) -> dict[str, LSPServerConfig]:
     """Merge installed built-ins, user config, and trusted project config."""
 
@@ -116,7 +120,7 @@ def load_lsp_server_configs(
     if detect_builtins:
         for config in BUILTIN_SERVERS:
             executable = _resolve_executable(
-                config.command[0], workspace, allow_workspace=include_project
+                config.command[0], workspace, allow_workspace=False
             )
             if executable is None:
                 continue
@@ -130,9 +134,14 @@ def load_lsp_server_configs(
     if include_project:
         paths.append((workspace / ".ash" / "lsp.json", workspace))
     for path, trusted_root in paths:
-        if not path.is_file():
+        payload = _read_config(
+            path,
+            trusted_root=trusted_root,
+            project_guard=(project_guard if trusted_root is not None else None),
+        )
+        if payload is None:
             continue
-        for name, raw in _read_config(path, trusted_root=trusted_root).items():
+        for name, raw in payload.items():
             existing = servers.get(name)
             parsed = _parse_server(name, raw, path, existing)
             if parsed.disabled:
@@ -202,16 +211,35 @@ def _read_config(
     path: Path,
     *,
     trusted_root: Path | None = None,
-) -> dict[str, Any]:
+    project_guard: SafetyGuard | None = None,
+) -> dict[str, Any] | None:
+    if project_guard is not None:
+        try:
+            _, snapshot = snapshot_scoped_file(
+                path,
+                project_guard,
+                max_bytes=MAX_LSP_CONFIG_BYTES,
+            )
+        except ScopedIOError as exc:
+            raise ValueError(f"invalid LSP config {path}: {exc}") from exc
+        if not snapshot.exists:
+            return None
+        raw = snapshot.content
+    else:
+        if not path.is_file():
+            return None
+        try:
+            raw = read_bounded_bytes(
+                path,
+                MAX_LSP_CONFIG_BYTES,
+                label="LSP config",
+                trusted_root=trusted_root,
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"invalid LSP config {path}: {exc}") from exc
     try:
-        raw = read_bounded_bytes(
-            path,
-            MAX_LSP_CONFIG_BYTES,
-            label="LSP config",
-            trusted_root=trusted_root,
-        )
-        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
-    except (OSError, ValueError) as exc:
+        payload = strict_json_loads(raw)
+    except (UnicodeError, ValueError) as exc:
         raise ValueError(f"invalid LSP config {path}: {exc}") from exc
     if not isinstance(payload, dict) or set(payload) != {"servers"}:
         raise ValueError(f"LSP config {path} must contain only a servers object")
@@ -357,12 +385,11 @@ def _resolve_executable(
     allow_workspace: bool,
     search_path: str | None = None,
 ) -> str | None:
-    suffix = ".cmd" if os.name == "nt" else ""
-    local = workspace / "node_modules" / ".bin" / f"{command}{suffix}"
+    local = workspace / "node_modules" / ".bin" / command
     if (
         allow_workspace
         and local.is_file()
-        and (os.name == "nt" or os.access(local, os.X_OK))
+        and os.access(local, os.X_OK)
     ):
         return str(local.resolve())
     return resolve_host_executable(
@@ -388,9 +415,7 @@ def _resolve_lsp_executable(
         candidate = (
             command_path if command_path.is_absolute() else workspace / command_path
         )
-        if not candidate.is_file() or (
-            os.name != "nt" and not os.access(candidate, os.X_OK)
-        ):
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
             return None
         return str(candidate)
     return resolve_host_executable(
@@ -399,12 +424,3 @@ def _resolve_lsp_executable(
         cwd=workspace,
         search_path=search_path,
     )
-
-
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    value: dict[str, Any] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate JSON object key: {key!r}")
-        value[key] = item
-    return value

@@ -8,10 +8,11 @@ import os
 import threading
 import tomllib
 from collections.abc import Mapping
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
+from dotenv import dotenv_values
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
@@ -21,26 +22,24 @@ from pydantic_settings import (
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
-from pydantic_settings.sources.providers.dotenv import (
-    dotenv_values,
-    parse_env_vars,
-)
 
 from ash.provider_catalog import BUILTIN_PROVIDER_IDS
 from ash.profiles import active_profile_name, profile_directory, profile_exists
 from ash.safe_io import read_bounded_bytes
 
 
-CURRENT_CONFIG_SCHEMA_VERSION = 1
+CURRENT_CONFIG_SCHEMA_VERSION = 2
 MAX_CONFIG_FILE_BYTES = 1024 * 1024
 MAX_DOTENV_FILE_BYTES = 1024 * 1024
 MAX_PLUGIN_MARKETPLACES = 32
 MAX_PLUGIN_MARKETPLACE_SOURCE_CHARS = 4096
+MAX_FALLBACK_MODELS = 16
 
 _INITIAL_USER_CONFIG_PATH = Path.home() / ".ash" / "ash.toml"
 _INITIAL_DOTENV_PATH = Path.home() / ".ash" / ".env"
 _DOTENV_RUNTIME_LOCK = threading.RLock()
 _DOTENV_RUNTIME_VALUES: dict[str, str] = {}
+_VALIDATION_ONLY_CONTEXT = object()
 
 
 def validate_plugin_marketplace_source(source: Any, *, publisher: str) -> str:
@@ -58,19 +57,15 @@ def validate_plugin_marketplace_source(source: Any, *, publisher: str) -> str:
     ):
         raise ValueError(f"plugin marketplace source for {publisher!r} is invalid")
     if "://" in normalized:
-        parsed = urlsplit(normalized)
-        if (
-            parsed.scheme.casefold() != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or bool(parsed.query)
-            or bool(parsed.fragment)
-        ):
+        from ash.plugins.catalog import PluginCatalogError, validate_catalog_https_url
+
+        try:
+            normalized = validate_catalog_https_url(normalized)
+        except PluginCatalogError as exc:
             raise ValueError(
                 "plugin marketplace URLs must be credential-free HTTPS URLs "
                 "without query strings or fragments"
-            )
+            ) from exc
     return normalized
 
 
@@ -118,6 +113,34 @@ def validate_plugin_marketplace_key_ids(value: Any) -> dict[str, str]:
             raise ValueError("plugin marketplace publisher must be a string")
         publisher = validate_catalog_publisher(raw_publisher)
         normalized[publisher] = validate_catalog_key_id(raw_key_id)
+    return normalized
+
+
+def validate_plugin_marketplace_key_fingerprints(value: Any) -> dict[str, str]:
+    """Validate publisher-to-public-key fingerprint bindings for marketplaces."""
+
+    from ash.plugins.catalog import (
+        validate_catalog_key_fingerprint,
+        validate_catalog_publisher,
+    )
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            "plugin_marketplace_key_fingerprints must be a publisher-to-fingerprint table"
+        )
+    if len(value) > MAX_PLUGIN_MARKETPLACES:
+        raise ValueError(
+            "plugin_marketplace_key_fingerprints supports at most "
+            f"{MAX_PLUGIN_MARKETPLACES} entries"
+        )
+    normalized: dict[str, str] = {}
+    for raw_publisher, raw_fingerprint in value.items():
+        if not isinstance(raw_publisher, str):
+            raise ValueError("plugin marketplace publisher must be a string")
+        publisher = validate_catalog_publisher(raw_publisher)
+        normalized[publisher] = validate_catalog_key_fingerprint(raw_fingerprint)
     return normalized
 
 
@@ -169,6 +192,7 @@ PROJECT_CONFIG_FIELDS = frozenset(
         "prompt_cache_enabled",
         "prompt_cache_retention",
         "provider_max_attempts",
+        "provider_request_timeout_seconds",
         "provider_retry_base_delay",
         "provider_retry_max_delay",
         "provider_circuit_failure_threshold",
@@ -314,7 +338,9 @@ def _read_toml(path: Path, *, trusted_root: Path | None = None) -> dict[str, Any
 class _BoundedTomlConfigSettingsSource(TomlConfigSettingsSource):
     """Pydantic TOML source that cannot read an unbounded local file."""
 
-    def _read_file(self, file_path: Path) -> dict[str, Any]:
+    def _read_file(self, file_path: Path | Traversable) -> dict[str, Any]:
+        if not isinstance(file_path, Path):
+            return super()._read_file(file_path)
         raw = read_bounded_bytes(
             file_path,
             MAX_CONFIG_FILE_BYTES,
@@ -338,12 +364,11 @@ class _BoundedDotEnvSettingsSource(DotEnvSettingsSource):
         )
         encoding = self.env_file_encoding or "utf-8"
         file_vars = dotenv_values(stream=io.StringIO(raw.decode(encoding)))
-        return parse_env_vars(
-            file_vars,
-            self.case_sensitive,
-            self.env_ignore_empty,
-            self.env_parse_none_str,
-        )
+        return {
+            key if self.case_sensitive else key.lower(): value
+            for key, value in file_vars.items()
+            if not (self.env_ignore_empty and value == "")
+        }
 
 
 def _filter_project_config(
@@ -398,6 +423,11 @@ class AshConfig(BaseSettings):
         toml_file=str(_INITIAL_USER_CONFIG_PATH),
         env_file=str(_INITIAL_DOTENV_PATH),
         extra="ignore",
+        protected_namespaces=(
+            "model_validate",
+            "model_dump",
+            "settings_customise_sources",
+        ),
     )
 
     _config_sources: dict[str, tuple[str, str]] = PrivateAttr(default_factory=dict)
@@ -410,7 +440,10 @@ class AshConfig(BaseSettings):
     config_schema_version: int = Field(
         CURRENT_CONFIG_SCHEMA_VERSION,
         ge=1,
-        description="Ash config schema version. Newer versions are refused.",
+        description=(
+            "Ash config schema version. Supported older versions are migrated in "
+            "memory; newer versions are refused."
+        ),
     )
     temperature: float = Field(0.0, description="Model generation temperature.")
 
@@ -488,6 +521,12 @@ class AshConfig(BaseSettings):
         ge=1,
         le=10,
         description="Maximum provider attempts before any response output is emitted.",
+    )
+    provider_request_timeout_seconds: float = Field(
+        1800.0,
+        ge=1.0,
+        le=86_400.0,
+        description="Maximum wall-clock seconds for one provider request attempt.",
     )
     provider_retry_base_delay: float = Field(
         0.5,
@@ -649,6 +688,22 @@ class AshConfig(BaseSettings):
         "ash-sandbox:latest",
         description="Local Docker image used by the Docker sandbox backend.",
     )
+    sandbox_docker_memory_mb: int = Field(
+        4096,
+        ge=0,
+        le=1_048_576,
+        description=(
+            "Docker sandbox memory limit in MiB; 0 disables the Docker memory limit."
+        ),
+    )
+    sandbox_docker_cpus: float = Field(
+        2.0,
+        ge=0.0,
+        le=1024.0,
+        description=(
+            "Docker sandbox CPU quota in cores; 0 disables the Docker CPU limit."
+        ),
+    )
     workspace_root: Path = Field(
         default_factory=discover_workspace_root,
         description="Scoped base folder containing project target code.",
@@ -661,7 +716,9 @@ class AshConfig(BaseSettings):
         default_factory=list,
         description=(
             "User-owned environment variable names explicitly forwarded to shell "
-            "commands. Values are read from the Ash process environment at execution time."
+            "commands. Values are read from the Ash process environment at execution time. "
+            "Including PATH explicitly also opts into workspace-local PATH entries; "
+            "otherwise Ash removes workspace-controlled PATH directories."
         ),
     )
     allowed_web_domains: list[str] = Field(
@@ -724,6 +781,13 @@ class AshConfig(BaseSettings):
         description=(
             "User-owned signing-key bindings for registered plugin marketplace "
             "publishers. Project config cannot set this field."
+        ),
+    )
+    plugin_marketplace_key_fingerprints: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "User-owned public-key fingerprint bindings for registered plugin "
+            "marketplace publishers. Project config cannot set this field."
         ),
     )
 
@@ -824,13 +888,13 @@ class AshConfig(BaseSettings):
         ),
     )
     memory_backend: str = Field(
-        "auto",
-        description="Memory backend: auto, chroma, fts5, or off.",
+        "sqlite",
+        description="Project-memory backend: built-in SQLite or off.",
     )
     memory_auto_index: bool = Field(
         False,
         description=(
-            "Automatically index bounded workspace source files into semantic "
+            "Automatically index bounded workspace source files into project "
             "memory for trusted projects."
         ),
     )
@@ -846,22 +910,51 @@ class AshConfig(BaseSettings):
         le=1_048_576,
         description="Maximum size of each file indexed automatically.",
     )
-    chroma_persist_dir: Path = Field(
-        Path(".ash/chroma"),
-        description=(
-            "Directory for semantic-memory persistence. Relative paths are anchored "
-            "to the workspace; absolute paths use a per-workspace namespace."
-        ),
-    )
     embedding_provider: str = Field(
-        "auto",
-        description="Embedding provider: 'auto' (deterministic), 'onnx' (local), 'openai' (remote)",
+        "none",
+        description=(
+            "Optional semantic embedding provider: none, onnx (local), or openai (remote)."
+        ),
     )
     openai_api_key: str = Field("", description="API key for OpenAI embeddings")
     onnx_model_path: Path = Field(
         Path(".ash/model.onnx"),
         description="Path to ONNX MiniLM model for local embeddings",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_memory_config(cls, value: Any) -> Any:
+        """Normalize schema-v1 project-memory settings into schema v2."""
+
+        if not isinstance(value, Mapping):
+            return value
+        migrated = dict(value)
+        raw_version = migrated.get("config_schema_version")
+        schema_v1 = raw_version is None or raw_version == 1 or raw_version == "1"
+        if not schema_v1:
+            return value
+
+        backend = migrated.get("memory_backend")
+        legacy_backend = (
+            backend.casefold()
+            if isinstance(backend, str)
+            and backend.casefold() in {"auto", "chroma", "fts5"}
+            else None
+        )
+        embedding = migrated.get("embedding_provider")
+        legacy_embedding = (
+            isinstance(embedding, str) and embedding.casefold() == "auto"
+        )
+        if legacy_backend is None and not legacy_embedding and raw_version is None:
+            return value
+
+        if legacy_backend is not None:
+            migrated["memory_backend"] = "sqlite"
+        if legacy_embedding:
+            migrated["embedding_provider"] = "none"
+        migrated["config_schema_version"] = CURRENT_CONFIG_SCHEMA_VERSION
+        return migrated
 
     @model_validator(mode="before")
     @classmethod
@@ -883,9 +976,31 @@ class AshConfig(BaseSettings):
     @field_validator("memory_backend")
     @classmethod
     def validate_memory_backend(cls, value: str) -> str:
-        if value not in {"auto", "chroma", "fts5", "off"}:
-            raise ValueError("memory_backend must be auto, chroma, fts5, or off")
+        if value not in {"sqlite", "off"}:
+            raise ValueError("memory_backend must be sqlite or off")
         return value
+
+    @field_validator("workspace_root")
+    @classmethod
+    def freeze_workspace_root(cls, value: Path) -> Path:
+        """Bind the workspace to one canonical target for the runtime lifetime."""
+
+        return value.expanduser().resolve(strict=False)
+
+    @field_validator("db_directory")
+    @classmethod
+    def freeze_database_directory(cls, value: Path) -> Path:
+        """Freeze cwd-relative state paths without following link indirection."""
+
+        return Path(os.path.abspath(value.expanduser()))
+
+    @field_validator("embedding_provider")
+    @classmethod
+    def validate_embedding_provider(cls, value: str) -> str:
+        normalized = value.casefold()
+        if normalized not in {"none", "onnx", "openai"}:
+            raise ValueError("embedding_provider must be none, onnx, or openai")
+        return normalized
 
     @field_validator("prompt_cache_retention")
     @classmethod
@@ -900,17 +1015,41 @@ class AshConfig(BaseSettings):
     def validate_model_string(cls, value: str) -> str:
         """Require a non-empty ``provider/model`` identifier."""
 
-        import os
+        from ash.providers.identifiers import parse_model_string
 
         if "/" not in value and os.environ.get("ASH_PROVIDER"):
             value = f"{os.environ['ASH_PROVIDER']}/{value}"
-        provider, separator, model_name = value.partition("/")
-        if not separator or not provider.strip() or not model_name.strip():
+        try:
+            provider, model_name = parse_model_string(value)
+        except ValueError as exc:
             raise ValueError(
                 "model must use provider/model format, for example "
                 "'anthropic/claude-sonnet-4-5' or 'ollama/qwen2.5-coder:7b'"
+            ) from exc
+        return f"{provider}/{model_name}"
+
+    @field_validator("fallback_models")
+    @classmethod
+    def validate_fallback_models(cls, value: list[str]) -> list[str]:
+        from ash.providers.identifiers import parse_model_string
+
+        if len(value) > MAX_FALLBACK_MODELS:
+            raise ValueError(
+                f"fallback_models cannot contain more than {MAX_FALLBACK_MODELS} models"
             )
-        return f"{provider.strip()}/{model_name.strip()}"
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            try:
+                provider, model_name = parse_model_string(item)
+            except ValueError as exc:
+                raise ValueError(f"invalid fallback model: {item!r}") from exc
+            canonical = f"{provider}/{model_name}"
+            if canonical in seen:
+                raise ValueError(f"duplicate fallback model: {canonical}")
+            seen.add(canonical)
+            normalized.append(canonical)
+        return normalized
 
     @field_validator("safety_tier")
     @classmethod
@@ -956,6 +1095,15 @@ class AshConfig(BaseSettings):
         if not normalized or any(char.isspace() for char in normalized):
             raise ValueError("sandbox_docker_image must be a non-empty image reference")
         return normalized
+
+    @field_validator("sandbox_docker_memory_mb")
+    @classmethod
+    def validate_sandbox_docker_memory_mb(cls, value: int) -> int:
+        if 0 < value < 6:
+            raise ValueError(
+                "sandbox_docker_memory_mb must be 0 or at least 6 MiB"
+            )
+        return value
 
     @field_validator("config_schema_version")
     @classmethod
@@ -1058,6 +1206,13 @@ class AshConfig(BaseSettings):
     @classmethod
     def validate_plugin_marketplace_key_ids_field(cls, value: Any) -> dict[str, str]:
         return validate_plugin_marketplace_key_ids(value)
+
+    @field_validator("plugin_marketplace_key_fingerprints", mode="before")
+    @classmethod
+    def validate_plugin_marketplace_key_fingerprints_field(
+        cls, value: Any
+    ) -> dict[str, str]:
+        return validate_plugin_marketplace_key_fingerprints(value)
 
     @field_validator("browser_cdp_url")
     @classmethod
@@ -1257,6 +1412,12 @@ class AshConfig(BaseSettings):
         )
 
     @classmethod
+    def validate_persisted_values(cls, values: Mapping[str, Any]) -> None:
+        """Validate persisted settings without publishing runtime dotenv values."""
+
+        cls.model_validate(dict(values), context=_VALIDATION_ONLY_CONTEXT)
+
+    @classmethod
     def load(
         cls,
         *,
@@ -1305,18 +1466,6 @@ class AshConfig(BaseSettings):
 
         dotenv_details = _apply_legacy_model_values(dotenv_values, raw_dotenv_values)
         env_details = _apply_legacy_model_values(env_values, os.environ)
-        from ash.commands.config import file_backed_env_values
-
-        file_backed_values = file_backed_env_values(dotenv_path)
-        for field in list(env_values):
-            env_key = env_details.get(field, f"ASH_{field.upper()}")
-            if (
-                file_backed_values.get(env_key) == os.environ.get(env_key)
-                and dotenv_values.get(field) == env_values[field]
-            ):
-                del env_values[field]
-                env_details.pop(field, None)
-
         base_values: dict[str, Any] = {}
         for values in (dotenv_values, user_values, env_values, overrides):
             base_values.update(values)
@@ -1343,6 +1492,14 @@ class AshConfig(BaseSettings):
         sources: dict[str, tuple[str, str]] = {
             field: ("default", "Ash built-in default") for field in cls.model_fields
         }
+        if active_profile != "default":
+            _merge_config_layer(
+                merged,
+                sources,
+                {"db_directory": profile_state_directory / "db"},
+                source="profile-default",
+                detail=f"isolated state for profile {active_profile!r}",
+            )
         _merge_config_layer(
             merged,
             sources,
@@ -1389,6 +1546,53 @@ class AshConfig(BaseSettings):
             source=_override_source,
             detail=_override_detail,
         )
+
+        raw_schema_version = merged.get("config_schema_version")
+        schema_v1 = (
+            raw_schema_version is None
+            or raw_schema_version == 1
+            or raw_schema_version == "1"
+        )
+        raw_memory_backend = merged.get("memory_backend")
+        legacy_memory_backend = (
+            raw_memory_backend.casefold()
+            if schema_v1
+            and isinstance(raw_memory_backend, str)
+            and raw_memory_backend.casefold() in {"auto", "chroma", "fts5"}
+            else None
+        )
+        raw_embedding_provider = merged.get("embedding_provider")
+        legacy_embedding_provider = (
+            schema_v1
+            and isinstance(raw_embedding_provider, str)
+            and raw_embedding_provider.casefold() == "auto"
+        )
+        if legacy_memory_backend is not None:
+            source, detail = sources["memory_backend"]
+            diagnostics.append(
+                "Config schema v1 memory_backend="
+                f"{legacy_memory_backend!r} from {source} ({detail}) is migrated "
+                "to 'sqlite' for schema v2. Any legacy memory index files are "
+                "derived state and are left untouched; run `/memory index-workspace` "
+                "in the REPL to rebuild the current index."
+            )
+        if legacy_embedding_provider:
+            source, detail = sources["embedding_provider"]
+            diagnostics.append(
+                "Config schema v1 embedding_provider='auto' from "
+                f"{source} ({detail}) is migrated to 'none' for schema v2. "
+                "SQLite lexical retrieval remains available; choose 'onnx' or "
+                "'openai' explicitly to enable semantic embeddings."
+            )
+        if schema_v1 and (
+            raw_schema_version is not None
+            or legacy_memory_backend is not None
+            or legacy_embedding_provider
+        ):
+            sources["config_schema_version"] = (
+                "derived",
+                "schema v1 compatibility migration",
+            )
 
         config = cls(**merged)
         if env_details.get("model") == "ASH_MODEL_NAME" and not os.environ.get(
@@ -1447,8 +1651,11 @@ class AshConfig(BaseSettings):
         ):
             self._config_sources[field] = ("derived", "screen_reader_mode")
 
-    def model_post_init(self, *args: Any, **kwargs: Any) -> None:
+    def model_post_init(self, context: Any) -> None:
         """Handle backward compat and load MCP servers."""
+        if context is _VALIDATION_ONLY_CONTEXT:
+            return
+
         from ash.commands.config import load_env
 
         setting_env_keys = {
@@ -1457,9 +1664,13 @@ class AshConfig(BaseSettings):
         _publish_dotenv_runtime_values(load_env(), setting_env_keys)
 
         # Backward compat: if ANTHROPIC_API_KEY is not set but ASH_API_KEY is,
-        # promote it so _build_provider() finds the right key.
+        # promote it so provider construction finds the right key.
         if not os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("ASH_API_KEY"):
-            os.environ["ANTHROPIC_API_KEY"] = os.environ["ASH_API_KEY"]
+            legacy_api_key = os.environ["ASH_API_KEY"]
+            os.environ["ANTHROPIC_API_KEY"] = legacy_api_key
+            with _DOTENV_RUNTIME_LOCK:
+                if _DOTENV_RUNTIME_VALUES.get("ASH_API_KEY") == legacy_api_key:
+                    _DOTENV_RUNTIME_VALUES["ANTHROPIC_API_KEY"] = legacy_api_key
 
         # Direct AshConfig() construction still supports the legacy model name.
         # AshConfig.load() normalizes this before validation and records provenance.

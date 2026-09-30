@@ -30,7 +30,7 @@ class ProviderRegistry:
     def __init__(self, capability_registry: CapabilityRegistry | None = None) -> None:
         self._factories: dict[str, ProviderFactory] = {}
         self._capabilities = capability_registry or get_capability_registry()
-        self._owned_capability_families: set[str] = set()
+        self._owned_capability_resolvers: dict[str, CapabilityResolver] = {}
         self._lock = RLock()
 
     def register(
@@ -53,18 +53,20 @@ class ProviderRegistry:
                 self._capabilities.register(
                     normalized,
                     capabilities,
-                    replace=(replace or normalized in self._owned_capability_families),
+                    replace=(
+                        replace or normalized in self._owned_capability_resolvers
+                    ),
                 )
-                self._owned_capability_families.add(normalized)
+                self._owned_capability_resolvers[normalized] = capabilities
             self._factories[normalized] = factory
 
     def unregister(self, name: str) -> bool:
         normalized = name.strip().casefold()
         with self._lock:
             removed = self._factories.pop(normalized, None) is not None
-            if normalized in self._owned_capability_families:
-                self._capabilities.unregister(normalized)
-                self._owned_capability_families.discard(normalized)
+            resolver = self._owned_capability_resolvers.pop(normalized, None)
+            if resolver is not None:
+                self._capabilities.unregister(normalized, resolver=resolver)
             return removed
 
     def names(self) -> tuple[str, ...]:
@@ -91,14 +93,18 @@ class ProviderRegistry:
         provider_name, model_name = parse_model_string(config.model)
         with self._lock:
             factory = self._factories.get(provider_name)
+            resolver = self._owned_capability_resolvers.get(provider_name)
         if factory is not None:
             provider = factory(config, model_name)
             if provider.provider_family == "custom":
                 provider.provider_family = provider_name
-            if provider_name in self._owned_capability_families and provider_name != "ollama":
-                provider._ash_declared_capabilities = self._capabilities.resolve(
-                    provider_name, model_name
-                )
+            if resolver is not None and provider_name != "ollama":
+                capabilities = resolver(model_name)
+                if not isinstance(capabilities, ProviderCapabilities):
+                    raise TypeError(
+                        "capability resolver must return ProviderCapabilities"
+                    )
+                provider._ash_declared_capabilities = capabilities
             return provider
         if provider_name in config.custom_providers:
             return _build_custom_openai_provider(config, provider_name, model_name)

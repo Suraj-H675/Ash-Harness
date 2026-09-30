@@ -1,11 +1,14 @@
 import asyncio
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from ash.safety.guard import SafetyGuard
+from ash.safety.git import read_only_git_args
+from ash.safety.scoped_io import workspace_mutation_lock
 from ash.sandbox import SandboxManager, SandboxResult
 from ash.sandbox.process_utils import ProcessOutputLimitExceeded, communicate_process
 from ash.tools.git import (
@@ -88,6 +91,45 @@ async def test_git_inspection_and_patch(tmp_path: Path) -> None:
     assert "initial" in log.output
 
 
+@pytest.mark.asyncio
+async def test_direct_apply_patch_refuses_competing_ash_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    await _init_repo(tmp_path)
+    target = tmp_path / "hello.txt"
+    target.write_text("old\n", encoding="utf-8")
+    await _git(tmp_path, "add", "hello.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    patch_text = """diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-old
++new
+"""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def owner() -> None:
+        with workspace_mutation_lock():
+            entered.set()
+            await release.wait()
+
+    owner_task = asyncio.create_task(owner())
+    await entered.wait()
+    try:
+        result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(patch=patch_text)
+    finally:
+        release.set()
+        await owner_task
+
+    assert result.success is False
+    assert "another Ash workspace mutation" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
 @pytest.mark.asyncio
 async def test_git_tools_do_not_execute_workspace_shadowed_git(
@@ -141,6 +183,21 @@ async def test_read_only_git_disables_repository_extensions(tmp_path: Path) -> N
     assert "+new" in diff.output
     assert "converted" not in diff.output
     assert not marker.exists()
+
+    await _git(tmp_path, "config", "filter.leak.clean", str(extension))
+    (tmp_path / ".gitattributes").write_text(
+        "hello.txt diff=leak filter=leak\n",
+        encoding="utf-8",
+    )
+    marker.unlink(missing_ok=True)
+
+    status_with_filter = await GitStatusTool(SafetyGuard(tmp_path)).run()
+    diff_with_filter = await GitDiffTool(SafetyGuard(tmp_path)).run()
+
+    assert status_with_filter.success is True
+    assert diff_with_filter.success is True
+    assert "+new" in diff_with_filter.output
+    assert not marker.exists()
     local_config = await asyncio.create_subprocess_exec(
         "git",
         "config",
@@ -152,6 +209,219 @@ async def test_read_only_git_disables_repository_extensions(tmp_path: Path) -> N
     )
     stdout, _ = await local_config.communicate()
     assert stdout.decode().strip() == str(extension)
+
+
+def test_read_only_git_filter_overrides_cover_process_and_complex_driver_names() -> None:
+    args = read_only_git_args(
+        ["status", "--short"],
+        filter_drivers=("foo.bar baz",),
+    )
+
+    assert "--work-tree=." in args
+    assert "log.showSignature=false" in args
+    assert "filter.foo.bar baz.clean=" in args
+    assert "filter.foo.bar baz.smudge=" in args
+    assert "filter.foo.bar baz.process=" in args
+    assert "filter.foo.bar baz.required=false" in args
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
+@pytest.mark.asyncio
+async def test_read_only_git_neutralizes_filters_from_included_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    await _init_repo(workspace)
+    tracked = workspace / "hello.txt"
+    tracked.write_text("old\n", encoding="utf-8")
+    await _git(workspace, "add", "hello.txt")
+    await _git(workspace, "commit", "-qm", "initial")
+
+    marker = tmp_path / "included-filter-ran"
+    extension = tmp_path / "included-filter.sh"
+    extension.write_text(
+        f"#!/bin/sh\nprintf ran >> {marker}\ncat\n",
+        encoding="utf-8",
+    )
+    extension.chmod(0o755)
+    included = home / "ash-filter-include.conf"
+    included.write_text(
+        "[filter \"included.driver\"]\n"
+        f"    clean = {extension}\n"
+        f"    smudge = {extension}\n",
+        encoding="utf-8",
+    )
+    (home / ".gitconfig").write_text(
+        f"[include]\n    path = {included}\n",
+        encoding="utf-8",
+    )
+    (workspace / ".gitattributes").write_text(
+        "hello.txt filter=included.driver\n",
+        encoding="utf-8",
+    )
+    tracked.write_text("new\n", encoding="utf-8")
+
+    status = await GitStatusTool(SafetyGuard(workspace)).run()
+    diff = await GitDiffTool(SafetyGuard(workspace)).run()
+
+    assert status.success is True
+    assert diff.success is True
+    assert "+new" in diff.output
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config_key", "command"),
+    [
+        ("core.excludesFile", ["status", "--short"]),
+        ("core.attributesFile", ["status", "--short"]),
+        ("diff.orderFile", ["diff", "--"]),
+        ("mailmap.file", ["log", "-1", "--pretty=format:%an"]),
+        ("include.path", ["status", "--short"]),
+        ("includeIf.onbranch:main.path", ["status", "--short"]),
+    ],
+)
+async def test_read_only_git_refuses_repository_host_path_indirections(
+    tmp_path: Path,
+    config_key: str,
+    command: list[str],
+) -> None:
+    await _init_repo(tmp_path)
+    outside = tmp_path.parent / f"outside-{config_key.replace('.', '-')}"
+    outside.write_text("synthetic host data\n", encoding="utf-8")
+    await _git(tmp_path, "config", config_key, str(outside))
+
+    code, stdout, stderr = await _run_git(tmp_path, command, read_only=True)
+
+    assert code == 126
+    assert stdout == ""
+    assert "untrusted repository Git config" in stderr
+    assert config_key.casefold() in stderr.casefold()
+
+
+@pytest.mark.asyncio
+async def test_read_only_git_preserves_global_excludes_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    outside_ignore = tmp_path / "global-ignore"
+    outside_ignore.write_text("global-hidden.tmp\n", encoding="utf-8")
+    (home / ".gitconfig").write_text(
+        f"[core]\n    excludesFile = {outside_ignore}\n",
+        encoding="utf-8",
+    )
+    await _init_repo(workspace)
+    (workspace / "global-hidden.tmp").write_text("hidden\n", encoding="utf-8")
+    (workspace / "visible.tmp").write_text("visible\n", encoding="utf-8")
+
+    code, stdout, stderr = await _run_git(
+        workspace,
+        ["status", "--short"],
+        read_only=True,
+    )
+
+    assert code == 0, stderr
+    assert "global-hidden.tmp" not in stdout
+    assert "visible.tmp" in stdout
+
+
+@pytest.mark.asyncio
+async def test_read_only_git_pins_worktree_to_selected_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    await _init_repo(workspace)
+    tracked = workspace / "tracked.txt"
+    tracked.write_text("same\n", encoding="utf-8")
+    await _git(workspace, "add", "tracked.txt")
+    await _git(workspace, "commit", "-qm", "initial")
+    (outside / "tracked.txt").write_text("outside replacement\n", encoding="utf-8")
+    await _git(workspace, "config", "core.worktree", str(outside))
+
+    code, stdout, stderr = await _run_git(
+        workspace,
+        ["status", "--short"],
+        read_only=True,
+    )
+
+    assert code == 0, stderr
+    assert stdout == ""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
+@pytest.mark.asyncio
+async def test_read_only_git_log_never_runs_repository_signature_verifier(
+    tmp_path: Path,
+) -> None:
+    await _init_repo(tmp_path)
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("signed content\n", encoding="utf-8")
+    await _git(tmp_path, "add", "tracked.txt")
+
+    tree_process = await asyncio.create_subprocess_exec(
+        "git",
+        "write-tree",
+        cwd=tmp_path,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    tree_stdout, _ = await tree_process.communicate()
+    assert tree_process.returncode == 0
+    tree = tree_stdout.decode().strip()
+    commit_payload = (
+        f"tree {tree}\n"
+        "author Test <test@example.com> 1700000000 +0000\n"
+        "committer Test <test@example.com> 1700000000 +0000\n"
+        "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+        " fake-signature\n"
+        " -----END PGP SIGNATURE-----\n"
+        "\n"
+        "signed-looking\n"
+    ).encode()
+    commit_process = await asyncio.create_subprocess_exec(
+        "git",
+        "hash-object",
+        "-t",
+        "commit",
+        "-w",
+        "--stdin",
+        cwd=tmp_path,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    commit_stdout, _ = await commit_process.communicate(commit_payload)
+    assert commit_process.returncode == 0
+    commit = commit_stdout.decode().strip()
+    await _git(tmp_path, "update-ref", "HEAD", commit)
+
+    marker = tmp_path / "signature-verifier-ran"
+    verifier = tmp_path / "fake-gpg"
+    verifier.write_text(
+        f"#!/bin/sh\nprintf ran >> {marker}\nexit 1\n",
+        encoding="utf-8",
+    )
+    verifier.chmod(0o755)
+    await _git(tmp_path, "config", "log.showSignature", "true")
+    await _git(tmp_path, "config", "gpg.program", str(verifier))
+
+    result = await GitLogTool(SafetyGuard(tmp_path)).run(limit=1)
+
+    assert result.success is True
+    assert "signed-looking" in result.output
+    assert not marker.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
@@ -196,6 +466,72 @@ async def test_git_inspection_reports_process_timeout(tmp_path: Path) -> None:
     assert result.success is False
     assert result.output == ""
     assert "timed out after 30 seconds" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_run_git_cleans_process_tree_after_unexpected_io_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+
+    import ash.tools.git as git_module
+
+    class FakeProcess:
+        returncode = None
+
+    process = FakeProcess()
+    cleaned = False
+
+    @contextmanager
+    def launch_context():
+        yield SimpleNamespace(argv=("git", "status"), pass_fds=(), cwd=str(tmp_path))
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    async def fail_communicate(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("git stream failed")
+
+    async def cleanup(target, *, plan=None, grace_seconds=1.0):
+        nonlocal cleaned
+        del plan, grace_seconds
+        assert target is process
+        cleaned = True
+        return None, False
+
+    monkeypatch.setattr(
+        git_module,
+        "prepare_scoped_process_launch",
+        lambda *args, **kwargs: launch_context(),
+    )
+    monkeypatch.setattr(
+        git_module,
+        "prepare_process_tree",
+        lambda *args, **kwargs: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(git_module.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(git_module, "communicate_process", fail_communicate)
+    monkeypatch.setattr(
+        git_module,
+        "settle_process_tree_after_cancellation",
+        cleanup,
+    )
+
+    with pytest.raises(RuntimeError, match="git stream failed"):
+        await git_module._run_prepared_git(
+            tmp_path,
+            "git",
+            ("status",),
+            {},
+            (),
+            expected_cwd_identity=None,
+            sandbox_manager=None,
+        )
+
+    assert cleaned is True
 
 
 @pytest.mark.asyncio
@@ -314,6 +650,53 @@ async def test_run_git_refuses_workspace_swap_during_executable_resolution(
     )
 
     assert swapped is True
+    assert code == 126
+    assert stdout == ""
+    assert "working directory identity changed" in stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
+@pytest.mark.asyncio
+async def test_read_only_git_refuses_workspace_swap_after_filter_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.git as git_module
+
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-saved"
+    replacement = tmp_path / "replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    await _init_repo(workspace)
+    await _init_repo(replacement)
+    real_run_prepared = git_module._run_prepared_git
+    calls = 0
+
+    async def run_then_swap(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = await real_run_prepared(*args, **kwargs)
+        if calls == 1:
+            workspace.rename(saved)
+            replacement.rename(workspace)
+        return result
+
+    monkeypatch.setattr(git_module, "_run_prepared_git", run_then_swap)
+
+    try:
+        code, stdout, stderr = await _run_git(
+            workspace,
+            ["status", "--short"],
+            read_only=True,
+        )
+    finally:
+        if workspace.exists() and not replacement.exists():
+            workspace.rename(replacement)
+        if saved.exists() and not workspace.exists():
+            saved.rename(workspace)
+
+    assert calls == 2
     assert code == 126
     assert stdout == ""
     assert "working directory identity changed" in stderr
@@ -523,6 +906,123 @@ new file mode 100644
     assert stdout == ""
     assert "stable cwd unavailable" in stderr
     create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_git_apply_cleans_process_tree_after_unexpected_io_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+
+    import ash.tools.patch as patch_module
+
+    class FakeProcess:
+        returncode = None
+
+    process = FakeProcess()
+    cleaned = False
+
+    @contextmanager
+    def launch_context():
+        yield SimpleNamespace(
+            argv=("git", "apply", "-"),
+            pass_fds=(),
+            cwd=str(tmp_path),
+        )
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    async def fail_communicate(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("git apply stream failed")
+
+    async def cleanup(target, *, plan=None, grace_seconds=1.0):
+        nonlocal cleaned
+        del plan, grace_seconds
+        assert target is process
+        cleaned = True
+        return None, False
+
+    monkeypatch.setattr(
+        patch_module,
+        "resolve_host_executable",
+        lambda *args, **kwargs: "git",
+    )
+    monkeypatch.setattr(
+        patch_module,
+        "prepare_scoped_process_launch",
+        lambda *args, **kwargs: launch_context(),
+    )
+    monkeypatch.setattr(
+        patch_module,
+        "prepare_process_tree",
+        lambda *args, **kwargs: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(patch_module.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(patch_module, "communicate_process", fail_communicate)
+    monkeypatch.setattr(
+        patch_module,
+        "settle_process_tree_after_cancellation",
+        cleanup,
+    )
+
+    patch_text = """diff --git a/x.txt b/x.txt
+new file mode 100644
+--- /dev/null
++++ b/x.txt
+@@ -0,0 +1 @@
++x
+"""
+    with pytest.raises(RuntimeError, match="git apply stream failed"):
+        await _git_apply(tmp_path, patch_text, check=False)
+
+    assert cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_git_apply_scrubs_parent_git_and_provider_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.patch as patch_module
+
+    monkeypatch.setenv("GIT_DIR", "/tmp/outside-git-dir")
+    monkeypatch.setenv("GIT_WORK_TREE", "/tmp/outside-worktree")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/tmp/outside-gitconfig")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-provider-secret")
+    process = SimpleNamespace(returncode=0)
+    create = AsyncMock(return_value=process)
+    monkeypatch.setattr(patch_module.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(
+        patch_module,
+        "communicate_process",
+        AsyncMock(return_value=(b"", b"")),
+    )
+    patch_text = """diff --git a/marker.txt b/marker.txt
+new file mode 100644
+--- /dev/null
++++ b/marker.txt
+@@ -0,0 +1 @@
++safe
+"""
+
+    code, stdout, stderr = await _git_apply(tmp_path, patch_text, check=True)
+
+    assert (code, stdout, stderr) == (0, "", "")
+    call = create.await_args
+    assert call is not None
+    argv = tuple(str(item) for item in call.args)
+    environment = call.kwargs["env"]
+    assert "--work-tree=." in argv
+    assert "--no-pager" in argv
+    assert "GIT_DIR" not in environment
+    assert "GIT_WORK_TREE" not in environment
+    assert "GIT_CONFIG_GLOBAL" not in environment
+    assert "OPENAI_API_KEY" not in environment
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX Git hook fixture")

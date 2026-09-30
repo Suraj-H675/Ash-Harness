@@ -558,6 +558,44 @@ async def test_browser_popup_admission_closes_overflow_tab() -> None:
 
 
 @pytest.mark.asyncio
+async def test_browser_popup_burst_coalesces_admission_work() -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+            self.url = "about:blank"
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def close(self) -> None:
+            self.closed = True
+
+    retained = [FakePage() for _ in range(MAX_BROWSER_TABS)]
+    overflow = [FakePage() for _ in range(256)]
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [*retained, *overflow]
+
+    session = BrowserSession(timeout_seconds=1)
+    session._context = FakeContext()
+    session._page = retained[0]
+
+    for page in overflow:
+        session._on_page_created(page)
+
+    assert len(session._page_tasks) == 1
+    assert len(session._tab_pages) == 0
+
+    await session._drain_page_tasks()
+
+    assert not session._page_tasks
+    assert len(session._live_pages()) == MAX_BROWSER_TABS
+    assert len(session._tab_pages) <= MAX_BROWSER_TABS
+    assert all(page.closed for page in overflow)
+
+
+@pytest.mark.asyncio
 async def test_browser_cancelled_tab_listing_still_finishes_popup_admission() -> None:
     close_started = asyncio.Event()
     release_close = asyncio.Event()
@@ -707,6 +745,9 @@ async def test_browser_open_tab_cancellation_rolls_back_new_tab(
             self.pages.append(created)
             return created
 
+        async def close(self) -> None:
+            return None
+
     monkeypatch.setattr(
         "ash.tools.browser._validate_browser_url",
         lambda url, _allowed_domains: url,
@@ -808,6 +849,9 @@ async def test_browser_open_tab_preserves_navigation_error_when_cleanup_fails(
         async def new_page(self) -> FakePage:
             self.pages.append(created)
             return created
+
+        async def close(self) -> None:
+            return None
 
     monkeypatch.setattr(
         "ash.tools.browser._validate_browser_url",
@@ -923,7 +967,7 @@ async def test_browser_snapshot_redacts_page_title(
             return "main"
 
     monkeypatch.setattr(
-        "ash.core.redaction.redact_text",
+        "ash.tools.browser.redact_text",
         lambda value: value.replace("title-secret", "[REDACTED]"),
     )
     page = FakePage()
@@ -1134,6 +1178,24 @@ async def test_browser_download_writes_bounded_payload_atomically(tmp_path: Path
     oversized.write_bytes(b"0123456789")
     with pytest.raises(ValueError, match="exceeds 5 bytes"):
         _read_download_payload(oversized, 5)
+
+
+@pytest.mark.asyncio
+async def test_browser_download_reader_rejects_symlinked_temporary_file(
+    tmp_path: Path,
+) -> None:
+    from ash.tools.browser import _read_download_payload
+
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_bytes(b"outside secret")
+    source = tmp_path / "playwright-download.tmp"
+    try:
+        source.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="cannot be read"):
+        _read_download_payload(source, 100)
 
 
 @pytest.mark.asyncio
@@ -1664,7 +1726,7 @@ async def test_browser_cdp_uses_isolated_policy_context_and_optional_storage() -
         async def new_page(self):
             return object()
 
-        async def close(self):
+        async def close(self) -> None:
             return None
 
     source_context = MagicMock()
@@ -1813,9 +1875,13 @@ async def test_browser_profile_is_ephemeral_by_default() -> None:
         async def new_page(self):
             return object()
 
+        async def close(self) -> None:
+            return None
+
     with patch("playwright.async_api.async_playwright") as playwright_factory:
         playwright = MagicMock()
         launch_result = MagicMock()
+        launch_result.close = AsyncMock()
         launch_result.new_context = AsyncMock(return_value=FakeContext())
         playwright.chromium.launch = AsyncMock(return_value=launch_result)
         playwright.chromium.launch_persistent_context = AsyncMock(
@@ -1856,6 +1922,9 @@ async def test_browser_optin_profile_creates_private_directory(tmp_path: Path) -
 
         async def new_page(self):
             return object()
+
+        async def close(self) -> None:
+            return None
 
     with patch("playwright.async_api.async_playwright") as playwright_factory:
         playwright = MagicMock()
@@ -1899,6 +1968,61 @@ async def test_browser_session_fails_closed_if_policy_proxy_cannot_start() -> No
 
 
 @pytest.mark.asyncio
+async def test_browser_startup_preserves_failure_and_retains_failed_cleanup() -> None:
+    class FlakyProxy:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.close_calls = 0
+            self.closed = False
+
+        async def start(self) -> None:
+            raise BrowserProxyError("browser proxy startup failed")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("browser proxy cleanup failed once")
+            self.closed = True
+
+    session = BrowserSession()
+    proxy = FlakyProxy()
+
+    with patch("ash.tools.browser.BrowserPolicyProxy", return_value=proxy):
+        with pytest.raises(BrowserUnavailableError, match="browser proxy startup failed") as failure:
+            await session.ensure_started()
+
+    assert any("browser session cleanup failed" in note for note in failure.value.__notes__)
+    assert session._proxy is proxy
+    assert proxy.close_calls == 1
+
+    await session.close()
+
+    assert proxy.close_calls == 2
+    assert proxy.closed is True
+    assert session._proxy is None
+
+
+@pytest.mark.asyncio
+async def test_browser_restart_refuses_to_replace_resource_that_failed_cleanup() -> None:
+    class PersistentProxy:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("old proxy cleanup still failing")
+
+    old_proxy = PersistentProxy()
+    session = BrowserSession()
+    session._proxy = old_proxy  # type: ignore[assignment]
+
+    with pytest.raises(BrowserUnavailableError, match="browser session cleanup failed"):
+        await session.ensure_started()
+
+    assert session._proxy is old_proxy
+    assert old_proxy.close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_browser_session_startup_cancellation_closes_started_proxy() -> None:
     class FakeProxy:
         instances: list["FakeProxy"] = []
@@ -1937,6 +2061,37 @@ async def test_browser_session_startup_cancellation_closes_started_proxy() -> No
     assert FakeProxy.instances[-1].closed is True
     assert session._proxy is None
     assert playwright.chromium.launch.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_browser_session_close_retries_failed_proxy_cleanup() -> None:
+    class FlakyProxy:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.closed = False
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("browser proxy cleanup failed once")
+            self.closed = True
+
+    session = BrowserSession()
+    proxy = FlakyProxy()
+    session._proxy = proxy  # type: ignore[assignment]
+
+    with pytest.raises(BrowserUnavailableError, match="browser session cleanup failed"):
+        await session.close()
+
+    assert session._closed is True
+    assert session._proxy is proxy
+    assert proxy.close_calls == 1
+
+    await session.close()
+
+    assert proxy.close_calls == 2
+    assert proxy.closed is True
+    assert session._proxy is None
 
 
 @pytest.mark.asyncio
@@ -2003,6 +2158,7 @@ async def test_browser_snapshot_retires_proxy_before_restarting_after_page_close
     context_one = FakeContext(page_one)
     context_two = FakeContext(page_two)
     browser = MagicMock()
+    browser.close = AsyncMock()
     browser.new_context = AsyncMock(side_effect=[context_one, context_two])
     playwright = MagicMock()
     playwright.chromium.launch = AsyncMock(return_value=browser)

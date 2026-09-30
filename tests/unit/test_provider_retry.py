@@ -122,3 +122,21 @@ def test_provider_circuit_tracks_providers_independently() -> None:
 
     circuit.before_request("provider-b")
     assert circuit.snapshot("provider-b")["open"] is False
+
+
+def test_provider_circuit_bounds_retained_failure_keys() -> None:
+    circuit = ProviderCircuitBreaker(failure_threshold=2, max_states=2)
+
+    circuit.record_failure("provider-a")
+    circuit.record_failure("provider-b")
+    circuit.record_failure("provider-a")
+    circuit.record_failure("provider-c")
+
+    assert circuit.snapshot("provider-a")["failures"] == 2
+    assert circuit.snapshot("provider-b")["failures"] == 0
+    assert circuit.snapshot("provider-c")["failures"] == 1
+
+
+def test_provider_circuit_rejects_invalid_state_limit() -> None:
+    with pytest.raises(ValueError, match="max_states"):
+        ProviderCircuitBreaker(max_states=0)

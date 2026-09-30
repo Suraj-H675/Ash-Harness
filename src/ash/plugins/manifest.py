@@ -13,7 +13,7 @@ from packaging.version import InvalidVersion, parse
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
 
-from ash.safe_io import strict_json_loads
+from ash.safe_io import read_bounded_open_file, strict_json_loads
 
 
 CURRENT_PLUGIN_MANIFEST_SCHEMA_VERSION = 2
@@ -319,10 +319,20 @@ class PluginManifest:
             hasattr(path, "is_junction") and path.is_junction()
         ):
             raise ValueError("plugin manifest cannot be a link")
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_PLUGIN_MANIFEST_BYTES + 1)
-        if len(raw) > MAX_PLUGIN_MANIFEST_BYTES:
-            raise ValueError("plugin manifest exceeds 128 KiB")
+        try:
+            raw = read_bounded_open_file(
+                path,
+                MAX_PLUGIN_MANIFEST_BYTES,
+                label="plugin manifest",
+                trusted_root=path.parent,
+            )
+        except ValueError as exc:
+            message = str(exc).casefold()
+            if "symlink" in message or "junction" in message:
+                raise ValueError("plugin manifest cannot be a link") from exc
+            if "exceeds" in message and str(MAX_PLUGIN_MANIFEST_BYTES) in message:
+                raise ValueError("plugin manifest exceeds 128 KiB") from exc
+            raise
         data = strict_json_loads(raw)
         if not isinstance(data, dict):
             raise ValueError("plugin manifest must be a JSON object")

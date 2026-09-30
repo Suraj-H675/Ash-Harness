@@ -40,11 +40,14 @@ class OllamaProvider(ProviderABC):
         self._model_name = model_name
         self._base_url = normalize_provider_base_url(base_url, provider="ollama")
         self._token_counter = token_counter or AnthropicTokenCounter()
-        self._client = (
-            client if client is not None else httpx.AsyncClient(timeout=60.0)
-        )
+        self._client = client
         self._owns_client = client is None
         self._dynamic_capabilities = None
+
+    def _resolve_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=60.0)
+        return self._client
 
     async def detect_capabilities(
         self, *, refresh: bool = False
@@ -54,8 +57,9 @@ class OllamaProvider(ProviderABC):
         if self._dynamic_capabilities is not None and not refresh:
             return self._dynamic_capabilities
         self._dynamic_capabilities = None
+        client = self._resolve_client()
         try:
-            async with self._client.stream(
+            async with client.stream(
                 "POST",
                 f"{self._base_url}/api/show",
                 json={"model": self._model_name},
@@ -148,8 +152,9 @@ class OllamaProvider(ProviderABC):
         pending_tool_calls: list[tuple[CanonicalToolCall, bool]] = []
         explicit_tool_call_ids: set[str] = set()
         tool_call_sequence = 0
+        client = self._resolve_client()
         try:
-            async with self._client.stream(
+            async with client.stream(
                 "POST", f"{self._base_url}/api/chat", json=payload
             ) as resp:
                 if resp.status_code != 200:
@@ -256,8 +261,11 @@ class OllamaProvider(ProviderABC):
             raise RuntimeError(f"Ollama connection error: {exc}") from exc
 
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        client = self._client
+        if self._owns_client and client is not None:
+            await client.aclose()
+            if self._client is client:
+                self._client = None
 
 
 async def _read_bounded_response(

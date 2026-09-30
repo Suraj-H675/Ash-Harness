@@ -28,7 +28,12 @@ __pycache__/
 
 # Local harness test artifacts
 __ash_test__/
+/.smoke-venv*/
+/.smoke-sdist-venv/
+/.release-smoke/
+/.zuse/
 
 # User-managed comparison sources (never package)
 /project/
 /ref/
+.context

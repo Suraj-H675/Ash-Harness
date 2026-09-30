@@ -22,6 +22,7 @@ from ash.automation.store import (
 )
 from ash.automation.worker import AutomationWorkerService
 from ash.config import AshConfig
+from ash.core.redaction import redact_text
 
 
 def automation_store(config: AshConfig) -> AutomationStore:
@@ -319,7 +320,19 @@ async def run_worker(
                 continue
             installed_signals.append(signum)
         try:
-            return await service.run_forever(once=once)
+            try:
+                result = await service.run_forever(once=once)
+            except BaseException as primary_error:
+                try:
+                    await service.aclose()
+                except BaseException as cleanup_error:
+                    primary_error.add_note(
+                        "automation worker cleanup failed: "
+                        + redact_text(str(cleanup_error))[:500]
+                    )
+                raise
+            await service.aclose()
+            return result
         finally:
             for signum in installed_signals:
                 loop.remove_signal_handler(signum)
@@ -336,7 +349,19 @@ async def run_manual(config: AshConfig, reference: str) -> AutomationRun:
             lease_seconds=config.automation_lease_seconds,
             config_loader=automation_config_loader(config),
         )
-        return await service.run_manual(reference)
+        try:
+            result = await service.run_manual(reference)
+        except BaseException as primary_error:
+            try:
+                await service.aclose()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    "automation worker cleanup failed: "
+                    + redact_text(str(cleanup_error))[:500]
+                )
+            raise
+        await service.aclose()
+        return result
 
 
 def create_job_from_cli(

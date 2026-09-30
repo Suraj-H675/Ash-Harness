@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -227,6 +228,54 @@ async def test_checkpoint_undo_rolls_files_forward_when_restore_fails(
 
     assert (tmp_path / "a.txt").read_text() == "after-a.txt"
     assert (tmp_path / "b.txt").read_text() == "after-b.txt"
+    assert len(store.latest_file_checkpoints(session.session_id)) == 2
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_rollback_preserves_later_edit_on_untouched_path(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.checkpoints as checkpoints
+
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    tool = WholeEditTool(guard)
+    for name in ("a.txt", "b.txt"):
+        path = tmp_path / name
+        path.write_text(f"before-{name}", encoding="utf-8")
+        middleware = FileCheckpointMiddleware(
+            store,
+            guard,
+            lambda name=name: (session.session_id, "turn-1", f"call-{name}"),
+        )
+        arguments = {"file_path": name, "content": f"after-{name}"}
+        await middleware.before_tool("whole_edit", arguments, tool)
+        result = await tool.run(**arguments)
+        await middleware.after_tool("whole_edit", arguments, result)
+
+    rows = store.latest_file_checkpoints(session.session_id)
+    first_path = Path(str(rows[0]["path"]))
+    untouched_path = Path(str(rows[1]["path"]))
+    original_restore = checkpoints.restore_scoped_file
+    failed = False
+
+    def fail_first_restore(path, content, file_guard, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            untouched_path.write_text("later-external-edit", encoding="utf-8")
+            raise OSError("injected first restore failure")
+        return original_restore(path, content, file_guard, **kwargs)
+
+    monkeypatch.setattr(checkpoints, "restore_scoped_file", fail_first_restore)
+
+    with pytest.raises(OSError, match="first restore failure"):
+        undo_latest_checkpoint(store, guard, session.session_id)
+
+    assert first_path.read_text(encoding="utf-8").startswith("after-")
+    assert untouched_path.read_text(encoding="utf-8") == "later-external-edit"
     assert len(store.latest_file_checkpoints(session.session_id)) == 2
 
 
@@ -1031,6 +1080,82 @@ def test_recovery_reconstructs_missing_terminal_tool_result_message(tmp_path) ->
     )
 
 
+def test_recovery_projects_oversized_terminal_result_without_losing_authoritative_data(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+    import ash.providers.messages as messages_module
+
+    monkeypatch.setattr(messages_module, "MAX_CANONICAL_CONTENT_BYTES", 2048)
+    monkeypatch.setattr(
+        session_module,
+        "MAX_RECOVERY_AUDIT_OUTPUT_PREVIEW_BYTES",
+        64,
+    )
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-terminal-large-result"
+    call_id = "call-terminal-large"
+    output = "x" * 5000
+    store.start_turn(session.session_id, turn_id, "run command")
+    store.save_message(
+        session.session_id,
+        Message(
+            role="assistant",
+            content="",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "tool_calls": [
+                    {
+                        "call_id": call_id,
+                        "name": "run_command",
+                        "arguments": {"command_line": "build"},
+                    }
+                ]
+            },
+        ),
+        turn_id=turn_id,
+    )
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name="run_command",
+            arguments={"command_line": "build"},
+            approved=True,
+            executed=True,
+            dispatched=True,
+            result=output,
+            error=None,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.interrupt_turn(turn_id)
+
+    summary = recover_interrupted_turns(
+        store,
+        SafetyGuard(tmp_path),
+        session.session_id,
+    )
+
+    assert summary.recovered_calls[0].output == output
+    loaded = store.load_session(session.session_id)
+    assert loaded.tool_calls[0].result == output
+    tool_message = next(message for message in loaded.messages if message.role == "tool")
+    payload = json.loads(tool_message.content)
+    assert payload["recovery_result_truncated"] is True
+    assert payload["original_output_bytes"] == 5000
+    assert len(payload["original_output_sha256"]) == 64
+    assert len(payload["output"].encode("utf-8")) <= 512
+    audit = store.list_audit_logs(session.session_id)[-1]
+    assert audit.details["output_truncated"] is True
+    assert len(audit.details["output_preview"].encode("utf-8")) <= 64
+    assert audit.details["output_bytes"] == 5000
+    assert len(audit.details["output_sha256"]) == 64
+
+
 def test_recovery_preserves_terminal_unknown_outcome_classification(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     session = store.create_session(str(tmp_path))
@@ -1099,3 +1224,80 @@ def test_recovery_preserves_terminal_unknown_outcome_classification(tmp_path) ->
     assert '"replayed": false' in tool_messages[0].content
     reports = store.interrupted_recovery_reports(session.session_id)
     assert reports[0]["status"] == "needs_attention"
+
+
+def test_recovery_repairs_oversized_legacy_assistant_arguments_atomically(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.providers.messages as messages_module
+
+    monkeypatch.setattr(messages_module, "MAX_TOOL_CALL_ARGUMENT_BYTES", 512)
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-legacy-oversized-arguments"
+    call_id = "call-legacy-oversized"
+    original_argument = "x" * 2000
+    store.start_turn(session.session_id, turn_id, "run command")
+    store.save_message(
+        session.session_id,
+        Message(
+            role="assistant",
+            content="",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "tool_calls": [
+                    {
+                        "call_id": call_id,
+                        "name": "run_command",
+                        "arguments": {"command_line": original_argument},
+                    }
+                ]
+            },
+        ),
+        turn_id=turn_id,
+    )
+    store.interrupt_turn(turn_id)
+
+    summary = recover_interrupted_turns(
+        store,
+        SafetyGuard(tmp_path),
+        session.session_id,
+    )
+
+    assert len(summary.recovered_calls) == 1
+    recovered = summary.recovered_calls[0]
+    assert recovered.call_id == call_id
+    assert recovered.tool_name == "run_command"
+    assert recovered.dispatched is False
+    assert recovered.assistant_message_id is not None
+    assert recovered.assistant_arguments is not None
+    assert recovered.assistant_arguments["_ash_recovery_arguments_truncated"] is True
+    assert len(recovered.assistant_arguments["original_sha256"]) == 64
+    assert (
+        len(
+            json.dumps(
+                recovered.assistant_arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        <= 512
+    )
+
+    loaded = store.load_session(session.session_id)
+    durable = loaded.tool_calls[0]
+    assert durable.call_id == call_id
+    assert durable.tool_name == "run_command"
+    assert durable.arguments == recovered.assistant_arguments
+    assistant = next(message for message in loaded.messages if message.role == "assistant")
+    repaired_call = assistant.metadata["tool_calls"][0]
+    assert repaired_call["call_id"] == call_id
+    assert repaired_call["name"] == "run_command"
+    assert repaired_call["arguments"] == recovered.assistant_arguments
+    assert original_argument not in json.dumps(assistant.metadata)
+    tool_message = next(message for message in loaded.messages if message.role == "tool")
+    tool_payload = json.loads(tool_message.content)
+    assert tool_payload["dispatched"] is False
+    assert tool_payload["replayed"] is False

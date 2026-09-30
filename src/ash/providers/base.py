@@ -5,11 +5,20 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from enum import StrEnum
+import json
 from typing import Any, AsyncGenerator, Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
 from ash.providers.messages import CanonicalToolCall, MessageInput
+
+
+MAX_PROVIDER_USAGE_TOKENS = 2**53 - 1
+MAX_PROVIDER_STOP_REASON_CHARS = 256
+MAX_PROVIDER_NATIVE_TOOL_CALLS_PER_CHUNK = 64
+MAX_PROVIDER_REASONING_BLOCKS_PER_CHUNK = 4096
+MAX_PROVIDER_CHUNK_TEXT_BYTES = 16 * 1024 * 1024
+MAX_PROVIDER_CHUNK_STRUCTURED_BYTES = 16 * 1024 * 1024
 
 
 class StreamChunk(BaseModel):
@@ -27,19 +36,72 @@ class StreamChunk(BaseModel):
     content: str = ""
     tool_call_delta: str = ""
     is_done: bool = False
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_write_tokens: int = 0
+    prompt_tokens: int = Field(default=0, ge=0, le=MAX_PROVIDER_USAGE_TOKENS)
+    completion_tokens: int = Field(default=0, ge=0, le=MAX_PROVIDER_USAGE_TOKENS)
+    cache_read_tokens: int = Field(default=0, ge=0, le=MAX_PROVIDER_USAGE_TOKENS)
+    cache_write_tokens: int = Field(default=0, ge=0, le=MAX_PROVIDER_USAGE_TOKENS)
     usage_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
-    stop_reason: str | None = None
-    reasoning_blocks: list[dict[str, Any]] = Field(default_factory=list)
+    stop_reason: str | None = Field(
+        default=None,
+        max_length=MAX_PROVIDER_STOP_REASON_CHARS,
+    )
+    reasoning_blocks: list[dict[str, Any]] = Field(
+        default_factory=list,
+        max_length=MAX_PROVIDER_REASONING_BLOCKS_PER_CHUNK,
+    )
     model: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     # Fully-formed tool calls from providers that support native
     # OpenAI tool_calls streaming (includes real id for tool_call_id).
-    native_tool_calls: list[CanonicalToolCall] | None = None
-    reasoning: list[dict[str, Any]] | None = None
+    native_tool_calls: list[CanonicalToolCall] | None = Field(
+        default=None,
+        max_length=MAX_PROVIDER_NATIVE_TOOL_CALLS_PER_CHUNK,
+    )
+    reasoning: list[dict[str, Any]] | None = Field(
+        default=None,
+        max_length=MAX_PROVIDER_REASONING_BLOCKS_PER_CHUNK,
+    )
+
+    @field_validator("native_tool_calls", "reasoning", "reasoning_blocks", mode="before")
+    @classmethod
+    def validate_structured_stream_payload(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        serializable = value
+        if isinstance(value, list):
+            serializable = [
+                item.to_wire() if isinstance(item, CanonicalToolCall) else item
+                for item in value
+            ]
+        try:
+            encoded = json.dumps(
+                serializable,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("provider structured stream data must be serializable") from exc
+        if len(encoded) > MAX_PROVIDER_CHUNK_STRUCTURED_BYTES:
+            raise ValueError(
+                "provider structured stream data exceeds "
+                f"{MAX_PROVIDER_CHUNK_STRUCTURED_BYTES} UTF-8 bytes"
+            )
+        return value
+
+    @field_validator("content", "tool_call_delta")
+    @classmethod
+    def validate_stream_text(cls, value: str) -> str:
+        try:
+            size = len(value.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("provider stream text must be valid UTF-8") from exc
+        if size > MAX_PROVIDER_CHUNK_TEXT_BYTES:
+            raise ValueError(
+                "provider stream text exceeds "
+                f"{MAX_PROVIDER_CHUNK_TEXT_BYTES} UTF-8 bytes"
+            )
+        return value
 
 
 class CompletionStopCategory(StrEnum):
@@ -66,13 +128,16 @@ class CompletionOutcome(BaseModel):
 
     text: str = ""
     tool_calls: list[CanonicalToolCall] = Field(default_factory=list)
-    prompt_tokens: int = Field(0, ge=0)
-    completion_tokens: int = Field(0, ge=0)
-    cache_read_tokens: int = Field(0, ge=0)
-    cache_write_tokens: int = Field(0, ge=0)
+    prompt_tokens: int = Field(0, ge=0, le=MAX_PROVIDER_USAGE_TOKENS)
+    completion_tokens: int = Field(0, ge=0, le=MAX_PROVIDER_USAGE_TOKENS)
+    cache_read_tokens: int = Field(0, ge=0, le=MAX_PROVIDER_USAGE_TOKENS)
+    cache_write_tokens: int = Field(0, ge=0, le=MAX_PROVIDER_USAGE_TOKENS)
     usage_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
-    stop_reason: str | None = None
-    reasoning_blocks: list[dict[str, Any]] = Field(default_factory=list)
+    stop_reason: str | None = Field(None, max_length=MAX_PROVIDER_STOP_REASON_CHARS)
+    reasoning_blocks: list[dict[str, Any]] = Field(
+        default_factory=list,
+        max_length=MAX_PROVIDER_REASONING_BLOCKS_PER_CHUNK,
+    )
 
 
 _COMPLETE_STOP_REASONS = frozenset(

@@ -19,7 +19,66 @@ from ash.plugins.skills import (
     ReadSkillResourceTool,
     SkillCatalog,
 )
+from ash.core.session import SessionStore
 from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PermissionPolicy
+
+
+def _install_fake_repl_frontend(
+    monkeypatch: pytest.MonkeyPatch,
+    commands,
+):
+    class FakeTerminalUI:
+        transcript = None
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.viewport_mode = False
+
+        def write_status(self, text: str, *, error: bool = False) -> None:
+            builtins.print(text, end="", file=__import__("sys").stderr if error else None)
+
+    class FakePromptInput:
+        interactive = False
+        uses_viewport = False
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def read(self, prompt: str) -> str:
+            del prompt
+            return next(commands)
+
+        def set_extra_commands(self, commands: list[str]) -> None:
+            del commands
+
+    class FakeStatusLine:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    class FakeNotifier:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    class FakeTurnController:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    class FakePrinter:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __call__(self, *values, sep=" ", end="\n", file=None, flush=False):
+            builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
+
+    monkeypatch.setattr("ash.ui.terminal.TerminalUI", FakeTerminalUI)
+    monkeypatch.setattr("ash.ui.prompt.PromptInput", FakePromptInput)
+    monkeypatch.setattr("ash.ui.status.StatusLine", FakeStatusLine)
+    monkeypatch.setattr("ash.ui.notifications.TerminalNotifier", FakeNotifier)
+    monkeypatch.setattr(
+        "ash.ui.turn_input.InteractiveTurnController", FakeTurnController
+    )
+    monkeypatch.setattr("ash.ui.output.ReplPrinter", FakePrinter)
+    return FakeTerminalUI
 
 
 def test_targetless_mcp_reload_message_reflects_errors_and_preservation() -> None:
@@ -73,6 +132,64 @@ def test_mcp_task_cancel_message_distinguishes_modern_ack_from_legacy_status() -
 
 
 @pytest.mark.asyncio
+async def test_repl_permission_mode_audit_records_actual_previous_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = iter(("/permissions plan", "/exit"))
+    FakeTerminalUI = _install_fake_repl_frontend(monkeypatch, commands)
+    monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path), model="test")
+    loop = SimpleNamespace(
+        ui=FakeTerminalUI(),
+        project_root=tmp_path,
+        repo_map=None,
+        _mcp_runtime=None,
+        _mcp_configs={},
+        safety_guard=SafetyGuard(tmp_path),
+        tools={},
+        current_session=session,
+        permission_policy=PermissionPolicy("interactive"),
+        safety_tier="interactive",
+        session_store=store,
+        notify_permission_rules_changed=lambda **kwargs: None,
+        _emit_event=lambda event: None,
+    )
+    config = SimpleNamespace(
+        input_mode="emacs",
+        keybindings={},
+        tui_mode="inline",
+        theme="default",
+        screen_reader_mode=False,
+        notification_method="off",
+        notification_events=(),
+        notification_include_preview=False,
+        sandbox_backend="auto",
+        sandbox_docker_image="ash-sandbox:latest",
+        sandbox_docker_memory_mb=4096,
+        sandbox_docker_cpus=2.0,
+        allow_unsafe_plugin_runtime=False,
+        allow_unsafe_auto_approve=False,
+        safety_tier="interactive",
+    )
+
+    assert await _repl(loop, config, SimpleNamespace()) == 0
+
+    audit = store.list_audit_logs(session.session_id)
+    mode_events = [item for item in audit if item.action_type == "permission_mode"]
+    assert len(mode_events) == 1
+    assert mode_events[0].details == {
+        "previous_mode": "interactive",
+        "mode": "plan",
+    }
+    assert loop.permission_policy.mode.value == "plan"
+    assert config.safety_tier == "plan"
+
+
+@pytest.mark.asyncio
 async def test_repl_reports_targetless_reload_errors_and_redacts_cancel_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -90,56 +207,7 @@ async def test_repl_reports_targetless_reload_errors_and_redacts_cancel_failure(
         )
     )
 
-    class FakeTerminalUI:
-        transcript = None
-
-        def __init__(self, *args, **kwargs) -> None:
-            self.viewport_mode = False
-
-        def write_status(self, text: str, *, error: bool = False) -> None:
-            builtins.print(text, end="", file=__import__("sys").stderr if error else None)
-
-    class FakePromptInput:
-        interactive = False
-        uses_viewport = False
-
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        async def read(self, prompt: str) -> str:
-            del prompt
-            return next(commands)
-
-        def set_extra_commands(self, commands: list[str]) -> None:
-            del commands
-
-    class FakeStatusLine:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-    class FakeNotifier:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-    class FakeTurnController:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-    class FakePrinter:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        def __call__(self, *values, sep=" ", end="\n", file=None, flush=False):
-            builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
-
-    monkeypatch.setattr("ash.ui.terminal.TerminalUI", FakeTerminalUI)
-    monkeypatch.setattr("ash.ui.prompt.PromptInput", FakePromptInput)
-    monkeypatch.setattr("ash.ui.status.StatusLine", FakeStatusLine)
-    monkeypatch.setattr("ash.ui.notifications.TerminalNotifier", FakeNotifier)
-    monkeypatch.setattr(
-        "ash.ui.turn_input.InteractiveTurnController", FakeTurnController
-    )
-    monkeypatch.setattr("ash.ui.output.ReplPrinter", FakePrinter)
+    FakeTerminalUI = _install_fake_repl_frontend(monkeypatch, commands)
     monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
@@ -208,6 +276,8 @@ async def test_repl_reports_targetless_reload_errors_and_redacts_cancel_failure(
         notification_include_preview=False,
         sandbox_backend="auto",
         sandbox_docker_image="ash-sandbox:latest",
+        sandbox_docker_memory_mb=4096,
+        sandbox_docker_cpus=2.0,
         allow_unsafe_plugin_runtime=False,
     )
 
@@ -226,3 +296,316 @@ async def test_repl_reports_targetless_reload_errors_and_redacts_cancel_failure(
     assert 'password="[REDACTED]": upstream password="[REDACTED]"' in captured.err
     assert 'Error: upstream password="[REDACTED]"' in captured.err
     assert 'password="[REDACTED]"' in captured.err
+
+
+@pytest.mark.asyncio
+async def test_repl_plugin_reload_failure_preserves_simple_live_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    commands = iter(("/reload-plugins", "/exit"))
+    FakeTerminalUI = _install_fake_repl_frontend(monkeypatch, commands)
+    monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    guard = SafetyGuard(tmp_path)
+    old_catalog = SkillCatalog(())
+    list_skills = ListSkillsTool(guard, old_catalog)
+    activate_skill = ActivateSkillTool(guard, old_catalog)
+    read_skill = ReadSkillResourceTool(guard, old_catalog)
+    old_hooks = object()
+    loop = SimpleNamespace(
+        ui=FakeTerminalUI(),
+        project_root=tmp_path,
+        repo_map=None,
+        _mcp_runtime=None,
+        _mcp_configs={},
+        safety_guard=guard,
+        tools={
+            "list_skills": list_skills,
+            "activate_skill": activate_skill,
+            "read_skill_resource": read_skill,
+        },
+        hooks=old_hooks,
+        current_session=SimpleNamespace(session_id="session"),
+        _emit_event=lambda event: None,
+    )
+
+    async def fail_plugin_tool_reload(tools) -> None:
+        del tools
+        raise RuntimeError("injected plugin tool reload failure")
+
+    async def unexpected_mcp_reload(configs):
+        del configs
+        pytest.fail("MCP reload must not run after plugin-tool reload failure")
+
+    loop.reload_plugin_runtime_tools = fail_plugin_tool_reload
+    loop.reload_mcp_servers = unexpected_mcp_reload
+
+    config = SimpleNamespace(
+        input_mode="emacs",
+        keybindings={},
+        tui_mode="inline",
+        theme="default",
+        screen_reader_mode=False,
+        notification_method="off",
+        notification_events=(),
+        notification_include_preview=False,
+        sandbox_backend="auto",
+        sandbox_docker_image="ash-sandbox:latest",
+        sandbox_docker_memory_mb=4096,
+        sandbox_docker_cpus=2.0,
+        allow_unsafe_plugin_runtime=False,
+    )
+
+    assert await _repl(loop, config, SimpleNamespace()) == 0
+
+    captured = capsys.readouterr()
+    assert "injected plugin tool reload failure" in captured.err
+    assert list_skills.catalog is old_catalog
+    assert activate_skill.catalog is old_catalog
+    assert read_skill.catalog is old_catalog
+    assert loop.hooks is old_hooks
+
+
+@pytest.mark.asyncio
+async def test_repl_plugin_reload_refuses_replaced_workspace_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    commands = iter(("/reload-plugins", "/exit"))
+    FakeTerminalUI = _install_fake_repl_frontend(monkeypatch, commands)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: True)
+
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    guard = SafetyGuard(workspace)
+
+    old_catalog = SkillCatalog(())
+    list_skills = ListSkillsTool(guard, old_catalog)
+    activate_skill = ActivateSkillTool(guard, old_catalog)
+    read_skill = ReadSkillResourceTool(guard, old_catalog)
+    reload_calls: list[object] = []
+
+    loop = SimpleNamespace(
+        ui=FakeTerminalUI(),
+        project_root=workspace,
+        repo_map=None,
+        _mcp_runtime=None,
+        _mcp_configs={},
+        safety_guard=guard,
+        tools={
+            "list_skills": list_skills,
+            "activate_skill": activate_skill,
+            "read_skill_resource": read_skill,
+        },
+        hooks=object(),
+        current_session=SimpleNamespace(session_id="session"),
+        _emit_event=lambda event: None,
+    )
+
+    def verify_project_root_identity() -> None:
+        try:
+            guard.ensure_project_root_current()
+        except Exception as exc:
+            raise RuntimeError(
+                "workspace root changed after runtime startup; refusing to continue"
+            ) from exc
+
+    async def reload_plugin_runtime_tools(tools) -> None:
+        reload_calls.append(tools)
+
+    async def reload_mcp_servers(configs):
+        reload_calls.append(configs)
+        return {}
+
+    loop._verify_project_root_identity = verify_project_root_identity
+    loop.reload_plugin_runtime_tools = reload_plugin_runtime_tools
+    loop.reload_mcp_servers = reload_mcp_servers
+
+    config = SimpleNamespace(
+        input_mode="emacs",
+        keybindings={},
+        tui_mode="inline",
+        theme="default",
+        screen_reader_mode=False,
+        notification_method="off",
+        notification_events=(),
+        notification_include_preview=False,
+        sandbox_backend="auto",
+        sandbox_docker_image="ash-sandbox:latest",
+        sandbox_docker_memory_mb=4096,
+        sandbox_docker_cpus=2.0,
+        allow_unsafe_plugin_runtime=False,
+    )
+
+    workspace.rename(saved)
+    replacement.rename(workspace)
+
+    assert await _repl(loop, config, SimpleNamespace()) == 0
+
+    captured = capsys.readouterr()
+    assert reload_calls == []
+    assert "workspace root changed after runtime startup" in captured.err
+    assert list_skills.catalog is old_catalog
+    assert activate_skill.catalog is old_catalog
+    assert read_skill.catalog is old_catalog
+
+
+@pytest.mark.asyncio
+async def test_repl_mcp_reload_exception_commits_other_plugin_state_and_reports_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    commands = iter(("/reload-plugins", "/exit"))
+    FakeTerminalUI = _install_fake_repl_frontend(monkeypatch, commands)
+    monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    guard = SafetyGuard(tmp_path)
+    old_catalog = SkillCatalog(())
+    list_skills = ListSkillsTool(guard, old_catalog)
+    activate_skill = ActivateSkillTool(guard, old_catalog)
+    read_skill = ReadSkillResourceTool(guard, old_catalog)
+    old_hooks = object()
+    old_mcp_runtime = object()
+    loop = SimpleNamespace(
+        ui=FakeTerminalUI(),
+        project_root=tmp_path,
+        repo_map=None,
+        _mcp_runtime=old_mcp_runtime,
+        _mcp_configs={},
+        safety_guard=guard,
+        tools={
+            "list_skills": list_skills,
+            "activate_skill": activate_skill,
+            "read_skill_resource": read_skill,
+        },
+        hooks=old_hooks,
+        current_session=SimpleNamespace(session_id="session"),
+        _emit_event=lambda event: None,
+    )
+
+    async def successful_plugin_tool_reload(tools) -> None:
+        del tools
+
+    async def fail_mcp_reload(configs):
+        del configs
+        raise RuntimeError("injected MCP reload failure")
+
+    loop.reload_plugin_runtime_tools = successful_plugin_tool_reload
+    loop.reload_mcp_servers = fail_mcp_reload
+
+    config = SimpleNamespace(
+        input_mode="emacs",
+        keybindings={},
+        tui_mode="inline",
+        theme="default",
+        screen_reader_mode=False,
+        notification_method="off",
+        notification_events=(),
+        notification_include_preview=False,
+        sandbox_backend="auto",
+        sandbox_docker_image="ash-sandbox:latest",
+        sandbox_docker_memory_mb=4096,
+        sandbox_docker_cpus=2.0,
+        allow_unsafe_plugin_runtime=False,
+    )
+
+    assert await _repl(loop, config, SimpleNamespace()) == 0
+
+    captured = capsys.readouterr()
+    assert "Reloaded 0 plugin(s)" in captured.out
+    assert "injected MCP reload failure" in captured.err
+    assert list_skills.catalog is not old_catalog
+    assert activate_skill.catalog is list_skills.catalog
+    assert read_skill.catalog is list_skills.catalog
+    assert loop.hooks is not old_hooks
+    assert loop._mcp_runtime is old_mcp_runtime
+
+
+@pytest.mark.asyncio
+async def test_repl_plugin_action_reports_persisted_state_when_reload_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    commands = iter(("/plugins disable demo", "/exit"))
+    FakeTerminalUI = _install_fake_repl_frontend(monkeypatch, commands)
+    monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    def fake_manage(action, target, **kwargs):
+        del kwargs
+        assert action == "disable"
+        assert target == "demo"
+        return {
+            "action": "disable",
+            "name": "demo",
+            "version": "1.0.0",
+            "root": str(tmp_path / "home" / ".ash" / "plugins" / "demo"),
+            "enabled": False,
+        }
+
+    monkeypatch.setattr("ash.commands.extensions.manage_local_plugin", fake_manage)
+
+    guard = SafetyGuard(tmp_path)
+    old_catalog = SkillCatalog(())
+    loop = SimpleNamespace(
+        ui=FakeTerminalUI(),
+        project_root=tmp_path,
+        repo_map=None,
+        _mcp_runtime=None,
+        _mcp_configs={},
+        safety_guard=guard,
+        tools={
+            "list_skills": ListSkillsTool(guard, old_catalog),
+            "activate_skill": ActivateSkillTool(guard, old_catalog),
+            "read_skill_resource": ReadSkillResourceTool(guard, old_catalog),
+        },
+        hooks=object(),
+        current_session=SimpleNamespace(session_id="session"),
+        _emit_event=lambda event: None,
+    )
+
+    async def fail_plugin_tool_reload(tools) -> None:
+        del tools
+        raise RuntimeError("injected live reload failure")
+
+    async def unexpected_mcp_reload(configs):
+        del configs
+        pytest.fail("MCP reload must not run after plugin-tool reload failure")
+
+    loop.reload_plugin_runtime_tools = fail_plugin_tool_reload
+    loop.reload_mcp_servers = unexpected_mcp_reload
+
+    config = SimpleNamespace(
+        input_mode="emacs",
+        keybindings={},
+        tui_mode="inline",
+        theme="default",
+        screen_reader_mode=False,
+        notification_method="off",
+        notification_events=(),
+        notification_include_preview=False,
+        sandbox_backend="auto",
+        sandbox_docker_image="ash-sandbox:latest",
+        sandbox_docker_memory_mb=4096,
+        sandbox_docker_cpus=2.0,
+        allow_unsafe_plugin_runtime=False,
+    )
+
+    assert await _repl(loop, config, SimpleNamespace()) == 0
+
+    captured = capsys.readouterr()
+    assert "Disabled demo" in captured.out
+    assert "plugin state was persisted, but live reload failed" in captured.err
+    assert "injected live reload failure" in captured.err
+    assert "/reload-plugins" in captured.err

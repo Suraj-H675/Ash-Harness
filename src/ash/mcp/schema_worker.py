@@ -11,6 +11,8 @@ from jsonschema.validators import validator_for  # type: ignore[import-untyped]
 from referencing import Registry  # type: ignore[import-untyped]
 from referencing.exceptions import NoSuchResource  # type: ignore[import-untyped]
 
+from ash.json_utils import strict_json_loads
+
 
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 
@@ -84,7 +86,7 @@ def main() -> int:
         }
     else:
         try:
-            payload = json.loads(raw)
+            payload = strict_json_loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError("validation request must be an object")
             response = _validate(payload)

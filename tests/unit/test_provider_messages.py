@@ -9,7 +9,12 @@ import pytest
 from ash.providers.anthropic import prepare_anthropic_messages
 from ash.providers.base import StreamChunk
 from ash.providers.messages import (
+    MAX_CANONICAL_CONTENT_BLOCKS,
+    MAX_CANONICAL_CONTENT_BYTES,
     MAX_CANONICAL_MESSAGES,
+    MAX_PROVIDER_TOOL_NAME_CHARS,
+    MAX_TOOL_CALL_ARGUMENT_BYTES,
+    MAX_TOOL_CALL_ID_BYTES,
     CanonicalMessage,
     CanonicalToolCall,
     ImageContentBlock,
@@ -53,6 +58,116 @@ def test_typed_canonical_messages_round_trip_to_wire_shape() -> None:
     }
     assert wire[2]["tool_calls"][0]["call_id"] == "call-1"
     assert wire[3]["tool_call_id"] == "call-1"
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda value: CanonicalToolCall(
+            call_id=value,
+            name="read_file",
+            arguments={},
+        ),
+        lambda value: CanonicalMessage(
+            role="tool",
+            tool_call_id=value,
+            content="result",
+        ),
+    ],
+)
+def test_canonical_tool_call_ids_have_a_byte_limit(factory) -> None:
+    oversized = "é" * (MAX_TOOL_CALL_ID_BYTES // 2 + 1)
+
+    with pytest.raises(ValueError, match="tool call ID exceeds 512 UTF-8 bytes"):
+        factory(oversized)
+
+
+def test_canonical_tool_call_rejects_invalid_utf8_identity_and_raw_arguments() -> None:
+    with pytest.raises(ValueError, match="unicode"):
+        CanonicalToolCall(call_id="\ud800", name="read_file", arguments={})
+
+    with pytest.raises(ValueError, match="tool-call arguments must be valid UTF-8 text"):
+        CanonicalToolCall(
+            call_id="call-1",
+            name="read_file",
+            arguments='{"value":"\ud800"}',
+        )
+
+
+def test_canonical_tool_call_rejects_oversized_raw_argument_json() -> None:
+    oversized = '{"value":"' + ("x" * MAX_TOOL_CALL_ARGUMENT_BYTES) + '"}'
+
+    with pytest.raises(ValueError, match="tool-call arguments exceed"):
+        CanonicalToolCall(
+            call_id="call-1",
+            name="read_file",
+            arguments=oversized,
+        )
+
+
+def test_canonical_tool_call_rejects_oversized_argument_object() -> None:
+    oversized = {"value": "x" * MAX_TOOL_CALL_ARGUMENT_BYTES}
+
+    with pytest.raises(ValueError, match="tool-call arguments exceed"):
+        CanonicalToolCall(
+            call_id="call-1",
+            name="read_file",
+            arguments=oversized,
+        )
+
+
+def test_canonical_tool_call_rejects_oversized_tool_name() -> None:
+    oversized = "x" * (MAX_PROVIDER_TOOL_NAME_CHARS + 1)
+
+    with pytest.raises(ValueError, match=r"provider tool name must match"):
+        CanonicalToolCall(
+            call_id="call-1",
+            name=oversized,
+            arguments={},
+        )
+
+
+def test_canonical_tool_call_rejects_nonportable_tool_name() -> None:
+    with pytest.raises(ValueError, match=r"provider tool name must match"):
+        CanonicalToolCall(
+            call_id="call-1",
+            name="remote.tool/read",
+            arguments={},
+        )
+
+
+def test_canonical_message_content_has_block_and_aggregate_byte_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.providers.messages as messages_module
+
+    monkeypatch.setattr(messages_module, "MAX_CANONICAL_CONTENT_BLOCKS", 2)
+    monkeypatch.setattr(messages_module, "MAX_CANONICAL_CONTENT_BYTES", 8)
+
+    with pytest.raises(ValueError, match="content blocks exceed the limit of 2"):
+        CanonicalMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+                {"type": "text", "text": "c"},
+            ],
+        )
+
+    with pytest.raises(ValueError, match="message content exceeds 8 UTF-8 bytes"):
+        CanonicalMessage(role="user", content="123456789")
+
+    with pytest.raises(ValueError, match="message content exceeds 8 UTF-8 bytes"):
+        CanonicalMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "12345"},
+                {"type": "text", "text": "6789"},
+            ],
+        )
+
+    assert MAX_CANONICAL_CONTENT_BLOCKS == 64
+    assert MAX_CANONICAL_CONTENT_BYTES == 16 * 1024 * 1024
 
 
 def test_first_party_encoders_support_image_only_user_content() -> None:

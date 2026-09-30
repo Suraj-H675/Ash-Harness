@@ -163,6 +163,45 @@ def test_validate_mutation_path_allows_new_nested_path(tmp_path: Path) -> None:
     )
 
 
+def test_guard_rejects_replaced_project_root(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    saved = tmp_path / "project-original"
+    replacement = tmp_path / "replacement"
+    project_root.mkdir()
+    replacement.mkdir()
+    (project_root / "original.txt").write_text("original", encoding="utf-8")
+    (replacement / "replacement.txt").write_text("replacement", encoding="utf-8")
+    guard = SafetyGuard(project_root)
+
+    project_root.rename(saved)
+    replacement.rename(project_root)
+
+    with pytest.raises(SafetyViolation, match="project root identity changed"):
+        guard.validate_path("replacement.txt")
+    with pytest.raises(SafetyViolation, match="project root identity changed"):
+        guard.validate_mutation_path("replacement.txt")
+
+
+def test_guard_rejects_unexpected_initial_project_root_identity(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    metadata = project_root.stat()
+    expected_identity = (metadata.st_dev, metadata.st_ino)
+    project_root.rename(tmp_path / "project-original")
+    project_root.mkdir()
+
+    with pytest.raises(
+        SafetyViolation,
+        match="identity changed before guard initialization",
+    ):
+        SafetyGuard(
+            project_root,
+            expected_project_root_identity=expected_identity,
+        )
+
+
 def test_validate_path_enforces_allowed_directories(tmp_path: Path) -> None:
     project_root = tmp_path / "project"
     allowed = project_root / "src"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -285,6 +286,234 @@ def test_profile_state_is_used_by_config_loader(
         "dotenv",
         f"ASH_MODEL in {profile_directory('work') / '.env'}",
     )
+
+
+def test_profile_switch_clears_legacy_promoted_anthropic_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ASH_PROFILE", raising=False)
+    monkeypatch.delenv("ASH_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    from ash.commands.profile import add_profile, use_profile
+    from ash.config import AshConfig
+    from ash.profiles import profile_directory
+
+    add_profile("work")
+    profile_directory("work").joinpath(".env").write_text(
+        "ASH_API_KEY=work-secret\n",
+        encoding="utf-8",
+    )
+
+    use_profile("work")
+    AshConfig.load()
+    assert os.environ["ANTHROPIC_API_KEY"] == "work-secret"
+
+    use_profile("default")
+    AshConfig.load()
+
+    assert "ASH_API_KEY" not in os.environ
+    assert "ANTHROPIC_API_KEY" not in os.environ
+
+
+def test_profile_switch_clears_profile_runtime_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ASH_PROFILE", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    from ash.commands import config as cli_config
+    from ash.commands.profile import add_profile, use_profile
+    from ash.config import AshConfig
+
+    add_profile("work")
+    add_profile("personal")
+    use_profile("work")
+    cli_config.save_env_values({"OPENAI_API_KEY": "work-key"})
+
+    AshConfig.load()
+    assert os.environ["OPENAI_API_KEY"] == "work-key"
+
+    use_profile("personal")
+    AshConfig.load()
+
+    assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_profile_setup_persistence_preserves_operator_env_and_profile_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ASH_PROFILE", raising=False)
+    monkeypatch.setenv("ASH_MODEL", "openai/operator-model")
+    monkeypatch.setenv("OPENAI_API_KEY", "operator-key")
+    monkeypatch.delenv("ASH_TEMPERATURE", raising=False)
+    monkeypatch.delenv("ASH_DB_DIRECTORY", raising=False)
+    from ash.commands import config as cli_config
+    from ash.commands.profile import add_profile, use_profile
+    from ash.config import AshConfig
+    from ash.profiles import profile_directory
+
+    add_profile("work")
+    add_profile("personal")
+    use_profile("work")
+    work_db = tmp_path / "work-db"
+    cli_config.save_env_values(
+        {
+            "ASH_MODEL": "ollama/work-model",
+            "ASH_TEMPERATURE": "0.42",
+            "ASH_DB_DIRECTORY": str(work_db),
+            "OPENAI_API_KEY": "work-key",
+        }
+    )
+
+    work = AshConfig.load()
+    assert work.model == "openai/operator-model"
+    assert work.temperature == 0.42
+    assert work.db_directory == work_db
+    assert work.config_source("model") == ("env", "ASH_MODEL")
+    assert work.config_source("temperature")[0] == "dotenv"
+    assert work.config_source("db_directory")[0] == "dotenv"
+    assert os.environ["ASH_MODEL"] == "openai/operator-model"
+    assert os.environ["OPENAI_API_KEY"] == "operator-key"
+    assert "ASH_TEMPERATURE" not in os.environ
+    assert "ASH_DB_DIRECTORY" not in os.environ
+
+    use_profile("personal")
+    personal = AshConfig.load()
+
+    assert personal.model == "openai/operator-model"
+    assert personal.temperature == 0.0
+    assert personal.db_directory == profile_directory("personal") / "db"
+    assert personal.config_source("model") == ("env", "ASH_MODEL")
+    assert os.environ["ASH_MODEL"] == "openai/operator-model"
+    assert os.environ["OPENAI_API_KEY"] == "operator-key"
+    assert "ASH_TEMPERATURE" not in os.environ
+    assert "ASH_DB_DIRECTORY" not in os.environ
+
+
+def test_cli_profile_override_is_one_shot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ASH_PROFILE", raising=False)
+    from ash.cli import main
+    from ash.commands.profile import add_profile
+
+    add_profile("work")
+
+    assert main(["--profile", "work", "profile", "list", "--json"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["active"] == "work"
+    assert "ASH_PROFILE" not in os.environ
+
+    assert main(["profile", "list", "--json"]) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["active"] == "default"
+    assert "ASH_PROFILE" not in os.environ
+
+
+def test_profile_show_missing_emits_json_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ASH_PROFILE", raising=False)
+    from ash.cli import main
+
+    assert main(["profile", "show", "missing", "--json"]) == 2
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert "profile does not exist: missing" in payload["error"]["message"]
+    assert captured.err == ""
+
+
+def test_named_profile_defaults_sqlite_state_to_profile_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ASH_PROFILE", raising=False)
+    monkeypatch.delenv("ASH_DB_DIRECTORY", raising=False)
+    from ash.commands.profile import add_profile, use_profile
+    from ash.config import AshConfig
+    from ash.profiles import profile_directory
+
+    add_profile("work")
+    use_profile("work")
+
+    config = AshConfig.load()
+    expected = profile_directory("work") / "db"
+
+    assert config.db_directory == expected
+    assert config.config_source("db_directory") == (
+        "profile-default",
+        "isolated state for profile 'work'",
+    )
+
+
+def test_named_profile_can_explicitly_override_sqlite_state_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ASH_PROFILE", raising=False)
+    monkeypatch.delenv("ASH_DB_DIRECTORY", raising=False)
+    from ash.commands.profile import add_profile, use_profile
+    from ash.config import AshConfig
+    from ash.profiles import profile_directory
+
+    add_profile("work")
+    use_profile("work")
+    custom = tmp_path / "custom-profile-db"
+    profile_directory("work").joinpath("ash.toml").write_text(
+        f'db_directory = "{custom.as_posix()}"\n',
+        encoding="utf-8",
+    )
+
+    config = AshConfig.load()
+
+    assert config.db_directory == custom
+    assert config.config_source("db_directory") == (
+        "user",
+        str(profile_directory("work") / "ash.toml"),
+    )
+
+
+def test_profile_removal_deletes_default_local_db_but_not_external_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ASH_PROFILE", raising=False)
+    from ash.commands.profile import add_profile, remove_profile, use_profile
+    from ash.config import AshConfig
+    from ash.profiles import profile_directory
+
+    add_profile("local")
+    use_profile("local")
+    local_config = AshConfig.load()
+    local_config.db_directory.mkdir(parents=True)
+    local_config.db_directory.joinpath("sessions.db").write_bytes(b"local")
+    local_profile = profile_directory("local")
+
+    use_profile("default")
+    assert remove_profile("local", confirmed=True) == "local"
+    assert local_profile.exists() is False
+
+    add_profile("external")
+    external_state = tmp_path / "external-db"
+    external_state.mkdir()
+    sentinel = external_state / "sessions.db"
+    sentinel.write_bytes(b"external")
+    profile_directory("external").joinpath("ash.toml").write_text(
+        f'db_directory = "{external_state.as_posix()}"\n',
+        encoding="utf-8",
+    )
+
+    assert remove_profile("external", confirmed=True) == "external"
+    assert sentinel.read_bytes() == b"external"
 
 
 def test_removing_active_profile_resets_marker_before_deletion(

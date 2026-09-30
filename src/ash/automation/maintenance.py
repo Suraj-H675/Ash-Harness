@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from typing import Any
 
 from ash.automation.store import AutomationStore
 from ash.core.session import SessionStore
+from ash.json_utils import strict_json_loads
 from ash.safe_io import read_bounded_text
 
 
@@ -60,7 +60,7 @@ def _required_int(request: dict[str, Any], key: str, *, minimum: int) -> int:
 
 def main() -> int:
     try:
-        raw = json.loads(
+        raw = strict_json_loads(
             read_bounded_text(
                 sys.stdin,
                 MAX_MAINTENANCE_REQUEST_BYTES,

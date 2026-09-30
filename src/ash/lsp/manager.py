@@ -22,6 +22,8 @@ MAX_DIAGNOSTICS_PER_FILE = 100
 MAX_LSP_STRING_CHARS = 64 * 1024
 MAX_DIAGNOSTIC_CACHE_FILES = 256
 MAX_LSP_RESTART_ATTEMPTS = 3
+MAX_LSP_CLIENT_ROOTS = 64
+MAX_LSP_FAILURE_RECORDS = 256
 _DROP = object()
 
 
@@ -305,7 +307,10 @@ class LanguageServerManager:
                     continue
                 diagnostic_key = (name, uri)
                 if report.result_id:
-                    self._diagnostic_result_ids[diagnostic_key] = report.result_id
+                    self._store_diagnostic_result_id(
+                        diagnostic_key,
+                        report.result_id,
+                    )
                 if report.kind == "full":
                     self._store_diagnostics(name, uri, report.items)
             if any(report is None for _, report in pull_results):
@@ -578,6 +583,12 @@ class LanguageServerManager:
                 return existing
             task = self._starting.get(key)
             if task is None:
+                owned_roots = set(self._clients) | set(self._starting)
+                if len(owned_roots) >= MAX_LSP_CLIENT_ROOTS:
+                    raise LSPError(
+                        "language-server client root limit reached; close or "
+                        "restart the runtime before opening another LSP root"
+                    )
                 task = asyncio.create_task(self._start_client(config, root))
                 self._starting[key] = task
         try:
@@ -634,6 +645,10 @@ class LanguageServerManager:
                 self._clients.pop(key, None)
 
     def _record_failure(self, key: tuple[str, Path], detail: str) -> None:
+        if key not in self._failure_counts and len(self._failure_counts) >= MAX_LSP_FAILURE_RECORDS:
+            oldest = next(iter(self._failure_counts))
+            self._failure_counts.pop(oldest, None)
+            self._broken.pop(oldest, None)
         failures = self._failure_counts.get(key, 0) + 1
         self._failure_counts[key] = failures
         delay = min(30.0, float(2 ** (failures - 1)))
@@ -677,6 +692,20 @@ class LanguageServerManager:
             _normalize_diagnostic(item, name)
             for item in items[:MAX_DIAGNOSTICS_PER_FILE]
         ]
+
+    def _store_diagnostic_result_id(
+        self,
+        key: tuple[str, str],
+        result_id: str,
+    ) -> None:
+        """Retain bounded incremental-diagnostic state independently of payloads."""
+
+        if key in self._diagnostic_result_ids:
+            self._diagnostic_result_ids.pop(key, None)
+        elif len(self._diagnostic_result_ids) >= MAX_DIAGNOSTIC_CACHE_FILES:
+            oldest = next(iter(self._diagnostic_result_ids))
+            self._diagnostic_result_ids.pop(oldest, None)
+        self._diagnostic_result_ids[key] = result_id
 
     def _bounded_results(self, values: list[Any]) -> list[Any]:
         normalized: list[Any] = []

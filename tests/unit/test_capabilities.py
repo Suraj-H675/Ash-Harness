@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from ash.sdk import AshClient
@@ -62,6 +64,65 @@ def test_provider_unregister_removes_owned_capability_declaration() -> None:
     assert providers.unregister("example") is True
     assert capabilities.families() == ()
     assert providers.unregister("example") is False
+
+
+def test_provider_unregister_preserves_another_registry_capability_owner() -> None:
+    capabilities = CapabilityRegistry()
+    first = ProviderRegistry(capabilities)
+    second = ProviderRegistry(capabilities)
+    first.register(
+        "example",
+        lambda config, model: DeclaredProvider(model),
+        capabilities=lambda model: ProviderCapabilities(local=True),
+    )
+    second.register(
+        "example",
+        lambda config, model: DeclaredProvider(model),
+        replace=True,
+        capabilities=lambda model: ProviderCapabilities(reasoning=True),
+    )
+
+    first_provider = first.build(AshConfig(model="example/model"))
+    second_provider = second.build(AshConfig(model="example/model"))
+
+    assert first_provider.capabilities.local is True
+    assert first_provider.capabilities.reasoning is False
+    assert second_provider.capabilities.reasoning is True
+    assert first.unregister("example") is True
+    assert capabilities.resolve("example", "model").reasoning is True
+
+
+def test_provider_build_snapshots_factory_and_capabilities_together() -> None:
+    capabilities = CapabilityRegistry()
+    providers = ProviderRegistry(capabilities)
+    factory_entered = threading.Event()
+    release_factory = threading.Event()
+
+    def factory(config, model):
+        factory_entered.set()
+        assert release_factory.wait(timeout=1)
+        return DeclaredProvider(model)
+
+    providers.register(
+        "example",
+        factory,
+        capabilities=lambda model: ProviderCapabilities(reasoning=True),
+    )
+    built: list[ProviderABC] = []
+
+    thread = threading.Thread(
+        target=lambda: built.append(providers.build(AshConfig(model="example/model")))
+    )
+    thread.start()
+    assert factory_entered.wait(timeout=1)
+
+    assert providers.unregister("example") is True
+    release_factory.set()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert len(built) == 1
+    assert built[0].capabilities.reasoning is True
 
 
 def test_capability_registry_rejects_duplicate_or_invalid_resolvers() -> None:

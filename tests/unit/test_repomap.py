@@ -326,6 +326,52 @@ def test_repomap_honors_gitignore_for_untracked_files(tmp_path: Path) -> None:
     assert [node.path.name for node in repo_map.files] == ["kept.py"]
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_repomap_fails_closed_on_repository_external_excludes_file(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    outside_ignore = tmp_path.parent / "outside-ignore"
+    outside_ignore.write_text("selectively-hidden.py\n", encoding="utf-8")
+    (tmp_path / "selectively-hidden.py").write_text("SECRET = 1\n", encoding="utf-8")
+    (tmp_path / "otherwise-visible.py").write_text("VISIBLE = 1\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "config", "core.excludesFile", str(outside_ignore)],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    repo_map = RepoMap(tmp_path)
+
+    assert repo_map.files == []
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_repomap_preserves_user_global_excludes_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    outside_ignore = tmp_path / "global-ignore"
+    outside_ignore.write_text("globally-hidden.py\n", encoding="utf-8")
+    (home / ".gitconfig").write_text(
+        f"[core]\n    excludesFile = {outside_ignore}\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    (workspace / "globally-hidden.py").write_text("SECRET = 1\n", encoding="utf-8")
+    (workspace / "visible.py").write_text("VISIBLE = 1\n", encoding="utf-8")
+
+    repo_map = RepoMap(workspace)
+
+    assert [node.path.name for node in repo_map.files] == ["visible.py"]
+
+
 @pytest.mark.skipif(
     shutil.which("git") is None or os.name != "posix",
     reason="Git and POSIX descriptor cwd are required",

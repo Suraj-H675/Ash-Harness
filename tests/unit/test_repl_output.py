@@ -18,6 +18,30 @@ def test_inline_repl_printer_preserves_print_contract() -> None:
     assert ui.transcript.snapshot() == ()
 
 
+def test_repl_printer_accepts_none_sep_and_end() -> None:
+    ui = TerminalUI(console=Console(file=io.StringIO(), force_terminal=False))
+    target = io.StringIO()
+
+    ReplPrinter(ui, viewport=False)("one", "two", sep=None, end=None, file=target)
+    ReplPrinter(ui, viewport=True)("three", "four", sep=None, end=None)
+
+    assert target.getvalue() == "one two\n"
+    assert ui.transcript.snapshot()[-1].content == "three four"
+
+
+def test_inline_repl_printer_neutralizes_terminal_controls() -> None:
+    ui = TerminalUI(console=Console(file=io.StringIO(), force_terminal=False))
+    target = io.StringIO()
+    printer = ReplPrinter(ui, viewport=False)
+
+    printer("safe\x1b[2J\u202ehidden\u202c", file=target)
+
+    rendered = target.getvalue()
+    assert "\x1b[2J" not in rendered
+    assert "\u202e" not in rendered
+    assert "safe\\x1b[2J\\u202ehidden\\u202c" in rendered
+
+
 def test_viewport_repl_printer_routes_output_and_errors() -> None:
     ui = TerminalUI(console=Console(file=io.StringIO(), force_terminal=False))
     printer = ReplPrinter(ui, viewport=True)

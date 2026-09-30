@@ -50,7 +50,10 @@ class AshError(Exception):
     """Base exception for Ash errors with optional structured metadata."""
 
     category = ErrorCategory.INTERNAL
-    remedy = "Retry with --debug for more detail, or report this as an Ash bug."
+    remedy = (
+        "Run `ash doctor`; if the issue persists, report it as an Ash bug with "
+        "the redacted error message and reproduction steps."
+    )
     exit_code = 1
     retriable = False
 
@@ -137,7 +140,17 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
             retriable=False,
         )
 
-    if isinstance(exc, KeyError) and "session" in lowered:
+    session_selection_value_error = isinstance(exc, ValueError) and (
+        name == "SessionResolutionError"
+        or lowered in {
+            "no sessions found in this project",
+            "no session found to continue in this project",
+            "session belongs to a different workspace",
+            "--resume without a session requires an interactive terminal",
+            "--fork-session requires --continue, --resume, or --session",
+        }
+    )
+    if (isinstance(exc, KeyError) and "session" in lowered) or session_selection_value_error:
         return ErrorInfo(
             ErrorCategory.SESSION,
             message.strip("'"),
@@ -211,7 +224,8 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
     return ErrorInfo(
         ErrorCategory.INTERNAL,
         message,
-        "Retry with --debug for more detail, or report this as an Ash bug.",
+        "Run `ash doctor`; if the issue persists, report it as an Ash bug with "
+        "the redacted error message and reproduction steps.",
     )
 
 

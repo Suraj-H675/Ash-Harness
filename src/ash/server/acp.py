@@ -8,7 +8,7 @@ import binascii
 import hashlib
 import html
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
@@ -106,11 +106,35 @@ ACPClientFactory = Callable[
 ]
 
 
+async def _settle_acp_cleanup_task(
+    task: asyncio.Task[Any],
+) -> tuple[BaseException | None, bool]:
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                continue
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, interrupted
+    return None, interrupted
+
+
 @dataclass
 class _ACPSession:
     workspace: Path
     client: AshClient
     prompt_task: asyncio.Task[Any] | None = None
+    close_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 class AshACPAgent:
@@ -127,10 +151,16 @@ class AshACPAgent:
         self._client_factory = client_factory or _create_ash_client
         self._max_sessions = max_sessions
         self._sessions: dict[str, _ACPSession] = {}
+        self._retired_sessions: dict[str, _ACPSession] = {}
+        self._unpublished_sessions: dict[int, _ACPSession] = {}
         self._pending_sessions = 0
         self._pending_session_ids: set[str] = set()
         self._forking_sessions: set[str] = set()
         self._lock = asyncio.Lock()
+        self._lifecycle_condition = asyncio.Condition(self._lock)
+        self._close_lock = asyncio.Lock()
+        self._closing = False
+        self._closed = False
         self._connection: ACPClient | None = None
 
     def on_connect(self, conn: ACPClient) -> None:
@@ -184,21 +214,33 @@ class AshACPAgent:
         configs = _mcp_configs(mcp_servers or [])
         await self._reserve_session()
         client: AshClient | None = None
+        state: _ACPSession | None = None
         session_id = ""
         try:
             approval = self._approval_callback(lambda: session_id)
             client = await self._client_factory(workspace, None, configs, approval)
+            state = _ACPSession(workspace, client)
             if client.loop.current_session is None:
                 raise RuntimeError("Ash did not create an ACP session")
             session_id = client.loop.current_session.session_id
             async with self._lock:
-                if session_id in self._sessions:
+                self._raise_if_closing_locked()
+                if (
+                    session_id in self._sessions
+                    or session_id in self._retired_sessions
+                ):
                     raise RuntimeError("Ash returned a duplicate session ID")
-                self._sessions[session_id] = _ACPSession(workspace, client)
+                self._sessions[session_id] = state
             return NewSessionResponse(session_id=session_id)
-        except BaseException:
-            if client is not None:
-                await client.close()
+        except BaseException as primary_error:
+            if client is not None and state is not None:
+                try:
+                    await self._retain_unpublished_session(state, session_id=session_id)
+                    await self._close_unpublished_session(state)
+                except BaseException as cleanup_error:
+                    primary_error.add_note(
+                        f"ACP unpublished runtime cleanup failed: {cleanup_error}"
+                    )
             raise
         finally:
             await self._release_reservation()
@@ -216,6 +258,7 @@ class AshACPAgent:
         configs = _mcp_configs(mcp_servers or [])
         await self._reserve_session(session_id=session_id)
         client: AshClient | None = None
+        state: _ACPSession | None = None
         try:
             _store, stored = _stored_session_for_workspace(workspace, session_id)
             approval = self._approval_callback(lambda: session_id)
@@ -224,6 +267,7 @@ class AshACPAgent:
             )
             state = _ACPSession(workspace, client)
             async with self._lock:
+                self._raise_if_closing_locked()
                 self._sessions[session_id] = state
             await self._replay(session_id, stored.messages, stored.tool_calls)
             async with self._lock:
@@ -235,11 +279,15 @@ class AshACPAgent:
             if client is not None:
                 await client.close()
             raise RequestError.resource_not_found(session_id) from exc
-        except BaseException:
-            if client is not None:
-                await client.close()
-            async with self._lock:
-                self._sessions.pop(session_id, None)
+        except BaseException as primary_error:
+            if client is not None and state is not None:
+                try:
+                    await self._retain_session_for_cleanup(session_id, state)
+                    await self._close_retired_session(session_id, state)
+                except BaseException as cleanup_error:
+                    primary_error.add_note(
+                        f"ACP load cleanup failed: {cleanup_error}"
+                    )
             raise
         finally:
             await self._release_reservation(session_id=session_id)
@@ -358,11 +406,8 @@ class AshACPAgent:
     async def close_session(
         self, session_id: str, **kwargs: Any
     ) -> CloseSessionResponse:
-        state = await self._pop_session(session_id)
-        if state.prompt_task is not None and not state.prompt_task.done():
-            state.prompt_task.cancel()
-            await asyncio.gather(state.prompt_task, return_exceptions=True)
-        await state.client.close()
+        state = await self._retire_session(session_id)
+        await self._close_retired_session(session_id, state)
         return CloseSessionResponse()
 
     async def set_session_mode(
@@ -431,31 +476,29 @@ class AshACPAgent:
             client = await self._client_factory(
                 workspace, child_id, configs, approval
             )
+            state = _ACPSession(workspace, client)
             current_session = client.loop.current_session
             if current_session is None or current_session.session_id != child_id:
                 raise RuntimeError("Ash did not attach the forked ACP session")
-            state = _ACPSession(workspace, client)
             async with self._lock:
+                self._raise_if_closing_locked()
                 if child_id in self._sessions:
                     raise RuntimeError("Ash returned a duplicate forked session ID")
                 self._sessions[child_id] = state
             return ForkSessionResponse(session_id=child_id)
         except BaseException as primary_error:
             runtime_cleanup_confirmed = client is None
-            if client is not None:
+            if client is not None and state is not None:
                 try:
-                    await client.close()
-                except BaseException:
+                    await self._retain_session_for_cleanup(child_id, state)
+                    await self._close_retired_session(child_id, state)
+                except BaseException as cleanup_error:
                     primary_error.add_note(
                         "fork runtime cleanup could not be confirmed; "
-                        "durable child state was preserved"
+                        f"durable child state was preserved: {cleanup_error}"
                     )
                 else:
                     runtime_cleanup_confirmed = True
-            if runtime_cleanup_confirmed and state is not None and forked is not None:
-                async with self._lock:
-                    if self._sessions.get(forked.session_id) is state:
-                        self._sessions.pop(forked.session_id, None)
             if runtime_cleanup_confirmed and store is not None and forked is not None:
                 store.discard_unchanged_leaf_fork(
                     forked.session_id,
@@ -465,11 +508,12 @@ class AshACPAgent:
                 )
             raise
         finally:
-            if child_id_reserved:
-                await self._release_pending_session_id(child_id)
-            if fork_source_reserved:
-                await self._release_fork_source(session_id)
-            await self._release_reservation()
+            await self._release_fork_reservations(
+                child_id=child_id,
+                child_id_reserved=child_id_reserved,
+                source_session_id=session_id,
+                fork_source_reserved=fork_source_reserved,
+            )
 
     async def resume_session(
         self,
@@ -491,11 +535,12 @@ class AshACPAgent:
             client = await self._client_factory(
                 workspace, session_id, configs, approval
             )
+            state = _ACPSession(workspace, client)
             current_session = client.loop.current_session
             if current_session is None or current_session.session_id != session_id:
                 raise RuntimeError("Ash did not resume the requested ACP session")
-            state = _ACPSession(workspace, client)
             async with self._lock:
+                self._raise_if_closing_locked()
                 if session_id in self._sessions:
                     raise RequestError.invalid_request(
                         {"sessionId": session_id, "reason": "session already loaded"}
@@ -503,21 +548,15 @@ class AshACPAgent:
                 self._sessions[session_id] = state
             return ResumeSessionResponse()
         except BaseException as primary_error:
-            runtime_cleanup_confirmed = client is None
-            if client is not None:
+            if client is not None and state is not None:
                 try:
-                    await client.close()
-                except BaseException:
+                    await self._retain_session_for_cleanup(session_id, state)
+                    await self._close_retired_session(session_id, state)
+                except BaseException as cleanup_error:
                     primary_error.add_note(
                         "resume runtime cleanup could not be confirmed; "
-                        "durable session state was preserved"
+                        f"durable session state was preserved: {cleanup_error}"
                     )
-                else:
-                    runtime_cleanup_confirmed = True
-            if runtime_cleanup_confirmed and state is not None:
-                async with self._lock:
-                    if self._sessions.get(session_id) is state:
-                        self._sessions.pop(session_id, None)
             raise
         finally:
             await self._release_reservation(session_id=session_id)
@@ -529,20 +568,40 @@ class AshACPAgent:
         return None
 
     async def aclose(self) -> None:
-        async with self._lock:
-            states = list(self._sessions.values())
-            self._sessions.clear()
-        prompt_tasks = [
-            state.prompt_task
-            for state in states
-            if state.prompt_task is not None and not state.prompt_task.done()
-        ]
-        for task in prompt_tasks:
-            task.cancel()
-        await asyncio.gather(*prompt_tasks, return_exceptions=True)
-        await asyncio.gather(
-            *(state.client.close() for state in states), return_exceptions=True
-        )
+        async with self._close_lock:
+            async with self._lifecycle_condition:
+                if self._closed:
+                    return
+                self._closing = True
+                while self._pending_sessions:
+                    await self._lifecycle_condition.wait()
+                for session_id, state in self._sessions.items():
+                    self._retired_sessions.setdefault(session_id, state)
+                self._sessions.clear()
+                retired = tuple(self._retired_sessions.items())
+                unpublished = tuple(self._unpublished_sessions.values())
+            retired_outcomes = await asyncio.gather(
+                *(
+                    self._close_retired_session(session_id, state)
+                    for session_id, state in retired
+                ),
+                return_exceptions=True,
+            )
+            unpublished_outcomes = await asyncio.gather(
+                *(self._close_unpublished_session(state) for state in unpublished),
+                return_exceptions=True,
+            )
+            failures = [
+                outcome
+                for outcome in (*retired_outcomes, *unpublished_outcomes)
+                if isinstance(outcome, BaseException)
+            ]
+            if failures:
+                raise RuntimeError(
+                    f"failed to close {len(failures)} ACP session runtime(s)"
+                ) from failures[0]
+            async with self._lock:
+                self._closed = True
 
     async def _send_event(self, session_id: str, event: AshEvent) -> None:
         data = event.data
@@ -710,17 +769,82 @@ class AshACPAgent:
             raise RequestError.resource_not_found(session_id)
         return state
 
-    async def _pop_session(self, session_id: str) -> _ACPSession:
+    async def _retire_session(self, session_id: str) -> _ACPSession:
         async with self._lock:
             state = self._sessions.pop(session_id, None)
+            if state is not None:
+                self._retired_sessions[session_id] = state
+            else:
+                state = self._retired_sessions.get(session_id)
         if state is None:
             raise RequestError.resource_not_found(session_id)
         return state
 
+    async def _retain_session_for_cleanup(
+        self,
+        session_id: str,
+        state: _ACPSession,
+    ) -> None:
+        async with self._lock:
+            published = self._sessions.get(session_id)
+            retired = self._retired_sessions.get(session_id)
+            if published is not None and published is not state:
+                raise RuntimeError("ACP session cleanup ownership changed unexpectedly")
+            if retired is not None and retired is not state:
+                raise RuntimeError("ACP retired session ownership changed unexpectedly")
+            if published is state:
+                self._sessions.pop(session_id, None)
+            self._retired_sessions[session_id] = state
+
+    async def _close_retired_session(
+        self,
+        session_id: str,
+        state: _ACPSession,
+    ) -> None:
+        async with state.close_lock:
+            async with self._lock:
+                if self._retired_sessions.get(session_id) is not state:
+                    return
+            prompt_task = state.prompt_task
+            if prompt_task is not None and not prompt_task.done():
+                prompt_task.cancel()
+                await asyncio.gather(prompt_task, return_exceptions=True)
+            await state.client.close()
+            async with self._lock:
+                if self._retired_sessions.get(session_id) is state:
+                    self._retired_sessions.pop(session_id, None)
+
+    async def _retain_unpublished_session(
+        self,
+        state: _ACPSession,
+        *,
+        session_id: str = "",
+    ) -> None:
+        async with self._lock:
+            if session_id and self._sessions.get(session_id) is state:
+                self._sessions.pop(session_id, None)
+            self._unpublished_sessions[id(state)] = state
+
+    async def _close_unpublished_session(self, state: _ACPSession) -> None:
+        async with state.close_lock:
+            async with self._lock:
+                if self._unpublished_sessions.get(id(state)) is not state:
+                    return
+            prompt_task = state.prompt_task
+            if prompt_task is not None and not prompt_task.done():
+                prompt_task.cancel()
+                await asyncio.gather(prompt_task, return_exceptions=True)
+            await state.client.close()
+            async with self._lock:
+                if self._unpublished_sessions.get(id(state)) is state:
+                    self._unpublished_sessions.pop(id(state), None)
+
     async def _reserve_session(self, *, session_id: str = "") -> None:
         async with self._lock:
+            self._raise_if_closing_locked()
             if session_id and (
                 session_id in self._sessions
+                or session_id in self._retired_sessions
                 or session_id in self._pending_session_ids
             ):
                 raise RequestError.invalid_request(
@@ -733,7 +857,13 @@ class AshACPAgent:
                         "reason": "session lifecycle operation is in progress",
                     }
                 )
-            if len(self._sessions) + self._pending_sessions >= self._max_sessions:
+            if (
+                len(self._sessions)
+                + len(self._retired_sessions)
+                + len(self._unpublished_sessions)
+                + self._pending_sessions
+                >= self._max_sessions
+            ):
                 raise RequestError(
                     -32003,
                     "ACP session limit reached",
@@ -744,15 +874,32 @@ class AshACPAgent:
                 self._pending_session_ids.add(session_id)
 
     async def _release_reservation(self, *, session_id: str = "") -> None:
-        async with self._lock:
+        cleanup = asyncio.create_task(
+            self._release_reservation_owned(session_id=session_id),
+            name="ash-acp-release-session-reservation",
+        )
+        cleanup_error, interrupted = await _settle_acp_cleanup_task(cleanup)
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if cleanup_error is not None:
+                cancellation.add_note("ACP session reservation cleanup also failed")
+            raise cancellation from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    async def _release_reservation_owned(self, *, session_id: str = "") -> None:
+        async with self._lifecycle_condition:
             self._pending_sessions = max(0, self._pending_sessions - 1)
             if session_id:
                 self._pending_session_ids.discard(session_id)
+            self._lifecycle_condition.notify_all()
 
     async def _reserve_pending_session_id(self, session_id: str) -> None:
         async with self._lock:
+            self._raise_if_closing_locked()
             if (
                 session_id in self._sessions
+                or session_id in self._retired_sessions
                 or session_id in self._pending_session_ids
                 or session_id in self._forking_sessions
             ):
@@ -762,11 +909,26 @@ class AshACPAgent:
             self._pending_session_ids.add(session_id)
 
     async def _release_pending_session_id(self, session_id: str) -> None:
+        cleanup = asyncio.create_task(
+            self._release_pending_session_id_owned(session_id),
+            name=f"ash-acp-release-pending-session-{session_id}",
+        )
+        cleanup_error, interrupted = await _settle_acp_cleanup_task(cleanup)
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if cleanup_error is not None:
+                cancellation.add_note("ACP pending session cleanup also failed")
+            raise cancellation from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    async def _release_pending_session_id_owned(self, session_id: str) -> None:
         async with self._lock:
             self._pending_session_ids.discard(session_id)
 
     async def _reserve_fork_source(self, session_id: str) -> None:
         async with self._lock:
+            self._raise_if_closing_locked()
             if (
                 session_id in self._forking_sessions
                 or session_id in self._pending_session_ids
@@ -788,21 +950,78 @@ class AshACPAgent:
                 )
             self._forking_sessions.add(session_id)
 
+    def _raise_if_closing_locked(self) -> None:
+        if self._closing or self._closed:
+            raise RequestError.invalid_request({"reason": "ACP agent is closing"})
+
     async def _release_fork_source(self, session_id: str) -> None:
+        cleanup = asyncio.create_task(
+            self._release_fork_source_owned(session_id),
+            name=f"ash-acp-release-fork-source-{session_id}",
+        )
+        cleanup_error, interrupted = await _settle_acp_cleanup_task(cleanup)
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if cleanup_error is not None:
+                cancellation.add_note("ACP fork-source cleanup also failed")
+            raise cancellation from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    async def _release_fork_source_owned(self, session_id: str) -> None:
         async with self._lock:
             self._forking_sessions.discard(session_id)
+
+    async def _release_fork_reservations(
+        self,
+        *,
+        child_id: str,
+        child_id_reserved: bool,
+        source_session_id: str,
+        fork_source_reserved: bool,
+    ) -> None:
+        async def release_owned() -> None:
+            if child_id_reserved:
+                await self._release_pending_session_id_owned(child_id)
+            if fork_source_reserved:
+                await self._release_fork_source_owned(source_session_id)
+            await self._release_reservation_owned()
+
+        cleanup = asyncio.create_task(
+            release_owned(),
+            name="ash-acp-release-fork-reservations",
+        )
+        cleanup_error, interrupted = await _settle_acp_cleanup_task(cleanup)
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if cleanup_error is not None:
+                cancellation.add_note("ACP fork reservation cleanup also failed")
+            raise cancellation from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 async def run_acp_agent() -> None:
     agent = AshACPAgent()
+    primary_error: BaseException | None = None
     try:
         await run_agent(
             agent,
             stdio_buffer_limit_bytes=MAX_ACP_STDIO_BYTES,
             use_unstable_protocol=True,
         )
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        await agent.aclose()
+        try:
+            await agent.aclose()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                "ACP agent cleanup failed: " + redact_text(str(cleanup_error))
+            )
 
 
 async def _create_ash_client(

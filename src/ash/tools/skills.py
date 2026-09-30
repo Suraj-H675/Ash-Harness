@@ -1,7 +1,9 @@
-"""Skill compiler and dynamic loader (Sprint 14 / V7).
+"""Legacy in-process executable-skill compatibility support.
 
-Two skill formats are supported, both loaded by
-:class:`ash.tools.registry.ToolRegistry`:
+Two legacy executable formats are supported by
+:class:`ash.tools.registry.ToolRegistry`. They are not wired into Ash's default
+runtime; standard runtime skills are non-executable ``SKILL.md`` packages
+handled by :mod:`ash.plugins.skills`.
 
 * **Python skill files** — a ``.py`` file with a docstring header
   (``name:``, ``description:``, ``trigger:``) and an
@@ -42,7 +44,7 @@ from ash.safe_io import (
 )
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
-from ash.tools.registry import SkillIndexEntry
+from ash.tools.skill_types import SkillIndexEntry
 
 UNSAFE_EXECUTABLE_SKILL_MESSAGE = (
     "executable Python/Markdown skills are disabled by default because they run "
@@ -371,6 +373,8 @@ def build_tool_from_python_module(
     parsed_trigger: str | None = None,
     source_path_verified: bool = False,
     allow_unsafe_code: bool = False,
+    tools_provider: Callable[[], list[BaseTool]] | None = None,
+    root_provider: Callable[[], Path] | None = None,
 ) -> BaseTool:
     """Wrap a Python skill module's ``execute`` function in a :class:`BaseTool`.
 
@@ -388,6 +392,10 @@ def build_tool_from_python_module(
     if execute is None or not callable(execute):
         raise SkillParseError("module is missing an execute() function")
     execute_fn = cast(Callable[..., Any], execute)
+    bound_tools_provider = tools_provider or _TOOLS_PROVIDER or (lambda: [])
+    bound_root_provider = (
+        root_provider or _ROOT_PROVIDER or safety_guard.ensure_project_root_current
+    )
     tool_name = (
         parsed_name
         or getattr(module, "__ash_name__", None)
@@ -412,8 +420,8 @@ def build_tool_from_python_module(
         async def run(self, **kwargs: Any) -> ToolResult:
             context = SkillContext(
                 safety_guard=self.safety_guard,
-                tools={t.name: t for t in _get_registry_tools()},
-                project_root=_get_project_root(),
+                tools={t.name: t for t in bound_tools_provider()},
+                project_root=bound_root_provider(),
             )
             try:
                 if asyncio_is_coroutine(execute_fn):
@@ -453,6 +461,8 @@ def compile_skill(
     safety_guard: SafetyGuard,
     *,
     allow_unsafe_code: bool = False,
+    tools_provider: Callable[[], list[BaseTool]] | None = None,
+    root_provider: Callable[[], Path] | None = None,
 ) -> BaseTool:
     """Compile a skill file (Python or markdown) into a :class:`BaseTool`."""
 
@@ -476,16 +486,33 @@ def compile_skill(
             parsed_trigger=parsed.trigger,
             source_path_verified=True,
             allow_unsafe_code=True,
+            tools_provider=tools_provider,
+            root_provider=root_provider,
         )
 
     if path.suffix == ".md":
-        return _compile_markdown_skill(path, safety_guard)
+        return _compile_markdown_skill(
+            path,
+            safety_guard,
+            tools_provider=tools_provider,
+            root_provider=root_provider,
+        )
 
     raise SkillParseError(f"Unsupported skill extension: {path.suffix}")
 
 
-def _compile_markdown_skill(path: Path, safety_guard: SafetyGuard) -> BaseTool:
+def _compile_markdown_skill(
+    path: Path,
+    safety_guard: SafetyGuard,
+    *,
+    tools_provider: Callable[[], list[BaseTool]] | None = None,
+    root_provider: Callable[[], Path] | None = None,
+) -> BaseTool:
     skill = parse_markdown_skill(path)
+    bound_tools_provider = tools_provider or _TOOLS_PROVIDER or (lambda: [])
+    bound_root_provider = (
+        root_provider or _ROOT_PROVIDER or safety_guard.ensure_project_root_current
+    )
     args_model = _build_args_model(skill.args, default_name=skill.name)
     captured_code = skill.code
     captured_name = skill.name
@@ -511,8 +538,8 @@ def _compile_markdown_skill(path: Path, safety_guard: SafetyGuard) -> BaseTool:
             )
         context = SkillContext(
             safety_guard=safety_guard,
-            tools={t.name: t for t in _get_registry_tools()},
-            project_root=_get_project_root(),
+            tools={t.name: t for t in bound_tools_provider()},
+            project_root=bound_root_provider(),
         )
         if asyncio_is_coroutine(execute_fn):
             return await execute_fn(context, **kwargs)
@@ -852,9 +879,9 @@ def configure_runtime(
 ) -> None:
     """Inject the runtime context used by compiled skills.
 
-    Called by the loop / entry point so compiled markdown skills can
-    access the tool registry and project root without importing the
-    ash package directly (which would create circular imports).
+    Compatibility callers may set defaults before compiling a skill. Compiled
+    tools capture those providers at construction time so a later runtime
+    cannot silently redirect an existing tool into another workspace.
     """
 
     global _TOOLS_PROVIDER, _ROOT_PROVIDER

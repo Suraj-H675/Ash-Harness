@@ -11,12 +11,18 @@ canonical `ash.*` namespace under `src/ash`.
 - [Production harness parity](architecture/PRODUCTION_HARNESS_PARITY.md)
 - [System prompts and templates](architecture/SYSTEM_PROMPTS_AND_TEMPLATES.md)
 
+## Audits and Benchmarks
+
+- [Parity audit and continuation evidence](audits/PARITY_AUDIT_2026.md)
+- [Setup and onboarding benchmark](audits/SETUP_HARNESS_BENCHMARK_2026.md)
+
 ## Guides
 
 - [Context management](guides/CONTEXT_MANAGEMENT.md)
 - [Durable automation](guides/DURABLE_AUTOMATION.md)
 - [Durable session branching](guides/SESSION_BRANCHING.md)
 - [Permissions and managed policy](guides/PERMISSIONS.md)
+- [Releasing Ash](guides/RELEASING.md)
 
 ## Reference
 

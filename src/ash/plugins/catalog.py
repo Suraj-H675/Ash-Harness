@@ -11,14 +11,17 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 import httpx
+from packaging.version import InvalidVersion, parse as parse_version
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+from ash.plugins.git_source import GIT_DIGEST_PATTERN, validate_plugin_git_source
 from ash.safe_io import (
     atomic_write_unlinked_bytes,
     ensure_anchored_directory,
@@ -31,12 +34,13 @@ CATALOG_VERSION = 2
 LEGACY_CATALOG_VERSION = 1
 MAX_CATALOG_BYTES = 256 * 1024
 MAX_CATALOG_ENTRIES = 1_000
+MAX_CATALOG_URL_CHARS = 4096
 SIGNATURE_ALGORITHM = "ed25519"
 _KEY_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
+_KEY_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")
 _PUBLISHER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PLUGIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _SOURCE = re.compile(r"^(https|file)://\S+$")
-_DIGEST = re.compile(r"^[0-9a-f]{40,64}$")
 
 
 class PluginCatalogError(ValueError):
@@ -51,12 +55,62 @@ def validate_catalog_key_id(value: str) -> str:
     return value
 
 
+def catalog_key_fingerprint(public_key: bytes) -> str:
+    """Return the stable fingerprint used to pin one trusted Ed25519 signer."""
+
+    if not isinstance(public_key, bytes) or len(public_key) != 32:
+        raise PluginCatalogError("invalid trusted catalog public key")
+    return "sha256:" + hashlib.sha256(public_key).hexdigest()
+
+
+def validate_catalog_key_fingerprint(value: str) -> str:
+    """Validate one persisted trusted-catalog public-key fingerprint."""
+
+    if not isinstance(value, str) or not _KEY_FINGERPRINT.fullmatch(value):
+        raise PluginCatalogError("invalid plugin catalog key fingerprint")
+    return value
+
+
 def validate_catalog_publisher(value: str) -> str:
     """Validate one signed catalog publisher namespace."""
 
     if not isinstance(value, str) or not _PUBLISHER.fullmatch(value):
         raise PluginCatalogError("invalid plugin catalog publisher")
     return value
+
+
+def validate_catalog_https_url(value: str) -> str:
+    """Validate and normalize one remote signed-catalog URL."""
+
+    if not isinstance(value, str):
+        raise PluginCatalogError("catalog URL must be a string")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > MAX_CATALOG_URL_CHARS
+        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+        or any(character.isspace() for character in normalized)
+    ):
+        raise PluginCatalogError("catalog URL is invalid")
+    try:
+        parsed = urlsplit(normalized)
+        port = parsed.port
+    except ValueError as exc:
+        raise PluginCatalogError("catalog URL is invalid") from exc
+    if (
+        parsed.scheme.casefold() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+        or port == 0
+    ):
+        raise PluginCatalogError(
+            "catalog URLs must be credential-free HTTPS URLs without query "
+            "strings or fragments"
+        )
+    return normalized
 
 
 def _catalog_trusted_root(path: Path) -> Path:
@@ -82,21 +136,25 @@ def trusted_catalog_keys_path() -> Path:
     )
 
 
-def default_catalog_path() -> Path | None:
+def default_catalog_source() -> Path | str | None:
+    """Return the configured legacy catalog source without losing URL identity."""
+
     configured = os.environ.get("ASH_PLUGIN_CATALOG")
-    return Path(configured).expanduser() if configured else None
+    if not configured:
+        return None
+    normalized = configured.strip()
+    if "://" in normalized:
+        return validate_catalog_https_url(normalized)
+    return Path(normalized).expanduser()
 
 
 def catalog_cache_path(url: str) -> Path:
     """Return a stable private cache location for one HTTPS catalog URL."""
 
-    from urllib.parse import urlsplit
-
-    parsed = urlsplit(url)
-    if parsed.scheme.casefold() != "https" or not parsed.hostname:
-        raise PluginCatalogError("catalog URL must use HTTPS")
-    identity = f"{parsed.hostname.lower()}{parsed.path or '/'}"
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    normalized = validate_catalog_https_url(url)
+    parsed = urlsplit(normalized)
+    assert parsed.hostname is not None
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", parsed.hostname.lower())[:80]
     return Path.home() / ".ash" / "cache" / "catalogs" / f"{safe_name}-{digest}.json"
 
@@ -106,12 +164,14 @@ def fetch_catalog(
     *,
     timeout_seconds: float = 10.0,
     transport: httpx.BaseTransport | None = None,
+    trusted_keys_path: Path | None = None,
 ) -> Path:
-    """Fetch a bounded HTTPS signed catalog into its stable cache path."""
+    """Fetch and verify a bounded HTTPS signed catalog before caching it."""
 
     if not 1.0 <= timeout_seconds <= 60.0:
         raise PluginCatalogError("catalog fetch timeout must be 1 to 60 seconds")
-    destination = Path(os.path.abspath(catalog_cache_path(url).expanduser()))
+    normalized_url = validate_catalog_https_url(url)
+    destination = Path(os.path.abspath(catalog_cache_path(normalized_url).expanduser()))
     trusted_root = _catalog_trusted_root(destination)
     try:
         destination = validate_unlinked_path(
@@ -128,7 +188,7 @@ def fetch_catalog(
             follow_redirects=False,
         ) as client:
             with client.stream(
-                "GET", url, headers={"Accept": "application/json"}
+                "GET", normalized_url, headers={"Accept": "application/json"}
             ) as response:
                 if response.status_code != 200:
                     raise PluginCatalogError(
@@ -159,13 +219,11 @@ def fetch_catalog(
                 raw = b"".join(chunks)
     except httpx.HTTPError as exc:
         raise PluginCatalogError(f"could not fetch plugin catalog: {exc}") from exc
-    try:
-        envelope = _parse_strict_json(raw.decode("utf-8"))
-        if not isinstance(envelope, dict) or "keyId" not in envelope:
-            raise ValueError("missing catalog key id")
-    except (UnicodeError, ValueError, KeyError, TypeError):
-        # Do not cache malformed or unsigned payloads.
-        raise PluginCatalogError("invalid signed plugin catalog response") from None
+    _parse_and_verify_catalog_bytes(
+        raw,
+        trusted_keys_path=trusted_keys_path or trusted_catalog_keys_path(),
+        source_label=normalized_url,
+    )
     try:
         ensure_anchored_directory(
             destination.parent,
@@ -211,6 +269,7 @@ class SignedCatalog:
     sequence: int
     entries: dict[str, CatalogEntry]
     key_id: str
+    key_fingerprint: str
     publisher: str | None = None
 
 
@@ -218,6 +277,7 @@ class SignedCatalog:
 class RegisteredCatalogSource:
     source: str
     key_id: str
+    key_fingerprint: str
 
 
 def load_trusted_keys(path: Path) -> dict[str, bytes]:
@@ -305,7 +365,26 @@ def parse_and_verify_catalog(
                 f"plugin catalog exceeds 256 KiB: {path}"
             ) from exc
         raise PluginCatalogError(f"cannot read plugin catalog {path}: {exc}") from exc
-    envelope = _parse_strict_json(raw.decode("utf-8"))
+    return _parse_and_verify_catalog_bytes(
+        raw,
+        trusted_keys_path=trusted_keys_path,
+        source_label=str(path),
+    )
+
+
+def _parse_and_verify_catalog_bytes(
+    raw: bytes,
+    *,
+    trusted_keys_path: Path,
+    source_label: str,
+) -> SignedCatalog:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise PluginCatalogError(
+            f"invalid signed plugin catalog JSON from {source_label}: {exc}"
+        ) from exc
+    envelope = _parse_strict_json(text)
     if not isinstance(envelope, dict) or set(envelope) != {
         "catalog",
         "keyId",
@@ -330,11 +409,20 @@ def parse_and_verify_catalog(
         )
     except (InvalidSignature, TypeError, ValueError) as exc:
         raise PluginCatalogError("plugin catalog signature is invalid") from exc
-    parsed = _validate_catalog(catalog, key_id=key_id)
+    parsed = _validate_catalog(
+        catalog,
+        key_id=key_id,
+        key_fingerprint=catalog_key_fingerprint(public_seed),
+    )
     return parsed
 
 
-def _validate_catalog(catalog: Mapping[str, Any], *, key_id: str) -> SignedCatalog:
+def _validate_catalog(
+    catalog: Mapping[str, Any],
+    *,
+    key_id: str,
+    key_fingerprint: str,
+) -> SignedCatalog:
     version = catalog.get("version")
     publisher: str | None
     if version == LEGACY_CATALOG_VERSION:
@@ -365,6 +453,7 @@ def _validate_catalog(catalog: Mapping[str, Any], *, key_id: str) -> SignedCatal
         sequence=sequence,
         entries=entries,
         key_id=key_id,
+        key_fingerprint=key_fingerprint,
         publisher=publisher,
     )
 
@@ -387,8 +476,16 @@ def _validate_entry(item: Any, *, publisher: str | None = None) -> CatalogEntry:
         raise PluginCatalogError("invalid plugin catalog entry name")
     if not isinstance(version, str) or not version or len(version) > 128:
         raise PluginCatalogError("invalid plugin catalog entry version")
+    try:
+        parse_version(version)
+    except InvalidVersion as exc:
+        raise PluginCatalogError("invalid plugin catalog entry version") from exc
     if not isinstance(source, str) or not _SOURCE.fullmatch(source):
         raise PluginCatalogError("invalid plugin catalog entry source")
+    try:
+        validate_plugin_git_source(source)
+    except ValueError as exc:
+        raise PluginCatalogError("invalid plugin catalog entry source") from exc
     if (
         not isinstance(ref, str)
         or not ref
@@ -398,7 +495,7 @@ def _validate_entry(item: Any, *, publisher: str | None = None) -> CatalogEntry:
         or len(ref) > 255
     ):
         raise PluginCatalogError("invalid plugin catalog entry ref")
-    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+    if not isinstance(digest, str) or not GIT_DIGEST_PATTERN.fullmatch(digest):
         raise PluginCatalogError("invalid plugin catalog entry digest")
     return CatalogEntry(
         name=name,

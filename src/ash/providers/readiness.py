@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from ash import __version__
+from ash.core.redaction import redact_known_secrets
 from ash.provider_catalog import BUILTIN_PROVIDERS
 from ash.safe_io import strict_json_loads
 from ash.providers.identifiers import parse_model_string
@@ -82,6 +83,12 @@ class ProviderConnection:
 
 class ProviderVerificationError(RuntimeError):
     """Raised when a provider catalog cannot be verified safely."""
+
+
+def redact_provider_error(message: str, *secrets: str) -> str:
+    """Redact canonical patterns plus exact configured provider credentials."""
+
+    return redact_known_secrets(message, *secrets)
 
 
 @dataclass(frozen=True)

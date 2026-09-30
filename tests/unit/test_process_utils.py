@@ -709,7 +709,9 @@ async def test_windows_async_cleanup_does_not_target_exited_root() -> None:
 
 def test_windows_sync_cleanup_checks_taskkill_status_and_root_state(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-provider-secret")
     plan = ProcessTreePlan({}, "taskkill.exe", tmp_path, "win32")
     process = Mock(pid=4321)
     process.poll.return_value = None
@@ -725,13 +727,14 @@ def test_windows_sync_cleanup_checks_taskkill_status_and_root_state(
     ):
         terminate_process_tree_sync(process, plan=plan, timeout_seconds=1)
 
-    run.assert_called_once_with(
-        ["taskkill.exe", "/PID", "4321", "/T", "/F"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        timeout=1,
-    )
+    run.assert_called_once()
+    call = run.call_args
+    assert call.args[0] == ["taskkill.exe", "/PID", "4321", "/T", "/F"]
+    assert call.kwargs["stdout"] == subprocess.DEVNULL
+    assert call.kwargs["stderr"] == subprocess.DEVNULL
+    assert call.kwargs["check"] is False
+    assert call.kwargs["timeout"] == 1
+    assert "OPENAI_API_KEY" not in call.kwargs["env"]
     process.kill.assert_called_once_with()
 
     exited = Mock(pid=4321)
@@ -868,6 +871,67 @@ async def test_shared_group_termination_kills_only_target_descendant_tree(
         pytest.fail("descendant survived target tree termination")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process tree semantics")
+@pytest.mark.asyncio
+async def test_posix_async_cleanup_kills_group_after_root_exits(tmp_path: Path) -> None:
+    pidfile = tmp_path / "child.pid"
+    code = (
+        "import subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+        f"open({str(pidfile)!r},'w').write(str(child.pid)); "
+        "raise SystemExit(0)"
+    )
+    plan = prepare_process_tree(workspace_root=tmp_path)
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        code,
+        **plan.spawn_options,
+    )
+    await process.wait()
+    child_pid = int(pidfile.read_text(encoding="utf-8"))
+
+    try:
+        os.kill(child_pid, 0)
+        await terminate_process_tree(process, plan=plan, grace_seconds=0.2)
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        try:
+            os.killpg(process.pid, __import__("signal").SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process tree semantics")
+def test_posix_sync_cleanup_kills_group_after_root_exits(tmp_path: Path) -> None:
+    pidfile = tmp_path / "child.pid"
+    code = (
+        "import subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+        f"open({str(pidfile)!r},'w').write(str(child.pid)); "
+        "raise SystemExit(0)"
+    )
+    plan = prepare_process_tree(workspace_root=tmp_path)
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        **plan.spawn_options,
+    )
+    process.wait(timeout=5)
+    child_pid = int(pidfile.read_text(encoding="utf-8"))
+
+    try:
+        os.kill(child_pid, 0)
+        terminate_process_tree_sync(process, plan=plan, timeout_seconds=0.2)
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        try:
+            os.killpg(process.pid, __import__("signal").SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX command syntax")
 @pytest.mark.asyncio
 async def test_communicate_process_preserves_bounded_output_on_overflow() -> None:
@@ -935,3 +999,81 @@ async def test_communicate_process_awaits_siblings_when_cleanup_fails() -> None:
         and not task.done()
         and task.get_coro().__qualname__.startswith("communicate_process.")
     ]
+
+
+@pytest.mark.asyncio
+async def test_communicate_process_settles_pipe_tasks_before_repeated_cancellation() -> None:
+    read_started = asyncio.Event()
+    allow_read = asyncio.Event()
+
+    class CancellationResistantReader:
+        async def read(self, _size: int) -> bytes:
+            read_started.set()
+            while not allow_read.is_set():
+                try:
+                    await allow_read.wait()
+                except asyncio.CancelledError:
+                    continue
+            return b""
+
+    process = Mock(
+        pid=4321,
+        returncode=0,
+        stdin=None,
+        stdout=CancellationResistantReader(),
+        stderr=None,
+    )
+    communication = asyncio.create_task(communicate_process(process))
+    await asyncio.wait_for(read_started.wait(), timeout=1)
+
+    communication.cancel()
+    await asyncio.sleep(0)
+    communication.cancel()
+    await asyncio.sleep(0)
+
+    assert communication.done() is False
+
+    allow_read.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(communication, timeout=1)
+
+    current = asyncio.current_task()
+    assert not [
+        task
+        for task in asyncio.all_tasks()
+        if task is not current
+        and not task.done()
+        and task.get_coro().__qualname__.startswith("communicate_process.")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_communicate_process_preserves_stdin_error_when_close_fails() -> None:
+    class FailingStdin:
+        def write(self, _data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            raise RuntimeError("stdin drain failed")
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            raise RuntimeError("stdin close failed")
+
+    process = Mock(
+        pid=4321,
+        returncode=0,
+        stdin=FailingStdin(),
+        stdout=None,
+        stderr=None,
+    )
+
+    with pytest.raises(RuntimeError, match="stdin drain failed") as captured:
+        await communicate_process(process, input_data=b"request")
+
+    assert any(
+        "subprocess stdin cleanup failed" in note
+        for note in captured.value.__notes__
+    )

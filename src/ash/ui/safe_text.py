@@ -36,6 +36,9 @@ def terminal_safe_text(value: str, *, single_line: bool = False) -> str:
     parts: list[str] = []
     for character in value:
         codepoint = ord(character)
+        if single_line and codepoint in {0x2028, 0x2029}:
+            parts.append(f"\\u{codepoint:04x}")
+            continue
         if (
             character in {"\n", "\t"}
             and not single_line

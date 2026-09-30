@@ -15,8 +15,9 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from ash.core.redaction import redact_known_secrets
 from ash.safe_io import strict_json_loads
-from ash.mcp.server import MCPServerConfig
+from ash.mcp.server import MCPServerConfig, resolve_mcp_stdio_launch
 from ash.mcp.oauth import (
     MCPAuthorizationRequired,
     MCPOAuthError,
@@ -55,6 +56,7 @@ MAX_PAGINATION_SESSION_RESTARTS = 1
 # catalog as well as each individual response so a hostile server cannot turn
 # pagination into an unbounded memory allocation.
 MAX_PAGINATION_RESULT_BYTES = 16 * 1024 * 1024
+MAX_MCP_TOOL_DEFINITIONS = 256
 MAX_STDIO_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_OUTBOUND_MESSAGE_BYTES = 8 * 1024 * 1024
 MAX_LEGACY_SSE_EVENT_BYTES = 8 * 1024 * 1024
@@ -62,10 +64,12 @@ MAX_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_HTTP_SSE_EVENT_BYTES = 8 * 1024 * 1024
 MAX_BUFFERED_LEGACY_SSE_RESPONSES = 1000
 SAFE_INTEGER_BOUND = 2**53 - 1
+MAX_JSONRPC_ID_BYTES = 512
 MAX_HTTP_SESSION_ID_BYTES = 1024
 MAX_PENDING_MCP_NOTIFICATIONS = 64
 MAX_PENDING_MCP_SERVER_REQUESTS = 64
 MAX_PENDING_MCP_OVERLOAD_RESPONSES = 64
+MAX_RECENT_OAUTH_ERROR_SECRETS = 4
 # Keep reconnection sleeps representable on every event loop while preserving
 # arbitrarily large valid SSE retry values by waiting in multiple slices.
 MAX_SSE_RETRY_SLEEP_SLICE_MS = 2**31 - 1
@@ -123,6 +127,23 @@ SubscriptionFailureHandler = Callable[[BaseException], Awaitable[None] | None]
 _MISSING = object()
 
 
+def _credential_header_secrets(headers: dict[str, str]) -> tuple[str, ...]:
+    secrets: list[str] = []
+    for name, value in headers.items():
+        if not value or name.casefold() not in {
+            "authorization",
+            "proxy-authorization",
+            "x-api-key",
+        }:
+            continue
+        secrets.append(value)
+        if name.casefold() in {"authorization", "proxy-authorization"} and " " in value:
+            _scheme, credential = value.split(None, 1)
+            if credential:
+                secrets.append(credential)
+    return tuple(dict.fromkeys(secrets))
+
+
 class MCPProtocolError(RuntimeError):
     """Raised for JSON-RPC or MCP negotiation failures."""
 
@@ -168,10 +189,15 @@ def _append_bounded_paginated_items(
     current_bytes: int,
     *,
     method: str,
+    max_items: int | None = None,
 ) -> int:
     """Append catalog entries without exceeding the aggregate response cap."""
 
     for value in values:
+        if max_items is not None and len(output) >= max_items:
+            raise MCPProtocolError(
+                f"{method} returned more than {max_items} entries"
+            )
         try:
             item_bytes = len(
                 json.dumps(
@@ -307,7 +333,67 @@ class MCPClient:
                 config.resolved_url,
                 oauth_config=config.resolved_oauth,
             )
+        self._configured_error_secrets = _credential_header_secrets(
+            config.resolved_headers
+        )
+        self._recent_oauth_error_secrets: list[str] = []
         self._initialized = False
+
+    async def _oauth_authorization_header(
+        self,
+        *,
+        force_refresh: bool = False,
+        rejected_access_token: str = "",
+    ) -> str:
+        if self._oauth is None:
+            raise MCPProtocolError("MCP OAuth session is unavailable")
+        header = await self._oauth.authorization_header(
+            force_refresh=force_refresh,
+            rejected_access_token=rejected_access_token,
+        )
+        self._remember_oauth_error_secret(header)
+        return header
+
+    def _remember_oauth_error_secret(self, header: str) -> None:
+        values = [header]
+        if header.casefold().startswith("bearer "):
+            values.append(header.split(None, 1)[1])
+        for value in values:
+            if not value:
+                continue
+            if value in self._recent_oauth_error_secrets:
+                self._recent_oauth_error_secrets.remove(value)
+            self._recent_oauth_error_secrets.append(value)
+        if len(self._recent_oauth_error_secrets) > MAX_RECENT_OAUTH_ERROR_SECRETS:
+            del self._recent_oauth_error_secrets[:-MAX_RECENT_OAUTH_ERROR_SECRETS]
+
+    def _redact_remote_text(self, value: str) -> str:
+        return redact_known_secrets(
+            value,
+            *self._configured_error_secrets,
+            *self._recent_oauth_error_secrets,
+        )
+
+    def _redact_remote_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._redact_remote_text(value)
+        if isinstance(value, dict):
+            return {
+                (
+                    self._redact_remote_text(key)
+                    if isinstance(key, str)
+                    else key
+                ): self._redact_remote_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self._redact_remote_value(item) for item in value]
+        return value
+
+    def redact_remote_output(self, value: Any) -> Any:
+        """Redact exact credentials sent to this server from surfaced output."""
+
+        return self._redact_remote_value(value)
 
     @property
     def client_capabilities(self) -> dict[str, Any]:
@@ -356,34 +442,60 @@ class MCPClient:
     def session_generation(self) -> int:
         return self._session_generation
 
+    @property
+    def needs_disconnect(self) -> bool:
+        """Whether this client still owns connection state that needs teardown."""
+
+        return bool(
+            self._initialized
+            or self._process is not None
+            or self._disconnect_cleanup_task is not None
+            or self._reader_task is not None
+            or self._stderr_task is not None
+            or self._sse_task is not None
+            or self._server_tasks
+            or self._pending
+            or self._legacy_sse_discovery is not None
+            or self._subscription_task is not None
+            or self._resource_subscription_tasks
+            or self._task_subscription_tasks
+            or self._http_session_id
+            or self._pending_initialize_session_id
+            or (self._owns_http and self._http is not None)
+        )
+
     async def connect(self) -> None:
         async with self._connect_lock:
             if self._initialized:
                 return
-            if self.config.transport == "stdio":
-                await self._connect_stdio()
-            elif self.config.transport in {"http", "sse"}:
-                if not self.config.resolved_url:
-                    raise MCPProtocolError(
-                        f"MCP server {self.config.name!r} has no URL"
-                    )
-                if self._http is None:
-                    self._http = httpx.AsyncClient(timeout=self.timeout)
-                if self._oauth is not None and self._oauth.http_client is None:
-                    self._oauth.http_client = self._http
-                if self.config.transport == "sse":
-                    self._legacy_sse_discovery = (
-                        asyncio.get_running_loop().create_future()
-                    )
-                    self._sse_task = asyncio.create_task(
-                        self._read_legacy_sse_events(self._sse_generation + 1)
-                    )
-                    await asyncio.shield(self._legacy_sse_discovery)
-            else:
-                raise MCPProtocolError(
-                    f"Unsupported MCP transport: {self.config.transport}"
-                )
             try:
+                self.config.ensure_source_current()
+            except ValueError as exc:
+                raise MCPProtocolError(str(exc)) from exc
+            try:
+                if self.config.transport == "stdio":
+                    await self._connect_stdio()
+                elif self.config.transport in {"http", "sse"}:
+                    if not self.config.resolved_url:
+                        raise MCPProtocolError(
+                            f"MCP server {self.config.name!r} has no URL"
+                        )
+                    if self._http is None:
+                        self._http = httpx.AsyncClient(timeout=self.timeout)
+                    if self._oauth is not None and self._oauth.http_client is None:
+                        self._oauth.http_client = self._http
+                    if self.config.transport == "sse":
+                        self._legacy_sse_discovery = (
+                            asyncio.get_running_loop().create_future()
+                        )
+                        self._sse_task = asyncio.create_task(
+                            self._read_legacy_sse_events(self._sse_generation + 1)
+                        )
+                        await asyncio.shield(self._legacy_sse_discovery)
+                else:
+                    raise MCPProtocolError(
+                        f"Unsupported MCP transport: {self.config.transport}"
+                    )
                 modern_result: dict[str, Any] | None = None
                 if self.config.transport == "stdio":
                     modern_result = await self._probe_modern_stdio()
@@ -529,7 +641,7 @@ class MCPClient:
         headers["MCP-Protocol-Version"] = MODERN_PROTOCOL_VERSION
         headers.update(self._tool_request_headers(payload, []))
         if self._oauth is not None:
-            headers["Authorization"] = await self._oauth.authorization_header()
+            headers["Authorization"] = await self._oauth_authorization_header()
         encoded = _encode_outbound_message(payload)
         async with self._http.stream(
             "POST",
@@ -1043,6 +1155,20 @@ class MCPClient:
         return True
 
     async def _stop_modern_task_subscription(self, task_id: str) -> None:
+        cleanup = asyncio.create_task(
+            self._stop_modern_task_subscription_owned(task_id),
+            name=f"ash-mcp-stop-task-watch-{self.config.name}-{task_id}",
+        )
+        cleanup_error, interrupted = await _settle_task_after_cancellation(cleanup)
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if cleanup_error is not None:
+                cancellation.add_note("MCP task subscription cleanup also failed")
+            raise cancellation from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    async def _stop_modern_task_subscription_owned(self, task_id: str) -> None:
         task = self._task_subscription_tasks.get(task_id)
         request_id = self._task_subscription_request_ids.get(task_id)
         self._task_subscription_stopping.add(task_id)
@@ -1088,6 +1214,20 @@ class MCPClient:
         self._modern_task_updates.pop(task_id, None)
 
     async def _stop_modern_resource_subscription(self, uri: str) -> None:
+        cleanup = asyncio.create_task(
+            self._stop_modern_resource_subscription_owned(uri),
+            name=f"ash-mcp-stop-resource-watch-{self.config.name}",
+        )
+        cleanup_error, interrupted = await _settle_task_after_cancellation(cleanup)
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if cleanup_error is not None:
+                cancellation.add_note("MCP resource subscription cleanup also failed")
+            raise cancellation from cleanup_error
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    async def _stop_modern_resource_subscription_owned(self, uri: str) -> None:
         task = self._resource_subscription_tasks.get(uri)
         request_id = self._resource_subscription_request_ids.get(uri)
         self._resource_subscription_stopping.add(uri)
@@ -1386,17 +1526,23 @@ class MCPClient:
 
     async def _connect_stdio(self) -> None:
         env = build_scrubbed_environment(overrides=self.config.resolved_env)
-        resolved_cwd = self.config.resolved_cwd
-        command = [self.config.resolved_command, *self.config.resolved_args]
+        try:
+            executable, resolved_cwd, expected_cwd_identity = resolve_mcp_stdio_launch(
+                self.config,
+                environment=env,
+            )
+        except ValueError as exc:
+            raise MCPProtocolError(str(exc)) from exc
+        command = [executable, *self.config.resolved_args]
         if resolved_cwd is not None:
             try:
-                cwd_guard = SafetyGuard(Path(resolved_cwd))
+                cwd_guard = SafetyGuard(resolved_cwd)
                 with prepare_scoped_process_launch(
                     command,
                     cwd=resolved_cwd,
                     guard=cwd_guard,
                     search_path=env.get("PATH"),
-                    expected_cwd_identity=self.config.cwd_identity,
+                    expected_cwd_identity=expected_cwd_identity,
                 ) as launch:
                     try:
                         process_tree_plan = prepare_process_tree(
@@ -1827,7 +1973,11 @@ class MCPClient:
                 raise MCPProtocolError(f"{method} failed with an invalid error")
             code = error.get("code")
             message = error.get("message")
-            error_data = {"data": error["data"]} if "data" in error else {}
+            error_data = (
+                {"data": self._redact_remote_value(error["data"])}
+                if "data" in error
+                else {}
+            )
             if isinstance(code, bool) or not isinstance(code, int):
                 raise MCPProtocolError(
                     f"{method} failed with an invalid error code",
@@ -1839,6 +1989,7 @@ class MCPClient:
                     code=code,
                     **error_data,
                 )
+            message = self._redact_remote_text(message)
             raise MCPProtocolError(
                 f"{method} failed ({code}): {message}",
                 code=code,
@@ -2096,7 +2247,7 @@ class MCPClient:
         headers["Accept"] = "application/json"
         headers["Content-Type"] = "application/json"
         if self._oauth is not None:
-            headers["Authorization"] = await self._oauth.authorization_header()
+            headers["Authorization"] = await self._oauth_authorization_header()
         if header_annotations:
             raise MCPProtocolError(
                 "MCP HTTP parameter headers require the http transport"
@@ -2345,7 +2496,7 @@ class MCPClient:
         else:
             headers.pop("MCP-Protocol-Version", None)
         if self._oauth is not None:
-            headers["Authorization"] = await self._oauth.authorization_header()
+            headers["Authorization"] = await self._oauth_authorization_header()
         if sent_protocol_version == MODERN_PROTOCOL_VERSION:
             headers.update(
                 self._tool_request_headers(
@@ -2382,7 +2533,7 @@ class MCPClient:
                     "server-side effect may have occurred"
                 )
             rejected_access_token = headers["Authorization"].removeprefix("Bearer ")
-            headers["Authorization"] = await self._oauth.authorization_header(
+            headers["Authorization"] = await self._oauth_authorization_header(
                 force_refresh=True,
                 rejected_access_token=rejected_access_token,
             )
@@ -2470,7 +2621,7 @@ class MCPClient:
                 self.server_capabilities = {}
                 self.server_info = {}
                 self.server_instructions = ""
-                self._stop_http_events()
+                await self._stop_http_events()
                 try:
                     await self._initialize_protocol()
                     skip_watch_uri = (
@@ -2487,7 +2638,7 @@ class MCPClient:
                         self._http_session_id or self._pending_initialize_session_id
                     )
                     self._initialized = False
-                    self._stop_http_events()
+                    await self._stop_http_events()
                     self._http_session_id = ""
                     self._pending_initialize_session_id = ""
                     self.protocol_version = ""
@@ -2536,7 +2687,11 @@ class MCPClient:
             self._session_ready.set()
 
     async def list_tools(self) -> list[dict[str, Any]]:
-        return await self._list_paginated("tools/list", "tools")
+        return await self._list_paginated(
+            "tools/list",
+            "tools",
+            max_items=MAX_MCP_TOOL_DEFINITIONS,
+        )
 
     async def call_tool(
         self,
@@ -3205,7 +3360,13 @@ class MCPClient:
             "prompts/get", {"name": name, "arguments": arguments or {}}
         )
 
-    async def _list_paginated(self, method: str, key: str) -> list[dict[str, Any]]:
+    async def _list_paginated(
+        self,
+        method: str,
+        key: str,
+        *,
+        max_items: int | None = None,
+    ) -> list[dict[str, Any]]:
         capability = "resources" if method.startswith("resources/") else key
         for restart in range(MAX_PAGINATION_SESSION_RESTARTS + 1):
             if self.config.transport != "stdio":
@@ -3252,6 +3413,7 @@ class MCPClient:
                     values,
                     output_bytes,
                     method=f"MCP {method}",
+                    max_items=max_items,
                 )
                 next_cursor = result.get("nextCursor")
                 if next_cursor is None:
@@ -3329,11 +3491,12 @@ class MCPClient:
         await self._stop_all_modern_resource_subscriptions()
         await self._stop_modern_subscription()
         self._initialized = False
-        self._stop_http_events()
+        await self._stop_http_events()
         if self._legacy_sse_discovery and not self._legacy_sse_discovery.done():
             self._legacy_sse_discovery.set_exception(
                 MCPProtocolError(f"MCP server {self.config.name!r} disconnected")
             )
+            self._legacy_sse_discovery.exception()
         self._legacy_sse_discovery = None
         self._legacy_sse_endpoint = ""
         self._fail_pending(
@@ -3442,7 +3605,7 @@ class MCPClient:
         try:
             headers = httpx.Headers(self.config.resolved_headers)
             if self._oauth is not None:
-                headers["Authorization"] = await self._oauth.authorization_header()
+                headers["Authorization"] = await self._oauth_authorization_header()
             headers["Mcp-Session-Id"] = session_id
             if self.protocol_version:
                 headers["MCP-Protocol-Version"] = self.protocol_version
@@ -3462,7 +3625,7 @@ class MCPClient:
         headers = httpx.Headers(self.config.resolved_headers)
         headers["Accept"] = "text/event-stream"
         if self._oauth is not None:
-            headers["Authorization"] = await self._oauth.authorization_header()
+            headers["Authorization"] = await self._oauth_authorization_header()
 
         try:
             async with self._http.stream(
@@ -3606,7 +3769,7 @@ class MCPClient:
             if self._sse_last_event_id:
                 headers["Last-Event-ID"] = self._sse_last_event_id
             if self._oauth is not None:
-                headers["Authorization"] = await self._oauth.authorization_header()
+                headers["Authorization"] = await self._oauth_authorization_header()
             try:
                 async with self._http.stream(
                     "GET", self.config.resolved_url, headers=headers
@@ -3681,12 +3844,33 @@ class MCPClient:
             await asyncio.sleep(slice_ms / 1000)
             remaining_ms -= slice_ms
 
-    def _stop_http_events(self) -> None:
+    async def _stop_http_events(self) -> None:
         self._sse_generation += 1
         task = self._sse_task
         self._sse_task = None
-        if task is not None:
+        if task is None or task is asyncio.current_task():
+            return
+        if not task.done():
             task.cancel()
+        interrupted = False
+        current = asyncio.current_task()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if current is not None and current.cancelling():
+                    interrupted = True
+                    while current.cancelling():
+                        current.uncancel()
+                elif task.done():
+                    break
+        if not task.cancelled():
+            try:
+                task.result()
+            except BaseException:
+                pass
+        if interrupted:
+            raise asyncio.CancelledError
 
 
 def _validate_http_session_id(session_id: str) -> None:
@@ -3889,6 +4073,13 @@ def _validate_jsonrpc_message(message: dict[str, Any]) -> None:
         request_id = message["id"]
         if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
             raise MCPProtocolError("MCP message id must be a string or integer")
+        if isinstance(request_id, str):
+            if len(request_id.encode("utf-8")) > MAX_JSONRPC_ID_BYTES:
+                raise MCPProtocolError(
+                    f"MCP message id exceeds {MAX_JSONRPC_ID_BYTES} UTF-8 bytes"
+                )
+        elif abs(request_id) > SAFE_INTEGER_BOUND:
+            raise MCPProtocolError("MCP integer message id exceeds JSON safe range")
     elif not has_method:
         raise MCPProtocolError("MCP response must contain an id")
 

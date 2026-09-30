@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import os
-import re
 from typing import Protocol
-
-import tiktoken
 
 
 CHARS_PER_TOKEN_HEURISTIC = 4
+ASCII_CHARS_PER_TOKEN_ESTIMATE = 3
 DEFAULT_OPENAI_FALLBACK_ENCODING = "cl100k_base"
 
 
@@ -44,28 +42,40 @@ class OpenAITokenCounter:
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
         self.using_approximation = True
-        self._encoder: object = _ApproximateEncoder()
+        self._encoder: object | None = None
         if os.environ.get("ASH_ENABLE_TIKTOKEN_DOWNLOAD") == "1":
             try:
+                import tiktoken  # type: ignore[import-not-found]
+
                 self._encoder = tiktoken.get_encoding(DEFAULT_OPENAI_FALLBACK_ENCODING)
                 self.using_approximation = False
             except Exception:
                 # Token usage returned by the provider remains authoritative.
-                self._encoder = _ApproximateEncoder()
+                self._encoder = None
 
     def count(self, text: str) -> int:
         if not text:
             return 0
-        return len(self._encoder.encode(text))  # type: ignore[attr-defined]
+        if self._encoder is not None:
+            return len(self._encoder.encode(text))  # type: ignore[attr-defined]
+        return _estimate_openai_tokens(text)
 
 
-class _ApproximateEncoder:
-    """Small offline tokenizer used only for input-budget estimates."""
+def _estimate_openai_tokens(text: str) -> int:
+    """Return a conservative offline estimate for mixed code and Unicode text.
 
-    _TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+    ASCII-heavy text is estimated at three characters per token rather than the
+    common English prose average of four. Non-ASCII input is charged by UTF-8
+    byte length so CJK, emoji, and other multi-byte text cannot collapse into a
+    severe character-count underestimate.
+    """
 
-    def encode(self, text: str) -> list[str]:
-        return self._TOKEN_PATTERN.findall(text)
+    ascii_chars = sum(character.isascii() for character in text)
+    non_ascii_bytes = len(text.encode("utf-8")) - ascii_chars
+    ascii_tokens = (
+        ascii_chars + ASCII_CHARS_PER_TOKEN_ESTIMATE - 1
+    ) // ASCII_CHARS_PER_TOKEN_ESTIMATE
+    return ascii_tokens + non_ascii_bytes
 
 
 def get_token_counter(provider: str, model_name: str) -> TokenCounter:

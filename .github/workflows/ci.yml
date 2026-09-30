@@ -7,28 +7,153 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv lock --check
+      - run: uv sync --locked --group dev --extra server --extra browser --extra acp --extra a2a
+      - name: Standalone installer Python 3.10 compatibility
+        run: |
+          uv run --python 3.10 --no-project python -I src/ash/installer.py --help
+          uv run --python 3.10 --no-project python -I tests/packaging/smoke_standalone_installer_py310.py
+      - run: uv audit --preview-features audit-command --locked
+      - run: uv run --locked ruff check src tests
+      - run: uv run --locked mypy src/ash
+      - name: Build release artifacts from a fresh sdist
+        shell: bash
+        run: |
+          uv build --sdist --out-dir dist --clear
+          sdist="$(printf '%s\n' dist/*.tar.gz)"
+          uv build --wheel "$sdist" --out-dir dist
+      - name: Installed wheel smoke test
+        shell: bash
+        run: |
+          uv venv .smoke-venv --python 3.12
+          uv pip install --python .smoke-venv dist/*.whl
+          .smoke-venv/bin/python tests/packaging/smoke_minimal_install.py
+      - name: Installed wheel upper-bound Python smoke
+        shell: bash
+        run: |
+          uv venv .smoke-venv-314 --python 3.14
+          uv pip install --python .smoke-venv-314 dist/*.whl
+          .smoke-venv-314/bin/ash --version
+      - name: Installed sdist smoke test
+        shell: bash
+        run: |
+          uv venv .smoke-sdist-venv --python 3.12
+          uv pip install --python .smoke-sdist-venv dist/*.tar.gz
+          .smoke-sdist-venv/bin/python tests/packaging/smoke_minimal_install.py
+
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ["3.11", "3.12"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.14"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: "0.12.17"
           enable-cache: true
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --group dev --extra server --extra browser --extra acp --extra a2a
-      - run: uv run ruff check src tests
-      - run: uv run mypy src/ash
-      - run: uv run pytest -v --timeout=120 --timeout-method=thread
-      - run: uv build
-      - name: Installed CLI smoke test
+      - run: uv sync --locked --group dev --extra server --extra browser --extra acp --extra a2a --extra local-embeddings
+      - run: uv run --locked pytest -v --timeout=120 --timeout-method=thread
+
+  minimum-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          python-version: "3.12"
+      - name: Resolve declared minimum dependency versions
         shell: bash
         run: |
-          uv venv .smoke-venv --python ${{ matrix.python-version }}
-          uv pip install --python .smoke-venv dist/*.whl
-          .smoke-venv/bin/python tests/packaging/smoke_minimal_install.py
+          rm uv.lock
+          uv sync --resolution lowest-direct --group dev --extra server --extra browser --extra acp --extra a2a --extra local-embeddings
+      - name: Minimum-version compatibility slice
+        run: >-
+          uv run pytest -q
+          tests/unit/test_config.py
+          tests/unit/test_embeddings.py
+          tests/unit/test_tokens.py
+          tests/unit/test_provider_registry.py
+          tests/unit/test_provider_readiness.py
+          tests/unit/test_providers.py
+          tests/unit/test_runtime.py
+          tests/unit/test_http_server.py
+          tests/unit/test_mcp_interactions.py
+          tests/unit/test_mcp_cli.py
+          tests/unit/test_acp.py
+          tests/unit/test_a2a.py
+
+  browser-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked --group dev --extra browser
+      - run: uv run --locked playwright install --with-deps chromium
+      - name: Real Chromium integration
+        env:
+          ASH_RUN_BROWSER_TESTS: "1"
+        run: uv run --locked pytest -q tests/e2e/test_browser_playwright.py --timeout=120 --timeout-method=thread
+
+  viewport-pty-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          python-version: "3.12"
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+      - run: uv sync --locked --group dev
+      - name: Real viewport PTY integration
+        env:
+          ASH_RUN_PTY_TESTS: "1"
+        run: uv run --locked pytest -q tests/e2e/test_viewport_pty.py --timeout=30 --timeout-method=thread

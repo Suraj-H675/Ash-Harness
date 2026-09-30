@@ -36,6 +36,7 @@ from ash.sandbox._base import SANDBOX_TIER_SCOPED, SANDBOX_TIER_SANDBOX_EXEC
 
 
 LEAD_AGENT_ID = "lead"
+MAX_ORCHESTRATOR_CONCURRENCY = 32
 
 
 @dataclass
@@ -121,8 +122,11 @@ class SubagentOrchestrator:
         max_concurrency: int = 4,
         poll_interval_seconds: float = 0.05,
     ) -> None:
-        if max_concurrency < 1:
-            raise ValueError("max_concurrency must be at least 1")
+        if not 1 <= max_concurrency <= MAX_ORCHESTRATOR_CONCURRENCY:
+            raise ValueError(
+                "max_concurrency must be between 1 and "
+                f"{MAX_ORCHESTRATOR_CONCURRENCY}"
+            )
         self.shared_state = shared_state
         self.lead_agent_id = lead_agent_id
         self.max_concurrency = max_concurrency
@@ -192,8 +196,8 @@ class SubagentOrchestrator:
     # --- internals ------------------------------------------------------
 
     async def _run_agents(self, specs: Sequence[SubagentSpec]) -> list[AgentReport]:
-        semaphore = asyncio.Semaphore(self.max_concurrency)
         reports: list[AgentReport] = []
+        next_index = 0
 
         async def _run_one(spec: SubagentSpec) -> AgentReport:
             agent = SubprocessAgent(
@@ -212,18 +216,16 @@ class SubagentOrchestrator:
                 sandbox_tier=spec.sandbox_tier,
                 workspace_root=spec.workspace_root,
             )
-            async with semaphore:
-                return await agent.run_in_process()
+            return await agent.run_in_process()
 
-        # Launch ALL tasks immediately — each one acquires the semaphore
-        # internally via `async with semaphore`. No serialized acquire in the loop.
-        tasks = [asyncio.create_task(_run_one(spec)) for spec in specs]
-
-        # Collect results as they complete (not in submission order).
-        try:
-            for finished in asyncio.as_completed(tasks):
+        async def _worker() -> None:
+            nonlocal next_index
+            while next_index < len(specs):
+                index = next_index
+                next_index += 1
+                spec = specs[index]
                 try:
-                    report = await finished
+                    report = await _run_one(spec)
                 except Exception as exc:  # noqa: BLE001
                     report = AgentReport(
                         agent_id="<unknown>",
@@ -234,6 +236,13 @@ class SubagentOrchestrator:
                     )
                 reports.append(report)
                 self._drain_lead_inbox()
+
+        tasks = [
+            asyncio.create_task(_worker())
+            for _ in range(min(self.max_concurrency, len(specs)))
+        ]
+        try:
+            await asyncio.gather(*tasks)
         finally:
             pending = [task for task in tasks if not task.done()]
             for task in pending:

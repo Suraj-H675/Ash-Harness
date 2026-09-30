@@ -8,7 +8,7 @@ import sys
 import pytest
 
 from ash.core.loop import AshLoop
-from ash.mcp.client import MCPClient
+from ash.mcp.client import MCPClient, MCPProtocolError
 from ash.mcp.runtime import MCPRuntime
 from ash.core.session import SessionStore
 from ash.mcp.server import MCPServerConfig
@@ -309,7 +309,7 @@ async def test_failed_targeted_reconnect_preserves_old_server_and_cleans_candida
         transport="stdio",
     )
     try:
-        with pytest.raises(OSError):
+        with pytest.raises(MCPProtocolError, match="executable is unavailable"):
             await loop.reconnect_mcp_server("one")
 
         assert loop._mcp_runtime is runtime
@@ -468,6 +468,69 @@ async def test_retired_client_cleanup_is_serialized_and_disconnects_once(
 
     assert client.disconnect_calls == 1
     assert not runtime._retired_clients
+
+
+@pytest.mark.asyncio
+async def test_deferred_reconnect_debt_blocks_same_server_replacement(
+    tmp_path: Path,
+) -> None:
+    config = MCPServerConfig(name="one", command="fake", args=[], env={})
+
+    class FakeClient:
+        def __init__(self, serial: int) -> None:
+            self.config = config
+            self.serial = serial
+            self.watched_resources: tuple[str, ...] = ()
+            self.session_generation = serial
+            self.server_capabilities: dict[str, object] = {}
+            self.server_info: dict[str, object] = {}
+            self.disconnect_calls = 0
+
+        async def connect(self) -> None:
+            return None
+
+        def supports_server_capability(self, name: str) -> bool:
+            del name
+            return False
+
+        async def watch_resource(self, uri: str) -> None:
+            del uri
+
+        async def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+    runtime = MCPRuntime({"one": config}, SafetyGuard(tmp_path))
+    runtime._started = True
+    runtime._refresh_locks["one"] = asyncio.Lock()
+    runtime._recovery_reconcile_locks["one"] = asyncio.Lock()
+    original = FakeClient(0)
+    runtime.clients["one"] = original  # type: ignore[assignment]
+    runtime._server_tools["one"] = {}
+    created: list[FakeClient] = []
+
+    def configure(server_name: str, replacement: MCPServerConfig) -> FakeClient:
+        assert server_name == "one"
+        assert replacement is config
+        candidate = FakeClient(len(created) + 1)
+        created.append(candidate)
+        return candidate
+
+    runtime._configure_client = configure  # type: ignore[method-assign]
+    try:
+        await runtime.replace_server("one", config, defer_client_cleanup=True)
+
+        active = runtime.clients["one"]
+        assert active is created[0]
+        assert runtime._retired_clients == {original}
+
+        with pytest.raises(RuntimeError, match="prior client cleanup is still pending"):
+            await runtime.replace_server("one", config, defer_client_cleanup=True)
+
+        assert runtime.clients["one"] is active
+        assert runtime._retired_clients == {original}
+        assert len(created) == 1
+    finally:
+        await runtime.close()
 
 
 @pytest.mark.asyncio

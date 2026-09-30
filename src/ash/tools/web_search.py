@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, Field, field_validator
 
-from ash.core.redaction import redact_text
+from ash.core.redaction import redact_known_secrets, redact_text, redact_url
 from ash.safe_io import strict_json_loads
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
@@ -25,6 +25,10 @@ from ash.tools.web import _host_allowed, _normalize_allowed_domains
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 MAX_SEARCH_RESPONSE_BYTES = 2_000_000
+MAX_RESULT_TITLE_CHARS = 500
+MAX_RESULT_URL_CHARS = 4096
+MAX_RESULT_SNIPPET_CHARS = 4000
+MAX_RESULT_PUBLISHED_AT_CHARS = 128
 WEB_SEARCH_PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 Freshness = Literal["any", "day", "week", "month", "year"]
 
@@ -39,6 +43,18 @@ class WebSearchHit:
 
 class WebSearchBackendError(RuntimeError):
     """A safe provider failure suitable for returning to the model."""
+
+
+def _redact_provider_result_url(value: str, secret: str) -> str:
+    """Redact an echoed provider secret without laundering embedded URL auth."""
+
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return value
+    if parsed.username is not None or parsed.password is not None:
+        return value
+    return redact_known_secrets(value, secret)
 
 
 class WebSearchProvider(ABC):
@@ -109,10 +125,14 @@ class BraveWebSearchProvider(WebSearchProvider):
             raise WebSearchBackendError("brave returned an invalid result list")
         return [
             WebSearchHit(
-                title=str(item.get("title", "")),
-                url=str(item.get("url", "")),
-                snippet=str(item.get("description", "")),
-                published_at=str(item.get("page_age", "")),
+                title=redact_known_secrets(str(item.get("title", "")), api_key),
+                url=_redact_provider_result_url(str(item.get("url", "")), api_key),
+                snippet=redact_known_secrets(
+                    str(item.get("description", "")), api_key
+                ),
+                published_at=redact_known_secrets(
+                    str(item.get("page_age", "")), api_key
+                ),
             )
             for item in raw_results[:limit]
             if isinstance(item, dict)
@@ -163,10 +183,12 @@ class TavilyWebSearchProvider(WebSearchProvider):
             raise WebSearchBackendError("tavily returned an invalid result list")
         return [
             WebSearchHit(
-                title=str(item.get("title", "")),
-                url=str(item.get("url", "")),
-                snippet=str(item.get("content", "")),
-                published_at=str(item.get("published_date", "")),
+                title=redact_known_secrets(str(item.get("title", "")), api_key),
+                url=_redact_provider_result_url(str(item.get("url", "")), api_key),
+                snippet=redact_known_secrets(str(item.get("content", "")), api_key),
+                published_at=redact_known_secrets(
+                    str(item.get("published_date", "")), api_key
+                ),
             )
             for item in raw_results[:limit]
             if isinstance(item, dict)
@@ -360,9 +382,10 @@ class WebSearchTool(BaseTool):
                 errors.append(str(exc))
                 continue
             hits = [
-                hit
+                normalized
                 for hit in raw_hits
-                if _result_url_allowed(hit.url, self._allowed_domains)
+                if (normalized := _normalize_search_hit(hit, self._allowed_domains))
+                is not None
             ][: args.limit]
             output = json.dumps(
                 {
@@ -373,18 +396,18 @@ class WebSearchTool(BaseTool):
                 ensure_ascii=False,
                 sort_keys=True,
             )
-            citations = [
-                {
-                    "title": redact_text(hit.title)[:300],
+            citations = []
+            for hit in hits:
+                citation = {
+                    "title": hit.title[:300],
                     "url": hit.url,
                     "snippet_sha256": hashlib.sha256(
-                        redact_text(hit.snippet).encode("utf-8")
+                        hit.snippet.encode("utf-8")
                     ).hexdigest(),
                     "published_at": hit.published_at[:64],
                     "provider": provider.name,
                 }
-                for hit in hits
-            ]
+                citations.append(citation)
             self.emit_event(
                 {
                     "type": "web.search.completed",
@@ -408,6 +431,29 @@ class WebSearchTool(BaseTool):
 
 def _result_url_allowed(url: str, allowed_domains: tuple[str, ...]) -> bool:
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or len(url) > MAX_RESULT_URL_CHARS
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in url)
+    ):
         return False
     return not allowed_domains or _host_allowed(parsed.hostname, allowed_domains)
+
+
+def _normalize_search_hit(
+    hit: WebSearchHit,
+    allowed_domains: tuple[str, ...],
+) -> WebSearchHit | None:
+    """Return one bounded/redacted provider hit or reject an unsafe URL."""
+
+    if not _result_url_allowed(hit.url, allowed_domains):
+        return None
+    return WebSearchHit(
+        title=redact_text(hit.title)[:MAX_RESULT_TITLE_CHARS],
+        url=redact_url(hit.url),
+        snippet=redact_text(hit.snippet)[:MAX_RESULT_SNIPPET_CHARS],
+        published_at=redact_text(hit.published_at)[:MAX_RESULT_PUBLISHED_AT_CHARS],
+    )

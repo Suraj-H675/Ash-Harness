@@ -13,6 +13,7 @@ to Tier 1.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -25,15 +26,48 @@ from ash.sandbox._base import (
     SandboxBackend,
     SandboxBackendUnavailable,
 )
-from ash.safety.environment import resolve_host_executable
+from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
+
+
+MINIMUM_BWRAP_VERSION = (0, 12, 0)
+_BWRAP_VERSION = re.compile(r"\bbubblewrap\s+(\d+)\.(\d+)\.(\d+)\b")
+
+_SYSTEM_READ_ONLY_PATHS: tuple[str, ...] = (
+    "/usr",
+    "/bin",
+    "/lib",
+    "/lib64",
+)
+
+_ETC_COMPAT_READ_ONLY_PATHS: tuple[str, ...] = (
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/nsswitch.conf",
+    "/etc/hosts",
+    "/etc/resolv.conf",
+    "/etc/gai.conf",
+    "/etc/services",
+    "/etc/protocols",
+    "/etc/ssl",
+    "/etc/pki",
+    "/etc/ca-certificates",
+    "/etc/crypto-policies",
+    "/etc/localtime",
+    "/etc/alternatives",
+)
 
 
 # Bwrap flags we always pass for hardened defaults.
 _BWRAP_BASE_FLAGS: tuple[str, ...] = (
-    "--unshare-user-try",  # create a new user namespace if allowed
+    "--unshare-user",  # a private user namespace is required for isolation
     "--unshare-pid",  # new PID namespace
     "--unshare-uts",  # new UTS namespace (hostname isolation)
     "--unshare-ipc",  # new IPC namespace
+    "--disable-userns",  # child cannot create nested user namespaces
+    "--assert-userns-disabled",  # fail closed if the lock-down was ineffective
     "--die-with-parent",  # kill the sandbox if the parent dies
     "--new-session",  # new session
 )
@@ -112,12 +146,18 @@ class BubblewrapSandbox(SandboxBackend):
         # Mount a fresh /tmp so the sandbox cannot tamper with host temp.
         args.extend(["--tmpfs", "/tmp"])
 
-        # Read-only system mounts so basic commands can resolve their
-        # loaders; the list is intentionally conservative.
-        for ro in ("/usr", "/bin", "/lib", "/lib64", "/etc"):
+        # Read-only system mounts so basic commands can resolve their loaders.
+        # Do not expose the whole host /etc: it can contain machine identity,
+        # organization configuration, and other host-readable state unrelated
+        # to command execution.
+        for ro in _SYSTEM_READ_ONLY_PATHS:
             if Path(ro).exists():
                 ro_str = str(Path(ro))
                 args.extend(["--ro-bind", ro_str, ro_str])
+        args.extend(["--dir", "/etc"])
+        for ro in _ETC_COMPAT_READ_ONLY_PATHS:
+            if Path(ro).exists():
+                args.extend(["--ro-bind", ro, ro])
         args.extend(["--proc", "/proc", "--dev", "/dev"])
 
         # Workspace access is caller-selected; commands default to read-write,
@@ -228,13 +268,31 @@ def probe_bwrap(*, workspace_root: Path | None = None) -> str | None:
         return None
     descriptor = -1
     try:
+        version = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            check=False,
+            timeout=5,
+            env=build_scrubbed_environment(),
+        )
+        if version.returncode != 0:
+            return None
+        output = version.stdout.decode("utf-8", errors="replace").strip()
+        match = _BWRAP_VERSION.search(output)
+        if match is None:
+            return None
+        parsed_version = tuple(int(part) for part in match.groups())
+        if parsed_version < MINIMUM_BWRAP_VERSION:
+            return None
         descriptor = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         result = subprocess.run(
             [
                 path,
-                "--unshare-user-try",
+                "--unshare-user",
                 "--unshare-pid",
                 "--unshare-net",
+                "--disable-userns",
+                "--assert-userns-disabled",
                 "--ro-bind-fd",
                 str(descriptor),
                 "/",
@@ -245,6 +303,7 @@ def probe_bwrap(*, workspace_root: Path | None = None) -> str | None:
             capture_output=True,
             check=False,
             timeout=5,
+            env=build_scrubbed_environment(),
         )
     except (OSError, subprocess.SubprocessError):
         return None

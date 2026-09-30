@@ -33,6 +33,7 @@ from rich.text import Text
 
 from ash.core.redaction import redact_value
 from ash.safe_io import read_bounded_bytes
+from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript
 from ash.ui.theme import get_theme
@@ -43,6 +44,22 @@ MAX_EDIT_PREVIEW_FILE_BYTES = 1_000_000
 MAX_EDIT_PREVIEW_TEXT_CHARS = 128_000
 MAX_EDIT_PREVIEW_LINES = 400
 DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
+_EDITOR_ENV_ALLOWLIST = (
+    "COLORTERM",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DISPLAY",
+    "KITTY_WINDOW_ID",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TMUX",
+    "VSCODE_IPC_HOOK_CLI",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",
+)
 
 
 @dataclass
@@ -89,6 +106,44 @@ def _read_preview_file(path: Path) -> str | None:
             return None
         raise OSError(str(exc)) from exc
     return raw.decode("utf-8")
+
+
+def _editor_launch(
+    editor: str,
+    *,
+    workspace: Path,
+) -> tuple[list[str], dict[str, str]]:
+    """Resolve a user-selected editor without ambient-secret inheritance."""
+
+    command = shlex.split(editor, posix=os.name != "nt")
+    if not command:
+        raise ValueError("VISUAL/EDITOR is empty")
+    environment = build_scrubbed_environment(_EDITOR_ENV_ALLOWLIST)
+    executable = command[0]
+    if "/" in executable or "\\" in executable:
+        candidate = Path(executable).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        try:
+            candidate = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"configured editor is unavailable: {executable}") from exc
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            raise ValueError(f"configured editor is unavailable: {executable}")
+        command[0] = str(candidate)
+    else:
+        resolved = resolve_host_executable(
+            executable,
+            workspace_root=workspace,
+            cwd=workspace,
+            search_path=environment.get("PATH"),
+        )
+        if resolved is None:
+            raise ValueError(
+                f"configured editor is unavailable outside the workspace: {executable}"
+            )
+        command[0] = resolved
+    return command, environment
 
 
 class TerminalUI:
@@ -1087,9 +1142,11 @@ class TerminalUI:
         editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
         if not editor:
             raise ValueError("Set VISUAL or EDITOR to edit sprint plans")
-        command = shlex.split(editor, posix=os.name != "nt")
-        if not command:
-            raise ValueError("VISUAL/EDITOR is empty")
+        workspace = self.workspace_root or Path.cwd().resolve()
+        command, editor_environment = _editor_launch(
+            editor,
+            workspace=workspace,
+        )
         file_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -1101,7 +1158,11 @@ class TerminalUI:
             ) as handle:
                 handle.write(render_sprint_markdown(execution))
                 file_path = Path(handle.name)
-            result = subprocess.run([*command, str(file_path)], check=False)
+            result = subprocess.run(
+                [*command, str(file_path)],
+                check=False,
+                env=editor_environment,
+            )
             if result.returncode != 0:
                 raise subprocess.SubprocessError(
                     f"editor exited with status {result.returncode}"

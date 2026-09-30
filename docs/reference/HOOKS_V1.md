@@ -36,6 +36,11 @@ schema version.
 
 `pre_tool`, `post_tool`, and `tool_error` entries accept a regular-expression
 `matcher` against the tool name. Other lifecycle events do not use matchers.
+Matchers intentionally support a bounded safe regex subset: literals, character
+classes, anchors, alternation, and simple atom quantifiers such as `write_.*`
+are supported; backreferences, lookarounds/conditionals, quantified groups, and
+excessively large or repetition-heavy patterns are rejected at config load to
+keep matching bounded in the Ash process.
 
 ## Control Responses
 

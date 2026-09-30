@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import math
@@ -11,6 +12,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker  # type: ignore[import-untyped]
 
+from ash.core.redaction import redact_text
 from ash.mcp.client import MCPProtocolError
 from ash.providers.base import (
     CompletionStopCategory,
@@ -62,6 +64,33 @@ _SENSITIVE_FIELD_MARKERS = frozenset(
 
 async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
+
+
+async def _settle_sampling_provider_close(
+    provider: ProviderABC,
+) -> tuple[BaseException | None, bool]:
+    task = asyncio.create_task(
+        provider.aclose(),
+        name="ash-mcp-sampling-provider-close",
+    )
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                continue
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, interrupted
+    return None, interrupted
 
 
 def _invalid(message: str, *, data: dict[str, Any] | None = None) -> MCPProtocolError:
@@ -498,8 +527,8 @@ class MCPInteractionController:
         self.sampling_review = sampling_review
         self.elicitation_callback = elicitation_callback
         self.sampling_max_tokens = sampling_max_tokens
-        self._sampling_lock = __import__("asyncio").Lock()
-        self._elicitation_lock = __import__("asyncio").Lock()
+        self._sampling_lock = asyncio.Lock()
+        self._elicitation_lock = asyncio.Lock()
 
     @property
     def supports_sampling(self) -> bool:
@@ -537,6 +566,7 @@ class MCPInteractionController:
 
             assert self.provider_factory is not None
             provider = self.provider_factory()
+            primary_error: BaseException | None = None
             try:
                 detect = getattr(provider, "detect_capabilities", None)
                 if callable(detect):
@@ -620,8 +650,44 @@ class MCPInteractionController:
                 if not approved_response:
                     raise MCPProtocolError("User rejected sampling response", code=-1)
                 return result
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
-                await provider.aclose()
+                cleanup_error, cleanup_interrupted = (
+                    await _settle_sampling_provider_close(provider)
+                )
+                if primary_error is not None:
+                    if cleanup_error is not None:
+                        primary_error.add_note(
+                            "MCP sampling provider cleanup failed: "
+                            + redact_text(str(cleanup_error))[:500]
+                        )
+                    if cleanup_interrupted and not isinstance(
+                        primary_error, asyncio.CancelledError
+                    ):
+                        cancellation = asyncio.CancelledError()
+                        cancellation.add_note(
+                            "MCP sampling failed before cleanup was cancelled: "
+                            + redact_text(str(primary_error))[:500]
+                        )
+                        if cleanup_error is not None:
+                            cancellation.add_note(
+                                "MCP sampling provider cleanup also failed: "
+                                + redact_text(str(cleanup_error))[:500]
+                            )
+                        raise cancellation from primary_error
+                else:
+                    if cleanup_interrupted:
+                        cancellation = asyncio.CancelledError()
+                        if cleanup_error is not None:
+                            cancellation.add_note(
+                                "MCP sampling provider cleanup failed: "
+                                + redact_text(str(cleanup_error))[:500]
+                            )
+                        raise cancellation from cleanup_error
+                    if cleanup_error is not None:
+                        raise cleanup_error
 
     async def handle_elicitation(
         self,

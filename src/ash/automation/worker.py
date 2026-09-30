@@ -51,9 +51,12 @@ from ash.sandbox.process_utils import (
 )
 from ash.sdk import AshResult
 from ash.logging import get_logger
+from ash.json_utils import strict_json_loads
 
 
 _log = get_logger(__name__)
+
+AUTOMATION_CLOSE_OWNED_TASK_WAIT_SECONDS = 0.5
 
 
 async def _settle_worker_task_after_cancellation(
@@ -70,6 +73,8 @@ async def _settle_worker_task_after_cancellation(
             current = asyncio.current_task()
             if current is not None:
                 current.uncancel()
+        except BaseException:
+            break
     try:
         return task.result(), None, interrupted
     except BaseException as exc:
@@ -305,13 +310,12 @@ class _SubprocessAutomationClient:
         blocked_environment_names: frozenset[str] = frozenset(),
     ) -> None:
         self._config = config
-        self._guard = SafetyGuard(workspace)
-        self._workspace = self._guard.project_root
-        self._workspace_identity = (
-            expected_workspace_identity
-            if expected_workspace_identity is not None
-            else _directory_identity(self._workspace)
+        self._guard = SafetyGuard(
+            workspace,
+            expected_project_root_identity=expected_workspace_identity,
         )
+        self._workspace = self._guard.project_root
+        self._workspace_identity = self._guard.project_root_identity
         self._blocked_environment_names = blocked_environment_names
         self._process: asyncio.subprocess.Process | None = None
         self._process_tree_plan: ProcessTreePlan | None = None
@@ -509,8 +513,8 @@ class _SubprocessAutomationClient:
             if not line.startswith(self._RESULT_PREFIX):
                 continue
             try:
-                payload = json.loads(line.removeprefix(self._RESULT_PREFIX))
-            except json.JSONDecodeError as exc:
+                payload = strict_json_loads(line.removeprefix(self._RESULT_PREFIX))
+            except (json.JSONDecodeError, ValueError) as exc:
                 raise RuntimeError(
                     "automation subprocess returned malformed JSON"
                 ) from exc
@@ -585,13 +589,95 @@ class AutomationWorkerService:
         self._claims: dict[str, AutomationRunLease] = {}
         self._detached_tasks: set[asyncio.Task[Any]] = set()
         self._deferred_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._retired_clients: set[AutomationClient] = set()
+        self._retired_client_lock = asyncio.Lock()
 
     @property
     def active_run_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._tasks))
 
+    def _active_cleanup_tasks(self) -> set[asyncio.Task[Any]]:
+        return {
+            task
+            for task in (*self._deferred_cleanup_tasks, *self._detached_tasks)
+            if not task.done()
+        }
+
     def request_stop(self) -> None:
         self._stop.set()
+
+    async def _retain_retired_client(self, client: AutomationClient) -> None:
+        async with self._retired_client_lock:
+            self._retired_clients.add(client)
+
+    async def _retry_retired_clients(self) -> int:
+        async with self._retired_client_lock:
+            clients = tuple(self._retired_clients)
+            if not clients:
+                return 0
+            outcomes = await asyncio.gather(
+                *(client.close() for client in clients),
+                return_exceptions=True,
+            )
+            failed = {
+                client
+                for client, outcome in zip(clients, outcomes, strict=True)
+                if isinstance(outcome, BaseException)
+            }
+            self._retired_clients.difference_update(set(clients) - failed)
+            return len(failed)
+
+    async def aclose(self) -> None:
+        owned = self._active_cleanup_tasks()
+        if owned:
+            wait_task = asyncio.create_task(
+                asyncio.wait(
+                    owned,
+                    timeout=AUTOMATION_CLOSE_OWNED_TASK_WAIT_SECONDS,
+                ),
+                name=f"ash-automation-owned-cleanup-wait-{self.worker_id}",
+            )
+            _, wait_error, interrupted = await _settle_worker_task_after_cancellation(
+                wait_task
+            )
+            if interrupted:
+                cancellation = asyncio.CancelledError()
+                if wait_error is not None:
+                    cancellation.add_note(
+                        "automation owned cleanup wait failed while cancellation was pending"
+                    )
+                raise cancellation from wait_error
+            if wait_error is not None:
+                raise wait_error
+            remaining = sum(1 for task in owned if not task.done())
+            if remaining:
+                raise RuntimeError(
+                    "automation cleanup remains active: "
+                    f"{remaining} owned task(s) have not settled"
+                )
+
+        cleanup = asyncio.create_task(
+            self._retry_retired_clients(),
+            name=f"ash-automation-retired-client-cleanup-{self.worker_id}",
+        )
+        result, error, interrupted = await _settle_worker_task_after_cancellation(
+            cleanup
+        )
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if error is not None:
+                cancellation.add_note(
+                    "automation client cleanup failed while cancellation was pending: "
+                    + redact_text(str(error))[:500]
+                )
+            raise cancellation from error
+        if error is not None:
+            raise error
+        failed = int(result or 0)
+        if failed:
+            raise RuntimeError(
+                f"failed to close {failed} retired automation client(s)"
+            )
 
     async def run_forever(self, *, once: bool = False) -> AutomationWorkerSummary:
         """Run until stopped, or drain one due batch when ``once`` is true."""
@@ -633,7 +719,11 @@ class AutomationWorkerService:
                 if not self._tasks:
                     await self._run_maintenance()
                     self._heartbeat()
-                capacity = self.max_concurrent_runs - len(self._tasks)
+                capacity = (
+                    0
+                    if self._active_cleanup_tasks()
+                    else self.max_concurrent_runs - len(self._tasks)
+                )
                 claims, skipped = (
                     self.store.claim_due_batch(
                         workspace=self.workspace,
@@ -693,6 +783,29 @@ class AutomationWorkerService:
     async def execute(self, claim: AutomationRunLease) -> AutomationRun:
         """Execute one owned lease and always finalize its durable outcome."""
 
+        cleanup_tasks = self._active_cleanup_tasks()
+        if cleanup_tasks:
+            return self.store.finish_run(
+                claim.run.run_id,
+                claim.token,
+                status="failed",
+                error=(
+                    "automation cleanup remains active; retry after owned "
+                    f"cleanup settles ({len(cleanup_tasks)} task(s))"
+                ),
+            )
+
+        if await self._retry_retired_clients():
+            return self.store.finish_run(
+                claim.run.run_id,
+                claim.token,
+                status="failed",
+                error=(
+                    "automation client cleanup remains incomplete; "
+                    "retry after worker cleanup succeeds"
+                ),
+            )
+
         client: AutomationClient | None = None
         client_holder: list[AutomationClient] = []
         client_close_started = False
@@ -744,6 +857,7 @@ class AutomationWorkerService:
             try:
                 await client_holder[0].close()
             except BaseException as cleanup_error:
+                await self._retain_retired_client(client_holder[0])
                 _log.warning(
                     "automation client cleanup failed for {}: {}",
                     claim.run.run_id,
@@ -1094,8 +1208,16 @@ class AutomationWorkerService:
         active = list(self._tasks.values())
         for task in active:
             task.cancel()
+        wait_error: BaseException | None = None
+        interrupted = False
         if active:
-            await asyncio.wait(active, timeout=4.0)
+            wait_task = asyncio.create_task(
+                asyncio.wait(active, timeout=4.0),
+                name=f"ash-automation-active-run-stop-{self.worker_id}",
+            )
+            _, wait_error, interrupted = (
+                await _settle_worker_task_after_cancellation(wait_task)
+            )
         self._collect_finished(summary)
         for run_id, task in list(self._tasks.items()):
             claim = self._claims.pop(run_id, None)
@@ -1114,6 +1236,15 @@ class AutomationWorkerService:
                 if run is not None:
                     self._record_terminal(summary, run)
             self._detach_task(task)
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if wait_error is not None:
+                cancellation.add_note(
+                    "automation active-run cleanup failed while cancellation was pending"
+                )
+            raise cancellation from wait_error
+        if wait_error is not None:
+            raise wait_error
 
     def _record_terminal(
         self, summary: AutomationWorkerSummary, run: AutomationRun
@@ -1236,19 +1367,38 @@ class AutomationWorkerService:
     ) -> bool:
         if cancel_first and not task.done():
             task.cancel()
+        wait_error: BaseException | None = None
+        interrupted = False
+        settled = True
         if not task.done():
-            done, _ = await asyncio.wait({task}, timeout=timeout)
-            if not done:
+            wait_task = asyncio.create_task(
+                asyncio.wait({task}, timeout=timeout),
+                name=f"ash-automation-task-cancel-{self.worker_id}",
+            )
+            _, wait_error, interrupted = (
+                await _settle_worker_task_after_cancellation(wait_task)
+            )
+            if not task.done():
                 if not cancel_first:
                     task.cancel()
                 if detach:
                     self._detach_task(task)
-                return False
-        try:
-            task.result()
-        except (asyncio.CancelledError, Exception):
-            pass
-        return True
+                settled = False
+        if task.done():
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+        if interrupted:
+            cancellation = asyncio.CancelledError()
+            if wait_error is not None:
+                cancellation.add_note(
+                    "automation task cleanup failed while cancellation was pending"
+                )
+            raise cancellation from wait_error
+        if wait_error is not None:
+            raise wait_error
+        return settled
 
     def _detach_task(self, task: asyncio.Task[Any]) -> None:
         self._detached_tasks.add(task)

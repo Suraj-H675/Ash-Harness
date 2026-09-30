@@ -18,8 +18,8 @@ from urllib.parse import urlparse, urlunparse
 
 from pydantic import BaseModel, Field, field_validator
 
-from ash.core.redaction import redact_url, redact_urls_in_text
-from ash.safe_io import validate_unlinked_directory_path
+from ash.core.redaction import redact_text, redact_url
+from ash.safe_io import read_bounded_bytes, validate_unlinked_directory_path
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
 from ash.safety.scoped_io import atomic_write_scoped_bytes
@@ -122,6 +122,7 @@ class BrowserSession:
         self._lock = asyncio.Lock()
         self._tab_lock = asyncio.Lock()
         self._closed = False
+        self._cleanup_failed = False
         self._playwright: Any | None = None
         self._browser: Any | None = None
         self._context: Any | None = None
@@ -132,6 +133,7 @@ class BrowserSession:
         self._session_token = secrets.token_hex(4)
         self._next_tab_id = 1
         self._page_tasks: set[asyncio.Task[None]] = set()
+        self._page_admission_dirty = False
         self._proxy: BrowserPolicyProxy | None = None
 
     @property
@@ -160,21 +162,34 @@ class BrowserSession:
                     f"Run `{pipx_install_command('browser')}`, then "
                     "`ash setup browser` to enable browser tools."
                 ) from exc
-            try:
-                if any(
-                    resource is not None
-                    for resource in (
-                        self._proxy,
-                        self._playwright,
-                        self._browser,
-                        self._context,
-                    )
-                ):
-                    cleanup_task = asyncio.create_task(
-                        self._close_unlocked(cancel_snapshot=False),
-                        name="ash-browser-startup-cleanup",
-                    )
+            if any(
+                resource is not None
+                for resource in (
+                    self._proxy,
+                    self._playwright,
+                    self._browser,
+                    self._context,
+                )
+            ):
+                cleanup_task = asyncio.create_task(
+                    self._close_unlocked(cancel_snapshot=False),
+                    name="ash-browser-startup-cleanup",
+                )
+                cleanup_error, cleanup_interrupted = (
                     await _settle_browser_cleanup_task(cleanup_task)
+                )
+                if cleanup_interrupted:
+                    cancellation = asyncio.CancelledError()
+                    if cleanup_error is not None:
+                        cancellation.add_note(
+                            "browser session cleanup failed while restart was "
+                            "being cancelled: "
+                            + _redact_browser_text(str(cleanup_error))[:500]
+                        )
+                    raise cancellation from cleanup_error
+                if cleanup_error is not None:
+                    raise cleanup_error
+            try:
                 if self.profile_path is not None:
                     validate_unlinked_directory_path(
                         self.profile_path, label="browser profile directory"
@@ -278,27 +293,53 @@ class BrowserSession:
                 self._page = await self._context.new_page()
                 self._remember_tab(self._page)
                 return self._page
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as primary_error:
                 cleanup_task = asyncio.create_task(
                     self._close_unlocked(cancel_snapshot=False),
                     name="ash-browser-startup-cleanup",
                 )
-                await _settle_browser_cleanup_task(cleanup_task)
+                cleanup_error, _ = await _settle_browser_cleanup_task(cleanup_task)
+                if cleanup_error is not None:
+                    primary_error.add_note(
+                        "browser session cleanup failed after startup cancellation: "
+                        + _redact_browser_text(str(cleanup_error))[:500]
+                    )
                 raise
             except Exception as exc:
                 cleanup_task = asyncio.create_task(
                     self._close_unlocked(cancel_snapshot=False),
                     name="ash-browser-startup-cleanup",
                 )
-                await _settle_browser_cleanup_task(cleanup_task)
+                cleanup_error, cleanup_interrupted = (
+                    await _settle_browser_cleanup_task(cleanup_task)
+                )
+                if cleanup_interrupted:
+                    cancellation = asyncio.CancelledError()
+                    cancellation.add_note(
+                        "browser startup failed before cancellation: "
+                        + _redact_browser_text(str(exc))[:500]
+                    )
+                    if cleanup_error is not None:
+                        cancellation.add_note(
+                            "browser session cleanup also failed: "
+                            + _redact_browser_text(str(cleanup_error))[:500]
+                        )
+                    raise cancellation from exc
                 message = _redact_browser_text(str(exc))[:500]
                 if "Executable doesn't exist" in message:
-                    raise BrowserUnavailableError(
+                    error = BrowserUnavailableError(
                         "Chromium is not installed; run `ash setup browser`."
-                    ) from exc
-                raise BrowserUnavailableError(
-                    f"Could not start the browser session: {message}"
-                ) from exc
+                    )
+                else:
+                    error = BrowserUnavailableError(
+                        f"Could not start the browser session: {message}"
+                    )
+                if cleanup_error is not None:
+                    error.add_note(
+                        "browser session cleanup failed: "
+                        + _redact_browser_text(str(cleanup_error))[:500]
+                    )
+                raise error from exc
 
     async def _route_request(self, route: Any, request: Any) -> None:
         try:
@@ -759,12 +800,28 @@ class BrowserSession:
         self._prune_tab_pages()
 
     def _on_page_created(self, page: Any) -> None:
+        del page
+        self._page_admission_dirty = True
+        if any(not task.done() for task in self._page_tasks):
+            return
         task = asyncio.create_task(
-            self._admit_page(page),
+            self._drain_page_admissions(),
             name="ash-browser-page-admission",
         )
         self._page_tasks.add(task)
         task.add_done_callback(self._page_task_done)
+
+    async def _drain_page_admissions(self) -> None:
+        while self._page_admission_dirty:
+            self._page_admission_dirty = False
+            async with self._tab_lock:
+                try:
+                    await self._enforce_tab_limit_unlocked()
+                except BrowserUnavailableError:
+                    pass
+                for page in self._live_pages()[:MAX_BROWSER_TABS]:
+                    self._remember_tab(page)
+                self._prune_tab_pages()
 
     def _page_task_done(self, task: asyncio.Task[None]) -> None:
         self._page_tasks.discard(task)
@@ -883,7 +940,7 @@ class BrowserSession:
 
     async def close(self) -> None:
         async with self._lock:
-            if self._closed:
+            if self._closed and not self._cleanup_failed:
                 return
             self._closed = True
             cleanup_task = asyncio.create_task(
@@ -893,10 +950,19 @@ class BrowserSession:
             cleanup_error, interrupted = await _settle_browser_cleanup_task(
                 cleanup_task
             )
-            if cleanup_error is not None:
-                raise cleanup_error
             if interrupted:
-                raise asyncio.CancelledError
+                cancellation = asyncio.CancelledError()
+                if cleanup_error is not None:
+                    cancellation.add_note(
+                        "browser session cleanup failed while cancellation was pending: "
+                        + _redact_browser_text(str(cleanup_error))[:500]
+                    )
+                self._cleanup_failed = cleanup_error is not None
+                raise cancellation from cleanup_error
+            if cleanup_error is not None:
+                self._cleanup_failed = True
+                raise cleanup_error
+            self._cleanup_failed = False
 
     async def _close_unlocked(self, *, cancel_snapshot: bool = True) -> None:
         snapshot_task = self._snapshot_task
@@ -918,29 +984,59 @@ class BrowserSession:
         if page_tasks:
             await asyncio.gather(*page_tasks, return_exceptions=True)
         self._page_tasks.clear()
-        for resource in (self._context, self._browser):
-            if resource is not None:
-                try:
-                    await resource.close()
-                except Exception:
-                    pass
-        if self._playwright is not None:
+        self._page_admission_dirty = False
+        cleanup_failures: list[tuple[str, BaseException]] = []
+        context = self._context
+        if context is not None:
             try:
-                await self._playwright.stop()
-            except Exception:
-                pass
-        if self._proxy is not None:
+                await context.close()
+            except BaseException as exc:
+                cleanup_failures.append(("browser context", exc))
+            else:
+                if self._context is context:
+                    self._context = None
+        browser = self._browser
+        if browser is not None:
             try:
-                await self._proxy.close()
-            except Exception:
-                pass
+                await browser.close()
+            except BaseException as exc:
+                cleanup_failures.append(("browser process", exc))
+            else:
+                if self._browser is browser:
+                    self._browser = None
+        playwright = self._playwright
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except BaseException as exc:
+                cleanup_failures.append(("Playwright runtime", exc))
+            else:
+                if self._playwright is playwright:
+                    self._playwright = None
+        proxy = self._proxy
+        if proxy is not None:
+            try:
+                await proxy.close()
+            except BaseException as exc:
+                cleanup_failures.append(("browser policy proxy", exc))
+            else:
+                if self._proxy is proxy:
+                    self._proxy = None
         self._page = None
         self._tab_pages.clear()
         self._snapshot_versions.clear()
-        self._context = None
-        self._browser = None
-        self._playwright = None
-        self._proxy = None
+        if cleanup_failures:
+            label, primary = cleanup_failures[0]
+            error = BrowserUnavailableError(
+                "browser session cleanup failed: "
+                f"{label}: {_redact_browser_text(str(primary))[:500]}"
+            )
+            for extra_label, extra in cleanup_failures[1:]:
+                error.add_note(
+                    f"additional {extra_label} cleanup failure: "
+                    + _redact_browser_text(str(extra))[:500]
+                )
+            raise error from primary
 
 
 async def _settle_browser_cleanup_task(
@@ -1053,7 +1149,7 @@ def _redact_browser_url(url: str) -> str:
 def _redact_browser_text(value: str) -> str:
     """Redact generic secrets plus secret-bearing browser URL fields."""
 
-    return redact_urls_in_text(value)
+    return redact_text(value)
 
 
 def _single_line(value: str) -> str:
@@ -1083,23 +1179,17 @@ def _read_download_payload(path: Path, max_bytes: int) -> bytes:
     """Read a Playwright temporary download without exceeding its byte cap."""
 
     try:
-        size = path.stat().st_size
-    except OSError as exc:
-        raise ValueError(f"browser download cannot be inspected: {exc}") from exc
-    if size > max_bytes:
-        raise ValueError(
-            f"browser download exceeds {max_bytes} bytes; choose a smaller file"
+        return read_bounded_bytes(
+            path,
+            max_bytes,
+            label="browser download",
         )
-    try:
-        with path.open("rb") as handle:
-            payload = handle.read(max_bytes + 1)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        if "exceeds" in str(exc):
+            raise ValueError(
+                f"browser download exceeds {max_bytes} bytes; choose a smaller file"
+            ) from exc
         raise ValueError(f"browser download cannot be read: {exc}") from exc
-    if len(payload) > max_bytes:
-        raise ValueError(
-            f"browser download exceeds {max_bytes} bytes; choose a smaller file"
-        )
-    return payload
 
 
 class NavigateArgs(BaseModel):
@@ -1297,6 +1387,7 @@ class BrowserTypeTool(_BrowserTool):
     name = "browser_type"
     description = "Fill or type into a referenced non-password browser control, optionally submit, and return the updated snapshot."
     args_schema = TypeArgs
+    sensitive_argument_fields = frozenset({"text"})
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = TypeArgs(**kwargs)

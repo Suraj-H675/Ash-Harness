@@ -222,3 +222,69 @@ async def test_hook_self_cancellation_is_isolated_but_task_cancellation_propagat
 
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_hook_runner_cleans_process_tree_after_unexpected_io_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import ash.hooks.config as hook_config
+
+    class FakeProcess:
+        returncode = None
+
+    process = FakeProcess()
+    cleaned = False
+
+    @contextmanager
+    def launch_context():
+        yield SimpleNamespace(argv=("hook",), pass_fds=(), cwd=str(tmp_path))
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    async def fail_communicate(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("hook stream failed")
+
+    async def cleanup(target, *, plan=None, grace_seconds=1.0):
+        nonlocal cleaned
+        del plan, grace_seconds
+        assert target is process
+        cleaned = True
+        return None, False
+
+    monkeypatch.setattr(
+        hook_config,
+        "prepare_scoped_process_launch",
+        lambda *args, **kwargs: launch_context(),
+    )
+    monkeypatch.setattr(
+        hook_config,
+        "prepare_process_tree",
+        lambda *args, **kwargs: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(hook_config.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(hook_config, "communicate_process", fail_communicate)
+    monkeypatch.setattr(
+        hook_config,
+        "settle_process_tree_after_cancellation",
+        cleanup,
+    )
+
+    with pytest.raises(RuntimeError, match="hook stream failed"):
+        await hook_config._run(
+            ["hook"],
+            {},
+            source=hook_config.HookConfigSource(
+                path=tmp_path / "hooks.json",
+                cwd=tmp_path,
+            ),
+        )
+
+    assert cleaned is True

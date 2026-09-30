@@ -8,6 +8,7 @@ executable verification so users do not need to understand pipx/uv internals.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -18,16 +19,22 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 
 REPOSITORY_URL = "https://github.com/Suraj-H675/Ash-Harness.git"
-SUPPORTED_EXTRAS = ("a2a", "acp", "browser", "server", "vector")
+_RELEASES_API = "https://api.github.com/repos/Suraj-H675/Ash-Harness/releases"
+_GITHUB_API_VERSION = "2026-03-10"
+SUPPORTED_EXTRAS = ("a2a", "acp", "browser", "local-embeddings", "server")
+_SUPPORTED_EXTRA_SET = frozenset(SUPPORTED_EXTRAS)
 _PACKAGE_NAME = "ash-ai"
 _EXTRAS_PATTERN = re.compile(
     rf"^\s*{re.escape(_PACKAGE_NAME)}(?:\[([^]]+)\])?(?:\s*@.*)?\s*$",
@@ -35,6 +42,17 @@ _EXTRAS_PATTERN = re.compile(
 )
 _UV_EXTRAS_PATTERN = re.compile(r"\[extras:\s*([^]]+)\]", re.IGNORECASE)
 _UV_ASH_PATH_PATTERN = re.compile(r"^-\s+ash\s+\(([^)]+)\)\s*$", re.MULTILINE)
+_UV_PYTHON_PATTERN = re.compile(
+    r"\[[A-Za-z][A-Za-z0-9_.+-]*\s+(\d+\.\d+(?:\.\d+)?)\]"
+)
+_PYTHON_VERSION_PATTERN = re.compile(
+    r"^(?:Python\s+)?(\d+)\.(\d+)(?:\.\d+)?$",
+    re.IGNORECASE,
+)
+_RELEASE_REF_PATTERN = re.compile(r"^ash-v\d+(?:\.\d+)+(?:[0-9A-Za-z._+-]*)$")
+_RELEASE_WHEEL_PATTERN = re.compile(
+    r"^ash_ai-[0-9A-Za-z_.!+\-]+-py3-none-any\.whl$"
+)
 _INSTALL_TIMEOUT_SECONDS = 15 * 60
 _QUERY_TIMEOUT_SECONDS = 30
 _VERIFY_TIMEOUT_SECONDS = 30
@@ -42,15 +60,241 @@ _MAX_STATE_OUTPUT_BYTES = 1024 * 1024
 _MAX_QUERY_OUTPUT_BYTES = 16 * 1024
 _MAX_VERSION_OUTPUT_BYTES = 16 * 1024
 _MAX_METADATA_BYTES = 1024 * 1024
+_MAX_RELEASE_METADATA_BYTES = 1024 * 1024
+_MAX_RELEASE_WHEEL_BYTES = 100 * 1024 * 1024
 _CAPTURE_CHUNK_BYTES = 8192
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 _CAPTURE_QUEUE_SIZE = 8
-_WINDOWS_TASKKILL_TIMEOUT_SECONDS = 5.0
+_PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
 _KILLPG = getattr(os, "killpg", None)
 _SIGKILL = getattr(signal, "SIGKILL", None)
+_BOOTSTRAP_MIN_PYTHON = (3, 10)
+_RUNTIME_MIN_PYTHON = (3, 12)
+_RUNTIME_MAX_PYTHON = (3, 15)
+_RUNTIME_FALLBACK_PYTHON = "3.14"
+_SUPPORTED_NATIVE_PLATFORMS = frozenset({"linux", "darwin"})
+_INSTALLER_ENV_KEYS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "PIPX_HOME",
+        "PIPX_BIN_DIR",
+        "PIPX_MAN_DIR",
+        "PIPX_SHARED_LIBS",
+        "UV_CACHE_DIR",
+        "UV_TOOL_DIR",
+        "UV_TOOL_BIN_DIR",
+        "UV_PYTHON_INSTALL_DIR",
+        "UV_PYTHON_BIN_DIR",
+    }
+)
+
+
+def _strict_json_loads(value: str | bytes | bytearray) -> Any:
+    """Parse standalone-installer JSON without duplicate keys/non-finite values."""
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON field: {key}")
+            result[key] = item
+        return result
+
+    def reject_constant(raw: str) -> None:
+        raise ValueError(f"invalid JSON constant: {raw}")
+
+    return json.loads(
+        value,
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
 
 
 class InstallError(RuntimeError):
     """A concise, user-actionable installation failure."""
+
+
+def _attach_cleanup_failure(
+    primary: BaseException,
+    cleanup_error: BaseException,
+) -> None:
+    """Preserve cleanup diagnostics on every supported bootstrap Python."""
+
+    note = f"Process-tree cleanup failed: {cleanup_error}"
+    add_note = getattr(primary, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+    elif primary.__cause__ is None:
+        # ``BaseException.add_note`` was added in Python 3.11, while the
+        # standalone installer intentionally bootstraps on Python 3.10.
+        primary.__cause__ = cleanup_error
+
+
+def _installer_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Keep package-manager essentials without forwarding unrelated secrets."""
+
+    environment = {
+        key: value
+        for key, value in source.items()
+        if key in _INSTALLER_ENV_KEYS or key.startswith("LC_")
+    }
+    if "PATH" in source:
+        environment["PATH"] = _sanitize_install_path(
+            source["PATH"],
+            home=source.get("HOME"),
+        )
+    else:
+        environment["PATH"] = os.defpath
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
+
+
+def _sanitize_install_path(path_value: str, *, home: str | None) -> str:
+    """Remove relative and workspace-controlled entries from child PATH."""
+
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        cwd = None
+    resolved_home: Path | None = None
+    if home:
+        try:
+            resolved_home = Path(home).expanduser().resolve()
+        except OSError:
+            resolved_home = None
+
+    safe_entries: list[str] = []
+    seen: set[str] = set()
+    for raw_entry in path_value.split(os.pathsep):
+        entry = raw_entry.strip('"')
+        if not entry:
+            continue
+        directory = Path(entry).expanduser()
+        if not directory.is_absolute():
+            continue
+        try:
+            directory = directory.resolve()
+        except OSError:
+            continue
+        if cwd is not None and _path_is_workspace_controlled(
+            directory,
+            cwd=cwd,
+            home=resolved_home,
+        ):
+            continue
+        rendered = str(directory)
+        if rendered in seen:
+            continue
+        seen.add(rendered)
+        safe_entries.append(rendered)
+    return os.pathsep.join(safe_entries)
+
+
+def _resolve_install_manager(
+    command: str,
+    *,
+    environment: Mapping[str, str],
+) -> str | None:
+    """Resolve pipx/uv without executing a workspace-controlled PATH entry."""
+
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        cwd = None
+    home: Path | None = None
+    raw_home = environment.get("HOME")
+    if raw_home:
+        try:
+            home = Path(raw_home).expanduser().resolve()
+        except OSError:
+            home = None
+
+    for raw_entry in environment.get("PATH", os.defpath).split(os.pathsep):
+        entry = raw_entry.strip('"')
+        if not entry:
+            continue
+        directory = Path(entry).expanduser()
+        if not directory.is_absolute():
+            continue
+        try:
+            directory = directory.resolve()
+        except OSError:
+            continue
+        if cwd is not None and _path_is_workspace_controlled(
+            directory,
+            cwd=cwd,
+            home=home,
+        ):
+            continue
+        resolved = shutil.which(command, path=str(directory))
+        if resolved is None:
+            continue
+        try:
+            candidate = Path(resolved).resolve()
+        except OSError:
+            continue
+        if cwd is not None and _path_is_workspace_controlled(
+            candidate,
+            cwd=cwd,
+            home=home,
+        ):
+            continue
+        return str(candidate)
+    return None
+
+
+def _path_is_workspace_controlled(path: Path, *, cwd: Path, home: Path | None) -> bool:
+    if path == cwd:
+        return True
+    if cwd.parent == cwd or (home is not None and cwd == home):
+        return False
+    return path.is_relative_to(cwd)
+
+
+def _platform_support_error(platform: str) -> str | None:
+    if platform in _SUPPORTED_NATIVE_PLATFORMS:
+        return None
+    if platform == "win32":
+        return (
+            "Native Windows is not currently supported by Ash. "
+            "Install and run Ash inside WSL2 instead."
+        )
+    return (
+        f"Ash does not currently support this native platform ({platform}). "
+        "Supported native platforms are Linux and macOS."
+    )
 
 
 @dataclass(frozen=True)
@@ -58,54 +302,12 @@ class _InstallerProcessTreePlan:
     """Dependency-free preflight for installer-managed subprocesses."""
 
     spawn_options: dict[str, Any]
-    taskkill_path: str | None
-    is_windows: bool
 
 
 def _prepare_process_tree() -> _InstallerProcessTreePlan:
-    if os.name == "nt":
-        taskkill_path = _resolve_system_taskkill()
-        if taskkill_path is None:
-            raise InstallError(
-                "reliable Windows descendant cleanup is unavailable: "
-                "taskkill was not found"
-            )
-        return _InstallerProcessTreePlan(
-            spawn_options={
-                "creationflags": getattr(
-                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-                )
-            },
-            taskkill_path=taskkill_path,
-            is_windows=True,
-        )
     return _InstallerProcessTreePlan(
         spawn_options={"start_new_session": True},
-        taskkill_path=None,
-        is_windows=False,
     )
-
-
-def _resolve_system_taskkill() -> str | None:
-    """Resolve taskkill from Windows' system directory, never ambient PATH."""
-
-    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
-    if not system_root:
-        return None
-    candidate = os.path.join(system_root, "System32", "taskkill.exe")
-    try:
-        resolved_root = os.path.realpath(system_root)
-        resolved_candidate = os.path.realpath(candidate)
-        common_root = os.path.commonpath((resolved_root, resolved_candidate))
-    except (OSError, RuntimeError, ValueError):
-        return None
-    if os.path.normcase(common_root) != os.path.normcase(resolved_root):
-        return None
-    if os.path.basename(os.path.dirname(resolved_candidate)).casefold() != "system32":
-        return None
-    if not os.path.isfile(resolved_candidate):
-        return None
-    return resolved_candidate
 
 
 @dataclass(frozen=True)
@@ -121,6 +323,7 @@ class _PipxState:
     installed: bool = False
     extras: tuple[str, ...] = ()
     executable: str | None = None
+    runtime_python: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +341,7 @@ class _UvState:
     installed: bool = False
     extras: tuple[str, ...] = ()
     executable: str | None = None
+    runtime_python: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,37 +352,57 @@ class _CapturedResult:
 
 
 @dataclass(frozen=True)
-class _OwnedMetadataFile:
-    path: Path
-    device: int
-    inode: int
+class _ReleaseWheel:
+    name: str
+    download_url: str
     sha256: str
+    size: int
 
 
 def install(
     *,
     extras: Sequence[str] = (),
     ref: str | None = None,
+    runtime_python: str | None = None,
+    host_platform: str = sys.platform,
     runner: Callable[..., Any] = subprocess.run,
-    which: Callable[[str], str | None] = shutil.which,
+    which: Callable[[str], str | None] | None = None,
     environ: Mapping[str, str] | None = None,
+    release_opener: Callable[..., Any] = urllib.request.urlopen,
 ) -> InstallResult:
     """Install or repair Ash, preserving existing pipx capability extras."""
 
-    environment = dict(os.environ if environ is None else environ)
-    pipx = which("pipx")
-    uv = which("uv")
+    unsupported_platform = _platform_support_error(host_platform)
+    if unsupported_platform is not None:
+        raise InstallError(unsupported_platform)
+
+    requested_extras = _normalize_requested_extras(extras)
+    environment = _installer_environment(os.environ if environ is None else environ)
+    resolver = which or (lambda name: _resolve_install_manager(name, environment=environment))
+    if runtime_python is None:
+        runtime_python = _runtime_python_override(sys.version_info[:2])
+    pipx = resolver("pipx")
+    uv = resolver("uv")
+    existing_ash = resolver("ash")
     if pipx is None:
         if uv is None:
             raise InstallError("Neither pipx nor uv is installed.")
         previous_uv = _read_uv_state(uv, runner=runner, environment=environment)
+        if not previous_uv.installed and existing_ash is not None:
+            raise InstallError(
+                "An existing Ash executable was found at "
+                f"{existing_ash}, but uv does not report owning it. Remove or "
+                "migrate that installation before creating a new managed install."
+            )
         return _install_with_uv(
             uv,
-            extras=extras or previous_uv.extras,
+            extras=requested_extras,
             ref=ref,
+            runtime_python=runtime_python,
             runner=runner,
             environment=environment,
             previous=previous_uv,
+            release_opener=release_opener,
         )
 
     try:
@@ -188,22 +412,25 @@ def install(
             environment=environment,
         )
     except OSError as exc:
-        if uv is None:
-            raise InstallError(f"pipx was found but could not start ({exc}).") from exc
-        previous_uv = _read_uv_state(uv, runner=runner, environment=environment)
-        return _install_with_uv(
-            uv,
-            extras=extras or previous_uv.extras,
-            ref=ref,
-            runner=runner,
-            environment=environment,
-            previous=previous_uv,
-        )
-    quarantine: _OwnedMetadataFile | None = None
-    repairing_corrupt_metadata = False
+        raise InstallError(
+            "pipx was found but could not start; Ash cannot safely determine "
+            f"package-manager ownership ({exc}). Repair or remove pipx before "
+            "running the Ash installer again."
+        ) from exc
     if inspection.succeeded:
         previous = inspection.state
         assert previous is not None
+        if previous.installed and uv is not None:
+            previous_uv = _read_uv_state(
+                uv,
+                runner=runner,
+                environment=environment,
+            )
+            if previous_uv.installed:
+                raise InstallError(
+                    "Ash is installed by both pipx and uv. Remove one installation "
+                    "before running the Ash installer again."
+                )
     else:
         pipx_home = _pipx_home_directory(
             pipx,
@@ -216,40 +443,55 @@ def install(
             raise InstallError(
                 f"Could not inspect the existing pipx installation: {detail}"
             )
-        quarantine = _quarantine_pipx_metadata_owned(corrupt_metadata)
-        repairing_corrupt_metadata = True
-        previous = _PipxState()
-        if not extras:
-            print(
-                "Warning: Ash's corrupt pipx metadata did not preserve optional "
-                "extras; repairing the base installation.",
-                file=sys.stderr,
-            )
-    if (
-        not previous.installed
-        and uv is not None
-        and not repairing_corrupt_metadata
-    ):
+        # POSIX offers no portable way to unlink/rename the exact object held
+        # by an open fd. A check-then-unlink sequence can delete a same-user
+        # replacement, so corrupt metadata is intentionally a manual boundary.
+        raise InstallError(
+            "Corrupt pipx metadata for Ash was detected at "
+            f"{corrupt_metadata}. Ash will not move or delete this file "
+            "automatically because the pathname may change concurrently. "
+            "After confirming no pipx process is using it, move the file aside "
+            "manually and rerun the Ash installer."
+        )
+    if not previous.installed and uv is not None:
         previous_uv = _read_uv_state(uv, runner=runner, environment=environment)
         if previous_uv.installed:
             return _install_with_uv(
                 uv,
-                extras=extras or previous_uv.extras,
+                extras=requested_extras,
                 ref=ref,
+                runtime_python=runtime_python,
                 runner=runner,
                 environment=environment,
                 previous=previous_uv,
+                release_opener=release_opener,
             )
+    if not previous.installed and existing_ash is not None:
+        raise InstallError(
+            "An existing Ash executable was found at "
+            f"{existing_ash}, but neither pipx nor uv reports owning it. Remove "
+            "or migrate that installation before creating a new managed install."
+        )
     # ``--extra`` augments the installed capability set. There is no public
     # remove-extra operation, so a repair cannot silently uninstall an
     # already-enabled pack when a user adds another one later.
-    selected_extras = _normalize_extras([*previous.extras, *extras])
-    package_spec = _package_spec(selected_extras, ref=ref)
+    selected_extras = _merge_capability_extras(previous.extras, requested_extras)
+    selected_runtime_python = previous.runtime_python or runtime_python
     install_environment = dict(environment)
     install_environment["UV_VENV_CLEAR"] = "1"
-    try:
+    with _prepared_package_spec(
+        selected_extras,
+        ref=ref,
+        release_opener=release_opener,
+    ) as package_spec:
+        install_command = [pipx, "install", "--force"]
+        if selected_runtime_python is not None:
+            install_command.extend(
+                ["--python", selected_runtime_python, "--fetch-python=missing"]
+            )
+        install_command.append(package_spec)
         _run_streaming(
-            [pipx, "install", "--force", package_spec],
+            install_command,
             runner=runner,
             environment=install_environment,
             timeout=_INSTALL_TIMEOUT_SECONDS,
@@ -257,68 +499,46 @@ def install(
             failure_message="pipx could not install Ash.",
         )
 
-        current_inspection = _read_pipx_state(
-            pipx,
-            runner=runner,
-            environment=environment,
-        )
-        if current_inspection.error is not None:
-            detail = current_inspection.error or "unknown pipx inspection failure"
-            raise InstallError(
-                "pipx installed Ash but its resulting state could not be read: "
-                f"{detail}"
-            )
-        current = current_inspection.state
-        if current is None or not current.installed:
-            raise InstallError(
-                "pipx reported a successful install, but Ash is absent from the "
-                "resulting pipx state."
-            )
-        launcher_directory = _pipx_bin_directory(
-            pipx,
-            runner=runner,
-            environment=environment,
-        )
-        executable = (
-            current.executable
-            or previous.executable
-            or _executable_in_directory(launcher_directory)
-        )
-        if not executable:
-            raise InstallError(
-                "Ash was installed, but its executable could not be located."
-            )
-        version = _verify_executable(
-            executable,
-            runner=runner,
-            environment=environment,
-        )
-        restart_required = _ensure_shell_path(
-            pipx,
-            manager="pipx",
-            launcher_directory=launcher_directory,
-            runner=runner,
-            environment=environment,
-        )
-        if quarantine is not None:
-            try:
-                _remove_owned_quarantine(quarantine)
-            except InstallError as exc:
-                print(
-                    "Warning: Ash repaired pipx successfully but left the "
-                    f"metadata quarantine untouched because ownership changed: {exc}",
-                    file=sys.stderr,
-                )
-    except Exception as exc:
-        if not repairing_corrupt_metadata or quarantine is None:
-            raise
-        detail = str(exc).strip() or type(exc).__name__
+    current_inspection = _read_pipx_state(
+        pipx,
+        runner=runner,
+        environment=environment,
+    )
+    if current_inspection.error is not None:
+        detail = current_inspection.error or "unknown pipx inspection failure"
         raise InstallError(
-            "Corrupt pipx metadata for Ash was detected, but automatic repair "
-            "failed. "
-            f"The original metadata was preserved at {quarantine.path}. "
+            "pipx installed Ash but its resulting state could not be read: "
             f"{detail}"
-        ) from exc
+        )
+    current = current_inspection.state
+    if current is None or not current.installed:
+        raise InstallError(
+            "pipx reported a successful install, but Ash is absent from the "
+            "resulting pipx state."
+        )
+    launcher_directory = _pipx_bin_directory(
+        pipx,
+        runner=runner,
+        environment=environment,
+    )
+    executable = _executable_in_directory(launcher_directory)
+    if not executable:
+        raise InstallError(
+            "Ash was installed, but pipx did not report its executable directory."
+        )
+    version = _verify_executable(
+        executable,
+        runner=runner,
+        environment=environment,
+    )
+    _verify_release_version(version, ref=ref)
+    restart_required = _ensure_shell_path(
+        pipx,
+        manager="pipx",
+        launcher_directory=launcher_directory,
+        runner=runner,
+        environment=environment,
+    )
     return InstallResult(
         manager="pipx",
         executable=executable,
@@ -356,7 +576,7 @@ def _pipx_bin_directory(
 def _executable_in_directory(directory: str | None) -> str | None:
     if not directory:
         return None
-    executable_name = "ash.exe" if os.name == "nt" else "ash"
+    executable_name = "ash"
     return str(Path(directory) / executable_name)
 
 
@@ -385,7 +605,7 @@ def _pipx_home_directory(
     return os.path.expanduser(directory)
 
 
-def _corrupt_ash_metadata(pipx_home: str | None) -> _OwnedMetadataFile | None:
+def _corrupt_ash_metadata(pipx_home: str | None) -> Path | None:
     if not pipx_home:
         return None
     metadata_path = Path(
@@ -394,7 +614,7 @@ def _corrupt_ash_metadata(pipx_home: str | None) -> _OwnedMetadataFile | None:
         )
     )
     try:
-        contents, metadata = _read_bounded_file_with_identity(
+        contents, _metadata = _read_bounded_file_with_identity(
             metadata_path,
             max_bytes=_MAX_METADATA_BYTES,
         )
@@ -402,705 +622,10 @@ def _corrupt_ash_metadata(pipx_home: str | None) -> _OwnedMetadataFile | None:
     except (OSError, UnicodeError, ValueError):
         return None
     try:
-        json.loads(text)
-    except json.JSONDecodeError:
-        return _OwnedMetadataFile(
-            path=metadata_path,
-            device=metadata.st_dev,
-            inode=metadata.st_ino,
-            sha256=hashlib.sha256(contents).hexdigest(),
-        )
+        _strict_json_loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return metadata_path
     return None
-
-
-def _corrupt_ash_metadata_path(pipx_home: str | None) -> Path | None:
-    corrupt = _corrupt_ash_metadata(pipx_home)
-    return corrupt.path if corrupt is not None else None
-
-
-def _quarantine_pipx_metadata(metadata_path: Path) -> Path:
-    contents, metadata = _read_bounded_file_with_identity(
-        metadata_path,
-        max_bytes=_MAX_METADATA_BYTES,
-    )
-    owned = _OwnedMetadataFile(
-        path=Path(os.path.abspath(metadata_path.expanduser())),
-        device=metadata.st_dev,
-        inode=metadata.st_ino,
-        sha256=hashlib.sha256(contents).hexdigest(),
-    )
-    return _quarantine_pipx_metadata_owned(owned).path
-
-
-def _quarantine_pipx_metadata_owned(
-    metadata: _OwnedMetadataFile,
-) -> _OwnedMetadataFile:
-    if not _installer_supports_dir_fd():
-        if os.name == "nt":
-            return _quarantine_pipx_metadata_owned_windows(metadata)
-        return _quarantine_pipx_metadata_owned_fallback(metadata)
-
-    try:
-        parent_descriptor = _open_installer_directory(metadata.path.parent)
-    except OSError as exc:
-        raise InstallError(
-            f"could not safely open pipx metadata directory: {exc}"
-        ) from exc
-    source_descriptor = -1
-    try:
-        source_name = metadata.path.name
-        source_flags = os.O_RDONLY
-        if hasattr(os, "O_CLOEXEC"):
-            source_flags |= os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            source_flags |= os.O_NOFOLLOW
-        if hasattr(os, "O_NONBLOCK"):
-            source_flags |= os.O_NONBLOCK
-        source_descriptor = os.open(
-            source_name,
-            source_flags,
-            dir_fd=parent_descriptor,
-        )
-        source = os.fstat(source_descriptor)
-        if (source.st_dev, source.st_ino) != (metadata.device, metadata.inode):
-            raise InstallError("pipx metadata changed before it could be quarantined")
-        if not stat.S_ISREG(source.st_mode):
-            raise InstallError("pipx metadata is no longer a regular file")
-        source_bytes = _read_bounded_descriptor(
-            source_descriptor,
-            max_bytes=_MAX_METADATA_BYTES,
-            path=metadata.path,
-        )
-        if hashlib.sha256(source_bytes).hexdigest() != metadata.sha256:
-            raise InstallError("pipx metadata contents changed before quarantine")
-
-        for _ in range(32):
-            quarantine_name = f"{source_name}.corrupt-{uuid.uuid4().hex}"
-            quarantine_path = metadata.path.with_name(quarantine_name)
-            quarantine_descriptor = -1
-            try:
-                quarantine_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                if hasattr(os, "O_CLOEXEC"):
-                    quarantine_flags |= os.O_CLOEXEC
-                if hasattr(os, "O_NOFOLLOW"):
-                    quarantine_flags |= os.O_NOFOLLOW
-                quarantine_descriptor = os.open(
-                    quarantine_name,
-                    quarantine_flags,
-                    0o600,
-                    dir_fd=parent_descriptor,
-                )
-            except FileExistsError:
-                continue
-            except OSError as exc:
-                raise InstallError(
-                    f"could not safely create pipx metadata quarantine: {exc}"
-                ) from exc
-            try:
-                if hasattr(os, "fchmod") and os.name != "nt":
-                    os.fchmod(quarantine_descriptor, 0o600)
-                _write_installer_descriptor(quarantine_descriptor, source_bytes)
-                os.fsync(quarantine_descriptor)
-                quarantined = os.fstat(quarantine_descriptor)
-                current = os.stat(
-                    source_name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if (current.st_dev, current.st_ino) != (
-                    metadata.device,
-                    metadata.inode,
-                ):
-                    raise InstallError(
-                        "pipx metadata changed while being quarantined"
-                    )
-                os.unlink(source_name, dir_fd=parent_descriptor)
-                return _OwnedMetadataFile(
-                    path=quarantine_path,
-                    device=quarantined.st_dev,
-                    inode=quarantined.st_ino,
-                    sha256=metadata.sha256,
-                )
-            except Exception:
-                if quarantine_descriptor >= 0:
-                    try:
-                        quarantined = os.fstat(quarantine_descriptor)
-                        _unlink_installer_entry_if_same(
-                            parent_descriptor,
-                            quarantine_name,
-                            quarantined,
-                        )
-                    except OSError:
-                        pass
-                raise
-            finally:
-                if quarantine_descriptor >= 0:
-                    os.close(quarantine_descriptor)
-        raise InstallError("could not allocate a unique pipx metadata quarantine name")
-    except InstallError:
-        raise
-    except OSError as exc:
-        raise InstallError(
-            f"could not safely quarantine corrupt pipx metadata: {exc}"
-        ) from exc
-    finally:
-        if source_descriptor >= 0:
-            os.close(source_descriptor)
-        os.close(parent_descriptor)
-
-
-def _quarantine_pipx_metadata_owned_fallback(
-    metadata: _OwnedMetadataFile,
-) -> _OwnedMetadataFile:
-    raise InstallError(
-        "safe automatic quarantine of corrupt pipx metadata is unavailable on "
-        f"this platform; metadata was left untouched at {metadata.path}"
-    )
-
-
-def _quarantine_pipx_metadata_owned_windows(
-    metadata: _OwnedMetadataFile,
-) -> _OwnedMetadataFile:
-    parent_handle = _windows_open_installer_directory(
-        metadata.path.parent,
-        for_rename=True,
-    )
-    descriptor = -1
-    try:
-        descriptor = _windows_open_owned_metadata(
-            metadata,
-            parent_handle=parent_handle,
-        )
-        for _ in range(32):
-            quarantine_name = f"{metadata.path.name}.corrupt-{uuid.uuid4().hex}"
-            quarantine_path = metadata.path.with_name(quarantine_name)
-            try:
-                _windows_rename_open_file(
-                    descriptor,
-                    parent_handle=parent_handle,
-                    destination_name=quarantine_name,
-                )
-            except FileExistsError:
-                continue
-            quarantined = os.fstat(descriptor)
-            return _OwnedMetadataFile(
-                path=quarantine_path,
-                device=quarantined.st_dev,
-                inode=quarantined.st_ino,
-                sha256=metadata.sha256,
-            )
-        raise InstallError("could not allocate a unique pipx metadata quarantine name")
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        _windows_close_handle(parent_handle)
-
-
-def _remove_owned_quarantine(quarantine: _OwnedMetadataFile) -> None:
-    if os.name == "nt" and not _installer_supports_dir_fd():
-        _remove_owned_quarantine_windows(quarantine)
-        return
-    try:
-        contents, metadata = _read_bounded_file_with_identity(
-            quarantine.path,
-            max_bytes=_MAX_METADATA_BYTES,
-        )
-    except FileNotFoundError:
-        return
-    except (OSError, ValueError) as exc:
-        raise InstallError(
-            f"could not safely inspect pipx metadata quarantine: {exc}"
-        ) from exc
-    if (metadata.st_dev, metadata.st_ino) != (quarantine.device, quarantine.inode):
-        raise InstallError("pipx metadata quarantine changed before cleanup")
-    if hashlib.sha256(contents).hexdigest() != quarantine.sha256:
-        raise InstallError("pipx metadata quarantine contents changed before cleanup")
-
-    try:
-        parent_descriptor = _open_installer_directory(quarantine.path.parent)
-    except OSError as exc:
-        raise InstallError(
-            f"could not safely open pipx metadata quarantine directory: {exc}"
-        ) from exc
-    try:
-        current = os.stat(
-            quarantine.path.name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        if (current.st_dev, current.st_ino) != (quarantine.device, quarantine.inode):
-            raise InstallError("pipx metadata quarantine changed before cleanup")
-        os.unlink(quarantine.path.name, dir_fd=parent_descriptor)
-    finally:
-        os.close(parent_descriptor)
-
-
-def _remove_owned_quarantine_windows(quarantine: _OwnedMetadataFile) -> None:
-    parent_handle = _windows_open_installer_directory(quarantine.path.parent)
-    try:
-        try:
-            descriptor = _windows_open_owned_metadata(
-                quarantine,
-                parent_handle=parent_handle,
-                write_attributes=True,
-            )
-        except FileNotFoundError:
-            return
-        try:
-            _windows_delete_open_file(descriptor)
-        finally:
-            os.close(descriptor)
-    finally:
-        _windows_close_handle(parent_handle)
-
-
-def _windows_open_installer_directory(path: Path, *, for_rename: bool = False) -> int:
-    import ctypes
-    from ctypes import wintypes
-
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    get_last_error: Any = getattr(ctypes, "get_last_error")
-    format_error: Any = getattr(ctypes, "FormatError")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    create_file: Any = kernel32.CreateFileW
-    create_file.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    create_file.restype = wintypes.HANDLE
-    file_read_attributes = 0x00000080
-    file_add_file = 0x00000002
-    synchronize = 0x00100000
-    share_read = 0x00000001
-    share_write = 0x00000002
-    share_delete = 0x00000004
-    open_existing = 3
-    flag_backup_semantics = 0x02000000
-    flag_open_reparse_point = 0x00200000
-    invalid_handle = ctypes.c_void_p(-1).value
-    desired_access = file_read_attributes
-    if for_rename:
-        desired_access |= file_add_file | synchronize
-    handle = create_file(
-        str(path),
-        desired_access,
-        share_read | share_write | share_delete,
-        None,
-        open_existing,
-        flag_backup_semantics | flag_open_reparse_point,
-        None,
-    )
-    if handle == invalid_handle:
-        error_number = int(get_last_error())
-        raise InstallError(
-            "could not safely open pipx metadata directory: "
-            f"{format_error(error_number)}"
-        )
-    try:
-        if _windows_handle_is_reparse(handle):
-            raise InstallError("pipx metadata directory is a reparse point")
-        return int(handle)
-    except Exception:
-        _windows_close_handle(int(handle))
-        raise
-
-
-def _windows_open_owned_metadata(
-    metadata: _OwnedMetadataFile,
-    *,
-    parent_handle: int,
-    write_attributes: bool = False,
-) -> int:
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-
-    class UnicodeString(ctypes.Structure):
-        _fields_ = [
-            ("Length", wintypes.USHORT),
-            ("MaximumLength", wintypes.USHORT),
-            ("Buffer", wintypes.LPWSTR),
-        ]
-
-    class ObjectAttributes(ctypes.Structure):
-        _fields_ = [
-            ("Length", wintypes.ULONG),
-            ("RootDirectory", wintypes.HANDLE),
-            ("ObjectName", ctypes.POINTER(UnicodeString)),
-            ("Attributes", wintypes.ULONG),
-            ("SecurityDescriptor", ctypes.c_void_p),
-            ("SecurityQualityOfService", ctypes.c_void_p),
-        ]
-
-    class IoStatusUnion(ctypes.Union):
-        _fields_ = [
-            ("Status", ctypes.c_long),
-            ("Pointer", ctypes.c_void_p),
-        ]
-
-    class IoStatusBlock(ctypes.Structure):
-        _anonymous_ = ("result",)
-        _fields_ = [
-            ("result", IoStatusUnion),
-            ("Information", ctypes.c_size_t),
-        ]
-
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    open_osfhandle: Any = getattr(msvcrt, "open_osfhandle")
-    ntdll: Any = win_dll("ntdll")
-    nt_open_file: Any = ntdll.NtOpenFile
-    nt_open_file.argtypes = [
-        ctypes.POINTER(wintypes.HANDLE),
-        wintypes.DWORD,
-        ctypes.POINTER(ObjectAttributes),
-        ctypes.POINTER(IoStatusBlock),
-        wintypes.ULONG,
-        wintypes.ULONG,
-    ]
-    nt_open_file.restype = ctypes.c_long
-
-    file_read_data = 0x00000001
-    file_read_attributes = 0x00000080
-    file_write_attributes = 0x00000100
-    delete_access = 0x00010000
-    synchronize = 0x00100000
-    share_read = 0x00000001
-    file_synchronous_io_nonalert = 0x00000020
-    file_non_directory_file = 0x00000040
-    file_open_reparse_point = 0x00200000
-    obj_case_insensitive = 0x00000040
-    missing_statuses = {0xC0000034, 0xC000003A}
-
-    name_buffer = ctypes.create_unicode_buffer(metadata.path.name)
-    name_length = len(metadata.path.name.encode("utf-16-le"))
-    name = UnicodeString(
-        Length=name_length,
-        MaximumLength=name_length + ctypes.sizeof(ctypes.c_wchar),
-        Buffer=ctypes.cast(name_buffer, wintypes.LPWSTR),
-    )
-    attributes = ObjectAttributes(
-        Length=ctypes.sizeof(ObjectAttributes),
-        RootDirectory=wintypes.HANDLE(parent_handle),
-        ObjectName=ctypes.pointer(name),
-        Attributes=obj_case_insensitive,
-        SecurityDescriptor=None,
-        SecurityQualityOfService=None,
-    )
-    io_status = IoStatusBlock()
-    handle = wintypes.HANDLE()
-    desired_access = (
-        file_read_data
-        | file_read_attributes
-        | delete_access
-        | synchronize
-    )
-    if write_attributes:
-        desired_access |= file_write_attributes
-    status = int(
-        nt_open_file(
-            ctypes.byref(handle),
-            desired_access,
-            ctypes.byref(attributes),
-            ctypes.byref(io_status),
-            share_read,
-            file_synchronous_io_nonalert
-            | file_non_directory_file
-            | file_open_reparse_point,
-        )
-    )
-    if status < 0:
-        status_code = status & 0xFFFFFFFF
-        if status_code in missing_statuses:
-            raise FileNotFoundError(
-                2,
-                "pipx metadata was not found",
-                metadata.path,
-            )
-        raise InstallError(
-            "could not safely open pipx metadata relative to its directory: "
-            f"NTSTATUS 0x{status_code:08x}"
-        )
-    handle_value = handle.value
-    if handle_value is None:
-        raise InstallError("NtOpenFile returned an invalid pipx metadata handle")
-    raw_handle = int(handle_value)
-    descriptor = -1
-    try:
-        if _windows_handle_is_reparse(raw_handle):
-            raise InstallError("pipx metadata is no longer a regular file")
-        descriptor = int(
-            open_osfhandle(
-                raw_handle,
-                os.O_RDONLY
-                | int(getattr(os, "O_BINARY", 0))
-                | int(getattr(os, "O_NOINHERIT", 0)),
-            )
-        )
-        if descriptor < 0:
-            raise OSError("could not adopt the pipx metadata handle")
-        raw_handle = -1
-        current = os.fstat(descriptor)
-        if metadata.inode == 0 or current.st_ino == 0:
-            raise InstallError("pipx metadata identity is unavailable")
-        if (current.st_dev, current.st_ino) != (metadata.device, metadata.inode):
-            raise InstallError("pipx metadata changed before it could be quarantined")
-        if not stat.S_ISREG(current.st_mode):
-            raise InstallError("pipx metadata is no longer a regular file")
-        contents = _read_bounded_descriptor(
-            descriptor,
-            max_bytes=_MAX_METADATA_BYTES,
-            path=metadata.path,
-        )
-        if hashlib.sha256(contents).hexdigest() != metadata.sha256:
-            raise InstallError("pipx metadata contents changed before quarantine")
-        return descriptor
-    except Exception:
-        if descriptor >= 0:
-            os.close(descriptor)
-        elif raw_handle >= 0:
-            _windows_close_handle(raw_handle)
-        raise
-
-
-def _windows_handle_is_reparse(handle: int) -> bool:
-    import ctypes
-    from ctypes import wintypes
-
-    class FileAttributeTagInfo(ctypes.Structure):
-        _fields_ = [
-            ("FileAttributes", wintypes.DWORD),
-            ("ReparseTag", wintypes.DWORD),
-        ]
-
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    get_last_error: Any = getattr(ctypes, "get_last_error")
-    format_error: Any = getattr(ctypes, "FormatError")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    get_info: Any = kernel32.GetFileInformationByHandleEx
-    get_info.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    get_info.restype = wintypes.BOOL
-    info = FileAttributeTagInfo()
-    if not get_info(
-        wintypes.HANDLE(handle),
-        9,
-        ctypes.byref(info),
-        ctypes.sizeof(info),
-    ):
-        error_number = int(get_last_error())
-        raise InstallError(
-            "could not inspect pipx metadata handle: "
-            f"{format_error(error_number)}"
-        )
-    return bool(int(info.FileAttributes) & 0x00000400)
-
-
-def _windows_rename_open_file(
-    descriptor: int,
-    *,
-    parent_handle: int,
-    destination_name: str,
-) -> None:
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-
-    class FileRenameInfo(ctypes.Structure):
-        _fields_ = [
-            ("ReplaceIfExists", ctypes.c_ubyte),
-            ("RootDirectory", wintypes.HANDLE),
-            ("FileNameLength", wintypes.DWORD),
-            ("FileName", ctypes.c_wchar * (len(destination_name) + 1)),
-        ]
-
-    class IoStatusUnion(ctypes.Union):
-        _fields_ = [
-            ("Status", ctypes.c_long),
-            ("Pointer", ctypes.c_void_p),
-        ]
-
-    class IoStatusBlock(ctypes.Structure):
-        _anonymous_ = ("result",)
-        _fields_ = [
-            ("result", IoStatusUnion),
-            ("Information", ctypes.c_size_t),
-        ]
-
-    info = FileRenameInfo()
-    info.ReplaceIfExists = 0
-    info.RootDirectory = wintypes.HANDLE(parent_handle)
-    info.FileNameLength = len(destination_name.encode("utf-16-le"))
-    info.FileName = destination_name
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    get_osfhandle: Any = getattr(msvcrt, "get_osfhandle")
-    ntdll: Any = win_dll("ntdll")
-    set_info: Any = ntdll.NtSetInformationFile
-    set_info.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(IoStatusBlock),
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.c_int,
-    ]
-    set_info.restype = ctypes.c_long
-    handle = int(get_osfhandle(descriptor))
-    io_status = IoStatusBlock()
-    status = int(
-        set_info(
-            wintypes.HANDLE(handle),
-            ctypes.byref(io_status),
-            ctypes.byref(info),
-            ctypes.sizeof(info),
-            10,  # FileRenameInformation
-        )
-    )
-    if status >= 0:
-        return
-    status_code = status & 0xFFFFFFFF
-    if status_code == 0xC0000035:  # STATUS_OBJECT_NAME_COLLISION
-        raise FileExistsError(17, "pipx metadata quarantine already exists", destination_name)
-    raise InstallError(
-        "could not safely rename pipx metadata into quarantine: "
-        f"NTSTATUS 0x{status_code:08x}"
-    )
-
-
-def _windows_delete_open_file(descriptor: int) -> None:
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-
-    class FileDispositionInfoEx(ctypes.Structure):
-        _fields_ = [("Flags", wintypes.DWORD)]
-
-    class FileDispositionInfo(ctypes.Structure):
-        _fields_ = [("DeleteFile", ctypes.c_ubyte)]
-
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    get_last_error: Any = getattr(ctypes, "get_last_error")
-    format_error: Any = getattr(ctypes, "FormatError")
-    get_osfhandle: Any = getattr(msvcrt, "get_osfhandle")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    set_info: Any = kernel32.SetFileInformationByHandle
-    set_info.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    set_info.restype = wintypes.BOOL
-    handle = int(get_osfhandle(descriptor))
-
-    # Prefer the extended disposition API so a user-owned read-only pipx
-    # metadata file can still be removed after a successful repair. The
-    # legacy API rejects read-only files. Fall back for older filesystems or
-    # Windows versions that do not support FileDispositionInfoEx.
-    extended = FileDispositionInfoEx()
-    extended.Flags = 0x00000001 | 0x00000010  # DELETE | IGNORE_READONLY_ATTRIBUTE
-    if set_info(
-        wintypes.HANDLE(handle),
-        21,  # FileDispositionInfoEx
-        ctypes.byref(extended),
-        ctypes.sizeof(extended),
-    ):
-        return
-    extended_error = int(get_last_error())
-    if extended_error not in {1, 50, 87}:
-        # ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED / ERROR_INVALID_PARAMETER
-        raise InstallError(
-            "could not safely remove pipx metadata quarantine: "
-            f"{format_error(extended_error)}"
-        )
-
-    info = FileDispositionInfo()
-    info.DeleteFile = 1
-    if not set_info(
-        wintypes.HANDLE(handle),
-        4,
-        ctypes.byref(info),
-        ctypes.sizeof(info),
-    ):
-        error_number = int(get_last_error())
-        raise InstallError(
-            "could not safely remove pipx metadata quarantine: "
-            f"{format_error(error_number)}"
-        )
-
-
-def _windows_close_handle(handle: int) -> None:
-    import ctypes
-    from ctypes import wintypes
-
-    win_dll: Any = getattr(ctypes, "WinDLL")
-    kernel32: Any = win_dll("kernel32", use_last_error=True)
-    close_handle: Any = kernel32.CloseHandle
-    close_handle(wintypes.HANDLE(handle))
-
-
-def _open_installer_directory(path: Path) -> int:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    return os.open(path, flags)
-
-
-def _installer_supports_dir_fd() -> bool:
-    supported: set[Any] = set(getattr(os, "supports_dir_fd", ()))
-    return all(function in supported for function in (os.open, os.stat, os.unlink))
-
-
-def _write_installer_descriptor(descriptor: int, payload: bytes) -> None:
-    view = memoryview(payload)
-    while view:
-        written = os.write(descriptor, view)
-        if written <= 0:
-            raise OSError("short write while preserving pipx metadata")
-        view = view[written:]
-
-
-def _read_bounded_descriptor(
-    descriptor: int,
-    *,
-    max_bytes: int,
-    path: Path,
-) -> bytes:
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    contents = bytearray()
-    while len(contents) <= max_bytes:
-        remaining = max_bytes + 1 - len(contents)
-        chunk = os.read(descriptor, min(_CAPTURE_CHUNK_BYTES, remaining))
-        if not chunk:
-            break
-        contents.extend(chunk)
-    if len(contents) > max_bytes:
-        raise ValueError(f"file exceeds {max_bytes} bytes: {path}")
-    return bytes(contents)
-
-
-def _unlink_installer_entry_if_same(
-    parent_descriptor: int,
-    name: str,
-    expected: os.stat_result,
-) -> None:
-    try:
-        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    if (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino):
-        os.unlink(name, dir_fd=parent_descriptor)
 
 
 def _completed_output_detail(completed: Any) -> str:
@@ -1121,53 +646,62 @@ def _install_with_uv(
     *,
     extras: Sequence[str],
     ref: str | None,
+    runtime_python: str | None,
     runner: Callable[..., Any],
     environment: Mapping[str, str],
     previous: _UvState,
+    release_opener: Callable[..., Any],
 ) -> InstallResult:
     # Keep existing capability packs when adding one through a later
     # pipx/uv invocation. This makes upgrades and repairs additive and safe.
-    selected_extras = _normalize_extras([*previous.extras, *extras])
-    package_spec = _package_spec(selected_extras, ref=ref)
-    _run_streaming(
-        [uv, "tool", "install", "--force", "--reinstall", package_spec],
-        runner=runner,
-        environment=environment,
-        timeout=_INSTALL_TIMEOUT_SECONDS,
-        description="uv installation",
-        failure_message="uv could not install Ash.",
-    )
+    selected_extras = _merge_capability_extras(previous.extras, extras)
+    selected_runtime_python = previous.runtime_python or runtime_python
+    with _prepared_package_spec(
+        selected_extras,
+        ref=ref,
+        release_opener=release_opener,
+    ) as package_spec:
+        install_command = [uv, "tool", "install", "--force", "--reinstall"]
+        if selected_runtime_python is not None:
+            install_command.extend(["--python", selected_runtime_python])
+        install_command.append(package_spec)
+        _run_streaming(
+            install_command,
+            runner=runner,
+            environment=environment,
+            timeout=_INSTALL_TIMEOUT_SECONDS,
+            description="uv installation",
+            failure_message="uv could not install Ash.",
+        )
     current = _read_uv_state(uv, runner=runner, environment=environment)
     if not current.installed:
         raise InstallError(
             "uv reported a successful install, but Ash is absent from the resulting uv state."
         )
-    executable = current.executable
-    if not executable:
-        directory = _run_captured(
-            [uv, "tool", "dir", "--bin"],
-            runner=runner,
-            environment=environment,
-            timeout=_QUERY_TIMEOUT_SECONDS,
-            max_bytes=_MAX_QUERY_OUTPUT_BYTES,
-            description="uv tool directory query",
+    directory = _run_captured(
+        [uv, "tool", "dir", "--bin"],
+        runner=runner,
+        environment=environment,
+        timeout=_QUERY_TIMEOUT_SECONDS,
+        max_bytes=_MAX_QUERY_OUTPUT_BYTES,
+        description="uv tool directory query",
+    )
+    if int(getattr(directory, "returncode", 1)) != 0:
+        raise InstallError(
+            "Ash was installed, but uv did not report its executable directory."
         )
-        if int(getattr(directory, "returncode", 1)) != 0:
-            raise InstallError(
-                "Ash was installed, but uv did not report its executable directory."
-            )
-        launcher_directory = str(getattr(directory, "stdout", "")).strip()
-        if not launcher_directory:
-            raise InstallError(
-                "Ash was installed, but uv did not report its executable directory."
-            )
-        executable_name = "ash.exe" if os.name == "nt" else "ash"
-        executable = str(Path(launcher_directory) / executable_name)
+    launcher_directory = str(getattr(directory, "stdout", "")).strip()
+    executable = _executable_in_directory(launcher_directory)
+    if not executable:
+        raise InstallError(
+            "Ash was installed, but uv did not report its executable directory."
+        )
     version = _verify_executable(executable, runner=runner, environment=environment)
+    _verify_release_version(version, ref=ref)
     restart_required = _ensure_shell_path(
         uv,
         manager="uv",
-        launcher_directory=str(Path(executable).parent),
+        launcher_directory=launcher_directory,
         runner=runner,
         environment=environment,
     )
@@ -1269,9 +803,10 @@ def _read_pipx_state(
             )
         return _PipxInspection(None, detail)
     try:
-        payload = json.loads(str(getattr(completed, "stdout", "")))
-    except json.JSONDecodeError as exc:
-        return _PipxInspection(None, f"pipx returned invalid JSON ({exc.msg})")
+        payload = _strict_json_loads(str(getattr(completed, "stdout", "")))
+    except (json.JSONDecodeError, ValueError) as exc:
+        detail = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+        return _PipxInspection(None, f"pipx returned invalid JSON ({detail})")
     if not isinstance(payload, dict) or not isinstance(payload.get("venvs"), dict):
         return _PipxInspection(None, "pipx returned an unexpected JSON shape")
     ash_venv = payload["venvs"].get(_PACKAGE_NAME)
@@ -1297,8 +832,14 @@ def _read_pipx_state(
             if isinstance(entry, dict) and entry.get("__Path__"):
                 executable = str(entry["__Path__"])
                 break
+    runtime_python = _supported_runtime_minor(metadata.get("python_version"))
     return _PipxInspection(
-        _PipxState(installed=True, extras=extras, executable=executable)
+        _PipxState(
+            installed=True,
+            extras=extras,
+            executable=executable,
+            runtime_python=runtime_python,
+        )
     )
 
 
@@ -1308,23 +849,36 @@ def _read_uv_state(
     runner: Callable[..., Any],
     environment: Mapping[str, str],
 ) -> _UvState:
+    base_command = [
+        uv,
+        "tool",
+        "list",
+        "--show-paths",
+        "--show-version-specifiers",
+        "--show-extras",
+    ]
     completed = _run_captured(
-        [
-            uv,
-            "tool",
-            "list",
-            "--show-paths",
-            "--show-version-specifiers",
-            "--show-extras",
-        ],
+        [*base_command, "--show-python"],
         runner=runner,
         environment=environment,
         timeout=_QUERY_TIMEOUT_SECONDS,
         max_bytes=_MAX_STATE_OUTPUT_BYTES,
         description="uv state query",
     )
-    if int(getattr(completed, "returncode", 1)) != 0:
-        return _UvState()
+    show_python = int(getattr(completed, "returncode", 1)) == 0
+    if not show_python:
+        completed = _run_captured(
+            base_command,
+            runner=runner,
+            environment=environment,
+            timeout=_QUERY_TIMEOUT_SECONDS,
+            max_bytes=_MAX_STATE_OUTPUT_BYTES,
+            description="uv compatibility state query",
+        )
+        if int(getattr(completed, "returncode", 1)) != 0:
+            detail = _completed_output_detail(completed)
+            suffix = f": {detail}" if detail else ""
+            raise InstallError(f"Could not inspect the existing uv installation{suffix}")
     output = str(getattr(completed, "stdout", ""))
     lines = output.splitlines()
     header_index = next(
@@ -1351,7 +905,16 @@ def _read_uv_state(
     extras = _normalize_extras(extras_match.group(1).split(",") if extras_match else ())
     path_match = _UV_ASH_PATH_PATTERN.search(block)
     executable = path_match.group(1).strip() if path_match else None
-    return _UvState(installed=True, extras=extras, executable=executable)
+    python_match = _UV_PYTHON_PATTERN.search(block_lines[0]) if show_python else None
+    runtime_python = _supported_runtime_minor(
+        python_match.group(1) if python_match else None
+    )
+    return _UvState(
+        installed=True,
+        extras=extras,
+        executable=executable,
+        runtime_python=runtime_python,
+    )
 
 
 def _run_streaming(
@@ -1398,7 +961,7 @@ def _run_streaming(
             try:
                 _terminate_process(process, plan=process_tree_plan)
             except InstallError as cleanup_error:
-                primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+                _attach_cleanup_failure(primary, cleanup_error)
             raise
         completed = _CapturedResult(returncode=returncode)
         if returncode != 0:
@@ -1592,7 +1155,7 @@ def _run_bounded_subprocess(
             try:
                 _terminate_process(process, plan=process_tree_plan)
             except InstallError as cleanup_error:
-                primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+                _attach_cleanup_failure(primary, cleanup_error)
         raise
     finally:
         stop_readers.set()
@@ -1615,72 +1178,39 @@ def _terminate_process(
     *,
     plan: _InstallerProcessTreePlan | None = None,
 ) -> None:
-    windows = plan.is_windows if plan is not None else os.name == "nt"
-    if windows:
-        if plan is None or plan.taskkill_path is None:
-            raise InstallError(
-                "managed Windows process-tree cleanup requires successful preflight"
-            )
-        if process.poll() is not None:
-            raise InstallError(
-                "managed root already exited; descendant cleanup is unconfirmed"
-            )
-        failure: str | None = None
-        try:
-            completed = subprocess.run(
-                [plan.taskkill_path, "/PID", str(process.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            failure = "taskkill timed out"
-        except OSError as exc:
-            failure = f"taskkill could not execute ({type(exc).__name__})"
-        else:
-            if completed.returncode != 0:
-                failure = f"taskkill exited with status {completed.returncode}"
-        if failure is not None:
-            _best_effort_root_kill(process)
-            raise InstallError(
-                f"Windows descendant cleanup could not be confirmed: {failure}"
-            )
-        try:
-            process.wait(timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            _best_effort_root_kill(process)
-            raise InstallError(
-                "Windows descendant cleanup could not be confirmed: "
-                "managed root did not exit"
-            )
-        except OSError as exc:
-            _best_effort_root_kill(process)
-            raise InstallError(
-                "Windows descendant cleanup could not be confirmed: "
-                "managed root could not be reaped"
-            ) from exc
-        return
-
-    if process.poll() is not None:
-        return
     options = plan.spawn_options if plan is not None else {"start_new_session": True}
-    if not options.get("start_new_session") or not _signal_process_group(
-        process.pid, signal.SIGTERM
-    ):
+    manages_group = bool(options.get("start_new_session") and _KILLPG is not None)
+    root_exited = process.poll() is not None
+    signaled_group = manages_group and _signal_process_group(process.pid, signal.SIGTERM)
+    if not signaled_group:
+        if root_exited:
+            return
         process.terminate()
-    try:
-        process.wait(timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        if (
-            not options.get("start_new_session")
-            or _SIGKILL is None
-            or not _signal_process_group(process.pid, _SIGKILL)
-        ):
-            process.kill()
+
+    if not root_exited:
         try:
-            process.wait(timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS)
+            process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
+            if not signaled_group:
+                process.kill()
+            elif _SIGKILL is not None:
+                _signal_process_group(process.pid, _SIGKILL)
+            try:
+                process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+
+    if signaled_group and _process_group_exists(process.pid):
+        deadline = time.monotonic() + _PROCESS_CLEANUP_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and _process_group_exists(process.pid):
+            time.sleep(0.05)
+        if _process_group_exists(process.pid) and _SIGKILL is not None:
+            _signal_process_group(process.pid, _SIGKILL)
+    elif not signaled_group and process.poll() is None:
+        process.kill()
+        try:
+            process.wait(timeout=_PROCESS_CLEANUP_TIMEOUT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
             pass
 
 
@@ -1696,16 +1226,18 @@ def _signal_process_group(pid: int, signum: int) -> bool:
     return True
 
 
-def _best_effort_root_kill(process: subprocess.Popen[Any]) -> None:
-    if process.poll() is None:
-        try:
-            process.kill()
-        except (OSError, ProcessLookupError):
-            pass
+def _process_group_exists(pid: int) -> bool:
+    if _KILLPG is None:
+        return False
     try:
-        process.wait(timeout=_WINDOWS_TASKKILL_TIMEOUT_SECONDS)
-    except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
-        pass
+        _KILLPG(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _read_bounded_file(path: Path, *, max_bytes: int) -> bytes:
@@ -1750,10 +1282,267 @@ def _normalize_extras(values: Sequence[str]) -> tuple[str, ...]:
     )
 
 
-def _package_spec(extras: Sequence[str], *, ref: str | None) -> str:
+def _normalize_requested_extras(values: Sequence[str]) -> tuple[str, ...]:
+    normalized = _normalize_extras(values)
+    unsupported = tuple(value for value in normalized if value not in _SUPPORTED_EXTRA_SET)
+    if unsupported:
+        raise InstallError(
+            "Unsupported Ash capability extra(s): "
+            + ", ".join(unsupported)
+            + ". Supported extras: "
+            + ", ".join(SUPPORTED_EXTRAS)
+        )
+    return normalized
+
+
+def _merge_capability_extras(
+    existing: Sequence[str],
+    requested: Sequence[str],
+) -> tuple[str, ...]:
+    normalized_existing = _normalize_extras(existing)
+    unsupported_existing = tuple(
+        value for value in normalized_existing if value not in _SUPPORTED_EXTRA_SET
+    )
+    if unsupported_existing:
+        print(
+            "Warning: ignoring obsolete or unsupported Ash capability extras from "
+            "the existing installation: " + ", ".join(unsupported_existing),
+            file=sys.stderr,
+        )
+    return _normalize_extras(
+        [
+            *(value for value in normalized_existing if value in _SUPPORTED_EXTRA_SET),
+            *requested,
+        ]
+    )
+
+
+def _supported_runtime_minor(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = _PYTHON_VERSION_PATTERN.fullmatch(value.strip())
+    if match is None:
+        return None
+    major, minor = int(match.group(1)), int(match.group(2))
+    if _RUNTIME_MIN_PYTHON <= (major, minor) < _RUNTIME_MAX_PYTHON:
+        return f"{major}.{minor}"
+    return None
+
+
+def _runtime_python_override(python_version: Sequence[int]) -> str:
+    """Select an explicit supported runtime for package-manager installation."""
+
+    major, minor = int(python_version[0]), int(python_version[1])
+    version = (major, minor)
+    if _RUNTIME_MIN_PYTHON <= version < _RUNTIME_MAX_PYTHON:
+        return f"{major}.{minor}"
+    return _RUNTIME_FALLBACK_PYTHON
+
+
+def _release_wheel(
+    ref: str,
+    *,
+    opener: Callable[..., Any],
+) -> _ReleaseWheel:
+    if _RELEASE_REF_PATTERN.fullmatch(ref) is None:
+        raise InstallError(
+            f"Ash release ref must use the canonical ash-v<version> form: {ref!r}"
+        )
+    release_url = f"{_RELEASES_API}/tags/{urllib.parse.quote(ref, safe='')}"
+    request = urllib.request.Request(
+        release_url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "ash-installer",
+            "X-GitHub-Api-Version": _GITHUB_API_VERSION,
+        },
+    )
+    try:
+        with opener(request, timeout=_QUERY_TIMEOUT_SECONDS) as response:
+            geturl = getattr(response, "geturl", None)
+            if callable(geturl):
+                final_url = str(geturl())
+                final = urllib.parse.urlsplit(final_url)
+                expected = urllib.parse.urlsplit(release_url)
+                if (
+                    final.scheme != "https"
+                    or final.hostname != "api.github.com"
+                    or final.username is not None
+                    or final.password is not None
+                    or final.port not in {None, 443}
+                    or final.path != expected.path
+                    or final.query != expected.query
+                    or final.fragment
+                ):
+                    raise InstallError(
+                        f"Ash release {ref} metadata redirected to an unexpected endpoint."
+                    )
+            raw = response.read(_MAX_RELEASE_METADATA_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise InstallError(
+            f"Could not resolve Ash release {ref}: GitHub returned HTTP {exc.code}."
+        ) from exc
+    except (OSError, TimeoutError, urllib.error.URLError) as exc:
+        raise InstallError(f"Could not resolve Ash release {ref}: {exc}") from exc
+    if len(raw) > _MAX_RELEASE_METADATA_BYTES:
+        raise InstallError("GitHub release metadata exceeded 1 MiB.")
+
+    try:
+        payload = _strict_json_loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise InstallError("GitHub returned invalid Ash release metadata.") from exc
+    if not isinstance(payload, dict):
+        raise InstallError("GitHub returned invalid Ash release metadata.")
+    if payload.get("tag_name") != ref or payload.get("immutable") is not True:
+        raise InstallError(
+            f"Ash release {ref} is missing, mutable, or does not match its tag."
+        )
+    assets = payload.get("assets")
+    if not isinstance(assets, list):
+        raise InstallError(f"Ash release {ref} does not contain release assets.")
+    wheels = [
+        asset
+        for asset in assets
+        if isinstance(asset, dict)
+        and asset.get("state") == "uploaded"
+        and isinstance(asset.get("name"), str)
+        and _RELEASE_WHEEL_PATTERN.fullmatch(asset["name"]) is not None
+    ]
+    if len(wheels) != 1:
+        raise InstallError(
+            f"Ash release {ref} must contain exactly one uploaded universal wheel."
+        )
+    wheel = wheels[0]
+    name = wheel["name"]
+    download_url = wheel.get("browser_download_url")
+    digest = wheel.get("digest")
+    size = wheel.get("size")
+    if (
+        not isinstance(download_url, str)
+        or not isinstance(digest, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 1
+        or size > _MAX_RELEASE_WHEEL_BYTES
+    ):
+        raise InstallError(f"Ash release {ref} has invalid wheel metadata.")
+    parsed = urllib.parse.urlsplit(download_url)
+    parts = parsed.path.split("/")
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "github.com"
+        or parsed.query
+        or parsed.fragment
+        or len(parts) != 7
+        or parts[1:5] != ["Suraj-H675", "Ash-Harness", "releases", "download"]
+        or urllib.parse.unquote(parts[5]) != ref
+        or urllib.parse.unquote(parts[6]) != name
+    ):
+        raise InstallError(f"Ash release {ref} has an untrusted wheel URL.")
+    return _ReleaseWheel(
+        name=name,
+        download_url=download_url,
+        sha256=digest.removeprefix("sha256:"),
+        size=size,
+    )
+
+
+@contextlib.contextmanager
+def _prepared_package_spec(
+    extras: Sequence[str],
+    *,
+    ref: str | None,
+    release_opener: Callable[..., Any] = urllib.request.urlopen,
+) -> Iterator[str]:
     suffix = f"[{','.join(extras)}]" if extras else ""
-    revision = f"@{ref}" if ref else ""
-    return f"{_PACKAGE_NAME}{suffix} @ git+{REPOSITORY_URL}{revision}"
+    if ref is None:
+        yield f"{_PACKAGE_NAME}{suffix} @ git+{REPOSITORY_URL}"
+        return
+
+    wheel = _release_wheel(ref, opener=release_opener)
+    request = urllib.request.Request(
+        wheel.download_url,
+        headers={"User-Agent": "ash-installer"},
+    )
+    with tempfile.TemporaryDirectory(prefix="ash-install-") as raw_directory:
+        directory = Path(raw_directory)
+        target = directory / wheel.name
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with release_opener(request, timeout=_QUERY_TIMEOUT_SECONDS) as response:
+                final_url = wheel.download_url
+                geturl = getattr(response, "geturl", None)
+                if callable(geturl):
+                    final_url = str(geturl())
+                final_parts = urllib.parse.urlsplit(final_url)
+                if (
+                    final_parts.scheme != "https"
+                    or final_parts.hostname is None
+                    or final_parts.username is not None
+                    or final_parts.password is not None
+                ):
+                    raise InstallError(
+                        f"Ash release {ref} wheel download redirected to an untrusted URL."
+                    )
+                final_host = final_parts.hostname
+                if final_host not in {
+                    "github.com",
+                    "release-assets.githubusercontent.com",
+                }:
+                    raise InstallError(
+                        f"Ash release {ref} wheel download redirected to an untrusted host."
+                    )
+                with target.open("xb") as handle:
+                    if os.name != "nt":
+                        os.chmod(target, 0o600)
+                    while True:
+                        chunk = response.read(_DOWNLOAD_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > wheel.size or total > _MAX_RELEASE_WHEEL_BYTES:
+                            raise InstallError(
+                                f"Ash release {ref} wheel exceeded its declared size."
+                            )
+                        digest.update(chunk)
+                        handle.write(chunk)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+        except urllib.error.HTTPError as exc:
+            raise InstallError(
+                f"Could not download Ash release {ref} wheel: HTTP {exc.code}."
+            ) from exc
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            raise InstallError(
+                f"Could not download Ash release {ref} wheel: {exc}"
+            ) from exc
+        if total != wheel.size:
+            raise InstallError(
+                f"Ash release {ref} wheel size did not match release metadata."
+            )
+        if digest.hexdigest() != wheel.sha256:
+            raise InstallError(
+                f"Ash release {ref} wheel SHA-256 did not match release metadata."
+            )
+        yield (
+            f"{_PACKAGE_NAME}{suffix} @ {target.resolve().as_uri()}"
+            f"#sha256={wheel.sha256}"
+        )
+
+
+def _verify_release_version(version: str, *, ref: str | None) -> None:
+    if ref is None:
+        return
+    expected = ref.removeprefix("ash-v")
+    actual = version.strip()
+    prefix = "ash "
+    if not actual.casefold().startswith(prefix) or actual[len(prefix) :].strip() != expected:
+        raise InstallError(
+            "Ash installation completed but the installed version "
+            f"{version!r} does not match release {ref}."
+        )
 
 
 def main(
@@ -1763,15 +1552,21 @@ def main(
     stdout: Any = None,
     stderr: Any = None,
     python_version: Sequence[int] = sys.version_info[:2],
+    host_platform: str = sys.platform,
 ) -> int:
     """Run the standalone installer CLI."""
 
     output = sys.stdout if stdout is None else stdout
     errors = sys.stderr if stderr is None else stderr
+    unsupported_platform = _platform_support_error(host_platform)
+    if unsupported_platform is not None:
+        print(f"Ash installation could not continue: {unsupported_platform}", file=errors)
+        return 1
     major, minor = int(python_version[0]), int(python_version[1])
-    if (major, minor) < (3, 11):
+    if (major, minor) < _BOOTSTRAP_MIN_PYTHON:
         print(
-            f"Ash requires Python 3.11 or newer; this interpreter is Python {major}.{minor}.",
+            "Ash's installer requires Python 3.10 or newer; "
+            f"this interpreter is Python {major}.{minor}.",
             file=errors,
         )
         return 1
@@ -1786,10 +1581,25 @@ def main(
         choices=SUPPORTED_EXTRAS,
         help="Install an optional capability pack; repeat for multiple packs.",
     )
-    parser.add_argument("--ref", help="Install a specific Git branch, tag, or commit.")
+    parser.add_argument(
+        "--ref",
+        help="Install a specific immutable Ash release tag (ash-v...).",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if not args.ref or _RELEASE_REF_PATTERN.fullmatch(args.ref) is None:
+        print(
+            "Ash installation could not continue: --ref must name a canonical "
+            "Ash release tag such as ash-v0.1.0. Use the verified release "
+            "bootstrap rather than installing a moving branch.",
+            file=errors,
+        )
+        return 1
     try:
-        result = installer(extras=args.extra, ref=args.ref)
+        result = installer(
+            extras=args.extra,
+            ref=args.ref,
+            runtime_python=_runtime_python_override(python_version),
+        )
     except InstallError as exc:
         print(f"Ash installation could not continue: {exc}", file=errors)
         if "Neither pipx nor uv" in str(exc):

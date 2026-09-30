@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -133,11 +134,12 @@ class TestAtomicWrite:
         assert victim.read_text(encoding="utf-8") == "MARKER=do-not-touch\n"
         assert "DUMMY_API_KEY" not in os.environ
 
-    def test_save_env_value_sets_os_environ(
+    def test_save_env_value_does_not_override_process_environment(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """save_env_value must set os.environ[key] immediately."""
+        """Persisted profile state must not become a process-env override."""
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("MY_API_KEY", "operator-secret")
         from ash.commands import config as cli_config
 
         cli_config.ASH_DIR = tmp_path / ".ash"
@@ -147,7 +149,8 @@ class TestAtomicWrite:
         cli_config.ensure_ash_dir()
         cli_config.save_env_value("MY_API_KEY", "secret123")
 
-        assert os.environ.get("MY_API_KEY") == "secret123"
+        assert cli_config.load_env()["MY_API_KEY"] == "secret123"
+        assert os.environ["MY_API_KEY"] == "operator-secret"
 
     def test_save_env_value_preserves_other_keys(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -272,6 +275,30 @@ class TestAtomicWrite:
         source.write_text('model_name = "changed"\n', encoding="utf-8")
         assert cli_config.is_config_migration_recorded(source) is False
 
+    def test_migration_record_lookup_uses_same_lexical_source_identity(
+        self, tmp_path: Path
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        real_root = tmp_path / "real-root"
+        source = real_root / "nested" / "legacy.toml"
+        source.parent.mkdir(parents=True)
+        source.write_text('model_name = "legacy"\n', encoding="utf-8")
+        alias = tmp_path / "alias-root"
+        try:
+            alias.symlink_to(real_root, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlinks are unavailable: {exc}")
+        aliased_source = alias / "nested" / "legacy.toml"
+
+        backup = cli_config.backup_config_file(aliased_source, label="legacy")
+        cli_config.record_config_migration(aliased_source, backup)
+
+        assert cli_config.is_config_migration_recorded(aliased_source) is True
+
     def test_migration_record_rejects_mismatched_or_corrupt_state(
         self, tmp_path: Path
     ) -> None:
@@ -341,7 +368,7 @@ class TestAtomicWrite:
             '{"version":1,"migrations":{"attacker":{}}}\n'
         )
 
-    def test_save_env_values_commits_related_settings_together(
+    def test_save_env_values_persists_without_mutating_process_environment(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from ash.commands import config as cli_config
@@ -349,6 +376,9 @@ class TestAtomicWrite:
         cli_config.ASH_DIR = tmp_path / ".ash"
         cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
         cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        monkeypatch.delenv("ASH_MODEL", raising=False)
+        monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "operator-key")
 
         cli_config.save_env_values(
             {
@@ -363,7 +393,95 @@ class TestAtomicWrite:
             "OPENAI_API_BASE": "https://example.test/v1",
             "ASH_MODEL": "openai/test-model",
         }
-        assert os.environ["ASH_MODEL"] == "openai/test-model"
+        assert "ASH_MODEL" not in os.environ
+        assert "OPENAI_API_BASE" not in os.environ
+        assert os.environ["OPENAI_API_KEY"] == "operator-key"
+
+    def test_save_env_values_serializes_concurrent_updates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        real_write = cli_config._write_anchored_private_file
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        call_lock = threading.Lock()
+        calls = 0
+
+        def paused_write(directory, name, payload, *, label):
+            nonlocal calls
+            with call_lock:
+                calls += 1
+                call = calls
+            if call == 1:
+                first_entered.set()
+                assert release_first.wait(5)
+            else:
+                second_entered.set()
+            return real_write(directory, name, payload, label=label)
+
+        monkeypatch.setattr(cli_config, "_write_anchored_private_file", paused_write)
+        errors: list[BaseException] = []
+
+        def save(key: str, value: str) -> None:
+            try:
+                cli_config.save_env_values({key: value})
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        first = threading.Thread(target=save, args=("FIRST_KEY", "one"))
+        second = threading.Thread(target=save, args=("SECOND_KEY", "two"))
+        first.start()
+        assert first_entered.wait(5)
+        second.start()
+        assert second_entered.wait(0.1) is False
+        release_first.set()
+        first.join(5)
+        second.join(5)
+
+        assert errors == []
+        assert first.is_alive() is False
+        assert second.is_alive() is False
+        assert cli_config.load_env() == {
+            "FIRST_KEY": "one",
+            "SECOND_KEY": "two",
+        }
+
+    def test_save_env_values_binds_one_profile_path_for_transaction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        work = tmp_path / ".ash" / "profiles" / "work"
+        personal = tmp_path / ".ash" / "profiles" / "personal"
+        work.mkdir(parents=True)
+        personal.mkdir(parents=True)
+        resolutions = iter(
+            (
+                (work, work / ".env", work / "ash.toml"),
+                (personal, personal / ".env", personal / "ash.toml"),
+            )
+        )
+        calls = 0
+
+        def alternating_paths():
+            nonlocal calls
+            calls += 1
+            return next(resolutions)
+
+        monkeypatch.setattr(cli_config, "_paths", alternating_paths)
+
+        cli_config.save_env_values({"BOUND_KEY": "work-value"})
+
+        assert calls == 1
+        assert work.joinpath(".env").read_text(encoding="utf-8") == (
+            "BOUND_KEY=work-value\n"
+        )
+        assert not personal.joinpath(".env").exists()
 
     def test_save_env_values_rejects_dotenv_injection(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -681,6 +799,79 @@ class TestTomlConfig:
         # No ensure_ash_dir, so ash.toml doesn't exist
         result = cli_config.load_config()
         assert result == {}
+
+    def test_mutate_config_serializes_concurrent_read_modify_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        cli_config.ensure_ash_dir()
+        cli_config.save_config({"existing": "keep"})
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        errors: list[BaseException] = []
+
+        def first_mutation(config: dict[str, object]) -> None:
+            config["alpha"] = 1
+            first_entered.set()
+            assert release_first.wait(5)
+
+        def second_mutation(config: dict[str, object]) -> None:
+            second_entered.set()
+            config["beta"] = 2
+
+        def run(mutator) -> None:
+            try:
+                cli_config.mutate_config(mutator)
+            except BaseException as exc:  # pragma: no cover - diagnostic assertion
+                errors.append(exc)
+
+        first = threading.Thread(target=run, args=(first_mutation,))
+        second = threading.Thread(target=run, args=(second_mutation,))
+        first.start()
+        assert first_entered.wait(5)
+        second.start()
+        assert not second_entered.wait(0.1)
+        release_first.set()
+        first.join(5)
+        second.join(5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert second_entered.is_set()
+        assert cli_config.load_config(strict=True) == {
+            "existing": "keep",
+            "alpha": 1,
+            "beta": 2,
+        }
+
+    def test_save_config_preserves_renamed_file_on_directory_sync_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands import config as cli_config
+
+        cli_config.ASH_DIR = tmp_path / ".ash"
+        cli_config.ENV_FILE = cli_config.ASH_DIR / ".env"
+        cli_config.CONFIG_FILE = cli_config.ASH_DIR / "ash.toml"
+        cli_config.ensure_ash_dir()
+        cli_config.save_config({"model": "old/model"})
+
+        def fail_sync(self) -> None:
+            del self
+            raise OSError("injected directory durability failure")
+
+        monkeypatch.setattr(cli_config.AnchoredDirectory, "sync", fail_sync)
+
+        with pytest.raises(OSError, match="durability failure"):
+            cli_config.save_config({"model": "new/model"})
+
+        assert cli_config.CONFIG_FILE.exists()
+        assert cli_config.load_config(strict=True) == {"model": "new/model"}
 
     def test_load_config_rejects_oversized_toml(self, tmp_path: Path) -> None:
         from ash.commands import config as cli_config
@@ -1507,6 +1698,65 @@ def test_cli_rejects_oversized_stdin_prompt_before_startup(
         f"stdin prompt exceeds {MAX_CLI_INPUT_BYTES} bytes"
         in capsys.readouterr().err
     )
+
+
+def test_cli_json_reports_oversized_stdin_prompt_as_structured_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.cli import MAX_CLI_INPUT_BYTES, main
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO("x" * (MAX_CLI_INPUT_BYTES + 1)))
+
+    assert main(["--prompt", "-", "--output-format", "json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["type"] == "error"
+    assert payload["error"]["exit_code"] == 2
+    assert f"stdin prompt exceeds {MAX_CLI_INPUT_BYTES} bytes" in payload["error"]["message"]
+
+
+def test_ci_reset_never_prompts_for_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.cli import main
+
+    class TtyInput(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(sys, "stdin", TtyInput("yes\n"))
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("--ci must never prompt")
+        ),
+    )
+
+    assert main(["--ci", "reset", "--cache"]) == 2
+    assert "Reset cancelled." in capsys.readouterr().err
+
+
+def test_ci_forces_setup_non_interactive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.cli import main
+    import ash.commands.setup as setup_module
+
+    observed: list[bool] = []
+
+    def fake_setup(args) -> int:
+        observed.append(bool(args.non_interactive))
+        return 0
+
+    monkeypatch.setattr(setup_module, "cmd_setup", fake_setup)
+
+    assert main(["--ci", "setup", "model"]) == 0
+    assert observed == [True]
 
 
 def test_memory_hit_rendering_sanitizes_workspace_terminal_controls() -> None:

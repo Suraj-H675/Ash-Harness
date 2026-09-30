@@ -5,13 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import secrets
 import sqlite3
 import threading
 import time
 import uuid
-from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, cast
@@ -32,7 +30,7 @@ from ash.automation.schedules import first_fire_time, next_fire_time
 from ash.automation.delivery import normalize_webhook_settings
 from ash.core.events import EventContext, envelope_event
 from ash.core.redaction import redact_text
-from ash.safe_io import validate_unlinked_file_path
+from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
 
 
 MAX_JOB_NAME_BYTES = 256
@@ -40,6 +38,8 @@ MAX_PROMPT_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_ERROR_BYTES = 16 * 1024
 MAX_EVENT_BYTES = 128 * 1024
+AUTOMATION_EVENT_RETENTION_DAYS = 365
+MAX_AUTOMATION_JOBS_PER_WORKSPACE = 1000
 AUTOMATION_SCHEMA_VERSION = 3
 
 _V2_RUN_COLUMNS = {
@@ -79,24 +79,23 @@ class AutomationStore:
         clock: Callable[[], float] = time.time,
     ) -> None:
         try:
-            database = validate_unlinked_file_path(db_path, label="automation database")
-            database.parent.mkdir(parents=True, exist_ok=True)
-            database = validate_unlinked_file_path(
-                database, label="automation database"
+            self._database = PinnedSQLiteDatabase.prepare(
+                db_path,
+                label="automation database",
             )
-        except ValueError as exc:
+        except SQLitePathError as exc:
             raise AutomationError(str(exc)) from exc
-        self.db_path = str(database)
+        self.db_path = str(self._database.path)
         self._clock = clock
         self._lock = threading.RLock()
         self._closed = False
         try:
-            self._conn = sqlite3.connect(
-                self.db_path,
+            self._conn = self._database.connect(
+                label="automation database",
                 check_same_thread=False,
                 timeout=busy_timeout_ms / 1000,
             )
-        except sqlite3.Error as exc:
+        except (SQLitePathError, sqlite3.Error) as exc:
             self._closed = True
             raise AutomationError(
                 f"cannot open automation database {self.db_path}: {exc}"
@@ -112,8 +111,12 @@ class AutomationStore:
                     f"cannot initialize automation database {self.db_path}: {exc}"
                 ) from exc
             raise
-        if os.name != "nt":
-            self._restrict_file_permissions()
+        try:
+            self._database.restrict_permissions(label="automation database")
+        except SQLitePathError as exc:
+            self._conn.close()
+            self._closed = True
+            raise AutomationError(str(exc)) from exc
 
     def close(self) -> None:
         with self._lock:
@@ -301,16 +304,6 @@ class AutomationStore:
                 f"ALTER TABLE automation_jobs ADD COLUMN {name} {declaration}"
             )
 
-    def _restrict_file_permissions(self) -> None:
-        for path in (
-            Path(self.db_path),
-            Path(f"{self.db_path}-wal"),
-            Path(f"{self.db_path}-shm"),
-        ):
-            if path.exists():
-                with suppress(OSError):
-                    os.chmod(path, 0o600)
-
     def create_job(
         self,
         *,
@@ -353,6 +346,20 @@ class AutomationStore:
         now = self._clock()
         next_run = first_fire_time(schedule, now=_from_epoch(now)) if enabled else None
         with self._transaction():
+            job_count = int(
+                self._conn.execute(
+                    """
+                    SELECT COUNT(*) FROM automation_jobs
+                    WHERE workspace = ? AND deleted_at IS NULL
+                    """,
+                    (root,),
+                ).fetchone()[0]
+            )
+            if job_count >= MAX_AUTOMATION_JOBS_PER_WORKSPACE:
+                raise AutomationError(
+                    "automation job limit reached for workspace: maximum "
+                    f"{MAX_AUTOMATION_JOBS_PER_WORKSPACE}"
+                )
             try:
                 self._conn.execute(
                     """
@@ -1330,7 +1337,8 @@ class AutomationStore:
             raise ValueError("workspace_key must be a non-empty string")
         root = workspace_key
         with self._transaction():
-            cutoff = self._clock() - older_than_days * 86400
+            now = self._clock()
+            cutoff = now - older_than_days * 86400
             # Keep lifecycle events as an audit ledger after bulky run output expires.
             # The explicit unlink also supports databases created by pre-release builds
             # whose foreign key did not yet include ON DELETE SET NULL.
@@ -1367,6 +1375,21 @@ class AutomationStore:
                   )
                 """,
                 (root, cutoff),
+            )
+            event_cutoff = now - max(
+                older_than_days,
+                AUTOMATION_EVENT_RETENTION_DAYS,
+            ) * 86400
+            self._conn.execute(
+                """
+                DELETE FROM automation_events
+                WHERE run_id IS NULL
+                  AND created_at < ?
+                  AND job_id IN (
+                      SELECT job_id FROM automation_jobs WHERE workspace = ?
+                  )
+                """,
+                (event_cutoff, root),
             )
             return int(cursor.rowcount)
 

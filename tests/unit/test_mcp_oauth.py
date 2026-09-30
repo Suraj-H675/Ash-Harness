@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ import httpx
 import pytest
 
 import ash.safety.private_store as private_store
-from ash.mcp.client import MCPClient
+from ash.mcp.client import MCPClient, MCPProtocolError
 from ash.mcp.oauth import (
     MCPAuthorizationRequired,
     MCPOAuthError,
@@ -35,6 +36,9 @@ from ash.mcp.oauth import (
     protected_resource_metadata_urls,
 )
 from ash.mcp.server import MCPServerConfig
+from ash.mcp.runtime import MCPReadResourceTool, MCPTool
+from ash.core.secret_middleware import SecretRedactionMiddleware
+from ash.safety.guard import SafetyGuard
 
 
 @pytest.mark.asyncio
@@ -49,6 +53,66 @@ async def test_oauth_json_response_rejects_duplicate_fields() -> None:
 
     with pytest.raises(MCPOAuthError, match="returned invalid JSON"):
         await _bounded_json_response(response, "token endpoint")
+
+
+@pytest.mark.asyncio
+async def test_oauth_json_response_preserves_protocol_error_when_close_fails() -> None:
+    from ash.mcp.oauth import _bounded_json_response
+
+    class FailingResponse:
+        status_code = 500
+        headers: dict[str, str] = {}
+
+        async def aiter_bytes(self):
+            if False:
+                yield b""
+
+        async def aclose(self) -> None:
+            raise RuntimeError("response close failed")
+
+    with pytest.raises(MCPOAuthError, match="returned HTTP 500") as captured:
+        await _bounded_json_response(FailingResponse(), "token endpoint")  # type: ignore[arg-type]
+
+    assert any("OAuth response cleanup failed" in note for note in captured.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_oauth_callback_preserves_drain_error_when_writer_close_fails() -> None:
+    from ash.mcp.oauth import _handle_callback
+
+    class FailingWriter:
+        def write(self, _data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            raise RuntimeError("callback drain failed")
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            raise RuntimeError("callback writer close failed")
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"GET /callback?code=ok&state=expected HTTP/1.1\r\n\r\n")
+    reader.feed_eof()
+    future: asyncio.Future[tuple[str, str, str, str]] = (
+        asyncio.get_running_loop().create_future()
+    )
+
+    with pytest.raises(RuntimeError, match="callback drain failed") as captured:
+        await _handle_callback(
+            reader,
+            FailingWriter(),  # type: ignore[arg-type]
+            future,
+            expected_state="expected",
+        )
+
+    assert future.result()[:2] == ("ok", "expected")
+    assert any(
+        "OAuth callback writer cleanup failed" in note
+        for note in captured.value.__notes__
+    )
 
 
 @pytest.mark.asyncio
@@ -350,7 +414,8 @@ def test_oauth_store_cleans_staged_file_after_failed_save(
     with pytest.raises(MCPOAuthError, match="forced private-store write failure"):
         store.save(_bundle(resource))
 
-    assert list(store.directory.iterdir()) == []
+    remaining = [path.name for path in store.directory.iterdir()]
+    assert remaining == [f".{store.path.name}.lock"]
 
 
 def test_oauth_store_preserves_preexisting_temp_on_name_collision(
@@ -380,7 +445,12 @@ def test_secure_store_capability_requires_fstat(
 
 @pytest.mark.parametrize(
     ("attribute", "missing"),
-    (("_O_NOFOLLOW", 0), ("_O_DIRECTORY", 0), ("_FCHMOD", None)),
+    (
+        ("_O_NOFOLLOW", 0),
+        ("_O_DIRECTORY", 0),
+        ("_FCHMOD", None),
+        ("_FLOCK", None),
+    ),
 )
 def test_secure_store_capability_requires_captured_posix_primitives(
     monkeypatch: pytest.MonkeyPatch,
@@ -390,6 +460,49 @@ def test_secure_store_capability_requires_captured_posix_primitives(
     monkeypatch.setattr(private_store, attribute, missing)
 
     assert private_store.secure_private_store_available() is False
+
+
+def test_private_store_serializes_concurrent_record_updates(tmp_path: Path) -> None:
+    store = private_store.PrivateStore(tmp_path / "tokens", trusted_root=tmp_path)
+    name = "record.json"
+    store.write(name, b"base")
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+    errors: list[BaseException] = []
+
+    def update_first(current: bytes | None) -> bytes:
+        assert current == b"base"
+        first_entered.set()
+        assert release_first.wait(timeout=2)
+        return current + b"-one"
+
+    def update_second(current: bytes | None) -> bytes:
+        second_entered.set()
+        assert current is not None
+        return current + b"-two"
+
+    def run(updater) -> None:
+        try:
+            store.update(name, updater, max_bytes=1024)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=run, args=(update_first,))
+    second = threading.Thread(target=run, args=(update_second,))
+    first.start()
+    assert first_entered.wait(timeout=2)
+    second.start()
+    assert second_entered.wait(timeout=0.1) is False
+    release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert first.is_alive() is False
+    assert second.is_alive() is False
+    assert errors == []
+    assert second_entered.is_set()
+    assert store.read(name, max_bytes=1024) == b"base-one-two"
 
 
 def test_oauth_store_runtime_unsupported_is_reported_unavailable(
@@ -769,6 +882,63 @@ async def test_explicit_oauth_login_rejects_non_finite_timeout(timeout: float) -
             "https://mcp.example.test/rpc",
             timeout_seconds=timeout,
         )
+
+
+@pytest.mark.asyncio
+async def test_oauth_login_cleanup_attempts_http_close_after_listener_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+
+    class FakeSocket:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43123)
+
+    class FailingServer:
+        sockets = [FakeSocket()]
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            raise RuntimeError("callback listener close failed")
+
+    async def start_server(handler: Any, host: str, port: int) -> FailingServer:
+        del handler, host, port
+        return FailingServer()
+
+    class TrackingClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    client = TrackingClient()
+
+    async def fail_discovery(*args: Any, **kwargs: Any) -> OAuthDiscovery:
+        del args, kwargs
+        raise MCPOAuthError("OAuth discovery failed")
+
+    monkeypatch.setattr(asyncio, "start_server", start_server)
+    monkeypatch.setattr("ash.mcp.oauth.httpx.AsyncClient", lambda **kwargs: client)
+    monkeypatch.setattr("ash.mcp.oauth.discover_oauth", fail_discovery)
+
+    with pytest.raises(MCPOAuthError, match="OAuth discovery failed") as captured:
+        await authorize_mcp_server(
+            "remote",
+            resource,
+            store=MCPOAuthTokenStore("remote", tmp_path / "tokens"),
+            announce=lambda message: None,
+            timeout_seconds=1,
+        )
+
+    assert client.closed is True
+    assert any(
+        "OAuth callback listener cleanup failed" in note
+        for note in captured.value.__notes__
+    )
 
 
 @pytest.mark.asyncio
@@ -1693,6 +1863,98 @@ async def test_oauth_session_refreshes_rotates_and_persists(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_oauth_refresh_preserves_primary_failure_when_owned_client_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource, expired=True))
+
+    class FailingCloseClient:
+        async def aclose(self) -> None:
+            raise RuntimeError("OAuth HTTP client close failed")
+
+    client = FailingCloseClient()
+    monkeypatch.setattr(
+        "ash.mcp.oauth.httpx.AsyncClient",
+        lambda **kwargs: client,
+    )
+
+    async def fail_refresh(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        raise MCPOAuthError("refresh endpoint rejected request")
+
+    monkeypatch.setattr("ash.mcp.oauth._request_json", fail_refresh)
+    session = MCPOAuthSession("remote", resource, store=store)
+
+    with pytest.raises(MCPAuthorizationRequired, match="token refresh failed") as captured:
+        await session.authorization_header()
+
+    assert any(
+        "OAuth HTTP client cleanup failed" in note
+        for note in captured.value.__notes__
+    )
+
+
+@pytest.mark.asyncio
+async def test_oauth_refresh_settles_owned_client_close_before_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = "https://mcp.example.test/rpc"
+    store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
+    store.save(_bundle(resource, expired=True))
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class BlockingCloseClient:
+        async def aclose(self) -> None:
+            close_started.set()
+            await release_close.wait()
+            close_finished.set()
+
+    client = BlockingCloseClient()
+    monkeypatch.setattr(
+        "ash.mcp.oauth.httpx.AsyncClient",
+        lambda **kwargs: client,
+    )
+
+    async def successful_refresh(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        return {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "token_type": "Bearer",
+            "expires_in": 1200,
+        }
+
+    monkeypatch.setattr("ash.mcp.oauth._request_json", successful_refresh)
+    session = MCPOAuthSession("remote", resource, store=store)
+    task = asyncio.create_task(session.authorization_header())
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+
+    try:
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        assert close_finished.is_set() is False
+
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+        assert close_finished.is_set() is True
+    finally:
+        release_close.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_oauth_session_refuses_configured_issuer_change(tmp_path: Path) -> None:
     resource = "https://mcp.example.test/rpc"
     store = MCPOAuthTokenStore("remote", tmp_path / "tokens")
@@ -2001,6 +2263,250 @@ async def test_mcp_tool_call_401_is_not_reposted_after_oauth_refresh() -> None:
             await client.call_tool("write", {})
         assert tool_posts == 1
         assert oauth.calls == [False, False, False, False]
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_redacts_echoed_oauth_token_from_protocol_error() -> None:
+    token = "tiny-k"
+
+    class FakeOAuth:
+        http_client = None
+
+        async def authorization_header(
+            self,
+            *,
+            force_refresh: bool = False,
+            rejected_access_token: str = "",
+        ) -> str:
+            del force_refresh, rejected_access_token
+            return f"Bearer {token}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload["method"] == "server/discover":
+            return httpx.Response(400, text="legacy server")
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        assert request.headers["Authorization"] == f"Bearer {token}"
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "error": {
+                    "code": -32000,
+                    "message": f"server echoed credential {token}",
+                    "data": {"detail": f"credential was {token}"},
+                },
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+            auth="oauth",
+        ),
+        http_client=http,
+        oauth_session=FakeOAuth(),  # type: ignore[arg-type]
+    )
+
+    await client.connect()
+    try:
+        with pytest.raises(MCPProtocolError) as exc_info:
+            await client.call_tool("read", {})
+        assert token not in str(exc_info.value)
+        assert token not in repr(exc_info.value.data)
+        assert "[REDACTED]" in str(exc_info.value)
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_redacts_echoed_oauth_token_from_success_output(
+    tmp_path: Path,
+) -> None:
+    token = "tiny-k"
+
+    class FakeOAuth:
+        http_client = None
+
+        async def authorization_header(
+            self,
+            *,
+            force_refresh: bool = False,
+            rejected_access_token: str = "",
+        ) -> str:
+            del force_refresh, rejected_access_token
+            return f"Bearer {token}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload["method"] == "server/discover":
+            return httpx.Response(400, text="legacy server")
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"tools": {}},
+                    },
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        assert request.headers["Authorization"] == f"Bearer {token}"
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {
+                    "content": [
+                        {"type": "text", "text": f"remote output {token}"}
+                    ]
+                },
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+            auth="oauth",
+        ),
+        http_client=http,
+        oauth_session=FakeOAuth(),  # type: ignore[arg-type]
+    )
+
+    await client.connect()
+    try:
+        tool = MCPTool(
+            SafetyGuard(tmp_path),
+            client=client,
+            server_name="remote",
+            definition={"name": "read", "inputSchema": {"type": "object"}},
+        )
+        result = await tool.run()
+        await SecretRedactionMiddleware().after_tool("mcp__remote__read", {}, result)
+
+        assert result.success is True
+        assert token not in result.output
+        assert "[REDACTED]" in result.output
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_resource_tool_redacts_echoed_oauth_token(
+    tmp_path: Path,
+) -> None:
+    token = "tiny-k"
+
+    class FakeOAuth:
+        http_client = None
+
+        async def authorization_header(
+            self,
+            *,
+            force_refresh: bool = False,
+            rejected_access_token: str = "",
+        ) -> str:
+            del force_refresh, rejected_access_token
+            return f"Bearer {token}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if payload["method"] == "server/discover":
+            return httpx.Response(400, text="legacy server")
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {"resources": {}},
+                    },
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        assert request.headers["Authorization"] == f"Bearer {token}"
+        assert payload["method"] == "resources/read"
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "result": {
+                    "contents": [
+                        {
+                            "uri": "file:///remote.txt",
+                            "text": f"remote resource {token}",
+                        }
+                    ]
+                },
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+            auth="oauth",
+        ),
+        http_client=http,
+        oauth_session=FakeOAuth(),  # type: ignore[arg-type]
+    )
+
+    class Runtime:
+        clients = {"remote": client}
+
+    await client.connect()
+    try:
+        tool = MCPReadResourceTool(SafetyGuard(tmp_path), Runtime())  # type: ignore[arg-type]
+        result = await tool.run(server="remote", uri="file:///remote.txt")
+
+        assert result.success is True
+        assert token not in result.output
+        assert "[REDACTED]" in result.output
     finally:
         await client.disconnect()
         await http.aclose()

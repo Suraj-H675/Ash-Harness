@@ -1,4 +1,4 @@
-"""Cross-platform smoke checks for an installed minimal Ash wheel."""
+"""Smoke checks for an installed minimal Ash artifact on supported hosts."""
 
 from __future__ import annotations
 
@@ -24,7 +24,9 @@ from packaging.requirements import Requirement
 OPTIONAL_DISTRIBUTIONS = {
     "fastapi",
     "numpy",
+    "onnxruntime",
     "playwright",
+    "tokenizers",
     "uvicorn",
     "websockets",
 }
@@ -71,8 +73,14 @@ def assert_distribution_metadata() -> None:
         )
     assert any('extra == "server"' in marker for marker in marked["fastapi"])
     assert any('extra == "server"' in marker for marker in marked["uvicorn"])
-    assert any('extra == "vector"' in marker for marker in marked["chromadb"])
-    assert any('extra == "vector"' in marker for marker in marked["onnxruntime"])
+    assert any(
+        'extra == "local-embeddings"' in marker
+        for marker in marked["onnxruntime"]
+    )
+    assert any(
+        'extra == "local-embeddings"' in marker
+        for marker in marked["tokenizers"]
+    )
     assert any('extra == "browser"' in marker for marker in marked["playwright"])
 
     packaged = {str(path).replace("\\", "/") for path in installed.files or ()}
@@ -93,6 +101,12 @@ def assert_distribution_metadata() -> None:
         "ash/sandbox/Dockerfile",
         "ash/tools/lsp.py",
     } <= packaged
+    assert {
+        "ash/memory/fts5.py",
+        "ash/memory/markdown_store.py",
+        "ash/memory/vector.py",
+        "ash/plugins/anchored_fs.py",
+    }.isdisjoint(packaged)
     assert (installed.read_text("top_level.txt") or "").splitlines() == ["ash"]
     assert not any(path.startswith("project/") for path in packaged)
     assert not any(path.startswith("tests/") for path in packaged)

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard
-from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from ash.tools.base import BaseTool, ToolExecutionContract, ToolResult, count_output_tokens
 
 
 class SymbolQueryArgs(BaseModel):
@@ -25,6 +25,7 @@ class SymbolQueryArgs(BaseModel):
 
 class FindSymbolTool(BaseTool):
     name = "find_symbol"
+    execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
         "Find exact class, type, function, and method definitions using the "
         "workspace Tree-sitter index."
@@ -75,6 +76,7 @@ class FindSymbolTool(BaseTool):
 
 class FindReferencesTool(BaseTool):
     name = "find_references"
+    execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
         "Find structural identifier uses while excluding declarations, comments, "
         "and string literals."

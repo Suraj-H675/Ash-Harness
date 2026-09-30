@@ -14,6 +14,8 @@ import ash.cli as ash_cli
 import ash.commands.lsp as cli_lsp
 import ash.lsp.manager as manager_module
 from ash.lsp.client import (
+    DocumentDiagnosticReport,
+    DocumentSyncResult,
     MAX_LSP_DOCUMENT_BYTES,
     LSPClient,
     LSPError,
@@ -107,6 +109,14 @@ def test_config_rejects_duplicate_keys_and_traversing_markers(
         load_lsp_server_configs(tmp_path, include_project=True, detect_builtins=False)
 
     config_path.write_text(
+        '{"servers":{"custom":{"command":["server"],"extensions":{".x":"x"},'
+        '"settings":{"threshold":NaN}}}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="invalid JSON constant: NaN"):
+        load_lsp_server_configs(tmp_path, include_project=True, detect_builtins=False)
+
+    config_path.write_text(
         json.dumps(
             {
                 "servers": {
@@ -167,13 +177,13 @@ def test_project_lsp_config_rejects_symlinked_parent(tmp_path: Path) -> None:
         )
 
 
-def test_workspace_server_detection_requires_trust_and_executable_bit(
+def test_builtin_server_detection_never_implicitly_uses_workspace_binary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     executable = tmp_path / "node_modules" / ".bin" / "basedpyright-langserver"
     executable.parent.mkdir(parents=True)
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
-    executable.chmod(0o644)
+    executable.chmod(0o755)
     monkeypatch.setattr(
         "ash.lsp.config.resolve_host_executable",
         lambda *args, **kwargs: None,
@@ -182,9 +192,42 @@ def test_workspace_server_detection_requires_trust_and_executable_bit(
     assert load_lsp_server_configs(tmp_path, include_project=False) == {}
     assert load_lsp_server_configs(tmp_path, include_project=True) == {}
 
+
+def test_explicit_project_lsp_config_can_use_workspace_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "node_modules" / ".bin" / "basedpyright-langserver"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o755)
-    configs = load_lsp_server_configs(tmp_path, include_project=True)
-    assert configs["basedpyright"].command[0] == str(executable.resolve())
+    config_dir = tmp_path / ".ash"
+    config_dir.mkdir()
+    (config_dir / "lsp.json").write_text(
+        json.dumps(
+            {
+                "servers": {
+                    "project-basedpyright": {
+                        "command": ["basedpyright-langserver", "--stdio"],
+                        "extensions": {".py": "python"},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "ash.lsp.config.resolve_host_executable",
+        lambda *args, **kwargs: None,
+    )
+
+    configs = load_lsp_server_configs(
+        tmp_path,
+        include_project=True,
+        detect_builtins=False,
+    )
+
+    assert configs["project-basedpyright"].command[0] == str(executable.resolve())
+    assert configs["project-basedpyright"].source.endswith(".ash/lsp.json")
 
 
 def test_disabling_basedpyright_preserves_detected_pyright_fallback(
@@ -330,7 +373,10 @@ async def test_lsp_client_refuses_root_replaced_before_start(
     create = AsyncMock(side_effect=AssertionError("LSP server must not launch"))
     monkeypatch.setattr("ash.lsp.client.asyncio.create_subprocess_exec", create)
 
-    with pytest.raises(LSPError, match="working directory identity changed"):
+    with pytest.raises(
+        LSPError,
+        match="(?:working directory|project root) identity changed",
+    ):
         await client.start()
 
     create.assert_not_awaited()
@@ -1047,6 +1093,81 @@ async def test_push_only_diagnostics_remain_cached_when_document_is_unchanged(
 
 
 @pytest.mark.asyncio
+async def test_diagnostic_result_ids_are_bounded_without_full_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(manager_module, "MAX_DIAGNOSTIC_CACHE_FILES", 3)
+    manager = LanguageServerManager(tmp_path, {})
+
+    class FakeConfig:
+        name = "fake"
+
+    class UnchangedClient:
+        config = FakeConfig()
+        supports_pull_diagnostics = True
+        supports_push_diagnostics = False
+        healthy = True
+
+        async def sync_document(
+            self, path: Path, language_id: str
+        ) -> DocumentSyncResult:
+            del language_id
+            return DocumentSyncResult(path.as_uri(), False)
+
+        async def pull_document_diagnostics(
+            self,
+            uri: str,
+            previous_result_id: str | None = None,
+        ) -> DocumentDiagnosticReport:
+            del previous_result_id
+            return DocumentDiagnosticReport(
+                "unchanged",
+                [],
+                "result-" + uri.rsplit("/", 1)[-1],
+            )
+
+    client = UnchangedClient()
+
+    async def clients_for(path: Path):
+        del path
+        return [(client, "python")]
+
+    manager.clients_for = clients_for  # type: ignore[method-assign]
+    for index in range(5):
+        source = tmp_path / f"file-{index}.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        assert await manager.diagnostics_for(source) == []
+
+    assert manager._diagnostics == {}
+    assert len(manager._diagnostic_result_ids) == 3
+    retained_uris = {uri for _, uri in manager._diagnostic_result_ids}
+    assert (tmp_path / "file-0.py").as_uri() not in retained_uris
+    assert (tmp_path / "file-1.py").as_uri() not in retained_uris
+
+
+@pytest.mark.asyncio
+async def test_pull_diagnostics_rejects_unchanged_without_previous_result(
+    tmp_path: Path,
+) -> None:
+    async def diagnostics(uri: str, items: list[dict[str, object]]) -> None:
+        del uri, items
+
+    client = LSPClient(
+        fake_config(tmp_path / "lsp.jsonl"),
+        tmp_path,
+        diagnostics_callback=diagnostics,
+    )
+    client.capabilities = {"diagnosticProvider": {}}
+    client.request = AsyncMock(
+        return_value={"kind": "unchanged", "resultId": "unexpected"}
+    )
+
+    with pytest.raises(LSPError, match="require a previous result id"):
+        await client.pull_document_diagnostics((tmp_path / "example.py").as_uri())
+
+
+@pytest.mark.asyncio
 async def test_failed_document_open_does_not_commit_sync_state(tmp_path: Path) -> None:
     source = tmp_path / "example.py"
     source.write_text("value = 1\n", encoding="utf-8")
@@ -1221,6 +1342,44 @@ async def test_manager_rechecks_closed_state_inside_lock(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_manager_bounds_owned_language_server_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = fake_config(tmp_path / "lsp.jsonl")
+    manager = LanguageServerManager(tmp_path, {"fake": config})
+    monkeypatch.setattr(manager_module, "MAX_LSP_CLIENT_ROOTS", 1)
+    first_root = tmp_path / "first-root"
+    second_root = tmp_path / "second-root"
+    manager._clients[(config.name, first_root)] = object()  # type: ignore[assignment]
+
+    with pytest.raises(LSPError, match="client root limit reached"):
+        await manager._get_client(config, second_root)
+
+    assert manager._starting == {}
+    manager._clients.clear()
+
+
+def test_manager_bounds_language_server_failure_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = fake_config(tmp_path / "lsp.jsonl")
+    manager = LanguageServerManager(tmp_path, {"fake": config})
+    monkeypatch.setattr(manager_module, "MAX_LSP_FAILURE_RECORDS", 2)
+    keys = [
+        (config.name, tmp_path / f"root-{index}")
+        for index in range(3)
+    ]
+
+    for index, key in enumerate(keys):
+        manager._record_failure(key, f"failure-{index}")
+
+    assert set(manager._failure_counts) == set(keys[1:])
+    assert set(manager._broken) == set(keys[1:])
+
+
+@pytest.mark.asyncio
 async def test_post_edit_diagnostics_are_advisory(tmp_path: Path) -> None:
     source = tmp_path / "example.py"
     source.write_text("problem\n", encoding="utf-8")
@@ -1338,3 +1497,44 @@ async def test_lsp_query_refuses_untrusted_workspace(
             operation="workspaceSymbol",
             query="example",
         )
+
+
+@pytest.mark.asyncio
+async def test_lsp_query_preserves_query_failure_when_manager_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ash.commands.lsp.is_workspace_trusted", lambda workspace: True)
+    monkeypatch.setattr(
+        "ash.commands.lsp.load_lsp_server_configs",
+        lambda workspace, include_project: {},
+    )
+
+    class FailingManager:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def query(self, *_args, **_kwargs):
+            raise RuntimeError("query failure")
+
+        async def aclose(self) -> None:
+            raise RuntimeError("manager close failure")
+
+    monkeypatch.setattr("ash.commands.lsp.LanguageServerManager", FailingManager)
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+    )
+
+    with pytest.raises(RuntimeError, match="query failure") as captured:
+        await inspect_lsp(
+            config,
+            action="query",
+            operation="workspaceSymbol",
+            query="example",
+        )
+
+    assert any(
+        "LSP manager cleanup failed" in note for note in captured.value.__notes__
+    )

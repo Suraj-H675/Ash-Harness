@@ -20,6 +20,7 @@ from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 MAX_FETCH_BYTES = 1_000_000
 DEFAULT_MAX_CHARS = 20_000
 MAX_REDIRECTS = 5
+DNS_TIMEOUT_SECONDS = 5.0
 TEXT_CONTENT_TYPES = (
     "text/",
     "application/json",
@@ -114,23 +115,32 @@ async def _fetch_public_text(
     transport: httpx.AsyncBaseTransport | None = None,
     allowed_domains: tuple[str, ...] = (),
 ) -> tuple[str, int, str, str]:
-    url = _validate_public_url(raw_url, allowed_domains=allowed_domains)
-    effective_transport = transport or _PinnedPublicTransport()
-    async with httpx.AsyncClient(
-        timeout=10.0,
-        transport=effective_transport,
-        headers={
-            "User-Agent": "ash-web-fetch/0.1",
-            "Accept": "text/*,application/json,application/xml;q=0.9,*/*;q=0.1",
-        },
-    ) as client:
-        for _ in range(MAX_REDIRECTS + 1):
+    url = _validate_public_url_syntax(raw_url, allowed_domains=allowed_domains)
+    headers = {
+        "User-Agent": "ash-web-fetch/0.1",
+        "Accept": "text/*,application/json,application/xml;q=0.9,*/*;q=0.1",
+    }
+    for _ in range(MAX_REDIRECTS + 1):
+        hostname = urlparse(url).hostname
+        assert hostname is not None
+        addresses = await _resolve_public_addresses_with_timeout(
+            hostname,
+            timeout_seconds=DNS_TIMEOUT_SECONDS,
+        )
+        effective_transport = transport or _PinnedPublicTransport(
+            pinned_addresses=addresses
+        )
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            transport=effective_transport,
+            headers=headers,
+        ) as client:
             async with client.stream("GET", url) as response:
                 if response.is_redirect:
                     location = response.headers.get("location")
                     if not location:
                         raise ValueError("Redirect response did not include Location")
-                    url = _validate_public_url(
+                    url = _validate_public_url_syntax(
                         urljoin(str(response.url), location),
                         allowed_domains=allowed_domains,
                     )
@@ -165,10 +175,25 @@ async def _fetch_public_text(
                     content_type,
                     data.decode(encoding, errors="replace"),
                 )
-        raise ValueError(f"Too many redirects while fetching {raw_url}")
+    raise ValueError(f"Too many redirects while fetching {raw_url}")
 
 
 def _validate_public_url(
+    raw_url: str,
+    *,
+    allowed_domains: tuple[str, ...] = (),
+) -> str:
+    validated = _validate_public_url_syntax(
+        raw_url,
+        allowed_domains=allowed_domains,
+    )
+    hostname = urlparse(validated).hostname
+    assert hostname is not None
+    _ensure_public_host(hostname)
+    return validated
+
+
+def _validate_public_url_syntax(
     raw_url: str,
     *,
     allowed_domains: tuple[str, ...] = (),
@@ -182,7 +207,6 @@ def _validate_public_url(
         raise ValueError("URLs cannot contain embedded credentials")
     if allowed_domains and not _host_allowed(parsed.hostname, allowed_domains):
         raise ValueError(f"Host {parsed.hostname!r} is not in allowed_web_domains")
-    _ensure_public_host(parsed.hostname)
     return raw_url
 
 

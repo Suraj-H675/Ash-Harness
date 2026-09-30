@@ -53,6 +53,56 @@ def test_agent_status_renderer_emits_json(tmp_path: Path) -> None:
     assert payload["agents"][0]["status"] == "completed"
 
 
+def test_agent_helpers_filter_shared_database_by_workspace(tmp_path: Path) -> None:
+    database = tmp_path / "agents.db"
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    first = SharedState(database, workspace=workspace_a)
+    second = SharedState(database, workspace=workspace_b)
+    try:
+        first.register_agent("worker", role="reviewer")
+        first.update_status("worker", "completed", "a done")
+        second.register_agent("worker", role="tester")
+        second.update_status("worker", "completed", "b done")
+        first.send_message(
+            "worker",
+            "lead",
+            "agent_report",
+            {"agent_id": "worker", "success": True, "summary": "report-a"},
+        )
+        second.send_message(
+            "worker",
+            "lead",
+            "agent_report",
+            {"agent_id": "worker", "success": True, "summary": "report-b"},
+        )
+        first.tasks.create_task(
+            "task-a",
+            task_id="task-a",
+            metadata={"workspace": str(workspace_a)},
+        )
+        second.tasks.create_task(
+            "task-b",
+            task_id="task-b",
+            metadata={"workspace": str(workspace_b)},
+        )
+    finally:
+        first.close()
+        second.close()
+
+    statuses = list_agent_statuses(database, workspace=workspace_a)
+    reports = list_agent_reports(database, workspace=workspace_a)
+    tasks = list_agent_tasks(database, workspace=workspace_a)
+
+    assert [(item["agent_id"], item["role"]) for item in statuses] == [
+        ("worker", "reviewer")
+    ]
+    assert [item["summary"] for item in reports] == ["report-a"]
+    assert [item["task_id"] for item in tasks] == ["task-a"]
+
+
 def test_agent_report_renderer_emits_json(tmp_path: Path) -> None:
     state = SharedState(tmp_path / "agents.db")
     state.send_message(
@@ -99,6 +149,21 @@ def test_agent_task_renderer_includes_durable_artifacts(tmp_path: Path) -> None:
     assert payload["tasks"][0]["used_tokens"] == 5
     assert payload["tasks"][0]["result"] == {"summary": "done"}
     assert payload["tasks"][0]["artifacts"][0]["kind"] == "git-commit"
+
+
+def test_agent_task_listing_enforces_aggregate_payload_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.commands.agents as agents_module
+
+    state = SharedState(tmp_path / "agents.db")
+    state.tasks.create_task("implement", task_id="task-1")
+    state.close()
+    monkeypatch.setattr(agents_module, "MAX_AGENT_TASK_LIST_PAYLOAD_BYTES", 1)
+
+    with pytest.raises(ValueError, match="8 MiB payload limit"):
+        list_agent_tasks(tmp_path / "agents.db")
 
 
 def test_agent_task_event_renderer_supports_cursor_and_type_filters(
@@ -175,15 +240,21 @@ def test_send_agent_message_renderer_emits_json(tmp_path: Path) -> None:
 def _seed_agent_approval(
     db_path: Path,
     *,
+    workspace: Path | None = None,
     task_id: str = "approval-task",
     agent_id: str = "approval-worker",
     max_attempts: int = 1,
 ) -> tuple[int, int, str]:
-    state = SharedState(db_path)
+    state = SharedState(db_path, workspace=workspace)
     state.tasks.create_task(
         "approval task",
         task_id=task_id,
         max_attempts=max_attempts,
+        metadata=(
+            {"workspace": str(workspace.resolve())}
+            if workspace is not None
+            else {}
+        ),
     )
     lease = state.tasks.claim_task(agent_id, task_id=task_id)
     assert lease is not None
@@ -357,7 +428,10 @@ def test_agents_cli_lists_and_resolves_background_approvals(
     capsys,
 ) -> None:
     db_dir = tmp_path / "db-approvals"
-    request_id, _, _ = _seed_agent_approval(db_dir / "agents.db")
+    request_id, _, _ = _seed_agent_approval(
+        db_dir / "agents.db",
+        workspace=tmp_path,
+    )
     monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
     monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
     monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
@@ -382,7 +456,7 @@ def test_agents_cli_lists_persisted_statuses(
     capsys,
 ) -> None:
     db_dir = tmp_path / "db"
-    state = SharedState(db_dir / "agents.db")
+    state = SharedState(db_dir / "agents.db", workspace=tmp_path)
     state.register_agent("agent-a", role="coder")
     state.update_status("agent-a", "working", "fix tests")
     state.close()
@@ -404,10 +478,10 @@ def test_agents_cli_honors_explicit_database_directory_for_read_and_write(
 ) -> None:
     default_dir = tmp_path / "default"
     alternate_dir = tmp_path / "alternate"
-    default_state = SharedState(default_dir / "agents.db")
+    default_state = SharedState(default_dir / "agents.db", workspace=tmp_path)
     default_state.register_agent("default-agent", role="default")
     default_state.close()
-    alternate_state = SharedState(alternate_dir / "agents.db")
+    alternate_state = SharedState(alternate_dir / "agents.db", workspace=tmp_path)
     alternate_state.register_agent("alternate-agent", role="alternate")
     alternate_state.close()
 
@@ -450,8 +524,8 @@ def test_agents_cli_honors_explicit_database_directory_for_read_and_write(
         "alternate-agent"
     )
 
-    default_state = SharedState(default_dir / "agents.db")
-    alternate_state = SharedState(alternate_dir / "agents.db")
+    default_state = SharedState(default_dir / "agents.db", workspace=tmp_path)
+    alternate_state = SharedState(alternate_dir / "agents.db", workspace=tmp_path)
     try:
         assert default_state.fetch_messages("alternate-agent") == []
         assert [
@@ -468,9 +542,17 @@ def test_agents_cli_lists_filtered_durable_tasks(
     capsys,
 ) -> None:
     db_dir = tmp_path / "db"
-    state = SharedState(db_dir / "agents.db")
-    state.tasks.create_task("queued", task_id="queued")
-    state.tasks.create_task("active", task_id="active")
+    state = SharedState(db_dir / "agents.db", workspace=tmp_path)
+    state.tasks.create_task(
+        "queued",
+        task_id="queued",
+        metadata={"workspace": str(tmp_path.resolve())},
+    )
+    state.tasks.create_task(
+        "active",
+        task_id="active",
+        metadata={"workspace": str(tmp_path.resolve())},
+    )
     lease = state.tasks.claim_task("worker", task_id="active")
     assert lease is not None
     state.tasks.start_task("active", lease.token)
@@ -494,8 +576,12 @@ def test_agents_cli_replays_filtered_task_events(
     capsys,
 ) -> None:
     db_dir = tmp_path / "db"
-    state = SharedState(db_dir / "agents.db")
-    state.tasks.create_task("trace", task_id="trace")
+    state = SharedState(db_dir / "agents.db", workspace=tmp_path)
+    state.tasks.create_task(
+        "trace",
+        task_id="trace",
+        metadata={"workspace": str(tmp_path.resolve())},
+    )
     state.close()
     monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
     monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
@@ -514,13 +600,20 @@ def test_agents_cli_filters_and_cancels_graph_with_confirmation(
     capsys,
 ) -> None:
     db_dir = tmp_path / "db"
-    state = SharedState(db_dir / "agents.db")
+    state = SharedState(db_dir / "agents.db", workspace=tmp_path)
     state.tasks.create_task(
         "graph task",
         task_id="graph-task",
-        metadata={"graph_id": "graph-cli"},
+        metadata={
+            "graph_id": "graph-cli",
+            "workspace": str(tmp_path.resolve()),
+        },
     )
-    state.tasks.create_task("unrelated", task_id="unrelated")
+    state.tasks.create_task(
+        "unrelated",
+        task_id="unrelated",
+        metadata={"workspace": str(tmp_path.resolve())},
+    )
     state.close()
     monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
     monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
@@ -556,7 +649,7 @@ def test_agents_cli_lists_reports_and_rejects_invalid_limit(
     capsys,
 ) -> None:
     db_dir = tmp_path / "db"
-    state = SharedState(db_dir / "agents.db")
+    state = SharedState(db_dir / "agents.db", workspace=tmp_path)
     state.send_message(
         "agent-a",
         "lead",
@@ -584,6 +677,9 @@ def test_agents_cli_lists_reports_and_rejects_invalid_limit(
     assert main(["agents", "reports", "--limit", "0"]) == 2
     assert "limit must be positive" in capsys.readouterr().err
 
+    assert main(["agents", "reports", "--limit", "10001"]) == 2
+    assert "between 1 and 10000" in capsys.readouterr().err
+
 
 def test_agents_cli_lists_messages_without_marking_delivered(
     tmp_path: Path,
@@ -591,7 +687,7 @@ def test_agents_cli_lists_messages_without_marking_delivered(
     capsys,
 ) -> None:
     db_dir = tmp_path / "db"
-    state = SharedState(db_dir / "agents.db")
+    state = SharedState(db_dir / "agents.db", workspace=tmp_path)
     state.register_agent("agent-a", role="coder")
     state.send_to_agent("lead", "agent-a", "steer", "continue")
     state.close()
@@ -603,7 +699,7 @@ def test_agents_cli_lists_messages_without_marking_delivered(
     payload = json.loads(capsys.readouterr().out)
 
     assert payload["messages"][0]["message_type"] == "steer"
-    followup_state = SharedState(db_dir / "agents.db")
+    followup_state = SharedState(db_dir / "agents.db", workspace=tmp_path)
     try:
         assert len(followup_state.fetch_messages("agent-a", undelivered_only=True)) == 1
     finally:
@@ -616,7 +712,7 @@ def test_agents_cli_messages_all_includes_delivered_and_rejects_invalid_limit(
     capsys,
 ) -> None:
     db_dir = tmp_path / "db"
-    state = SharedState(db_dir / "agents.db")
+    state = SharedState(db_dir / "agents.db", workspace=tmp_path)
     state.register_agent("agent-a", role="coder")
     delivered_id = state.send_to_agent("lead", "agent-a", "steer", "delivered")
     state.send_to_agent("lead", "agent-a", "steer", "pending")
@@ -640,6 +736,9 @@ def test_agents_cli_messages_all_includes_delivered_and_rejects_invalid_limit(
     assert main(["agents", "messages", "--limit", "0"]) == 2
     assert "limit must be positive" in capsys.readouterr().err
 
+    assert main(["agents", "messages", "--limit", "10001"]) == 2
+    assert "between 1 and 10000" in capsys.readouterr().err
+
 
 def test_agents_cli_sends_plain_steering_message(
     tmp_path: Path,
@@ -647,7 +746,7 @@ def test_agents_cli_sends_plain_steering_message(
     capsys,
 ) -> None:
     db_dir = tmp_path / "db"
-    state = SharedState(db_dir / "agents.db")
+    state = SharedState(db_dir / "agents.db", workspace=tmp_path)
     state.register_agent("agent-a", role="coder")
     state.close()
     monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
@@ -659,7 +758,7 @@ def test_agents_cli_sends_plain_steering_message(
 
     assert payload["message"]["recipient_id"] == "agent-a"
     assert payload["message"]["content"] == {"content": "continue"}
-    followup_state = SharedState(db_dir / "agents.db")
+    followup_state = SharedState(db_dir / "agents.db", workspace=tmp_path)
     try:
         messages = followup_state.fetch_messages("agent-a")
         assert messages[0].message_type == "steer"

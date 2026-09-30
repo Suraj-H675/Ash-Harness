@@ -65,7 +65,11 @@ def test_transcript_rejects_invalid_limits_and_finalized_updates() -> None:
 
 def test_viewport_formatters_neutralize_terminal_controls() -> None:
     transcript = Transcript()
-    transcript.append("tool", "tool\x1b[2Joutput", title="bad\x1b]0;title\x07")
+    transcript.append(
+        "tool",
+        "tool\x1b[2Joutput",
+        title="bad\x1b]0;title\x07\nforged\u2028line",
+    )
     transcript.append("assistant", "answer\x1b[3J")
 
     plain = format_transcript(transcript.snapshot())
@@ -73,3 +77,4 @@ def test_viewport_formatters_neutralize_terminal_controls() -> None:
 
     assert all("\x1b" not in fragment[1] for fragment in plain)
     assert all("\x1b" not in fragment[1] for fragment in rich)
+    assert all("bad\\x1b]0;title\\x07\\x0aforged\\u2028line" in "".join(fragment[1] for fragment in rendered) for rendered in (plain, rich))

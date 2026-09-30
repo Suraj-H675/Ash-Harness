@@ -135,12 +135,36 @@ for line in sys.stdin:
         )
 ```
 
+## Lifecycle crash recovery
+
+Managed user-plugin install, replacement, update, and uninstall operations are
+serialized by the plugin-root lifecycle lock and use a durable transaction
+journal. The journal binds the plugin root, any moved/staged/live tree inodes,
+the exact before/after managed provenance, and any managed activation-state
+transition. Plugin lifecycle persistence requires successful file and directory
+`fsync` checkpoints before advancing the durable decision.
+
+There is one durable decision point: before the journal is marked committed,
+restart recovery compensates back to the previous tree/provenance/activation
+state. After the committed journal is durable, recovery preserves the new
+state and only finishes transaction cleanup. Recovery runs before normal user
+plugin discovery and before a later lifecycle mutation. If a recorded inode,
+plugin root, activation-state parent, provenance value, or activation value can
+no longer be proven to match, recovery fails closed rather than deleting or
+overwriting an unknown entry.
+
+Ash-generated staging, backup, quarantine, and rollback-conflict directories
+are not plugin discovery roots. Unrecognized residue is preserved; recovery
+only removes entries whose persisted inode identity proves that Ash owns that
+transaction artifact.
+
 ## Isolation and policy
 
 Executable plugins are denied by default unless Bubblewrap or the configured
 local Docker sandbox is available. macOS `sandbox-exec` is not sufficient for
-plugins because it cannot provide the required host-read isolation; macOS and
-Windows therefore use Docker. The installed plugin root is mounted read-only,
+plugins because it cannot provide the required host-read isolation; macOS
+therefore uses Docker for executable plugins. WSL2 follows the Linux host path.
+Native Windows is not currently supported. The installed plugin root is mounted read-only,
 temporary storage is isolated, the network is disabled, and the environment
 contains only operational values such as `PATH`, `HOME`, locale, and Python I/O
 settings. Ash credentials and arbitrary host environment variables are not

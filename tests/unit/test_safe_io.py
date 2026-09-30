@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from ash.json_utils import strict_json_loads as core_strict_json_loads
 from ash.safe_io import (
     atomic_write_unlinked_bytes,
     create_anchored_regular_file,
@@ -23,6 +24,10 @@ from ash.safe_io import (
     validate_unlinked_path,
     verify_open_file_identity,
 )
+
+
+def test_safe_io_reexports_core_strict_json_parser() -> None:
+    assert strict_json_loads is core_strict_json_loads
 
 
 def test_strict_json_loads_accepts_standard_json() -> None:

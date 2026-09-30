@@ -53,12 +53,28 @@ _SENSITIVE_HEADER_VALUE = re.compile(
     (?:(?P<value_quote>[\"'])(?P<quoted_value>[^\"\r\n]*)(?P=value_quote)|(?P<unquoted_value>[^\r\n]*))
     """
 )
+_PRIVATE_KEY_BEGIN = re.compile(
+    r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----"
+)
+_PRIVATE_KEY_END = re.compile(
+    r"-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----"
+)
+_PRIVATE_KEY_BLOCK_OR_TAIL = re.compile(
+    r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?"
+    r"(?:-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----|\Z)",
+    re.DOTALL,
+)
+_PRIVATE_KEY_BEGIN_PREFIX = "-----BEGIN"
+_PRIVATE_KEY_STREAM_TAIL = 256
 _SECRET_PATTERNS = (
     _SECRET_VALUE_ASSIGNMENT,
     re.compile(r"\b(sk-(?:ant-|proj-)?[A-Za-z0-9_-]{12,})\b"),
     re.compile(r"\b(gsk_[A-Za-z0-9_-]{12,})\b"),
     re.compile(r"\b(xai-[A-Za-z0-9_-]{20,})\b"),
     re.compile(r"\b(csk[-_][A-Za-z0-9_-]{12,})\b"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
+    re.compile(r"\bsk_live_[A-Za-z0-9]{16,}\b"),
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
 )
 _SECRET_CANDIDATE_PATTERNS = (
@@ -163,8 +179,11 @@ class SecretFinding:
     line_number: int
 
 
-def redact_text(value: str) -> str:
-    redacted = _SENSITIVE_HEADER_VALUE.sub(_redact_sensitive_header, value)
+def _redact_text_patterns(value: str) -> str:
+    """Apply non-URL secret patterns without recursively scanning URLs."""
+
+    redacted = _PRIVATE_KEY_BLOCK_OR_TAIL.sub("[REDACTED]", value)
+    redacted = _SENSITIVE_HEADER_VALUE.sub(_redact_sensitive_header, redacted)
     redacted = _UNTERMINATED_SECRET_VALUE_ASSIGNMENT.sub(
         lambda match: _redact_unterminated_if_incomplete(match, value),
         redacted,
@@ -175,6 +194,21 @@ def redact_text(value: str) -> str:
     )
     for pattern in _SECRET_PATTERNS[1:]:
         redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def redact_text(value: str) -> str:
+    """Apply Ash's complete human-text redaction policy."""
+
+    return redact_urls_in_text(value)
+
+
+def redact_known_secrets(value: str, *secrets: str) -> str:
+    """Redact canonical patterns plus exact secret values known by the caller."""
+
+    redacted = redact_text(value)
+    for secret in sorted({secret for secret in secrets if secret}, key=len, reverse=True):
+        redacted = redacted.replace(secret, "[REDACTED]")
     return redacted
 
 
@@ -208,7 +242,7 @@ def _is_sensitive_url_field(name: str) -> bool:
 
 
 def _redact_malformed_url(value: str) -> str:
-    redacted = redact_text(value)
+    redacted = _redact_text_patterns(value)
     scheme_separator = redacted.find("://")
     if scheme_separator >= 0:
         authority_start = scheme_separator + 3
@@ -227,7 +261,7 @@ def _redact_malformed_url(value: str) -> str:
         replacement = (
             "[REDACTED]"
             if _is_sensitive_url_field(name) and field_value
-            else redact_text(field_value)
+            else _redact_text_patterns(field_value)
         )
         return f"{match.group('prefix')}{name}={replacement}"
 
@@ -244,17 +278,17 @@ def redact_url(value: str, *, _depth: int = 0) -> str:
     scheme = parsed.scheme.casefold()
     protocol_relative = not scheme and bool(parsed.netloc) and value.startswith("//")
     if scheme not in {"http", "https", "ws", "wss"} and not protocol_relative:
-        return redact_text(value)
+        return _redact_text_patterns(value)
 
     def redact_component(component: str) -> str:
         if not component or "=" not in component:
-            return redact_text(component)
+            return _redact_text_patterns(component)
         pairs: list[tuple[str, str]] = []
         for segment in re.split(r"[&;]", component):
             pairs.extend(parse_qsl(segment, keep_blank_values=True))
         redacted_pairs: list[tuple[str, str]] = []
         for name, field_value in pairs:
-            redacted_field_value = redact_text(field_value)
+            redacted_field_value = _redact_text_patterns(field_value)
             if not _is_sensitive_url_field(name):
                 candidate = field_value
                 for _ in range(_MAX_URL_DECODE_ROUNDS + 1):
@@ -297,7 +331,10 @@ def redact_url(value: str, *, _depth: int = 0) -> str:
     fragment = parsed.fragment
     if "?" in fragment:
         fragment_path, fragment_query = fragment.split("?", 1)
-        fragment = f"{redact_text(fragment_path)}?{redact_component(fragment_query)}"
+        fragment = (
+            f"{_redact_text_patterns(fragment_path)}?"
+            f"{redact_component(fragment_query)}"
+        )
     else:
         decoded_fragment = fragment
         exhausted_decode_budget = False
@@ -320,8 +357,8 @@ def redact_url(value: str, *, _depth: int = 0) -> str:
     return urlunparse(
         parsed._replace(
             netloc=netloc,
-            path=redact_text(parsed.path),
-            params=redact_text(parsed.params),
+            path=_redact_text_patterns(parsed.path),
+            params=_redact_text_patterns(parsed.params),
             query=redact_component(parsed.query),
             fragment=fragment,
         )
@@ -331,7 +368,7 @@ def redact_url(value: str, *, _depth: int = 0) -> str:
 def redact_urls_in_text(value: str, *, _depth: int = 0) -> str:
     """Redact secret-bearing absolute or protocol-relative URLs inside text."""
 
-    redacted = redact_text(value)
+    redacted = _redact_text_patterns(value)
     redacted = _URL_IN_TEXT.sub(
         lambda match: redact_url(match.group(0), _depth=_depth),
         redacted,
@@ -461,19 +498,40 @@ class StreamingRedactor:
         self.max_token_characters = max_token_characters
         self._buffer = ""
         self._withholding_long_token = False
+        self._withholding_private_key = False
 
     def feed(self, value: str) -> str:
         if not value:
             return ""
         self._buffer += value
+        emitted = ""
+
+        while True:
+            if self._withholding_private_key:
+                end = _PRIVATE_KEY_END.search(self._buffer)
+                if end is None:
+                    if len(self._buffer) > _PRIVATE_KEY_STREAM_TAIL:
+                        self._buffer = self._buffer[-_PRIVATE_KEY_STREAM_TAIL:]
+                    return emitted
+                self._buffer = self._buffer[end.end() :]
+                self._withholding_private_key = False
+                continue
+
+            begin = _PRIVATE_KEY_BEGIN.search(self._buffer)
+            if begin is None:
+                break
+            emitted += redact_text(self._buffer[: begin.start()]) + "[REDACTED]"
+            self._buffer = self._buffer[begin.end() :]
+            self._withholding_private_key = True
+
         if self._withholding_long_token:
             boundary = _last_whitespace_boundary(self._buffer)
             if boundary is None:
                 self._buffer = self._buffer[-1:]
-                return ""
+                return emitted
             self._withholding_long_token = False
             self._buffer = self._buffer[boundary:]
-            return ""
+            return emitted
 
         if (
             len(self._buffer) > self.max_token_characters
@@ -481,7 +539,7 @@ class StreamingRedactor:
         ):
             self._buffer = ""
             self._withholding_long_token = True
-            return LONG_TOKEN_WITHHELD_MARKER
+            return emitted + LONG_TOKEN_WITHHELD_MARKER
 
         incomplete_start = _incomplete_secret_assignment_start(self._buffer)
         header_start = _incomplete_sensitive_header_start(self._buffer)
@@ -491,16 +549,23 @@ class StreamingRedactor:
                 if incomplete_start is None
                 else min(incomplete_start, header_start)
             )
+        private_key_start = _incomplete_private_key_begin_start(self._buffer)
+        if private_key_start is not None:
+            incomplete_start = (
+                private_key_start
+                if incomplete_start is None
+                else min(incomplete_start, private_key_start)
+            )
         if incomplete_start is not None:
             if incomplete_start:
                 complete = self._buffer[:incomplete_start]
                 self._buffer = self._buffer[incomplete_start:]
-                return redact_text(complete)
+                return emitted + redact_text(complete)
             if len(self._buffer) > self.max_token_characters:
                 self._buffer = ""
                 self._withholding_long_token = True
-                return LONG_TOKEN_WITHHELD_MARKER
-            return ""
+                return emitted + LONG_TOKEN_WITHHELD_MARKER
+            return emitted
 
         boundary = _last_whitespace_boundary(self._buffer)
         if boundary is not None:
@@ -508,14 +573,18 @@ class StreamingRedactor:
         if boundary is not None:
             complete = self._buffer[:boundary]
             self._buffer = self._buffer[boundary:]
-            return redact_text(complete)
+            return emitted + redact_text(complete)
         if len(self._buffer) > self.max_token_characters:
             self._buffer = ""
             self._withholding_long_token = True
-            return LONG_TOKEN_WITHHELD_MARKER
-        return ""
+            return emitted + LONG_TOKEN_WITHHELD_MARKER
+        return emitted
 
     def finish(self) -> str:
+        if self._withholding_private_key:
+            self._buffer = ""
+            self._withholding_private_key = False
+            return ""
         if self._withholding_long_token:
             self._buffer = ""
             self._withholding_long_token = False
@@ -523,6 +592,17 @@ class StreamingRedactor:
         remaining = redact_text(self._buffer)
         self._buffer = ""
         return remaining
+
+
+def _incomplete_private_key_begin_start(value: str) -> int | None:
+    """Return a suffix start that might become a private-key BEGIN marker."""
+
+    marker_start = value.rfind(_PRIVATE_KEY_BEGIN_PREFIX)
+    if marker_start >= 0:
+        tail = value[marker_start:]
+        if "\n" not in tail and "\r" not in tail:
+            return marker_start
+    return None
 
 
 def _last_whitespace_boundary(value: str) -> int | None:

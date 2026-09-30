@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from ash.providers.base import ProviderABC, StreamChunk
@@ -84,6 +86,95 @@ async def test_failover_failure_diagnostics_are_request_scoped() -> None:
     chunks = [chunk async for chunk in provider.stream_chat([])]
     assert chunks[0].content == "backup"
     assert provider.failures == ["primary: new-first"]
+
+
+@pytest.mark.asyncio
+async def test_failover_redacts_child_failure_diagnostics() -> None:
+    secret = "short-secret"
+    primary = FakeProvider(
+        "primary",
+        error=RuntimeError(f"request failed API_KEY={secret}"),
+    )
+    backup = FakeProvider("backup", error=RuntimeError("also offline"))
+    provider = FailoverProvider([primary, backup])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _ = [chunk async for chunk in provider.stream_chat([])]
+
+    rendered = str(exc_info.value)
+    assert secret not in rendered
+    assert secret not in " ".join(provider.failures)
+    assert "API_KEY=[REDACTED]" in rendered
+
+
+@pytest.mark.asyncio
+async def test_failover_close_attempts_all_children_and_retries_only_failures() -> None:
+    class ClosingProvider(FakeProvider):
+        def __init__(self, name: str, *, fail_close: bool) -> None:
+            super().__init__(name)
+            self.fail_close = fail_close
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            if self.fail_close:
+                raise RuntimeError(f"{self.model_name} close failed")
+
+    primary = ClosingProvider("primary", fail_close=True)
+    backup = ClosingProvider("backup", fail_close=False)
+    provider = FailoverProvider([primary, backup])
+
+    with pytest.raises(RuntimeError, match="failed to close 1 failover provider"):
+        await provider.aclose()
+
+    assert primary.close_calls == 1
+    assert backup.close_calls == 1
+
+    with pytest.raises(RuntimeError, match="failed to close 1 failover provider"):
+        await provider.aclose()
+
+    assert primary.close_calls == 2
+    assert backup.close_calls == 1
+
+    primary.fail_close = False
+    await provider.aclose()
+
+    assert primary.close_calls == 3
+    assert backup.close_calls == 1
+
+    await provider.aclose()
+    assert primary.close_calls == 3
+    assert backup.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_failover_close_propagates_child_cancellation_after_other_cleanup() -> None:
+    class ClosingProvider(FakeProvider):
+        def __init__(self, name: str, *, cancel_close: bool) -> None:
+            super().__init__(name)
+            self.cancel_close = cancel_close
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            if self.cancel_close:
+                raise asyncio.CancelledError
+
+    primary = ClosingProvider("primary", cancel_close=True)
+    backup = ClosingProvider("backup", cancel_close=False)
+    provider = FailoverProvider([primary, backup])
+
+    with pytest.raises(asyncio.CancelledError):
+        await provider.aclose()
+
+    assert primary.close_calls == 1
+    assert backup.close_calls == 1
+
+    primary.cancel_close = False
+    await provider.aclose()
+
+    assert primary.close_calls == 2
+    assert backup.close_calls == 1
 
 
 @pytest.mark.asyncio

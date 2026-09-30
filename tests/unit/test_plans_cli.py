@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from ash.core.sprint import (
     ChecklistStatus,
     SprintContract,
     SprintExecution,
+    SprintState,
 )
 
 
@@ -36,6 +38,44 @@ def _save_plan(store: SessionStore, project: Path, goal: str) -> str:
     return execution.contract.contract_id
 
 
+def test_load_latest_active_sprint_ignores_terminal_history(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    base = datetime(2026, 9, 30, tzinfo=timezone.utc)
+
+    older_active = SprintExecution(
+        contract=SprintContract(goal="older active"),
+        state=SprintState.ACTIVE,
+        created_at=base,
+        started_at=base,
+    )
+    newest_nonterminal = SprintExecution(
+        contract=SprintContract(goal="newest planning"),
+        created_at=base + timedelta(seconds=1),
+    )
+    newer_terminal = SprintExecution(
+        contract=SprintContract(goal="newer complete"),
+        state=SprintState.COMPLETE,
+        created_at=base + timedelta(seconds=2),
+        started_at=base,
+        completed_at=base + timedelta(seconds=2),
+    )
+    for execution in (older_active, newest_nonterminal, newer_terminal):
+        store.save_sprint(session.session_id, execution)
+
+    loaded = store.load_latest_active_sprint(session.session_id)
+
+    assert loaded is not None
+    assert loaded.contract.contract_id == newest_nonterminal.contract.contract_id
+    assert loaded.state is SprintState.PLANNING
+
+    newest_nonterminal.abort("done")
+    older_active.complete()
+    store.save_sprint(session.session_id, newest_nonterminal)
+    store.save_sprint(session.session_id, older_active)
+    assert store.load_latest_active_sprint(session.session_id) is None
+
+
 def test_plan_summary_renderer_emits_json(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     sprint_id = _save_plan(store, tmp_path, "ship feature")
@@ -47,6 +87,13 @@ def test_plan_summary_renderer_emits_json(tmp_path: Path) -> None:
     assert payload["plans"][0]["goal"] == "ship feature"
     assert payload["plans"][0]["total_items"] == 2
     assert payload["plans"][0]["completed_items"] == 0
+
+
+def test_plan_list_limit_is_bounded(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+
+    with pytest.raises(ValueError, match="limit must be between 1 and 1000"):
+        list_plans(store, project_path=str(tmp_path), limit=1001)
 
 
 def test_plan_list_rejects_session_database_link_swap(tmp_path: Path) -> None:
@@ -150,7 +197,15 @@ def test_plans_cli_rejects_invalid_limit_and_item(
     sprint_id = _save_plan(store, tmp_path, "current")
 
     assert main(["--db-directory", str(db_dir), "plans", "list", "--limit", "0"]) == 2
-    assert "limit must be positive" in capsys.readouterr().err
+    assert "limit must be between 1 and 1000" in capsys.readouterr().err
+
+    assert (
+        main(
+            ["--db-directory", str(db_dir), "plans", "list", "--limit", "1001"]
+        )
+        == 2
+    )
+    assert "limit must be between 1 and 1000" in capsys.readouterr().err
 
     assert (
         main(

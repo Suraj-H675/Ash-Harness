@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ash.safe_io import descriptor_path
-from ash.safety.environment import resolve_host_executable
+from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.guard import SafetyGuard
 from ash.safety.path_scope import is_relative_to
 from ash.safety.scoped_io import open_scoped_directory
@@ -25,6 +26,7 @@ from ash.safety.scoped_io import open_scoped_directory
 ProcessStreamCallback = Callable[[str, str], None]
 INHERIT_PROCESS_GROUP_ENV = "ASH_INTERNAL_INHERIT_PROCESS_GROUP"
 WINDOWS_TASKKILL_TIMEOUT_SECONDS = 5.0
+OUTPUT_LIMIT_NATURAL_EXIT_GRACE_SECONDS = 0.05
 _KILLPG = getattr(os, "killpg", None)
 _SIGKILL = getattr(signal, "SIGKILL", None)
 _FCHDIR_EXEC = (
@@ -387,20 +389,43 @@ async def terminate_process_tree(
         if plan is not None
         else Path(workspace_root or Path.cwd()).resolve()
     )
+    owned_group = (
+        process.pid
+        if plan is not None and plan.spawn_options.get("start_new_session") is True
+        else None
+    )
     descendants = _descendant_pids(process.pid, workspace_root=workspace)
-    _signal_posix_processes(process.pid, descendants, signal.SIGTERM)
+    _signal_posix_processes(
+        process.pid,
+        descendants,
+        signal.SIGTERM,
+        owned_group=owned_group,
+    )
     await asyncio.gather(
         _wait_for_returncode(process, grace_seconds),
         _wait_for_pids(descendants, grace_seconds),
+        _wait_for_process_group(owned_group, grace_seconds),
     )
     survivors = [pid for pid in descendants if _pid_exists(pid)]
-    if process.returncode is None or survivors:
+    group_alive = _process_group_exists(owned_group)
+    if process.returncode is None or survivors or group_alive:
         if _SIGKILL is None:
             raise ProcessTreeUnavailable("POSIX hard-kill signal is unavailable")
-        _signal_posix_processes(process.pid, survivors, _SIGKILL)
+        _signal_posix_processes(
+            process.pid,
+            survivors,
+            _SIGKILL,
+            owned_group=owned_group,
+        )
         await asyncio.gather(
             _wait_for_returncode(process, grace_seconds),
             _wait_for_pids(survivors, grace_seconds),
+            _wait_for_process_group(owned_group, grace_seconds),
+        )
+    remaining = [pid for pid in survivors if _pid_exists(pid)]
+    if process.returncode is None or remaining or _process_group_exists(owned_group):
+        raise ProcessTreeTerminationError(
+            "POSIX process-tree cleanup could not be confirmed"
         )
 
 
@@ -470,6 +495,7 @@ async def _terminate_windows_process_tree(
             "/F",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=build_scrubbed_environment(),
         )
         try:
             status = await asyncio.wait_for(
@@ -580,25 +606,49 @@ def terminate_process_tree_sync(
         )
         return
 
-    if process.poll() is not None:
-        return
     options = plan.spawn_options if plan is not None else process_group_options()
-    if not options.get("start_new_session") or not _signal_process_group(
+    owned_group = (
+        process.pid
+        if plan is not None and options.get("start_new_session") is True
+        else None
+    )
+    if owned_group is not None:
+        _signal_known_process_group(owned_group, signal.SIGTERM)
+    elif process.poll() is not None:
+        return
+    elif options.get("start_new_session") and _signal_process_group(
         process.pid, signal.SIGTERM
     ):
-        process.terminate()
-    try:
-        process.wait(timeout=timeout_seconds)
-        return
-    except subprocess.TimeoutExpired:
         pass
-    if (
-        not options.get("start_new_session")
-        or _SIGKILL is None
-        or not _signal_process_group(process.pid, _SIGKILL)
-    ):
-        process.kill()
-    process.wait(timeout=timeout_seconds)
+    else:
+        process.terminate()
+    if process.poll() is None:
+        try:
+            process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            pass
+    group_alive = _wait_for_process_group_sync(owned_group, timeout_seconds)
+    if process.poll() is None or group_alive:
+        if owned_group is not None:
+            if _SIGKILL is None:
+                raise ProcessTreeUnavailable("POSIX hard-kill signal is unavailable")
+            _signal_known_process_group(owned_group, _SIGKILL)
+        elif (
+            process.poll() is None
+            and options.get("start_new_session")
+            and _SIGKILL is not None
+            and _signal_process_group(process.pid, _SIGKILL)
+        ):
+            pass
+        elif process.poll() is None:
+            process.kill()
+        if process.poll() is None:
+            process.wait(timeout=timeout_seconds)
+        group_alive = _wait_for_process_group_sync(owned_group, timeout_seconds)
+    if process.poll() is None or group_alive:
+        raise ProcessTreeTerminationError(
+            "POSIX process-tree cleanup could not be confirmed"
+        )
 
 
 def _terminate_windows_process_tree_sync(
@@ -622,6 +672,7 @@ def _terminate_windows_process_tree_sync(
             stderr=subprocess.DEVNULL,
             check=False,
             timeout=timeout_seconds,
+            env=build_scrubbed_environment(),
         )
     except subprocess.TimeoutExpired:
         failure = "taskkill timed out"
@@ -679,7 +730,13 @@ def _signal_process_group(pid: int, signum: int) -> bool:
     return True
 
 
-def _signal_posix_processes(root: int, descendants: list[int], signum: int) -> None:
+def _signal_posix_processes(
+    root: int,
+    descendants: list[int],
+    signum: int,
+    *,
+    owned_group: int | None = None,
+) -> None:
     getpgrp = getattr(os, "getpgrp", None)
     getpgid = getattr(os, "getpgid", None)
     killpg = getattr(os, "killpg", None)
@@ -688,10 +745,14 @@ def _signal_posix_processes(root: int, descendants: list[int], signum: int) -> N
     own_group = getpgrp()
     groups: set[int] = set()
     individual: list[int] = []
+    if owned_group is not None:
+        _signal_known_process_group(owned_group, signum)
     for pid in [root, *descendants]:
         try:
             group = getpgid(pid)
         except (OSError, TypeError, ValueError):
+            continue
+        if group == owned_group:
             continue
         if group == own_group:
             individual.append(pid)
@@ -707,6 +768,55 @@ def _signal_posix_processes(root: int, descendants: list[int], signum: int) -> N
             os.kill(pid, signum)
         except ProcessLookupError:
             pass
+
+
+def _signal_known_process_group(group: int, signum: int) -> None:
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        raise ProcessTreeUnavailable("POSIX process-group signaling is unavailable")
+    try:
+        killpg(group, signum)
+    except ProcessLookupError:
+        pass
+
+
+def _process_group_exists(group: int | None) -> bool:
+    if group is None:
+        return False
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        raise ProcessTreeUnavailable("POSIX process-group signaling is unavailable")
+    try:
+        killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _wait_for_process_group(group: int | None, timeout: float) -> bool:
+    if group is None:
+        return True
+    deadline = asyncio.get_running_loop().time() + timeout
+    while _process_group_exists(group):
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
+
+
+def _wait_for_process_group_sync(group: int | None, timeout: float) -> bool:
+    """Return whether the group still exists after waiting up to ``timeout``."""
+
+    if group is None:
+        return False
+    deadline = time.monotonic() + timeout
+    while _process_group_exists(group):
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(0.01)
+    return False
 
 
 def _descendant_pids(
@@ -747,6 +857,7 @@ def _descendant_pids(
                     capture_output=True,
                     text=True,
                     timeout=2,
+                    env=build_scrubbed_environment(),
                 )
             except (OSError, subprocess.TimeoutExpired):
                 completed = None
@@ -811,18 +922,30 @@ async def communicate_process(
     async def write_stdin() -> None:
         if process.stdin is None:
             return
+        primary_error: BaseException | None = None
         try:
             if input_data is not None:
                 process.stdin.write(input_data)
                 await process.stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            process.stdin.close()
             try:
-                await process.stdin.wait_closed()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                process.stdin.close()
+                try:
+                    await process.stdin.wait_closed()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "subprocess stdin cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
 
     if max_output_bytes is not None and max_output_bytes < 1:
         raise ValueError("max_output_bytes must be positive")
@@ -836,6 +959,18 @@ async def communicate_process(
         if termination_started:
             return
         termination_started = True
+        if process.returncode is None:
+            deadline = (
+                asyncio.get_running_loop().time()
+                + OUTPUT_LIMIT_NATURAL_EXIT_GRACE_SECONDS
+            )
+            while (
+                process.returncode is None
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.005)
+        if process.returncode is not None and process_tree_plan is None:
+            return
         try:
             await terminate_process_tree(process, plan=process_tree_plan)
         except ProcessTreeError as exc:
@@ -891,11 +1026,40 @@ async def communicate_process(
     ]
     try:
         gathered = await asyncio.gather(*tasks)
-    except BaseException:
+    except BaseException as primary_error:
         for task in tasks:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        async def settle_children() -> None:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        cleanup = asyncio.create_task(
+            settle_children(),
+            name="ash-subprocess-pipe-cleanup",
+        )
+        interrupted = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                if cleanup.done():
+                    continue
+                interrupted = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    "subprocess pipe cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+                break
+        if interrupted and not isinstance(primary_error, asyncio.CancelledError):
+            cancellation = asyncio.CancelledError()
+            cancellation.add_note(
+                "subprocess communication failed before pipe cleanup was cancelled"
+            )
+            raise cancellation from primary_error
         raise
     stdout, stderr, _, _ = gathered
     if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):

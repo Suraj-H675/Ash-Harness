@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ash.sandbox import SandboxManager
+from ash.sandbox.docker import run_docker_cli_sync
+from ash.sandbox.process_utils import ProcessTreeError
 from ash.safety.environment import resolve_host_executable
 
 if TYPE_CHECKING:
@@ -21,6 +22,8 @@ def sandbox_status(config: AshConfig) -> dict[str, Any]:
         network=config.sandbox_network,
         backend_preference=config.sandbox_backend,
         docker_image=config.sandbox_docker_image,
+        docker_memory_mb=config.sandbox_docker_memory_mb,
+        docker_cpus=config.sandbox_docker_cpus,
     )
     return dict(manager.status())
 
@@ -61,16 +64,19 @@ def build_sandbox_image(
     dockerfile = Path(str(resource))
     if not dockerfile.is_file():
         raise RuntimeError("packaged sandbox Dockerfile is missing")
-    result = subprocess.run(
-        [
-            docker,
-            "build",
-            "--tag",
-            image,
-            "--file",
-            str(dockerfile),
-            str(dockerfile.parent),
-        ],
-        check=False,
-    )
+    try:
+        result = run_docker_cli_sync(
+            [
+                docker,
+                "build",
+                "--tag",
+                image,
+                "--file",
+                str(dockerfile),
+                str(dockerfile.parent),
+            ],
+            workspace_root=workspace,
+        )
+    except ProcessTreeError as exc:
+        raise RuntimeError(f"Docker build could not be managed safely: {exc}") from exc
     return result.returncode

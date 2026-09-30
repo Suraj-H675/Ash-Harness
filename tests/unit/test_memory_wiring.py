@@ -9,14 +9,6 @@ from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
 from ash.ui.headless import HeadlessUI
 
-from ash.context.compaction import Chunk
-from ash.memory import (
-    DeterministicEmbedding,
-    FTS5FallbackIndex,
-    InMemoryVectorIndex,
-    VectorSearchPipeline,
-)
-
 
 class MemoryTestProvider(ProviderABC):
     model_name = "memory-test"
@@ -26,24 +18,6 @@ class MemoryTestProvider(ProviderABC):
 
     def count_tokens(self, text: str) -> int:
         return len(text.split())
-
-
-@pytest.mark.asyncio
-async def test_fts5_only_pipeline_indexes_and_searches_lexically(tmp_path) -> None:
-    pipeline = VectorSearchPipeline(
-        adapter=DeterministicEmbedding(),
-        vector_index=InMemoryVectorIndex(),
-        lexical_index=FTS5FallbackIndex(db_path=tmp_path / "memory.db"),
-        vector_enabled=False,
-    )
-    chunks = [Chunk(file_path="a.py", start_line=1, end_line=1, content="uniquephrase")]
-    assert await pipeline.index_chunks(chunks, "a.py") == 1
-    hits, source = await pipeline.search("uniquephrase")
-    assert source == "lexical"
-    assert hits[0].file_path == "a.py"
-    pipeline.clear()
-    hits, _ = await pipeline.search("uniquephrase")
-    assert hits == []
 
 
 @pytest.mark.asyncio
@@ -59,9 +33,8 @@ async def test_project_memory_auto_index_is_bounded_and_respects_excludes(
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend="fts5",
-        chroma_persist_dir=tmp_path / "memory",
-        repo_map_exclude_patterns=["excluded.py"],
+        memory_backend="sqlite",
+                repo_map_exclude_patterns=["excluded.py"],
     )
     loop = AshLoop(
         SessionStore(config.db_directory / "sessions.db"),
@@ -70,19 +43,18 @@ async def test_project_memory_auto_index_is_bounded_and_respects_excludes(
         None,
         tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend="fts5",
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         indexed = await loop.index_project_memory(
             max_files=2,
             max_bytes_per_file=1_000,
         )
         assert indexed == 1
-        hits = await loop.semantic_search("beta")
+        hits = await loop.search_memory("beta")
         assert all(hit.file_path != "excluded.py" for hit in hits)
-        hits = await loop.semantic_search("alpha")
+        hits = await loop.search_memory("alpha")
         assert any(hit.file_path.endswith("included.py") for hit in hits)
     finally:
         await loop.aclose()
@@ -96,9 +68,8 @@ async def test_manual_memory_index_skips_oversized_file(tmp_path) -> None:
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend="fts5",
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -106,22 +77,19 @@ async def test_manual_memory_index_skips_oversized_file(tmp_path) -> None:
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend="fts5",
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         assert await loop.index_file_for_memory(path, max_bytes_per_file=8) == 0
-        assert await loop.semantic_search("x") == []
+        assert await loop.search_memory("x") == []
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("memory_backend", ["auto", "fts5"])
 async def test_manual_then_workspace_reindex_uses_one_document_identity(
     tmp_path,
-    memory_backend: str,
 ) -> None:
     path = tmp_path / "notes.py"
     path.write_text("legacy_manual_memory_marker\n", encoding="utf-8")
@@ -129,9 +97,8 @@ async def test_manual_then_workspace_reindex_uses_one_document_identity(
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -139,21 +106,20 @@ async def test_manual_then_workspace_reindex_uses_one_document_identity(
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         assert await loop.index_file_for_memory(path) == 1
-        assert loop._vector_pipeline is not None
-        assert loop._vector_pipeline.document_paths() == {"notes.py"}
+        assert loop._memory_pipeline is not None
+        assert loop._memory_pipeline.document_paths() == {"notes.py"}
 
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 1
-        assert loop._vector_pipeline.document_paths() == {"notes.py"}
+        assert loop._memory_pipeline.document_paths() == {"notes.py"}
 
         path.write_text("fresh_project_memory_marker\n", encoding="utf-8")
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 1
-        exported = str(loop._vector_pipeline.export(limit=20))
+        exported = str(loop._memory_pipeline.export(limit=20))
         assert "fresh_project_memory_marker" in exported
         assert "legacy_manual_memory_marker" not in exported
     finally:
@@ -175,9 +141,8 @@ async def test_large_repository_memory_indexing_is_bounded(tmp_path) -> None:
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend="fts5",
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -185,10 +150,9 @@ async def test_large_repository_memory_indexing_is_bounded(tmp_path) -> None:
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend="fts5",
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         indexed = await loop.index_project_memory(
             max_files=100,
@@ -196,21 +160,19 @@ async def test_large_repository_memory_indexing_is_bounded(tmp_path) -> None:
         )
         assert indexed == 100
 
-        hits = await loop.semantic_search("function_100")
+        hits = await loop.search_memory("function_100")
         assert hits
         assert all(hit.file_path.endswith("module-100.py") for hit in hits)
 
-        hits = await loop.semantic_search("function_99")
+        hits = await loop.search_memory("function_99")
         assert not any(hit.file_path.endswith("module-99.py") for hit in hits)
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("memory_backend", ["auto", "fts5"])
-async def test_lower_workspace_index_limit_preserves_other_eligible_documents(
+async def test_lower_workspace_index_limit_prunes_unselected_documents(
     tmp_path,
-    memory_backend: str,
 ) -> None:
     (tmp_path / "a.py").write_text("alpha_limit_marker\n", encoding="utf-8")
     (tmp_path / "b.py").write_text("beta_limit_marker\n", encoding="utf-8")
@@ -218,9 +180,8 @@ async def test_lower_workspace_index_limit_preserves_other_eligible_documents(
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -228,26 +189,26 @@ async def test_lower_workspace_index_limit_preserves_other_eligible_documents(
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         assert await loop.index_project_memory(max_files=2, max_bytes_per_file=4096) == 2
-        assert await loop.semantic_search("beta_limit_marker")
+        assert await loop.search_memory("beta_limit_marker")
 
+        (tmp_path / "b.py").write_text("stale_beta_limit_marker\n", encoding="utf-8")
         assert await loop.index_project_memory(max_files=1, max_bytes_per_file=4096) == 1
-        hits = await loop.semantic_search("beta_limit_marker")
-        assert any(hit.file_path == "b.py" for hit in hits)
+        assert await loop.search_memory("beta_limit_marker") == []
+        assert await loop.search_memory("stale_beta_limit_marker") == []
+        assert loop._memory_pipeline is not None
+        assert loop._memory_pipeline.document_paths() == {"a.py"}
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("memory_backend", ["auto", "fts5"])
 async def test_workspace_reindex_preserves_document_on_transient_read_error(
     tmp_path,
-    memory_backend: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "stable.py"
@@ -256,9 +217,8 @@ async def test_workspace_reindex_preserves_document_on_transient_read_error(
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -266,29 +226,26 @@ async def test_workspace_reindex_preserves_document_on_transient_read_error(
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 1
-        assert await loop.semantic_search("transient_read_memory_marker")
+        assert await loop.search_memory("transient_read_memory_marker")
 
         def fail_read(_path, _max_bytes_per_file=128_000):
             raise OSError("transient read failure")
 
         monkeypatch.setattr(loop, "_chunk_file", fail_read)
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 0
-        assert await loop.semantic_search("transient_read_memory_marker")
+        assert await loop.search_memory("transient_read_memory_marker")
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("memory_backend", ["auto", "fts5"])
 async def test_truncated_workspace_scan_does_not_evict_unseen_documents(
     tmp_path,
-    memory_backend: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (tmp_path / "a.py").write_text("alpha_scan_marker\n", encoding="utf-8")
@@ -297,9 +254,8 @@ async def test_truncated_workspace_scan_does_not_evict_unseen_documents(
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -307,26 +263,23 @@ async def test_truncated_workspace_scan_does_not_evict_unseen_documents(
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 2
-        assert await loop.semantic_search("beta_scan_marker")
+        assert await loop.search_memory("beta_scan_marker")
 
         monkeypatch.setattr("ash.core.loop.MAX_MEMORY_SCAN_ENTRIES", 1)
         await loop.index_project_memory(max_files=10, max_bytes_per_file=4096)
-        assert await loop.semantic_search("beta_scan_marker")
+        assert await loop.search_memory("beta_scan_marker")
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("memory_backend", ["auto", "fts5"])
 async def test_incomplete_nested_scan_does_not_evict_unseen_documents(
     tmp_path,
-    memory_backend: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     package = tmp_path / "package"
@@ -337,9 +290,8 @@ async def test_incomplete_nested_scan_does_not_evict_unseen_documents(
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -347,13 +299,12 @@ async def test_incomplete_nested_scan_does_not_evict_unseen_documents(
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 1
-        assert await loop.semantic_search("nested_scan_memory_marker")
+        assert await loop.search_memory("nested_scan_memory_marker")
 
         real_iterdir = Path.iterdir
 
@@ -364,16 +315,14 @@ async def test_incomplete_nested_scan_does_not_evict_unseen_documents(
 
         monkeypatch.setattr(Path, "iterdir", fail_nested_iterdir)
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 0
-        assert await loop.semantic_search("nested_scan_memory_marker")
+        assert await loop.search_memory("nested_scan_memory_marker")
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("memory_backend", ["auto", "fts5"])
 async def test_empty_unselected_workspace_file_drops_stale_memory(
     tmp_path,
-    memory_backend: str,
 ) -> None:
     (tmp_path / "a.py").write_text("selected_empty_guard\n", encoding="utf-8")
     stale = tmp_path / "z.py"
@@ -382,9 +331,8 @@ async def test_empty_unselected_workspace_file_drops_stale_memory(
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -392,26 +340,24 @@ async def test_empty_unselected_workspace_file_drops_stale_memory(
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         assert await loop.index_project_memory(max_files=2, max_bytes_per_file=4096) == 2
-        assert await loop.semantic_search("unselected_empty_memory_marker")
+        assert await loop.search_memory("unselected_empty_memory_marker")
 
         stale.write_text("", encoding="utf-8")
         assert await loop.index_project_memory(max_files=1, max_bytes_per_file=4096) == 1
-        assert loop._vector_pipeline is not None
-        assert "z.py" not in loop._vector_pipeline.document_paths()
+        assert loop._memory_pipeline is not None
+        assert "z.py" not in loop._memory_pipeline.document_paths()
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("memory_backend", ["auto", "fts5"])
 async def test_workspace_reindex_forgets_documents_deleted_from_disk(
-    tmp_path, memory_backend: str
+    tmp_path
 ) -> None:
     stale = tmp_path / "stale.py"
     stale.write_text("deleted_workspace_memory_marker\n", encoding="utf-8")
@@ -419,9 +365,8 @@ async def test_workspace_reindex_forgets_documents_deleted_from_disk(
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -429,26 +374,23 @@ async def test_workspace_reindex_forgets_documents_deleted_from_disk(
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 1
-        assert await loop.semantic_search("deleted_workspace_memory_marker")
+        assert await loop.search_memory("deleted_workspace_memory_marker")
         stale.unlink()
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 0
-        assert await loop.semantic_search("deleted_workspace_memory_marker") == []
+        assert await loop.search_memory("deleted_workspace_memory_marker") == []
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("memory_backend", ["auto", "fts5"])
 @pytest.mark.parametrize("transition", ["oversized", "excluded", "empty"])
 async def test_workspace_reindex_forgets_documents_that_become_ineligible(
     tmp_path,
-    memory_backend: str,
     transition: str,
 ) -> None:
     stale = tmp_path / "stale.py"
@@ -457,9 +399,8 @@ async def test_workspace_reindex_forgets_documents_that_become_ineligible(
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -467,13 +408,12 @@ async def test_workspace_reindex_forgets_documents_that_become_ineligible(
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=64) == 1
-        assert await loop.semantic_search("ineligible_workspace_memory_marker")
+        assert await loop.search_memory("ineligible_workspace_memory_marker")
 
         if transition == "oversized":
             stale.write_text("x" * 256, encoding="utf-8")
@@ -484,16 +424,14 @@ async def test_workspace_reindex_forgets_documents_that_become_ineligible(
             stale.write_text("", encoding="utf-8")
 
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=64) == 0
-        assert await loop.semantic_search("ineligible_workspace_memory_marker") == []
+        assert await loop.search_memory("ineligible_workspace_memory_marker") == []
     finally:
         await loop.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("memory_backend", ["auto", "fts5"])
 async def test_workspace_reindex_forgets_document_hidden_by_symlinked_parent(
     tmp_path,
-    memory_backend: str,
 ) -> None:
     package = tmp_path / "package"
     package.mkdir()
@@ -503,9 +441,8 @@ async def test_workspace_reindex_forgets_document_hidden_by_symlinked_parent(
         model="openai/memory-test",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        memory_backend="sqlite",
+            )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
         provider=MemoryTestProvider(),
@@ -513,13 +450,12 @@ async def test_workspace_reindex_forgets_document_hidden_by_symlinked_parent(
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend=memory_backend,
-        chroma_persist_dir=tmp_path / "memory",
-    )
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+            )
     try:
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 1
-        assert await loop.semantic_search("symlinked_workspace_memory_marker")
+        assert await loop.search_memory("symlinked_workspace_memory_marker")
 
         hidden = tmp_path / ".package-saved"
         package.rename(hidden)
@@ -529,6 +465,109 @@ async def test_workspace_reindex_forgets_document_hidden_by_symlinked_parent(
             pytest.skip(f"symlink creation is unavailable: {exc}")
 
         assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 0
-        assert await loop.semantic_search("symlinked_workspace_memory_marker") == []
+        assert await loop.search_memory("symlinked_workspace_memory_marker") == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_workspace_reindex_contains_directory_symlink_race(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "package"
+    package.mkdir()
+    inside = package / "inside.py"
+    inside.write_text("inside_memory_marker\n", encoding="utf-8")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-memory"
+    outside.mkdir()
+    (outside / "outside.py").write_text("outside_memory_marker\n", encoding="utf-8")
+    config = AshConfig(
+        model="openai/memory-test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="sqlite",
+    )
+    loop = AshLoop(
+        session_store=SessionStore(config.db_directory / "sessions.db"),
+        provider=MemoryTestProvider(),
+        ui=HeadlessUI(output_format="text"),
+        safety_guard=SafetyGuard(project_root=tmp_path),
+        project_root=tmp_path,
+        config=config,
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+    )
+    saved = tmp_path / ".package-saved"
+    real_is_dir = Path.is_dir
+    swapped = False
+
+    def race_directory_check(path: Path) -> bool:
+        nonlocal swapped
+        result = real_is_dir(path)
+        if path == package and result and not swapped:
+            package.rename(saved)
+            package.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return result
+
+    try:
+        assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 1
+        assert await loop.search_memory("inside_memory_marker")
+
+        monkeypatch.setattr(Path, "is_dir", race_directory_check)
+        assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 0
+        assert swapped is True
+        assert await loop.search_memory("outside_memory_marker") == []
+        assert await loop.search_memory("inside_memory_marker")
+    finally:
+        await loop.aclose()
+        if package.is_symlink():
+            package.unlink()
+        if outside.exists():
+            for child in outside.iterdir():
+                child.unlink()
+            outside.rmdir()
+
+
+@pytest.mark.asyncio
+async def test_workspace_reindex_rejects_replaced_workspace_root(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    original = workspace / "original.py"
+    original.write_text("original_workspace_memory_marker\n", encoding="utf-8")
+    config = AshConfig(
+        model="openai/memory-test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="sqlite",
+    )
+    loop = AshLoop(
+        session_store=SessionStore(config.db_directory / "sessions.db"),
+        provider=MemoryTestProvider(),
+        ui=HeadlessUI(output_format="text"),
+        safety_guard=SafetyGuard(project_root=workspace),
+        project_root=workspace,
+        config=config,
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
+    )
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    replacement.mkdir()
+    (replacement / "replacement.py").write_text(
+        "replacement_workspace_memory_marker\n",
+        encoding="utf-8",
+    )
+    try:
+        assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 1
+        assert await loop.search_memory("original_workspace_memory_marker")
+
+        workspace.rename(saved)
+        replacement.rename(workspace)
+
+        assert await loop.index_project_memory(max_files=10, max_bytes_per_file=4096) == 0
+        assert await loop.search_memory("replacement_workspace_memory_marker") == []
+        assert await loop.search_memory("original_workspace_memory_marker") == []
     finally:
         await loop.aclose()

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -19,6 +20,7 @@ from ash.hooks.registry import (
     HookEvent,
     HookRegistry,
     LifecycleHook,
+    MAX_HOOKS_PER_EVENT,
     MAX_INJECTED_CONTEXT_CHARS,
     PostToolUseHook,
     PreToolUseHook,
@@ -28,6 +30,7 @@ from ash.safe_io import read_bounded_bytes
 from ash.safety.guard import SafetyGuard
 from ash.safety.path_scope import lexical_target_path, path_has_link_component
 from ash.sandbox.process_utils import (
+    ProcessOutputLimitExceeded,
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
@@ -39,6 +42,8 @@ from ash.sandbox.process_utils import (
 MAX_HOOK_CONFIG_BYTES = 1024 * 1024
 MAX_HOOK_PAYLOAD_BYTES = 1024 * 1024
 MAX_HOOK_OUTPUT_BYTES = 1024 * 1024
+MAX_HOOK_MATCHER_CHARS = 512
+MAX_HOOK_MATCHER_QUANTIFIERS = 4
 LIFECYCLE_EVENTS: tuple[HookEvent, ...] = (
     "session_end",
     "turn_start",
@@ -61,6 +66,7 @@ class HookConfigSource:
     environment: tuple[tuple[str, str], ...] = ()
     trusted_root: Path | None = None
     cwd_identity: tuple[int, int] | None = None
+    trusted_root_identity: tuple[int, int] | None = None
 
 
 def load_command_hooks(
@@ -70,9 +76,10 @@ def load_command_hooks(
     for item in paths:
         source = item if isinstance(item, HookConfigSource) else HookConfigSource(item)
         path = source.path
+        _ensure_trusted_root_identity(source)
         if not path.is_file():
             continue
-        if source.cwd is not None:
+        if source.cwd is not None and source.cwd_identity is None:
             metadata = source.cwd.stat()
             source = HookConfigSource(
                 path=source.path,
@@ -80,6 +87,7 @@ def load_command_hooks(
                 environment=source.environment,
                 trusted_root=source.trusted_root,
                 cwd_identity=(metadata.st_dev, metadata.st_ino),
+                trusted_root_identity=source.trusted_root_identity,
             )
         if source.trusted_root is not None:
             trusted_root = source.trusted_root.expanduser().resolve()
@@ -105,6 +113,7 @@ def load_command_hooks(
             if "exceeds" in str(exc):
                 raise ValueError(f"Hook config exceeds 1 MiB: {path}") from exc
             raise
+        _ensure_trusted_root_identity(source)
         payload = strict_json_loads(raw)
         if not isinstance(payload, dict):
             raise ValueError(f"Hook config must be an object: {path}")
@@ -181,10 +190,30 @@ def load_command_hooks(
     return registry
 
 
+def _ensure_trusted_root_identity(source: HookConfigSource) -> None:
+    expected = source.trusted_root_identity
+    root = source.trusted_root
+    if root is None or expected is None:
+        return
+    try:
+        metadata = os.stat(root, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"hook config source identity changed: {root}") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+    ) != expected:
+        raise ValueError(f"hook config source identity changed: {root}")
+
+
 def _entries(payload: dict[str, Any], key: str, path: Path) -> list[Any]:
     entries = payload.get(key, [])
     if not isinstance(entries, list):
         raise ValueError(f"Hook event {key!r} must be a list in {path}")
+    if len(entries) > MAX_HOOKS_PER_EVENT:
+        raise ValueError(
+            f"Hook event {key!r} exceeds {MAX_HOOKS_PER_EVENT} entries in {path}"
+        )
     return entries
 
 
@@ -206,7 +235,89 @@ def _parse(
     pattern = raw_pattern
     if matcher_required and not pattern:
         raise ValueError(f"Hook matcher cannot be empty in {path}")
+    _validate_safe_matcher(pattern, path)
     return re.compile(pattern), command
+
+
+def _validate_safe_matcher(pattern: str, path: Path) -> None:
+    """Reject regex constructs that can create unbounded backtracking."""
+
+    if len(pattern) > MAX_HOOK_MATCHER_CHARS:
+        raise ValueError(
+            f"Hook matcher exceeds {MAX_HOOK_MATCHER_CHARS} characters in {path}"
+        )
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in pattern):
+        raise ValueError(f"Hook matcher contains control characters in {path}")
+
+    quantifiers = 0
+    escaped = False
+    in_class = False
+    previous_significant = ""
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if escaped:
+            if not in_class and character in "123456789":
+                raise ValueError(f"Hook matcher backreferences are not allowed in {path}")
+            escaped = False
+            previous_significant = "atom"
+            index += 1
+            continue
+        if character == "\\":
+            escaped = True
+            index += 1
+            continue
+        if in_class:
+            if character == "]":
+                in_class = False
+                previous_significant = "atom"
+            index += 1
+            continue
+        if character == "[":
+            in_class = True
+            index += 1
+            continue
+        if pattern.startswith(("(?=", "(?!", "(?<=", "(?<!", "(?P=", "(?(", "(?>"), index):
+            raise ValueError(
+                f"Hook matcher advanced assertions/backreferences are not allowed in {path}"
+            )
+        if character == ")":
+            previous_significant = "group"
+            index += 1
+            continue
+        if character in "*+?":
+            if previous_significant == "group":
+                raise ValueError(f"Hook matcher quantified groups are not allowed in {path}")
+            quantifiers += 1
+            previous_significant = "quantifier"
+        elif character == "{":
+            closing = pattern.find("}", index + 1)
+            if closing >= 0:
+                body = pattern[index + 1 : closing]
+                if re.fullmatch(r"\d+(?:,\d*)?", body):
+                    if previous_significant == "group":
+                        raise ValueError(
+                            f"Hook matcher quantified groups are not allowed in {path}"
+                        )
+                    quantifiers += 1
+                    previous_significant = "quantifier"
+                    index = closing
+                else:
+                    previous_significant = "atom"
+            else:
+                previous_significant = "atom"
+        elif character not in "^$|()":
+            previous_significant = "atom"
+        index += 1
+
+    if escaped or in_class:
+        # Let re.compile() provide the detailed syntax diagnostic below.
+        return
+    if quantifiers > MAX_HOOK_MATCHER_QUANTIFIERS:
+        raise ValueError(
+            f"Hook matcher has too many quantifiers in {path}; maximum is "
+            f"{MAX_HOOK_MATCHER_QUANTIFIERS}"
+        )
 
 
 def validate_command_hooks_payload(payload: Any, path: Path) -> None:
@@ -280,6 +391,25 @@ async def _run(
             cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
         if cleanup_cancelled:
             cancellation.add_note("Process-tree cleanup was cancelled")
+        raise
+    except ProcessOutputLimitExceeded:
+        raise
+    except Exception as primary_error:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            primary_error.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cleanup_cancellation = asyncio.CancelledError()
+            cleanup_cancellation.add_note(
+                "hook subprocess failed before process-tree cleanup was cancelled"
+            )
+            if cleanup_error is not None:
+                cleanup_cancellation.add_note("Process-tree cleanup also failed")
+            raise cleanup_cancellation from primary_error
         raise
     if process.returncode != 0:
         raise RuntimeError(

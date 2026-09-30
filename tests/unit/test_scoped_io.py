@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import stat
@@ -13,12 +14,14 @@ from ash.safety.scoped_io import (
     ScopedFileChanged,
     ScopedIOError,
     atomic_write_scoped_text,
+    atomic_write_scoped_text_chunks,
     list_scoped_directory,
     open_scoped_directory,
     remove_scoped_file,
     read_scoped_bytes,
     restore_scoped_file,
     stat_scoped_path,
+    workspace_mutation_lock,
 )
 
 
@@ -109,6 +112,36 @@ def test_scoped_read_rejects_in_scope_symlink(tmp_path) -> None:
         read_scoped_bytes(link, SafetyGuard(tmp_path))
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptor")
+def test_scoped_read_rejects_workspace_root_swapped_after_validation(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    (workspace / "target.txt").write_text("safe", encoding="utf-8")
+    (replacement / "target.txt").write_text("replacement-secret", encoding="utf-8")
+    guard = SafetyGuard(workspace)
+    real_validate = guard.validate_mutation_path
+    calls = 0
+
+    def validate_then_swap(path):
+        nonlocal calls
+        calls += 1
+        validated = real_validate(path)
+        if calls == 2:
+            workspace.rename(saved)
+            replacement.rename(workspace)
+        return validated
+
+    guard.validate_mutation_path = validate_then_swap  # type: ignore[method-assign]
+
+    with pytest.raises(SafetyViolation, match="project root identity changed"):
+        read_scoped_bytes("target.txt", guard)
+
+    assert calls == 2
+
+
 def test_scoped_atomic_write_detects_in_place_change_before_replace(tmp_path) -> None:
     from ash.safety import scoped_io
 
@@ -167,6 +200,37 @@ def test_fallback_no_overwrite_is_atomic(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("fallback", [False, True])
+def test_streaming_atomic_write_cleans_up_on_iterator_failure(
+    tmp_path,
+    fallback: bool,
+) -> None:
+    target = tmp_path / "streamed.txt"
+    target.write_text("original", encoding="utf-8")
+    guard = SafetyGuard(tmp_path)
+
+    def chunks():
+        yield "first chunk"
+        raise RuntimeError("synthetic export failure")
+
+    mode = (
+        patch("ash.safety.scoped_io._supports_anchored_io", return_value=False)
+        if fallback
+        else nullcontext()
+    )
+    with mode:
+        with pytest.raises(RuntimeError, match="synthetic export failure"):
+            atomic_write_scoped_text_chunks(
+                target,
+                chunks(),
+                guard,
+                overwrite=True,
+            )
+
+    assert target.read_text(encoding="utf-8") == "original"
+    assert list(tmp_path.glob(".streamed.txt.*.tmp")) == []
+
+
+@pytest.mark.parametrize("fallback", [False, True])
 def test_scoped_restore_and_remove_check_state_and_mode(tmp_path, fallback: bool) -> None:
     target = tmp_path / "existing.txt"
     target.write_text("current", encoding="utf-8")
@@ -219,6 +283,115 @@ def test_scoped_restore_and_remove_check_state_and_mode(tmp_path, fallback: bool
 
     assert not target.exists()
     assert not created.exists()
+
+
+@pytest.mark.asyncio
+async def test_workspace_mutation_lock_is_reentrant_but_rejects_other_task(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def owner() -> None:
+        with workspace_mutation_lock():
+            with workspace_mutation_lock():
+                entered.set()
+                await release.wait()
+
+    async def contender() -> None:
+        await entered.wait()
+        with pytest.raises(ScopedIOError, match="another Ash workspace mutation"):
+            with workspace_mutation_lock():
+                pass
+        release.set()
+
+    await asyncio.gather(owner(), contender())
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_missing_restore_and_remove_preserve_new_file(
+    tmp_path,
+    fallback: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.safety import scoped_io
+
+    target = tmp_path / "created.txt"
+    guard = SafetyGuard(tmp_path)
+    mode = (
+        patch("ash.safety.scoped_io._supports_anchored_io", return_value=False)
+        if fallback
+        else nullcontext()
+    )
+    with mode:
+        if fallback:
+            real_link = os.link
+
+            def create_before_link(source, destination, *args, **kwargs):
+                target.write_bytes(b"external")
+                return real_link(source, destination, *args, **kwargs)
+
+            monkeypatch.setattr(os, "link", create_before_link)
+        else:
+            real_link = scoped_io.os.link
+
+            def create_before_link(source, destination, *args, **kwargs):
+                target.write_bytes(b"external")
+                return real_link(source, destination, *args, **kwargs)
+
+            monkeypatch.setattr(scoped_io.os, "link", create_before_link)
+
+        with pytest.raises(ScopedFileChanged, match="appeared"):
+            restore_scoped_file(
+                target,
+                b"restored",
+                guard,
+                expected_sha256="missing",
+                mode=0o600,
+            )
+        assert target.read_bytes() == b"external"
+
+    target.unlink()
+    original_digest = scoped_io._entry_digest
+
+    def appear_after_missing(parent_fd, name, path, *, max_bytes):
+        digest = original_digest(
+            parent_fd,
+            name,
+            path,
+            max_bytes=max_bytes,
+        )
+        if digest == "missing":
+            target.write_bytes(b"external")
+        return digest
+
+    if fallback:
+        original_fallback_digest = scoped_io._fallback_entry_digest
+
+        def fallback_appear_after_missing(path, file_guard, *, max_bytes):
+            digest = original_fallback_digest(
+                path,
+                file_guard,
+                max_bytes=max_bytes,
+            )
+            if digest == "missing":
+                target.write_bytes(b"external")
+            return digest
+
+        monkeypatch.setattr(
+            scoped_io,
+            "_fallback_entry_digest",
+            fallback_appear_after_missing,
+        )
+        with patch("ash.safety.scoped_io._supports_anchored_io", return_value=False):
+            remove_scoped_file(target, guard, expected_sha256="missing")
+    else:
+        monkeypatch.setattr(scoped_io, "_entry_digest", appear_after_missing)
+        remove_scoped_file(target, guard, expected_sha256="missing")
+
+    assert target.read_bytes() == b"external"
 
 
 def test_scoped_directory_listing_does_not_follow_child_links(tmp_path) -> None:

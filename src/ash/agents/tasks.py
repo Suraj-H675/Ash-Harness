@@ -19,7 +19,8 @@ from typing import Any, Literal, Sequence
 
 from ash.core.events import envelope_event
 from ash.core.redaction import redact_text
-from ash.safe_io import strict_json_loads, validate_unlinked_file_path
+from ash.safe_io import strict_json_loads
+from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
 
 TaskState = Literal[
     "queued",
@@ -32,6 +33,9 @@ TaskState = Literal[
 ACTIVE_TASK_STATES = ("leased", "running")
 TERMINAL_TASK_STATES = ("succeeded", "failed", "cancelled")
 MAX_TASK_JSON_BYTES = 128 * 1024
+MAX_NONTERMINAL_TASKS_PER_WORKSPACE = 1024
+MAX_TASK_DEPENDENCIES = 32
+MAX_ARTIFACTS_PER_TASK = 32
 TASK_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
@@ -138,29 +142,47 @@ class AgentGraphBudget:
 class AgentTaskStore:
     """SQLite task scheduler with atomic claims and renewable ownership leases."""
 
-    def __init__(self, db_path: Path | str, *, busy_timeout_ms: int = 5000) -> None:
+    def __init__(
+        self,
+        db_path: Path | str,
+        *,
+        busy_timeout_ms: int = 5000,
+        _database: PinnedSQLiteDatabase | None = None,
+    ) -> None:
         try:
-            self.db_path = str(
-                validate_unlinked_file_path(db_path, label="agent task database")
+            self._database = _database or PinnedSQLiteDatabase.prepare(
+                db_path,
+                label="agent task database",
             )
-        except ValueError as exc:
+            self.db_path = str(self._database.path)
+            self._conn = self._database.connect(
+                label="agent task database",
+                check_same_thread=False,
+                timeout=busy_timeout_ms / 1000,
+            )
+        except SQLitePathError as exc:
             raise AgentTaskError(str(exc)) from exc
-        self._conn = sqlite3.connect(
-            self.db_path,
-            check_same_thread=False,
-            timeout=busy_timeout_ms / 1000,
-        )
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._closed = False
-        self._init_db(busy_timeout_ms)
+        try:
+            self._init_db(busy_timeout_ms)
+        except BaseException as primary_error:
+            self._closed = True
+            try:
+                self._conn.close()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"agent task database connection cleanup failed: {cleanup_error}"
+                )
+            raise
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
-            self._closed = True
             self._conn.close()
+            self._closed = True
 
     def _init_db(self, busy_timeout_ms: int) -> None:
         with self._lock, self._conn:
@@ -229,6 +251,8 @@ class AgentTaskStore:
                     ON agent_tasks(state, created_at);
                 CREATE INDEX IF NOT EXISTS idx_agent_tasks_owner
                     ON agent_tasks(owner_agent_id, state);
+                CREATE INDEX IF NOT EXISTS idx_agent_tasks_workspace_state
+                    ON agent_tasks(json_extract(metadata_json, '$.workspace'), state);
                 CREATE INDEX IF NOT EXISTS idx_agent_task_dependencies_dep
                     ON agent_task_dependencies(depends_on_task_id);
                 CREATE INDEX IF NOT EXISTS idx_agent_artifacts_task
@@ -316,8 +340,43 @@ class AgentTaskStore:
         _validate_task_graph(prepared, graph_ids)
         _validate_graph_token_budgets(prepared, graph_ids)
         _validate_graph_cost_budgets(prepared, graph_ids)
+        incoming_by_workspace: dict[str | None, int] = {}
+        for definition in prepared:
+            workspace = _json_object(definition.metadata_json).get("workspace")
+            scope = workspace if isinstance(workspace, str) else None
+            incoming_by_workspace[scope] = incoming_by_workspace.get(scope, 0) + 1
         now = time.time()
         with self._transaction():
+            for workspace, incoming in incoming_by_workspace.items():
+                if workspace is None:
+                    existing = int(
+                        self._conn.execute(
+                            """
+                            SELECT COUNT(*) FROM agent_tasks
+                            WHERE state IN ('queued','leased','running')
+                              AND json_extract(metadata_json, '$.workspace') IS NULL
+                            """
+                        ).fetchone()[0]
+                    )
+                    scope_label = "unscoped tasks"
+                else:
+                    existing = int(
+                        self._conn.execute(
+                            """
+                            SELECT COUNT(*) FROM agent_tasks
+                            WHERE state IN ('queued','leased','running')
+                              AND json_extract(metadata_json, '$.workspace') = ?
+                            """,
+                            (workspace,),
+                        ).fetchone()[0]
+                    )
+                    scope_label = f"workspace {workspace!r}"
+                if existing + incoming > MAX_NONTERMINAL_TASKS_PER_WORKSPACE:
+                    raise AgentTaskError(
+                        "agent task nonterminal queue limit reached for "
+                        f"{scope_label}: maximum "
+                        f"{MAX_NONTERMINAL_TASKS_PER_WORKSPACE}"
+                    )
             self._require_graph_references(prepared, graph_ids)
             for definition in prepared:
                 try:
@@ -884,20 +943,32 @@ class AgentTaskStore:
             )
         return task_ids
 
-    def cancel_task(self, task_id: str, *, reason: str = "cancelled") -> list[str]:
+    def cancel_task(
+        self,
+        task_id: str,
+        *,
+        reason: str = "cancelled",
+        workspace: str | Path | None = None,
+    ) -> list[str]:
         identifier = _identifier(task_id, "task id")
         reason = _bounded_text(reason, "cancellation reason", 4096)
+        workspace_value = _workspace_scope(workspace)
         now = time.time()
         with self._transaction():
-            if (
-                self._conn.execute(
-                    "SELECT 1 FROM agent_tasks WHERE task_id = ?", (identifier,)
-                ).fetchone()
-                is None
-            ):
+            root_query = "SELECT 1 FROM agent_tasks WHERE task_id = ?"
+            root_params: tuple[Any, ...] = (identifier,)
+            if workspace_value is not None:
+                root_query += " AND json_extract(metadata_json, '$.workspace') = ?"
+                root_params += (workspace_value,)
+            if self._conn.execute(root_query, root_params).fetchone() is None:
                 raise AgentTaskError(f"unknown task: {identifier}")
+            recursive_scope = (
+                " AND json_extract(child.metadata_json, '$.workspace') = ?"
+                if workspace_value is not None
+                else ""
+            )
             rows = self._conn.execute(
-                """
+                f"""
                 WITH RECURSIVE descendants(task_id) AS (
                     SELECT ?
                     UNION
@@ -905,10 +976,16 @@ class AgentTaskStore:
                     FROM agent_task_dependencies AS dependency
                     JOIN descendants
                       ON dependency.depends_on_task_id = descendants.task_id
+                    JOIN agent_tasks AS child ON child.task_id = dependency.task_id
+                    WHERE 1 = 1{recursive_scope}
                 )
                 SELECT task_id FROM descendants
                 """,
-                (identifier,),
+                (
+                    (identifier, workspace_value)
+                    if workspace_value is not None
+                    else (identifier,)
+                ),
             ).fetchall()
             task_ids = [str(row["task_id"]) for row in rows]
             self._cancel_task_ids_locked(
@@ -924,25 +1001,43 @@ class AgentTaskStore:
         graph_id: str,
         *,
         reason: str = "graph cancelled",
+        workspace: str | Path | None = None,
     ) -> list[str]:
         identifier = _identifier(graph_id, "graph id")
         reason = _bounded_text(reason, "cancellation reason", 4096)
+        workspace_value = _workspace_scope(workspace)
         now = time.time()
         with self._transaction():
+            seed_scope = (
+                " AND json_extract(metadata_json, '$.workspace') = ?"
+                if workspace_value is not None
+                else ""
+            )
+            recursive_scope = (
+                " AND json_extract(child.metadata_json, '$.workspace') = ?"
+                if workspace_value is not None
+                else ""
+            )
+            params: tuple[Any, ...] = (identifier,)
+            if workspace_value is not None:
+                params += (workspace_value, workspace_value)
             rows = self._conn.execute(
-                """
+                f"""
                 WITH RECURSIVE descendants(task_id) AS (
                     SELECT task_id FROM agent_tasks
                     WHERE json_extract(metadata_json, '$.graph_id') = ?
+                    {seed_scope}
                     UNION
                     SELECT dependency.task_id
                     FROM agent_task_dependencies AS dependency
                     JOIN descendants
                       ON dependency.depends_on_task_id = descendants.task_id
+                    JOIN agent_tasks AS child ON child.task_id = dependency.task_id
+                    WHERE 1 = 1{recursive_scope}
                 )
                 SELECT task_id FROM descendants
                 """,
-                (identifier,),
+                params,
             ).fetchall()
             if not rows:
                 raise AgentTaskError(f"unknown task graph: {identifier}")
@@ -960,12 +1055,21 @@ class AgentTaskStore:
         with self._transaction():
             return self._recover_expired_locked(now)
 
-    def get_task(self, task_id: str) -> AgentTask | None:
+    def get_task(
+        self,
+        task_id: str,
+        *,
+        workspace: str | Path | None = None,
+    ) -> AgentTask | None:
         identifier = _identifier(task_id, "task id")
+        workspace_value = _workspace_scope(workspace)
+        query = "SELECT * FROM agent_tasks WHERE task_id = ?"
+        params: tuple[Any, ...] = (identifier,)
+        if workspace_value is not None:
+            query += " AND json_extract(metadata_json, '$.workspace') = ?"
+            params += (workspace_value,)
         with self._lock, closing(self._conn.cursor()) as cursor:
-            row = cursor.execute(
-                "SELECT * FROM agent_tasks WHERE task_id = ?", (identifier,)
-            ).fetchone()
+            row = cursor.execute(query, params).fetchone()
             if row is None:
                 return None
             return self._row_to_task(row)
@@ -976,6 +1080,7 @@ class AgentTaskStore:
         state: TaskState | None = None,
         owner_agent_id: str | None = None,
         graph_id: str | None = None,
+        workspace: str | Path | None = None,
         limit: int = 100,
     ) -> list[AgentTask]:
         if type(limit) is not int or not 1 <= limit <= 1000:
@@ -993,6 +1098,10 @@ class AgentTaskStore:
         if graph_id is not None:
             clauses.append("json_extract(metadata_json, '$.graph_id') = ?")
             params.append(_identifier(graph_id, "graph id"))
+        workspace_value = _workspace_scope(workspace)
+        if workspace_value is not None:
+            clauses.append("json_extract(metadata_json, '$.workspace') = ?")
+            params.append(workspace_value)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._lock, closing(self._conn.cursor()) as cursor:
             rows = cursor.execute(
@@ -1093,6 +1202,17 @@ class AgentTaskStore:
             ).fetchone()
             if task is None:
                 raise AgentTaskError(f"unknown task: {identifier}")
+            artifact_count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM agent_artifacts WHERE task_id = ?",
+                    (identifier,),
+                ).fetchone()[0]
+            )
+            if artifact_count >= MAX_ARTIFACTS_PER_TASK:
+                raise AgentTaskError(
+                    "task artifact limit reached: maximum "
+                    f"{MAX_ARTIFACTS_PER_TASK}"
+                )
             self._conn.execute(
                 """
                 INSERT INTO agent_artifacts
@@ -1120,13 +1240,38 @@ class AgentTaskStore:
             _from_epoch(now),
         )
 
-    def list_artifacts(self, task_id: str) -> list[AgentArtifact]:
+    def list_artifacts(
+        self,
+        task_id: str,
+        *,
+        workspace: str | Path | None = None,
+    ) -> list[AgentArtifact]:
         identifier = _identifier(task_id, "task id")
+        workspace_value = _workspace_scope(workspace)
         with self._lock, closing(self._conn.cursor()) as cursor:
-            rows = cursor.execute(
-                "SELECT * FROM agent_artifacts WHERE task_id = ? ORDER BY created_at, artifact_id",
-                (identifier,),
-            ).fetchall()
+            if workspace_value is None:
+                rows = cursor.execute(
+                    "SELECT * FROM agent_artifacts WHERE task_id = ? "
+                    "ORDER BY created_at, artifact_id LIMIT ?",
+                    (identifier, MAX_ARTIFACTS_PER_TASK + 1),
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    """
+                    SELECT artifact.*
+                    FROM agent_artifacts AS artifact
+                    JOIN agent_tasks AS task ON task.task_id = artifact.task_id
+                    WHERE artifact.task_id = ?
+                      AND json_extract(task.metadata_json, '$.workspace') = ?
+                    ORDER BY artifact.created_at, artifact.artifact_id
+                    LIMIT ?
+                    """,
+                    (identifier, workspace_value, MAX_ARTIFACTS_PER_TASK + 1),
+                ).fetchall()
+        if len(rows) > MAX_ARTIFACTS_PER_TASK:
+            raise AgentTaskError(
+                "stored task artifact count exceeds the supported limit"
+            )
         return [
             AgentArtifact(
                 artifact_id=str(row["artifact_id"]),
@@ -1145,6 +1290,7 @@ class AgentTaskStore:
         *,
         task_id: str | None = None,
         event_type: str | None = None,
+        workspace: str | Path | None = None,
         after_sequence: int = 0,
         limit: int = 1000,
     ) -> list[AgentTaskEvent]:
@@ -1154,19 +1300,28 @@ class AgentTaskStore:
             raise ValueError("after_sequence must be a non-negative integer")
         if type(limit) is not int or not 1 <= limit <= 10_000:
             raise ValueError("limit must be between 1 and 10000")
-        clauses = ["sequence > ?"]
+        clauses = ["event.sequence > ?"]
         params: list[Any] = [after_sequence]
         if task_id is not None:
-            clauses.append("task_id = ?")
+            clauses.append("event.task_id = ?")
             params.append(_identifier(task_id, "task id"))
         if event_type is not None:
-            clauses.append("event_type = ?")
+            clauses.append("event.event_type = ?")
             params.append(_identifier(event_type, "event type"))
+        workspace_value = _workspace_scope(workspace)
+        join = ""
+        if workspace_value is not None:
+            join = " JOIN agent_tasks AS task ON task.task_id = event.task_id"
+            clauses.append("json_extract(task.metadata_json, '$.workspace') = ?")
+            params.append(workspace_value)
         with self._lock, closing(self._conn.cursor()) as cursor:
             rows = cursor.execute(
-                "SELECT sequence, task_id, event_json FROM agent_task_events WHERE "
+                "SELECT event.sequence, event.task_id, event.event_json "
+                "FROM agent_task_events AS event"
+                + join
+                + " WHERE "
                 + " AND ".join(clauses)
-                + " ORDER BY sequence LIMIT ?",
+                + " ORDER BY event.sequence LIMIT ?",
                 (*params, limit),
             ).fetchall()
         return [
@@ -1523,6 +1678,11 @@ def _prepare_task_create(definition: AgentTaskCreate) -> _PreparedTaskCreate:
             _identifier(item, "dependency") for item in definition.dependencies
         )
     )
+    if len(dependencies) > MAX_TASK_DEPENDENCIES:
+        raise ValueError(
+            "task dependencies exceed the limit of "
+            f"{MAX_TASK_DEPENDENCIES}"
+        )
     if identifier in dependencies:
         raise ValueError("task cannot depend on itself")
     if parent == identifier:
@@ -1554,6 +1714,12 @@ def _prepare_task_create(definition: AgentTaskCreate) -> _PreparedTaskCreate:
     time_budget = float(raw_time_budget)
     if not 0.1 <= time_budget <= 86_400:
         raise ValueError("time_budget_seconds must be between 0.1 and 86400")
+    metadata = dict(definition.metadata)
+    if "workspace" in metadata:
+        workspace = metadata["workspace"]
+        if not isinstance(workspace, str) or not workspace.strip():
+            raise ValueError("task metadata.workspace must be a non-empty path string")
+        metadata["workspace"] = _workspace_scope(workspace)
     return _PreparedTaskCreate(
         description=description,
         role=role,
@@ -1564,7 +1730,7 @@ def _prepare_task_create(definition: AgentTaskCreate) -> _PreparedTaskCreate:
         max_attempts=definition.max_attempts,
         token_budget=definition.token_budget,
         time_budget_seconds=time_budget,
-        metadata_json=_bounded_json(definition.metadata, "task metadata"),
+        metadata_json=_bounded_json(metadata, "task metadata"),
         graph_token_budget=graph_token_budget,
         graph_cost_budget_usd=graph_cost_budget,
     )
@@ -1673,6 +1839,12 @@ def _identifier(value: str, label: str) -> str:
             f"{label} must be a portable identifier of at most 128 characters"
         )
     return value
+
+
+def _workspace_scope(value: str | Path | None) -> str | None:
+    if value is None:
+        return None
+    return str(Path(value).expanduser().resolve())
 
 
 def _optional_identifier(value: str | None, label: str) -> str | None:

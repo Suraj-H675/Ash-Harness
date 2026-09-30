@@ -9,6 +9,8 @@ from collections.abc import Mapping
 from enum import StrEnum
 from typing import Protocol, TextIO
 
+from ash.core.redaction import redact_text
+
 
 class NotificationMethod(StrEnum):
     """Terminal sequence used to request a notification."""
@@ -64,11 +66,12 @@ def resolve_notification_method(
 
 
 def sanitize_notification_message(message: str) -> str:
-    """Remove control characters and bound content embedded in OSC sequences."""
+    """Redact secrets, remove controls, and bound OSC notification content."""
 
+    redacted = redact_text(message)
     without_controls = "".join(
         character
-        for character in message
+        for character in redacted
         if not unicodedata.category(character).startswith("C")
     )
     normalized = " ".join(without_controls.split()) or "Ash needs attention"

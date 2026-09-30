@@ -100,6 +100,142 @@ async def test_jsonrpc_initialize_advertises_versioned_contracts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_jsonrpc_bounds_in_flight_requests_without_blocking_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.server.jsonrpc as jsonrpc_module
+
+    monkeypatch.setattr(jsonrpc_module, "MAX_PENDING_JSONRPC_REQUESTS", 2)
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+    started = 0
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked(_params):
+        nonlocal started
+        started += 1
+        if started == 2:
+            both_started.set()
+        await release.wait()
+        return {"done": True}
+
+    server._methods["test/block"] = blocked
+    first = asyncio.create_task(
+        server.handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "test/block"}
+        )
+    )
+    second = asyncio.create_task(
+        server.handle_request(
+            {"jsonrpc": "2.0", "id": 2, "method": "test/block"}
+        )
+    )
+    await asyncio.wait_for(both_started.wait(), timeout=1)
+
+    busy = await server.handle_request(
+        {"jsonrpc": "2.0", "id": 3, "method": "test/block"}
+    )
+    assert busy == {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "error": {"code": -32001, "message": "Server is busy"},
+    }
+    assert len(server._request_tasks) == 2
+
+    cancelled = await server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "$/cancelRequest",
+            "params": {"id": 1},
+        }
+    )
+    assert cancelled == {"jsonrpc": "2.0", "id": 4, "result": True}
+
+    release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    assert first_result == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32800, "message": "Request cancelled"},
+    }
+    assert second_result == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"done": True},
+    }
+    assert server._request_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_rejects_duplicate_in_flight_request_id_without_losing_cancel_handle() -> None:
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked(_params):
+        started.set()
+        await release.wait()
+        return {"done": True}
+
+    server._methods["test/block"] = blocked
+    first = asyncio.create_task(
+        server.handle_request(
+            {"jsonrpc": "2.0", "id": "same", "method": "test/block"}
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    duplicate = await server.handle_request(
+        {"jsonrpc": "2.0", "id": "same", "method": "status"}
+    )
+    assert duplicate == {
+        "jsonrpc": "2.0",
+        "id": "same",
+        "error": {
+            "code": -32600,
+            "message": "Request id is already in flight",
+        },
+    }
+    assert server._pending.get("same") is not None
+
+    cancelled = await server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": "cancel",
+            "method": "$/cancelRequest",
+            "params": {"id": "same"},
+        }
+    )
+    assert cancelled == {"jsonrpc": "2.0", "id": "cancel", "result": True}
+    result = await first
+    assert result == {
+        "jsonrpc": "2.0",
+        "id": "same",
+        "error": {"code": -32800, "message": "Request cancelled"},
+    }
+    assert "same" not in server._pending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_id", ["x" * 513, 2**53, -(2**53), float("inf")])
+async def test_jsonrpc_rejects_unsafe_request_ids_before_admission(request_id) -> None:
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+
+    response = await server.handle_request(
+        {"jsonrpc": "2.0", "id": request_id, "method": "status"}
+    )
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32600, "message": "Invalid Request"},
+    }
+    assert server._request_tasks == set()
+    assert server._pending == {}
+
+
+@pytest.mark.asyncio
 async def test_jsonrpc_event_replay_returns_next_cursor() -> None:
     server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
 
@@ -195,6 +331,50 @@ async def test_jsonrpc_explicit_null_id_is_a_request_not_a_notification() -> Non
     assert numeric_zero is not None and numeric_zero["id"] == 0
     assert string_id is not None and string_id["id"] == "status"
     assert server._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_close_owns_explicit_null_id_request() -> None:
+    client = FakeClient()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow(text: str) -> AshResult:
+        del text
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    client.prompt = slow
+    server = JSONRPCServer(client)  # type: ignore[arg-type]
+    pending = asyncio.create_task(
+        server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": None,
+                "method": "turn/run",
+                "params": {"input": "wait"},
+            }
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert server._pending == {}
+    assert len(server._request_tasks) == 1
+
+    await server.close(close_client=False)
+    response = await asyncio.wait_for(pending, timeout=1)
+
+    assert cancelled.is_set()
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32800, "message": "Request cancelled"},
+    }
+    assert not server._request_tasks
 
 
 @pytest.mark.asyncio
@@ -395,3 +575,113 @@ async def test_jsonrpc_bounds_and_cancels_notification_tasks(
     assert server._notification_tasks == set()
     assert all(task.done() for task in notification_tasks)
     assert cancelled == 1
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_close_rejects_request_arriving_after_shutdown_snapshot() -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    prompt_started = asyncio.Event()
+    allow_prompt = asyncio.Event()
+
+    class ClosingClient(FakeClient):
+        async def prompt(self, text: str) -> AshResult:
+            prompt_started.set()
+            await allow_prompt.wait()
+            return AshResult(text.upper(), "session-1", "fake/model", 3)
+
+        async def close(self) -> None:
+            close_started.set()
+            await allow_close.wait()
+
+    server = JSONRPCServer(ClosingClient())  # type: ignore[arg-type]
+    closing = asyncio.create_task(server.close(close_client=True))
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    late = asyncio.create_task(
+        server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": "late",
+                "method": "turn/run",
+                "params": {"input": "must not start"},
+            }
+        )
+    )
+    try:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert prompt_started.is_set() is False
+        assert await late == {
+            "jsonrpc": "2.0",
+            "id": "late",
+            "error": {"code": -32000, "message": "Server is closing"},
+        }
+    finally:
+        allow_prompt.set()
+        allow_close.set()
+        await asyncio.gather(late, closing, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_close_retries_failed_client_cleanup_once() -> None:
+    class FlakyCloseClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("JSON-RPC client cleanup failed once")
+
+    client = FlakyCloseClient()
+    server = JSONRPCServer(client)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="JSON-RPC client cleanup failed once"):
+        await server.close(close_client=True)
+
+    assert client.close_calls == 1
+    rejected = await server.handle_request(
+        {"jsonrpc": "2.0", "id": "late", "method": "status"}
+    )
+    assert rejected == {
+        "jsonrpc": "2.0",
+        "id": "late",
+        "error": {"code": -32000, "message": "Server is closing"},
+    }
+
+    await server.close(close_client=True)
+    assert client.close_calls == 2
+
+    await server.close(close_client=True)
+    assert client.close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_close_settles_client_cleanup_before_propagating_cancellation() -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class BlockingCloseClient(FakeClient):
+        async def close(self) -> None:
+            close_started.set()
+            await allow_close.wait()
+            close_finished.set()
+
+    server = JSONRPCServer(BlockingCloseClient())  # type: ignore[arg-type]
+    closing = asyncio.create_task(server.close(close_client=True))
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+
+    closing.cancel()
+    await asyncio.sleep(0)
+
+    assert closing.done() is False
+    assert close_finished.is_set() is False
+
+    allow_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, timeout=1)
+
+    assert close_finished.is_set() is True
+    assert server._client_closed is True

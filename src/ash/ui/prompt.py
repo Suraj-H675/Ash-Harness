@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -17,8 +16,10 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.enums import EditingMode
 
 from ash.commands.slash import COMMANDS
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.ui.history import PrivateFileHistory
 from ash.ui.transcript import Transcript
-from ash.ui.viewport import PrivateFileHistory, TranscriptViewport, validate_history_path
+from ash.ui.viewport import TranscriptViewport
 
 
 MAX_PATH_COMPLETION_SCAN_ENTRIES = 10_000
@@ -144,21 +145,25 @@ class AshCompleter(Completer):
         if self._mcp_runtime is None:
             return
         runtime = self._mcp_runtime
+
         async def collect() -> list[dict[str, Any]]:
             return await runtime.list_resources()
 
         try:
             try:
-                running_loop = asyncio.get_running_loop()
+                asyncio.get_running_loop()
             except RuntimeError:
-                running_loop = None
-            if running_loop is not None:
-                future = asyncio.run_coroutine_threadsafe(collect(), running_loop)
-                resources = future.result(timeout=0.25)
-            else:
                 resources = asyncio.run(collect())
+            else:
+                return
         except Exception:
             return
+        yield from self._render_mcp_completions(resources, prefix=prefix, word=word)
+
+    @staticmethod
+    def _render_mcp_completions(
+        resources: list[dict[str, Any]], *, prefix: str, word: str
+    ):
         candidates: list[tuple[str, str]] = []
         for resource in resources:
             server = str(resource.get("server", ""))
@@ -173,6 +178,30 @@ class AshCompleter(Completer):
                 display=replacement,
                 display_meta=meta[:120],
             )
+
+    async def get_completions_async(self, document: Document, complete_event):
+        word = document.get_word_before_cursor(WORD=True)
+        typed = word[1:].strip("\"'") if word.startswith("@") else ""
+        scheme, separator, prefix = typed.partition(":")
+        if separator == ":" and scheme == "mcp":
+            if self._mcp_runtime is None:
+                return
+            try:
+                resources = await asyncio.wait_for(
+                    self._mcp_runtime.list_resources(),
+                    timeout=0.25,
+                )
+            except Exception:
+                return
+            for completion in self._render_mcp_completions(
+                resources,
+                prefix=prefix,
+                word=word,
+            ):
+                yield completion
+            return
+        for completion in self.get_completions(document, complete_event):
+            yield completion
 
     def _extended_completions(self, typed: str, word: str):
         scheme, separator, prefix = typed.partition(":")
@@ -237,11 +266,19 @@ class PromptInput:
         self.screen_reader_mode = screen_reader_mode
         if self.interactive:
             path = history_path or (Path.home() / ".ash" / "history")
-            validate_history_path(path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            validate_history_path(path)
-            if history_path is None and os.name != "nt":
-                path.parent.chmod(0o700)
+            if history_path is None:
+                try:
+                    with AnchoredDirectory.open(
+                        path.parent,
+                        create=True,
+                        private=True,
+                        pin_path=True,
+                    ) as history_directory:
+                        history_directory.validation_path()
+                except AnchoredFilesystemError as exc:
+                    raise ValueError(
+                        f"refusing to use redirected prompt history path: {path}"
+                    ) from exc
             history = PrivateFileHistory(path)
             words = sorted(
                 {

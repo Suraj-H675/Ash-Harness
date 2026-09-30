@@ -74,6 +74,22 @@ An undeclared model still works through the conservative text/XML-tool path;
 Ash does not send native tool schemas or image inputs merely because the server
 implements an OpenAI-compatible HTTP API.
 
+## Runtime Request Boundary
+
+Every provider request attempt is finite even for custom provider
+implementations. `provider_request_timeout_seconds` defaults to 1800 seconds
+and accepts values from 1 second through 24 hours. A timeout is eligible for
+Ash's normal provider retry path only when the attempt produced no output; once
+assistant/tool output has started, the request is never replayed automatically.
+
+The core loop also bounds retained provider output independently of adapter
+behavior: one completion may retain at most 16 MiB across text, XML tool-call
+deltas, native tool calls, and reasoning payloads, at most 4096 reasoning
+blocks, and at most 100000 stream chunks. Built-in adapters may enforce tighter
+transport-specific limits before data reaches this boundary. These ceilings are
+resource/liveness guards, not substitutes for `max_completion_tokens` or model
+capability limits.
+
 The same wire/capability separation applies to built-in routes where Ash can
 inspect provider-owned metadata. Mistral starts conservative and reads the
 selected `/v1/models` entry for explicit function-calling, vision, and context

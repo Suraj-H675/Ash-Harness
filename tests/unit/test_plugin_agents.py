@@ -56,7 +56,10 @@ def test_agent_catalog_isolates_invalid_definitions(tmp_path: Path) -> None:
     assert "base-role" in catalog.errors[str(invalid)]
 
 
-def test_agent_catalog_rejects_direct_linked_definition(tmp_path: Path) -> None:
+def test_agent_catalog_rejects_direct_linked_definition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     target = tmp_path / "target.md"
     target.write_text("Inspect the task.", encoding="utf-8")
     linked = tmp_path / "linked.md"
@@ -67,6 +70,26 @@ def test_agent_catalog_rejects_direct_linked_definition(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="cannot be a link"):
         parse_agent_definition(linked)
+
+    linked.unlink()
+    linked.write_text("Inside definition.", encoding="utf-8")
+    real_is_symlink = Path.is_symlink
+    swapped = False
+
+    def race_link_check(path: Path) -> bool:
+        nonlocal swapped
+        result = real_is_symlink(path)
+        if path == linked and not swapped:
+            linked.unlink()
+            linked.symlink_to(target)
+            swapped = True
+            return False
+        return result
+
+    monkeypatch.setattr(Path, "is_symlink", race_link_check)
+    with pytest.raises(ValueError, match="cannot be a link"):
+        parse_agent_definition(linked)
+    assert swapped is True
 
 
 def test_agent_definition_rejects_duplicate_frontmatter_keys(tmp_path: Path) -> None:
@@ -163,6 +186,70 @@ async def test_spawn_agent_runs_custom_definition_with_restricted_tools(
 
 
 @pytest.mark.asyncio
+async def test_spawn_agent_rejects_aba_swapped_definition_generation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    original_agents = workspace / ".ash" / "agents"
+    replacement_agents = replacement / ".ash" / "agents"
+    original_agents.mkdir(parents=True)
+    replacement_agents.mkdir(parents=True)
+    (original_agents / "review.md").write_text(
+        "---\nname: review\nbase-role: reviewer\n---\nORIGINAL_AGENT_INSTRUCTIONS\n",
+        encoding="utf-8",
+    )
+    (replacement_agents / "review.md").write_text(
+        "---\nname: review\nbase-role: reviewer\n---\n"
+        "REPLACEMENT_AGENT_INSTRUCTION_SECRET\n",
+        encoding="utf-8",
+    )
+    catalog = AgentCatalog((original_agents,))
+
+    workspace.rename(saved)
+    replacement.rename(workspace)
+    try:
+        definitions = catalog.discover()
+    finally:
+        workspace.rename(replacement)
+        saved.rename(workspace)
+
+    observed: list[str] = []
+
+    class CaptureProvider(ProviderABC):
+        model_name = "capture"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            observed.extend(
+                str(message.get("content", ""))
+                for message in messages
+                if isinstance(message, dict)
+            )
+            yield StreamChunk(content="done", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+    definition = definitions[0]
+    state = SharedState(tmp_path / "state" / "aba-agents.db")
+    tool = SpawnAgentTool(
+        SafetyGuard(workspace),
+        state,
+        CaptureProvider,
+        custom_agents={definition.name: definition},
+    )
+
+    result = await tool.run(role=definition.name, task="inspect changes")
+
+    assert result.success is False
+    assert not any("REPLACEMENT_AGENT_INSTRUCTION_SECRET" in item for item in observed)
+    assert "agent definition identity changed after discovery" in (result.error or "")
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_custom_agent_cannot_elevate_beyond_base_role(tmp_path: Path) -> None:
     definition = AgentDefinition(
         name="unsafe",
@@ -173,10 +260,17 @@ async def test_custom_agent_cannot_elevate_beyond_base_role(tmp_path: Path) -> N
         allowed_tools=("run_command",),
     )
     state = SharedState(tmp_path / "state" / "agents.db")
+    provider_calls = 0
+
+    def provider_factory() -> ProviderABC:
+        nonlocal provider_calls
+        provider_calls += 1
+        return CustomAgentProvider()
+
     tool = SpawnAgentTool(
         SafetyGuard(tmp_path),
         state,
-        CustomAgentProvider,
+        provider_factory,
         custom_agents={definition.name: definition},
     )
 
@@ -184,6 +278,7 @@ async def test_custom_agent_cannot_elevate_beyond_base_role(tmp_path: Path) -> N
 
     assert result.success is False
     assert "requests unavailable tools: run_command" in (result.error or "")
+    assert provider_calls == 0
     await tool.aclose()
 
 

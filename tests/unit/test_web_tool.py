@@ -22,9 +22,21 @@ def guard(tmp_path):
     return SafetyGuard(tmp_path)
 
 
+async def _allow_public_dns(
+    hostname: str,
+    *,
+    timeout_seconds: float,
+) -> tuple[str, ...]:
+    del hostname, timeout_seconds
+    return ("93.184.216.34",)
+
+
 @pytest.mark.asyncio
 async def test_web_fetch_returns_bounded_html_text(monkeypatch, guard) -> None:
-    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["user-agent"].startswith("ash-web-fetch")
@@ -53,16 +65,20 @@ async def test_web_fetch_returns_bounded_html_text(monkeypatch, guard) -> None:
 
 @pytest.mark.asyncio
 async def test_web_fetch_validates_redirect_targets(monkeypatch, guard) -> None:
-    from ash.tools import web
-
-    original = web._ensure_public_host
-
-    def allow_example_only(hostname: str) -> None:
+    async def allow_example_only(
+        hostname: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, ...]:
+        del timeout_seconds
         if hostname == "example.com":
-            return None
-        return original(hostname)
+            return ("93.184.216.34",)
+        return _resolve_public_addresses(hostname)
 
-    monkeypatch.setattr("ash.tools.web._ensure_public_host", allow_example_only)
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        allow_example_only,
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(302, headers={"location": "http://127.0.0.1/private"})
@@ -79,7 +95,10 @@ async def test_web_fetch_redacts_signed_redirect_url_from_output_and_citation(
     monkeypatch,
     guard,
 ) -> None:
-    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
     marker = "redirect-signature-marker"
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -118,7 +137,10 @@ async def test_web_fetch_marks_redacted_citation_url_as_sanitized(
     monkeypatch,
     guard,
 ) -> None:
-    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -141,7 +163,10 @@ async def test_web_fetch_marks_redacted_citation_url_as_sanitized(
 
 @pytest.mark.asyncio
 async def test_web_fetch_redacts_signed_url_from_http_error(monkeypatch, guard) -> None:
-    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
     marker = "error-signature-marker"
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -172,7 +197,10 @@ async def test_web_fetch_redacts_signed_url_from_http_error(monkeypatch, guard) 
 
 @pytest.mark.asyncio
 async def test_web_fetch_enforces_allowed_domains(monkeypatch, guard) -> None:
-    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -201,7 +229,10 @@ async def test_web_fetch_rejects_redirect_outside_allowed_domains(
     monkeypatch,
     guard,
 ) -> None:
-    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -225,7 +256,10 @@ async def test_web_fetch_returns_network_failures_as_tool_results(
     monkeypatch,
     guard,
 ) -> None:
-    monkeypatch.setattr("ash.tools.web._ensure_public_host", lambda hostname: None)
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
@@ -283,6 +317,90 @@ async def test_public_dns_resolution_timeout_does_not_block_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_web_fetch_dns_timeout_fails_before_transport_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    guard,
+) -> None:
+    dispatched = False
+
+    async def timed_out(
+        hostname: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, ...]:
+        del timeout_seconds
+        raise ValueError(f"DNS resolution timed out for host {hostname!r}")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal dispatched
+        dispatched = True
+        return httpx.Response(200, text="must not dispatch", request=request)
+
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        timed_out,
+    )
+    tool = WebFetchTool(guard, transport=httpx.MockTransport(handler))
+
+    result = await tool.run(url="https://stalled.example/page")
+
+    assert result.success is False
+    assert "DNS resolution timed out" in (result.error or "")
+    assert dispatched is False
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_connects_with_preflight_pinned_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.tools import web
+
+    observed: dict[str, object] = {}
+
+    async def resolved(
+        hostname: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, ...]:
+        observed["hostname"] = hostname
+        observed["timeout"] = timeout_seconds
+        return ("93.184.216.34",)
+
+    def pinned_transport(*, pinned_addresses: tuple[str, ...]):
+        observed["addresses"] = pinned_addresses
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                text="pinned",
+                request=request,
+            )
+
+        return httpx.MockTransport(handler)
+
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        resolved,
+    )
+    monkeypatch.setattr(web, "_PinnedPublicTransport", pinned_transport)
+
+    final_url, status, content_type, body = await web._fetch_public_text(
+        "https://example.com/page"
+    )
+
+    assert final_url == "https://example.com/page"
+    assert status == 200
+    assert content_type == "text/plain"
+    assert body == "pinned"
+    assert observed == {
+        "hostname": "example.com",
+        "timeout": web.DNS_TIMEOUT_SECONDS,
+        "addresses": ("93.184.216.34",),
+    }
+
+
+@pytest.mark.asyncio
 async def test_pinned_transport_reuses_preflight_addresses_without_dns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -337,27 +455,11 @@ def test_web_fetch_rejects_mixed_public_and_non_global_dns_answers(
 async def test_web_fetch_pins_vetted_dns_result_against_rebinding(
     monkeypatch, guard
 ) -> None:
-    import asyncio
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from ash.tools import web
 
-    from ash.tools.web import _fetch_public_text
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"private-local-service")
-
-        def log_message(self, format: str, *args: object) -> None:
-            return
-
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
     original = socket.getaddrinfo
     resolutions = 0
+    observed_addresses: list[tuple[str, ...]] = []
 
     def fake_getaddrinfo(host, port, *args, **kwargs):
         nonlocal resolutions
@@ -377,13 +479,29 @@ async def test_web_fetch_pins_vetted_dns_result_against_rebinding(
             )
         ]
 
+    def pinned_transport(*, pinned_addresses: tuple[str, ...]):
+        observed_addresses.append(pinned_addresses)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                text="vetted-public-endpoint",
+                request=request,
+            )
+
+        return httpx.MockTransport(handler)
+
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
-    try:
-        with pytest.raises(ValueError, match="non-public"):
-            await _fetch_public_text(f"http://rebind.test:{server.server_port}/private")
-    finally:
-        server.shutdown()
-        await asyncio.to_thread(thread.join, 2)
+    monkeypatch.setattr(web, "_PinnedPublicTransport", pinned_transport)
+
+    _final_url, _status, _content_type, body = await web._fetch_public_text(
+        "http://rebind.test/private"
+    )
+
+    assert body == "vetted-public-endpoint"
+    assert resolutions == 1
+    assert observed_addresses == [("93.184.216.34",)]
 
 
 def test_web_fetch_rejects_embedded_url_credentials(monkeypatch) -> None:

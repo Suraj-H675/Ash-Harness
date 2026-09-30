@@ -46,9 +46,19 @@ class CapabilityRegistry:
                 )
             self._resolvers[normalized] = resolver
 
-    def unregister(self, family: str) -> bool:
+    def unregister(
+        self,
+        family: str,
+        *,
+        resolver: CapabilityResolver | None = None,
+    ) -> bool:
         with self._lock:
-            return self._resolvers.pop(family.strip().casefold(), None) is not None
+            normalized = family.strip().casefold()
+            current = self._resolvers.get(normalized)
+            if current is None or (resolver is not None and current is not resolver):
+                return False
+            del self._resolvers[normalized]
+            return True
 
     def families(self) -> tuple[str, ...]:
         with self._lock:

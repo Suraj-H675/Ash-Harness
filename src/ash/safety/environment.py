@@ -110,7 +110,7 @@ def resolve_host_executable(
 ) -> str | None:
     """Resolve an Ash-owned helper without executing workspace-controlled code.
 
-    Internal helpers such as Git, ripgrep, and sandbox backends are selected by
+    Internal helpers such as Git and sandbox backends are selected by
     Ash rather than by the model or user.  A workspace can legitimately appear
     on ``PATH`` (including through a relative or empty PATH entry), so resolving
     those helpers with a plain ``shutil.which(name)`` would allow untrusted

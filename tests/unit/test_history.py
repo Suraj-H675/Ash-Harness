@@ -283,6 +283,36 @@ def test_compaction_preserves_task_paths_actions_and_prior_summary_ends() -> Non
     assert "Assistant outcome: I will keep the public API stable" in result.summary
 
 
+def test_windowed_history_keeps_previous_summary_visible_below_compaction_limit() -> None:
+    previous = "Earlier durable context"
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "recent request"},
+        {"role": "assistant", "content": "recent answer"},
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=10_000,
+        completion_reserve=100,
+        recent_messages=2,
+    )
+
+    result = compactor.compact(
+        messages,
+        count_tokens=count_words,
+        previous_summary=previous,
+        include_previous_summary=True,
+    )
+
+    assert result.removed_messages == 0
+    assert result.compacted is False
+    assert any(
+        str(message.get("content", "")).startswith(
+            "## Compacted conversation summary\nEarlier durable context"
+        )
+        for message in result.messages
+    )
+
+
 def test_compaction_drops_old_multi_tool_group_atomically_to_hard_limit() -> None:
     messages = [
         {"role": "system", "content": "system"},

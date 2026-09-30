@@ -51,6 +51,33 @@ def test_parse_model_string_normalizes_provider_only() -> None:
     assert parse_model_string(" OpenAI/gpt/custom ") == ("openai", "gpt/custom")
 
 
+def test_parse_model_string_rejects_oversized_identifier() -> None:
+    with pytest.raises(ValueError, match="provider/model.*exceeds"):
+        parse_model_string("openai/" + "x" * 600)
+
+
+def test_config_bounds_and_normalizes_fallback_models() -> None:
+    config = AshConfig(
+        model="OpenAI/primary",
+        fallback_models=["Anthropic/backup", "openai/secondary"],
+    )
+
+    assert config.model == "openai/primary"
+    assert config.fallback_models == ["anthropic/backup", "openai/secondary"]
+
+    with pytest.raises(ValueError, match="more than 16"):
+        AshConfig(
+            model="openai/primary",
+            fallback_models=[f"openai/fallback-{index}" for index in range(17)],
+        )
+
+    with pytest.raises(ValueError, match="duplicate fallback model"):
+        AshConfig(
+            model="openai/primary",
+            fallback_models=["OpenAI/backup", "openai/backup"],
+        )
+
+
 def test_registry_registers_and_builds_provider() -> None:
     registry = ProviderRegistry()
     registry.register(
@@ -178,8 +205,16 @@ def test_google_runtime_client_identifies_ash_without_affecting_nvidia(
     monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
     monkeypatch.setenv("NVIDIA_API_KEY", "nvidia-key")
 
-    create_default_provider_registry().build(AshConfig(model="google/gemini-test"))
-    create_default_provider_registry().build(AshConfig(model="nvidia/nvidia/test-model"))
+    google = create_default_provider_registry().build(
+        AshConfig(model="google/gemini-test")
+    )
+    nvidia = create_default_provider_registry().build(
+        AshConfig(model="nvidia/nvidia/test-model")
+    )
+
+    assert calls == []
+    google._resolve_client()
+    nvidia._resolve_client()
 
     assert calls[0]["default_headers"] == {
         "x-goog-api-client": readiness.GOOGLE_API_CLIENT_HEADER
@@ -324,7 +359,7 @@ def test_local_openai_compatible_catalog_providers_are_anonymous(
     assert callable(getattr(result, "detect_capabilities", None))
     assert result._base_url == base_url
     assert result._api_key == ""
-    assert result._client.api_key == "ash-anonymous"
+    assert result._resolve_client().api_key == "ash-anonymous"
 
 
 @pytest.mark.asyncio
@@ -423,7 +458,7 @@ async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer
 
     # Keep the provider's real AsyncClient and request-hook path, replacing
     # only the network transport with a deterministic local response.
-    provider._client._client._transport = httpx.MockTransport(handler)
+    provider._resolve_client()._client._transport = httpx.MockTransport(handler)
     chunks = [
         chunk
         async for chunk in provider.stream_chat(

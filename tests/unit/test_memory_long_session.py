@@ -44,8 +44,7 @@ async def test_long_session_memory_index_and_recall_remain_bounded(
         model="openai/memory-benchmark",
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        memory_backend="fts5",
-        chroma_persist_dir=tmp_path / "memory",
+        memory_backend="sqlite",
     )
     loop = AshLoop(
         session_store=SessionStore(config.db_directory / "sessions.db"),
@@ -54,9 +53,8 @@ async def test_long_session_memory_index_and_recall_remain_bounded(
         safety_guard=SafetyGuard(project_root=tmp_path),
         project_root=tmp_path,
         config=config,
-        enable_semantic_memory=True,
-        memory_backend="fts5",
-        chroma_persist_dir=tmp_path / "memory",
+        enable_project_memory=True,
+        memory_db_path=tmp_path / "memory" / "memory.db",
     )
     try:
         started = time.perf_counter()
@@ -68,7 +66,7 @@ async def test_long_session_memory_index_and_recall_remain_bounded(
         for index in range(SEARCH_ROUNDS):
             target = (index * 37) % FILE_COUNT
             started = time.perf_counter()
-            hits = await loop.semantic_search(f'"unique_function_{target}"', top_k=5)
+            hits = await loop.search_memory(f'"unique_function_{target}"', top_k=5)
             durations.append(time.perf_counter() - started)
             hit_counts.append(len(hits))
             assert hits and hits[0].file_path.endswith(f"module-{target}.py"), (

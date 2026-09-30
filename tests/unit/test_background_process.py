@@ -1,6 +1,7 @@
 import asyncio
 import os
 import shlex
+import signal
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -85,6 +86,53 @@ async def test_background_process_close_does_not_reterminate_completed_job(
     terminate.assert_not_awaited()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group semantics")
+@pytest.mark.asyncio
+async def test_background_process_close_cleans_descendant_after_root_exits(
+    tmp_path: Path,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    script = (
+        "import subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+        "print(child.pid, flush=True); "
+        "raise SystemExit(0)"
+    )
+    started = await tool.run(action="start", command=_python_shell_command(script))
+    job = tool.jobs[started.output.split()[1]]
+    child_pid: int | None = None
+
+    try:
+        for _ in range(100):
+            if job.process.returncode is not None and job.output:
+                break
+            await asyncio.sleep(0.01)
+        assert job.process.returncode == 0
+        child_pid = int("".join(job.output).strip().splitlines()[0])
+        assert any(not reader.done() for reader in job.readers)
+        os.kill(child_pid, 0)
+
+        close_task = asyncio.create_task(tool.aclose())
+        done, _ = await asyncio.wait({close_task}, timeout=2)
+        if not done:
+            try:
+                os.killpg(job.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await asyncio.wait_for(close_task, timeout=2)
+            pytest.fail("background close did not clean an exited root's descendants")
+        await close_task
+
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        if child_pid is not None:
+            try:
+                os.killpg(job.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 @pytest.mark.asyncio
 async def test_background_process_close_allows_native_exit_notification(
     tmp_path: Path,
@@ -111,6 +159,28 @@ async def test_background_process_close_allows_native_exit_notification(
     await exit_notification
 
     terminate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_background_process_close_cancellation_waits_for_tree_cleanup(
+    tmp_path: Path,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    started = await tool.run(
+        action="start",
+        command=_python_shell_command("import time; time.sleep(30)"),
+    )
+    job = tool.jobs[started.output.split()[1]]
+
+    close_task = asyncio.create_task(tool.aclose())
+    await asyncio.sleep(0.02)
+    close_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(close_task, timeout=2)
+
+    assert job.process.returncode is not None
+    assert all(reader.done() for reader in job.readers)
 
 
 @pytest.mark.asyncio
@@ -148,27 +218,6 @@ async def test_background_process_serializes_windows_tree_cleanup(
     await tool.aclose()
 
     assert max_active == 1
-
-
-@pytest.mark.asyncio
-async def test_background_process_applies_windows_shell_safety(
-    tmp_path: Path,
-) -> None:
-    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
-    with (
-        patch("ash.tools.command.platform.system", return_value="Windows"),
-        pytest.raises(SafetyViolation, match="command chains"),
-    ):
-        await tool.run(
-            action="start",
-            command="Write-Output safe; Remove-Item marker.txt",
-        )
-
-    with (
-        patch("ash.tools.command.platform.system", return_value="Windows"),
-        pytest.raises(SafetyViolation, match="-LiteralPath"),
-    ):
-        await tool.run(action="start", command="Get-Content marker.txt")
 
 
 @pytest.mark.asyncio
@@ -230,6 +279,36 @@ async def test_background_process_stream_redacts_secret_split_across_polls(
     assert first_fragment not in first_payload
     assert second_fragment not in second_payload
     assert "[REDACTED]" in second_payload
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_stream_redacts_split_private_key(tmp_path) -> None:
+    marker = "SYNTHETIC_BACKGROUND_PRIVATE_KEY_BODY"
+    script = (
+        "import sys,time; "
+        "sys.stdout.write('-----BEGIN PRIVATE '); sys.stdout.flush(); "
+        "time.sleep(0.15); "
+        f"sys.stdout.write('KEY-----\\n{marker}\\n-----END PRIVATE '); "
+        "sys.stdout.flush(); time.sleep(0.15); "
+        "sys.stdout.write('KEY-----\\nafter\\n'); sys.stdout.flush()"
+    )
+    script_path = tmp_path / "emit_private_key.py"
+    script_path.write_text(script, encoding="utf-8")
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}"
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+
+    started = await tool.run(action="start", command=command)
+    job_id = started.output.split()[1]
+    await tool.jobs[job_id].process.wait()
+    await asyncio.gather(*tool.jobs[job_id].readers)
+    polled = await tool.run(action="poll", job_id=job_id)
+
+    assert marker not in polled.output
+    assert "-----BEGIN PRIVATE KEY-----" not in polled.output
+    assert "-----END PRIVATE KEY-----" not in polled.output
+    assert "[REDACTED]" in polled.output
+    assert "after" in polled.output
     await tool.aclose()
 
 
@@ -628,76 +707,3 @@ async def test_background_process_fails_closed_without_descriptor_cwd(
     assert result.success is False
     assert "race-resistant cwd launch unavailable" in (result.error or "")
     assert not tool.jobs
-
-
-@pytest.mark.asyncio
-async def test_windows_background_resolves_powershell_outside_workspace(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    workspace = tmp_path / "workspace"
-    host_bin = tmp_path / "host-bin"
-    workspace.mkdir()
-    host_bin.mkdir()
-    workspace_powershell = workspace / "powershell.exe"
-    host_powershell = host_bin / "powershell.exe"
-    workspace_powershell.write_text("shadowed", encoding="utf-8")
-    host_powershell.write_text("trusted", encoding="utf-8")
-    workspace_powershell.chmod(0o755)
-    host_powershell.chmod(0o755)
-    monkeypatch.setenv(
-        "PATH",
-        f"{workspace}{os.pathsep}{host_bin}",
-    )
-
-    stdout = asyncio.StreamReader()
-    stderr = asyncio.StreamReader()
-    stdout.feed_eof()
-    stderr.feed_eof()
-    process = Mock(pid=1234, returncode=0, stdin=None, stdout=stdout, stderr=stderr)
-    process.wait = AsyncMock(return_value=0)
-    with (
-        patch("ash.tools.process.platform.system", return_value="Windows"),
-        patch(
-            "ash.tools.process.asyncio.create_subprocess_exec",
-            new=AsyncMock(return_value=process),
-        ) as spawn,
-        patch(
-            "ash.tools.process.terminate_process_tree",
-            new=AsyncMock(return_value=None),
-        ),
-    ):
-        tool = BackgroundProcessTool(SafetyGuard(workspace))
-        result = await tool.run(action="start", command="Write-Output intended")
-        await asyncio.gather(*tool.jobs[next(iter(tool.jobs))].readers)
-
-    assert result.success is True
-    assert spawn.await_args.args[0] == str(host_powershell.resolve())
-    assert spawn.await_args.args[0] != str(workspace_powershell)
-
-
-@pytest.mark.asyncio
-async def test_windows_background_fails_before_spawn_without_host_powershell(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    fake = workspace / "powershell.exe"
-    fake.write_text("shadowed", encoding="utf-8")
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", str(workspace))
-
-    with (
-        patch("ash.tools.process.platform.system", return_value="Windows"),
-        patch(
-            "ash.tools.process.asyncio.create_subprocess_exec",
-            new=AsyncMock(),
-        ) as spawn,
-    ):
-        tool = BackgroundProcessTool(SafetyGuard(workspace))
-        result = await tool.run(action="start", command="Write-Output unsafe")
-
-    assert result.success is False
-    assert "was not started" in (result.error or "")
-    spawn.assert_not_awaited()

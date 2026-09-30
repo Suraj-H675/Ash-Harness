@@ -1,29 +1,67 @@
-"""Local plugin installation and enablement state."""
+"""Transactional plugin publication, removal, and Git acquisition."""
 
 from __future__ import annotations
 
-import errno
-import json
 import os
-import re
 import stat
 import subprocess
 import tempfile
 import time
-import urllib.parse
+from contextlib import nullcontext
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, parse as parse_version
 
-from ash.safe_io import read_bounded_open_file, strict_json_loads
-from ash.plugins.anchored_fs import (
+from ash.plugins._lifecycle_support import (
+    lifecycle_error as _lifecycle_error,
+    require_anchored_plugin_mutation as _require_anchored_plugin_mutation,
+    sync_directory_strict as _sync_directory_strict,
+    validate_plugin_name as _validate_plugin_name,
+)
+from ash.plugins.errors import PluginLifecycleError
+from ash.plugins.git_source import GIT_DIGEST_PATTERN, validate_plugin_git_source
+from ash.plugins.install_records import (
+    MAX_PLUGIN_INSTALL_RECORDS as MAX_PLUGIN_INSTALL_RECORDS,
+    MAX_PLUGIN_INSTALL_RECORDS_BYTES as MAX_PLUGIN_INSTALL_RECORDS_BYTES,
+    PLUGIN_INSTALL_RECORDS_FILENAME as PLUGIN_INSTALL_RECORDS_FILENAME,
+    PLUGIN_INSTALL_RECORDS_VERSION as PLUGIN_INSTALL_RECORDS_VERSION,
+    PluginInstallRecord as PluginInstallRecord,
+    _read_plugin_install_records_at,
+    load_plugin_install_records as load_plugin_install_records,
+    plugin_install_records_path as plugin_install_records_path,
+    require_plugin_install_record_current as require_plugin_install_record_current,
+    require_plugin_install_tree_current as require_plugin_install_tree_current,
+    transition_plugin_install_records_at as _transition_plugin_install_records_at,
+    user_plugin_root as user_plugin_root,
+    validate_plugin_install_record as _validate_plugin_install_record,
+)
+from ash.plugins.lifecycle_journal import (
+    PluginLifecycleJournal,
+    TreeIdentity,
+    clear_lifecycle_journal_at,
+    read_lifecycle_journal_at,
+    write_lifecycle_journal_at,
+)
+from ash.plugins.state import (
+    MAX_EXTENSION_STATE_BYTES as MAX_EXTENSION_STATE_BYTES,
+    STATE_VERSION as STATE_VERSION,
+    ExtensionState,
+    extension_state_path as extension_state_path,
+    load_extension_state as load_extension_state,
+    locked_extension_state,
+    set_plugin_enabled as set_plugin_enabled,
+    transition_extension_state as _transition_extension_state,
+    transition_extension_state_checked as _transition_extension_state_checked,
+)
+
+from ash.safe_io import strict_json_loads
+from ash.safety.anchored_fs import (
     AnchoredDirectory,
     AnchoredFilesystemError,
-    AnchoredFilesystemUnavailable,
-    require_anchored_mutation,
-    supports_anchored_mutation,
 )
 from ash.plugins.snapshot import (
     MAX_PLUGIN_BYTES,
@@ -33,7 +71,6 @@ from ash.plugins.snapshot import (
 )
 from ash.plugins.manifest import (
     MAX_PLUGIN_MANIFEST_BYTES,
-    PLUGIN_NAME,
     PluginManifest,
     validate_plugin_identity,
 )
@@ -42,7 +79,9 @@ from ash.plugins.registry import (
     MAX_PLUGIN_TREE_DEPTH,
     MAX_PLUGIN_TREE_ENTRIES,
 )
+from ash.plugins.validation import validate_plugin_contents_at
 from ash.safety.environment import resolve_host_executable
+from ash.safety.git import isolated_git_environment
 from ash.sandbox.process_utils import (
     ProcessTreeError,
     ProcessTreeUnavailable,
@@ -51,27 +90,11 @@ from ash.sandbox.process_utils import (
     terminate_process_tree_sync,
 )
 
-MAX_EXTENSION_STATE_BYTES = 256 * 1024
-STATE_VERSION = 1
-MAX_PLUGIN_INSTALL_RECORDS_BYTES = 512 * 1024
-MAX_PLUGIN_INSTALL_RECORDS = 10_000
-PLUGIN_INSTALL_RECORDS_VERSION = 2
-PLUGIN_INSTALL_RECORDS_FILENAME = ".ash-install-records.json"
 MAX_GIT_CLONE_BYTES = MAX_PLUGIN_BYTES
 MAX_GIT_CLONE_SECONDS = 300
 MAX_GIT_ERROR_BYTES = 64 * 1024
 _GIT_CLONE_POLL_SECONDS = 0.05
-_GIT_DIGEST = re.compile(r"^[0-9a-f]{40,64}$")
 _INSTALL_RECORD_UNCHANGED = object()
-
-
-class PluginLifecycleError(ValueError):
-    """Raised when a local plugin lifecycle operation is unsafe or invalid."""
-
-
-@dataclass(frozen=True)
-class ExtensionState:
-    disabled_plugins: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -79,410 +102,476 @@ class InstalledPlugin:
     name: str
     version: str
     root: Path
+    install_record: PluginInstallRecord | None = None
 
 
-@dataclass(frozen=True)
-class PluginInstallRecord:
-    name: str
-    version: str
-    source: str
-    ref: str
-    digest: str
-    publisher: str | None = None
-    origin: Literal["git", "catalog", "legacy-unknown"] = "legacy-unknown"
-
-
-def user_plugin_root() -> Path:
-    return Path.home() / ".ash" / "plugins"
-
-
-def extension_state_path() -> Path:
-    return Path.home() / ".ash" / "extensions.json"
-
-
-def plugin_install_records_path(destination_root: Path | None = None) -> Path:
-    root = (destination_root or user_plugin_root()).expanduser()
-    return root / PLUGIN_INSTALL_RECORDS_FILENAME
-
-
-def load_plugin_install_records(
-    destination_root: Path | None = None,
-) -> dict[str, PluginInstallRecord]:
-    root = (destination_root or user_plugin_root()).expanduser()
-    _require_anchored_plugin_mutation()
-    try:
-        directory = AnchoredDirectory.open(root, create=False)
-    except FileNotFoundError:
-        return {}
-    except (AnchoredFilesystemError, OSError) as exc:
-        raise _lifecycle_error("plugin install records", exc) from exc
-    try:
-        return _read_plugin_install_records_at(directory, root)
-    except PluginLifecycleError:
-        raise
-    except (AnchoredFilesystemError, OSError) as exc:
-        raise _lifecycle_error("plugin install records", exc) from exc
-    finally:
-        directory.close()
-
-
-def require_plugin_install_record_current(record: PluginInstallRecord) -> None:
-    """Fail if one managed plugin's provenance changed since it was read."""
-
-    root = user_plugin_root().expanduser()
-    _require_anchored_plugin_mutation()
-    try:
-        with (
-            AnchoredDirectory.open(root, create=False) as directory,
-            directory.lock(".ash-lifecycle.lock"),
-        ):
-            current = _read_plugin_install_records_at(directory, root).get(record.name)
-            if current != record:
-                raise PluginLifecycleError(
-                    f"plugin {record.name!r} changed while update was in progress"
-                )
-    except FileNotFoundError as exc:
-        raise PluginLifecycleError(
-            f"plugin {record.name!r} changed while update was in progress"
-        ) from exc
-    except PluginLifecycleError:
-        raise
-    except (AnchoredFilesystemError, OSError) as exc:
-        raise _lifecycle_error("plugin install records", exc) from exc
-
-
-def require_plugin_install_tree_current(
-    record: PluginInstallRecord,
-    snapshot: PluginSnapshot,
+def _validate_activation_transition(
+    manifest: PluginManifest,
+    manifests: Mapping[str, PluginManifest],
+    state: ExtensionState,
+    *,
+    enabled: bool,
 ) -> None:
-    """Fail if managed provenance or installed bytes differ from a trusted snapshot."""
-
-    root = user_plugin_root().expanduser()
-    _require_anchored_plugin_mutation()
-    try:
-        with (
-            AnchoredDirectory.open(root, create=False) as directory,
-            directory.lock(".ash-lifecycle.lock"),
-        ):
-            current = _read_plugin_install_records_at(directory, root).get(record.name)
-            if current != record:
-                raise PluginLifecycleError(
-                    f"plugin {record.name!r} changed while update was in progress"
-                )
-            metadata = directory.stat(record.name)
-            if (
-                metadata is None
-                or stat.S_ISLNK(metadata.st_mode)
-                or not stat.S_ISDIR(metadata.st_mode)
-            ):
-                raise PluginLifecycleError(
-                    f"installed plugin {record.name!r} differs from trusted source; "
-                    "reinstall it before updating"
-                )
-            with directory.child(record.name, expected=metadata) as plugin_directory:
-                try:
-                    snapshot.verify_materialized(plugin_directory)
-                except (PluginSnapshotError, AnchoredFilesystemError, OSError) as exc:
-                    raise PluginLifecycleError(
-                        f"installed plugin {record.name!r} differs from trusted source; "
-                        "reinstall it before updating"
-                    ) from exc
-                if not directory.same_entry(record.name, plugin_directory.descriptor):
-                    raise PluginLifecycleError(
-                        f"plugin {record.name!r} changed while update was in progress"
-                    )
-    except FileNotFoundError as exc:
-        raise PluginLifecycleError(
-            f"plugin {record.name!r} changed while update was in progress"
-        ) from exc
-    except PluginLifecycleError:
-        raise
-    except (AnchoredFilesystemError, OSError) as exc:
-        raise _lifecycle_error("installed plugin integrity", exc) from exc
-
-
-def _validate_plugin_install_record(record: PluginInstallRecord) -> None:
-    _validate_plugin_name(record.name)
-    try:
-        parse_version(record.version)
-    except InvalidVersion as exc:
-        raise PluginLifecycleError("plugin install record version is invalid") from exc
-    if not record.source or len(record.source) > 2048 or any(
-        ord(character) < 32 or ord(character) == 127 for character in record.source
-    ):
-        raise PluginLifecycleError("plugin install record source is invalid")
-    if not record.ref or len(record.ref) > 255 or any(
-        character in "\x00\r\n" for character in record.ref
-    ):
-        raise PluginLifecycleError("plugin install record ref is invalid")
-    if not _GIT_DIGEST.fullmatch(record.digest):
-        raise PluginLifecycleError("plugin install record digest is invalid")
-    if record.publisher is not None:
-        from ash.plugins.catalog import validate_catalog_publisher
-
-        try:
-            validate_catalog_publisher(record.publisher)
-        except PluginCatalogError as exc:
-            raise PluginLifecycleError("plugin install record publisher is invalid") from exc
-    if record.origin not in {"git", "catalog", "legacy-unknown"}:
-        raise PluginLifecycleError("plugin install record origin is invalid")
-    if record.origin != "catalog" and record.publisher is not None:
-        raise PluginLifecycleError(
-            "plugin install record publisher requires catalog origin"
-        )
-
-
-def _parse_plugin_install_records(
-    raw: bytes,
-    path: Path,
-) -> dict[str, PluginInstallRecord]:
-    try:
-        payload = strict_json_loads(raw)
-    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
-        raise PluginLifecycleError(
-            f"cannot load plugin install records {path}: {exc}"
-        ) from exc
-    if not isinstance(payload, dict) or set(payload) != {"version", "plugins"}:
-        raise PluginLifecycleError(f"invalid plugin install records: {path}")
-    version = payload["version"]
-    if version not in {1, PLUGIN_INSTALL_RECORDS_VERSION}:
-        raise PluginLifecycleError(f"invalid plugin install records: {path}")
-    plugins = payload["plugins"]
-    if not isinstance(plugins, dict) or len(plugins) > MAX_PLUGIN_INSTALL_RECORDS:
-        raise PluginLifecycleError(f"invalid plugin install records: {path}")
-    records: dict[str, PluginInstallRecord] = {}
-    for name, item in plugins.items():
-        if not isinstance(name, str) or not isinstance(item, dict):
-            raise PluginLifecycleError(f"invalid plugin install records: {path}")
-        expected_keys = {"version", "source", "ref", "digest", "publisher"}
-        if version == PLUGIN_INSTALL_RECORDS_VERSION:
-            expected_keys.add("origin")
-        if set(item) != expected_keys:
-            raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
-        values = (item["version"], item["source"], item["ref"], item["digest"])
-        if not all(isinstance(value, str) for value in values):
-            raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
-        publisher = item["publisher"]
-        if publisher is not None and not isinstance(publisher, str):
-            raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
-        origin: Literal["git", "catalog", "legacy-unknown"]
-        if version == 1:
-            origin = "catalog" if publisher is not None else "legacy-unknown"
-        else:
-            raw_origin = item["origin"]
-            if not isinstance(raw_origin, str):
-                raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
-            if raw_origin == "git":
-                origin = "git"
-            elif raw_origin == "catalog":
-                origin = "catalog"
-            elif raw_origin == "legacy-unknown":
-                origin = "legacy-unknown"
-            else:
-                raise PluginLifecycleError(f"invalid plugin install record for {name!r}")
-        record = PluginInstallRecord(
-            name=name,
-            version=item["version"],
-            source=item["source"],
-            ref=item["ref"],
-            digest=item["digest"],
-            publisher=publisher,
-            origin=origin,
-        )
-        _validate_plugin_install_record(record)
-        records[name] = record
-    return records
-
-
-def _read_plugin_install_records_at(
-    directory: AnchoredDirectory,
-    root: Path,
-) -> dict[str, PluginInstallRecord]:
-    raw = directory.read_file(
-        PLUGIN_INSTALL_RECORDS_FILENAME,
-        max_bytes=MAX_PLUGIN_INSTALL_RECORDS_BYTES,
-    )
-    if raw is None:
-        return {}
-    return _parse_plugin_install_records(raw, plugin_install_records_path(root))
-
-
-def _save_plugin_install_records_at(
-    directory: AnchoredDirectory,
-    records: dict[str, PluginInstallRecord],
-) -> None:
-    if len(records) > MAX_PLUGIN_INSTALL_RECORDS:
-        raise PluginLifecycleError(
-            f"plugin install records exceed {MAX_PLUGIN_INSTALL_RECORDS} entries"
-        )
-    for name, record in records.items():
-        if name != record.name:
-            raise PluginLifecycleError("plugin install record key does not match name")
-        _validate_plugin_install_record(record)
-    existing = directory.stat(PLUGIN_INSTALL_RECORDS_FILENAME)
-    if existing is not None and not stat.S_ISREG(existing.st_mode):
-        raise PluginLifecycleError("plugin install records state is not a regular file")
-    if not records:
-        if existing is not None:
-            directory.unlink(PLUGIN_INSTALL_RECORDS_FILENAME, expected=existing)
-            directory.sync()
+    if enabled:
+        versions = {
+            candidate: installed.version
+            for candidate, installed in manifests.items()
+            if candidate != manifest.name
+            and candidate not in state.disabled_plugins
+        }
+        errors = manifest.check_dependencies(versions)
+        if errors:
+            raise PluginLifecycleError("; ".join(errors))
         return
-    payload = {
-        "version": PLUGIN_INSTALL_RECORDS_VERSION,
-        "plugins": {
-            name: {
-                "version": record.version,
-                "source": record.source,
-                "ref": record.ref,
-                "digest": record.digest,
-                "publisher": record.publisher,
-                "origin": record.origin,
-            }
-            for name, record in sorted(records.items())
-        },
-    }
-    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    if len(data) > MAX_PLUGIN_INSTALL_RECORDS_BYTES:
-        raise PluginLifecycleError("plugin install records state is too large")
-    temporary = directory.unique_name(
-        f".{PLUGIN_INSTALL_RECORDS_FILENAME}.", ".tmp"
-    )
-    descriptor = -1
-    temporary_identity: os.stat_result | None = None
-    try:
-        descriptor = directory.create_file(temporary, mode=0o600)
-        temporary_identity = os.fstat(descriptor)
-        _write_all(descriptor, data)
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        directory.rename(
-            temporary,
-            PLUGIN_INSTALL_RECORDS_FILENAME,
-            expected_source=temporary_identity,
+
+    dependents = sorted(
+        candidate
+        for candidate, installed in manifests.items()
+        if candidate != manifest.name
+        and candidate not in state.disabled_plugins
+        and any(
+            dependency.get("name") == manifest.name
+            for dependency in installed.dependencies
         )
-        temporary = ""
-        directory.sync()
-    except BaseException as primary:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except BaseException as cleanup:
-                primary.add_note(f"install-record descriptor close failed: {cleanup}")
-            descriptor = -1
-        if temporary:
-            try:
-                directory.unlink(
-                    temporary,
-                    expected=temporary_identity,
-                    missing_ok=True,
-                )
-            except BaseException as cleanup:
-                primary.add_note(f"install-record temporary cleanup failed: {cleanup}")
-        raise
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    )
+    if dependents:
+        raise PluginLifecycleError(
+            f"cannot disable {manifest.name!r}; required by: "
+            + ", ".join(dependents)
+        )
 
 
-def _transition_plugin_install_records_at(
-    directory: AnchoredDirectory,
-    before: dict[str, PluginInstallRecord],
-    after: dict[str, PluginInstallRecord],
-) -> None:
-    try:
-        _save_plugin_install_records_at(directory, after)
-    except BaseException as primary:
-        try:
-            _save_plugin_install_records_at(directory, before)
-        except BaseException as cleanup:
-            primary.add_note(f"plugin install record rollback failed: {cleanup}")
-        raise
+def recover_plugin_lifecycle(destination_root: Path | None = None) -> bool:
+    """Recover one interrupted serialized plugin mutation, if present."""
 
-
-def load_extension_state(path: Path | None = None) -> ExtensionState:
-    state_path = path or extension_state_path()
-    if not supports_anchored_mutation():
-        try:
-            raw = read_bounded_open_file(
-                state_path,
-                MAX_EXTENSION_STATE_BYTES,
-                label="extension state",
-            )
-        except FileNotFoundError:
-            return ExtensionState()
-        except (OSError, ValueError) as exc:
-            raise _lifecycle_error("extension state", exc) from exc
-        return _parse_extension_state(raw, state_path)
-
+    root = (destination_root or user_plugin_root()).expanduser()
     _require_anchored_plugin_mutation()
     try:
-        directory = AnchoredDirectory.open(
-            state_path.parent,
+        with (
+            AnchoredDirectory.open(root, create=False) as root_directory,
+            root_directory.lock(".ash-lifecycle.lock"),
+        ):
+            return _recover_plugin_lifecycle_at(root_directory, root)
+    except FileNotFoundError:
+        return False
+    except PluginLifecycleError:
+        raise
+    except (AnchoredFilesystemError, OSError) as exc:
+        raise _lifecycle_error("plugin lifecycle recovery", exc) from exc
+
+
+def _recover_plugin_lifecycle_at(
+    root_directory: AnchoredDirectory,
+    root: Path,
+) -> bool:
+    journal = read_lifecycle_journal_at(root_directory)
+    if journal is None:
+        return False
+    if not journal.root_tree.matches(os.fstat(root_directory.descriptor)):
+        raise PluginLifecycleError("plugin lifecycle root changed before crash recovery")
+    if journal.phase == "committed":
+        _finish_committed_lifecycle_at(root_directory, root, journal)
+    else:
+        _rollback_prepared_lifecycle_at(root_directory, root, journal)
+    clear_lifecycle_journal_at(root_directory)
+    return True
+
+
+def _sync_lifecycle_root(root_directory: AnchoredDirectory) -> None:
+    root_directory.sync()
+    _sync_directory_strict(
+        root_directory.descriptor,
+        label="plugin lifecycle root",
+    )
+
+
+def _rollback_prepared_lifecycle_at(
+    root_directory: AnchoredDirectory,
+    root: Path,
+    journal: PluginLifecycleJournal,
+) -> None:
+    if journal.operation == "install":
+        _rollback_prepared_install_tree(root_directory, journal)
+        _remove_journal_stage(root_directory, journal)
+    else:
+        _rollback_prepared_uninstall_tree(root_directory, journal)
+    _restore_journal_record(root_directory, root, journal)
+    _restore_journal_activation(journal)
+    _sync_lifecycle_root(root_directory)
+
+
+def _finish_committed_lifecycle_at(
+    root_directory: AnchoredDirectory,
+    root: Path,
+    journal: PluginLifecycleJournal,
+) -> None:
+    if journal.operation == "install":
+        current = root_directory.stat(journal.plugin)
+        if (
+            current is None
+            or journal.live_tree is None
+            or not journal.live_tree.matches(current)
+        ):
+            raise PluginLifecycleError(
+                f"committed plugin {journal.plugin!r} changed before crash recovery"
+            )
+        _verify_journal_record(root_directory, root, journal)
+        _verify_journal_activation(journal)
+        _remove_journal_moved_tree(root_directory, journal)
+        _remove_journal_stage(root_directory, journal)
+    else:
+        if root_directory.stat(journal.plugin) is not None:
+            raise PluginLifecycleError(
+                f"committed uninstall for {journal.plugin!r} has a live destination"
+            )
+        _verify_journal_record(root_directory, root, journal)
+        _verify_journal_activation(journal)
+        _remove_journal_moved_tree(root_directory, journal)
+    _sync_lifecycle_root(root_directory)
+
+
+def _rollback_prepared_install_tree(
+    root_directory: AnchoredDirectory,
+    journal: PluginLifecycleJournal,
+) -> None:
+    if journal.moved_name is not None:
+        previous = _open_journal_moved_tree(root_directory, journal)
+        try:
+            current = root_directory.stat(journal.plugin)
+            if (
+                current is not None
+                and journal.live_tree is not None
+                and journal.live_tree.matches(current)
+            ):
+                with root_directory.child(
+                    journal.plugin,
+                    expected=current,
+                ) as candidate:
+                    root_directory.remove_tree(
+                        journal.plugin,
+                        expected_descriptor=candidate.descriptor,
+                    )
+            _restore_moved_entry(
+                root_directory,
+                journal.plugin,
+                journal.moved_name,
+                conflict_prefix=f".{journal.plugin}.install-conflict-",
+                expected_descriptor=previous.descriptor,
+            )
+        finally:
+            previous.close()
+        return
+
+    current = root_directory.stat(journal.plugin)
+    if current is None:
+        return
+    if journal.live_tree is None or not journal.live_tree.matches(current):
+        raise PluginLifecycleError(
+            f"cannot safely recover interrupted install for {journal.plugin!r}; "
+            "live tree identity is unknown"
+        )
+    with root_directory.child(journal.plugin, expected=current) as candidate:
+        root_directory.remove_tree(
+            journal.plugin,
+            expected_descriptor=candidate.descriptor,
+        )
+
+
+def _remove_journal_stage(
+    root_directory: AnchoredDirectory,
+    journal: PluginLifecycleJournal,
+) -> None:
+    if journal.stage_name is None or journal.stage_tree is None:
+        return
+    metadata = root_directory.stat(journal.stage_name)
+    if metadata is None:
+        return
+    if not journal.stage_tree.matches(metadata):
+        raise PluginLifecycleError(
+            f"plugin lifecycle recovery stage changed: {journal.stage_name}"
+        )
+    with root_directory.child(journal.stage_name, expected=metadata) as stage:
+        root_directory.remove_tree(
+            journal.stage_name,
+            expected_descriptor=stage.descriptor,
+        )
+
+
+def _rollback_prepared_uninstall_tree(
+    root_directory: AnchoredDirectory,
+    journal: PluginLifecycleJournal,
+) -> None:
+    moved = root_directory.stat(journal.moved_name or "")
+    if moved is None:
+        current = root_directory.stat(journal.plugin)
+        if (
+            current is not None
+            and journal.previous_tree is not None
+            and journal.previous_tree.matches(current)
+        ):
+            return
+        raise PluginLifecycleError(
+            f"cannot safely recover interrupted uninstall for {journal.plugin!r}"
+        )
+    previous = _open_journal_moved_tree(root_directory, journal)
+    try:
+        _restore_moved_entry(
+            root_directory,
+            journal.plugin,
+            journal.moved_name or "",
+            conflict_prefix=f".{journal.plugin}.uninstall-conflict-",
+            expected_descriptor=previous.descriptor,
+        )
+    finally:
+        previous.close()
+
+
+def _open_journal_moved_tree(
+    root_directory: AnchoredDirectory,
+    journal: PluginLifecycleJournal,
+) -> AnchoredDirectory:
+    if journal.moved_name is None or journal.previous_tree is None:
+        raise PluginLifecycleError("plugin lifecycle journal lacks moved-tree identity")
+    metadata = root_directory.stat(journal.moved_name)
+    if metadata is None or not journal.previous_tree.matches(metadata):
+        raise PluginLifecycleError(
+            f"plugin lifecycle recovery tree changed: {journal.moved_name}"
+        )
+    return root_directory.child(journal.moved_name, expected=metadata)
+
+
+def _remove_journal_moved_tree(
+    root_directory: AnchoredDirectory,
+    journal: PluginLifecycleJournal,
+) -> None:
+    if journal.moved_name is None:
+        return
+    metadata = root_directory.stat(journal.moved_name)
+    if metadata is None:
+        return
+    moved = _open_journal_moved_tree(root_directory, journal)
+    try:
+        root_directory.remove_tree(
+            journal.moved_name,
+            expected_descriptor=moved.descriptor,
+        )
+    finally:
+        moved.close()
+
+
+def _restore_journal_record(
+    root_directory: AnchoredDirectory,
+    root: Path,
+    journal: PluginLifecycleJournal,
+) -> None:
+    if not journal.manage_record:
+        return
+    records = _read_plugin_install_records_at(root_directory, root)
+    current = records.get(journal.plugin)
+    if current not in {journal.previous_record, journal.desired_record}:
+        raise PluginLifecycleError(
+            f"plugin {journal.plugin!r} provenance changed before crash recovery"
+        )
+    restored = dict(records)
+    if journal.previous_record is None:
+        restored.pop(journal.plugin, None)
+    else:
+        restored[journal.plugin] = journal.previous_record
+    _transition_plugin_install_records_at(root_directory, records, restored)
+
+
+def _verify_journal_record(
+    root_directory: AnchoredDirectory,
+    root: Path,
+    journal: PluginLifecycleJournal,
+) -> None:
+    if not journal.manage_record:
+        return
+    current = _read_plugin_install_records_at(root_directory, root).get(journal.plugin)
+    if current != journal.desired_record:
+        raise PluginLifecycleError(
+            f"committed plugin {journal.plugin!r} provenance changed before recovery"
+        )
+
+
+def _restore_journal_activation(journal: PluginLifecycleJournal) -> None:
+    if journal.state_path is None or journal.previous_disabled is None:
+        return
+    _verify_journal_state_parent(journal)
+    _transition_extension_state(
+        journal.plugin,
+        enabled=not journal.previous_disabled,
+        path=Path(journal.state_path),
+    )
+
+
+def _verify_journal_activation(journal: PluginLifecycleJournal) -> None:
+    if journal.state_path is None or journal.desired_disabled is None:
+        return
+    _verify_journal_state_parent(journal)
+    state = load_extension_state(Path(journal.state_path))
+    if (journal.plugin in state.disabled_plugins) != journal.desired_disabled:
+        raise PluginLifecycleError(
+            f"committed plugin {journal.plugin!r} activation state changed before recovery"
+        )
+
+
+def _state_parent_identity(path: Path) -> TreeIdentity:
+    try:
+        with AnchoredDirectory.open(
+            path.parent,
+            create=True,
+            private=False,
+        ) as directory:
+            return TreeIdentity.from_stat(os.fstat(directory.descriptor))
+    except (AnchoredFilesystemError, OSError) as exc:
+        raise PluginLifecycleError(
+            f"plugin activation state parent is unavailable: {path.parent}"
+        ) from exc
+
+
+def _verify_journal_state_parent(journal: PluginLifecycleJournal) -> None:
+    if journal.state_path is None or journal.state_parent_tree is None:
+        return
+    parent = Path(journal.state_path).parent
+    try:
+        with AnchoredDirectory.open(
+            parent,
             create=False,
             private=False,
-        )
-    except FileNotFoundError:
-        return ExtensionState()
-    except (AnchoredFilesystemError, OSError) as exc:
-        raise _lifecycle_error("extension state", exc) from exc
-    try:
-        return _read_extension_state_at(directory, state_path)
+        ) as directory:
+            if not journal.state_parent_tree.matches(os.fstat(directory.descriptor)):
+                raise PluginLifecycleError(
+                    "plugin activation state parent changed before crash recovery"
+                )
+    except FileNotFoundError as exc:
+        raise PluginLifecycleError(
+            "plugin activation state parent disappeared before crash recovery"
+        ) from exc
     except PluginLifecycleError:
         raise
     except (AnchoredFilesystemError, OSError) as exc:
-        raise _lifecycle_error("extension state", exc) from exc
-    finally:
-        directory.close()
-
-
-def _parse_extension_state(raw: bytes, state_path: Path) -> ExtensionState:
-    try:
-        payload = strict_json_loads(raw)
-    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise PluginLifecycleError(
-            f"cannot load extension state {state_path}: {exc}"
+            "plugin activation state parent could not be verified during recovery"
         ) from exc
-    if not isinstance(payload, dict) or payload.get("version") != STATE_VERSION:
-        raise PluginLifecycleError(f"invalid extension state: {state_path}")
-    disabled = payload.get("disabled_plugins", [])
-    if not isinstance(disabled, list) or not all(
-        isinstance(name, str) and name for name in disabled
-    ):
+
+
+def load_managed_plugin_for_update(
+    name: str,
+) -> tuple[InstalledPlugin, PluginInstallRecord]:
+    """Read one managed update identity from Ash-owned provenance.
+
+    The live plugin tree is deliberately not trusted for update eligibility. A
+    changed trusted revision may be the recovery path for arbitrary local tree
+    damage, including a missing or malformed manifest. Unchanged revisions
+    still verify the complete installed tree against trusted source before
+    reporting a no-op.
+    """
+
+    _validate_plugin_name(name)
+    root = user_plugin_root().expanduser()
+    destination = root / name
+    _require_anchored_plugin_mutation()
+    try:
+        with (
+            AnchoredDirectory.open(root, create=False) as root_directory,
+            root_directory.lock(".ash-lifecycle.lock"),
+        ):
+            _recover_plugin_lifecycle_at(root_directory, root)
+            record = _read_plugin_install_records_at(root_directory, root).get(name)
+            if record is None:
+                raise PluginLifecycleError(
+                    f"plugin {name!r} is not tracked for updates; reinstall it from Git "
+                    "or a signed catalog"
+                )
+            return InstalledPlugin(record.name, record.version, destination, record), record
+    except FileNotFoundError as exc:
         raise PluginLifecycleError(
-            f"disabled_plugins must be a list of names: {state_path}"
-        )
-    return ExtensionState(disabled_plugins=frozenset(disabled))
+            f"plugin {name!r} is not tracked for updates; reinstall it from Git "
+            "or a signed catalog"
+        ) from exc
+    except PluginLifecycleError:
+        raise
+    except (AnchoredFilesystemError, OSError) as exc:
+        raise _lifecycle_error("managed plugin update state", exc) from exc
 
 
-def set_plugin_enabled(
+def set_local_plugin_enabled(
     name: str,
     *,
     enabled: bool,
-    path: Path | None = None,
-) -> ExtensionState:
+    state_path: Path | None = None,
+) -> InstalledPlugin:
+    """Atomically validate plugin topology and change one user plugin's state."""
+
     _validate_plugin_name(name)
+    root = user_plugin_root().expanduser()
+    destination = root / name
     _require_anchored_plugin_mutation()
-    state_path = path or extension_state_path()
     try:
         with (
-            AnchoredDirectory.open(state_path.parent, create=True) as directory,
-            directory.lock(f".{state_path.name}.lock"),
+            AnchoredDirectory.open(root, create=False) as root_directory,
+            root_directory.lock(".ash-lifecycle.lock"),
         ):
-            directory.prepare_durable_mutation()
-            state = _read_extension_state_at(directory, state_path)
-            disabled = set(state.disabled_plugins)
+            _recover_plugin_lifecycle_at(root_directory, root)
+            root_directory.prepare_durable_mutation()
+            manifests = _installed_plugin_manifests_strict_at(root_directory)
+            manifest = manifests.get(name)
+            if manifest is None:
+                raise PluginLifecycleError(f"plugin is not installed: {name}")
+
             if enabled:
-                disabled.discard(name)
-            else:
-                disabled.add(name)
-            updated = ExtensionState(disabled_plugins=frozenset(disabled))
-            _save_extension_state_at(directory, updated, state_path)
-            return updated
+                metadata = root_directory.stat(name)
+                if (
+                    metadata is None
+                    or stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISDIR(metadata.st_mode)
+                ):
+                    raise PluginLifecycleError(f"plugin is not installed: {name}")
+                with root_directory.child(name, expected=metadata) as plugin_directory:
+                    snapshot = PluginSnapshot.capture(
+                        plugin_directory,
+                        max_files=MAX_PLUGIN_FILES,
+                        max_bytes=MAX_PLUGIN_BYTES,
+                        max_entries=MAX_PLUGIN_TREE_ENTRIES,
+                        max_depth=MAX_PLUGIN_TREE_DEPTH,
+                    )
+                    try:
+                        snapshot_manifest = _load_manifest_snapshot(snapshot)
+                        _validate_manifest_snapshot(snapshot_manifest, snapshot)
+                        if snapshot_manifest != manifest:
+                            raise PluginLifecycleError(
+                                f"plugin {name!r} changed while enablement was checked"
+                            )
+                        validate_plugin_contents_at(snapshot, snapshot_manifest)
+                    finally:
+                        snapshot.close()
+                    if not root_directory.same_entry(name, plugin_directory.descriptor):
+                        raise PluginLifecycleError(
+                            f"plugin {name!r} changed while enablement was checked"
+                        )
+
+            def validate_state(state: ExtensionState) -> None:
+                _validate_activation_transition(
+                    manifest,
+                    manifests,
+                    state,
+                    enabled=enabled,
+                )
+
+            _transition_extension_state_checked(
+                name,
+                enabled=enabled,
+                path=state_path,
+                validator=validate_state,
+            )
+            return InstalledPlugin(manifest.name, manifest.version, destination)
+    except FileNotFoundError as exc:
+        raise PluginLifecycleError(f"plugin is not installed: {name}") from exc
     except PluginLifecycleError:
         raise
     except (AnchoredFilesystemError, OSError) as exc:
-        raise _lifecycle_error("extension state", exc) from exc
+        raise _lifecycle_error("plugin lifecycle", exc) from exc
 
 
 def install_local_plugin(
@@ -490,13 +579,33 @@ def install_local_plugin(
     *,
     destination_root: Path | None = None,
     replace: bool = False,
+    enabled: bool | None = None,
+    state_path: Path | None = None,
     validator: Callable[[Path, PluginManifest], None] | None = None,
     _validator_at: Callable[[PluginSnapshot, PluginManifest], None] | None = None,
+    _topology_validator: (
+        Callable[[PluginManifest, Mapping[str, PluginManifest]], None] | None
+    ) = None,
     _source_directory: AnchoredDirectory | None = None,
     _snapshot: PluginSnapshot | None = None,
+    _state_validator: (
+        Callable[
+            [PluginManifest, ExtensionState, Mapping[str, PluginManifest]],
+            None,
+        ]
+        | None
+    ) = None,
     _install_record: PluginInstallRecord | None | object = _INSTALL_RECORD_UNCHANGED,
     _expected_install_record: PluginInstallRecord | object = _INSTALL_RECORD_UNCHANGED,
 ) -> InstalledPlugin:
+    if enabled is not None and destination_root is not None:
+        raise PluginLifecycleError(
+            "plugin activation state is only available for the user plugin root"
+        )
+    if enabled is not None and _state_validator is not None:
+        raise PluginLifecycleError(
+            "plugin activation and publication-state validation cannot be combined"
+        )
     source_path = source.expanduser()
     if destination_root is None and _install_record is _INSTALL_RECORD_UNCHANGED:
         _install_record = None
@@ -569,9 +678,10 @@ def install_local_plugin(
         destination = root / manifest.name
         try:
             with (
-                AnchoredDirectory.open(root, create=True) as root_directory,
-                root_directory.lock(".ash-lifecycle.lock"),
-            ):
+            AnchoredDirectory.open(root, create=True) as root_directory,
+            root_directory.lock(".ash-lifecycle.lock"),
+        ):
+                _recover_plugin_lifecycle_at(root_directory, root)
                 root_directory.prepare_durable_mutation()
                 install_records_before: dict[str, PluginInstallRecord] | None = None
                 if (
@@ -592,15 +702,8 @@ def install_local_plugin(
                             f"plugin {_expected_install_record.name!r} changed while "
                             "update was in progress"
                         )
-                installed_versions = _installed_plugin_versions_at(
-                    root_directory,
-                    excluding=manifest.name,
-                )
-                dependency_errors = manifest.check_dependencies(installed_versions)
-                if dependency_errors:
-                    raise PluginLifecycleError("; ".join(dependency_errors))
-
                 existing = root_directory.stat(manifest.name)
+                current_version: str | None = None
                 if existing is not None:
                     if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
                         raise PluginLifecycleError(
@@ -610,6 +713,58 @@ def install_local_plugin(
                         raise PluginLifecycleError(
                             f"plugin {manifest.name!r} is already installed; use --replace"
                         )
+                    try:
+                        with root_directory.child(
+                            manifest.name,
+                            expected=existing,
+                        ) as current_directory:
+                            current_manifest = _load_manifest_at(
+                                current_directory,
+                                "plugin.json",
+                            )
+                            _validate_manifest_at(current_manifest, current_directory)
+                    except (
+                        AnchoredFilesystemError,
+                        OSError,
+                        ValueError,
+                        TypeError,
+                    ):
+                        current_manifest = None
+                    if (
+                        current_manifest is not None
+                        and current_manifest.name == manifest.name
+                    ):
+                        current_version = current_manifest.version
+
+                installed_manifests = _installed_plugin_manifests_at(
+                    root_directory,
+                    excluding=manifest.name,
+                )
+                activation_manifests = dict(installed_manifests)
+                activation_manifests[manifest.name] = manifest
+                installed_versions = {
+                    name: installed.version
+                    for name, installed in installed_manifests.items()
+                }
+                dependency_errors = manifest.check_dependencies(installed_versions)
+                if dependency_errors:
+                    raise PluginLifecycleError("; ".join(dependency_errors))
+                reverse_dependency_errors = _new_reverse_dependency_errors(
+                    installed_manifests,
+                    target=manifest.name,
+                    before_version=current_version,
+                    after_version=manifest.version,
+                )
+                if reverse_dependency_errors:
+                    raise PluginLifecycleError("; ".join(reverse_dependency_errors))
+                if _topology_validator is not None:
+                    _topology_validator(
+                        manifest,
+                        _installed_plugin_manifests_strict_at(
+                            root_directory,
+                            excluding=manifest.name,
+                        ),
+                    )
 
                 stage_name = root_directory.unique_name(".install-", ".tmp")
                 stage_directory = root_directory.create_child(stage_name)
@@ -618,6 +773,7 @@ def install_local_plugin(
                 destination_directory: AnchoredDirectory | None = None
                 destination_moved = False
                 published = False
+                lifecycle_journal: PluginLifecycleJournal | None = None
                 primary: BaseException | None = None
                 cleanup_errors: list[BaseException] = []
                 try:
@@ -638,78 +794,199 @@ def install_local_plugin(
                             raise PluginLifecycleError(
                                 f"invalid plugin component: {exc}"
                             ) from exc
-                    current = root_directory.stat(manifest.name)
-                    if existing is None:
-                        if current is not None:
-                            raise AnchoredFilesystemError(
-                                "plugin destination appeared during installation"
-                            )
-                    else:
-                        if current is None or not _same_metadata(existing, current):
-                            raise AnchoredFilesystemError(
-                                "plugin destination changed during installation"
-                            )
-                        if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(
-                            current.st_mode
-                        ):
-                            raise PluginLifecycleError(
-                                f"plugin destination is not a directory: {destination}"
-                            )
-                        backup_directory = root_directory.child(
-                            manifest.name,
-                            expected=current,
-                        )
-                        backup_name = root_directory.unique_name(
-                            f".{manifest.name}.backup-"
-                        )
-                        root_directory.rename(
-                            manifest.name,
-                            backup_name,
-                            expected_source_descriptor=backup_directory.descriptor,
-                        )
-                        if not root_directory.same_entry(
-                            backup_name,
-                            backup_directory.descriptor,
-                        ):
-                            raise AnchoredFilesystemError(
-                                "plugin destination changed during replacement"
-                            )
-                        destination_moved = True
-
-                    # Publication is a descriptor-relative population into a
-                    # directory created under the held destination root. The
-                    # validated stage name is never renamed into the live slot.
-                    destination_directory = root_directory.create_child(manifest.name)
-                    snapshot.write_to(destination_directory)
-                    _validate_tree_at(destination_directory)
-                    snapshot.verify_materialized(destination_directory)
-                    installed_manifest = _load_manifest_at(
-                        destination_directory,
-                        "plugin.json",
+                    backup_name = (
+                        root_directory.unique_name(f".{manifest.name}.backup-")
+                        if existing is not None
+                        else None
                     )
-                    _validate_manifest_at(installed_manifest, destination_directory)
-                    if installed_manifest != staged_manifest:
-                        raise AnchoredFilesystemError(
-                            "plugin changed while being published"
+                    state_journal_path: Path | None = None
+                    previous_disabled: bool | None = None
+                    desired_disabled: bool | None = None
+                    if enabled is not None:
+                        state_journal_path = Path(
+                            state_path or extension_state_path()
+                        ).expanduser().absolute()
+                        state_parent_tree = _state_parent_identity(state_journal_path)
+                        state_before = load_extension_state(state_journal_path)
+                        previous_disabled = (
+                            manifest.name in state_before.disabled_plugins
                         )
-                    _verify_visible_destination(
-                        root_directory,
-                        destination_directory,
-                        destination,
+                        desired_disabled = not enabled
+                    previous_record = (
+                        install_records_before.get(manifest.name)
+                        if install_records_before is not None
+                        else None
                     )
-                    if install_records_before is not None:
-                        install_records_after = dict(install_records_before)
-                        if _install_record is None:
-                            install_records_after.pop(manifest.name, None)
+                    desired_record = (
+                        _install_record
+                        if isinstance(_install_record, PluginInstallRecord)
+                        else None
+                    )
+                    lifecycle_journal = PluginLifecycleJournal(
+                        operation="install",
+                        phase="prepared",
+                        plugin=manifest.name,
+                        root_tree=TreeIdentity.from_stat(
+                            os.fstat(root_directory.descriptor)
+                        ),
+                        stage_name=stage_name,
+                        stage_tree=TreeIdentity.from_stat(
+                            os.fstat(stage_directory.descriptor)
+                        ),
+                        moved_name=backup_name,
+                        previous_tree=(
+                            TreeIdentity.from_stat(existing)
+                            if existing is not None
+                            else None
+                        ),
+                        manage_record=install_records_before is not None,
+                        previous_record=previous_record,
+                        desired_record=desired_record,
+                        state_path=(
+                            str(state_journal_path)
+                            if state_journal_path is not None
+                            else None
+                        ),
+                        state_parent_tree=(
+                            state_parent_tree if enabled is not None else None
+                        ),
+                        previous_disabled=previous_disabled,
+                        desired_disabled=desired_disabled,
+                    )
+                    write_lifecycle_journal_at(root_directory, lifecycle_journal)
+                    state_guard = (
+                        locked_extension_state(path=state_path)
+                        if _state_validator is not None
+                        else nullcontext(None)
+                    )
+                    with state_guard as publication_state:
+                        if _state_validator is not None:
+                            assert publication_state is not None
+                            _state_validator(
+                                staged_manifest,
+                                publication_state,
+                                _installed_plugin_manifests_strict_at(
+                                    root_directory,
+                                    excluding=staged_manifest.name,
+                                ),
+                            )
+                        current = root_directory.stat(manifest.name)
+                        if existing is None:
+                            if current is not None:
+                                raise AnchoredFilesystemError(
+                                    "plugin destination appeared during installation"
+                                )
                         else:
-                            assert isinstance(_install_record, PluginInstallRecord)
-                            install_records_after[manifest.name] = _install_record
-                        _transition_plugin_install_records_at(
-                            root_directory,
-                            install_records_before,
-                            install_records_after,
+                            if current is None or not _same_metadata(existing, current):
+                                raise AnchoredFilesystemError(
+                                    "plugin destination changed during installation"
+                                )
+                            if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(
+                                current.st_mode
+                            ):
+                                raise PluginLifecycleError(
+                                    f"plugin destination is not a directory: {destination}"
+                                )
+                            backup_directory = root_directory.child(
+                                manifest.name,
+                                expected=current,
+                            )
+                            assert backup_name is not None
+                            root_directory.rename(
+                                manifest.name,
+                                backup_name,
+                                expected_source_descriptor=backup_directory.descriptor,
+                            )
+                            if not root_directory.same_entry(
+                                backup_name,
+                                backup_directory.descriptor,
+                            ):
+                                raise AnchoredFilesystemError(
+                                    "plugin destination changed during replacement"
+                                )
+                            destination_moved = True
+
+                        # Publication is a descriptor-relative population into a
+                        # directory created under the held destination root. The
+                        # validated stage name is never renamed into the live slot.
+                        destination_directory = root_directory.create_child(manifest.name)
+                        lifecycle_journal = lifecycle_journal.with_live_tree(
+                            os.fstat(destination_directory.descriptor)
                         )
-                    published = True
+                        write_lifecycle_journal_at(
+                            root_directory,
+                            lifecycle_journal,
+                        )
+                        snapshot.write_to(destination_directory)
+                        _validate_tree_at(destination_directory)
+                        snapshot.verify_materialized(destination_directory)
+                        installed_manifest = _load_manifest_at(
+                            destination_directory,
+                            "plugin.json",
+                        )
+                        _validate_manifest_at(installed_manifest, destination_directory)
+                        if installed_manifest != staged_manifest:
+                            raise AnchoredFilesystemError(
+                                "plugin changed while being published"
+                            )
+                        _verify_visible_destination(
+                            root_directory,
+                            destination_directory,
+                            destination,
+                        )
+                        if install_records_before is not None:
+                            install_records_after = dict(install_records_before)
+                            if _install_record is None:
+                                install_records_after.pop(manifest.name, None)
+                            else:
+                                assert isinstance(_install_record, PluginInstallRecord)
+                                install_records_after[manifest.name] = _install_record
+                            _transition_plugin_install_records_at(
+                                root_directory,
+                                install_records_before,
+                                install_records_after,
+                            )
+                        if enabled is not None:
+                            assert previous_disabled is not None
+
+                            def validate_activation_state(
+                                state: ExtensionState,
+                            ) -> None:
+                                if (
+                                    manifest.name in state.disabled_plugins
+                                ) != previous_disabled:
+                                    raise PluginLifecycleError(
+                                        f"plugin {manifest.name!r} activation state "
+                                        "changed while installation was in progress"
+                                    )
+                                _validate_activation_transition(
+                                    manifest,
+                                    activation_manifests,
+                                    state,
+                                    enabled=enabled,
+                                )
+
+                            _transition_extension_state_checked(
+                                manifest.name,
+                                enabled=enabled,
+                                path=state_path,
+                                validator=validate_activation_state,
+                            )
+                        # Keep dependency/activation state stable through the
+                        # actual commit checkpoint.  Once this succeeds, later
+                        # state changes apply to an already committed plugin.
+                        _sync_lifecycle_root(root_directory)
+                        _verify_visible_destination(
+                            root_directory,
+                            destination_directory,
+                            destination,
+                        )
+                        lifecycle_journal = lifecycle_journal.committed()
+                        write_lifecycle_journal_at(
+                            root_directory,
+                            lifecycle_journal,
+                        )
+                        published = True
                     if destination_moved and backup_name is not None:
                         assert backup_directory is not None
                         root_directory.remove_tree(
@@ -717,42 +994,49 @@ def install_local_plugin(
                             expected_descriptor=backup_directory.descriptor,
                         )
                         backup_name = None
-                    root_directory.sync()
+                    # Backup deletion is post-commit cleanup.  Failure here may
+                    # be reported, but must not roll provenance back underneath
+                    # an already committed live plugin tree.
+                    _sync_lifecycle_root(root_directory)
                     _verify_visible_destination(
                         root_directory,
                         destination_directory,
                         destination,
                     )
+                    root_directory.remove_tree(
+                        stage_name,
+                        expected_descriptor=stage_directory.descriptor,
+                    )
+                    stage_name = ""
+                    _sync_lifecycle_root(root_directory)
+                    clear_lifecycle_journal_at(root_directory)
+                    lifecycle_journal = None
                     return InstalledPlugin(
                         manifest.name,
                         manifest.version,
                         destination,
+                        (
+                            _install_record
+                            if isinstance(_install_record, PluginInstallRecord)
+                            else None
+                        ),
                     )
                 except BaseException as exc:
                     primary = exc
-                    if destination_directory is not None and not published:
+                    if lifecycle_journal is not None and not published:
                         try:
-                            root_directory.remove_tree(
-                                manifest.name,
-                                expected_descriptor=destination_directory.descriptor,
-                            )
-                        except BaseException as cleanup:
-                            primary.add_note(f"candidate cleanup failed: {cleanup}")
-                    if destination_moved and not published and backup_name is not None:
-                        try:
-                            _restore_moved_entry(
+                            _rollback_prepared_lifecycle_at(
                                 root_directory,
-                                manifest.name,
-                                backup_name,
-                                conflict_prefix=f".{manifest.name}.install-conflict-",
-                                expected_descriptor=backup_directory.descriptor
-                                if backup_directory is not None
-                                else None,
+                                root,
+                                lifecycle_journal,
                             )
-                            if root_directory.stat(backup_name) is None:
-                                backup_name = None
+                            clear_lifecycle_journal_at(root_directory)
+                            lifecycle_journal = None
+                            backup_name = None
                         except BaseException as cleanup:
-                            primary.add_note(f"replacement rollback failed: {cleanup}")
+                            primary.add_note(
+                                f"durable plugin installation rollback failed: {cleanup}"
+                            )
                     raise
                 finally:
                     if stage_name:
@@ -815,6 +1099,9 @@ def uninstall_local_plugin(
     destination_root: Path | None = None,
     confirmed: bool = False,
     state_path: Path | None = None,
+    _preflight: (
+        Callable[[PluginManifest, Mapping[str, PluginManifest]], None] | None
+    ) = None,
 ) -> Path:
     _validate_plugin_name(name)
     if not confirmed:
@@ -822,12 +1109,14 @@ def uninstall_local_plugin(
     root = (destination_root or user_plugin_root()).expanduser()
     destination = root / name
     manage_install_record = destination_root is None
+    manage_activation_state = destination_root is None or state_path is not None
     _require_anchored_plugin_mutation()
     try:
         with (
             AnchoredDirectory.open(root, create=False) as root_directory,
             root_directory.lock(".ash-lifecycle.lock"),
         ):
+            _recover_plugin_lifecycle_at(root_directory, root)
             root_directory.prepare_durable_mutation()
             install_records_before: dict[str, PluginInstallRecord] | None = None
             install_records_after: dict[str, PluginInstallRecord] | None = None
@@ -859,10 +1148,53 @@ def uninstall_local_plugin(
                     raise PluginLifecycleError(
                         f"refusing to uninstall mismatched plugin {manifest.name!r} as {name!r}"
                     )
+                if _preflight is not None:
+                    _preflight(
+                        manifest,
+                        _installed_plugin_manifests_strict_at(root_directory),
+                    )
                 quarantine_name = root_directory.unique_name(f".{name}.uninstall-")
+                state_journal_path: Path | None = None
+                previous_disabled: bool | None = None
+                desired_disabled: bool | None = None
+                if manage_activation_state:
+                    state_journal_path = Path(
+                        state_path or extension_state_path()
+                    ).expanduser().absolute()
+                    state_parent_tree = _state_parent_identity(state_journal_path)
+                    state_before = load_extension_state(state_journal_path)
+                    previous_disabled = name in state_before.disabled_plugins
+                    desired_disabled = False
+                lifecycle_journal = PluginLifecycleJournal(
+                    operation="uninstall",
+                    phase="prepared",
+                    plugin=name,
+                    root_tree=TreeIdentity.from_stat(
+                        os.fstat(root_directory.descriptor)
+                    ),
+                    moved_name=quarantine_name,
+                    previous_tree=TreeIdentity.from_stat(destination_metadata),
+                    manage_record=manage_install_record,
+                    previous_record=(
+                        install_records_before.get(name)
+                        if install_records_before is not None
+                        else None
+                    ),
+                    desired_record=None,
+                    state_path=(
+                        str(state_journal_path)
+                        if state_journal_path is not None
+                        else None
+                    ),
+                    state_parent_tree=(
+                        state_parent_tree if manage_activation_state else None
+                    ),
+                    previous_disabled=previous_disabled,
+                    desired_disabled=desired_disabled,
+                )
+                write_lifecycle_journal_at(root_directory, lifecycle_journal)
                 primary: BaseException | None = None
-                record_transitioned = False
-                quarantine_removed = False
+                published = False
                 try:
                     root_directory.rename(
                         name,
@@ -885,48 +1217,52 @@ def uninstall_local_plugin(
                             install_records_before,
                             install_records_after,
                         )
-                        record_transitioned = True
+                    if manage_activation_state:
+                        assert previous_disabled is not None
+
+                        def validate_activation_state(state: ExtensionState) -> None:
+                            if (name in state.disabled_plugins) != previous_disabled:
+                                raise PluginLifecycleError(
+                                    f"plugin {name!r} activation state changed while "
+                                    "uninstall was in progress"
+                                )
+
+                        _transition_extension_state_checked(
+                            name,
+                            enabled=True,
+                            path=state_path,
+                            validator=validate_activation_state,
+                        )
+                    _sync_lifecycle_root(root_directory)
+                    lifecycle_journal = lifecycle_journal.committed()
+                    write_lifecycle_journal_at(root_directory, lifecycle_journal)
+                    published = True
                     root_directory.remove_tree(
                         quarantine_name,
                         expected_descriptor=plugin_directory.descriptor,
                     )
-                    quarantine_removed = True
-                    root_directory.sync()
+                    _sync_lifecycle_root(root_directory)
+                    clear_lifecycle_journal_at(root_directory)
                 except BaseException as exc:
                     primary = exc
-                    if (
-                        record_transitioned
-                        and not quarantine_removed
-                        and install_records_before is not None
-                        and install_records_after is not None
-                    ):
+                    if not published:
                         try:
-                            _transition_plugin_install_records_at(
+                            _rollback_prepared_lifecycle_at(
                                 root_directory,
-                                install_records_after,
-                                install_records_before,
+                                root,
+                                lifecycle_journal,
                             )
+                            clear_lifecycle_journal_at(root_directory)
+                            quarantine_name = ""
                         except BaseException as cleanup:
                             primary.add_note(
-                                f"install record restoration failed: {cleanup}"
+                                f"durable plugin uninstall rollback failed: {cleanup}"
                             )
-                    if not quarantine_removed:
-                        try:
-                            _restore_moved_entry(
-                                root_directory,
-                                name,
-                                quarantine_name,
-                                conflict_prefix=f".{name}.uninstall-conflict-",
-                                expected_descriptor=plugin_directory.descriptor,
-                            )
-                        except BaseException as cleanup:
-                            primary.add_note(f"uninstall rollback failed: {cleanup}")
                     raise
     except PluginLifecycleError:
         raise
     except (AnchoredFilesystemError, OSError) as exc:
         raise _lifecycle_error("plugin destination root", exc) from exc
-    set_plugin_enabled(name, enabled=True, path=state_path)
     return destination
 
 
@@ -1131,40 +1467,36 @@ def install_git_plugin(
     ref: str,
     destination_root: Path | None = None,
     replace: bool = False,
+    enabled: bool | None = None,
+    state_path: Path | None = None,
     validator: Callable[[Path, PluginManifest], None] | None = None,
     _validator_at: Callable[[PluginSnapshot, PluginManifest], None] | None = None,
     expected: CatalogEntry | None = None,
     _skip_if_digest: str | None = None,
     _unchanged: InstalledPlugin | None = None,
     _expected_previous_record: PluginInstallRecord | None = None,
+    _topology_validator: (
+        Callable[[PluginManifest, Mapping[str, PluginManifest]], None] | None
+    ) = None,
+    _state_validator: (
+        Callable[
+            [PluginManifest, ExtensionState, Mapping[str, PluginManifest]],
+            None,
+        ]
+        | None
+    ) = None,
 ) -> InstalledPlugin:
     _require_anchored_plugin_mutation()
-    parsed = urllib.parse.urlsplit(source)
-    scheme = parsed.scheme.lower()
-    if scheme == "https":
-        if not parsed.hostname:
-            raise PluginLifecycleError("plugin Git source must use an HTTPS URL")
-        if parsed.username is not None or parsed.password is not None:
-            raise PluginLifecycleError(
-                "plugin Git source URL cannot contain embedded credentials"
-            )
-        if parsed.query or parsed.fragment:
-            raise PluginLifecycleError(
-                "plugin Git source URL cannot contain a query or fragment"
-            )
-    elif scheme == "file":
-        if parsed.hostname not in {None, "", "localhost"}:
-            raise PluginLifecycleError("plugin file source must be local")
-    else:
-        raise PluginLifecycleError("plugin Git source must use an HTTPS URL")
+    try:
+        validate_plugin_git_source(source)
+    except ValueError as exc:
+        raise PluginLifecycleError(str(exc)) from exc
     if not ref:
         raise PluginLifecycleError("plugin Git source requires an explicit --ref")
     if len(ref) > 255 or "\x00" in ref or "\n" in ref or "\r" in ref:
         raise PluginLifecycleError("plugin Git reference is invalid")
-    if len(source) > 2048:
-        raise PluginLifecycleError("plugin Git source URL is too long")
     if _skip_if_digest is not None:
-        if not _GIT_DIGEST.fullmatch(_skip_if_digest) or _unchanged is None:
+        if not GIT_DIGEST_PATTERN.fullmatch(_skip_if_digest) or _unchanged is None:
             raise PluginLifecycleError("invalid tracked plugin update digest")
         if expected is not None and expected.digest != _skip_if_digest:
             raise PluginLifecycleError(
@@ -1185,6 +1517,7 @@ def install_git_plugin(
     temporary_name: str | None = None
     temporary_parent: AnchoredDirectory | None = None
     temporary_directory: AnchoredDirectory | None = None
+    git_home_directory: AnchoredDirectory | None = None
     checkout_directory: AnchoredDirectory | None = None
     snapshot: PluginSnapshot | None = None
     git_primary: BaseException | None = None
@@ -1206,6 +1539,10 @@ def install_git_plugin(
                 f"plugin Git temporary directory is unavailable: {exc}"
             ) from exc
         checkout_directory = temporary_directory.create_child("plugin")
+        git_home_directory = temporary_directory.create_child("git-home")
+        git_environment = isolated_git_environment(
+            git_home_directory.descriptor_path()
+        )
         checkout = checkout_directory.descriptor_path()
         with tempfile.TemporaryFile() as error_output:
             process = subprocess.Popen(
@@ -1223,9 +1560,8 @@ def install_git_plugin(
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=error_output,
-                pass_fds=(checkout_directory.descriptor,)
-                if os.name == "posix"
-                else (),
+                env=git_environment,
+                pass_fds=(checkout_directory.descriptor,),
                 **process_tree_plan.spawn_options,
             )
             deadline = time.monotonic() + MAX_GIT_CLONE_SECONDS
@@ -1286,7 +1622,11 @@ def install_git_plugin(
                 "could not clone plugin source"
                 + (f": {detail_text}" if detail_text else "")
             )
-        resolved_digest = _resolve_git_revision(checkout_directory, git_path)
+        resolved_digest = _resolve_git_revision(
+            checkout_directory,
+            git_path,
+            environment=git_environment,
+        )
         snapshot = PluginSnapshot.capture(
             checkout_directory,
             max_files=MAX_PLUGIN_FILES,
@@ -1297,11 +1637,11 @@ def install_git_plugin(
         )
         if expected is not None:
             _verify_catalog_checkout(
-                checkout,
                 source,
                 ref,
                 expected,
                 git_path=git_path,
+                git_environment=git_environment,
                 checkout_directory=checkout_directory,
                 snapshot=snapshot,
             )
@@ -1331,10 +1671,14 @@ def install_git_plugin(
             checkout,
             destination_root=destination_root,
             replace=replace,
+            enabled=enabled,
+            state_path=state_path,
             validator=validator,
             _validator_at=_validator_at,
+            _topology_validator=_topology_validator,
             _source_directory=checkout_directory,
             _snapshot=snapshot,
+            _state_validator=_state_validator,
             _install_record=install_record,
             _expected_install_record=(
                 _expected_previous_record
@@ -1357,6 +1701,11 @@ def install_git_plugin(
         if checkout_directory is not None:
             try:
                 checkout_directory.close()
+            except BaseException as cleanup:
+                cleanup_errors.append(cleanup)
+        if git_home_directory is not None:
+            try:
+                git_home_directory.close()
             except BaseException as cleanup:
                 cleanup_errors.append(cleanup)
         if (
@@ -1422,8 +1771,8 @@ def _tree_exceeds_bytes_at(directory: AnchoredDirectory, limit: int) -> bool:
                         if walk(child):
                             return True
                     except FileNotFoundError:
-                        # The held child can itself be removed before its
-                        # pathname-backed Windows traversal begins.
+                        # The held child can itself be removed between the
+                        # parent lookup and the descriptor-relative traversal.
                         continue
                 finally:
                     child.close()
@@ -1443,7 +1792,12 @@ def _terminate_git_clone(
     terminate_process_tree_sync(process, plan=plan, timeout_seconds=1.0)
 
 
-def _resolve_git_revision(directory: AnchoredDirectory, git_path: str) -> str:
+def _resolve_git_revision(
+    directory: AnchoredDirectory,
+    git_path: str,
+    *,
+    environment: Mapping[str, str],
+) -> str:
     completed = subprocess.run(
         [
             git_path,
@@ -1456,10 +1810,11 @@ def _resolve_git_revision(directory: AnchoredDirectory, git_path: str) -> str:
         stderr=subprocess.DEVNULL,
         check=False,
         text=True,
-        pass_fds=(directory.descriptor,) if os.name == "posix" else (),
+        env=dict(environment),
+        pass_fds=(directory.descriptor,),
     )
     digest = completed.stdout.strip().casefold()
-    if completed.returncode or not _GIT_DIGEST.fullmatch(digest):
+    if completed.returncode or not GIT_DIGEST_PATTERN.fullmatch(digest):
         raise PluginLifecycleError("could not resolve plugin Git revision")
     return digest
 
@@ -1487,42 +1842,19 @@ def _remove_git_metadata(directory: AnchoredDirectory) -> None:
 
 
 def _verify_catalog_checkout(
-    checkout: Path,
     source: str,
     ref: str,
     expected: CatalogEntry,
     *,
     git_path: str,
-    checkout_directory: AnchoredDirectory | None = None,
-    snapshot: PluginSnapshot | None = None,
+    git_environment: Mapping[str, str],
+    checkout_directory: AnchoredDirectory,
+    snapshot: PluginSnapshot,
 ) -> None:
     if expected.source != source or expected.ref != ref:
         raise PluginCatalogError("catalog entry does not match requested plugin source")
-
-    if checkout_directory is None:
-        try:
-            metadata = os.stat(checkout, follow_symlinks=False)
-            with AnchoredDirectory.open(
-                checkout,
-                create=False,
-                private=False,
-                expected=metadata,
-            ) as held_checkout:
-                _verify_catalog_checkout(
-                    checkout,
-                    source,
-                    ref,
-                    expected,
-                    git_path=git_path,
-                    checkout_directory=held_checkout,
-                )
-                return
-        except (OSError, AnchoredFilesystemError) as exc:
-            raise PluginCatalogError(
-                f"invalid catalog plugin checkout: {exc}"
-            ) from exc
-
     held_checkout = checkout_directory
+    verification_environment = dict(git_environment)
 
     def git(arguments: list[str]) -> str:
         completed = subprocess.run(
@@ -1538,7 +1870,8 @@ def _verify_catalog_checkout(
             stderr=subprocess.DEVNULL,
             check=False,
             text=True,
-            pass_fds=(held_checkout.descriptor,) if os.name == "posix" else (),
+            env=verification_environment,
+            pass_fds=(held_checkout.descriptor,),
         )
         if completed.returncode:
             raise PluginCatalogError("could not verify catalog plugin revision")
@@ -1547,13 +1880,8 @@ def _verify_catalog_checkout(
     if git(["rev-parse", "HEAD"]) != expected.digest:
         raise PluginCatalogError("catalog plugin digest does not match cloned revision")
     try:
-        if snapshot is not None:
-            staged_manifest = _load_manifest_snapshot(snapshot)
-            _validate_manifest_snapshot(staged_manifest, snapshot)
-        else:
-            _validate_tree_at(held_checkout)
-            staged_manifest = _load_manifest_at(held_checkout, "plugin.json")
-            _validate_manifest_at(staged_manifest, held_checkout)
+        staged_manifest = _load_manifest_snapshot(snapshot)
+        _validate_manifest_snapshot(staged_manifest, snapshot)
     except (OSError, UnicodeError, ValueError, TypeError, AnchoredFilesystemError) as exc:
         raise PluginCatalogError(f"invalid catalog plugin checkout: {exc}") from exc
     if staged_manifest.name != expected.name:
@@ -1589,38 +1917,10 @@ def _temporary_parent_path() -> Path:
     return temporary
 
 
-def _validate_plugin_name(name: str) -> None:
-    if not PLUGIN_NAME.fullmatch(name):
-        raise PluginLifecycleError("plugin name must be a path-safe identifier")
-
-
 def _validate_lifecycle_path(path: Path, label: str) -> None:
     for candidate in (path, path.parent):
         if _is_link(candidate):
             raise PluginLifecycleError(f"{label} cannot traverse a link: {candidate}")
-
-
-def _require_anchored_plugin_mutation() -> None:
-    if not supports_anchored_mutation():
-        raise PluginLifecycleError(
-            "descriptor-anchored plugin lifecycle mutation is unavailable "
-            "on this platform/build"
-        )
-    try:
-        require_anchored_mutation()
-    except AnchoredFilesystemUnavailable as exc:
-        raise PluginLifecycleError(str(exc)) from exc
-    except AnchoredFilesystemError as exc:
-        raise PluginLifecycleError(str(exc)) from exc
-
-
-def _lifecycle_error(label: str, exc: BaseException) -> PluginLifecycleError:
-    if getattr(exc, "errno", None) == errno.ELOOP:
-        return PluginLifecycleError(f"{label} cannot traverse a link")
-    detail = str(exc)
-    if "link" in detail.lower():
-        return PluginLifecycleError(f"{label} cannot use a linked entry: {detail}")
-    return PluginLifecycleError(f"cannot securely mutate {label}: {detail}")
 
 
 def _verify_anchored_path(directory: AnchoredDirectory, path: Path) -> None:
@@ -1704,19 +2004,6 @@ def _restore_moved_entry(
         raise
 
 
-def _read_extension_state_at(
-    directory: AnchoredDirectory,
-    state_path: Path,
-) -> ExtensionState:
-    raw = directory.read_file(
-        state_path.name,
-        max_bytes=MAX_EXTENSION_STATE_BYTES,
-    )
-    if raw is None:
-        return ExtensionState()
-    return _parse_extension_state(raw, state_path)
-
-
 def _load_manifest_snapshot(snapshot: PluginSnapshot) -> PluginManifest:
     raw = snapshot.read_bytes("plugin.json", max_bytes=MAX_PLUGIN_MANIFEST_BYTES)
     payload = strict_json_loads(raw)
@@ -1738,12 +2025,12 @@ def _load_manifest_at(
     return PluginManifest.from_dict(payload)
 
 
-def _installed_plugin_versions_at(
+def _installed_plugin_manifests_at(
     directory: AnchoredDirectory,
     *,
     excluding: str,
-) -> dict[str, str]:
-    installed_versions: dict[str, str] = {}
+) -> dict[str, PluginManifest]:
+    installed_manifests: dict[str, PluginManifest] = {}
     for name in sorted(directory.list_names()):
         if name == excluding:
             continue
@@ -1751,81 +2038,83 @@ def _installed_plugin_versions_at(
         if metadata is None or not stat.S_ISDIR(metadata.st_mode):
             continue
         try:
-            with directory.child(name) as plugin_directory:
+            with directory.child(name, expected=metadata) as plugin_directory:
                 manifest = _load_manifest_at(plugin_directory, "plugin.json")
+                _validate_manifest_at(manifest, plugin_directory)
         except (AnchoredFilesystemError, OSError, ValueError, TypeError):
             continue
-        installed_versions[manifest.name] = manifest.version
-    return installed_versions
+        if manifest.name != name:
+            continue
+        installed_manifests[name] = manifest
+    return installed_manifests
 
 
-def _save_extension_state(state: ExtensionState, path: Path) -> None:
-    _require_anchored_plugin_mutation()
-    try:
-        with (
-            AnchoredDirectory.open(path.parent, create=True) as directory,
-            directory.lock(f".{path.name}.lock"),
-        ):
-            directory.prepare_durable_mutation()
-            _save_extension_state_at(directory, state, path)
-    except PluginLifecycleError:
-        raise
-    except (AnchoredFilesystemError, OSError) as exc:
-        raise _lifecycle_error("extension state", exc) from exc
-
-
-def _save_extension_state_at(
+def _installed_plugin_manifests_strict_at(
     directory: AnchoredDirectory,
-    state: ExtensionState,
-    path: Path,
-) -> None:
-    payload: dict[str, Any] = {
-        "version": STATE_VERSION,
-        "disabled_plugins": sorted(state.disabled_plugins),
-    }
-    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    existing = directory.stat(path.name)
-    if existing is not None and not stat.S_ISREG(existing.st_mode):
-        raise PluginLifecycleError(f"extension state is not a regular file: {path}")
-    temporary = directory.unique_name(f".{path.name}.", ".tmp")
-    descriptor = -1
-    temporary_identity: os.stat_result | None = None
+    *,
+    excluding: str | None = None,
+) -> dict[str, PluginManifest]:
+    """Load the visible installed plugin graph from one held root descriptor."""
+
+    installed_manifests: dict[str, PluginManifest] = {}
+    for name in sorted(directory.list_names()):
+        if name == excluding:
+            continue
+        if name.startswith("."):
+            continue
+        metadata = directory.stat(name)
+        if metadata is None or stat.S_ISLNK(metadata.st_mode):
+            continue
+        if not stat.S_ISDIR(metadata.st_mode):
+            continue
+        try:
+            with directory.child(name, expected=metadata) as plugin_directory:
+                manifest = _load_manifest_at(plugin_directory, "plugin.json")
+                _validate_manifest_at(manifest, plugin_directory)
+        except (AnchoredFilesystemError, OSError, ValueError, TypeError) as exc:
+            raise PluginLifecycleError(
+                f"installed plugin {name!r} is invalid: {exc}"
+            ) from exc
+        if manifest.name != name:
+            raise PluginLifecycleError(
+                f"installed plugin directory {name!r} contains manifest "
+                f"{manifest.name!r}"
+            )
+        installed_manifests[name] = manifest
+    return installed_manifests
+
+
+def _dependency_version_satisfied(version: str | None, version_spec: str) -> bool:
+    if version is None:
+        return False
+    if not version_spec:
+        return True
     try:
-        descriptor = directory.create_file(temporary, mode=0o600)
-        temporary_identity = os.fstat(descriptor)
-        _write_all(descriptor, data)
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        directory.rename(temporary, path.name, expected_source=temporary_identity)
-        temporary = ""
-        directory.sync()
-    except BaseException as primary:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except BaseException as cleanup:
-                primary.add_note(f"extension-state descriptor close failed: {cleanup}")
-            descriptor = -1
-        if temporary:
-            try:
-                directory.unlink(
-                    temporary,
-                    expected=temporary_identity,
-                    missing_ok=True,
-                )
-            except BaseException as cleanup:
-                primary.add_note(f"extension-state temporary cleanup failed: {cleanup}")
-        raise
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+        return SpecifierSet(version_spec).contains(parse_version(version))
+    except (InvalidSpecifier, InvalidVersion):
+        return False
 
 
-def _write_all(descriptor: int, payload: bytes) -> None:
-    view = memoryview(payload)
-    while view:
-        written = os.write(descriptor, view)
-        if written <= 0:
-            raise PluginLifecycleError("short write to extension state")
-        view = view[written:]
+def _new_reverse_dependency_errors(
+    installed_manifests: Mapping[str, PluginManifest],
+    *,
+    target: str,
+    before_version: str | None,
+    after_version: str,
+) -> list[str]:
+    errors: list[str] = []
+    for dependent_name, dependent_manifest in installed_manifests.items():
+        for dependency in dependent_manifest.dependencies:
+            if dependency.get("name") != target:
+                continue
+            version_spec = dependency.get("version", "")
+            if not _dependency_version_satisfied(before_version, version_spec):
+                continue
+            if _dependency_version_satisfied(after_version, version_spec):
+                continue
+            requirement = version_spec or "any version"
+            errors.append(
+                f"{dependent_name} requires {target} {requirement}; "
+                f"candidate {after_version} would break it"
+            )
+    return errors

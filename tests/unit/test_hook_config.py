@@ -3,7 +3,12 @@ import sys
 
 import pytest
 
-from ash.hooks.config import MAX_HOOK_CONFIG_BYTES, HookConfigSource, load_command_hooks
+from ash.hooks.config import (
+    MAX_HOOK_CONFIG_BYTES,
+    MAX_HOOKS_PER_EVENT,
+    HookConfigSource,
+    load_command_hooks,
+)
 from ash.hooks.registry import HookBlock
 
 
@@ -87,6 +92,53 @@ async def test_plugin_hook_refuses_working_directory_symlink_swap(tmp_path) -> N
     assert not marker.exists()
     assert len(registry.diagnostics) == 1
     assert registry.diagnostics[0].error == "working directory identity changed"
+
+
+@pytest.mark.asyncio
+async def test_aba_swapped_hook_command_is_blocked_by_cwd_identity(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    saved = tmp_path / "workspace-original"
+    replacement = tmp_path / "workspace-replacement"
+    workspace.mkdir()
+    replacement.mkdir()
+    marker = tmp_path / "replacement-hook-ran"
+    replacement_config = replacement / ".ash" / "hooks.json"
+    replacement_config.parent.mkdir(parents=True)
+    replacement_config.write_text(
+        json.dumps(
+            {
+                "pre_tool": [
+                    {
+                        "matcher": "read_file",
+                        "command": [
+                            sys.executable,
+                            "-c",
+                            f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = HookConfigSource(
+        workspace / ".ash" / "hooks.json",
+        cwd=workspace,
+        trusted_root=workspace,
+    )
+
+    workspace.rename(saved)
+    replacement.rename(workspace)
+    try:
+        registry = load_command_hooks([source])
+    finally:
+        workspace.rename(replacement)
+        saved.rename(workspace)
+
+    with pytest.raises(Exception, match="working directory identity changed"):
+        await registry.fire_pre_tool("read_file", {"file_path": "README.md"})
+
+    assert not marker.exists()
 
 
 @pytest.mark.asyncio
@@ -211,6 +263,91 @@ def test_hook_config_rejects_unknown_event_names(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="unknown events.*pre_toll"):
         load_command_hooks([config])
+
+
+def test_hook_config_bounds_entries_per_event(tmp_path) -> None:
+    config = tmp_path / "hooks.json"
+    config.write_text(
+        json.dumps(
+            {
+                "pre_tool": [
+                    {"command": ["echo", str(index)]}
+                    for index in range(MAX_HOOKS_PER_EVENT + 1)
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="pre_tool.*32"):
+        load_command_hooks([config])
+
+
+def test_hook_config_bounds_merged_entries_per_event(tmp_path) -> None:
+    first = tmp_path / "hooks-a.json"
+    second = tmp_path / "hooks-b.json"
+    payload = {
+        "pre_tool": [
+            {"command": ["echo", str(index)]}
+            for index in range(20)
+        ]
+    }
+    first.write_text(json.dumps(payload), encoding="utf-8")
+    second.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="pre_tool.*32 registered hooks"):
+        load_command_hooks([first, second])
+
+
+@pytest.mark.parametrize(
+    "matcher",
+    [
+        "(a+)+$",
+        "(a|aa)+$",
+        r"(read_file)\1",
+        "(?=read)read_file",
+        ".*.*.*.*.*blocked",
+    ],
+)
+def test_hook_config_rejects_potentially_pathological_matchers(
+    tmp_path,
+    matcher: str,
+) -> None:
+    config = tmp_path / "hooks.json"
+    config.write_text(
+        json.dumps(
+            {
+                "pre_tool": [
+                    {"matcher": matcher, "command": ["echo", "blocked"]}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Hook matcher"):
+        load_command_hooks([config])
+
+
+def test_hook_config_accepts_bounded_simple_regex_matchers(tmp_path) -> None:
+    config = tmp_path / "hooks.json"
+    config.write_text(
+        json.dumps(
+            {
+                "pre_tool": [
+                    {
+                        "matcher": "read_.*|write_.*",
+                        "command": ["echo", "ok"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry = load_command_hooks([config])
+
+    assert len(registry._pre_tool) == 1
 
 
 def test_hook_config_rejects_symlinked_file(tmp_path) -> None:

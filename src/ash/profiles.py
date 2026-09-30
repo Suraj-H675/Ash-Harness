@@ -8,7 +8,7 @@ import stat
 from collections.abc import Mapping
 from pathlib import Path
 
-from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.safe_io import (
     anchored_directory_exists,
     list_anchored_directory,

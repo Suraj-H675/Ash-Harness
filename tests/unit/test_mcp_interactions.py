@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -441,6 +442,76 @@ async def test_sampling_cancellation_closes_provider_and_releases_lock() -> None
 
     assert provider.closed is True
     assert controller._sampling_lock.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_sampling_preserves_primary_failure_when_provider_close_fails() -> None:
+    class FailingCloseProvider(AbruptSamplingProvider):
+        async def aclose(self) -> None:
+            raise RuntimeError("sampling provider close failed")
+
+    provider = FailingCloseProvider()
+    controller = MCPInteractionController(
+        sampling_enabled=True,
+        elicitation_enabled=False,
+        provider_factory=lambda: provider,
+        sampling_review=lambda *_args: True,
+        sampling_max_tokens=64,
+    )
+
+    with pytest.raises(MCPProtocolError, match="terminal completion") as captured:
+        await controller.handle_sampling("docs", _sampling_params(maxTokens=32))
+
+    assert any(
+        "sampling provider cleanup failed" in note
+        for note in captured.value.__notes__
+    )
+
+
+@pytest.mark.asyncio
+async def test_sampling_settles_provider_close_before_propagating_cancellation() -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class BlockingCloseProvider(SamplingProvider):
+        async def aclose(self) -> None:
+            close_started.set()
+            await release_close.wait()
+            self.closed = True
+            close_finished.set()
+
+    provider = BlockingCloseProvider()
+    controller = MCPInteractionController(
+        sampling_enabled=True,
+        elicitation_enabled=False,
+        provider_factory=lambda: provider,
+        sampling_review=lambda *_args: True,
+        sampling_max_tokens=64,
+    )
+    task = asyncio.create_task(
+        controller.handle_sampling("docs", _sampling_params(maxTokens=32))
+    )
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+
+    try:
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        assert close_finished.is_set() is False
+
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+        assert close_finished.is_set() is True
+        assert provider.closed is True
+    finally:
+        release_close.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

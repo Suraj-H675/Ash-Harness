@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
 from ash.agents.shared_state import SharedState
+from ash.core.redaction import redact_text, redact_value
 from ash.safety.environment import build_scrubbed_environment
 
 
@@ -59,6 +60,10 @@ class AgentReport:
     artifacts: dict[str, Any] = field(default_factory=dict)
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "summary", redact_text(self.summary))
+        object.__setattr__(self, "artifacts", redact_value(self.artifacts))
 
 
 # A task is just an async callable that takes a context dict and
@@ -346,8 +351,8 @@ def _report_to_payload(report: AgentReport) -> dict[str, Any]:
         "role": report.role,
         "task": report.task,
         "success": report.success,
-        "summary": report.summary,
-        "artifacts": dict(report.artifacts),
+        "summary": redact_text(report.summary),
+        "artifacts": redact_value(dict(report.artifacts)),
         "started_at": report.started_at.isoformat(),
         "finished_at": report.finished_at.isoformat(),
     }

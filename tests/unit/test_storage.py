@@ -53,6 +53,42 @@ def test_storage_human_output_sanitizes_database_diagnostics() -> None:
     assert machine["path"] == "/tmp/db\nname\u202ehidden\u202c"
 
 
+def test_debug_bundle_git_revision_ignores_parent_git_dir_redirection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import storage as storage_module
+
+    inside = tmp_path / "inside"
+    outside = tmp_path / "outside"
+    inside.mkdir()
+    outside.mkdir()
+    revisions: dict[str, str] = {}
+    for repo, content in ((inside, "inside\n"), (outside, "outside\n")):
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=repo,
+            check=True,
+        )
+        (repo / "tracked.txt").write_text(content, encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "initial"], cwd=repo, check=True)
+        revisions[str(repo)] = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    assert revisions[str(inside)] != revisions[str(outside)]
+    monkeypatch.setenv("GIT_DIR", str(outside / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(outside))
+
+    assert storage_module._debug_bundle_git_revision(inside) == revisions[str(inside)]
+
+
 def test_storage_cli_honors_database_directory_override(tmp_path: Path, capsys) -> None:
     assert (
         main(
@@ -353,13 +389,14 @@ def test_restore_quiesces_concurrent_session_writer(
 
     assert not thread.is_alive()
     assert completed_before_replace == [False]
-    assert writer_errors == []
-    assert len(writer_session_id) == 1
+    assert writer_session_id == []
+    assert len(writer_errors) == 1
+    assert isinstance(writer_errors[0], SessionStorageError)
+    assert "file identity changed" in str(writer_errors[0])
     session_ids = {
         item.session_id for item in SessionStore(database).list_sessions(limit=10)
     }
-    assert original.session_id in session_ids
-    assert writer_session_id[0] in session_ids
+    assert session_ids == {original.session_id}
 
 
 @pytest.mark.skipif(os.name != "posix", reason="cross-process flock is POSIX-only")
@@ -429,7 +466,7 @@ else:
     try:
         restore_database(database, backup, confirmed=True)
         assert child is not None
-        assert child.wait(timeout=5) == 0
+        assert child.wait(timeout=5) != 0
     finally:
         if child is not None and child.poll() is None:
             child.kill()
@@ -437,13 +474,12 @@ else:
 
     assert completed_before_replace == [False]
     payload = result.read_text(encoding="utf-8")
-    assert payload.startswith("ok:")
-    child_session_id = payload.removeprefix("ok:")
+    assert payload.startswith("error:")
+    assert "file identity changed" in payload
     session_ids = {
         item.session_id for item in SessionStore(database).list_sessions(limit=10)
     }
-    assert original.session_id in session_ids
-    assert child_session_id in session_ids
+    assert session_ids == {original.session_id}
 
 
 def test_backup_rejects_symlinked_destination(tmp_path: Path) -> None:
@@ -520,8 +556,11 @@ def test_debug_bundle_is_bounded_json_and_restricted(
     payload = json.loads(created.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1
     assert payload["ash"]["model"] == "anthropic/claude-sonnet-4-6"
-    assert payload["storage"]["path"] == str(db_dir / "sessions.db")
-    assert payload["runtime"]["workspace"] == str(workspace.resolve())
+    assert payload["storage"]["path"] == "<external>/sessions.db"
+    assert payload["runtime"]["workspace"] == "<workspace>"
+    serialized = created.read_text(encoding="utf-8")
+    assert str(workspace.resolve()) not in serialized
+    assert str(db_dir.resolve()) not in serialized
     assert oct(created.stat().st_mode & 0o777) in {"0o600", "0o644"}
 
 
@@ -766,7 +805,6 @@ def test_debug_bundle_refuses_workspace_swap_for_git_metadata(
         db_directory=tmp_path / "db",
         memory_backend="off",
     )
-    configured_workspace = str(config.workspace_root)
     real_resolve = storage_module.resolve_host_executable
     swapped = False
 
@@ -789,7 +827,7 @@ def test_debug_bundle_refuses_workspace_swap_for_git_metadata(
     payload = json.loads(created.read_text(encoding="utf-8"))
 
     assert original_revision != replacement_revision
-    assert payload["runtime"]["workspace"] == configured_workspace
+    assert payload["runtime"]["workspace"] == "<workspace>"
     assert payload["runtime"]["git_revision"] == ""
 
 

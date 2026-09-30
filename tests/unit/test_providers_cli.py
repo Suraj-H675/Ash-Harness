@@ -301,6 +301,88 @@ def test_provider_completion_probe_obeys_timeout_and_closes(monkeypatch) -> None
     assert provider.closed is True
 
 
+@pytest.mark.asyncio
+async def test_provider_completion_probe_preserves_failure_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import providers
+
+    verification = _provider_verification()
+
+    class FailingCloseProvider(_ScriptedProbeProvider):
+        async def aclose(self) -> None:
+            raise RuntimeError("provider cleanup failed")
+
+    provider = FailingCloseProvider(
+        error=RuntimeError("completion endpoint rejected request")
+    )
+    _install_probe_provider(monkeypatch, provider)
+
+    verified, error = await providers._probe_provider_completion(
+        _provider_command_config(),
+        verification,
+        timeout=1.0,
+    )
+
+    assert verified is False
+    assert error is not None
+    assert "completion endpoint rejected request" in error
+    assert "cleanup failed" in error
+
+
+@pytest.mark.asyncio
+async def test_provider_completion_probe_settles_close_before_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import providers
+
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    class BlockingCloseProvider(_ScriptedProbeProvider):
+        async def aclose(self) -> None:
+            close_started.set()
+            await release_close.wait()
+            self.closed = True
+            close_finished.set()
+
+    provider = BlockingCloseProvider(
+        chunks=[
+            StreamChunk(content="OK"),
+            StreamChunk(is_done=True, stop_reason="stop"),
+        ]
+    )
+    _install_probe_provider(monkeypatch, provider)
+    task = asyncio.create_task(
+        providers._probe_provider_completion(
+            _provider_command_config(),
+            _provider_verification(),
+            timeout=1.0,
+        )
+    )
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+
+    try:
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        assert close_finished.is_set() is False
+
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+        assert close_finished.is_set() is True
+        assert provider.closed is True
+    finally:
+        release_close.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 def test_provider_completion_error_redacts_connection_secret(monkeypatch) -> None:
     from ash.commands import providers
 

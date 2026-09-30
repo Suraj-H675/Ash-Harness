@@ -79,6 +79,7 @@ MAX_JSONRPC_BODY_BYTES = 1_048_576
 MAX_JSONRPC_BATCH_REQUESTS = 32
 MAX_EVENT_LIST_LIMIT = 10_000
 MAX_HTTP_BODY_BYTES = 16 * 1024 * 1024
+MAX_HTTP_IN_FLIGHT_TURNS = 16
 
 
 class _HTTPBoundaryMiddleware:
@@ -197,18 +198,71 @@ def create_app(
     bearer_token: str,
     requests_per_minute: int = 60,
     close_client_on_shutdown: bool = False,
+    max_in_flight_turns: int = MAX_HTTP_IN_FLIGHT_TURNS,
 ) -> FastAPI:
     if len(bearer_token) < 16:
         raise ValueError("HTTP bearer token must contain at least 16 characters")
+    if max_in_flight_turns < 1:
+        raise ValueError("HTTP in-flight turn limit must be positive")
     rpc = JSONRPCServer(client)
+    active_turns = 0
+
+    def try_acquire_turn_slot() -> bool:
+        nonlocal active_turns
+        if active_turns >= max_in_flight_turns:
+            return False
+        active_turns += 1
+        return True
+
+    def release_turn_slot() -> None:
+        nonlocal active_turns
+        if active_turns <= 0:
+            raise RuntimeError("HTTP turn admission accounting underflow")
+        active_turns -= 1
+
+    def require_turn_slot() -> None:
+        if try_acquire_turn_slot():
+            return
+        raise HTTPException(
+            status_code=503,
+            detail="Ash is busy; retry this turn later",
+            headers={"Retry-After": "1"},
+        )
+
+    class AdmittedTurnStreamingResponse(StreamingResponse):
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            if not try_acquire_turn_slot():
+                response = JSONResponse(
+                    status_code=503,
+                    content={"detail": "Ash is busy; retry this turn later"},
+                    headers={"Retry-After": "1"},
+                )
+                await response(scope, receive, send)
+                return
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                release_turn_slot()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.ash_client = client
+        primary_error: BaseException | None = None
         try:
             yield
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            await rpc.close(close_client=close_client_on_shutdown)
+            try:
+                await rpc.close(close_client=close_client_on_shutdown)
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "HTTP JSON-RPC shutdown cleanup failed: "
+                    + redact_text(str(cleanup_error))
+                )
 
     app = FastAPI(title="Ash API", version="1", lifespan=lifespan)
     app.add_middleware(
@@ -289,22 +343,29 @@ def create_app(
 
     @app.post("/v1/turn")
     async def run_turn(payload: TurnRequest) -> dict:
-        result = await client.prompt(payload.input)
-        return {
-            "response": result.response,
-            "session_id": result.session_id,
-            "model": result.model,
-            "context_tokens": result.context_tokens,
-            "usage": result.usage,
-        }
+        require_turn_slot()
+        try:
+            result = await client.prompt(payload.input)
+            return {
+                "response": result.response,
+                "session_id": result.session_id,
+                "model": result.model,
+                "context_tokens": result.context_tokens,
+                "usage": result.usage,
+            }
+        finally:
+            release_turn_slot()
 
     @app.post("/v1/turn/stream")
     async def stream_turn(payload: TurnRequest) -> StreamingResponse:
         async def events() -> AsyncIterator[str]:
             async for event in client.stream_prompt(payload.input):
-                yield _sse(event.type, redact_value(event.to_wire(include_type=False)))
+                yield _sse(
+                    event.type,
+                    redact_value(event.to_wire(include_type=False)),
+                )
 
-        return StreamingResponse(events(), media_type="text/event-stream")
+        return AdmittedTurnStreamingResponse(events(), media_type="text/event-stream")
 
     @app.post("/v1/turn/steer")
     async def steer_turn(payload: SteeringRequest) -> dict[str, int]:
@@ -408,7 +469,8 @@ def create_app(
 
 
 def _sse(event: str, payload: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+    encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+    return f"event: {event}\ndata: {encoded}\n\n"
 
 
 async def _read_bounded_body(request: Request, max_bytes: int) -> bytes | None:

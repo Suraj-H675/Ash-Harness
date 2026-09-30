@@ -3,6 +3,7 @@
 import os
 import re
 import shlex
+import stat
 from pathlib import Path
 from typing import Tuple
 
@@ -88,8 +89,30 @@ class SafetyGuard:
         project_root: Path,
         allowed_directories: list[str | Path] | None = None,
         blocklist_commands: list[str] | None = None,
+        expected_project_root_identity: tuple[int, int] | None = None,
     ) -> None:
         self.project_root = normalize_project_root(project_root)
+        try:
+            root_metadata = os.stat(self.project_root, follow_symlinks=False)
+        except OSError as exc:
+            raise SafetyViolation(
+                f"Project root is unavailable: {self.project_root}"
+            ) from exc
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise SafetyViolation(f"Project root is not a directory: {self.project_root}")
+        observed_identity = self._directory_identity(root_metadata)
+        if (
+            expected_project_root_identity is not None
+            and observed_identity != expected_project_root_identity
+        ):
+            raise SafetyViolation(
+                "Project root identity changed before guard initialization."
+            )
+        self._project_root_identity = (
+            expected_project_root_identity
+            if expected_project_root_identity is not None
+            else observed_identity
+        )
         try:
             self.allowed_directories = normalize_allowed_directories(
                 self.project_root,
@@ -103,6 +126,59 @@ class SafetyGuard:
     def default_blocklist(cls) -> tuple[str, ...]:
         return cls.LINUX_BLOCKLIST + cls.WINDOWS_BLOCKLIST
 
+    @staticmethod
+    def _directory_identity(metadata: os.stat_result) -> tuple[int, int] | None:
+        inode = int(metadata.st_ino)
+        if inode == 0:
+            return None
+        return int(metadata.st_dev), inode
+
+    def ensure_project_root_current(self) -> Path:
+        """Fail closed if the visible workspace root no longer names the startup directory."""
+
+        try:
+            current = os.stat(self.project_root, follow_symlinks=False)
+        except OSError as exc:
+            raise SafetyViolation(
+                "Access denied: project root is unavailable; restart Ash."
+            ) from exc
+        if not stat.S_ISDIR(current.st_mode):
+            raise SafetyViolation(
+                "Access denied: project root identity changed; restart Ash."
+            )
+        identity = self._directory_identity(current)
+        if (
+            self._project_root_identity is not None
+            and identity != self._project_root_identity
+        ):
+            raise SafetyViolation(
+                "Access denied: project root identity changed; restart Ash."
+            )
+        return self.project_root
+
+    @property
+    def project_root_identity(self) -> tuple[int, int] | None:
+        """Filesystem identity captured for the project root at guard creation."""
+
+        return self._project_root_identity
+
+    def verify_project_root_descriptor(self, descriptor: int) -> None:
+        """Verify an opened root descriptor against the workspace captured at startup."""
+
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise SafetyViolation(
+                "Access denied: project root identity changed; restart Ash."
+            )
+        identity = self._directory_identity(metadata)
+        if (
+            self._project_root_identity is not None
+            and identity != self._project_root_identity
+        ):
+            raise SafetyViolation(
+                "Access denied: project root identity changed; restart Ash."
+            )
+
     def validate_path(self, target_path: str | Path) -> Path:
         """
         Resolve and validate a target path against the project safety boundary.
@@ -111,6 +187,7 @@ class SafetyGuard:
         components are resolved, so symlink escapes are treated as out of scope.
         """
 
+        self.ensure_project_root_current()
         resolved = resolve_target_path(target_path, self.project_root)
         if path_is_in_scope(resolved, self.project_root, self.allowed_directories):
             return resolved
@@ -122,6 +199,7 @@ class SafetyGuard:
     def validate_mutation_path(self, target_path: str | Path) -> Path:
         """Validate a write target and reject link-based path indirection."""
 
+        self.ensure_project_root_current()
         lexical = lexical_target_path(target_path, self.project_root)
         resolved = resolve_target_path(lexical, self.project_root)
         if not path_is_in_scope(

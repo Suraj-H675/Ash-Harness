@@ -24,6 +24,7 @@ class BaseTool(ABC):
     name: str = Field(..., description="Unique tool identifier registered with the LLM.")
     description: str = Field(..., description="Detailed instructions for the LLM outlining when to call this tool.")
     args_schema: Type[BaseModel] = Field(..., description="Pydantic model defining exact tool arguments.")
+    sensitive_argument_fields: frozenset[str] = frozenset()
 
     @abstractmethod
     async def run(self, **kwargs: Any) -> ToolResult:
@@ -54,6 +55,23 @@ intent for inspection or a newly approved user/model action, but it must not
 silently resume the original operation. Provider-request retries before visible
 model output are separate transport mechanisms and never permit host-level
 replay of a tool invocation.
+
+### 1.2 Sensitive Argument Persistence
+
+Tools whose otherwise ordinary argument names can carry confidential values may
+declare top-level field names in `BaseTool.sensitive_argument_fields`. Ash uses
+this class metadata only when serializing durable tool intent, audit/event
+arguments, and persisted assistant tool-call metadata. Declared values are
+stored as `[REDACTED]`; the live approval and execution paths still receive the
+original arguments so the user can make an informed one-time decision and the
+tool can perform the requested action.
+
+Sensitive-field metadata is declarative: Ash reads it from the tool class and
+does not invoke plugin/tool instance code while preparing a pre-approval record.
+Automatic exact-scope permission rules fail closed when a call contains a
+declared-sensitive field rather than silently omitting it and broadening the
+grant. The explicit scope editor may exclude sensitive fields and build a scope
+from the remaining non-sensitive arguments after informing the user.
 
 ---
 
@@ -146,25 +164,27 @@ Executes user-approved commands in a subprocess shell.
     ```
 *   **Security Policies (Critical)**:
     1.  Command string parsed into individual arguments.
-    2.  Search arguments against command blocklist:
-        -   **Windows Blocklist**: `Format-Volume`, `Remove-Item * -Recurse`, `del /s /q c:\*`, `diskpart`, `bootrec`, `net user`, `reg delete`.
-        -   **Linux Blocklist**: `rm -rf /`, `mkfs`, `dd if=`, `chmod -R 777 /`, `chown`, `shutdown`, `reboot`, `passwd`.
+    2.  Search arguments against the supported-host command blocklist, including
+        destructive patterns such as `rm -rf /`, `mkfs`, `dd if=`,
+        `chmod -R 777 /`, `chown`, `shutdown`, `reboot`, and `passwd`.
     3.  If command contains blacklisted patterns, raise `SafetyViolation` immediately.
     4.  All commands run with standard output buffering. Max output size is limited to 100,000 characters.
 
-### 2.6 `git_status` / `git_diff` / `git_commit`
-Handles source-control synchronization.
+### 2.6 `git_status` / `git_diff` / `git_log` / `auto_commit`
 
-*   **Arguments Schema**:
-    ```python
-    class GitCommitArgs(BaseModel):
-        message: str = Field(..., description="Descriptive commit message.")
-        files: list[str] | None = Field(None, description="Subset of files to stage and commit. If omitted, stages all changes in workspace.")
-    ```
-*   **Aider-style Transaction Logic**:
-    1.  Before executing any file write, check git status.
-    2.  After successful tool execution, automatically track modified files.
-    3.  Create git commits programmatically on completion of each model loop step to ensure absolute session recovery.
+The read-only Git tools expose bounded status, diff, and recent-log inspection.
+`auto_commit` is the only commit tool and requires an explicit workspace-relative
+path list; it refuses an empty scope so unrelated user work cannot be staged by
+default. Commit messages and path counts are bounded, staged content is scanned
+for secrets, and hook execution remains inside the runtime's sandbox and
+environment policy.
+
+Loop-level automatic commits are a separate optional feature. They are disabled
+by default. When enabled, Ash snapshots Git state at turn start and, after the
+turn completes, commits only paths Ash changed during that turn that still match
+the recorded post-edit identity/digest checks. Pre-existing user changes,
+concurrently modified files, and unrelated staged work are preserved rather than
+absorbed into the commit.
 
 ### 2.7 `lsp`
 
@@ -239,10 +259,14 @@ entries from different sessions are never combined.
 ### 3.2 Tool Schema Boundary
 
 After protocol negotiation, Ash paginates `tools/list` and namespaces each remote
-tool as `mcp__<server>__<tool>`. For MCP 2026-07-28, negotiation uses the
-stateless `server/discover` path rather than `initialize`. The declared `inputSchema` remains the
-authoritative provider-facing schema; Ash does not translate it into a smaller
-Pydantic type model.
+tool as `mcp__<server>__<tool>` when that literal name is provider-portable. The
+provider-facing name must match `[A-Za-z0-9_-]{1,64}`; when a server/tool identity
+contains unsupported characters or would exceed that envelope, Ash derives a
+deterministic hashed alias while retaining the exact remote MCP tool name for
+wire calls, contract fingerprints, and durable task recovery. For MCP 2026-07-28,
+negotiation uses the stateless `server/discover` path rather than `initialize`.
+The declared `inputSchema` remains the authoritative provider-facing schema; Ash
+does not translate it into a smaller Pydantic type model.
 
 Servers that declare `tools.listChanged` can update this catalog without a
 restart. Ash coalesces notification bursts, paginates and validates a complete
@@ -315,24 +339,13 @@ remains unimplemented.
 
 ## 4. Platform-Specific Command Safety Policies
 
-### Windows Safety Patterns
-When Ash runs on a Windows host, the subprocess executor uses `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command` by default.
+Ash supports native Linux and macOS hosts. Windows users run Ash inside WSL2,
+which uses the Linux command/process model. Native Windows PowerShell execution
+is intentionally not part of the supported runtime contract.
 
-To prevent command injection and runtime exceptions:
-1.  **Command Injection**: All target paths passed as arguments must be wrapped in matching single-quotes: `'$path'`.
-2.  **Environment Variables**: Environment variables must be resolved strictly using environment dictionary keys rather than shell expansion (e.g. use `os.environ.get("VAR")`, do not pass `%VAR%` directly to shell execution).
-3.  **Forbidden Chains**: Command chains using `;`, `&&`, or `||` are forbidden unless executing standard compiler commands (e.g., `cargo build && cargo test`).
-4.  **Process Timeouts**: Every subprocess execution MUST have a hard timeout limit configured (default: 300 seconds) to prevent hanging processes from locking the harness.
-5.  **UTF-8 Encoding Safety**: On Windows, subprocess byte streams can carry localized characters causing decode crashes. The execution runner must use robust byte decoding:
-    ```python
-    def decode_stream(raw_bytes: bytes) -> str:
-        try:
-            return raw_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            # Fallback to system default encoding with character replacement to prevent crashes
-            return raw_bytes.decode("cp1252", errors="replace")
-    ```
-6.  **Literal Path Parameterization**: When executing file operations via PowerShell commandlets, paths must be referenced using `-LiteralPath` instead of positional path variables to prevent bracket expressions `(x86)` from being parsed as executable code blocks.
+Supported hosts enforce workspace-scoped executable resolution, destructive
+command blocking, bounded subprocess output, explicit timeouts, process-tree
+cleanup, and robust UTF-8 decoding at the central command/process layer.
 
 ---
 

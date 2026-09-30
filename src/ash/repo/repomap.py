@@ -23,7 +23,12 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ash.safety.environment import resolve_host_executable
-from ash.safety.git import read_only_git_args, read_only_git_environment
+from ash.safety.git import (
+    read_only_git_args,
+    read_only_git_config_probe_args,
+    read_only_git_environment,
+    read_only_git_untrusted_config_keys,
+)
 from ash.repo.parser import (
     MAX_SOURCE_FILE_BYTES,
     SOURCE_SUFFIXES,
@@ -212,34 +217,35 @@ def _git_ignored_files(
     payload = "\0".join(relative_to_candidate).encode("utf-8") + b"\0"
     try:
         environment = read_only_git_environment()
-        with prepare_scoped_process_launch(
-            [git, *read_only_git_args(["check-ignore", "--stdin", "-z"])],
-            cwd=project_root,
-            guard=guard or SafetyGuard(project_root),
-            search_path=environment.get("PATH"),
-            expected_cwd_identity=expected_root_identity,
-        ) as launch:
-            if launch.pass_fds:
-                completed = subprocess.run(
-                    launch.argv,
-                    cwd=launch.cwd,
-                    input=payload,
-                    capture_output=True,
-                    check=False,
-                    timeout=10,
-                    env=environment,
-                    pass_fds=launch.pass_fds,
+        active_guard = guard or SafetyGuard(project_root)
+        config_probe = _run_read_only_git_probe(
+            git,
+            read_only_git_config_probe_args(["check-ignore", "--stdin", "-z"]),
+            project_root=project_root,
+            guard=active_guard,
+            environment=environment,
+            expected_root_identity=expected_root_identity,
+        )
+        if config_probe.returncode not in {0, 1}:
+            return set(candidates)
+        if config_probe.returncode == 0:
+            try:
+                untrusted = read_only_git_untrusted_config_keys(
+                    config_probe.stdout.decode("utf-8", errors="replace")
                 )
-            else:
-                completed = subprocess.run(
-                    launch.argv,
-                    cwd=launch.cwd,
-                    input=payload,
-                    capture_output=True,
-                    check=False,
-                    timeout=10,
-                    env=environment,
-                )
+            except ValueError:
+                return set(candidates)
+            if untrusted:
+                return set(candidates)
+        completed = _run_read_only_git_probe(
+            git,
+            read_only_git_args(["check-ignore", "--stdin", "-z"]),
+            project_root=project_root,
+            guard=active_guard,
+            environment=environment,
+            expected_root_identity=expected_root_identity,
+            input_bytes=payload,
+        )
     except (
         OSError,
         subprocess.TimeoutExpired,
@@ -257,6 +263,47 @@ def _git_ignored_files(
         for relative in [item.decode("utf-8", errors="surrogateescape")]
         if (candidate := relative_to_candidate.get(relative)) is not None
     }
+
+
+def _run_read_only_git_probe(
+    git: str,
+    arguments: Sequence[str],
+    *,
+    project_root: Path,
+    guard: SafetyGuard,
+    environment: dict[str, str],
+    expected_root_identity: tuple[int, int] | None,
+    input_bytes: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one descriptor-bound, scrubbed, read-only Git probe."""
+
+    with prepare_scoped_process_launch(
+        [git, *arguments],
+        cwd=project_root,
+        guard=guard,
+        search_path=environment.get("PATH"),
+        expected_cwd_identity=expected_root_identity,
+    ) as launch:
+        if launch.pass_fds:
+            return subprocess.run(
+                launch.argv,
+                cwd=launch.cwd,
+                input=input_bytes,
+                capture_output=True,
+                check=False,
+                timeout=10,
+                env=environment,
+                pass_fds=launch.pass_fds,
+            )
+        return subprocess.run(
+            launch.argv,
+            cwd=launch.cwd,
+            input=input_bytes,
+            capture_output=True,
+            check=False,
+            timeout=10,
+            env=environment,
+        )
 
 
 def _module_to_path(module: str, project_root: Path) -> Path | None:
@@ -500,8 +547,7 @@ class RepoMap:
     ) -> None:
         self.project_root = project_root.resolve()
         self._guard = SafetyGuard(self.project_root)
-        root_metadata = self.project_root.stat()
-        self._project_root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+        self._project_root_identity = self._guard.project_root_identity
         self._extractor = extractor or SymbolExtractor()
         self._max_files = max_files
         self._exclude_patterns = exclude_patterns or []

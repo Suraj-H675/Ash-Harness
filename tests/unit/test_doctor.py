@@ -51,6 +51,27 @@ def test_render_doctor_human_output_sanitizes_untrusted_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_doctor_reports_unsupported_native_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ash.commands.doctor.platform_support_error",
+        lambda: "Native Windows is not currently supported by Ash. Use WSL2.",
+    )
+    monkeypatch.setattr(
+        "ash.commands.doctor.AshConfig.load",
+        lambda: (_ for _ in ()).throw(ValueError("stop after platform check")),
+    )
+
+    checks = await run_doctor(connect=False)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["platform"].status == "fail"
+    assert "WSL2" in by_name["platform"].remedy
+    assert by_name["runtime"].status == "pass"
+
+
+@pytest.mark.asyncio
 async def test_run_doctor_connect_uses_shared_provider_verification(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -193,6 +214,7 @@ async def test_doctor_reports_local_runtime_without_network(
     assert by_name["storage"].status == "pass"
     assert by_name["automation"].status == "pass"
     assert by_name["extensions"].status == "pass"
+    assert "ripgrep" not in by_name
     assert "connectivity" not in by_name
     assert not (tmp_path / "db" / ".doctor.sqlite3").exists()
     assert not any((tmp_path / "db").glob(".doctor-*"))
@@ -256,14 +278,17 @@ def test_storage_check_cleans_probe_artifacts_after_sqlite_failure(
     sentinel = database_directory / ".doctor.sqlite3"
     sentinel.write_bytes(b"user database")
 
-    def fail_connect(database: object, *args: object, **kwargs: object) -> None:
-        probe = os.fspath(database)
+    def fail_connect(database, *args: object, **kwargs: object) -> None:
+        probe = os.fspath(database.path)
         for suffix in ("", "-journal", "-wal", "-shm"):
             with open(f"{probe}{suffix}", "wb") as handle:
                 handle.write(b"probe artifact")
         raise sqlite3.OperationalError("probe failed")
 
-    monkeypatch.setattr("ash.commands.doctor.sqlite3.connect", fail_connect)
+    monkeypatch.setattr(
+        "ash.commands.doctor.PinnedSQLiteDatabase.connect",
+        fail_connect,
+    )
 
     check = _check_storage(AshConfig(db_directory=database_directory))
 
@@ -271,6 +296,54 @@ def test_storage_check_cleans_probe_artifacts_after_sqlite_failure(
     assert "probe failed" in check.message
     assert sentinel.read_bytes() == b"user database"
     assert not any(database_directory.glob(".doctor-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-anchored POSIX regression")
+def test_storage_check_parent_swap_fails_without_writing_replacement(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.safety.anchored_fs as anchored_fs
+
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    saved_root = tmp_path / "state-saved"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    database_directory = state_root / "db"
+    real_open_or_create = anchored_fs._open_or_create_directory
+    swapped = False
+
+    def open_or_create_then_swap(
+        parent_descriptor,
+        name,
+        *,
+        create,
+        expected=None,
+    ):
+        nonlocal swapped
+        if name == "db" and not swapped:
+            state_root.rename(saved_root)
+            state_root.symlink_to(replacement, target_is_directory=True)
+            swapped = True
+        return real_open_or_create(
+            parent_descriptor,
+            name,
+            create=create,
+            expected=expected,
+        )
+
+    monkeypatch.setattr(
+        anchored_fs,
+        "_open_or_create_directory",
+        open_or_create_then_swap,
+    )
+
+    check = _check_storage(AshConfig(db_directory=database_directory))
+
+    assert swapped is True
+    assert check.status == "fail"
+    assert not (replacement / "db").exists()
 
 
 def test_storage_check_reports_malformed_database_directory(tmp_path) -> None:
@@ -461,7 +534,8 @@ def test_browser_doctor_distinguishes_missing_extra_and_binary(
     )
     missing_extra = _check_browser()
     assert missing_extra.status == "warn"
-    assert "installer.py" in missing_extra.remedy
+    assert "api.github.com/repos/Suraj-H675/Ash-Harness/releases/latest" in missing_extra.remedy
+    assert "raw.githubusercontent.com" not in missing_extra.remedy
     assert "--extra browser" in missing_extra.remedy
     assert "pipx install" not in missing_extra.remedy
 
@@ -474,7 +548,7 @@ def test_browser_doctor_distinguishes_missing_extra_and_binary(
         calls.append((command, kwargs))
         return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-    monkeypatch.setattr("ash.commands.doctor.subprocess.run", fake_run)
+    monkeypatch.setattr("ash.commands.doctor.run_browser_subprocess", fake_run)
     missing_binary = _check_browser()
     assert missing_binary.status == "warn"
     assert "setup browser" in missing_binary.remedy
@@ -505,7 +579,7 @@ def test_browser_doctor_probes_configured_cdp_without_requiring_local_chromium(
         calls.append((command, kwargs))
         return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
-    monkeypatch.setattr("ash.commands.doctor.subprocess.run", fake_run)
+    monkeypatch.setattr("ash.commands.doctor.run_browser_subprocess", fake_run)
     check = _check_browser(AshConfig(browser_cdp_url="http://127.0.0.1:9222"))
 
     assert check.status == "pass"
@@ -524,7 +598,7 @@ def test_browser_doctor_reports_unreachable_configured_cdp(
         "ash.commands.doctor.importlib.util.find_spec", lambda name: object()
     )
     monkeypatch.setattr(
-        "ash.commands.doctor.subprocess.run",
+        "ash.commands.doctor.run_browser_subprocess",
         lambda *args, **kwargs: type(
             "Completed", (), {"returncode": 1, "stdout": "", "stderr": "failed"}
         )(),

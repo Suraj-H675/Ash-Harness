@@ -18,7 +18,7 @@ from ash.safety.scoped_io import (
     atomic_write_scoped_bytes,
     read_scoped_bytes,
 )
-from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from ash.tools.base import BaseTool, ToolExecutionContract, ToolResult, count_output_tokens
 
 
 BINARY_DETECTION_BYTES = 8192
@@ -170,6 +170,7 @@ class WholeEditArgs(BaseModel):
 
 class ReadFileTool(BaseTool):
     name = "read_file"
+    execution_contract = ToolExecutionContract(parallel_safe=True)
     description = "Read line-delimited text content from a workspace file."
     args_schema = ReadFileArgs
 

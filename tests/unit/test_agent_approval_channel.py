@@ -8,6 +8,7 @@ from ash.agents._agent_driver import _run_durable_task
 from ash.agents.approval_channel import (
     ApprovalChannelError,
     ApprovalDecision,
+    ApprovalEndpoint,
     ApprovalRuleDelta,
     ForegroundApprovalServer,
     request_foreground_approval,
@@ -149,6 +150,149 @@ async def test_foreground_approval_channel_close_cancels_active_handler() -> Non
 
 
 @pytest.mark.asyncio
+async def test_foreground_approval_close_settles_listener_before_cancellation() -> None:
+    wait_started = asyncio.Event()
+    release_wait = asyncio.Event()
+    wait_finished = asyncio.Event()
+
+    class BlockingServer:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        async def wait_closed(self) -> None:
+            wait_started.set()
+            await release_wait.wait()
+            wait_finished.set()
+
+    async def handler(tool_name: str, arguments: dict) -> ApprovalDecision:
+        del tool_name, arguments
+        return ApprovalDecision(True)
+
+    server = ForegroundApprovalServer(
+        task_id="task-1",
+        agent_id="agent-1",
+        attempt=1,
+        handler=handler,
+    )
+    listener = BlockingServer()
+    server._server = listener  # type: ignore[assignment]
+
+    closing = asyncio.create_task(server.aclose())
+    await asyncio.wait_for(wait_started.wait(), timeout=1)
+    closing.cancel()
+    await asyncio.sleep(0)
+
+    assert closing.done() is False
+    assert server._server is listener
+    assert wait_finished.is_set() is False
+
+    release_wait.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, timeout=1)
+
+    assert wait_finished.is_set() is True
+    assert listener.close_calls == 1
+    assert server._server is None
+
+
+@pytest.mark.asyncio
+async def test_foreground_approval_close_retries_failed_listener_cleanup() -> None:
+    class FlakyServer:
+        def __init__(self) -> None:
+            self.close_calls = 0
+            self.wait_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        async def wait_closed(self) -> None:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise RuntimeError("approval listener close failed once")
+
+    async def handler(tool_name: str, arguments: dict) -> ApprovalDecision:
+        del tool_name, arguments
+        return ApprovalDecision(True)
+
+    server = ForegroundApprovalServer(
+        task_id="task-1",
+        agent_id="agent-1",
+        attempt=1,
+        handler=handler,
+    )
+    listener = FlakyServer()
+    server._server = listener  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="approval listener close failed once"):
+        await server.aclose()
+
+    assert server._server is listener
+    assert listener.close_calls == 1
+    assert listener.wait_calls == 1
+
+    await server.aclose()
+
+    assert listener.close_calls == 2
+    assert listener.wait_calls == 2
+    assert server._server is None
+
+
+@pytest.mark.asyncio
+async def test_foreground_approval_request_preserves_protocol_error_when_writer_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.approval_channel as approval_module
+
+    class FakeReader:
+        async def readline(self) -> bytes:
+            return b"{}\n"
+
+    class FailingWriter:
+        def write(self, _data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            raise RuntimeError("writer cleanup failed")
+
+    async def open_connection(*_args, **_kwargs):
+        return FakeReader(), FailingWriter()
+
+    monkeypatch.setattr(approval_module.asyncio, "open_connection", open_connection)
+    endpoint = ApprovalEndpoint(
+        host="127.0.0.1",
+        port=12345,
+        token="ab" * 32,
+        task_id="task-1",
+        agent_id="agent-1",
+        attempt=1,
+    )
+
+    with pytest.raises(
+        ApprovalChannelError,
+        match="subagent approval response correlation failed",
+    ) as captured:
+        await request_foreground_approval(
+            endpoint,
+            tool_name="write_file",
+            arguments={"file_path": "one.txt"},
+        )
+
+    assert any(
+        "subagent approval client cleanup failed" in note
+        for note in captured.value.__notes__
+    )
+
+
+@pytest.mark.asyncio
 async def test_foreground_approval_channel_drops_silent_pre_auth_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -236,7 +380,54 @@ async def test_foreground_approval_channel_caps_pre_auth_connections(
 
 
 @pytest.mark.asyncio
-async def test_agent_driver_rejects_stale_live_approval_attempt(tmp_path) -> None:
+async def test_foreground_approval_channel_bounds_replay_history_per_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def handler(tool_name: str, arguments: dict) -> ApprovalDecision:
+        nonlocal calls
+        del tool_name, arguments
+        calls += 1
+        return ApprovalDecision(True)
+
+    monkeypatch.setattr(
+        approval_channel_module,
+        "MAX_APPROVAL_REQUESTS_PER_ATTEMPT",
+        1,
+    )
+    server = ForegroundApprovalServer(
+        task_id="task-1",
+        agent_id="agent-1",
+        attempt=1,
+        handler=handler,
+    )
+    endpoint = await server.start()
+    try:
+        first = await request_foreground_approval(
+            endpoint,
+            tool_name="write_file",
+            arguments={"file_path": "one.txt", "content": "one\n"},
+        )
+        with pytest.raises(ApprovalChannelError, match="closed without a response"):
+            await request_foreground_approval(
+                endpoint,
+                tool_name="write_file",
+                arguments={"file_path": "two.txt", "content": "two\n"},
+            )
+
+        assert first.approved is True
+        assert calls == 1
+        assert len(server._seen_request_ids) == 1
+    finally:
+        await server.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_driver_rejects_stale_live_approval_attempt(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     state = SharedState(tmp_path / "agents.db")
     durable = state.tasks.create_task(
         "write one file",
@@ -276,6 +467,86 @@ async def test_agent_driver_rejects_stale_live_approval_attempt(tmp_path) -> Non
             "attempt": 2,
         },
     }
+    state.close()
+    created: list[SharedState] = []
 
-    with pytest.raises(ValueError, match="does not match durable task"):
+    class TrackingSharedState(SharedState):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(
+        "ash.agents._agent_driver.SharedState",
+        TrackingSharedState,
+    )
+
+    try:
+        with pytest.raises(ValueError, match="does not match durable task"):
+            await _run_durable_task(spec)
+
+        assert len(created) == 1
+        assert created[0]._closed is True
+    finally:
+        for item in created:
+            item.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_driver_preserves_task_failure_when_tool_close_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    durable = state.tasks.create_task(
+        "write one file",
+        role="coder",
+        metadata={"agent_id": "agent-1"},
+    )
+    config = AshConfig(
+        workspace_root=tmp_path,
+        model="openai/test-model",
+        memory_backend="off",
+    )
+    spec = {
+        "version": 1,
+        "kind": "durable_task",
+        "db_path": str(state.db_path),
+        "task_id": durable.task_id,
+        "workspace_root": str(tmp_path),
+        "config": config.model_dump(mode="json", exclude={"openai_api_key"}),
+        "provider_env": {},
+        "permission_policy": {
+            "mode": "interactive",
+            "managed_rules": [],
+            "persistent_rules": [],
+            "session_rules": [],
+        },
+        "custom_agent": None,
+        "max_return_chars": 20_000,
+        "max_turn_iterations": 12,
+        "require_dispatchable": False,
+        "approval_channel": None,
+    }
+    state.close()
+
+    class FailingTool:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def set_permission_policy_provider(self, _provider) -> None:
+            pass
+
+        async def run_queued_task(self, *_args, **_kwargs):
+            raise RuntimeError("task execution failure")
+
+        async def aclose(self) -> None:
+            raise RuntimeError("tool cleanup failure")
+
+    monkeypatch.setattr("ash.tools.agent.SpawnAgentTool", FailingTool)
+
+    with pytest.raises(RuntimeError, match="task execution failure") as captured:
         await _run_durable_task(spec)
+
+    assert any(
+        "subagent driver cleanup failed" in note for note in captured.value.__notes__
+    )

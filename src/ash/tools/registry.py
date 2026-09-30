@@ -1,40 +1,26 @@
-"""Tool registry and dynamic skill loader (Sprint 14 / V7).
+"""Legacy executable-skill registry compatibility support.
 
-A :class:`ToolRegistry` holds the name -> :class:`BaseTool` map the
-loop layer consults when dispatching tool calls. The registry can
-also be pointed at a directory of skill files (Python modules with
-the V7 docstring convention, or Markdown recipe files compiled by
-:mod:`ash.tools.skills`) and will discover / load them on demand.
+A :class:`ToolRegistry` holds a name -> :class:`BaseTool` map and can discover
+legacy executable Python/Markdown skill files on demand. Ash's default runtime
+does not instantiate this registry; production skill discovery uses standard
+non-executable ``SKILL.md`` packages from :mod:`ash.plugins.skills`.
 
-Lazy loading keeps the system prompt small (per the Pi convention in
-ASH_MASTER_PLAN_V2.md): only the skill index is injected into the
-model's context, full skill bodies are compiled into active tools
-only when a discovery pass runs.
+This module remains available for compatibility callers that explicitly opt in
+to in-process executable skills.
 """
 
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool
+from ash.tools.skill_types import SkillIndexEntry
 
 MAX_SKILL_DISCOVERY_ENTRIES = 100_000
 MAX_SKILL_DISCOVERY_DEPTH = 32
-
-
-@dataclass(frozen=True)
-class SkillIndexEntry:
-    """Lightweight skill description used to populate the system prompt."""
-
-    name: str
-    description: str
-    source: str  # "python" or "markdown"
-    path: str
-    trigger: str = ""
 
 
 class ToolRegistry:
@@ -183,6 +169,8 @@ class ToolRegistry:
             path,
             self._safety_guard,
             allow_unsafe_code=self._allow_executable_skills,
+            tools_provider=lambda: list(self.as_dict().values()),
+            root_provider=self._safety_guard.ensure_project_root_current,
         )
         self.register(tool)
         return tool
@@ -222,37 +210,33 @@ class ToolRegistry:
             _parse_python_skill_source,
             _read_executable_skill_text,
             build_tool_from_python_module,
+            validate_executable_skill_name,
         )
 
+        validate_executable_skill_name(name)
         source = _read_executable_skill_text(path)
+        parsed = _parse_python_skill_source(path, source)
+        if parsed.name != name:
+            raise SkillParseError(
+                f"reloaded skill declares name {parsed.name!r}, expected {name!r}"
+            )
         module_name = f"_ash_skill_{name}_{abs(hash(str(path)))}"
         try:
             module = _execute_python_skill_source(module_name, path, source)
         except Exception:
             raise
 
-        # Parse the exact bytes that were executed so metadata cannot be swapped
-        # independently of the module body after validation.
-        parsed_name: str | None = None
-        parsed_description: str | None = None
-        parsed_trigger: str | None = None
-        try:
-            parsed = _parse_python_skill_source(path, source)
-            parsed_name = parsed.name
-            parsed_description = parsed.description
-            parsed_trigger = parsed.trigger
-        except SkillParseError:
-            pass
-
         tool = build_tool_from_python_module(
             module,
             self._safety_guard,
             source_path=path,
-            parsed_name=parsed_name,
-            parsed_description=parsed_description,
-            parsed_trigger=parsed_trigger,
+            parsed_name=parsed.name,
+            parsed_description=parsed.description,
+            parsed_trigger=parsed.trigger,
             source_path_verified=True,
             allow_unsafe_code=True,
+            tools_provider=lambda: list(self.as_dict().values()),
+            root_provider=self._safety_guard.ensure_project_root_current,
         )
         self._loaded_skill_modules[name] = path
         self.register(tool)

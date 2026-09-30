@@ -15,11 +15,13 @@ from ash.context.tokens import AnthropicTokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
 from ash.providers.messages import CanonicalToolCall, MessageInput
 from ash.providers.openai import (
+    _owned_openai_http_client,
     account_openai_compatible_stream_bytes,
     prepare_openai_messages,
 )
 from ash.providers.readiness import (
     normalize_provider_base_url,
+    redact_provider_error,
     require_secure_provider_transport,
 )
 
@@ -47,11 +49,7 @@ class GroqProvider(ProviderABC):
         )
         require_secure_provider_transport(self._base_url, provider="groq")
         self._token_counter = token_counter or AnthropicTokenCounter()
-        self._client = openai.AsyncOpenAI(
-            api_key=api_key,
-            base_url=self._base_url,
-            max_retries=0,
-        )
+        self._client: Any | None = None
 
     @property
     def model_name(self) -> str:
@@ -59,6 +57,16 @@ class GroqProvider(ProviderABC):
 
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
+
+    def _resolve_client(self) -> Any:
+        if self._client is None:
+            self._client = openai.AsyncOpenAI(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                max_retries=0,
+                http_client=_owned_openai_http_client(),
+            )
+        return self._client
 
     def configure_max_tokens(self, max_tokens: int) -> None:
         if max_tokens < 1:
@@ -82,9 +90,11 @@ class GroqProvider(ProviderABC):
         if hasattr(self, "_max_tokens"):
             kwargs["max_tokens"] = self._max_tokens
         try:
-            stream = await self._client.chat.completions.create(**kwargs)
+            client = self._resolve_client()
+            stream = await client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"Groq API error: {exc}") from exc
+            detail = redact_provider_error(str(exc), self._api_key)
+            raise RuntimeError(f"Groq API error: {detail}") from exc
 
         partials: dict[int, Any] = {}
         completed: list[CanonicalToolCall] = []
@@ -166,4 +176,8 @@ class GroqProvider(ProviderABC):
             completed.clear()
 
     async def aclose(self) -> None:
-        await self._client.close()
+        client = self._client
+        if client is not None:
+            await client.close()
+            if self._client is client:
+                self._client = None

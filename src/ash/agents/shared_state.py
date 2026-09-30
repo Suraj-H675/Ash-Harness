@@ -20,6 +20,7 @@ Tables (per ARCHITECTURAL_SPECIFICATION.md section 3.3):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import threading
@@ -29,10 +30,10 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from ash.agents.tasks import AgentTaskStore
-from ash.safe_io import validate_unlinked_file_path
+from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
 
 
 # --- public type aliases ---------------------------------------------------
@@ -40,6 +41,12 @@ from ash.safe_io import validate_unlinked_file_path
 
 AgentStatusValue = str  # one of {"idle", "working", "failed", "completed"}
 SprintStateValue = str  # one of {"planning", "active", "complete", "aborted"}
+MAX_IPC_MESSAGE_BYTES = 512 * 1024
+MAX_PENDING_IPC_MESSAGES_PER_RECIPIENT = 1000
+MAX_DELIVERED_IPC_HISTORY_PER_WORKSPACE = 10_000
+MAX_IPC_FETCH_MESSAGES = 10_000
+MAX_TERMINAL_AGENT_STATUS_PER_WORKSPACE = 2048
+MAX_TERMINAL_SPRINT_HISTORY_PER_WORKSPACE = 2048
 
 
 # --- row dataclasses -------------------------------------------------------
@@ -81,37 +88,238 @@ class SharedSprint:
 class SharedState:
     """SQLite-backed coordination layer with WAL concurrency."""
 
-    def __init__(self, db_path: Path | str, *, busy_timeout_ms: int = 5000) -> None:
-        database = validate_unlinked_file_path(db_path, label="agent shared-state database")
-        database.parent.mkdir(parents=True, exist_ok=True)
-        database = validate_unlinked_file_path(
-            database, label="agent shared-state database"
+    def __init__(
+        self,
+        db_path: Path | str,
+        *,
+        workspace: Path | str | None = None,
+        busy_timeout_ms: int = 5000,
+    ) -> None:
+        self.workspace = (
+            str(Path(workspace).expanduser().resolve())
+            if workspace is not None
+            else None
         )
-        self.db_path = str(database)
-        # check_same_thread=False because the connection is used by the
-        # orchestrator thread and any spawned subagent threads.
-        self._conn = sqlite3.connect(
-            self.db_path, check_same_thread=False, timeout=busy_timeout_ms / 1000
+        self._agent_namespace_prefix = (
+            "ws:"
+            + hashlib.sha256(self.workspace.encode("utf-8")).hexdigest()
+            + ":"
+            if self.workspace is not None
+            else ""
         )
+        try:
+            self._database = PinnedSQLiteDatabase.prepare(
+                db_path,
+                label="agent shared-state database",
+            )
+            self.db_path = str(self._database.path)
+            # check_same_thread=False because the connection is used by the
+            # orchestrator thread and any spawned subagent threads.
+            self._conn = self._database.connect(
+                label="agent shared-state database",
+                check_same_thread=False,
+                timeout=busy_timeout_ms / 1000,
+            )
+        except SQLitePathError as exc:
+            raise ValueError(str(exc)) from exc
         self._conn.row_factory = sqlite3.Row
-        self._write_lock = threading.Lock()
-        self._async_lock = asyncio.Lock()
+        self._conn_lock = threading.RLock()
         self._closed = False
-        self._init_db()
-        self.tasks = AgentTaskStore(self.db_path, busy_timeout_ms=busy_timeout_ms)
+        try:
+            self._init_db()
+            self.tasks = AgentTaskStore(
+                self.db_path,
+                busy_timeout_ms=busy_timeout_ms,
+                _database=self._database,
+            )
+        except BaseException as primary_error:
+            self._closed = True
+            try:
+                self._conn.close()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    f"agent shared-state connection cleanup failed: {cleanup_error}"
+                )
+            raise
+
+    def _scope_agent_id(self, agent_id: str) -> str:
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise ValueError("agent id must be non-empty text")
+        return f"{self._agent_namespace_prefix}{agent_id}" if self.workspace else agent_id
+
+    def _unscope_agent_id(self, stored_agent_id: str) -> str:
+        if self.workspace and stored_agent_id.startswith(self._agent_namespace_prefix):
+            return stored_agent_id[len(self._agent_namespace_prefix) :]
+        return stored_agent_id
+
+    def _scoped_agent_like(self) -> str | None:
+        return f"{self._agent_namespace_prefix}%" if self.workspace else None
+
+    def _row_to_agent_status(self, row: sqlite3.Row) -> AgentStatus:
+        value = _row_to_agent_status(row)
+        return AgentStatus(
+            agent_id=self._unscope_agent_id(value.agent_id),
+            role=value.role,
+            status=value.status,
+            current_task=value.current_task,
+            last_heartbeat=value.last_heartbeat,
+            metadata=value.metadata,
+        )
+
+    def _row_to_ipc(self, row: sqlite3.Row) -> IPCMessage:
+        value = _row_to_ipc(row)
+        return IPCMessage(
+            message_id=value.message_id,
+            sender_id=self._unscope_agent_id(value.sender_id),
+            recipient_id=self._unscope_agent_id(value.recipient_id),
+            message_type=value.message_type,
+            content=value.content,
+            delivered=value.delivered,
+            timestamp=value.timestamp,
+        )
+
+    def _row_to_sprint(self, row: sqlite3.Row) -> SharedSprint:
+        return SharedSprint(
+            sprint_id=str(row["sprint_id"]),
+            lead_agent_id=self._unscope_agent_id(str(row["lead_agent_id"])),
+            goal=str(row["sprint_goal"]),
+            state=str(row["state"]),
+            created_at=_parse_iso(row["created_at"])
+            or datetime.now(timezone.utc),
+        )
+
+    def _encode_ipc_content(self, content: dict[str, Any]) -> str:
+        if not isinstance(content, dict):
+            raise ValueError("IPC content must be an object")
+        try:
+            payload = json.dumps(
+                content,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("IPC content must contain valid JSON values") from exc
+        if len(payload.encode("utf-8")) > MAX_IPC_MESSAGE_BYTES:
+            raise ValueError(
+                f"IPC content exceeds {MAX_IPC_MESSAGE_BYTES} bytes"
+            )
+        return payload
+
+    def _prune_delivered_ipc_locked(self) -> None:
+        scoped = self._scoped_agent_like()
+        if scoped is None:
+            return
+        self._conn.execute(
+            """
+            DELETE FROM ipc_messages
+            WHERE message_id IN (
+                SELECT message_id
+                FROM ipc_messages
+                WHERE delivered = 1
+                  AND (sender_id LIKE ? OR recipient_id LIKE ?)
+                ORDER BY message_id DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (scoped, scoped, MAX_DELIVERED_IPC_HISTORY_PER_WORKSPACE),
+        )
+
+    def _require_ipc_capacity_locked(self, scoped_recipient: str) -> None:
+        pending = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM ipc_messages "
+                "WHERE recipient_id = ? AND delivered = 0",
+                (scoped_recipient,),
+            ).fetchone()[0]
+        )
+        if pending >= MAX_PENDING_IPC_MESSAGES_PER_RECIPIENT:
+            raise ValueError(
+                "IPC recipient pending-message limit reached: maximum "
+                f"{MAX_PENDING_IPC_MESSAGES_PER_RECIPIENT}"
+            )
+
+    def _prune_terminal_agent_status_locked(self) -> None:
+        scoped = self._scoped_agent_like()
+        if scoped is None:
+            return
+        self._conn.execute(
+            """
+            DELETE FROM agent_status
+            WHERE agent_id IN (
+                SELECT agent_id
+                FROM agent_status
+                WHERE agent_id LIKE ? AND status IN ('completed','failed')
+                ORDER BY last_heartbeat DESC, agent_id DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (scoped, MAX_TERMINAL_AGENT_STATUS_PER_WORKSPACE),
+        )
+
+    def _prune_terminal_sprints_locked(self) -> None:
+        scoped = self._scoped_agent_like()
+        if scoped is None:
+            return
+        self._conn.execute(
+            """
+            DELETE FROM sprints
+            WHERE sprint_id IN (
+                SELECT sprint_id
+                FROM sprints
+                WHERE lead_agent_id LIKE ? AND state IN ('complete','aborted')
+                ORDER BY created_at DESC, sprint_id DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (scoped, MAX_TERMINAL_SPRINT_HISTORY_PER_WORKSPACE),
+        )
 
     # --- lifecycle -------------------------------------------------------
 
     def close(self) -> None:
-        with self._write_lock:
+        with self._conn_lock:
             if self._closed:
                 return
+            primary_error: BaseException | None = None
+            try:
+                self.tasks.close()
+            except BaseException as exc:
+                primary_error = exc
+            try:
+                self._conn.close()
+            except BaseException as exc:
+                if primary_error is None:
+                    primary_error = exc
+                else:
+                    primary_error.add_note(
+                        f"agent shared-state connection cleanup also failed: {exc}"
+                    )
+            if primary_error is not None:
+                raise primary_error
             self._closed = True
-            self.tasks.close()
-            self._conn.close()
+
+    def __enter__(self) -> "SharedState":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Any,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> Literal[False]:
+        del exc_type, tb
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if exc is None:
+                raise
+            exc.add_note(f"agent shared-state cleanup failed: {cleanup_error}")
+        return False
 
     def _init_db(self) -> None:
-        with self._write_lock, self._conn:
+        with self._conn_lock, self._conn:
             self._conn.executescript(
                 """
                 PRAGMA journal_mode=WAL;
@@ -163,8 +371,12 @@ class SharedState:
     ) -> None:
         """Register an agent in the ``agent_status`` table (idempotent)."""
 
-        meta_json = json.dumps(metadata or {})
-        with self._write_lock, self._conn:
+        scoped_agent_id = self._scope_agent_id(agent_id)
+        stored_metadata = dict(metadata or {})
+        if self.workspace is not None:
+            stored_metadata["workspace"] = self.workspace
+        meta_json = json.dumps(stored_metadata)
+        with self._conn_lock, self._conn:
             self._conn.execute(
                 """
                 INSERT INTO agent_status (agent_id, role, status, current_task, metadata_json)
@@ -174,7 +386,7 @@ class SharedState:
                     metadata_json = excluded.metadata_json,
                     last_heartbeat = CURRENT_TIMESTAMP
                 """,
-                (agent_id, role, meta_json),
+                (scoped_agent_id, role, meta_json),
             )
 
     def update_status(
@@ -185,15 +397,18 @@ class SharedState:
     ) -> None:
         if status not in {"idle", "working", "failed", "completed"}:
             raise ValueError(f"Invalid status: {status!r}")
-        with self._write_lock, self._conn:
+        scoped_agent_id = self._scope_agent_id(agent_id)
+        with self._conn_lock, self._conn:
             self._conn.execute(
                 """
                 UPDATE agent_status
                 SET status = ?, current_task = ?, last_heartbeat = CURRENT_TIMESTAMP
                 WHERE agent_id = ?
                 """,
-                (status, current_task, agent_id),
+                (status, current_task, scoped_agent_id),
             )
+            if status in {"completed", "failed"}:
+                self._prune_terminal_agent_status_locked()
 
     async def update_status_async(
         self,
@@ -201,27 +416,17 @@ class SharedState:
         status: AgentStatusValue,
         current_task: str = "",
     ) -> None:
-        """Async-safe version of update_status for use from asyncio tasks."""
-        if status not in {"idle", "working", "failed", "completed"}:
-            raise ValueError(f"Invalid status: {status!r}")
-        async with self._async_lock:
-            with self._conn:
-                self._conn.execute(
-                    """
-                    UPDATE agent_status
-                    SET status = ?, current_task = ?, last_heartbeat = CURRENT_TIMESTAMP
-                    WHERE agent_id = ?
-                    """,
-                    (status, current_task, agent_id),
-                )
+        """Async wrapper around the serialized connection owner."""
+        await asyncio.to_thread(self.update_status, agent_id, status, current_task)
 
     def heartbeat(self, agent_id: str) -> None:
         """Touch the last_heartbeat timestamp for an agent."""
 
-        with self._write_lock, self._conn:
+        scoped_agent_id = self._scope_agent_id(agent_id)
+        with self._conn_lock, self._conn:
             self._conn.execute(
                 "UPDATE agent_status SET last_heartbeat = CURRENT_TIMESTAMP WHERE agent_id = ?",
-                (agent_id,),
+                (scoped_agent_id,),
             )
 
     async def register_agent_async(
@@ -230,37 +435,33 @@ class SharedState:
         role: str = "general",
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Async-safe version of register_agent for use from asyncio tasks."""
-        meta_json = json.dumps(metadata or {})
-        async with self._async_lock:
-            with self._conn:
-                self._conn.execute(
-                    """
-                    INSERT INTO agent_status (agent_id, role, status, current_task, metadata_json)
-                    VALUES (?, ?, 'idle', '', ?)
-                    ON CONFLICT(agent_id) DO UPDATE SET
-                        role = excluded.role,
-                        metadata_json = excluded.metadata_json,
-                        last_heartbeat = CURRENT_TIMESTAMP
-                    """,
-                    (agent_id, role, meta_json),
-                )
+        """Async wrapper around the serialized connection owner."""
+        await asyncio.to_thread(self.register_agent, agent_id, role, metadata)
 
     def get_status(self, agent_id: str) -> AgentStatus | None:
-        with closing(self._conn.cursor()) as cur:
+        scoped_agent_id = self._scope_agent_id(agent_id)
+        with self._conn_lock, closing(self._conn.cursor()) as cur:
             row = cur.execute(
-                "SELECT * FROM agent_status WHERE agent_id = ?", (agent_id,)
+                "SELECT * FROM agent_status WHERE agent_id = ?", (scoped_agent_id,)
             ).fetchone()
         if row is None:
             return None
-        return _row_to_agent_status(row)
+        return self._row_to_agent_status(row)
 
     def list_agents(self) -> list[AgentStatus]:
-        with closing(self._conn.cursor()) as cur:
-            rows = cur.execute(
-                "SELECT * FROM agent_status ORDER BY last_heartbeat DESC"
-            ).fetchall()
-        return [_row_to_agent_status(r) for r in rows]
+        with self._conn_lock, closing(self._conn.cursor()) as cur:
+            scoped = self._scoped_agent_like()
+            if scoped is None:
+                rows = cur.execute(
+                    "SELECT * FROM agent_status ORDER BY last_heartbeat DESC"
+                ).fetchall()
+            else:
+                rows = cur.execute(
+                    "SELECT * FROM agent_status WHERE agent_id LIKE ? "
+                    "ORDER BY last_heartbeat DESC",
+                    (scoped,),
+                ).fetchall()
+        return [self._row_to_agent_status(r) for r in rows]
 
     def reap_stale_agents(self, max_age_seconds: float) -> list[str]:
         """Mark agents whose last heartbeat is older than the cutoff as failed.
@@ -271,13 +472,23 @@ class SharedState:
 
         cutoff = time.time() - max_age_seconds
         reaped: list[str] = []
-        with self._write_lock, self._conn:
-            rows = self._conn.execute(
-                """
-                SELECT agent_id, last_heartbeat FROM agent_status
-                WHERE status IN ('idle', 'working')
-                """,
-            ).fetchall()
+        with self._conn_lock, self._conn:
+            scoped = self._scoped_agent_like()
+            if scoped is None:
+                rows = self._conn.execute(
+                    """
+                    SELECT agent_id, last_heartbeat FROM agent_status
+                    WHERE status IN ('idle', 'working')
+                    """,
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT agent_id, last_heartbeat FROM agent_status
+                    WHERE status IN ('idle', 'working') AND agent_id LIKE ?
+                    """,
+                    (scoped,),
+                ).fetchall()
             for row in rows:
                 last = _parse_iso(row["last_heartbeat"])
                 if last is None:
@@ -287,7 +498,9 @@ class SharedState:
                         "UPDATE agent_status SET status = 'failed' WHERE agent_id = ?",
                         (row["agent_id"],),
                     )
-                    reaped.append(row["agent_id"])
+                    reaped.append(self._unscope_agent_id(str(row["agent_id"])))
+            if reaped:
+                self._prune_terminal_agent_status_locked()
         return reaped
 
     # --- IPC ------------------------------------------------------------
@@ -301,17 +514,28 @@ class SharedState:
     ) -> int:
         """Enqueue a JSON-RPC-shaped message. Returns the new message id."""
 
-        payload = json.dumps(content, ensure_ascii=False)
-        with self._write_lock, self._conn:
-            cur = self._conn.execute(
-                """
-                INSERT INTO ipc_messages
-                    (sender_id, recipient_id, message_type, content_json)
-                VALUES (?, ?, ?, ?)
-                """,
-                (sender_id, recipient_id, message_type, payload),
-            )
-            return int(cur.lastrowid) if cur.lastrowid is not None else 0
+        payload = self._encode_ipc_content(content)
+        scoped_sender = self._scope_agent_id(sender_id)
+        scoped_recipient = self._scope_agent_id(recipient_id)
+        with self._conn_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._require_ipc_capacity_locked(scoped_recipient)
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO ipc_messages
+                        (sender_id, recipient_id, message_type, content_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (scoped_sender, scoped_recipient, message_type, payload),
+                )
+                self._prune_delivered_ipc_locked()
+                message_id = int(cur.lastrowid) if cur.lastrowid is not None else 0
+                self._conn.commit()
+                return message_id
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     async def send_message_async(
         self,
@@ -320,19 +544,14 @@ class SharedState:
         message_type: str,
         content: dict[str, Any],
     ) -> int:
-        """Async-safe version of send_message for use from asyncio tasks."""
-        payload = json.dumps(content, ensure_ascii=False)
-        async with self._async_lock:
-            with self._conn:
-                cur = self._conn.execute(
-                    """
-                    INSERT INTO ipc_messages
-                        (sender_id, recipient_id, message_type, content_json)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (sender_id, recipient_id, message_type, payload),
-                )
-                return int(cur.lastrowid) if cur.lastrowid is not None else 0
+        """Async wrapper around the serialized connection owner."""
+        return await asyncio.to_thread(
+            self.send_message,
+            sender_id,
+            recipient_id,
+            message_type,
+            content,
+        )
 
     def fetch_messages(
         self,
@@ -344,8 +563,14 @@ class SharedState:
     ) -> list[IPCMessage]:
         """Return messages addressed to ``recipient_id``, oldest first."""
 
+        if type(limit) is not int or not 1 <= limit <= MAX_IPC_FETCH_MESSAGES:
+            raise ValueError(
+                "IPC message fetch limit must be between 1 and "
+                f"{MAX_IPC_FETCH_MESSAGES}"
+            )
+
         clauses = ["recipient_id = ?"]
-        params: list[Any] = [recipient_id]
+        params: list[Any] = [self._scope_agent_id(recipient_id)]
         if undelivered_only:
             clauses.append("delivered = 0")
         if message_type is not None:
@@ -357,9 +582,9 @@ class SharedState:
             + " AND ".join(clauses)
             + " ORDER BY timestamp ASC, message_id ASC LIMIT ?"
         )
-        with closing(self._conn.cursor()) as cur:
+        with self._conn_lock, closing(self._conn.cursor()) as cur:
             rows = cur.execute(sql, params).fetchall()
-        return [_row_to_ipc(r) for r in rows]
+        return [self._row_to_ipc(r) for r in rows]
 
     def mark_delivered(self, message_ids: Iterable[int]) -> int:
         """Mark messages as delivered. Returns the row count affected."""
@@ -368,11 +593,23 @@ class SharedState:
         if not ids:
             return 0
         placeholders = ",".join("?" for _ in ids)
-        with self._write_lock, self._conn:
-            cur = self._conn.execute(
-                f"UPDATE ipc_messages SET delivered = 1 WHERE message_id IN ({placeholders})",
-                ids,
-            )
+        with self._conn_lock, self._conn:
+            scoped = self._scoped_agent_like()
+            if scoped is None:
+                cur = self._conn.execute(
+                    f"UPDATE ipc_messages SET delivered = 1 WHERE message_id IN ({placeholders})",
+                    ids,
+                )
+            else:
+                cur = self._conn.execute(
+                    f"""
+                    UPDATE ipc_messages SET delivered = 1
+                    WHERE message_id IN ({placeholders})
+                      AND (sender_id LIKE ? OR recipient_id LIKE ?)
+                    """,
+                    (*ids, scoped, scoped),
+                )
+                self._prune_delivered_ipc_locked()
             return int(cur.rowcount)
 
     def resolve_approval_request(
@@ -395,18 +632,20 @@ class SharedState:
         if not resolver_id.strip():
             raise ValueError("resolver id must not be empty")
 
-        with self._write_lock:
+        with self._conn_lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                scoped_lead = self._scope_agent_id("lead")
                 row = self._conn.execute(
-                    "SELECT * FROM ipc_messages WHERE message_id = ?",
-                    (request_message_id,),
+                    "SELECT * FROM ipc_messages "
+                    "WHERE message_id = ? AND recipient_id = ?",
+                    (request_message_id, scoped_lead),
                 ).fetchone()
                 if row is None:
                     raise ValueError(
                         f"unknown approval request {request_message_id}"
                     )
-                request = _row_to_ipc(row)
+                request = self._row_to_ipc(row)
                 if request.recipient_id != "lead" or request.message_type != "approval_request":
                     raise ValueError(
                         f"message {request_message_id} is not an approval request"
@@ -434,14 +673,25 @@ class SharedState:
                     raise ValueError(
                         f"approval request {request_message_id} is malformed"
                     )
-                task_row = self._conn.execute(
-                    """
-                    SELECT state, owner_agent_id, attempt
-                    FROM agent_tasks
-                    WHERE task_id = ?
-                    """,
-                    (task_id,),
-                ).fetchone()
+                if self.workspace is None:
+                    task_row = self._conn.execute(
+                        """
+                        SELECT state, owner_agent_id, attempt
+                        FROM agent_tasks
+                        WHERE task_id = ?
+                        """,
+                        (task_id,),
+                    ).fetchone()
+                else:
+                    task_row = self._conn.execute(
+                        """
+                        SELECT state, owner_agent_id, attempt
+                        FROM agent_tasks
+                        WHERE task_id = ?
+                          AND json_extract(metadata_json, '$.workspace') = ?
+                        """,
+                        (task_id, self.workspace),
+                    ).fetchone()
                 if (
                     task_row is None
                     or task_row["state"] not in {"leased", "running"}
@@ -473,6 +723,7 @@ class SharedState:
                     "approved": approved,
                     "feedback": feedback,
                 }
+                response_payload = self._encode_ipc_content(response_content)
                 cur = self._conn.execute(
                     """
                     INSERT INTO ipc_messages
@@ -480,12 +731,13 @@ class SharedState:
                     VALUES (?, ?, 'approval_response', ?)
                     """,
                     (
-                        resolver_id.strip(),
-                        agent_id,
-                        json.dumps(response_content, ensure_ascii=False),
+                        self._scope_agent_id(resolver_id.strip()),
+                        self._scope_agent_id(agent_id),
+                        response_payload,
                     ),
                 )
                 response_message_id = int(cur.lastrowid or 0)
+                self._prune_delivered_ipc_locked()
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -502,26 +754,29 @@ class SharedState:
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
         retired: list[int] = []
-        with self._write_lock, self._conn:
+        with self._conn_lock, self._conn:
+            scoped_lead = self._scope_agent_id("lead")
             rows = self._conn.execute(
                 """
                 SELECT * FROM ipc_messages
-                WHERE recipient_id = 'lead'
+                WHERE recipient_id = ?
                   AND message_type = 'approval_request'
                   AND delivered = 0
                 ORDER BY message_id
                 LIMIT ?
                 """,
-                (limit,),
+                (scoped_lead, limit),
             ).fetchall()
             for row in rows:
-                message = _row_to_ipc(row)
+                message = self._row_to_ipc(row)
                 content = message.content
                 task_id = content.get("task_id")
                 attempt = content.get("attempt")
                 agent_id = content.get("agent_id")
-                task_row = (
-                    self._conn.execute(
+                if not isinstance(task_id, str):
+                    task_row = None
+                elif self.workspace is None:
+                    task_row = self._conn.execute(
                         """
                         SELECT state, owner_agent_id, attempt
                         FROM agent_tasks
@@ -529,9 +784,16 @@ class SharedState:
                         """,
                         (task_id,),
                     ).fetchone()
-                    if isinstance(task_id, str)
-                    else None
-                )
+                else:
+                    task_row = self._conn.execute(
+                        """
+                        SELECT state, owner_agent_id, attempt
+                        FROM agent_tasks
+                        WHERE task_id = ?
+                          AND json_extract(metadata_json, '$.workspace') = ?
+                        """,
+                        (task_id, self.workspace),
+                    ).fetchone()
                 active = bool(
                     task_row is not None
                     and task_row["state"] in {"leased", "running"}
@@ -551,6 +813,8 @@ class SharedState:
                 )
                 if int(updated.rowcount) == 1:
                     retired.append(message.message_id)
+            if retired:
+                self._prune_delivered_ipc_locked()
         return retired
 
     def send_to_agent(
@@ -573,12 +837,7 @@ class SharedState:
     ) -> int:
         """Send the same message to every registered agent. Returns the count sent."""
 
-        recipients = [
-            row["agent_id"]
-            for row in self._conn.execute(
-                "SELECT agent_id FROM agent_status"
-            ).fetchall()
-        ]
+        recipients = [status.agent_id for status in self.list_agents()]
         count = 0
         for recipient in recipients:
             if recipient == sender_id:
@@ -593,82 +852,76 @@ class SharedState:
         """Create a sprint row owned by ``lead_agent_id`` and return its id."""
 
         sprint_id = str(uuid.uuid4())
-        with self._write_lock, self._conn:
+        with self._conn_lock, self._conn:
             self._conn.execute(
                 """
                 INSERT INTO sprints (sprint_id, lead_agent_id, sprint_goal, state)
                 VALUES (?, ?, ?, 'planning')
                 """,
-                (sprint_id, lead_agent_id, goal),
+                (sprint_id, self._scope_agent_id(lead_agent_id), goal),
             )
         return sprint_id
 
     async def create_sprint_async(self, lead_agent_id: str, goal: str) -> str:
-        """Async-safe version of create_sprint for use from asyncio tasks."""
-        sprint_id = str(uuid.uuid4())
-        async with self._async_lock:
-            with self._conn:
-                self._conn.execute(
-                    """
-                    INSERT INTO sprints (sprint_id, lead_agent_id, sprint_goal, state)
-                    VALUES (?, ?, ?, 'planning')
-                    """,
-                    (sprint_id, lead_agent_id, goal),
-                )
-        return sprint_id
+        """Async wrapper around the serialized connection owner."""
+        return await asyncio.to_thread(self.create_sprint, lead_agent_id, goal)
 
     def update_sprint_state(self, sprint_id: str, state: SprintStateValue) -> None:
         if state not in {"planning", "active", "complete", "aborted"}:
             raise ValueError(f"Invalid sprint state: {state!r}")
-        with self._write_lock, self._conn:
-            self._conn.execute(
-                "UPDATE sprints SET state = ? WHERE sprint_id = ?",
-                (state, sprint_id),
-            )
-
-    async def update_sprint_state_async(
-        self, sprint_id: str, state: SprintStateValue
-    ) -> None:
-        """Async-safe version of update_sprint_state for use from asyncio tasks."""
-        if state not in {"planning", "active", "complete", "aborted"}:
-            raise ValueError(f"Invalid sprint state: {state!r}")
-        async with self._async_lock:
-            with self._conn:
+        with self._conn_lock, self._conn:
+            scoped = self._scoped_agent_like()
+            if scoped is None:
                 self._conn.execute(
                     "UPDATE sprints SET state = ? WHERE sprint_id = ?",
                     (state, sprint_id),
                 )
+            else:
+                self._conn.execute(
+                    "UPDATE sprints SET state = ? "
+                    "WHERE sprint_id = ? AND lead_agent_id LIKE ?",
+                    (state, sprint_id, scoped),
+                )
+            if state in {"complete", "aborted"}:
+                self._prune_terminal_sprints_locked()
+
+    async def update_sprint_state_async(
+        self, sprint_id: str, state: SprintStateValue
+    ) -> None:
+        """Async wrapper around the serialized connection owner."""
+        await asyncio.to_thread(self.update_sprint_state, sprint_id, state)
 
     def get_sprint(self, sprint_id: str) -> SharedSprint | None:
-        with closing(self._conn.cursor()) as cur:
-            row = cur.execute(
-                "SELECT * FROM sprints WHERE sprint_id = ?", (sprint_id,)
-            ).fetchone()
+        with self._conn_lock, closing(self._conn.cursor()) as cur:
+            scoped = self._scoped_agent_like()
+            if scoped is None:
+                row = cur.execute(
+                    "SELECT * FROM sprints WHERE sprint_id = ?", (sprint_id,)
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT * FROM sprints "
+                    "WHERE sprint_id = ? AND lead_agent_id LIKE ?",
+                    (sprint_id, scoped),
+                ).fetchone()
         if row is None:
             return None
-        return SharedSprint(
-            sprint_id=row["sprint_id"],
-            lead_agent_id=row["lead_agent_id"],
-            goal=row["sprint_goal"],
-            state=row["state"],
-            created_at=_parse_iso(row["created_at"]) or datetime.now(timezone.utc),
-        )
+        return self._row_to_sprint(row)
 
     def list_sprints(self) -> list[SharedSprint]:
-        with closing(self._conn.cursor()) as cur:
-            rows = cur.execute(
-                "SELECT * FROM sprints ORDER BY created_at DESC"
-            ).fetchall()
-        return [
-            SharedSprint(
-                sprint_id=r["sprint_id"],
-                lead_agent_id=r["lead_agent_id"],
-                goal=r["sprint_goal"],
-                state=r["state"],
-                created_at=_parse_iso(r["created_at"]) or datetime.now(timezone.utc),
-            )
-            for r in rows
-        ]
+        with self._conn_lock, closing(self._conn.cursor()) as cur:
+            scoped = self._scoped_agent_like()
+            if scoped is None:
+                rows = cur.execute(
+                    "SELECT * FROM sprints ORDER BY created_at DESC"
+                ).fetchall()
+            else:
+                rows = cur.execute(
+                    "SELECT * FROM sprints WHERE lead_agent_id LIKE ? "
+                    "ORDER BY created_at DESC",
+                    (scoped,),
+                ).fetchall()
+        return [self._row_to_sprint(r) for r in rows]
 
 
 # --- internal helpers -----------------------------------------------------

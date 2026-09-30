@@ -9,6 +9,9 @@ from typing import Any
 from ash.safety.grants import PermissionRule, RuleEffect
 
 
+MAX_SESSION_PERMISSION_RULES = 1024
+
+
 class PolicyAction(str, Enum):
     ALLOW = "allow"
     ASK = "ask"
@@ -84,6 +87,11 @@ class PermissionPolicy:
         self.managed_rules = list(managed_rules or ())
         self.persistent_rules = list(persistent_rules or ())
         self.session_rules = list(session_rules or ())
+        if len(self.session_rules) > MAX_SESSION_PERMISSION_RULES:
+            raise ValueError(
+                "session permission rules exceed the runtime limit "
+                f"({MAX_SESSION_PERMISSION_RULES})"
+            )
         if persistent_tool_grants:
             existing = {rule.rule_id for rule in self.persistent_rules}
             for tool_name in persistent_tool_grants:
@@ -121,9 +129,16 @@ class PermissionPolicy:
     def set_managed_rules(self, rules: list[PermissionRule]) -> None:
         self.managed_rules = list(rules)
 
-    def add_session_rule(self, rule: PermissionRule) -> None:
-        if all(existing.rule_id != rule.rule_id for existing in self.session_rules):
-            self.session_rules.append(rule)
+    def add_session_rule(self, rule: PermissionRule) -> bool:
+        if any(existing.rule_id == rule.rule_id for existing in self.session_rules):
+            return False
+        if len(self.session_rules) >= MAX_SESSION_PERMISSION_RULES:
+            raise OverflowError(
+                "session permission rule limit reached "
+                f"({MAX_SESSION_PERMISSION_RULES})"
+            )
+        self.session_rules.append(rule)
+        return True
 
     def _matching_rule(
         self,

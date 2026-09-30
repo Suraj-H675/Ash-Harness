@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import closing, contextmanager
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,7 +67,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 14
+            == 15
         )
         assert "mcp_tasks" in table_names
         assert {
@@ -82,6 +82,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
             row["name"] for row in conn.execute("PRAGMA table_info(sessions)")
         }
         assert "total_cache_read_tokens" in session_columns
+        assert "context_summary_message_count" in session_columns
         assert "total_cache_write_tokens" in session_columns
         assert "estimated_prompt_tokens" in session_columns
         assert "estimated_completion_tokens" in session_columns
@@ -96,6 +97,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
             "depth",
         }.issubset(session_columns)
         assert {"idx_sessions_parent", "idx_sessions_root_depth"}.issubset(index_names)
+        assert "idx_sprints_session_state_created" in index_names
         assert "turn_id" in {
             row["name"] for row in conn.execute("PRAGMA table_info(messages)")
         }
@@ -111,6 +113,124 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         assert "call_id" in {
             row["name"] for row in conn.execute("PRAGMA table_info(file_checkpoints)")
         }
+
+
+def test_v15_migration_adds_context_summary_message_count(tmp_path: Path) -> None:
+    db_path = tmp_path / "v14.db"
+    store = SessionStore(db_path)
+    session = store.create_session(str(tmp_path))
+    store.save_context_summary(session.session_id, "legacy summary")
+
+    with closing(get_db_connection(db_path)) as conn, conn:
+        conn.execute("ALTER TABLE sessions DROP COLUMN context_summary_message_count")
+        conn.execute("DROP INDEX IF EXISTS idx_sprints_session_state_created")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 15")
+
+    migrated = SessionStore(db_path)
+
+    assert len(list(tmp_path.glob("v14.db.before-v15-migration.*.backup"))) == 1
+    with get_db_connection(db_path) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 15
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+        assert "context_summary_message_count" in columns
+        indexes = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert "idx_sprints_session_state_created" in indexes
+    loaded = migrated.load_session(session.session_id)
+    assert loaded.context_summary == "legacy summary"
+    assert loaded.context_summary_message_count == 0
+
+
+def test_runtime_session_load_uses_persisted_compaction_window(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    for index in range(6):
+        store.save_message(
+            session.session_id,
+            Message(
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"message-{index}",
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id="call-history",
+            tool_name="read_file",
+            arguments={"file_path": "README.md"},
+            approved=True,
+            executed=True,
+            result="ok",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    store.save_context_summary(
+        session.session_id,
+        "summary of the first four messages",
+        summarized_message_count=4,
+    )
+
+    full = store.load_session(session.session_id)
+    runtime = store.load_session(session.session_id, runtime_window=True)
+
+    assert [message.content for message in full.messages] == [
+        f"message-{index}" for index in range(6)
+    ]
+    assert len(full.tool_calls) == 1
+    assert full.resident_message_offset == 0
+    assert full.context_summary_message_count == 4
+    assert [message.content for message in runtime.messages] == [
+        "message-4",
+        "message-5",
+    ]
+    assert [call.call_id for call in runtime.tool_calls] == ["call-history"]
+    assert runtime.resident_message_offset == 4
+    assert runtime.context_summary_message_count == 4
+    assert runtime.resident_history_is_windowed is True
+
+
+def test_runtime_session_load_bounds_recent_tool_call_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+
+    monkeypatch.setattr(session_module, "MAX_RUNTIME_SESSION_TOOL_CALLS", 2)
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    for index in range(4):
+        store.save_tool_call(
+            session.session_id,
+            ToolCallRecord(
+                call_id=f"call-{index}",
+                tool_name="read_file",
+                arguments={"file_path": f"{index}.txt"},
+                approved=True,
+                executed=True,
+                result=f"result-{index}",
+                timestamp=datetime(2026, 1, 1, 0, 0, index, tzinfo=timezone.utc),
+            ),
+        )
+
+    runtime = store.load_session(session.session_id, runtime_window=True)
+    full = store.load_session(session.session_id)
+
+    assert [call.call_id for call in runtime.tool_calls] == ["call-2", "call-3"]
+    assert [call.call_id for call in full.tool_calls] == [
+        "call-0",
+        "call-1",
+        "call-2",
+        "call-3",
+    ]
 
 
 def test_mcp_task_state_is_durable_and_updatable(tmp_path: Path) -> None:
@@ -182,6 +302,103 @@ def test_mcp_task_state_is_durable_and_updatable(tmp_path: Path) -> None:
 
     store.delete_mcp_task("server", "task-1")
     assert store.list_mcp_tasks(session.session_id) == []
+
+
+def test_mcp_task_durable_state_has_count_and_payload_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+
+    monkeypatch.setattr(session_module, "MAX_DURABLE_MCP_TASKS_PER_SESSION", 2)
+    monkeypatch.setattr(session_module, "MAX_DURABLE_MCP_TASK_STATE_BYTES", 256)
+    monkeypatch.setattr(
+        session_module,
+        "MAX_DURABLE_MCP_ANSWERED_INPUTS_BYTES",
+        128,
+    )
+    monkeypatch.setattr(session_module, "MAX_DURABLE_MCP_ANSWERED_INPUTS", 2)
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(project_path=str(tmp_path))
+    base_task = {
+        "taskId": "task",
+        "status": "working",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+    }
+
+    def save(task_id: str, call_id: str, *, task=None, answered=None) -> None:
+        payload = dict(base_task if task is None else task)
+        payload["taskId"] = task_id
+        store.save_mcp_task(
+            task_id=task_id,
+            session_id=session.session_id,
+            turn_id=f"turn-{call_id}",
+            call_id=call_id,
+            server_name="server",
+            remote_tool_name="slow",
+            contract_fingerprint="contract",
+            server_fingerprint="server-fingerprint",
+            protocol_version="2026-07-28",
+            task=payload,
+            answered_inputs={} if answered is None else answered,
+        )
+
+    save("task-1", "call-1")
+    save("task-2", "call-2")
+    # Updating an existing row must not consume another capacity slot.
+    save("task-1", "call-1", answered={"approve": "yes"})
+
+    with pytest.raises(ValueError, match="capacity exceeded"):
+        save("task-3", "call-3")
+    with pytest.raises(ValueError, match="task state exceeds 256"):
+        save(
+            "task-1",
+            "call-1",
+            task={**base_task, "padding": "x" * 300},
+        )
+    with pytest.raises(ValueError, match="answered-input history exceeds 2 entries"):
+        save(
+            "task-1",
+            "call-1",
+            answered={"a": "1", "b": "2", "c": "3"},
+        )
+    with pytest.raises(ValueError, match="answered-input history exceeds 128"):
+        save("task-1", "call-1", answered={"a": "x" * 200})
+    with pytest.raises(ValueError, match="strict JSON"):
+        save("task-1", "call-1", task={**base_task, "value": float("nan")})
+
+    # Simulate an oversized legacy/corrupt row set that predates the write cap.
+    with closing(get_db_connection(store.db_path)) as conn, conn:
+        conn.execute(
+            """
+            INSERT INTO mcp_tasks (
+                task_id, session_id, turn_id, call_id, server_name,
+                remote_tool_name, contract_fingerprint, server_fingerprint,
+                protocol_version, status, task_json, answered_inputs_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "task-legacy",
+                session.session_id,
+                "turn-legacy",
+                "call-legacy",
+                "legacy-server",
+                "slow",
+                "contract",
+                "legacy-fingerprint",
+                "2026-07-28",
+                "working",
+                json.dumps({**base_task, "taskId": "task-legacy"}),
+                "{}",
+                "2026-09-20T00:00:00Z",
+                "2026-09-20T00:00:01Z",
+            ),
+        )
+
+    with pytest.raises(SessionStorageError, match="task count exceeds"):
+        store.list_mcp_tasks(session.session_id)
 
 
 def test_mcp_task_ids_are_namespaced_by_server_and_cannot_be_reassigned(
@@ -261,11 +478,11 @@ def test_v12_migration_adds_mcp_task_table_with_backup(tmp_path: Path) -> None:
 
     SessionStore(db_path)
 
-    assert len(list(tmp_path.glob("v11.db.before-v14-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v11.db.before-v15-migration.*.backup"))) == 1
     with get_db_connection(db_path) as conn:
         assert conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 14
+        ).fetchone()[0] == 15
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type = 'table' AND name = 'mcp_tasks'"
@@ -307,7 +524,7 @@ def test_v13_migration_binds_existing_mcp_task_table_to_server_identity(
 
     SessionStore(db_path)
 
-    assert len(list(tmp_path.glob("v12.db.before-v14-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v12.db.before-v15-migration.*.backup"))) == 1
     with get_db_connection(db_path) as conn:
         columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(mcp_tasks)")
@@ -315,7 +532,7 @@ def test_v13_migration_binds_existing_mcp_task_table_to_server_identity(
         assert "server_fingerprint" in columns
         assert conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 14
+        ).fetchone()[0] == 15
 
 
 def test_v14_migration_scopes_tool_call_and_event_ids_to_sessions(
@@ -407,11 +624,11 @@ def test_v14_migration_scopes_tool_call_and_event_ids_to_sessions(
 
     migrated = SessionStore(db_path)
 
-    assert len(list(tmp_path.glob("v13.db.before-v14-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v13.db.before-v15-migration.*.backup"))) == 1
     with get_db_connection(db_path) as conn:
         assert conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 14
+        ).fetchone()[0] == 15
     assert migrated.load_session(first.session_id).tool_calls[0].call_id == (
         "shared-call-id"
     )
@@ -473,6 +690,27 @@ def test_session_store_rejects_linked_database_file_and_parent(tmp_path: Path) -
         ).fetchone()[0] == 0
 
 
+def test_session_store_rejects_database_identity_replacement(tmp_path: Path) -> None:
+    database = tmp_path / "sessions.db"
+    replacement = tmp_path / "replacement.db"
+    moved = tmp_path / "sessions-original.db"
+    store = SessionStore(database)
+    session = store.create_session("/workspace")
+    replacement_store = SessionStore(replacement)
+    replacement_store.create_session("/replacement")
+
+    try:
+        database.rename(moved)
+        replacement.rename(database)
+
+        with pytest.raises(SessionStorageError, match="file identity changed"):
+            store.load_session(session.session_id)
+    finally:
+        if database.exists() and moved.exists():
+            database.unlink()
+            moved.rename(database)
+
+
 def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     db_path = tmp_path / "legacy.db"
     with sqlite3.connect(db_path) as conn:
@@ -498,7 +736,7 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v14-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v15-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
@@ -556,7 +794,7 @@ def test_v7_migration_preserves_checkpoints_and_adds_call_granularity(
         call_id="call-2",
     )
     assert len(migrated.file_checkpoints_for_turns(session.session_id, ["turn-1"])) == 2
-    assert len(list(tmp_path.glob("v6.db.before-v14-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v6.db.before-v15-migration.*.backup"))) == 1
 
 
 def test_session_forks_form_a_durable_redacted_tree(tmp_path: Path) -> None:
@@ -653,6 +891,60 @@ def test_session_fork_rejects_incomplete_tool_and_turn_boundaries(
     )
     with pytest.raises(ValueError, match="splits an Ash turn"):
         store.fork_session(turn_session.session_id, message_count=1)
+
+
+def test_fork_session_does_not_preload_source_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path / "fork-no-preload.db")
+    source = store.create_session(str(tmp_path))
+    now = datetime.now(timezone.utc)
+    for content in ("one", "two", "three"):
+        store.save_message(
+            source.session_id,
+            Message(role="user", content=content, timestamp=now),
+        )
+    original_load = store.load_session
+    loaded_ids: list[str] = []
+
+    def tracking_load(session_id: str, **kwargs):
+        loaded_ids.append(session_id)
+        return original_load(session_id, **kwargs)
+
+    monkeypatch.setattr(store, "load_session", tracking_load)
+
+    child = store.fork_session(source.session_id, message_count=2)
+
+    assert loaded_ids == [child.session_id]
+    assert [message.content for message in child.messages] == ["one", "two"]
+
+
+def test_rewind_session_does_not_preload_full_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path / "rewind-no-preload.db")
+    session = store.create_session(str(tmp_path))
+    now = datetime.now(timezone.utc)
+    for content in ("one", "two", "three"):
+        store.save_message(
+            session.session_id,
+            Message(role="user", content=content, timestamp=now),
+        )
+    original_load = store.load_session
+    loaded_ids: list[str] = []
+
+    def tracking_load(session_id: str, **kwargs):
+        loaded_ids.append(session_id)
+        return original_load(session_id, **kwargs)
+
+    monkeypatch.setattr(store, "load_session", tracking_load)
+
+    rewound = store.rewind_session(session.session_id, 1)
+
+    assert loaded_ids == [session.session_id]
+    assert [message.content for message in rewound.messages] == ["one"]
 
 
 def test_session_cleanup_deletes_only_complete_inactive_trees(tmp_path: Path) -> None:
@@ -807,6 +1099,7 @@ def test_discard_unchanged_leaf_fork_is_narrow_and_fail_closed(tmp_path: Path) -
 def test_runtime_event_log_is_ordered_idempotent_and_redacted(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "events.db")
     session = store.create_session(str(tmp_path))
+    github_token = "ghp_" + "A" * 36
     base = {
         "schema_version": 1,
         "timestamp": "2026-07-10T00:00:00+00:00",
@@ -822,7 +1115,10 @@ def test_runtime_event_log_is_ordered_idempotent_and_redacted(tmp_path: Path) ->
             **base,
             "event_id": "event-2",
             "type": "tool.completed",
-            "output": "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
+            "output": (
+                "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz "
+                f"github={github_token}"
+            ),
         },
     ]
 
@@ -838,6 +1134,7 @@ def test_runtime_event_log_is_ordered_idempotent_and_redacted(tmp_path: Path) ->
         "tool.completed",
     ]
     assert "sk-proj" not in remainder[0].event["output"]
+    assert github_token not in remainder[0].event["output"]
     assert "REDACTED" in remainder[0].event["output"]
 
 
@@ -1007,10 +1304,7 @@ def test_manual_backup_does_not_follow_destination_swapped_to_symlink(
 
 def test_manual_backup_does_not_follow_source_swapped_to_symlink(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import ash.core.session as session_module
-
     source = tmp_path / "sessions.db"
     store = SessionStore(source)
     source_session = store.create_session("/source")
@@ -1018,37 +1312,43 @@ def test_manual_backup_does_not_follow_source_swapped_to_symlink(
     replacement_store = SessionStore(replacement)
     replacement_session = replacement_store.create_session("/replacement")
     destination = tmp_path / "manual.backup"
-    real_open = session_module.open_unlinked_regular_file
-    swapped = False
-
-    @contextmanager
-    def swap_source_before_open(path, *, label):
-        nonlocal swapped
-        if not swapped and label == "session database":
-            swapped = True
-            source.unlink()
-            try:
-                source.symlink_to(replacement)
-            except OSError as exc:
-                pytest.skip(f"symlinks are unavailable: {exc}")
-        with real_open(path, label=label) as descriptor:
-            yield descriptor
-
-    monkeypatch.setattr(
-        session_module,
-        "open_unlinked_regular_file",
-        swap_source_before_open,
-    )
+    source.unlink()
+    try:
+        source.symlink_to(replacement)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
 
     with pytest.raises(SessionStorageError):
         store.backup(destination)
 
-    assert swapped is True
     assert not destination.exists()
     assert SessionStore(replacement).load_session(replacement_session.session_id).session_id == (
         replacement_session.session_id
     )
     assert source_session.session_id != replacement_session.session_id
+
+
+def test_manual_backup_rejects_regular_file_replacement_before_backup(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sessions.db"
+    store = SessionStore(source)
+    source_session = store.create_session("/source")
+    original = tmp_path / "sessions-original.db"
+    source.rename(original)
+
+    replacement_store = SessionStore(source)
+    replacement_session = replacement_store.create_session("/replacement")
+    destination = tmp_path / "manual.backup"
+
+    with pytest.raises(SessionStorageError, match="file identity changed"):
+        store.backup(destination)
+
+    assert not destination.exists()
+    assert source_session.session_id != replacement_session.session_id
+    assert SessionStore(source).load_session(replacement_session.session_id).session_id == (
+        replacement_session.session_id
+    )
 
 
 def test_manual_backup_never_copies_replacement_during_regular_file_aba_swap(
@@ -1163,10 +1463,19 @@ def test_manual_backup_quiesces_concurrent_session_writer(
     real_copy = session_module._copy_descriptor
     real_acquire = session_module._acquire_database_coordination
 
-    def observe_acquire(db_path, *, exclusive):
+    def observe_acquire(
+        db_path,
+        *,
+        exclusive,
+        coordination_parent_descriptor=None,
+    ):
         if threading.current_thread().name == "backup-writer" and not exclusive:
             writer_reached_acquire.set()
-        return real_acquire(db_path, exclusive=exclusive)
+        return real_acquire(
+            db_path,
+            exclusive=exclusive,
+            coordination_parent_descriptor=coordination_parent_descriptor,
+        )
 
     def writer() -> None:
         assert copy_entered.wait(5)
@@ -1239,10 +1548,19 @@ attempt = Path(sys.argv[3])
 result = Path(sys.argv[4])
 real_acquire = session_module._acquire_database_coordination
 
-def marked_acquire(db_path, *, exclusive):
+def marked_acquire(
+    db_path,
+    *,
+    exclusive,
+    coordination_parent_descriptor=None,
+):
     if exclusive:
         attempt.write_text("waiting", encoding="utf-8")
-    return real_acquire(db_path, exclusive=exclusive)
+    return real_acquire(
+        db_path,
+        exclusive=exclusive,
+        coordination_parent_descriptor=coordination_parent_descriptor,
+    )
 
 session_module._acquire_database_coordination = marked_acquire
 store = SessionStore(database)
@@ -1372,6 +1690,56 @@ def test_nested_database_read_completes_while_writer_is_queued(tmp_path: Path) -
     assert not writer_thread.is_alive()
     assert writer_done.is_set()
     assert errors == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-anchored POSIX regression")
+def test_exclusive_database_access_parent_swap_fails_without_writing_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+    import ash.safety.anchored_fs as anchored_fs
+
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    source = state_root / "db" / "sessions.db"
+    saved_root = tmp_path / "state-saved"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    real_open_or_create = anchored_fs._open_or_create_directory
+    swapped = False
+
+    def open_or_create_then_swap(
+        parent_descriptor,
+        name,
+        *,
+        create,
+        expected=None,
+    ):
+        nonlocal swapped
+        if name == "db" and not swapped:
+            state_root.rename(saved_root)
+            state_root.symlink_to(replacement, target_is_directory=True)
+            swapped = True
+        return real_open_or_create(
+            parent_descriptor,
+            name,
+            create=create,
+            expected=expected,
+        )
+
+    monkeypatch.setattr(
+        anchored_fs,
+        "_open_or_create_directory",
+        open_or_create_then_swap,
+    )
+
+    with pytest.raises(SessionStorageError):
+        with session_module.exclusive_database_access(source):
+            pass
+
+    assert swapped is True
+    assert not (replacement / "db").exists()
 
 
 def test_manual_backup_fails_closed_without_descriptor_validation_support(
@@ -1543,6 +1911,70 @@ def test_audit_log_hash_chain_detects_tampering(tmp_path: Path) -> None:
     ]
 
 
+def test_audit_append_serializes_chain_tail_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "session_store.db"
+    first_store = SessionStore(db_path)
+    session = first_store.create_session(project_path=str(tmp_path))
+    second_store = SessionStore(db_path)
+    original_append = SessionStore._append_audit_log_in_connection
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    counter_lock = threading.Lock()
+    calls = 0
+
+    def controlled_append(self, conn, session_id, **kwargs):
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=2)
+        elif call_number == 2:
+            second_entered.set()
+        return original_append(self, conn, session_id, **kwargs)
+
+    monkeypatch.setattr(
+        SessionStore,
+        "_append_audit_log_in_connection",
+        controlled_append,
+    )
+    errors: list[BaseException] = []
+
+    def append(store: SessionStore, target: str) -> None:
+        try:
+            store.append_audit_log(
+                session.session_id,
+                action_type="tool_call",
+                target_resource=target,
+                details={"target": target},
+                result="SUCCESS",
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=append, args=(first_store, "first"))
+    second = threading.Thread(target=append, args=(second_store, "second"))
+    first.start()
+    assert first_entered.wait(timeout=2)
+    second.start()
+    try:
+        assert second_entered.wait(timeout=0.1) is False
+    finally:
+        release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert first_store.verify_audit_log(session.session_id) == []
+
+
 def test_connection_uses_wal_pragmas_and_foreign_keys(tmp_path: Path) -> None:
     db_path = tmp_path / "session_store.db"
 
@@ -1553,6 +1985,24 @@ def test_connection_uses_wal_pragmas_and_foreign_keys(tmp_path: Path) -> None:
         assert conn.execute("PRAGMA foreign_keys;").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX advisory lock regression")
+def test_session_runtime_lease_rejects_second_active_owner(tmp_path: Path) -> None:
+    db_path = tmp_path / "session_store.db"
+    first_store = SessionStore(db_path)
+    session = first_store.create_session(project_path=str(tmp_path))
+    second_store = SessionStore(db_path)
+
+    first_lease = first_store.acquire_session_runtime_lease(session.session_id)
+    try:
+        with pytest.raises(SessionStorageError, match="active in another Ash process"):
+            second_store.acquire_session_runtime_lease(session.session_id)
+    finally:
+        first_lease.close()
+
+    second_lease = second_store.acquire_session_runtime_lease(session.session_id)
+    second_lease.close()
 
 
 @pytest.mark.asyncio
@@ -1607,6 +2057,37 @@ async def test_write_transaction_serializes_concurrent_writes(tmp_path: Path) ->
     assert labels == ["first", "second"]
 
 
+def test_write_transaction_can_contend_across_sequential_event_loops(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "session_store.db"
+    SessionStore(db_path)
+
+    async def contend() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def first() -> None:
+            async with write_transaction(db_path):
+                entered.set()
+                await release.wait()
+
+        async def second() -> None:
+            await entered.wait()
+            async with write_transaction(db_path):
+                return
+
+        first_task = asyncio.create_task(first())
+        second_task = asyncio.create_task(second())
+        await entered.wait()
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first_task, second_task)
+
+    asyncio.run(contend())
+    asyncio.run(contend())
+
+
 def test_get_recent_session_summaries(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "test.db")
     s1 = store.create_session(str(tmp_path))
@@ -1625,6 +2106,27 @@ def test_get_recent_session_summaries(tmp_path: Path) -> None:
     assert len(summaries) == 2
     assert any("hello" in s for s in summaries)
     assert any("goodbye" in s for s in summaries)
+
+
+def test_recent_session_summaries_are_bounded_recent_tails(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "test.db")
+    session = store.create_session(str(tmp_path))
+    for index in range(40):
+        store.save_message(
+            session.session_id,
+            Message(
+                role="user",
+                content=f"message-{index:02d} " + ("x" * 180),
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+
+    summaries = store.get_recent_session_summaries(str(tmp_path), limit=1)
+
+    assert len(summaries) == 1
+    assert len(summaries[0]) <= 2000
+    assert "message-39" in summaries[0]
+    assert "message-00" not in summaries[0]
 
 
 def test_session_scope_resolves_equivalent_project_paths(tmp_path: Path) -> None:
@@ -1669,9 +2171,11 @@ def test_session_resolution_rejects_ambiguous_and_cross_project_references(
     store = SessionStore(tmp_path / "test.db")
     first = store.create_session(str(tmp_path))
     second = store.create_session(str(tmp_path))
+    third = store.create_session(str(tmp_path))
     foreign = store.create_session(str(tmp_path / "other"))
     store.rename_session(first.session_id, "duplicate")
     store.rename_session(second.session_id, "DUPLICATE")
+    store.rename_session(third.session_id, "Duplicate")
 
     with pytest.raises(SessionResolutionError, match="ambiguous"):
         store.resolve_session("duplicate", str(tmp_path))
@@ -1699,6 +2203,64 @@ def test_list_and_rename_sessions(tmp_path: Path) -> None:
     assert second.session_id in {
         item.session_id for item in store.list_sessions(limit=10)
     }
+
+
+def test_session_list_limit_is_bounded(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+
+    with pytest.raises(ValueError, match="limit must be between 1 and 1000"):
+        store.list_sessions(limit=1001)
+
+
+def test_session_tree_and_lineage_fail_closed_above_node_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.core.session as session_module
+
+    monkeypatch.setattr(session_module, "MAX_SESSION_TREE_NODES", 2)
+    store = SessionStore(tmp_path / "sessions.db")
+    root = store.create_session(str(tmp_path))
+    first = store.fork_session(root.session_id, branch_name="first")
+    store.fork_session(root.session_id, branch_name="second")
+    store.fork_session(root.session_id, branch_name="third")
+    store.fork_session(first.session_id, branch_name="grandchild")
+
+    with pytest.raises(SessionStorageError, match="child-node limit"):
+        store.get_session_lineage(root.session_id)
+    with pytest.raises(SessionStorageError, match="session tree exceeds"):
+        store.session_tree(first.session_id)
+
+
+def test_rename_session_rejects_oversized_title_without_mutation(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.rename_session(session.session_id, "Original")
+
+    with pytest.raises(ValueError, match="session title cannot exceed 256 characters"):
+        store.rename_session(session.session_id, "x" * 257)
+
+    assert store.load_session(session.session_id).title == "Original"
+
+
+def test_fork_title_suffix_stays_within_session_title_limit(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.rename_session(session.session_id, "x" * 256)
+
+    fork = store.fork_session(session.session_id)
+
+    assert fork.title.endswith(" (fork)")
+    assert len(fork.title) <= 256
+
+
+def test_create_session_rejects_oversized_model_metadata(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+
+    with pytest.raises(ValueError, match="session model cannot exceed 512 UTF-8 bytes"):
+        store.create_session(str(tmp_path), model="x" * 513)
+
+    assert store.list_sessions(limit=10) == []
 
 
 def test_session_summary_search_matches_redacted_context_summary(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -117,6 +118,34 @@ def test_completer_offers_live_mcp_resources(tmp_path: Path) -> None:
     assert len(matches) == 1
     assert matches[0].text == "@mcp:docs/file:///guides/security.md"
     assert "Security Guide" in str(matches[0].display_meta)
+
+
+@pytest.mark.asyncio
+async def test_completer_offers_mcp_resources_inside_running_event_loop(
+    tmp_path: Path,
+) -> None:
+    class Runtime:
+        async def list_resources(self):
+            await asyncio.sleep(0)
+            return [
+                {
+                    "server": "docs",
+                    "uri": "file:///guides/security.md",
+                    "name": "Security Guide",
+                }
+            ]
+
+    completer = AshCompleter(["/help"], tmp_path, mcp_runtime=Runtime())
+
+    matches = [
+        item
+        async for item in completer.get_completions_async(
+            Document("@mcp:secur", 10), CompleteEvent()
+        )
+    ]
+
+    assert len(matches) == 1
+    assert matches[0].text == "@mcp:docs/file:///guides/security.md"
 
 
 def test_extended_mentions_resolve_symbols_to_bounded_file_attachments(

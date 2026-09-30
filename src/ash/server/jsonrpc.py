@@ -16,15 +16,46 @@ MAX_JSONRPC_SESSION_LIST_LIMIT = 100
 MAX_JSONRPC_EVENT_LIST_LIMIT = 10_000
 MAX_JSONRPC_BRANCH_NAME_CHARS = 128
 MAX_JSONRPC_BRANCH_SUMMARY_CHARS = 12_000
+MAX_PENDING_JSONRPC_REQUESTS = 64
 MAX_PENDING_JSONRPC_NOTIFICATIONS = 64
+MAX_JSONRPC_REQUEST_ID_BYTES = 512
+JSON_SAFE_INTEGER_BOUND = 2**53 - 1
+JSONRPC_SERVER_CLOSING_CODE = -32000
+JSONRPC_SERVER_BUSY_CODE = -32001
+
+
+async def _settle_jsonrpc_cleanup_task(
+    task: asyncio.Task[None],
+) -> tuple[BaseException | None, bool]:
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException as exc:
+        return exc, interrupted
+    return None, interrupted
 
 
 class JSONRPCServer:
     def __init__(self, client: AshClient) -> None:
         self.client = client
         self._pending: dict[str | int, asyncio.Future[Any]] = {}
+        self._request_tasks: set[asyncio.Future[Any]] = set()
         self._notification_tasks: set[asyncio.Future[Any]] = set()
         self._turn_lock = asyncio.Lock()
+        self._admission_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._closing = False
+        self._client_closed = False
         self._methods: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
             "initialize": self._initialize,
             "turn/run": self._run_turn,
@@ -52,31 +83,55 @@ class JSONRPCServer:
         params = request.get("params", {})
         if not isinstance(params, dict):
             return _error(request_id, -32602, "Params must be an object")
-        if method == "$/cancelRequest":
-            target_id = params.get("id")
-            if "id" not in params or not _is_valid_request_id(target_id):
-                return _error(request_id, -32602, "cancel request id is invalid")
-            cancelled = self.cancel(target_id)
-            return None if not has_request_id else _result(request_id, cancelled)
-        handler = self._methods.get(method)
-        if handler is None:
-            return (
-                None
-                if not has_request_id
-                else _error(request_id, -32601, f"Method not found: {method}")
-            )
-        if not has_request_id:
-            if len(self._notification_tasks) >= MAX_PENDING_JSONRPC_NOTIFICATIONS:
+        async with self._admission_lock:
+            if self._closing:
+                return (
+                    None
+                    if not has_request_id
+                    else _error(
+                        request_id,
+                        JSONRPC_SERVER_CLOSING_CODE,
+                        "Server is closing",
+                    )
+                )
+            if (
+                has_request_id
+                and request_id is not None
+                and request_id in self._pending
+            ):
+                return _error(
+                    request_id,
+                    -32600,
+                    "Request id is already in flight",
+                )
+            if method == "$/cancelRequest":
+                target_id = params.get("id")
+                if "id" not in params or not _is_valid_request_id(target_id):
+                    return _error(request_id, -32602, "cancel request id is invalid")
+                cancelled = self.cancel(target_id)
+                return None if not has_request_id else _result(request_id, cancelled)
+            handler = self._methods.get(method)
+            if handler is None:
+                return (
+                    None
+                    if not has_request_id
+                    else _error(request_id, -32601, f"Method not found: {method}")
+                )
+            if not has_request_id:
+                if len(self._notification_tasks) >= MAX_PENDING_JSONRPC_NOTIFICATIONS:
+                    return None
+                notification_task = asyncio.ensure_future(handler(params))
+                self._notification_tasks.add(notification_task)
+                notification_task.add_done_callback(self._finish_notification)
                 return None
-            notification_task = asyncio.ensure_future(handler(params))
-            self._notification_tasks.add(notification_task)
-            notification_task.add_done_callback(self._finish_notification)
-            return None
-        task: asyncio.Future[Any] = asyncio.ensure_future(handler(params))
-        # Explicit null is a request identifier, but it cannot safely identify
-        # one entry in the cancellation map when multiple such requests run.
-        if request_id is not None:
-            self._pending[request_id] = task
+            if len(self._request_tasks) >= MAX_PENDING_JSONRPC_REQUESTS:
+                return _error(request_id, JSONRPC_SERVER_BUSY_CODE, "Server is busy")
+            task: asyncio.Future[Any] = asyncio.ensure_future(handler(params))
+            self._request_tasks.add(task)
+            # Explicit null is a request identifier, but it cannot safely identify
+            # one entry in the cancellation map when multiple such requests run.
+            if request_id is not None:
+                self._pending[request_id] = task
         try:
             value = await task
             return _result(request_id, value)
@@ -92,6 +147,7 @@ class JSONRPCServer:
                 {"detail": redact_text(str(exc))},
             )
         finally:
+            self._request_tasks.discard(task)
             if request_id is not None:
                 self._pending.pop(request_id, None)
 
@@ -111,13 +167,34 @@ class JSONRPCServer:
         task.exception()
 
     async def close(self, *, close_client: bool = True) -> None:
-        tasks = list(self._pending.values())
-        notification_tasks = list(self._notification_tasks)
+        async with self._close_lock:
+            cleanup = asyncio.create_task(
+                self._close_owned(close_client=close_client),
+                name="ash-jsonrpc-shutdown",
+            )
+            cleanup_error, interrupted = await _settle_jsonrpc_cleanup_task(cleanup)
+            if interrupted:
+                cancellation = asyncio.CancelledError()
+                if cleanup_error is not None:
+                    cancellation.add_note(
+                        "JSON-RPC shutdown cleanup failed while cancellation was pending: "
+                        + redact_text(str(cleanup_error))
+                    )
+                raise cancellation from cleanup_error
+            if cleanup_error is not None:
+                raise cleanup_error
+
+    async def _close_owned(self, *, close_client: bool) -> None:
+        async with self._admission_lock:
+            self._closing = True
+            tasks = list(self._request_tasks)
+            notification_tasks = list(self._notification_tasks)
         for task in (*tasks, *notification_tasks):
             task.cancel()
         await asyncio.gather(*tasks, *notification_tasks, return_exceptions=True)
-        if close_client:
+        if close_client and not self._client_closed:
             await self.client.close()
+            self._client_closed = True
 
     async def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -287,11 +364,15 @@ def _result(request_id: Any, value: Any) -> dict[str, Any]:
 
 
 def _is_valid_request_id(value: Any) -> bool:
-    if value is None or isinstance(value, str):
+    if value is None:
         return True
+    if isinstance(value, str):
+        return len(value.encode("utf-8")) <= MAX_JSONRPC_REQUEST_ID_BYTES
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    return not isinstance(value, float) or math.isfinite(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return abs(value) <= JSON_SAFE_INTEGER_BOUND
 
 
 def _error(

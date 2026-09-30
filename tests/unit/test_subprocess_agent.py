@@ -1,17 +1,18 @@
 # tests/unit/test_subprocess_agent.py
+import tempfile
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
+from ash.agents.shared_state import SharedState
 from ash.agents.subprocess_agent import (
     MAX_SUBPROCESS_SPEC_BYTES,
+    AgentReport,
     SubprocessAgent,
     make_simple_text_task,
 )
-from ash.agents.shared_state import SharedState
 from ash.sandbox._base import SANDBOX_TIER_SCOPED
-import tempfile
-from pathlib import Path
 
 
 @pytest.fixture
@@ -113,6 +114,60 @@ def test_spawn_subprocess_rejects_oversized_spec(shared_state) -> None:
 
     with pytest.raises(ValueError, match="specification exceeds"):
         agent.spawn_subprocess()
+
+
+@pytest.mark.asyncio
+async def test_agent_report_redacts_secrets_before_shared_state_publication(
+    shared_state: SharedState,
+) -> None:
+    secret = "sk-proj-" + "A" * 32
+
+    async def failing_runner(_context):
+        raise RuntimeError(f"upstream echoed credential {secret}")
+
+    agent = SubprocessAgent(
+        agent_id="redaction-agent",
+        role="general",
+        task="test task",
+        shared_state=shared_state,
+        runner=failing_runner,
+    )
+
+    report = await agent.run_in_process()
+    status = shared_state.get_status("redaction-agent")
+    messages = shared_state.fetch_messages("lead")
+
+    assert secret not in report.summary
+    assert secret not in repr(report.artifacts)
+    assert status is not None
+    assert secret not in status.current_task
+    assert len(messages) == 1
+    assert secret not in repr(messages[0].content)
+    assert "[REDACTED]" in report.summary
+
+
+def test_agent_report_payload_redacts_mutated_artifacts(shared_state: SharedState) -> None:
+    secret = "xoxb-" + "A" * 24
+    report = AgentReport(
+        agent_id="redaction-agent",
+        role="general",
+        task="test task",
+        success=True,
+        summary="done",
+        artifacts={"status": "ok"},
+    )
+    report.artifacts["late_detail"] = f"credential {secret}"
+
+    payload = SubprocessAgent(
+        agent_id="redaction-agent",
+        role="general",
+        task="test task",
+        shared_state=shared_state,
+        runner=make_simple_text_task("done"),
+    ).report_to_payload(report)
+
+    assert secret not in repr(payload)
+    assert "[REDACTED]" in repr(payload)
 
 
 def test_subagent_spec_sandbox_tier_default():

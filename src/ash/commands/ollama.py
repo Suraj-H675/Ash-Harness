@@ -134,6 +134,23 @@ async def pull_model(
         if cleanup_cancelled:
             cancellation.add_note("Process-tree cleanup was cancelled")
         raise
+    except Exception as primary_error:
+        cleanup_error, cleanup_cancelled = (
+            await settle_process_tree_after_cancellation(
+                process, plan=process_tree_plan
+            )
+        )
+        if cleanup_error is not None:
+            primary_error.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled:
+            cleanup_cancellation = asyncio.CancelledError()
+            cleanup_cancellation.add_note(
+                "ollama pull failed before process-tree cleanup was cancelled"
+            )
+            if cleanup_error is not None:
+                cleanup_cancellation.add_note("Process-tree cleanup also failed")
+            raise cleanup_cancellation from primary_error
+        raise
     if process.returncode == 0:
         print(f"Pulled {normalized}.")
     else:

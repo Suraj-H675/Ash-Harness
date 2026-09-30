@@ -5,7 +5,9 @@ import pytest
 
 from ash.safety.grants import (
     ArgumentMatcher,
+    MAX_RULE_BYTES,
     MAX_RULE_FILE_BYTES,
+    MAX_RULE_MATCHERS,
     MatchOperator,
     PermissionGrantError,
     PermissionRule,
@@ -90,6 +92,45 @@ def test_command_prefix_matcher_rejects_ambiguous_shell_programs() -> None:
     assert matcher.matches({"command_line": "pytest -q && rm marker"}) is False
     assert matcher.matches({"command_line": "pytest -q > result.txt"}) is False
     assert matcher.matches({"command_line": 'pytest "$(touch marker)"'}) is False
+
+
+def test_permission_rule_matcher_count_and_total_bytes_are_bounded() -> None:
+    with pytest.raises(
+        PermissionGrantError,
+        match=f"exceeds {MAX_RULE_MATCHERS} matchers",
+    ):
+        PermissionRule.create(
+            RuleEffect.ALLOW,
+            "run_command",
+            [
+                ArgumentMatcher(f"arg{index}", MatchOperator.EXACT, index)
+                for index in range(MAX_RULE_MATCHERS + 1)
+            ],
+        )
+
+    oversized_matchers = [
+        ArgumentMatcher(f"arg{index}", MatchOperator.EXACT, "x" * 8000)
+        for index in range(9)
+    ]
+    with pytest.raises(
+        PermissionGrantError,
+        match=f"exceeds {MAX_RULE_BYTES} bytes",
+    ):
+        PermissionRule.create(
+            RuleEffect.ALLOW,
+            "run_command",
+            oversized_matchers,
+        )
+
+    with pytest.raises(PermissionGrantError, match="must be valid JSON"):
+        ArgumentMatcher("threshold", MatchOperator.EXACT, float("nan"))
+
+    with pytest.raises(PermissionGrantError, match="permission rule must be valid JSON"):
+        PermissionRule.create(
+            RuleEffect.ALLOW,
+            "run_command",
+            [ArgumentMatcher("command_line", MatchOperator.PREFIX, "\ud800")],
+        )
 
 
 def test_path_prefix_matcher_is_workspace_scoped_and_safe() -> None:
@@ -256,6 +297,29 @@ def test_permission_rule_file_rejects_duplicate_json_keys(tmp_path, monkeypatch)
     )
 
     with pytest.raises(PermissionGrantError, match="duplicate JSON object key"):
+        load_permission_rules(workspace)
+
+
+def test_permission_rule_file_rejects_non_standard_json(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    path = grants_path()
+    path.parent.mkdir(parents=True)
+    rule = PermissionRule.create(RuleEffect.ALLOW, "run_command")
+    path.write_text(
+        '{"version":2,"workspaces":{'
+        + json.dumps(str(workspace.resolve()))
+        + ':['
+        + json.dumps(rule.as_payload(), separators=(",", ":"))
+        + ']},"metric":NaN}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PermissionGrantError, match="invalid JSON constant: NaN"):
         load_permission_rules(workspace)
 
 

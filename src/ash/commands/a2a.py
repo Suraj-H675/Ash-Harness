@@ -26,7 +26,12 @@ from a2a.utils.constants import TransportProtocol
 from google.protobuf.json_format import MessageToDict
 
 from ash.config import AshConfig
-from ash.agents.a2a_remote import _validate_remote_url, validate_agent_card_origins
+from ash.agents.a2a_remote import (
+    _close_remote_agent_resources,
+    _settle_cleanup_task_after_cancellation,
+    _validate_remote_url,
+    validate_agent_card_origins,
+)
 from ash.core.redaction import redact_urls_in_text, redact_value
 from ash.safe_io import read_bounded_text
 from ash.server.a2a import create_a2a_app
@@ -99,9 +104,20 @@ async def serve_a2a(args) -> int:
 
 async def inspect_a2a(args) -> int:
     url = _remote_url(args.url)
-    async with _remote_http_client(args) as http:
+    http = _remote_http_client(args)
+    primary_error: BaseException | None = None
+    try:
         card = await A2ACardResolver(http, url).get_agent_card()
         print(json.dumps(redact_value(agent_card_to_dict(card)), indent=2))
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        await _close_remote_agent_resources(
+            None,
+            http,
+            primary_error=primary_error,
+        )
     return 0
 
 
@@ -121,7 +137,10 @@ async def send_a2a(args) -> int:
     if args.context_id and len(args.context_id.encode("utf-8")) > 512:
         raise ValueError("A2A context ID exceeds 512 bytes")
 
-    async with _remote_http_client(args) as http:
+    http = _remote_http_client(args)
+    client: Any | None = None
+    primary_error: BaseException | None = None
+    try:
         factory = ClientFactory(
             ClientConfig(
                 httpx_client=http,
@@ -143,95 +162,102 @@ async def send_a2a(args) -> int:
         rendered_text = False
         status_message = ""
         rendered_bytes = 0
-        try:
-            message = Message(
-                message_id=str(uuid4()),
-                role=Role.ROLE_USER,
-                parts=[Part(text=prompt)],
-            )
-            if args.context_id:
-                message.context_id = args.context_id
-            request = SendMessageRequest(message=message)
-            async for event in client.send_message(request):
-                event_count += 1
-                if event_count > MAX_A2A_CLIENT_EVENTS:
-                    raise RuntimeError("A2A response exceeded 10,000 events")
-                if args.json:
-                    event_raw_bytes, event_rendered_bytes = _append_json_event(
-                        events,
-                        MessageToDict(event),
-                        event_raw_bytes,
-                        event_rendered_bytes,
-                    )
-                if event.HasField("task"):
-                    task_id = event.task.id
-                    final_state = event.task.status.state
-                elif event.HasField("message"):
-                    immediate_message = True
-                    if not args.json:
-                        for part in event.message.parts:
-                            if part.WhichOneof("content") == "text":
-                                rendered_bytes = _write_bounded_text(
-                                    part.text,
-                                    rendered_bytes,
-                                )
-                                rendered_text = True
-                elif event.HasField("status_update"):
-                    task_id = event.status_update.task_id
-                    final_state = event.status_update.status.state
-                    if event.status_update.status.HasField("message"):
-                        status_message = _bounded_text_parts(
-                            event.status_update.status.message.parts,
-                            MAX_A2A_CLIENT_STATUS_BYTES,
-                            "A2A status message",
-                        )
-                elif event.HasField("artifact_update"):
-                    task_id = event.artifact_update.task_id
-                    if not args.json:
-                        for part in event.artifact_update.artifact.parts:
-                            if part.WhichOneof("content") == "text":
-                                rendered_bytes = _write_bounded_text(
-                                    part.text,
-                                    rendered_bytes,
-                                )
-                                rendered_text = True
+        message = Message(
+            message_id=str(uuid4()),
+            role=Role.ROLE_USER,
+            parts=[Part(text=prompt)],
+        )
+        if args.context_id:
+            message.context_id = args.context_id
+        request = SendMessageRequest(message=message)
+        async for event in client.send_message(request):
+            event_count += 1
+            if event_count > MAX_A2A_CLIENT_EVENTS:
+                raise RuntimeError("A2A response exceeded 10,000 events")
             if args.json:
-                print(
-                    json.dumps(
-                        {
-                            "task_id": task_id or None,
-                            "state": (
-                                "MESSAGE"
-                                if immediate_message
-                                else _state_name(final_state)
-                            ),
-                            "events": events,
-                        }
-                    )
+                event_raw_bytes, event_rendered_bytes = _append_json_event(
+                    events,
+                    MessageToDict(event),
+                    event_raw_bytes,
+                    event_rendered_bytes,
                 )
-            elif rendered_text:
-                print()
-            if (
-                not args.json
-                and not immediate_message
-                and final_state != TaskState.TASK_STATE_COMPLETED
-            ):
-                suffix = f": {status_message}" if status_message else ""
-                print(
-                    f"A2A task ended in {_state_name(final_state) or 'UNKNOWN'}{suffix}",
-                    file=sys.stderr,
-                )
-        except asyncio.CancelledError:
-            if task_id:
-                try:
-                    await asyncio.shield(
-                        client.cancel_task(CancelTaskRequest(id=task_id))
+            if event.HasField("task"):
+                task_id = event.task.id
+                final_state = event.task.status.state
+            elif event.HasField("message"):
+                immediate_message = True
+                if not args.json:
+                    for part in event.message.parts:
+                        if part.WhichOneof("content") == "text":
+                            rendered_bytes = _write_bounded_text(
+                                part.text,
+                                rendered_bytes,
+                            )
+                            rendered_text = True
+            elif event.HasField("status_update"):
+                task_id = event.status_update.task_id
+                final_state = event.status_update.status.state
+                if event.status_update.status.HasField("message"):
+                    status_message = _bounded_text_parts(
+                        event.status_update.status.message.parts,
+                        MAX_A2A_CLIENT_STATUS_BYTES,
+                        "A2A status message",
                     )
-                except Exception:  # noqa: BLE001 - cancellation remains primary
-                    pass
-            raise
-        finally:
-            await client.close()
+            elif event.HasField("artifact_update"):
+                task_id = event.artifact_update.task_id
+                if not args.json:
+                    for part in event.artifact_update.artifact.parts:
+                        if part.WhichOneof("content") == "text":
+                            rendered_bytes = _write_bounded_text(
+                                part.text,
+                                rendered_bytes,
+                            )
+                            rendered_text = True
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "task_id": task_id or None,
+                        "state": (
+                            "MESSAGE"
+                            if immediate_message
+                            else _state_name(final_state)
+                        ),
+                        "events": events,
+                    }
+                )
+            )
+        elif rendered_text:
+            print()
+        if (
+            not args.json
+            and not immediate_message
+            and final_state != TaskState.TASK_STATE_COMPLETED
+        ):
+            suffix = f": {status_message}" if status_message else ""
+            print(
+                f"A2A task ended in {_state_name(final_state) or 'UNKNOWN'}{suffix}",
+                file=sys.stderr,
+            )
+    except asyncio.CancelledError as exc:
+        primary_error = exc
+        if task_id and client is not None:
+            cancel_task = asyncio.create_task(
+                client.cancel_task(CancelTaskRequest(id=task_id))
+            )
+            cancel_error = await _settle_cleanup_task_after_cancellation(cancel_task)
+            if cancel_error is not None:
+                exc.add_note("A2A remote task cancellation failed")
+        raise
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        await _close_remote_agent_resources(
+            client,
+            http,
+            primary_error=primary_error,
+        )
     return (
         0 if immediate_message or final_state == TaskState.TASK_STATE_COMPLETED else 1
     )

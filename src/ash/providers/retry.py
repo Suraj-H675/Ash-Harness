@@ -17,6 +17,7 @@ NON_RETRYABLE_RATE_LIMIT_MARKERS = (
     "billing",
     "credit balance",
 )
+MAX_PROVIDER_CIRCUIT_STATES = 256
 
 
 @dataclass(frozen=True)
@@ -62,14 +63,18 @@ class ProviderCircuitBreaker:
         *,
         failure_threshold: int = 5,
         cooldown_seconds: float = 30.0,
+        max_states: int = MAX_PROVIDER_CIRCUIT_STATES,
         clock=time.monotonic,
     ) -> None:
         if failure_threshold < 2:
             raise ValueError("failure_threshold must be at least 2")
         if cooldown_seconds <= 0:
             raise ValueError("cooldown_seconds must be positive")
+        if type(max_states) is not int or max_states < 1:
+            raise ValueError("max_states must be a positive integer")
         self.failure_threshold = failure_threshold
         self.cooldown_seconds = cooldown_seconds
+        self.max_states = max_states
         self._clock = clock
         self._states: dict[str, _CircuitState] = {}
 
@@ -88,7 +93,12 @@ class ProviderCircuitBreaker:
         self._states.pop(provider, None)
 
     def record_failure(self, provider: str) -> bool:
-        state = self._states.setdefault(provider, _CircuitState())
+        state = self._states.pop(provider, None)
+        if state is None:
+            if len(self._states) >= self.max_states:
+                self._states.pop(next(iter(self._states)))
+            state = _CircuitState()
+        self._states[provider] = state
         state.failures += 1
         if state.failures < self.failure_threshold:
             return False

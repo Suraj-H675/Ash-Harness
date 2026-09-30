@@ -27,8 +27,11 @@ reported total.
 catalog. When the catalog exceeds `tool_search_threshold` (32 by default), Ash
 sends only a compact essential set and `search_tools` to the provider. A search
 returns the best matching names, descriptions, and exact input schemas and
-activates those matches for the next model iteration. Activation lasts for the
-current session and resets when the session changes. Set
+activates those matches for the next model iteration. Ash retains at most 64
+recently activated deferred schemas per session; re-searching a tool refreshes
+its recency, and older activations fall out of the provider-visible window while
+remaining available through `search_tools`. The activation window resets when
+the session changes. Set
 `tool_search_threshold = 0` to send the full catalog on every request.
 
 Only visible schemas count against the tools budget. Deferred tools remain in

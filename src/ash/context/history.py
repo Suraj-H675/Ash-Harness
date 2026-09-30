@@ -317,12 +317,36 @@ class HistoryCompactor:
         *,
         count_tokens: Callable[[str], int],
         previous_summary: str = "",
+        include_previous_summary: bool = False,
         force: bool = False,
         protected_from_index: int | None = None,
     ) -> CompactionResult:
         prepared, pruned = self._prune_tool_outputs(messages)
         estimated = self._count(prepared, count_tokens)
         if not force and estimated <= self.input_limit:
+            if include_previous_summary and previous_summary:
+                system = prepared[0] if prepared and prepared[0].get("role") == "system" else None
+                body_start = 1 if system is not None else 0
+                prefix = [system] if system is not None else []
+                recent = list(prepared[body_start:])
+                summary_message = self._fit_summary_message(
+                    previous_summary,
+                    prefix=prefix,
+                    recent=recent,
+                    count_tokens=count_tokens,
+                )
+                visible = (
+                    prefix
+                    + ([summary_message] if summary_message is not None else [])
+                    + recent
+                )
+                return CompactionResult(
+                    visible,
+                    previous_summary,
+                    bool(pruned),
+                    self._count(visible, count_tokens),
+                    pruned_tool_outputs=pruned,
+                )
             return CompactionResult(
                 prepared,
                 previous_summary,
@@ -395,7 +419,7 @@ class HistoryCompactor:
                 recent=recent,
                 count_tokens=count_tokens,
             )
-            if removed and summary
+            if summary and (removed or include_previous_summary)
             else None
         )
         compacted = prefix + ([summary_message] if summary_message is not None else []) + recent

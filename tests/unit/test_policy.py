@@ -72,6 +72,41 @@ def test_unknown_mode_fails_closed() -> None:
         PermissionPolicy("unknown")
 
 
+def test_session_permission_rule_admission_is_bounded_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.safety.policy as policy_module
+
+    monkeypatch.setattr(policy_module, "MAX_SESSION_PERMISSION_RULES", 2)
+    first = PermissionRule.create(RuleEffect.ALLOW, "write_file")
+    second = PermissionRule.create(RuleEffect.ALLOW, "run_command")
+    overflow = PermissionRule.create(RuleEffect.ALLOW, "browser_type")
+    policy = PermissionPolicy("interactive")
+
+    assert policy.add_session_rule(first) is True
+    assert policy.add_session_rule(second) is True
+    assert policy.add_session_rule(first) is False
+    with pytest.raises(OverflowError, match="session permission rule limit reached"):
+        policy.add_session_rule(overflow)
+
+    assert policy.session_rules == [first, second]
+
+
+def test_session_permission_rule_constructor_rejects_oversized_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.safety.policy as policy_module
+
+    monkeypatch.setattr(policy_module, "MAX_SESSION_PERMISSION_RULES", 1)
+    rules = [
+        PermissionRule.create(RuleEffect.ALLOW, "write_file"),
+        PermissionRule.create(RuleEffect.ALLOW, "run_command"),
+    ]
+
+    with pytest.raises(ValueError, match="session permission rules exceed"):
+        PermissionPolicy("interactive", session_rules=rules)
+
+
 def test_deny_and_ask_rules_override_broad_modes() -> None:
     deny = PermissionRule.create(RuleEffect.DENY, "run_command")
     ask = PermissionRule.create(RuleEffect.ASK, "read_file")

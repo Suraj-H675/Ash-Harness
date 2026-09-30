@@ -79,6 +79,7 @@ def test_mcp_cli_list_json_reports_config_without_secret_values(
     capsys,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MCP_API_KEY", "secret")
     assert (
         main(
             [
@@ -90,7 +91,7 @@ def test_mcp_cli_list_json_reports_config_without_secret_values(
                 "--url",
                 "https://example.test/mcp",
                 "--header",
-                "X-Api-Key=secret",
+                "X-Api-Key=${MCP_API_KEY}",
             ]
         )
         == 0
@@ -104,6 +105,87 @@ def test_mcp_cli_list_json_reports_config_without_secret_values(
     assert payload["servers"][0]["url"] == "https://example.test/mcp"
     assert payload["servers"][0]["header_keys"] == ["X-Api-Key"]
     assert "secret" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "credential_option",
+    [
+        ["--env", "API_KEY=literal-secret"],
+        ["--header", "Authorization=Bearer literal-secret"],
+        ["--header", "X-Api-Key=literal-secret"],
+    ],
+)
+def test_mcp_cli_add_rejects_literal_credentials_in_repo_config(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    credential_option: list[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    status = main(
+        [
+            "mcp",
+            "add",
+            "unsafe",
+            *credential_option,
+            "--",
+            "server",
+        ]
+    )
+
+    assert status == 2
+    captured = capsys.readouterr()
+    assert "environment variable" in captured.err
+    assert "literal-secret" not in captured.err
+    assert not (tmp_path / ".mcp.json").exists()
+
+
+def test_mcp_cli_add_rejects_literal_secret_command_options(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    status = main(
+        ["mcp", "add", "unsafe", "--", "server", "--api-key=literal-secret"]
+    )
+
+    assert status == 2
+    captured = capsys.readouterr()
+    assert "--api-key" in captured.err
+    assert "literal-secret" not in captured.err
+    assert not (tmp_path / ".mcp.json").exists()
+
+
+def test_mcp_cli_add_allows_non_secret_literal_configuration(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        main(
+            [
+                "mcp",
+                "add",
+                "ordinary",
+                "--env",
+                "PORT=4312",
+                "--header",
+                "X-Tenant=acme",
+                "--",
+                "server",
+                "--mode=fast",
+            ]
+        )
+        == 0
+    )
+    loaded = load_mcp_servers(tmp_path / ".mcp.json")["ordinary"]
+    assert loaded.env == {"PORT": "4312"}
+    assert loaded.headers == {"X-Tenant": "acme"}
+    assert loaded.args == ["--mode=fast"]
 
 
 def test_mcp_cli_rejects_invalid_env_option(
@@ -130,6 +212,21 @@ def test_mcp_cli_add_rejects_server_name_its_loader_would_reject(
 
     captured = capsys.readouterr()
     assert "invalid MCP server name" in captured.err
+    assert not (tmp_path / ".mcp.json").exists()
+
+
+def test_mcp_cli_add_requires_explicit_command_separator(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    status = main(["mcp", "add", "local", "--typo-command"])
+
+    assert status == 2
+    captured = capsys.readouterr()
+    assert "requires '-- command [args...]'" in captured.err
     assert not (tmp_path / ".mcp.json").exists()
 
 
@@ -483,6 +580,7 @@ def test_mcp_cli_probe_live_stdio_server_reports_safe_capabilities(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     secret = "probe-secret-value"
+    monkeypatch.setenv("PROBE_SECRET", secret)
     server = r'''
 import json, sys
 for line in sys.stdin:
@@ -526,7 +624,7 @@ for line in sys.stdin:
                 "add",
                 "probe",
                 "--env",
-                f"PROBE_SECRET={secret}",
+                "PROBE_SECRET=${PROBE_SECRET}",
                 "--",
                 sys.executable,
                 "-u",
@@ -620,6 +718,7 @@ def test_mcp_cli_probe_connection_failure_is_redacted(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     secret = "super-secret-probe-token"
+    monkeypatch.setenv("PROBE_TOKEN", secret)
     assert (
         main(
             [
@@ -627,7 +726,7 @@ def test_mcp_cli_probe_connection_failure_is_redacted(
                 "add",
                 "broken",
                 "--env",
-                f"TOKEN={secret}",
+                "TOKEN=${PROBE_TOKEN}",
                 "--",
                 str(tmp_path / "missing-mcp-server"),
             ]
@@ -762,3 +861,58 @@ async def test_mcp_probe_cleanup_failure_does_not_mask_primary_error(
     with pytest.raises(MCPProtocolError, match="primary probe failure") as failure:
         await probe_mcp_server(config, workspace=tmp_path, timeout=1.0)
     assert any("cleanup failure" in note for note in failure.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_mcp_probe_redacts_exact_credential_from_server_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    secret = "tiny-k"
+
+    class EchoingClient:
+        protocol_version = "2026-07-28"
+        server_info = {"name": f"remote {secret}", "version": secret}
+        server_capabilities = {}
+
+        def __init__(self, config, *, timeout, roots) -> None:
+            assert config.headers == {"X-Api-Key": secret}
+            assert roots == (tmp_path,)
+
+        def supports_server_capability(self, name: str) -> bool:
+            return False
+
+        def redact_remote_output(self, value):
+            if isinstance(value, str):
+                return value.replace(secret, "[REDACTED]")
+            if isinstance(value, dict):
+                return {
+                    key: self.redact_remote_output(item)
+                    for key, item in value.items()
+                }
+            return value
+
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+    monkeypatch.setattr("ash.commands.mcp.MCPClient", EchoingClient)
+    config = MCPServerConfig(
+        name="echoing",
+        command="",
+        args=[],
+        env={},
+        transport="http",
+        url="https://mcp.example.test/rpc",
+        headers={"X-Api-Key": secret},
+    )
+
+    payload = await probe_mcp_server(config, workspace=tmp_path, timeout=1.0)
+
+    assert secret not in json.dumps(payload)
+    assert payload["server"] == {
+        "name": "remote [REDACTED]",
+        "version": "[REDACTED]",
+    }

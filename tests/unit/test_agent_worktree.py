@@ -61,6 +61,207 @@ def test_worktree_agent_commits_branch_without_mutating_lead(
     assert _git(repository, "show", f"{lease.branch}:file.txt") == "worker"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-anchored POSIX regression")
+def test_worktree_storage_creation_does_not_follow_parent_swap(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.safety.anchored_fs as anchored_fs
+
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    saved_root = tmp_path / "state-saved"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    storage = state_root / "worktrees" / "repo-id"
+    manager = WorktreeManager(repository, storage)
+    real_open_or_create = anchored_fs._open_or_create_directory
+    swapped = False
+
+    def open_or_create_then_swap(
+        parent_descriptor,
+        name,
+        *,
+        create,
+        expected=None,
+    ):
+        nonlocal swapped
+        if name == "worktrees" and not swapped:
+            state_root.rename(saved_root)
+            state_root.symlink_to(replacement, target_is_directory=True)
+            swapped = True
+        return real_open_or_create(
+            parent_descriptor,
+            name,
+            create=create,
+            expected=expected,
+        )
+
+    monkeypatch.setattr(
+        anchored_fs,
+        "_open_or_create_directory",
+        open_or_create_then_swap,
+    )
+
+    with pytest.raises(WorktreeError, match="could not be prepared safely"):
+        manager._prepare_storage_root()
+
+    assert swapped is True
+    assert not (replacement / "worktrees").exists()
+    assert (saved_root / "worktrees" / "repo-id").is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-anchored POSIX regression")
+@pytest.mark.asyncio
+async def test_worktree_create_refuses_lease_when_storage_changes_before_git_add(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.worktree as worktree_module
+
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    storage = state_root / "agents"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    saved_root = tmp_path / "state-saved"
+    manager = WorktreeManager(repository, storage)
+    real_run_git = worktree_module._run_git
+    swapped = False
+
+    async def run_git_then_swap(cwd, args, **kwargs):
+        nonlocal swapped
+        if len(args) >= 2 and args[0] == "worktree" and args[1] == "add" and not swapped:
+            state_root.rename(saved_root)
+            state_root.symlink_to(replacement, target_is_directory=True)
+            swapped = True
+        return await real_run_git(cwd, args, **kwargs)
+
+    monkeypatch.setattr(worktree_module, "_run_git", run_git_then_swap)
+
+    with pytest.raises(
+        WorktreeError,
+        match="agent worktree storage.*symlink or junction|storage identity changed",
+    ):
+        await manager.create("coder-race")
+
+    assert swapped is True
+    assert (replacement / "agents" / "coder-race").is_dir()
+    assert not (saved_root / "agents" / "coder-race").exists()
+
+
+@pytest.mark.asyncio
+async def test_worktree_lease_rejects_replaced_worktree_directory(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    manager = WorktreeManager(repository, tmp_path / "agents")
+    lease = await manager.create("coder-identity")
+    original = lease.path.with_name(f"{lease.path.name}-original")
+    lease.path.rename(original)
+    lease.path.mkdir()
+
+    with pytest.raises(WorktreeError, match="worktree identity changed"):
+        await manager.commit_changes(lease, message="must not run")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable hook fixture")
+def test_worktree_create_does_not_run_repository_post_checkout_hook(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "post-checkout-ran"
+    hook = repository / ".git" / "hooks" / "post-checkout"
+    hook.write_text(
+        f"#!/bin/sh\nprintf ran >> {marker}\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    async def run() -> None:
+        lease = await manager.create("hook-create")
+        await manager.remove(lease, keep_branch=False)
+
+    asyncio.run(run())
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable hook fixture")
+def test_worktree_commit_does_not_run_repository_post_commit_hook(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "post-commit-ran"
+    hook = repository / ".git" / "hooks" / "post-commit"
+    hook.write_text(
+        f"#!/bin/sh\nprintf ran >> {marker}\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    async def run() -> None:
+        lease = await manager.create("hook-commit")
+        (lease.path / "file.txt").write_text("worker\n", encoding="utf-8")
+        assert await manager.commit_changes(lease, message="agent change") is not None
+        await manager.remove(lease, keep_branch=True)
+
+    asyncio.run(run())
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable filter fixture")
+def test_worktree_refuses_repository_configured_executable_filter(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    (repository / ".gitattributes").write_text(
+        "file.txt filter=leak\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", ".gitattributes")
+    _git(
+        repository,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "attributes",
+    )
+    marker = tmp_path / "filter-ran"
+    helper = tmp_path / "filter.sh"
+    helper.write_text(
+        f"#!/bin/sh\nprintf ran >> {marker}\ncat\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    _git(repository, "config", "filter.leak.clean", str(helper))
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    with pytest.raises(WorktreeError, match="untrusted repository Git config"):
+        asyncio.run(manager.create("filter-config"))
+
+    assert not marker.exists()
+
+
+def test_worktree_refuses_repository_configured_merge_driver(
+    repository: Path,
+    tmp_path: Path,
+) -> None:
+    _git(repository, "config", "merge.untrusted.driver", "false")
+    manager = WorktreeManager(repository, tmp_path / "agents")
+
+    with pytest.raises(WorktreeError, match="untrusted repository Git config"):
+        asyncio.run(manager.create("merge-driver"))
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX cwd race regression")
 @pytest.mark.asyncio
 async def test_worktree_manager_refuses_replaced_repository_before_branch_delete(
@@ -184,8 +385,9 @@ async def test_worktree_git_cwd_swap_cannot_escape_repository(
     )
 
     assert swapped is True
-    assert result.returncode == 0, result.stderr
-    assert Path(result.stdout.strip()).resolve() == saved.resolve()
+    assert result.returncode == 126
+    assert result.stdout == ""
+    assert "working directory identity changed" in result.stderr
 
 
 @pytest.mark.asyncio
@@ -217,6 +419,71 @@ async def test_worktree_git_fails_closed_without_stable_cwd(
     assert result.returncode == 126
     assert "stable cwd unavailable" in result.stderr
     create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_worktree_git_cleans_process_tree_after_unexpected_io_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    import ash.agents.worktree as worktree_module
+
+    class FakeProcess:
+        returncode = None
+
+    process = FakeProcess()
+    cleaned = False
+
+    @contextmanager
+    def launch_context():
+        yield SimpleNamespace(argv=("git", "status"), pass_fds=(), cwd=str(tmp_path))
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    async def fail_communicate(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("worktree git stream failed")
+
+    async def cleanup(target, *, plan=None, grace_seconds=1.0):
+        nonlocal cleaned
+        del plan, grace_seconds
+        assert target is process
+        cleaned = True
+        return None, False
+
+    monkeypatch.setattr(
+        worktree_module,
+        "prepare_scoped_process_launch",
+        lambda *args, **kwargs: launch_context(),
+    )
+    monkeypatch.setattr(
+        worktree_module,
+        "prepare_process_tree",
+        lambda *args, **kwargs: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(worktree_module.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(worktree_module, "communicate_process", fail_communicate)
+    monkeypatch.setattr(
+        worktree_module,
+        "settle_process_tree_after_cancellation",
+        cleanup,
+    )
+
+    with pytest.raises(RuntimeError, match="worktree git stream failed"):
+        await worktree_module._run_git_process(
+            tmp_path,
+            "git",
+            ("status",),
+            {},
+            expected_cwd_identity=None,
+        )
+
+    assert cleaned is True
 
 
 def test_worktree_agent_branch_can_be_applied_and_removed(

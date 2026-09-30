@@ -696,7 +696,9 @@ async def test_delegate_graph_enforces_shared_cost_ceiling(tmp_path: Path):
         budget = state.tasks.get_graph_budget(payload["graph_id"])
         assert task is not None and task.state == "failed"
         assert task.error is not None and task.error.startswith("graph cost budget")
-        assert budget.used_cost_usd == pytest.approx(0.000181)
+        assert task.used_cost_usd > 0.0001
+        assert budget.used_cost_usd == pytest.approx(task.used_cost_usd)
+        assert budget.remaining_cost_usd == pytest.approx(0.0)
     finally:
         state.close()
         await delegate.aclose()

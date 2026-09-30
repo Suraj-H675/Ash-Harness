@@ -12,23 +12,97 @@ raises :class:`SandboxBackendUnavailable`.
 from __future__ import annotations
 
 import subprocess
-import sys
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from ash.sandbox._base import (
     SANDBOX_TIER_DOCKER,
     SandboxBackend,
     SandboxBackendUnavailable,
 )
-from ash.safety.environment import resolve_host_executable
+from ash.sandbox.process_utils import (
+    ProcessTreeError,
+    prepare_process_tree,
+    terminate_process_tree_sync,
+)
+from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 
 
 DEFAULT_IMAGE = "ash-sandbox:latest"
 _DOCKER_VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_DOCKER_ENV_ALLOWLIST = (
+    "ALL_PROXY",
+    "DOCKER_API_VERSION",
+    "DOCKER_CONFIG",
+    "DOCKER_CONTEXT",
+    "DOCKER_DEFAULT_PLATFORM",
+    "DOCKER_HOST",
+    "DOCKER_TLS",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "SSH_AUTH_SOCK",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+
+
+def docker_cli_environment() -> dict[str, str]:
+    """Return only operational state required by the trusted Docker CLI."""
+
+    return build_scrubbed_environment(_DOCKER_ENV_ALLOWLIST)
+
+
+def run_docker_cli_sync(
+    command: Sequence[str],
+    *,
+    workspace_root: str | Path | None = None,
+    timeout: float | None = None,
+    capture_output: bool = False,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run a trusted Docker CLI command with descendant-tree ownership."""
+
+    plan = prepare_process_tree(workspace_root=workspace_root)
+    popen_kwargs: dict[str, Any] = {
+        "env": docker_cli_environment(),
+        **plan.spawn_options,
+    }
+    if capture_output:
+        popen_kwargs["stdout"] = subprocess.PIPE
+        popen_kwargs["stderr"] = subprocess.PIPE
+
+    process: subprocess.Popen[bytes] = subprocess.Popen(
+        list(command),
+        **popen_kwargs,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as primary:
+        try:
+            terminate_process_tree_sync(process, plan=plan, timeout_seconds=1.0)
+        except ProcessTreeError as cleanup_error:
+            primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        raise
+    except BaseException as primary:
+        try:
+            terminate_process_tree_sync(process, plan=plan, timeout_seconds=1.0)
+        except ProcessTreeError as cleanup_error:
+            primary.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        raise
+
+    return subprocess.CompletedProcess(
+        list(command),
+        process.returncode if process.returncode is not None else -1,
+        stdout,
+        stderr,
+    )
 
 
 @dataclass(frozen=True)
@@ -58,9 +132,6 @@ class DockerSandbox(SandboxBackend):
     def is_available(self) -> bool:
         if self.docker_path is None:
             return False
-        if sys.platform == "win32" and self.docker_path.endswith(".exe") is False:
-            # Still allowed — Docker Desktop ships docker.exe on Windows.
-            pass
         return Path(self.docker_path).exists()
 
     def wrap(
@@ -92,11 +163,7 @@ class DockerSandbox(SandboxBackend):
             "--env",
             "HOME=/tmp",
         ]
-        if (
-            self.run_as_host_user
-            and sys.platform != "win32"
-            and hasattr(os, "getuid")
-        ):
+        if self.run_as_host_user and hasattr(os, "getuid"):
             args.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
         if not self.network:
             args.append("--network=none")
@@ -185,20 +252,20 @@ def probe_docker(
     if path is None:
         return None
     try:
-        daemon = subprocess.run(
+        daemon = run_docker_cli_sync(
             [path, "version", "--format", "{{.Server.Version}}"],
+            workspace_root=workspace_root,
             capture_output=True,
-            check=False,
             timeout=5,
         )
         if daemon.returncode != 0 or not daemon.stdout.strip():
             return None
-        image_check = subprocess.run(
+        image_check = run_docker_cli_sync(
             [path, "image", "inspect", image],
+            workspace_root=workspace_root,
             capture_output=True,
-            check=False,
             timeout=5,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ProcessTreeError, subprocess.SubprocessError):
         return None
     return path if image_check.returncode == 0 else None

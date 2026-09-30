@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+import ash.plugins.install_records as install_records
 import ash.plugins.lifecycle as lifecycle
 from ash.plugins.catalog import CatalogEntry
 from ash.plugins.lifecycle import (
@@ -65,6 +68,110 @@ def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     return home
+
+
+def test_plugin_lifecycle_crash_recovery_handles_pre_and_post_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.plugins.state import load_extension_state
+    from ash.runtime import discover_active_plugins
+
+    def write_plugin(root: Path, version: str) -> Path:
+        root.mkdir(parents=True)
+        (root / "plugin.json").write_text(
+            json.dumps({"name": "demo", "version": version}),
+            encoding="utf-8",
+        )
+        return root
+
+    def seed(case_root: Path) -> tuple[Path, str]:
+        home = case_root / "home"
+        home.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        source = (case_root / "repository").as_uri()
+        first = write_plugin(case_root / "v1", "1.0.0")
+        record = lifecycle.PluginInstallRecord(
+            "demo",
+            "1.0.0",
+            source,
+            "v1",
+            "a" * 40,
+            None,
+            "git",
+        )
+        install_local_plugin(first, enabled=False, _install_record=record)
+        return home, source
+
+    pre_root = tmp_path / "precommit"
+    pre_home, pre_source = seed(pre_root)
+    write_plugin(pre_root / "v2", "2.0.0")
+    pre_script = r"""
+import os, sys
+from pathlib import Path
+import ash.plugins.lifecycle as lifecycle
+root = Path(sys.argv[1]); source = sys.argv[2]
+old = lifecycle.PluginInstallRecord('demo','1.0.0',source,'v1','a'*40,None,'git')
+new = lifecycle.PluginInstallRecord('demo','2.0.0',source,'v2','b'*40,None,'git')
+real = lifecycle._transition_plugin_install_records_at
+def crash(directory, before, after):
+    real(directory, before, after)
+    os._exit(77)
+lifecycle._transition_plugin_install_records_at = crash
+lifecycle.install_local_plugin(
+    root / 'v2', replace=True, enabled=True,
+    _install_record=new, _expected_install_record=old,
+)
+"""
+    pre_result = subprocess.run(
+        [sys.executable, "-c", pre_script, str(pre_root), pre_source],
+        check=False,
+        env={**os.environ, "HOME": str(pre_home)},
+    )
+    assert pre_result.returncode == 77
+
+    monkeypatch.setenv("HOME", str(pre_home))
+    assert discover_active_plugins(tmp_path, include_project=False) == []
+    pre_plugins = pre_home / ".ash" / "plugins"
+    assert json.loads((pre_plugins / "demo" / "plugin.json").read_text())["version"] == "1.0.0"
+    assert load_plugin_install_records()["demo"].version == "1.0.0"
+    assert load_extension_state().disabled_plugins == frozenset({"demo"})
+    assert not (pre_plugins / ".ash-lifecycle-journal.json").exists()
+    assert not any(
+        path.name.startswith((".install-", ".demo.backup-", ".demo.install-conflict-"))
+        for path in pre_plugins.iterdir()
+    )
+
+    post_root = tmp_path / "postcommit"
+    post_home, _ = seed(post_root)
+    post_script = r"""
+import os
+import ash.plugins.lifecycle as lifecycle
+real = lifecycle.write_lifecycle_journal_at
+def crash(directory, journal):
+    real(directory, journal)
+    if journal.phase == 'committed':
+        os._exit(78)
+lifecycle.write_lifecycle_journal_at = crash
+lifecycle.uninstall_local_plugin('demo', confirmed=True)
+"""
+    post_result = subprocess.run(
+        [sys.executable, "-c", post_script],
+        check=False,
+        env={**os.environ, "HOME": str(post_home)},
+    )
+    assert post_result.returncode == 78
+
+    monkeypatch.setenv("HOME", str(post_home))
+    assert discover_active_plugins(tmp_path, include_project=False) == []
+    post_plugins = post_home / ".ash" / "plugins"
+    assert not (post_plugins / "demo").exists()
+    assert load_plugin_install_records() == {}
+    assert load_extension_state().disabled_plugins == frozenset()
+    assert not (post_plugins / ".ash-lifecycle-journal.json").exists()
+    assert not any(
+        path.name.startswith(".demo.uninstall-") for path in post_plugins.iterdir()
+    )
 
 
 def test_managed_git_install_persists_exact_provenance(
@@ -215,7 +322,7 @@ def test_provenance_write_failure_rolls_back_plugin_replacement(
     def fail_save(*args, **kwargs):
         raise OSError("record write failed")
 
-    monkeypatch.setattr(lifecycle, "_save_plugin_install_records_at", fail_save)
+    monkeypatch.setattr(install_records, "_save_plugin_install_records_at", fail_save)
 
     with pytest.raises(PluginLifecycleError, match="record write failed"):
         install_git_plugin(second_source, ref="v2.0.0", replace=True)
@@ -226,6 +333,103 @@ def test_provenance_write_failure_rolls_back_plugin_replacement(
     assert manifest["version"] == "1.0.0"
     assert before.digest == first_digest
     assert load_plugin_install_records()["demo"] == before
+
+
+def test_precommit_root_sync_failure_rolls_back_plugin_and_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolated_home(tmp_path, monkeypatch)
+    first_source, _ = _git_plugin(tmp_path / "repo-one")
+    second_source, _ = _git_plugin(
+        tmp_path / "repo-two", version="2.0.0", tag="v2.0.0"
+    )
+    install_git_plugin(first_source, ref="v1.0.0")
+    before = load_plugin_install_records()["demo"]
+    root = lifecycle.user_plugin_root()
+    original_sync = lifecycle.AnchoredDirectory.sync
+    failed = False
+
+    def fail_new_publication_sync(directory: lifecycle.AnchoredDirectory) -> None:
+        nonlocal failed
+        if directory.path == root and not failed:
+            manifest_path = root / "demo" / "plugin.json"
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                names = set(directory.list_names())
+                backup_present = any(
+                    name.startswith(".demo.backup-") for name in names
+                )
+                if manifest.get("version") == "2.0.0" and backup_present:
+                    failed = True
+                    raise OSError("replacement commit sync failed")
+        original_sync(directory)
+
+    monkeypatch.setattr(
+        lifecycle.AnchoredDirectory,
+        "sync",
+        fail_new_publication_sync,
+    )
+
+    with pytest.raises(PluginLifecycleError, match="replacement commit sync failed"):
+        install_git_plugin(second_source, ref="v2.0.0", replace=True)
+
+    assert failed is True
+    manifest = json.loads(
+        (root / "demo" / "plugin.json").read_text(encoding="utf-8")
+    )
+    assert manifest["version"] == "1.0.0"
+    assert load_plugin_install_records()["demo"] == before
+
+
+def test_postcommit_backup_cleanup_sync_failure_preserves_new_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolated_home(tmp_path, monkeypatch)
+    first_source, _ = _git_plugin(tmp_path / "repo-one")
+    second_source, second_digest = _git_plugin(
+        tmp_path / "repo-two", version="2.0.0", tag="v2.0.0"
+    )
+    install_git_plugin(first_source, ref="v1.0.0")
+    before = load_plugin_install_records()["demo"]
+    root = lifecycle.user_plugin_root()
+    original_sync = lifecycle.AnchoredDirectory.sync
+    failed = False
+
+    def fail_backup_cleanup_sync(directory: lifecycle.AnchoredDirectory) -> None:
+        nonlocal failed
+        if directory.path == root and not failed:
+            manifest_path = root / "demo" / "plugin.json"
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                names = set(directory.list_names())
+                backup_present = any(
+                    name.startswith(".demo.backup-") for name in names
+                )
+                if manifest.get("version") == "2.0.0" and not backup_present:
+                    failed = True
+                    raise OSError("replacement cleanup sync failed")
+        original_sync(directory)
+
+    monkeypatch.setattr(
+        lifecycle.AnchoredDirectory,
+        "sync",
+        fail_backup_cleanup_sync,
+    )
+
+    with pytest.raises(PluginLifecycleError, match="replacement cleanup sync failed"):
+        install_git_plugin(second_source, ref="v2.0.0", replace=True)
+
+    assert failed is True
+    manifest = json.loads(
+        (root / "demo" / "plugin.json").read_text(encoding="utf-8")
+    )
+    after = load_plugin_install_records()["demo"]
+    assert manifest["version"] == "2.0.0"
+    assert after.version == "2.0.0"
+    assert after.digest == second_digest
+    assert after != before
 
 
 def test_uninstall_removes_managed_install_provenance(
@@ -254,7 +458,7 @@ def test_uninstall_provenance_failure_restores_plugin_and_record(
     def fail_save(*args, **kwargs):
         raise OSError("record removal failed")
 
-    monkeypatch.setattr(lifecycle, "_save_plugin_install_records_at", fail_save)
+    monkeypatch.setattr(install_records, "_save_plugin_install_records_at", fail_save)
 
     with pytest.raises(PluginLifecycleError, match="record removal failed"):
         uninstall_local_plugin("demo", confirmed=True)
@@ -333,6 +537,19 @@ def test_install_records_reject_symlinked_state_file(
                     "ref": "main",
                     "digest": "not-a-git-digest",
                     "publisher": None,
+                }
+            },
+        },
+        {
+            "version": 2,
+            "plugins": {
+                "demo": {
+                    "version": "1.0.0",
+                    "source": "https://user:secret@plugins.example/demo.git",
+                    "ref": "main",
+                    "digest": "a" * 40,
+                    "publisher": None,
+                    "origin": "git",
                 }
             },
         },

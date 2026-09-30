@@ -1,68 +1,42 @@
-"""Safe extension inventory for skills, plugins, and hooks."""
+"""Extension catalog, lifecycle orchestration, and CLI rendering helpers."""
 
 from __future__ import annotations
 
 import json
-import os
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
 from ash.core.redaction import redact_text, redact_urls_in_text
-from ash.mcp.server import load_mcp_servers, parse_mcp_servers_payload
-from ash.plugins.agents import (
-    AgentCatalog,
-    AgentSource,
-    parse_agent_definition_bytes,
-)
-from ash.commands.custom_commands import (
-    CommandSource,
-    CustomCommandCatalog,
-    parse_custom_command_bytes,
-)
-from ash.hooks.config import (
-    MAX_HOOK_CONFIG_BYTES,
-    HookConfigSource,
-    load_command_hooks,
-    validate_command_hooks_payload,
-)
 from ash.plugins.catalog import (
     CatalogEntry,
     RegisteredCatalogSource,
     SignedCatalog,
     fetch_catalog,
-    default_catalog_path,
+    default_catalog_source,
     parse_and_verify_catalog,
     trusted_catalog_keys_path,
 )
-from ash.plugins.manifest import PluginManifest, namespaced_plugin_tool_name
-from ash.plugins.lifecycle import (
-    InstalledPlugin,
+from ash.plugins.inventory import ExtensionInventory
+from ash.plugins.errors import PluginLifecycleError
+from ash.plugins.install_records import (
     PluginInstallRecord,
-    PluginLifecycleError,
-    install_git_plugin,
-    install_local_plugin,
-    load_extension_state,
     load_plugin_install_records,
-    set_plugin_enabled,
-    uninstall_local_plugin,
     user_plugin_root,
 )
-from ash.plugins.snapshot import PluginSnapshot, SnapshotEntry
-from ash.plugins.registry import PluginCatalog
-from ash.plugins.registry import (
-    DiscoveredPlugin,
-    _plugin_manifest_paths,
-    _validate_manifest,
+from ash.plugins.lifecycle import (
+    InstalledPlugin,
+    install_git_plugin,
+    install_local_plugin,
+    load_managed_plugin_for_update,
+    recover_plugin_lifecycle,
+    set_local_plugin_enabled,
+    uninstall_local_plugin,
 )
-from ash.plugins.skills import (
-    SkillCatalog,
-    SkillSource,
-    parse_instruction_skill_bytes,
-)
-from ash.safety.trust import canonical_workspace, is_workspace_trusted
-from ash.safe_io import read_bounded_bytes, strict_json_loads
+from ash.plugins.state import ExtensionState, load_extension_state
+from ash.plugins.snapshot import PluginSnapshot
+from ash.plugins.validation import validate_plugin_contents, validate_plugin_contents_at
+from ash.plugins.manifest import PluginManifest
 from ash.ui.safe_text import terminal_safe_text
 
 ExtensionKind = Literal["all", "skills", "agents", "plugins", "hooks"]
@@ -105,226 +79,6 @@ def safe_plugin_diagnostic(
         return rendered[: max_chars - 3] + "..."
     return rendered
 
-
-@dataclass(frozen=True)
-class SkillSummary:
-    name: str
-    description: str
-    path: str
-
-
-@dataclass(frozen=True)
-class AgentSummary:
-    name: str
-    description: str
-    base_role: str
-    path: str
-
-
-@dataclass(frozen=True)
-class PluginSummary:
-    name: str
-    version: str
-    description: str
-    source: str
-    root: str
-    skills: tuple[str, ...]
-    commands: tuple[str, ...]
-    hooks: tuple[str, ...]
-    mcp_servers: tuple[str, ...]
-    agents: tuple[str, ...]
-    runtime_protocol: int | None
-    tools: tuple[str, ...]
-    enabled: bool
-
-
-@dataclass(frozen=True)
-class HookConfigSummary:
-    path: str
-    source: str
-    pre_tool: int = 0
-    post_tool: int = 0
-    session_start: int = 0
-    session_end: int = 0
-    turn_start: int = 0
-    turn_end: int = 0
-    turn_error: int = 0
-    pre_model: int = 0
-    post_model: int = 0
-    tool_error: int = 0
-
-
-@dataclass(frozen=True)
-class ExtensionInventory:
-    workspace: str
-    project_trusted: bool
-    skills: tuple[SkillSummary, ...]
-    agents: tuple[AgentSummary, ...]
-    plugins: tuple[PluginSummary, ...]
-    hooks: tuple[HookConfigSummary, ...]
-    errors: tuple[str, ...]
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "workspace": self.workspace,
-            "project_trusted": self.project_trusted,
-            "skills": [asdict(item) for item in self.skills],
-            "agents": [asdict(item) for item in self.agents],
-            "plugins": [asdict(item) for item in self.plugins],
-            "hooks": [asdict(item) for item in self.hooks],
-            "errors": list(self.errors),
-        }
-
-
-def discover_extensions(workspace: Path) -> ExtensionInventory:
-    trusted = is_workspace_trusted(workspace)
-    user_skill_root = Path.home() / ".ash" / "skills"
-    plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
-    hook_paths = [(Path.home() / ".ash" / "hooks.json", "user")]
-    if trusted:
-        plugin_roots.append((workspace / ".ash" / "plugins", "project"))
-        hook_paths.append((workspace / ".ash" / "hooks.json", "project"))
-
-    state_errors: list[str] = []
-    extension_state_available = True
-    try:
-        disabled_plugins = load_extension_state().disabled_plugins
-    except PluginLifecycleError as exc:
-        disabled_plugins = frozenset()
-        extension_state_available = False
-        state_errors.append(str(exc))
-    plugin_catalog = PluginCatalog(
-        tuple(plugin_roots), disabled_plugins=disabled_plugins
-    )
-    # A secure extension-state read is part of the trust decision for plugin
-    # components. Do not turn an unavailable/corrupt state into an empty
-    # disabled set and then activate plugin hooks, MCP, skills, or agents.
-    discovered_plugins = (
-        plugin_catalog.discover(include_disabled=True)
-        if extension_state_available
-        else []
-    )
-    hook_paths.extend(
-        (path, f"plugin:{plugin.manifest.name}")
-        for plugin in discovered_plugins
-        if plugin.enabled
-        for path in plugin.hook_paths()
-    )
-    skill_roots: list[Path | SkillSource] = [user_skill_root]
-    if trusted:
-        skill_roots.append(workspace / ".ash" / "skills")
-    skill_roots.extend(
-        SkillSource(
-            paths=plugin.skill_paths(),
-            namespace=plugin.manifest.name,
-        )
-        for plugin in discovered_plugins
-        if plugin.enabled
-    )
-    skill_catalog = SkillCatalog(tuple(skill_roots))
-    discovered_skills = skill_catalog.discover()
-    agent_sources: list[Path | AgentSource] = [Path.home() / ".ash" / "agents"]
-    if trusted:
-        agent_sources.append(workspace / ".ash" / "agents")
-    agent_sources.extend(
-        AgentSource(
-            paths=plugin.agent_paths(),
-            namespace=plugin.manifest.name,
-        )
-        for plugin in discovered_plugins
-        if plugin.enabled
-    )
-    agent_catalog = AgentCatalog(tuple(agent_sources))
-    discovered_agents = agent_catalog.discover()
-
-    errors = state_errors + [
-        f"Invalid plugin {path}: {error}"
-        for path, error in sorted(plugin_catalog.errors.items())
-    ]
-    errors.extend(
-        f"Invalid skill {path}: {error}"
-        for path, error in sorted(skill_catalog.errors.items())
-    )
-    errors.extend(
-        f"Invalid agent {path}: {error}"
-        for path, error in sorted(agent_catalog.errors.items())
-    )
-    hooks, hook_errors = _discover_hooks(hook_paths)
-    errors.extend(hook_errors)
-    for plugin in discovered_plugins:
-        if not plugin.enabled:
-            continue
-        for path in plugin.mcp_paths():
-            try:
-                load_mcp_servers(
-                    path,
-                    namespace=plugin.manifest.name,
-                    cwd=plugin.root,
-                    environment={"ASH_PLUGIN_ROOT": str(plugin.root)},
-                )
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                errors.append(f"Invalid plugin MCP config {path}: {exc}")
-
-    return ExtensionInventory(
-        workspace=canonical_workspace(workspace),
-        project_trusted=trusted,
-        skills=tuple(
-            SkillSummary(
-                name=skill.name,
-                description=skill.description,
-                path=str(skill.path),
-            )
-            for skill in sorted(discovered_skills, key=lambda item: item.name)
-        ),
-        agents=tuple(
-            AgentSummary(
-                name=agent.name,
-                description=agent.description,
-                base_role=agent.base_role,
-                path=str(agent.path),
-            )
-            for agent in sorted(discovered_agents, key=lambda item: item.name)
-        ),
-        plugins=tuple(
-            PluginSummary(
-                name=plugin.manifest.name,
-                version=plugin.manifest.version,
-                description=plugin.manifest.description,
-                source=plugin.source,
-                root=str(plugin.root),
-                skills=tuple(plugin.manifest.skills),
-                commands=tuple(
-                    item for item in plugin.manifest.commands if isinstance(item, str)
-                ),
-                hooks=tuple(
-                    item for item in plugin.manifest.hooks if isinstance(item, str)
-                ),
-                mcp_servers=tuple(
-                    item
-                    for item in plugin.manifest.mcp_servers
-                    if isinstance(item, str)
-                ),
-                agents=tuple(
-                    item for item in plugin.manifest.agents if isinstance(item, str)
-                ),
-                runtime_protocol=(
-                    plugin.manifest.runtime.protocol_version
-                    if plugin.manifest.runtime is not None
-                    else None
-                ),
-                tools=tuple(
-                    namespaced_plugin_tool_name(plugin.manifest.name, tool.name)
-                    for tool in plugin.manifest.tools
-                ),
-                enabled=plugin.enabled,
-            )
-            for plugin in sorted(
-                discovered_plugins, key=lambda item: item.manifest.name
-            )
-        ),
-        hooks=tuple(hooks),
-        errors=tuple(errors),
-    )
 
 
 def render_extension_inventory(
@@ -415,11 +169,13 @@ def _verified_catalog(
     transport: Any | None = None,
 ):
     catalog_file: Path | None
+    remotely_fetched = False
     if isinstance(catalog, str):
+        remotely_fetched = "://" in catalog
         try:
             catalog_file = (
                 fetch_catalog(catalog, transport=transport)
-                if "://" in catalog
+                if remotely_fetched
                 else Path(catalog).expanduser()
             )
         except ValueError as exc:
@@ -427,27 +183,36 @@ def _verified_catalog(
     else:
         catalog_file = catalog
     if catalog_file is None:
-        configured = os.environ.get("ASH_PLUGIN_CATALOG")
-        if not configured:
+        configured = default_catalog_source()
+        if configured is None:
             raise PluginLifecycleError(
                 "plugin catalog is not configured; pass --catalog or set "
                 "ASH_PLUGIN_CATALOG"
             )
+        remotely_fetched = isinstance(configured, str)
         try:
             catalog_file = (
                 fetch_catalog(configured)
-                if "://" in configured
-                else Path(configured).expanduser()
+                if isinstance(configured, str)
+                else configured
             )
         except ValueError as exc:
             raise PluginLifecycleError(str(exc)) from exc
     try:
-        return parse_and_verify_catalog(
+        verified = parse_and_verify_catalog(
             catalog_file,
             trusted_keys_path=trusted_catalog_keys_path(),
         )
     except ValueError as exc:
         raise PluginLifecycleError(str(exc)) from exc
+    if remotely_fetched and any(
+        entry.source.casefold().startswith("file://")
+        for entry in verified.entries.values()
+    ):
+        raise PluginLifecycleError(
+            "remotely fetched plugin catalogs may only reference HTTPS Git sources"
+        )
+    return verified
 
 
 def _verified_catalogs(
@@ -457,25 +222,31 @@ def _verified_catalogs(
 ) -> tuple[SignedCatalog, ...]:
     expected_publishers: tuple[str, ...] | None = None
     expected_key_ids: tuple[str | None, ...] | None = None
-    registered_sequences: dict[str, int] = {}
+    expected_key_fingerprints: tuple[str | None, ...] | None = None
+    registered_sequences: dict[str, tuple[str, int]] = {}
     sources: tuple[CatalogSource | None, ...]
     if isinstance(catalog, Mapping):
         expected_publishers = tuple(catalog.keys())
         bound_sources: list[CatalogSource | None] = []
         bound_key_ids: list[str | None] = []
+        bound_key_fingerprints: list[str | None] = []
         for value in catalog.values():
             if isinstance(value, RegisteredCatalogSource):
                 bound_sources.append(value.source)
                 bound_key_ids.append(value.key_id)
+                bound_key_fingerprints.append(value.key_fingerprint)
             else:
                 bound_sources.append(value)
                 bound_key_ids.append(None)
+                bound_key_fingerprints.append(None)
         sources = tuple(bound_sources)
         expected_key_ids = tuple(bound_key_ids)
+        expected_key_fingerprints = tuple(bound_key_fingerprints)
         if not sources:
             sources = (None,)
             expected_publishers = None
             expected_key_ids = None
+            expected_key_fingerprints = None
     elif isinstance(catalog, Path | str) or catalog is None:
         sources = (catalog,)
     else:
@@ -487,9 +258,11 @@ def _verified_catalogs(
     )
     if expected_publishers is not None:
         assert expected_key_ids is not None
-        for expected, expected_key_id, item in zip(
+        assert expected_key_fingerprints is not None
+        for expected, expected_key_id, expected_key_fingerprint, item in zip(
             expected_publishers,
             expected_key_ids,
+            expected_key_fingerprints,
             verified,
             strict=True,
         ):
@@ -503,8 +276,18 @@ def _verified_catalogs(
                     f"registered marketplace @{expected} signing key changed from "
                     f"{expected_key_id!r} to {item.key_id!r}"
                 )
-            if expected_key_id is not None:
-                registered_sequences[expected] = item.sequence
+            if (
+                expected_key_fingerprint is not None
+                and item.key_fingerprint != expected_key_fingerprint
+            ):
+                raise PluginLifecycleError(
+                    f"registered marketplace @{expected} signing key material changed"
+                )
+            if expected_key_fingerprint is not None:
+                registered_sequences[expected] = (
+                    expected_key_fingerprint,
+                    item.sequence,
+                )
     if len(verified) > 1:
         publishers = [item.publisher for item in verified]
         if any(publisher is None for publisher in publishers):
@@ -517,7 +300,13 @@ def _verified_catalogs(
     if registered_sequences:
         from ash.commands.marketplace import accept_registered_marketplace_sequences
 
-        accept_registered_marketplace_sequences(registered_sequences)
+        accept_registered_marketplace_sequences(
+            registered_sequences,
+            legacy_fingerprints={
+                publisher: fingerprint
+                for publisher, (fingerprint, _sequence) in registered_sequences.items()
+            },
+        )
     return verified
 
 
@@ -657,7 +446,7 @@ def catalog_entry_for_name(
         raise PluginLifecycleError(f"ambiguous catalog plugin: {name}{suffix}")
     if not matches[0].source.lower().startswith(("https://", "file://")):
         raise PluginLifecycleError(
-            f"catalog plugin {name!r} does not use an HTTPS Git source"
+            f"catalog plugin {name!r} does not use an HTTPS or local file Git source"
         )
     return matches[0]
 
@@ -672,22 +461,29 @@ def manage_local_plugin(
     catalog: CatalogSelection = None,
 ) -> dict[str, Any]:
     if action == "install":
-        state = load_extension_state()
-
         def validate_install(root: Path, manifest: PluginManifest) -> None:
-            _require_enabled_dependencies(manifest, state.disabled_plugins)
-            _validate_plugin_contents(root, manifest)
+            validate_plugin_contents(root, manifest)
 
         def validate_install_at(
             snapshot: PluginSnapshot,
             manifest: PluginManifest,
         ) -> None:
-            _require_enabled_dependencies(manifest, state.disabled_plugins)
-            _validate_plugin_contents_at(snapshot, manifest)
+            validate_plugin_contents_at(snapshot, manifest)
+
+        def validate_install_topology(
+            manifest: PluginManifest,
+            manifests: Mapping[str, PluginManifest],
+        ) -> None:
+            state = load_extension_state()
+            _require_enabled_dependencies_from_manifests(
+                manifest,
+                state.disabled_plugins,
+                manifests,
+            )
 
         if target.startswith(("https://", "http://")):
             expected = None
-            if git_ref and (catalog is not None or default_catalog_path() is not None):
+            if git_ref and (catalog is not None or default_catalog_source() is not None):
                 verified_catalogs = _verified_catalogs(catalog)
                 matches = [
                     entry
@@ -705,8 +501,10 @@ def manage_local_plugin(
                 target,
                 ref=git_ref or "",
                 replace=replace,
+                enabled=True,
                 validator=validate_install,
                 _validator_at=validate_install_at,
+                _topology_validator=validate_install_topology,
                 expected=expected,
             )
         elif git_ref is not None:
@@ -715,8 +513,10 @@ def manage_local_plugin(
             installed = install_local_plugin(
                 Path(target).expanduser(),
                 replace=replace,
+                enabled=True,
                 validator=validate_install,
                 _validator_at=validate_install_at,
+                _topology_validator=validate_install_topology,
             )
         else:
             expected = catalog_entry_for_name(target, catalog=catalog)
@@ -724,11 +524,12 @@ def manage_local_plugin(
                 expected.source,
                 ref=expected.ref,
                 replace=replace,
+                enabled=True,
                 validator=validate_install,
                 _validator_at=validate_install_at,
+                _topology_validator=validate_install_topology,
                 expected=expected,
             )
-        set_plugin_enabled(installed.name, enabled=True)
         return {
             "action": action,
             "name": installed.name,
@@ -737,39 +538,52 @@ def manage_local_plugin(
             "enabled": True,
         }
 
-    plugin = _installed_user_plugin(target)
     if action == "enable":
-        state = load_extension_state()
-        _require_enabled_dependencies(plugin.manifest, state.disabled_plugins)
-        _validate_plugin_contents(plugin.root, plugin.manifest)
-        set_plugin_enabled(target, enabled=True)
+        plugin = set_local_plugin_enabled(target, enabled=True)
         enabled = True
     elif action == "disable":
-        dependents = _plugin_dependents(target, enabled_only=True)
-        if dependents:
-            raise PluginLifecycleError(
-                f"cannot disable {target!r}; required by: {', '.join(dependents)}"
-            )
-        set_plugin_enabled(target, enabled=False)
+        plugin = set_local_plugin_enabled(target, enabled=False)
         enabled = False
     else:
-        dependents = _plugin_dependents(target, enabled_only=False)
-        if dependents:
-            raise PluginLifecycleError(
-                f"cannot uninstall {target!r}; required by: {', '.join(dependents)}"
+        removed_version = ""
+        removed_root = user_plugin_root() / target
+
+        def validate_uninstall(
+            manifest: PluginManifest,
+            manifests: Mapping[str, PluginManifest],
+        ) -> None:
+            nonlocal removed_version
+            removed_version = manifest.version
+            dependents = sorted(
+                candidate
+                for candidate, installed in manifests.items()
+                if candidate != target
+                and any(
+                    dependency.get("name") == target
+                    for dependency in installed.dependencies
+                )
             )
-        uninstall_local_plugin(target, confirmed=confirmed)
+            if dependents:
+                raise PluginLifecycleError(
+                    f"cannot uninstall {target!r}; required by: {', '.join(dependents)}"
+                )
+
+        uninstall_local_plugin(
+            target,
+            confirmed=confirmed,
+            _preflight=validate_uninstall,
+        )
         return {
             "action": action,
             "name": target,
-            "version": plugin.manifest.version,
-            "root": str(plugin.root),
+            "version": removed_version,
+            "root": str(removed_root),
             "removed": True,
         }
     return {
         "action": action,
         "name": target,
-        "version": plugin.manifest.version,
+        "version": plugin.version,
         "root": str(plugin.root),
         "enabled": enabled,
     }
@@ -782,31 +596,13 @@ def update_local_plugin(
 ) -> dict[str, Any]:
     """Update one managed Git/catalog plugin from its persisted provenance."""
 
-    plugin = _installed_user_plugin(target)
-    _validate_plugin_contents(plugin.root, plugin.manifest)
-    records = load_plugin_install_records()
-    record = records.get(target)
-    if record is None:
-        raise PluginLifecycleError(
-            f"plugin {target!r} is not tracked for updates; reinstall it from Git "
-            "or a signed catalog"
-        )
-    if record.version != plugin.manifest.version:
-        raise PluginLifecycleError(
-            f"tracked install metadata for {target!r} does not match installed "
-            "plugin version; reinstall it before updating"
-        )
-
-    state = load_extension_state()
-
     def validate_update(root: Path, manifest: PluginManifest) -> None:
         if manifest.name != target:
             raise PluginLifecycleError(
                 f"updated plugin manifest {manifest.name!r} does not match "
                 f"tracked plugin {target!r}"
             )
-        _require_enabled_dependencies(manifest, state.disabled_plugins)
-        _validate_plugin_contents(root, manifest)
+        validate_plugin_contents(root, manifest)
 
     def validate_update_at(
         snapshot: PluginSnapshot,
@@ -816,9 +612,22 @@ def update_local_plugin(
             raise PluginLifecycleError(
                 f"updated plugin manifest {manifest.name!r} does not match "
                 f"tracked plugin {target!r}"
+        )
+        validate_plugin_contents_at(snapshot, manifest)
+
+    plugin, record = load_managed_plugin_for_update(target)
+
+    def validate_publication_state(
+        manifest: PluginManifest,
+        state: ExtensionState,
+        manifests: Mapping[str, PluginManifest],
+    ) -> None:
+        if target not in state.disabled_plugins:
+            _require_enabled_dependencies_from_manifests(
+                manifest,
+                state.disabled_plugins,
+                manifests,
             )
-        _require_enabled_dependencies(manifest, state.disabled_plugins)
-        _validate_plugin_contents_at(snapshot, manifest)
 
     if record.origin == "legacy-unknown":
         raise PluginLifecycleError(
@@ -845,7 +654,7 @@ def update_local_plugin(
             and expected.publisher == record.publisher
         )
         if unchanged:
-            install_git_plugin(
+            installed_result = install_git_plugin(
                 expected.source,
                 ref=expected.ref,
                 replace=True,
@@ -854,14 +663,15 @@ def update_local_plugin(
                 expected=expected,
                 _skip_if_digest=record.digest,
                 _unchanged=InstalledPlugin(
-                    plugin.manifest.name,
-                    plugin.manifest.version,
+                    plugin.name,
+                    plugin.version,
                     plugin.root,
                 ),
                 _expected_previous_record=record,
+                _state_validator=validate_publication_state,
             )
         else:
-            install_git_plugin(
+            installed_result = install_git_plugin(
                 expected.source,
                 ref=expected.ref,
                 replace=True,
@@ -869,9 +679,10 @@ def update_local_plugin(
                 _validator_at=validate_update_at,
                 expected=expected,
                 _expected_previous_record=record,
+                _state_validator=validate_publication_state,
             )
     else:
-        install_git_plugin(
+        installed_result = install_git_plugin(
             record.source,
             ref=record.ref,
             replace=True,
@@ -879,21 +690,17 @@ def update_local_plugin(
             _validator_at=validate_update_at,
             _skip_if_digest=record.digest,
             _unchanged=InstalledPlugin(
-                plugin.manifest.name,
-                plugin.manifest.version,
+                plugin.name,
+                plugin.version,
                 plugin.root,
             ),
             _expected_previous_record=record,
+            _state_validator=validate_publication_state,
         )
 
-    updated_records = load_plugin_install_records()
-    after = updated_records.get(target)
-    if after is None:
-        raise PluginLifecycleError(
-            f"plugin {target!r} update completed without install provenance"
-        )
+    after = installed_result.install_record or record
     status: Literal["updated", "unchanged"] = (
-        "unchanged" if after.digest == record.digest else "updated"
+        "unchanged" if after == record else "updated"
     )
     return _plugin_update_result(
         target,
@@ -910,6 +717,7 @@ def update_all_local_plugins(
 ) -> dict[str, Any]:
     """Update every tracked plugin independently and report all outcomes."""
 
+    recover_plugin_lifecycle()
     names = sorted(load_plugin_install_records())
     results: list[dict[str, Any]] = []
     for name in names:
@@ -962,19 +770,26 @@ def _plugin_update_result(
 def render_plugin_action(result: dict[str, Any], *, json_output: bool) -> str:
     if json_output:
         return json.dumps(result, sort_keys=True)
-    action = str(result["action"])
-    name = str(result["name"])
+    action = terminal_safe_text(str(result["action"]), single_line=True)
+    name = terminal_safe_text(str(result["name"]), single_line=True)
+    version = terminal_safe_text(str(result.get("version", "")), single_line=True)
+    root = terminal_safe_text(str(result.get("root", "")), single_line=True)
     if action == "install":
-        return f"Installed and enabled {name} {result['version']} at {result['root']}"
+        return f"Installed and enabled {name} {version} at {root}"
     if action == "update":
         if result["status"] == "unchanged":
-            return f"{name} {result['version']} is already up to date"
+            return f"{name} {version} is already up to date"
+        previous_version = terminal_safe_text(
+            str(result["previous_version"]), single_line=True
+        )
+        if previous_version == version:
+            return f"Updated {name} {version} at {root}"
         return (
-            f"Updated {name} {result['previous_version']} -> {result['version']} "
-            f"at {result['root']}"
+            f"Updated {name} {previous_version} -> {version} "
+            f"at {root}"
         )
     if action == "uninstall":
-        return f"Uninstalled {name} from {result['root']}"
+        return f"Uninstalled {name} from {root}"
     return f"{action.capitalize()}d {name}"
 
 
@@ -1002,372 +817,16 @@ def render_plugin_update_all(result: dict[str, Any], *, json_output: bool) -> st
     return "\n".join(lines)
 
 
-def _installed_user_plugin(name: str):
-    expected = user_plugin_root() / name / "plugin.json"
-    if not expected.is_file():
-        raise PluginLifecycleError(f"plugin is not installed in user scope: {name}")
-    try:
-        manifest = PluginManifest.load(expected)
-        _validate_manifest(manifest, expected.parent)
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
-        raise PluginLifecycleError(
-            f"installed plugin {name!r} is invalid: {exc}"
-        ) from exc
-    if manifest.name != name:
-        raise PluginLifecycleError(
-            f"installed plugin directory {name!r} contains manifest {manifest.name!r}"
-        )
-    return DiscoveredPlugin(
-        manifest,
-        expected.parent,
-        "user",
-        name not in load_extension_state().disabled_plugins,
-    )
-
-
-def _installed_user_manifests() -> dict[str, PluginManifest]:
-    manifests: dict[str, PluginManifest] = {}
-    root = user_plugin_root()
-    if not root.is_dir():
-        return manifests
-    try:
-        manifest_paths = _plugin_manifest_paths(root)
-    except (OSError, ValueError) as exc:
-        raise PluginLifecycleError(f"cannot inspect installed plugins: {exc}") from exc
-    for path in manifest_paths:
-        try:
-            manifest = PluginManifest.load(path)
-            _validate_manifest(manifest, path.parent)
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
-            raise PluginLifecycleError(
-                f"installed plugin {path} is invalid: {exc}"
-            ) from exc
-        manifests[manifest.name] = manifest
-    return manifests
-
-
-def _require_enabled_dependencies(
-    manifest: PluginManifest, disabled_plugins: frozenset[str]
+def _require_enabled_dependencies_from_manifests(
+    manifest: PluginManifest,
+    disabled_plugins: frozenset[str],
+    manifests: Mapping[str, PluginManifest],
 ) -> None:
     versions = {
         name: installed.version
-        for name, installed in _installed_user_manifests().items()
+        for name, installed in manifests.items()
         if name not in disabled_plugins and name != manifest.name
     }
     errors = manifest.check_dependencies(versions)
     if errors:
         raise PluginLifecycleError("; ".join(errors))
-
-
-def _plugin_dependents(name: str, *, enabled_only: bool) -> list[str]:
-    disabled = load_extension_state().disabled_plugins
-    return sorted(
-        candidate
-        for candidate, manifest in _installed_user_manifests().items()
-        if candidate != name
-        and (not enabled_only or candidate not in disabled)
-        and any(dependency.get("name") == name for dependency in manifest.dependencies)
-    )
-
-
-def _validate_plugin_contents(root: Path, manifest: PluginManifest) -> None:
-    plugin = DiscoveredPlugin(manifest, root, "validation")
-    skills = SkillCatalog((SkillSource(plugin.skill_paths(), manifest.name),))
-    skills.discover()
-    commands = CustomCommandCatalog(
-        (
-            CommandSource(
-                plugin.command_paths(),
-                source=f"plugin:{manifest.name}",
-                namespace=manifest.name,
-            ),
-        )
-    )
-    commands.discover()
-    agents = AgentCatalog((AgentSource(plugin.agent_paths(), manifest.name),))
-    agents.discover()
-    errors = [
-        *skills.errors.values(),
-        *commands.errors.values(),
-        *agents.errors.values(),
-    ]
-    if errors:
-        raise PluginLifecycleError(errors[0])
-    try:
-        load_command_hooks(
-            [
-                HookConfigSource(
-                    path,
-                    cwd=root,
-                    environment=(("ASH_PLUGIN_ROOT", str(root)),),
-                    trusted_root=root,
-                )
-                for path in plugin.hook_paths()
-            ]
-        )
-        for path in plugin.mcp_paths():
-            load_mcp_servers(
-                path,
-                namespace=manifest.name,
-                cwd=root,
-                environment={"ASH_PLUGIN_ROOT": str(root)},
-            )
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
-        raise PluginLifecycleError(f"invalid plugin component: {exc}") from exc
-
-
-def _validate_plugin_contents_at(
-    snapshot: PluginSnapshot,
-    manifest: PluginManifest,
-) -> None:
-    """Run semantic plugin validation against immutable snapshot bytes."""
-
-    _validate_plugin_contents_snapshot(snapshot, manifest)
-
-
-def _validate_plugin_contents_snapshot(
-    snapshot: PluginSnapshot,
-    manifest: PluginManifest,
-) -> None:
-    """Validate every plugin component without reopening the live filesystem."""
-
-    try:
-        skill_names: dict[str, Path] = {}
-        skill_roots: list[str | dict[str, Any]] = (
-            list(manifest.skills)
-            if manifest.skills
-            else ["SKILL.md", "skills"]
-        )
-        for entry in _snapshot_skill_entries(
-            snapshot,
-            skill_roots,
-        ):
-            path = _snapshot_skill_path(snapshot, entry, manifest.name)
-            skill = parse_instruction_skill_bytes(
-                snapshot.read_bytes(entry.relative),
-                path,
-                namespace=manifest.name,
-            )
-            previous = skill_names.get(skill.name)
-            if previous is not None:
-                raise PluginLifecycleError(
-                    f"duplicate skill name {skill.name!r}; already provided by {previous}"
-                )
-            skill_names[skill.name] = path
-
-        command_names: dict[str, Path] = {}
-        command_roots: list[str | dict[str, Any]] = (
-            list(manifest.commands) if manifest.commands else ["commands"]
-        )
-        for entry, root_relative in _snapshot_markdown_entries(snapshot, command_roots):
-            path = snapshot.display_path(entry.relative)
-            command = parse_custom_command_bytes(
-                snapshot.read_bytes(entry.relative),
-                path,
-                snapshot.display_path(root_relative),
-                f"plugin:{manifest.name}",
-                namespace=manifest.name,
-            )
-            previous = command_names.get(command.name)
-            if previous is not None:
-                raise PluginLifecycleError(
-                    f"duplicate command name {command.name!r}; already provided by {previous}"
-                )
-            command_names[command.name] = path
-
-        agent_names: dict[str, Path] = {}
-        agent_roots: list[str | dict[str, Any]] = (
-            list(manifest.agents) if manifest.agents else ["agents"]
-        )
-        for entry, _root_relative in _snapshot_markdown_entries(snapshot, agent_roots):
-            path = snapshot.display_path(entry.relative)
-            agent = parse_agent_definition_bytes(
-                snapshot.read_bytes(entry.relative),
-                path,
-                namespace=manifest.name,
-            )
-            previous = agent_names.get(agent.name)
-            if previous is not None:
-                raise PluginLifecycleError(
-                    f"duplicate agent name {agent.name!r}; already provided by {previous}"
-                )
-            agent_names[agent.name] = path
-
-        hook_roots: list[str | dict[str, Any]] = (
-            list(manifest.hooks) if manifest.hooks else ["hooks/hooks.json"]
-        )
-        for entry in _snapshot_file_entries(snapshot, hook_roots):
-            path = snapshot.display_path(entry.relative)
-            payload = strict_json_loads(
-                snapshot.read_bytes(entry.relative, max_bytes=MAX_HOOK_CONFIG_BYTES)
-            )
-            validate_command_hooks_payload(payload, path)
-
-        mcp_roots: list[str | dict[str, Any]] = (
-            list(manifest.mcp_servers) if manifest.mcp_servers else [".mcp.json"]
-        )
-        for entry in _snapshot_file_entries(snapshot, mcp_roots):
-            path = snapshot.display_path(entry.relative)
-            payload = strict_json_loads(snapshot.read_bytes(entry.relative))
-            parse_mcp_servers_payload(
-                payload,
-                path,
-                namespace=manifest.name,
-                cwd=snapshot.root,
-                environment={"ASH_PLUGIN_ROOT": str(snapshot.root)},
-            )
-    except PluginLifecycleError:
-        raise
-    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise PluginLifecycleError(f"invalid plugin component: {exc}") from exc
-
-
-def _snapshot_file_entries(
-    snapshot: PluginSnapshot,
-    roots: Iterable[str | dict[str, Any]],
-) -> list[SnapshotEntry]:
-    entries: list[SnapshotEntry] = []
-    for raw_root in roots:
-        if not isinstance(raw_root, str):
-            raise PluginLifecycleError("inline plugin component declarations are unsupported")
-        relative = _snapshot_parts(raw_root)
-        entry = snapshot.entry(relative)
-        if entry is None:
-            continue
-        if entry.kind == "file":
-            entries.append(entry)
-    return entries
-
-
-def _snapshot_skill_entries(
-    snapshot: PluginSnapshot,
-    roots: Iterable[str | dict[str, Any]],
-) -> list[SnapshotEntry]:
-    entries: list[SnapshotEntry] = []
-    for raw_root in roots:
-        if not isinstance(raw_root, str):
-            raise PluginLifecycleError("inline plugin component declarations are unsupported")
-        relative = _snapshot_parts(raw_root)
-        entry = snapshot.entry(relative)
-        if entry is None:
-            continue
-        if entry.kind == "file":
-            if entry.relative[-1] == "SKILL.md":
-                entries.append(entry)
-            continue
-        pending: list[tuple[tuple[str, ...], int]] = [(relative, 0)]
-        while pending:
-            current, depth = pending.pop()
-            manifest_entry = snapshot.entry((*current, "SKILL.md"))
-            if manifest_entry is not None:
-                if manifest_entry.kind == "file":
-                    entries.append(manifest_entry)
-                continue
-            for child in snapshot.children(current):
-                name = child.relative[-1]
-                if name.startswith(".") or name == "node_modules":
-                    continue
-                if child.kind == "file":
-                    if name == "SKILL.md":
-                        entries.append(child)
-                    continue
-                if depth < 32:
-                    pending.append((child.relative, depth + 1))
-    return entries
-
-
-def _snapshot_skill_path(
-    snapshot: PluginSnapshot,
-    entry: SnapshotEntry,
-    plugin_name: str,
-) -> Path:
-    """Give a root-level skill the same parent-name semantics as installation."""
-
-    if entry.relative == ("SKILL.md",):
-        return snapshot.root / plugin_name / "SKILL.md"
-    return snapshot.display_path(entry.relative)
-
-
-def _snapshot_markdown_entries(
-    snapshot: PluginSnapshot,
-    roots: Iterable[str | dict[str, Any]],
-) -> list[tuple[SnapshotEntry, tuple[str, ...]]]:
-    entries: list[tuple[SnapshotEntry, tuple[str, ...]]] = []
-    for raw_root in roots:
-        if not isinstance(raw_root, str):
-            raise PluginLifecycleError("inline plugin component declarations are unsupported")
-        relative = _snapshot_parts(raw_root)
-        entry = snapshot.entry(relative)
-        if entry is None:
-            continue
-        if entry.kind == "file":
-            if Path(entry.relative[-1]).suffix.casefold() == ".md":
-                entries.append((entry, relative[:-1]))
-            continue
-        pending = [relative]
-        while pending:
-            current = pending.pop()
-            for child in snapshot.children(current):
-                if child.kind == "directory":
-                    pending.append(child.relative)
-                elif Path(child.relative[-1]).suffix.casefold() == ".md":
-                    entries.append((child, relative))
-    return entries
-
-
-def _snapshot_parts(relative: str) -> tuple[str, ...]:
-    candidate = Path(relative)
-    if candidate.is_absolute() or not candidate.parts:
-        raise PluginLifecycleError(f"component path escapes plugin root: {relative}")
-    parts = tuple(candidate.parts)
-    if any(not part or part in {".", ".."} for part in parts):
-        raise PluginLifecycleError(f"component path escapes plugin root: {relative}")
-    return parts
-
-
-def _discover_hooks(
-    paths: list[tuple[Path, str]],
-) -> tuple[list[HookConfigSummary], list[str]]:
-    hooks: list[HookConfigSummary] = []
-    errors: list[str] = []
-    for path, source in paths:
-        if not path.is_file():
-            continue
-        try:
-            raw = read_bounded_bytes(
-                path,
-                MAX_HOOK_CONFIG_BYTES,
-                label="hook config",
-            )
-            payload = json.loads(raw.decode("utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("hook config must be an object")
-            summary = HookConfigSummary(
-                path=str(path),
-                source=source,
-                pre_tool=_count_hook_entries(payload, "pre_tool"),
-                post_tool=_count_hook_entries(payload, "post_tool"),
-                session_start=_count_hook_entries(payload, "session_start"),
-                session_end=_count_hook_entries(payload, "session_end"),
-                turn_start=_count_hook_entries(payload, "turn_start"),
-                turn_end=_count_hook_entries(payload, "turn_end"),
-                turn_error=_count_hook_entries(payload, "turn_error"),
-                pre_model=_count_hook_entries(payload, "pre_model"),
-                post_model=_count_hook_entries(payload, "post_model"),
-                tool_error=_count_hook_entries(payload, "tool_error"),
-            )
-            load_command_hooks([path])
-            hooks.append(summary)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            errors.append(f"Invalid hook config {path}: {exc}")
-    return hooks, errors
-
-
-def _count_hook_entries(payload: dict[str, Any], key: str) -> int:
-    entries = payload.get(key, [])
-    if not isinstance(entries, list):
-        raise ValueError(f"{key} hooks must be a list")
-    for entry in entries:
-        if not isinstance(entry, dict) or not isinstance(entry.get("command"), list):
-            raise ValueError(f"{key} hook entries must contain command arrays")
-    return len(entries)

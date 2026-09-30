@@ -4,26 +4,30 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import sqlite3
 import stat
+import sys
 import threading
+import weakref
 from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Iterator, Literal, Sequence
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
-from ash.plugins.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.providers.identifiers import MAX_MODEL_IDENTIFIER_BYTES
+
+from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.safe_io import (
-    open_unlinked_regular_file,
     strict_json_loads,
     validate_unlinked_file_path,
-    verify_open_file_identity,
 )
+from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
 
 try:
     import fcntl
@@ -41,11 +45,43 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 14
+CURRENT_SCHEMA_VERSION = 15
+SQLITE_INTEGER_MAX = 2**63 - 1
+SQLITE_REAL_MAX = sys.float_info.max
+MAX_SESSION_IMPORT_BYTES = 64 * 1024 * 1024
+MAX_RUNTIME_SESSION_TOOL_CALLS = 256
+MAX_DURABLE_MCP_TASKS_PER_SESSION = 64
+MAX_DURABLE_MCP_TASK_STATE_BYTES = 8 * 1024 * 1024
+MAX_DURABLE_MCP_ANSWERED_INPUTS_BYTES = 8 * 1024 * 1024
+MAX_DURABLE_MCP_ANSWERED_INPUTS = 256
+MAX_RECENT_SESSION_CONTEXT_SESSIONS = 20
+MAX_RECENT_SESSION_CONTEXT_MESSAGES = 32
+MAX_RECENT_SESSION_CONTEXT_CHARS = 2000
+MAX_SESSION_LIST_LIMIT = 1000
+MAX_SESSION_TREE_NODES = 4096
+MAX_AUDIT_VERIFICATION_ERRORS = 1000
+MAX_RECOVERY_TOOL_OUTPUT_PREVIEW_BYTES = 2 * 1024 * 1024
+MAX_RECOVERY_TOOL_ERROR_PREVIEW_BYTES = 256 * 1024
+MAX_RECOVERY_AUDIT_OUTPUT_PREVIEW_BYTES = 64 * 1024
+MAX_RECOVERY_ARGUMENT_PREVIEW_BYTES = 64 * 1024
 
 
 class SessionStorageError(RuntimeError):
     """Session database cannot be opened or migrated safely."""
+
+
+class _SessionRuntimeLease:
+    """Held advisory lock proving one process owns active session work."""
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor = descriptor
+
+    def close(self) -> None:
+        descriptor = self._descriptor
+        if descriptor < 0:
+            return
+        self._descriptor = -1
+        os.close(descriptor)
 
 
 class SessionResolutionError(ValueError):
@@ -231,20 +267,43 @@ def exclusive_database_access(
     """Quiesce Ash database connections while a storage-level mutation runs."""
 
     normalized_path = Path(_normalize_db_path(db_path))
-    normalized_path.parent.mkdir(parents=True, exist_ok=True)
     normalized = _normalize_db_path(normalized_path)
-    if coordination_parent_descriptor is None:
-        release = _acquire_database_coordination(normalized, exclusive=True)
-    else:
+    if coordination_parent_descriptor is not None:
         release = _acquire_database_coordination(
             normalized,
             exclusive=True,
             coordination_parent_descriptor=coordination_parent_descriptor,
         )
+        try:
+            yield Path(normalized)
+        finally:
+            release()
+        return
+
     try:
-        yield Path(normalized)
-    finally:
-        release()
+        with AnchoredDirectory.open(
+            normalized_path.parent,
+            create=True,
+            private=False,
+            pin_path=True,
+        ) as directory:
+            release = _acquire_database_coordination(
+                normalized,
+                exclusive=True,
+                coordination_parent_descriptor=(
+                    directory.descriptor if os.name == "posix" else None
+                ),
+            )
+            try:
+                directory.validation_path()
+                yield Path(normalized)
+                directory.validation_path()
+            finally:
+                release()
+    except (AnchoredFilesystemError, OSError) as exc:
+        raise SessionStorageError(
+            f"Could not safely coordinate session database access: {exc}"
+        ) from exc
 
 
 class _CoordinatedConnection(sqlite3.Connection):
@@ -306,6 +365,7 @@ class Session(BaseModel):
     title: str = ""
     updated_at: datetime | None = None
     context_summary: str = ""
+    context_summary_message_count: int = 0
     model: str = ""
     parent_session_id: str | None = None
     root_session_id: str = ""
@@ -315,6 +375,213 @@ class Session(BaseModel):
     depth: int = 0
     messages: list[Message] = Field(default_factory=list)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
+    _resident_message_offset: int = PrivateAttr(default=0)
+
+    @property
+    def resident_history_is_windowed(self) -> bool:
+        """Whether ``messages`` omits a compacted durable prefix."""
+
+        return self._resident_message_offset > 0
+
+    @property
+    def resident_message_offset(self) -> int:
+        """Number of durable leading messages omitted from the live snapshot."""
+
+        return self._resident_message_offset
+
+    def discard_compacted_prefix(self, count: int) -> None:
+        """Drop a summarized live prefix while leaving durable history untouched."""
+
+        if count < 0 or count > len(self.messages):
+            raise ValueError("compacted message count is outside the resident history")
+        if count == 0:
+            return
+        del self.messages[:count]
+        self._resident_message_offset += count
+
+
+MAX_SESSION_TITLE_CHARS = 256
+
+
+def _normalize_session_title(title: str, *, allow_empty: bool = False) -> str:
+    normalized = " ".join(title.split())
+    if not normalized and not allow_empty:
+        raise ValueError("session title cannot be empty")
+    if len(normalized) > MAX_SESSION_TITLE_CHARS:
+        raise ValueError(
+            f"session title cannot exceed {MAX_SESSION_TITLE_CHARS} characters"
+        )
+    return normalized
+
+
+def _derived_session_title(base: str, suffix: str) -> str:
+    normalized = " ".join(base.split())
+    available = MAX_SESSION_TITLE_CHARS - len(suffix)
+    if available < 1:
+        raise ValueError("session title suffix exceeds the title limit")
+    fitted = normalized[:available].rstrip()
+    if not fitted:
+        fitted = "session"[:available]
+    return f"{fitted}{suffix}"
+
+
+def _validate_session_model(model: str) -> str:
+    try:
+        size = len(model.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("session model must be valid UTF-8 text") from exc
+    if size > MAX_MODEL_IDENTIFIER_BYTES:
+        raise ValueError(
+            f"session model cannot exceed {MAX_MODEL_IDENTIFIER_BYTES} UTF-8 bytes"
+        )
+    return model
+
+
+def _truncate_utf8_bytes(value: str, maximum: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum:
+        return value
+    return encoded[:maximum].decode("utf-8", errors="ignore")
+
+
+def _render_recovered_tool_message(
+    *,
+    success: bool,
+    output: str,
+    error: str | None,
+    dispatched: bool,
+    ambiguous: bool,
+) -> str:
+    from ash.providers.messages import MAX_CANONICAL_CONTENT_BYTES
+
+    payload: dict[str, Any] = {
+        "success": success,
+        "output": output,
+        "error": error,
+        "provenance": "ash_startup_recovery",
+        "dispatched": dispatched,
+        "ambiguous": ambiguous,
+        "replayed": False,
+        "policy_note": (
+            "Ash reconstructed this model-visible result during startup recovery "
+            "and did not replay the tool call."
+        ),
+    }
+
+    def render(value: dict[str, Any]) -> str:
+        return json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+
+    rendered = render(payload)
+    if len(rendered.encode("utf-8")) <= MAX_CANONICAL_CONTENT_BYTES:
+        return rendered
+
+    output_bytes = output.encode("utf-8")
+    compact = dict(payload)
+    compact["output"] = _truncate_utf8_bytes(
+        output,
+        min(MAX_RECOVERY_TOOL_OUTPUT_PREVIEW_BYTES, MAX_CANONICAL_CONTENT_BYTES // 4),
+    )
+    compact["error"] = (
+        _truncate_utf8_bytes(
+            error,
+            min(MAX_RECOVERY_TOOL_ERROR_PREVIEW_BYTES, MAX_CANONICAL_CONTENT_BYTES // 8),
+        )
+        if error
+        else None
+    )
+    compact["recovery_result_truncated"] = True
+    compact["original_output_bytes"] = len(output_bytes)
+    compact["original_output_sha256"] = hashlib.sha256(output_bytes).hexdigest()
+    rendered = render(compact)
+    if len(rendered.encode("utf-8")) > MAX_CANONICAL_CONTENT_BYTES:
+        raise ValueError(
+            "recovered tool response could not fit the canonical message limit"
+        )
+    return rendered
+
+
+def _recovery_audit_output_fields(output: str) -> dict[str, Any]:
+    from ash.core.redaction import redact_text
+
+    redacted = redact_text(output)
+    encoded = redacted.encode("utf-8")
+    if len(encoded) <= MAX_RECOVERY_AUDIT_OUTPUT_PREVIEW_BYTES:
+        return {"output": redacted}
+    return {
+        "output_truncated": True,
+        "output_preview": _truncate_utf8_bytes(
+            redacted,
+            MAX_RECOVERY_AUDIT_OUTPUT_PREVIEW_BYTES,
+        ),
+        "output_bytes": len(encoded),
+        "output_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _bounded_recovery_arguments(arguments: Any) -> dict[str, Any]:
+    from ash.providers.messages import MAX_TOOL_CALL_ARGUMENT_BYTES
+
+    if not isinstance(arguments, dict):
+        return {}
+    try:
+        encoded_text = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        encoded = encoded_text.encode("utf-8")
+    except (TypeError, ValueError, OverflowError, UnicodeEncodeError):
+        return {"_ash_recovery_arguments_invalid": True}
+    if len(encoded) <= MAX_TOOL_CALL_ARGUMENT_BYTES:
+        return dict(arguments)
+
+    def fits(value: dict[str, Any]) -> bool:
+        return (
+            len(
+                json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            )
+            <= MAX_TOOL_CALL_ARGUMENT_BYTES
+        )
+
+    compact: dict[str, Any] = {"_ash_recovery_arguments_truncated": True}
+    for key, value in (
+        ("original_bytes", len(encoded)),
+        ("original_sha256", hashlib.sha256(encoded).hexdigest()),
+    ):
+        candidate = {**compact, key: value}
+        if fits(candidate):
+            compact = candidate
+
+    if not fits(compact):
+        raise ValueError("tool call argument limit is too small for recovery metadata")
+
+    preview_limit = min(
+        MAX_RECOVERY_ARGUMENT_PREVIEW_BYTES,
+        MAX_TOOL_CALL_ARGUMENT_BYTES,
+    )
+    low = 0
+    high = preview_limit
+    best: dict[str, Any] = compact
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = {
+            **compact,
+            "preview": _truncate_utf8_bytes(encoded_text, midpoint),
+        }
+        if fits(candidate):
+            best = candidate
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    return best
 
 
 class SessionSummary(BaseModel):
@@ -366,7 +633,9 @@ class StoredRuntimeEvent(BaseModel):
     event: dict[str, Any]
 
 
-_db_write_locks: dict[str, asyncio.Lock] = {}
+_db_write_locks: weakref.WeakValueDictionary[tuple[int, str], asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
 _db_write_locks_guard = threading.Lock()
 
 
@@ -473,15 +742,59 @@ def _lineage_from_row(
     )
 
 
-def _validate_fork_boundary(messages: list[Message], count: int) -> None:
-    if count <= 0 or count >= len(messages):
+def _message_boundary_rows(
+    conn: sqlite3.Connection,
+    session_id: str,
+    message_count: int,
+) -> tuple[int, sqlite3.Row | None, sqlite3.Row | None]:
+    """Return total count plus adjacent retained/removed rows for one boundary."""
+
+    total = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()[0]
+    )
+    if message_count < 0 or message_count > total:
+        raise ValueError(f"message_count must be between 0 and {total}")
+    retained = None
+    removed = None
+    if message_count > 0:
+        retained = conn.execute(
+            "SELECT message_id, role, timestamp, metadata_json, turn_id "
+            "FROM messages WHERE session_id = ? ORDER BY message_id "
+            "LIMIT 1 OFFSET ?",
+            (session_id, message_count - 1),
+        ).fetchone()
+    if message_count < total:
+        removed = conn.execute(
+            "SELECT message_id, role, timestamp, metadata_json, turn_id "
+            "FROM messages WHERE session_id = ? ORDER BY message_id "
+            "LIMIT 1 OFFSET ?",
+            (session_id, message_count),
+        ).fetchone()
+    return total, retained, removed
+
+
+def _validate_sql_fork_boundary(
+    retained: sqlite3.Row | None,
+    removed: sqlite3.Row | None,
+) -> None:
+    if retained is None or removed is None:
         return
-    retained = messages[count - 1]
-    removed = messages[count]
-    if removed.role == "tool":
+    if str(removed["role"]) == "tool":
         raise ValueError("message_count splits an assistant/tool-call pair")
-    if retained.role == "assistant" and retained.metadata.get("tool_calls"):
-        raise ValueError("message_count splits an assistant/tool-call pair")
+    if str(retained["role"]) == "assistant":
+        try:
+            metadata = json.loads(retained["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("stored assistant metadata is invalid JSON") from exc
+        if isinstance(metadata, dict) and metadata.get("tool_calls"):
+            raise ValueError("message_count splits an assistant/tool-call pair")
+    retained_turn = retained["turn_id"]
+    removed_turn = removed["turn_id"]
+    if retained_turn is not None and retained_turn == removed_turn:
+        raise ValueError("message_count splits an Ash turn; choose a turn boundary")
 
 
 def _validate_imported_provider_message(message: Message) -> None:
@@ -531,11 +844,6 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(
         row["name"] == column for row in conn.execute(f"PRAGMA table_info({table})")
     )
-
-
-def _restrict_file_permissions(path: Path) -> None:
-    if os.name != "nt" and path.exists():
-        path.chmod(0o600)
 
 
 def _copy_descriptor(source: int, destination: int) -> None:
@@ -629,12 +937,15 @@ def _validate_backup_descriptor(descriptor: int) -> None:
         _validate_backup_source_connection(connection)
 
 
-def _require_quiescent_backup_source(source_path: Path) -> None:
+def _require_quiescent_backup_source(
+    directory: AnchoredDirectory,
+    source_path: Path,
+) -> None:
     """Reject sidecar state that may contain committed bytes missing from the main DB."""
 
     wal = Path(f"{source_path}-wal")
-    if os.path.lexists(wal):
-        wal_stat = os.lstat(wal)
+    wal_stat = directory.stat(f"{source_path.name}-wal")
+    if wal_stat is not None:
         if stat.S_ISLNK(wal_stat.st_mode) or not stat.S_ISREG(wal_stat.st_mode):
             raise SessionStorageError(
                 f"Refusing to back up session database with unsafe WAL sidecar: {wal}"
@@ -646,8 +957,8 @@ def _require_quiescent_backup_source(source_path: Path) -> None:
             )
 
     shm = Path(f"{source_path}-shm")
-    if os.path.lexists(shm):
-        shm_stat = os.lstat(shm)
+    shm_stat = directory.stat(f"{source_path.name}-shm")
+    if shm_stat is not None:
         if stat.S_ISLNK(shm_stat.st_mode) or not stat.S_ISREG(shm_stat.st_mode):
             raise SessionStorageError(
                 "Refusing to back up session database with unsafe shared-memory "
@@ -655,8 +966,8 @@ def _require_quiescent_backup_source(source_path: Path) -> None:
             )
 
     journal = Path(f"{source_path}-journal")
-    if os.path.lexists(journal):
-        journal_stat = os.lstat(journal)
+    journal_stat = directory.stat(f"{source_path.name}-journal")
+    if journal_stat is not None:
         if stat.S_ISLNK(journal_stat.st_mode) or not stat.S_ISREG(journal_stat.st_mode):
             raise SessionStorageError(
                 "Refusing to back up session database with unsafe rollback journal: "
@@ -668,37 +979,60 @@ def _require_quiescent_backup_source(source_path: Path) -> None:
         )
 
 
-def get_db_connection(db_path: str | Path) -> sqlite3.Connection:
+def get_db_connection(
+    db_path: str | Path,
+    *,
+    _database: PinnedSQLiteDatabase | None = None,
+) -> sqlite3.Connection:
     """Open a SQLite connection configured for WAL persistence."""
 
-    normalized_path = Path(_normalize_db_path(db_path))
-    normalized_path.parent.mkdir(parents=True, exist_ok=True)
-    normalized_path = Path(_normalize_db_path(normalized_path))
-    release = _acquire_database_coordination(str(normalized_path), exclusive=False)
     try:
-        conn = sqlite3.connect(
-            normalized_path,
-            check_same_thread=False,
-            factory=_CoordinatedConnection,
+        database = _database or PinnedSQLiteDatabase.prepare(
+            _normalize_db_path(db_path),
+            label="session database",
         )
+    except SQLitePathError as exc:
+        raise SessionStorageError(str(exc)) from exc
+
+    normalized_path = database.path
+    release: Any | None = None
+    try:
+        with database.parent_directory(label="session database") as parent:
+            release = _acquire_database_coordination(
+                str(normalized_path),
+                exclusive=False,
+                coordination_parent_descriptor=parent.descriptor,
+            )
+            conn = database.connect(
+                label="session database",
+                check_same_thread=False,
+                factory=_CoordinatedConnection,
+            )
         conn._ash_coordination_release = release  # type: ignore[attr-defined]
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
         return conn
-    except BaseException:
-        release()
+    except BaseException as exc:
+        if release is not None:
+            release()
+        if isinstance(exc, SQLitePathError):
+            raise SessionStorageError(str(exc)) from exc
         raise
 
 
 @asynccontextmanager
 async def write_transaction(db_path: str | Path) -> AsyncIterator[sqlite3.Connection]:
-    """Serialize asynchronous SQLite write transactions for a database path."""
+    """Serialize writes for one database within the current event loop."""
 
     lock_key = _normalize_db_path(db_path)
+    loop_key = id(asyncio.get_running_loop())
     with _db_write_locks_guard:
-        lock = _db_write_locks.setdefault(lock_key, asyncio.Lock())
+        lock = _db_write_locks.get((loop_key, lock_key))
+        if lock is None:
+            lock = asyncio.Lock()
+            _db_write_locks[(loop_key, lock_key)] = lock
 
     async with lock:
         conn = get_db_connection(db_path)
@@ -714,10 +1048,14 @@ async def write_transaction(db_path: str | Path) -> AsyncIterator[sqlite3.Connec
 
 class SessionStore:
     def __init__(self, db_path: str | Path) -> None:
-        self.db_path = _normalize_db_path(db_path)
-        path = Path(self.db_path)
-        existed = path.is_file() and path.stat().st_size > 0
         try:
+            self._database = PinnedSQLiteDatabase.prepare(
+                _normalize_db_path(db_path),
+                label="session database",
+            )
+            self.db_path = str(self._database.path)
+            path = self._database.path
+            existed = self._database.initial_size > 0
             version = self._schema_version()
             if version > CURRENT_SCHEMA_VERSION:
                 raise SessionStorageError(
@@ -728,8 +1066,9 @@ class SessionStore:
                 self.backup(reason=f"before-v{CURRENT_SCHEMA_VERSION}-migration")
             self._init_db()
             self._migrate_if_needed(version)
-            _restrict_file_permissions(path)
-        except SessionStorageError:
+        except (SessionStorageError, SQLitePathError) as exc:
+            if isinstance(exc, SQLitePathError):
+                raise SessionStorageError(str(exc)) from exc
             raise
         except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
             raise SessionStorageError(
@@ -737,10 +1076,65 @@ class SessionStore:
                 "Run 'ash storage check' and restore a backup if needed."
             ) from exc
 
+    def acquire_session_runtime_lease(self, session_id: str) -> _SessionRuntimeLease:
+        """Fail fast when another process is actively mutating this session."""
+
+        if os.name != "posix" or fcntl is None:
+            raise SessionStorageError(
+                "session runtime locking is unavailable on this platform"
+            )
+        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+        lock_name = f".{self._database.path.name}.session-{digest}.lock"
+        descriptor = -1
+        try:
+            with self._database.parent_directory(label="session runtime lease") as parent:
+                metadata = parent.stat(lock_name)
+                if metadata is None:
+                    descriptor = parent.create_file(lock_name, mode=0o600)
+                else:
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise SessionStorageError(
+                            "session runtime lock is not a regular file"
+                        )
+                    descriptor = parent.open_file(
+                        lock_name,
+                        os.O_RDWR,
+                        expected=metadata,
+                        expected_type=stat.S_IFREG,
+                    )
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise SessionStorageError(
+                        f"session {session_id!r} is active in another Ash process"
+                    ) from exc
+                if not parent.same_entry(lock_name, descriptor):
+                    raise SessionStorageError(
+                        "session runtime lock changed while it was being acquired"
+                    )
+            lease = _SessionRuntimeLease(descriptor)
+            descriptor = -1
+            return lease
+        except (AnchoredFilesystemError, SQLitePathError, OSError) as exc:
+            raise SessionStorageError(
+                f"could not acquire session runtime lock: {exc}"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _connect(self) -> sqlite3.Connection:
+        return get_db_connection(self.db_path, _database=self._database)
+
+    def open_connection(self) -> sqlite3.Connection:
+        """Open a coordinated connection bound to this store's database identity."""
+
+        return self._connect()
+
     def _schema_version(self) -> int:
         if not Path(self.db_path).exists():
             return 0
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             table = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
                 "AND name = 'schema_migrations'"
@@ -758,7 +1152,7 @@ class SessionStore:
         Version 0 covers databases created before explicit schema tracking.
         """
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             if from_version < 1:
                 self._migrate_v1(conn)
             if from_version < 2:
@@ -787,6 +1181,8 @@ class SessionStore:
                 self._migrate_v13(conn)
             if from_version < 14:
                 self._migrate_v14(conn)
+            if from_version < 15:
+                self._migrate_v15(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -1204,6 +1600,25 @@ class SessionStore:
             (14, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v15(self, conn: sqlite3.Connection) -> None:
+        """Persist how much durable history the current context summary covers."""
+
+        if not _column_exists(conn, "sessions", "context_summary_message_count"):
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN context_summary_message_count "
+                "INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(context_summary_message_count >= 0)"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sprints_session_state_created "
+            "ON sprints(session_id, state, created_at DESC)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (15, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -1252,42 +1667,77 @@ class SessionStore:
                     os.fchmod(descriptor, 0o600)
                 completed = False
                 try:
-                    with exclusive_database_access(source_path) as locked_source:
-                        _require_quiescent_backup_source(locked_source)
-                        with open_unlinked_regular_file(
-                            locked_source,
-                            label="session database",
-                        ) as source_descriptor:
-                            verify_open_file_identity(
-                                locked_source,
-                                source_descriptor,
-                                label="session database",
+                    with self._database.parent_directory(
+                        label="session database"
+                    ) as source_directory:
+                        source_metadata = source_directory.stat(source_path.name)
+                        if (
+                            source_metadata is None
+                            or stat.S_ISLNK(source_metadata.st_mode)
+                            or not stat.S_ISREG(source_metadata.st_mode)
+                            or int(source_metadata.st_dev) != self._database.file_device
+                            or int(source_metadata.st_ino) != self._database.file_inode
+                        ):
+                            raise SessionStorageError(
+                                "Session database file identity changed before backup"
                             )
-                            before = os.fstat(source_descriptor)
-                            _require_quiescent_backup_source(locked_source)
-                            _copy_descriptor(source_descriptor, descriptor)
-                            after = os.fstat(source_descriptor)
-                            if (
-                                before.st_size,
-                                before.st_mtime_ns,
-                                before.st_ctime_ns,
-                                before.st_nlink,
-                            ) != (
-                                after.st_size,
-                                after.st_mtime_ns,
-                                after.st_ctime_ns,
-                                after.st_nlink,
-                            ):
+
+                        with exclusive_database_access(
+                            source_path,
+                            coordination_parent_descriptor=source_directory.descriptor,
+                        ) as locked_source:
+                            if locked_source != source_path:
                                 raise SessionStorageError(
-                                    "Session database changed while secure backup was in progress"
+                                    "Session database coordination changed the backup path"
                                 )
-                            _require_quiescent_backup_source(locked_source)
-                            verify_open_file_identity(
+                            source_directory.validation_path()
+                            _require_quiescent_backup_source(
+                                source_directory,
                                 locked_source,
-                                source_descriptor,
-                                label="session database",
                             )
-                        _validate_backup_descriptor(descriptor)
+                            source_descriptor = source_directory.open_file(
+                                source_path.name,
+                                os.O_RDONLY,
+                                expected=source_metadata,
+                                expected_type=stat.S_IFREG,
+                            )
+                            try:
+                                before = os.fstat(source_descriptor)
+                                if (
+                                    int(before.st_dev) != self._database.file_device
+                                    or int(before.st_ino) != self._database.file_inode
+                                ):
+                                    raise SessionStorageError(
+                                        "Session database file identity changed before backup"
+                                    )
+                                _require_quiescent_backup_source(
+                                    source_directory,
+                                    locked_source,
+                                )
+                                _copy_descriptor(source_descriptor, descriptor)
+                                after = os.fstat(source_descriptor)
+                                if (
+                                    before.st_size,
+                                    before.st_mtime_ns,
+                                    before.st_ctime_ns,
+                                    before.st_nlink,
+                                ) != (
+                                    after.st_size,
+                                    after.st_mtime_ns,
+                                    after.st_ctime_ns,
+                                    after.st_nlink,
+                                ):
+                                    raise SessionStorageError(
+                                        "Session database changed while secure backup was in progress"
+                                    )
+                                _require_quiescent_backup_source(
+                                    source_directory,
+                                    locked_source,
+                                )
+                                source_directory.validation_path()
+                            finally:
+                                os.close(source_descriptor)
+                            _validate_backup_descriptor(descriptor)
                     os.fsync(descriptor)
                     destination_directory.validation_path()
                     completed = True
@@ -1323,7 +1773,7 @@ class SessionStore:
     def _init_db(self) -> None:
         """Create session and audit tables if they do not exist."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -1333,6 +1783,8 @@ class SessionStore:
                     title TEXT DEFAULT '',
                     updated_at TIMESTAMP,
                     context_summary TEXT DEFAULT '',
+                    context_summary_message_count INTEGER NOT NULL DEFAULT 0
+                        CHECK(context_summary_message_count >= 0),
                     model TEXT DEFAULT '',
                     total_tokens INTEGER DEFAULT 0,
                     total_cost_inr REAL DEFAULT 0,
@@ -1463,6 +1915,8 @@ class SessionStore:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_sprints_session ON sprints(session_id);
+                CREATE INDEX IF NOT EXISTS idx_sprints_session_state_created
+                    ON sprints(session_id, state, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_checklist_sprint ON checklist_items(sprint_id);
 
                 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1486,6 +1940,7 @@ class SessionStore:
     ) -> Session:
         canonical_project_path = normalize_project_path(project_path)
         session_id = session_id or str(uuid4())
+        model = _validate_session_model(model)
         normalized_branch_name, normalized_branch_summary = _normalize_branch_metadata(
             branch_name, branch_summary
         )
@@ -1564,21 +2019,27 @@ class SessionStore:
     ) -> Session:
         """Create a new session record in SQLite and return its model."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             return self._create_session_record(
                 conn,
                 project_path,
                 model=model,
             )
 
-    def load_session(self, session_id: str) -> Session:
-        """Load a session with all messages and tool call records."""
+    def load_session(
+        self,
+        session_id: str,
+        *,
+        runtime_window: bool = False,
+    ) -> Session:
+        """Load a session, optionally using its persisted live-history window."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             session_row = conn.execute(
                 """
                 SELECT session_id, project_path, created_at, title, updated_at,
-                       context_summary, model, parent_session_id, root_session_id,
+                       context_summary, context_summary_message_count, model,
+                       parent_session_id, root_session_id,
                        fork_message_count, branch_name, branch_summary, depth
                 FROM sessions
                 WHERE session_id = ?
@@ -1589,29 +2050,64 @@ class SessionStore:
             if session_row is None:
                 raise KeyError(f"Session not found: {session_id}")
 
+            summary_message_count = int(
+                session_row["context_summary_message_count"] or 0
+            )
+            if summary_message_count < 0:
+                raise _invalid_stored_data_error(self.db_path)
+            if summary_message_count and not str(session_row["context_summary"] or ""):
+                raise _invalid_stored_data_error(self.db_path)
+
+            message_offset = 0
+            if runtime_window and summary_message_count:
+                total_messages = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()[0]
+                )
+                if summary_message_count > total_messages:
+                    raise _invalid_stored_data_error(self.db_path)
+                message_offset = summary_message_count
+
             message_rows = conn.execute(
                 """
                 SELECT role, content, timestamp, metadata_json
                 FROM messages
                 WHERE session_id = ?
                 ORDER BY message_id ASC
+                LIMIT -1 OFFSET ?
                 """,
-                (session_id,),
+                (session_id, message_offset),
             ).fetchall()
 
-            tool_call_rows = conn.execute(
-                """
-                SELECT call_id, tool_name, arguments_json, approved, executed,
-                       dispatched, result, error, timestamp
-                FROM tool_calls
-                WHERE session_id = ?
-                ORDER BY timestamp ASC, call_id ASC
-                """,
-                (session_id,),
-            ).fetchall()
+            if runtime_window:
+                tool_call_rows = conn.execute(
+                    """
+                    SELECT call_id, tool_name, arguments_json, approved, executed,
+                           dispatched, result, error, timestamp
+                    FROM tool_calls
+                    WHERE session_id = ?
+                    ORDER BY timestamp DESC, call_id DESC
+                    LIMIT ?
+                    """,
+                    (session_id, MAX_RUNTIME_SESSION_TOOL_CALLS),
+                ).fetchall()
+                tool_call_rows.reverse()
+            else:
+                tool_call_rows = conn.execute(
+                    """
+                    SELECT call_id, tool_name, arguments_json, approved, executed,
+                           dispatched, result, error, timestamp
+                    FROM tool_calls
+                    WHERE session_id = ?
+                    ORDER BY timestamp ASC, call_id ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
 
         try:
-            return Session(
+            session = Session(
                 session_id=session_row["session_id"],
                 project_path=session_row["project_path"],
                 created_at=_deserialize_datetime(session_row["created_at"]),
@@ -1620,6 +2116,7 @@ class SessionStore:
                     session_row["updated_at"] or session_row["created_at"]
                 ),
                 context_summary=session_row["context_summary"] or "",
+                context_summary_message_count=summary_message_count,
                 model=session_row["model"] or "",
                 parent_session_id=session_row["parent_session_id"],
                 root_session_id=session_row["root_session_id"]
@@ -1652,6 +2149,9 @@ class SessionStore:
                     for row in tool_call_rows
                 ],
             )
+            if runtime_window:
+                session._resident_message_offset = message_offset
+            return session
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise _invalid_stored_data_error(self.db_path) from exc
 
@@ -1659,7 +2159,7 @@ class SessionStore:
         """Refuse access to a session outside the requested canonical project."""
 
         project_key = normalize_project_path(project_path)
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT project_key FROM sessions WHERE session_id = ?",
                 (session_id,),
@@ -1680,7 +2180,7 @@ class SessionStore:
     ) -> None:
         """Append a single message to a session."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO messages (
@@ -1715,8 +2215,10 @@ class SessionStore:
     ) -> list[SessionSummary]:
         """List recent sessions, optionally filtered by project and title."""
 
-        if limit < 1:
-            raise ValueError("limit must be positive")
+        if not 1 <= limit <= MAX_SESSION_LIST_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {MAX_SESSION_LIST_LIMIT}"
+            )
         clauses: list[str] = []
         params: list[Any] = []
         if project_path is not None:
@@ -1730,7 +2232,7 @@ class SessionStore:
             params.extend((pattern, pattern, pattern))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""
                 SELECT s.session_id, s.project_path, s.title, s.created_at,
@@ -1776,6 +2278,16 @@ class SessionStore:
         sessions = self.list_sessions(project_path=project_path, limit=1)
         return sessions[0] if sessions else None
 
+    def session_exists(self, session_id: str) -> bool:
+        """Return whether one session row exists without loading transcript state."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
     def resolve_session(self, reference: str, project_path: str) -> SessionSummary:
         """Resolve an exact ID or title within one canonical project scope."""
 
@@ -1783,8 +2295,8 @@ class SessionStore:
         if not normalized_reference:
             raise SessionResolutionError("session reference must not be empty")
         project_key = normalize_project_path(project_path)
-        with closing(get_db_connection(self.db_path)) as conn:
-            rows = conn.execute(
+        with closing(self._connect()) as conn:
+            exact = conn.execute(
                 """
                 SELECT s.session_id, s.project_path, s.title, s.created_at,
                        COALESCE(s.updated_at, s.created_at) AS updated_at,
@@ -1793,23 +2305,40 @@ class SessionStore:
                        s.fork_message_count, s.branch_name, s.depth
                 FROM sessions s
                 LEFT JOIN messages m ON m.session_id = s.session_id
-                WHERE s.project_key = ?
-                  AND (s.session_id = ? OR s.title = ? COLLATE NOCASE)
+                WHERE s.project_key = ? AND s.session_id = ?
                 GROUP BY s.session_id
-                ORDER BY CASE WHEN s.session_id = ? THEN 0 ELSE 1 END,
-                         updated_at DESC
                 """,
-                (
-                    project_key,
-                    normalized_reference,
-                    normalized_reference,
-                    normalized_reference,
-                ),
-            ).fetchall()
-            id_matches = [row for row in rows if row["session_id"] == reference]
-            if id_matches:
-                rows = id_matches
-            if not rows:
+                (project_key, normalized_reference),
+            ).fetchone()
+            if exact is not None:
+                row = exact
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT s.session_id, s.project_path, s.title, s.created_at,
+                           COALESCE(s.updated_at, s.created_at) AS updated_at,
+                           COUNT(m.message_id) AS message_count, s.model,
+                           s.parent_session_id, s.root_session_id,
+                           s.fork_message_count, s.branch_name, s.depth
+                    FROM sessions s
+                    LEFT JOIN messages m ON m.session_id = s.session_id
+                    WHERE s.project_key = ? AND s.title = ? COLLATE NOCASE
+                    GROUP BY s.session_id
+                    ORDER BY updated_at DESC
+                    LIMIT 2
+                    """,
+                    (project_key, normalized_reference),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise SessionResolutionError(
+                        f"session title {normalized_reference!r} is ambiguous; "
+                        "resume by session ID"
+                    )
+                if rows:
+                    row = rows[0]
+                else:
+                    row = None
+            if row is None:
                 elsewhere = conn.execute(
                     "SELECT project_path FROM sessions WHERE session_id = ?",
                     (normalized_reference,),
@@ -1823,12 +2352,6 @@ class SessionStore:
                     f"no session named or identified by {normalized_reference!r} "
                     "exists in this project"
                 )
-            if len(rows) > 1:
-                raise SessionResolutionError(
-                    f"session title {normalized_reference!r} is ambiguous; "
-                    "resume by session ID"
-                )
-            row = rows[0]
         try:
             return SessionSummary(
                 session_id=row["session_id"],
@@ -1850,7 +2373,7 @@ class SessionStore:
     def get_session_usage(self, session_id: str) -> SessionUsage:
         """Return persisted token and explicitly configured cost totals."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT COALESCE(total_tokens, 0) AS total_tokens, "
                 "COALESCE(total_prompt_tokens, 0) AS prompt_tokens, "
@@ -1871,7 +2394,7 @@ class SessionStore:
     def local_metrics_summary(self) -> dict[str, Any]:
         """Return aggregate local-only model usage metrics."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 """
                 SELECT COUNT(*) AS session_count,
@@ -1909,7 +2432,7 @@ class SessionStore:
             if project_path is not None
             else (_serialize_datetime(cutoff),)
         )
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 "DELETE FROM sessions WHERE root_session_id IN ("
                 "SELECT root_session_id FROM sessions"
@@ -1919,13 +2442,13 @@ class SessionStore:
                 params,
             )
             deleted = cursor.rowcount
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             conn.execute("VACUUM")
         return deleted
 
     def start_turn(self, session_id: str, turn_id: str, user_input: str) -> None:
         """Persist intent before provider or tool work starts."""
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO turn_journal "
                 "(turn_id, session_id, status, user_input, started_at) "
@@ -1934,7 +2457,7 @@ class SessionStore:
             )
 
     def complete_turn(self, turn_id: str) -> None:
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "UPDATE turn_journal SET status = 'completed', completed_at = ? "
                 "WHERE turn_id = ?",
@@ -1944,7 +2467,7 @@ class SessionStore:
     def save_turn_usage(self, turn_id: str, usage: dict[str, Any]) -> None:
         """Persist normalized usage so rewinding can adjust session totals."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 "UPDATE turn_journal SET usage_json = ? WHERE turn_id = ?",
                 (json.dumps(usage, sort_keys=True), turn_id),
@@ -1955,7 +2478,7 @@ class SessionStore:
     def interrupt_turn(self, turn_id: str) -> None:
         """Mark one in-flight turn interrupted without affecting other sessions."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "UPDATE turn_journal SET status = 'interrupted', completed_at = ? "
                 "WHERE turn_id = ? AND status = 'started'",
@@ -1963,7 +2486,7 @@ class SessionStore:
             )
 
     def reconcile_interrupted_turns(self, session_id: str) -> int:
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 "UPDATE turn_journal SET status = 'interrupted', completed_at = ? "
                 "WHERE session_id = ? AND status = 'started'",
@@ -1974,7 +2497,7 @@ class SessionStore:
     def started_turns(self, session_id: str) -> list[sqlite3.Row]:
         """Return unfinished turns newest-first without mutating them."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             return conn.execute(
                 "SELECT * FROM turn_journal WHERE session_id = ? "
                 "AND status = 'started' ORDER BY started_at DESC, turn_id DESC",
@@ -1984,7 +2507,7 @@ class SessionStore:
     def recoverable_turns(self, session_id: str) -> list[sqlite3.Row]:
         """Return turns that still require crash-consistency recovery."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT * FROM turn_journal WHERE session_id = ? "
                 "AND (status = 'started' OR (status = 'interrupted' "
@@ -2025,7 +2548,7 @@ class SessionStore:
     ) -> list[dict[str, Any]]:
         """Return assistant tool calls that lack a matching model-visible result."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             return self._assistant_tool_calls_missing_results_in_connection(
                 conn, session_id, turn_id
             )
@@ -2057,7 +2580,7 @@ class SessionStore:
 
         missing: dict[str, dict[str, Any]] = {}
         rows = conn.execute(
-            "SELECT metadata_json FROM messages WHERE session_id = ? "
+            "SELECT message_id, metadata_json FROM messages WHERE session_id = ? "
             "AND turn_id = ? AND role = 'assistant' ORDER BY message_id",
             (session_id, turn_id),
         ).fetchall()
@@ -2081,7 +2604,7 @@ class SessionStore:
                     or call_id in missing
                 ):
                     continue
-                arguments = raw_call.get("arguments")
+                arguments = _bounded_recovery_arguments(raw_call.get("arguments"))
                 durable = durable_by_id.get(call_id)
                 durable_payload: dict[str, Any] | None = None
                 if durable is not None:
@@ -2105,7 +2628,8 @@ class SessionStore:
                 missing[call_id] = {
                     "call_id": call_id,
                     "tool_name": tool_name,
-                    "arguments": dict(arguments) if isinstance(arguments, dict) else {},
+                    "arguments": arguments,
+                    "assistant_message_id": int(row["message_id"]),
                     "durable": durable_payload,
                 }
         return list(missing.values())
@@ -2113,7 +2637,7 @@ class SessionStore:
     def pending_tool_calls(self, session_id: str, turn_id: str) -> list[sqlite3.Row]:
         """Return approved calls that never persisted an execution outcome."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             return conn.execute(
                 "SELECT * FROM tool_calls WHERE session_id = ? AND turn_id = ? "
                 "AND approved = 1 AND executed = 0 "
@@ -2122,13 +2646,22 @@ class SessionStore:
                 (session_id, turn_id),
             ).fetchall()
 
-    def tool_call_ids(self, session_id: str) -> set[str]:
-        """Return durable provider/tool call IDs already used by one session."""
+    def existing_tool_call_ids(
+        self,
+        session_id: str,
+        call_ids: Sequence[str],
+    ) -> set[str]:
+        """Return only candidate tool-call IDs already used by one session."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        candidates = tuple(dict.fromkeys(str(call_id) for call_id in call_ids))
+        if not candidates:
+            return set()
+        placeholders = ",".join("?" for _ in candidates)
+        with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT call_id FROM tool_calls WHERE session_id = ?",
-                (session_id,),
+                "SELECT call_id FROM tool_calls WHERE session_id = ? "
+                f"AND call_id IN ({placeholders})",
+                (session_id, *candidates),
             ).fetchall()
         return {str(row["call_id"]) for row in rows}
 
@@ -2137,7 +2670,7 @@ class SessionStore:
     ) -> list[sqlite3.Row]:
         """Return unrestored checkpoints belonging to one tool call."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             return conn.execute(
                 "SELECT * FROM file_checkpoints WHERE session_id = ? "
                 "AND turn_id = ? AND call_id = ? AND restored = 0 "
@@ -2156,7 +2689,7 @@ class SessionStore:
             placeholders = ",".join("?" for _ in pending_call_ids)
             exclusion = f" AND call_id NOT IN ({placeholders})"
             parameters.extend(pending_call_ids)
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             return conn.execute(
                 "SELECT * FROM file_checkpoints WHERE session_id = ? "
                 "AND turn_id = ? AND restored = 0 AND after_sha256 IS NULL"
@@ -2177,10 +2710,58 @@ class SessionStore:
     ) -> None:
         """Atomically persist one startup recovery decision."""
 
-        from ash.core.redaction import redact_text
-
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             recovered_by_id = {str(call.call_id): call for call in recovered_calls}
+            for call in recovered_calls:
+                assistant_message_id = getattr(call, "assistant_message_id", None)
+                assistant_arguments = getattr(call, "assistant_arguments", None)
+                if (
+                    assistant_message_id is None
+                    or not isinstance(assistant_arguments, dict)
+                    or not any(
+                        key.startswith("_ash_recovery_arguments_")
+                        for key in assistant_arguments
+                    )
+                ):
+                    continue
+                row = conn.execute(
+                    "SELECT metadata_json FROM messages "
+                    "WHERE message_id = ? AND session_id = ? AND turn_id = ? "
+                    "AND role = 'assistant'",
+                    (assistant_message_id, session_id, turn_id),
+                ).fetchone()
+                if row is None:
+                    continue
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                raw_calls = metadata.get("tool_calls") if isinstance(metadata, dict) else None
+                if not isinstance(raw_calls, list):
+                    continue
+                changed = False
+                for raw_call in raw_calls:
+                    if not isinstance(raw_call, dict):
+                        continue
+                    if str(raw_call.get("call_id", "")) != str(call.call_id):
+                        continue
+                    raw_call["arguments"] = assistant_arguments
+                    changed = True
+                    break
+                if changed:
+                    conn.execute(
+                        "UPDATE messages SET metadata_json = ? WHERE message_id = ?",
+                        (
+                            json.dumps(
+                                metadata,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            ),
+                            assistant_message_id,
+                        ),
+                    )
             for call_id, error in call_errors.items():
                 call = recovered_by_id[call_id]
                 cursor = conn.execute(
@@ -2195,7 +2776,14 @@ class SessionStore:
                     ),
                 )
                 if cursor.rowcount == 0:
-                    arguments = getattr(call, "arguments", None)
+                    assistant_arguments = getattr(call, "assistant_arguments", None)
+                    arguments = (
+                        dict(assistant_arguments)
+                        if isinstance(assistant_arguments, dict)
+                        else _bounded_recovery_arguments(
+                            getattr(call, "arguments", None)
+                        )
+                    )
                     conn.execute(
                         """
                         INSERT INTO tool_calls (
@@ -2209,7 +2797,11 @@ class SessionStore:
                             session_id,
                             str(call.tool_name),
                             json.dumps(
-                                dict(arguments) if isinstance(arguments, dict) else {}
+                                arguments,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                allow_nan=False,
                             ),
                             int(bool(call.dispatched)),
                             int(bool(call.dispatched)),
@@ -2250,7 +2842,7 @@ class SessionStore:
                         "recovered": True,
                         "replay_policy": "never",
                         "success": recovered_success,
-                        "output": redact_text(recovered_output),
+                        **_recovery_audit_output_fields(recovered_output),
                     },
                     result=(
                         "SUCCESS"
@@ -2274,22 +2866,12 @@ class SessionStore:
                 recovery_error: str | None = (
                     str(call.error) if str(call.error) else None
                 )
-                content = json.dumps(
-                    {
-                        "success": success,
-                        "output": output,
-                        "error": recovery_error,
-                        "provenance": "ash_startup_recovery",
-                        "dispatched": bool(call.dispatched),
-                        "ambiguous": bool(call.ambiguous),
-                        "replayed": False,
-                        "policy_note": (
-                            "Ash reconstructed this model-visible result during "
-                            "startup recovery and did not replay the tool call."
-                        ),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
+                content = _render_recovered_tool_message(
+                    success=success,
+                    output=output,
+                    error=recovery_error,
+                    dispatched=bool(call.dispatched),
+                    ambiguous=bool(call.ambiguous),
                 )
                 conn.execute(
                     """
@@ -2335,7 +2917,7 @@ class SessionStore:
     def interrupted_recovery_reports(self, session_id: str) -> list[dict[str, Any]]:
         """Return persisted non-empty startup recovery reports newest-first."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT recovery_json FROM turn_journal WHERE session_id = ? "
                 "AND status = 'interrupted' AND recovery_json != '{}' "
@@ -2361,32 +2943,42 @@ class SessionStore:
     ) -> list[str]:
         """Return complete turns removed at a transcript message boundary."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
+            total, retained, removed = _message_boundary_rows(
+                conn,
+                session_id,
+                message_count,
+            )
+            if retained is not None and removed is not None:
+                retained_turn = retained["turn_id"]
+                removed_turn = removed["turn_id"]
+                if retained_turn is not None and retained_turn == removed_turn:
+                    raise ValueError(
+                        "message_count splits an Ash turn; choose a user-turn boundary"
+                    )
+            if message_count == total:
+                return []
+            assert removed is not None
+            first_removed_id = int(removed["message_id"])
+            if require_complete_mapping:
+                unmapped = conn.execute(
+                    "SELECT 1 FROM messages WHERE session_id = ? "
+                    "AND message_id >= ? AND turn_id IS NULL LIMIT 1",
+                    (session_id, first_removed_id),
+                ).fetchone()
+                if unmapped is not None:
+                    raise ValueError(
+                        "combined rewind is unavailable for legacy messages without "
+                        "turn IDs; use transcript-only /rewind or start a newer boundary"
+                    )
             rows = conn.execute(
-                "SELECT message_id, turn_id FROM messages WHERE session_id = ? "
-                "ORDER BY message_id",
-                (session_id,),
+                "SELECT turn_id, MIN(message_id) AS first_message_id "
+                "FROM messages WHERE session_id = ? AND message_id >= ? "
+                "AND turn_id IS NOT NULL GROUP BY turn_id "
+                "ORDER BY first_message_id",
+                (session_id, first_removed_id),
             ).fetchall()
-        if message_count < 0 or message_count > len(rows):
-            raise ValueError(f"message_count must be between 0 and {len(rows)}")
-        if 0 < message_count < len(rows):
-            retained_turn = rows[message_count - 1]["turn_id"]
-            removed_turn = rows[message_count]["turn_id"]
-            if retained_turn is not None and retained_turn == removed_turn:
-                raise ValueError(
-                    "message_count splits an Ash turn; choose a user-turn boundary"
-                )
-        removed = rows[message_count:]
-        if require_complete_mapping and any(row["turn_id"] is None for row in removed):
-            raise ValueError(
-                "combined rewind is unavailable for legacy messages without turn IDs; "
-                "use transcript-only /rewind or start a newer boundary"
-            )
-        return list(
-            dict.fromkeys(
-                str(row["turn_id"]) for row in removed if row["turn_id"] is not None
-            )
-        )
+        return [str(row["turn_id"]) for row in rows]
 
     def rewind_session(
         self,
@@ -2396,112 +2988,152 @@ class SessionStore:
         restored_checkpoint_turn_ids: list[str] | None = None,
     ) -> Session:
         """Delete transcript records after a confirmed message boundary."""
-        session = self.load_session(session_id)
-        turn_ids = self.rewind_turn_ids(session_id, message_count)
-        if restored_checkpoint_turn_ids and not set(
-            restored_checkpoint_turn_ids
-        ).issubset(turn_ids):
-            raise ValueError("restored checkpoint turns must be part of the rewind")
-        retained = session.messages[:message_count]
-        cutoff = retained[-1].timestamp if retained else None
-        with closing(get_db_connection(self.db_path)) as conn, conn:
-            usage_totals = {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "cache_read_tokens": 0,
-                "cache_write_tokens": 0,
-                "cost_usd": 0.0,
-                "estimated_prompt_tokens": 0,
-                "estimated_completion_tokens": 0,
-                "estimated_cost_usd": 0.0,
-            }
-            if turn_ids:
-                placeholders = ",".join("?" for _ in turn_ids)
-                usage_rows = conn.execute(
-                    f"SELECT usage_json FROM turn_journal WHERE session_id = ? "
-                    f"AND turn_id IN ({placeholders})",
-                    (session_id, *turn_ids),
-                ).fetchall()
-                for row in usage_rows:
-                    try:
-                        usage = json.loads(row["usage_json"] or "{}")
-                    except (TypeError, json.JSONDecodeError):
-                        usage = {}
-                    for key in usage_totals:
-                        value = usage.get(key, 0)
-                        if isinstance(value, (int, float)) and not isinstance(
-                            value, bool
-                        ):
-                            usage_totals[key] += value
-            ids = conn.execute(
-                "SELECT message_id FROM messages WHERE session_id = ? "
-                "ORDER BY message_id LIMIT -1 OFFSET ?",
-                (session_id, message_count),
-            ).fetchall()
-            conn.executemany(
-                "DELETE FROM messages WHERE message_id = ?",
-                [(row["message_id"],) for row in ids],
-            )
-            if turn_ids:
-                placeholders = ",".join("?" for _ in turn_ids)
-                conn.execute(
-                    f"DELETE FROM tool_calls WHERE session_id = ? "
-                    f"AND turn_id IN ({placeholders})",
-                    (session_id, *turn_ids),
-                )
-            if cutoff is None:
-                conn.execute(
-                    "DELETE FROM tool_calls WHERE session_id = ?", (session_id,)
-                )
-            else:
-                conn.execute(
-                    "DELETE FROM tool_calls WHERE session_id = ? AND timestamp > ?",
-                    (session_id, _serialize_datetime(cutoff)),
-                )
-            conn.execute(
-                "UPDATE sessions SET "
-                "total_tokens = MAX(0, COALESCE(total_tokens, 0) - ?), "
-                "total_prompt_tokens = MAX(0, COALESCE(total_prompt_tokens, 0) - ?), "
-                "total_completion_tokens = MAX(0, COALESCE(total_completion_tokens, 0) - ?), "
-                "total_cache_read_tokens = MAX(0, COALESCE(total_cache_read_tokens, 0) - ?), "
-                "total_cache_write_tokens = MAX(0, COALESCE(total_cache_write_tokens, 0) - ?), "
-                "total_cost_usd = MAX(0, COALESCE(total_cost_usd, 0) - ?), "
-                "estimated_prompt_tokens = MAX(0, COALESCE(estimated_prompt_tokens, 0) - ?), "
-                "estimated_completion_tokens = MAX(0, COALESCE(estimated_completion_tokens, 0) - ?), "
-                "estimated_cost_usd = MAX(0, COALESCE(estimated_cost_usd, 0) - ?) "
-                "WHERE session_id = ?",
-                (
-                    usage_totals["prompt_tokens"] + usage_totals["completion_tokens"],
-                    usage_totals["prompt_tokens"],
-                    usage_totals["completion_tokens"],
-                    usage_totals["cache_read_tokens"],
-                    usage_totals["cache_write_tokens"],
-                    usage_totals["cost_usd"],
-                    usage_totals["estimated_prompt_tokens"],
-                    usage_totals["estimated_completion_tokens"],
-                    usage_totals["estimated_cost_usd"],
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                exists = conn.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if exists is None:
+                    raise KeyError(f"Session not found: {session_id}")
+
+                _, retained, removed = _message_boundary_rows(
+                    conn,
                     session_id,
-                ),
-            )
-            if restored_checkpoint_turn_ids:
-                placeholders = ",".join("?" for _ in restored_checkpoint_turn_ids)
-                conn.execute(
-                    "UPDATE file_checkpoints SET restored = 1 "
-                    f"WHERE session_id = ? AND turn_id IN ({placeholders})",
-                    (session_id, *restored_checkpoint_turn_ids),
+                    message_count,
                 )
-            if turn_ids:
-                placeholders = ",".join("?" for _ in turn_ids)
-                conn.execute(
-                    f"DELETE FROM turn_journal WHERE session_id = ? "
-                    f"AND turn_id IN ({placeholders})",
-                    (session_id, *turn_ids),
+                if retained is not None and removed is not None:
+                    retained_turn = retained["turn_id"]
+                    removed_turn = removed["turn_id"]
+                    if retained_turn is not None and retained_turn == removed_turn:
+                        raise ValueError(
+                            "message_count splits an Ash turn; choose a user-turn boundary"
+                        )
+                first_removed_id = (
+                    int(removed["message_id"]) if removed is not None else None
                 )
-            conn.execute(
-                "UPDATE sessions SET context_summary = '', updated_at = ? "
-                "WHERE session_id = ?",
-                (_serialize_datetime(_utc_now()), session_id),
-            )
+                turn_ids: list[str] = []
+                if first_removed_id is not None:
+                    rows = conn.execute(
+                        "SELECT turn_id, MIN(message_id) AS first_message_id "
+                        "FROM messages WHERE session_id = ? AND message_id >= ? "
+                        "AND turn_id IS NOT NULL GROUP BY turn_id "
+                        "ORDER BY first_message_id",
+                        (session_id, first_removed_id),
+                    ).fetchall()
+                    turn_ids = [str(row["turn_id"]) for row in rows]
+                if restored_checkpoint_turn_ids and not set(
+                    restored_checkpoint_turn_ids
+                ).issubset(turn_ids):
+                    raise ValueError("restored checkpoint turns must be part of the rewind")
+                cutoff = (
+                    _deserialize_datetime(retained["timestamp"])
+                    if retained is not None
+                    else None
+                )
+                usage_totals = {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "cost_usd": 0.0,
+                    "estimated_prompt_tokens": 0,
+                    "estimated_completion_tokens": 0,
+                    "estimated_cost_usd": 0.0,
+                }
+                if turn_ids:
+                    placeholders = ",".join("?" for _ in turn_ids)
+                    usage_rows = conn.execute(
+                        f"SELECT usage_json FROM turn_journal WHERE session_id = ? "
+                        f"AND turn_id IN ({placeholders})",
+                        (session_id, *turn_ids),
+                    ).fetchall()
+                    for row in usage_rows:
+                        try:
+                            usage = json.loads(row["usage_json"] or "{}")
+                        except (TypeError, json.JSONDecodeError):
+                            usage = {}
+                        for key in usage_totals:
+                            value = usage.get(key, 0)
+                            if isinstance(value, (int, float)) and not isinstance(
+                                value, bool
+                            ):
+                                usage_totals[key] += value
+
+                if first_removed_id is not None:
+                    conn.execute(
+                        "DELETE FROM messages WHERE session_id = ? AND message_id >= ?",
+                        (session_id, first_removed_id),
+                    )
+
+                if turn_ids:
+                    placeholders = ",".join("?" for _ in turn_ids)
+                    conn.execute(
+                        f"DELETE FROM tool_calls WHERE session_id = ? "
+                        f"AND turn_id IN ({placeholders})",
+                        (session_id, *turn_ids),
+                    )
+                if cutoff is None:
+                    conn.execute(
+                        "DELETE FROM tool_calls WHERE session_id = ?", (session_id,)
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM tool_calls WHERE session_id = ? AND timestamp > ?",
+                        (session_id, _serialize_datetime(cutoff)),
+                    )
+
+                conn.execute(
+                    "UPDATE sessions SET "
+                    "total_tokens = MAX(0, COALESCE(total_tokens, 0) - ?), "
+                    "total_prompt_tokens = MAX(0, COALESCE(total_prompt_tokens, 0) - ?), "
+                    "total_completion_tokens = MAX(0, COALESCE(total_completion_tokens, 0) - ?), "
+                    "total_cache_read_tokens = MAX(0, COALESCE(total_cache_read_tokens, 0) - ?), "
+                    "total_cache_write_tokens = MAX(0, COALESCE(total_cache_write_tokens, 0) - ?), "
+                    "total_cost_usd = MAX(0, COALESCE(total_cost_usd, 0) - ?), "
+                    "estimated_prompt_tokens = MAX(0, COALESCE(estimated_prompt_tokens, 0) - ?), "
+                    "estimated_completion_tokens = MAX(0, COALESCE(estimated_completion_tokens, 0) - ?), "
+                    "estimated_cost_usd = MAX(0, COALESCE(estimated_cost_usd, 0) - ?) "
+                    "WHERE session_id = ?",
+                    (
+                        usage_totals["prompt_tokens"]
+                        + usage_totals["completion_tokens"],
+                        usage_totals["prompt_tokens"],
+                        usage_totals["completion_tokens"],
+                        usage_totals["cache_read_tokens"],
+                        usage_totals["cache_write_tokens"],
+                        usage_totals["cost_usd"],
+                        usage_totals["estimated_prompt_tokens"],
+                        usage_totals["estimated_completion_tokens"],
+                        usage_totals["estimated_cost_usd"],
+                        session_id,
+                    ),
+                )
+                if restored_checkpoint_turn_ids:
+                    placeholders = ",".join("?" for _ in restored_checkpoint_turn_ids)
+                    conn.execute(
+                        "UPDATE file_checkpoints SET restored = 1 "
+                        f"WHERE session_id = ? AND turn_id IN ({placeholders})",
+                        (session_id, *restored_checkpoint_turn_ids),
+                    )
+                if turn_ids:
+                    placeholders = ",".join("?" for _ in turn_ids)
+                    conn.execute(
+                        f"DELETE FROM turn_journal WHERE session_id = ? "
+                        f"AND turn_id IN ({placeholders})",
+                        (session_id, *turn_ids),
+                    )
+                conn.execute(
+                    "UPDATE sessions SET context_summary = '', "
+                    "context_summary_message_count = 0, updated_at = ? "
+                    "WHERE session_id = ?",
+                    (_serialize_datetime(_utc_now()), session_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         return self.load_session(session_id)
 
     def file_checkpoints_for_turns(
@@ -2512,7 +3144,7 @@ class SessionStore:
         if not turn_ids:
             return []
         placeholders = ",".join("?" for _ in turn_ids)
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             return conn.execute(
                 "SELECT * FROM file_checkpoints WHERE session_id = ? "
                 f"AND turn_id IN ({placeholders}) AND restored = 0 "
@@ -2533,7 +3165,7 @@ class SessionStore:
         call_id: str = "",
     ) -> None:
         """Save the first pre-edit state for one path in a turn."""
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO file_checkpoints
@@ -2563,7 +3195,7 @@ class SessionStore:
         *,
         call_id: str = "",
     ) -> None:
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "UPDATE file_checkpoints SET after_sha256 = ? "
                 "WHERE session_id = ? AND turn_id = ? AND call_id = ? AND path = ?",
@@ -2572,7 +3204,7 @@ class SessionStore:
 
     def latest_file_checkpoints(self, session_id: str) -> list[sqlite3.Row]:
         """Return the latest unrestored completed checkpoint group."""
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             turn = conn.execute(
                 "SELECT turn_id FROM file_checkpoints "
                 "WHERE session_id = ? AND restored = 0 AND after_sha256 IS NOT NULL "
@@ -2589,7 +3221,7 @@ class SessionStore:
             ).fetchall()
 
     def mark_file_checkpoints_restored(self, session_id: str, turn_id: str) -> None:
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "UPDATE file_checkpoints SET restored = 1 "
                 "WHERE session_id = ? AND turn_id = ?",
@@ -2599,10 +3231,8 @@ class SessionStore:
     def rename_session(self, session_id: str, title: str) -> None:
         """Set a human-readable session title."""
 
-        normalized = " ".join(title.split())
-        if not normalized:
-            raise ValueError("session title cannot be empty")
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        normalized = _normalize_session_title(title)
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 "UPDATE sessions SET title = ?, updated_at = ? WHERE session_id = ?",
                 (normalized, _serialize_datetime(_utc_now()), session_id),
@@ -2610,17 +3240,54 @@ class SessionStore:
             if cursor.rowcount == 0:
                 raise KeyError(f"Session not found: {session_id}")
 
-    def save_context_summary(self, session_id: str, summary: str) -> None:
+    def save_context_summary(
+        self,
+        session_id: str,
+        summary: str,
+        *,
+        summarized_message_count: int = 0,
+    ) -> None:
         """Persist the working compaction summary without deleting history."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        if summarized_message_count < 0:
+            raise ValueError("summarized_message_count cannot be negative")
+        if summarized_message_count and not summary:
+            raise ValueError("a non-empty summary is required for summarized history")
+
+        with closing(self._connect()) as conn, conn:
+            total_messages = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()[0]
+            )
+            if summarized_message_count > total_messages:
+                raise ValueError(
+                    "summarized_message_count cannot exceed durable message count"
+                )
             cursor = conn.execute(
-                "UPDATE sessions SET context_summary = ?, updated_at = ? "
+                "UPDATE sessions SET context_summary = ?, "
+                "context_summary_message_count = ?, updated_at = ? "
                 "WHERE session_id = ?",
-                (summary, _serialize_datetime(_utc_now()), session_id),
+                (
+                    summary,
+                    summarized_message_count,
+                    _serialize_datetime(_utc_now()),
+                    session_id,
+                ),
             )
             if cursor.rowcount == 0:
                 raise KeyError(f"Session not found: {session_id}")
+
+    def durable_message_count(self, session_id: str) -> int:
+        """Return the number of durable transcript messages for one session."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row["count"])
 
     def save_runtime_events(self, events: list[dict[str, Any]]) -> int:
         """Append a batch of canonical events, ignoring replayed event IDs."""
@@ -2651,7 +3318,7 @@ class SessionStore:
                     _canonical_json(redacted),
                 )
             )
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             before = conn.total_changes
             conn.executemany(
                 """
@@ -2688,7 +3355,7 @@ class SessionStore:
             parameters.append(turn_id)
         query += " ORDER BY sequence ASC LIMIT ?"
         parameters.append(limit)
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(query, parameters).fetchall()
         return [
             StoredRuntimeEvent(
@@ -2709,58 +3376,61 @@ class SessionStore:
     ) -> Session:
         """Create a durable child branch at a complete message boundary."""
 
-        source = self.load_session(session_id)
-        count = len(source.messages) if message_count is None else message_count
-        if count < 0 or count > len(source.messages):
-            raise ValueError(
-                f"message_count must be between 0 and {len(source.messages)}"
-            )
-        _validate_fork_boundary(source.messages, count)
-        if 0 < count < len(source.messages):
-            with closing(get_db_connection(self.db_path)) as conn:
-                rows = conn.execute(
-                    "SELECT turn_id FROM messages WHERE session_id = ? "
-                    "ORDER BY message_id",
-                    (source.session_id,),
-                ).fetchall()
-            retained_turn = rows[count - 1]["turn_id"]
-            removed_turn = rows[count]["turn_id"]
-            if retained_turn and retained_turn == removed_turn:
-                raise ValueError(
-                    "message_count splits an Ash turn; choose a turn boundary"
-                )
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                current_count = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-                        (source.session_id,),
-                    ).fetchone()[0]
+                source = conn.execute(
+                    "SELECT session_id, project_path, title, context_summary, "
+                    "context_summary_message_count, model FROM sessions "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if source is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                total_count, retained, removed = _message_boundary_rows(
+                    conn,
+                    session_id,
+                    (
+                        int(
+                            conn.execute(
+                                "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                                (session_id,),
+                            ).fetchone()[0]
+                        )
+                        if message_count is None
+                        else message_count
+                    ),
                 )
-                if current_count != len(source.messages):
-                    raise RuntimeError(
-                        "session changed during fork; retry the operation"
-                    )
+                count = total_count if message_count is None else message_count
+                _validate_sql_fork_boundary(retained, removed)
                 fork = self._create_session_record(
                     conn,
-                    source.project_path,
+                    str(source["project_path"]),
                     session_id=_child_session_id,
-                    model=source.model,
-                    parent_session_id=source.session_id,
+                    model=str(source["model"] or ""),
+                    parent_session_id=str(source["session_id"]),
                     fork_message_count=count,
                     branch_name=branch_name,
                     branch_summary=branch_summary,
                 )
                 title = fork.branch_name or (
-                    f"{source.title or source.session_id[:8]} (fork)"
+                    _derived_session_title(
+                        str(source["title"] or "") or str(source["session_id"])[:8],
+                        " (fork)",
+                    )
                 )
                 conn.execute(
-                    "UPDATE sessions SET title = ?, context_summary = ? "
+                    "UPDATE sessions SET title = ?, context_summary = ?, "
+                    "context_summary_message_count = ? "
                     "WHERE session_id = ?",
                     (
                         title,
-                        source.context_summary if count == len(source.messages) else "",
+                        str(source["context_summary"] or "") if count == total_count else "",
+                        (
+                            int(source["context_summary_message_count"] or 0)
+                            if count == total_count
+                            else 0
+                        ),
                         fork.session_id,
                     ),
                 )
@@ -2772,7 +3442,7 @@ class SessionStore:
                     "token_count, prompt_tokens, completion_tokens, NULL "
                     "FROM messages WHERE session_id = ? "
                     "ORDER BY message_id LIMIT ?",
-                    (fork.session_id, source.session_id, count),
+                    (fork.session_id, session_id, count),
                 )
                 conn.commit()
             except Exception:
@@ -2791,7 +3461,7 @@ class SessionStore:
         """Discard one unpublished fork only while its exact creation state is intact."""
 
         expected_updated_at = updated_at or created_at
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 "DELETE FROM sessions "
                 "WHERE session_id = ? AND parent_session_id = ? "
@@ -2828,7 +3498,7 @@ class SessionStore:
     def get_session_lineage(self, session_id: str) -> SessionLineage:
         """Return one session node and its direct child identifiers."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT session_id, root_session_id, parent_session_id, "
                 "fork_message_count, branch_name, branch_summary, depth, created_at "
@@ -2839,9 +3509,13 @@ class SessionStore:
                 raise KeyError(f"Session not found: {session_id}")
             children = conn.execute(
                 "SELECT session_id FROM sessions WHERE parent_session_id = ? "
-                "ORDER BY created_at, session_id",
-                (session_id,),
+                "ORDER BY created_at, session_id LIMIT ?",
+                (session_id, MAX_SESSION_TREE_NODES + 1),
             ).fetchall()
+            if len(children) > MAX_SESSION_TREE_NODES:
+                raise SessionStorageError(
+                    "session lineage exceeds the supported child-node limit"
+                )
         try:
             return _lineage_from_row(
                 row,
@@ -2854,25 +3528,25 @@ class SessionStore:
         """Return the complete conversation tree in stable parent-first order."""
 
         node = self.get_session_lineage(session_id)
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT session_id, root_session_id, parent_session_id, "
                 "fork_message_count, branch_name, branch_summary, depth, created_at "
                 "FROM sessions WHERE root_session_id = ? "
-                "ORDER BY depth, created_at, session_id",
-                (node.root_session_id,),
+                "ORDER BY depth, created_at, session_id LIMIT ?",
+                (node.root_session_id, MAX_SESSION_TREE_NODES + 1),
             ).fetchall()
-            child_rows = conn.execute(
-                "SELECT parent_session_id, session_id FROM sessions "
-                "WHERE root_session_id = ? AND parent_session_id IS NOT NULL "
-                "ORDER BY created_at, session_id",
-                (node.root_session_id,),
-            ).fetchall()
-        children_by_parent: dict[str, list[str]] = {}
-        for child in child_rows:
-            children_by_parent.setdefault(str(child["parent_session_id"]), []).append(
-                str(child["session_id"])
+        if len(rows) > MAX_SESSION_TREE_NODES:
+            raise SessionStorageError(
+                "session tree exceeds the supported node limit"
             )
+        children_by_parent: dict[str, list[str]] = {}
+        for child in rows:
+            parent = child["parent_session_id"]
+            if parent is not None:
+                children_by_parent.setdefault(str(parent), []).append(
+                    str(child["session_id"])
+                )
         rows_by_id = {str(row["session_id"]): row for row in rows}
         ordered_ids: list[str] = []
         pending = [node.root_session_id]
@@ -2900,65 +3574,129 @@ class SessionStore:
     def export_session(self, session_id: str, *, format: str = "jsonl") -> str:
         """Serialize a redacted session transcript for local export."""
 
+        return "".join(self.iter_session_export(session_id, format=format))
+
+    def iter_session_export(
+        self,
+        session_id: str,
+        *,
+        format: str = "jsonl",
+    ) -> Iterator[str]:
+        """Stream a redacted session transcript without materializing its history."""
+
         from ash.core.redaction import redact_text, redact_value
 
-        session = self.load_session(session_id)
-        if format == "jsonl":
-            records = [
-                {
+        if format not in {"jsonl", "markdown"}:
+            raise ValueError("format must be 'jsonl' or 'markdown'")
+
+        with closing(self._connect()) as conn:
+            session = conn.execute(
+                """
+                SELECT session_id, created_at, model, title, parent_session_id,
+                       root_session_id, fork_message_count, branch_name,
+                       branch_summary, depth
+                FROM sessions
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+
+            if format == "jsonl":
+                header = {
                     "schema_version": 1,
                     "type": "session",
-                    "session_id": session.session_id,
-                    "project_path": session.project_path,
-                    "model": session.model,
-                    "title": session.title,
-                    "created_at": session.created_at.isoformat(),
-                    "parent_session_id": session.parent_session_id,
-                    "root_session_id": session.root_session_id,
-                    "fork_message_count": session.fork_message_count,
-                    "branch_name": session.branch_name,
-                    "branch_summary": redact_text(session.branch_summary),
-                    "depth": session.depth,
+                    "session_id": str(session["session_id"]),
+                    "project_path": "<project>",
+                    "model": redact_text(str(session["model"] or "")),
+                    "title": redact_text(str(session["title"] or "")),
+                    "created_at": _deserialize_datetime(
+                        str(session["created_at"])
+                    ).isoformat(),
+                    "parent_session_id": session["parent_session_id"],
+                    "root_session_id": session["root_session_id"],
+                    "fork_message_count": session["fork_message_count"],
+                    "branch_name": redact_text(str(session["branch_name"] or "")),
+                    "branch_summary": redact_text(
+                        str(session["branch_summary"] or "")
+                    ),
+                    "depth": int(session["depth"] or 0),
                 }
-            ]
-            records.extend(
-                {
+                yield json.dumps(header, ensure_ascii=False) + "\n"
+            else:
+                heading = redact_text(
+                    str(session["title"] or "")
+                    or f'Ash session {session["session_id"]}'
+                )
+                model = redact_text(str(session["model"] or "") or "unknown")
+                yield f"# {heading}\n\nModel: `{model}`"
+
+            rows = conn.execute(
+                """
+                SELECT role, content, timestamp, metadata_json
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY message_id ASC
+                """,
+                (session_id,),
+            )
+            for row in rows:
+                if format == "jsonl":
+                    try:
+                        metadata = json.loads(row["metadata_json"] or "{}")
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise _invalid_stored_data_error(self.db_path) from exc
+                    if not isinstance(metadata, dict):
+                        raise _invalid_stored_data_error(self.db_path)
+                    record = {
                     "schema_version": 1,
                     "type": "message",
-                    "role": message.role,
-                    "content": redact_text(message.content),
-                    "timestamp": message.timestamp.isoformat(),
-                    "metadata": redact_value(message.metadata),
-                }
-                for message in session.messages
-            )
-            return (
-                "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
-                + "\n"
-            )
-        if format == "markdown":
-            heading = redact_text(session.title or f"Ash session {session.session_id}")
-            sections = [f"# {heading}", f"Model: `{session.model or 'unknown'}`"]
-            sections.extend(
-                f"## {message.role.title()}\n\n{redact_text(message.content)}"
-                for message in session.messages
-            )
-            return "\n\n".join(sections) + "\n"
-        raise ValueError("format must be 'jsonl' or 'markdown'")
+                        "role": str(row["role"]),
+                        "content": redact_text(str(row["content"])),
+                        "timestamp": _deserialize_datetime(
+                            str(row["timestamp"])
+                        ).isoformat(),
+                        "metadata": redact_value(metadata),
+                    }
+                    yield json.dumps(record, ensure_ascii=False) + "\n"
+                else:
+                    yield (
+                        f"\n\n## {str(row['role']).title()}\n\n"
+                        f"{redact_text(str(row['content']))}"
+                    )
+
+            if format == "markdown":
+                yield "\n"
 
     def import_session_jsonl(self, content: str, *, project_path: str) -> Session:
         """Import Ash's versioned JSONL format into the current project."""
+        from ash.providers.messages import MAX_CANONICAL_MESSAGES
+
+        total_bytes = 0
         try:
-            records = [
-                strict_json_loads(line)
-                for line in content.splitlines()
-                if line.strip()
-            ]
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise ValueError(f"invalid session JSONL: {exc}") from exc
-        if not records or not isinstance(records[0], dict):
+            for offset in range(0, len(content), 64 * 1024):
+                total_bytes += len(content[offset : offset + 64 * 1024].encode("utf-8"))
+                if total_bytes > MAX_SESSION_IMPORT_BYTES:
+                    raise ValueError(
+                        f"session import exceeds {MAX_SESSION_IMPORT_BYTES} UTF-8 bytes"
+                    )
+        except UnicodeEncodeError as exc:
+            raise ValueError("session import must be valid UTF-8 text") from exc
+
+        def records() -> Any:
+            for line in io.StringIO(content):
+                if not line.strip():
+                    continue
+                try:
+                    yield strict_json_loads(line)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    raise ValueError(f"invalid session JSONL: {exc}") from exc
+
+        record_iter = records()
+        header = next(record_iter, None)
+        if not isinstance(header, dict):
             raise ValueError("session JSONL is empty")
-        header = records[0]
         if (
             type(header.get("schema_version")) is not int
             or header.get("schema_version") != 1
@@ -2971,9 +3709,14 @@ class SessionStore:
             raise ValueError("imported session title must be a string")
         if not isinstance(raw_model, str):
             raise ValueError("imported session model must be a string")
-        title = raw_title.strip()
+        title = _normalize_session_title(raw_title, allow_empty=True)
         imported_messages: list[Message] = []
-        for record in records[1:]:
+        for record in record_iter:
+            if len(imported_messages) >= MAX_CANONICAL_MESSAGES:
+                raise ValueError(
+                    "imported message count exceeds the limit of "
+                    f"{MAX_CANONICAL_MESSAGES}"
+                )
             if not isinstance(record, dict) or record.get("type") != "message":
                 raise ValueError("session export contains an invalid record")
             if (
@@ -3006,7 +3749,7 @@ class SessionStore:
             _validate_imported_provider_message(message)
             imported_messages.append(message)
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             session = self._create_session_record(
                 conn,
                 project_path,
@@ -3015,7 +3758,7 @@ class SessionStore:
             if title:
                 conn.execute(
                     "UPDATE sessions SET title = ? WHERE session_id = ?",
-                    (f"{title} (imported)", session.session_id),
+                    (_derived_session_title(title, " (imported)"), session.session_id),
                 )
             for message in imported_messages:
                 conn.execute(
@@ -3055,7 +3798,7 @@ class SessionStore:
     ) -> None:
         """Accumulate one turn's token and explicitly configured cost totals."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 UPDATE sessions
@@ -3093,7 +3836,7 @@ class SessionStore:
     ) -> None:
         """Save or update a tool execution record."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO tool_calls (
@@ -3146,7 +3889,7 @@ class SessionStore:
     ) -> None:
         """Atomically persist a terminal tool outcome and model-visible result."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO tool_calls (
@@ -3240,8 +3983,40 @@ class SessionStore:
             "failed",
         }:
             raise ValueError("invalid MCP task status")
+        if len(answered_inputs) > MAX_DURABLE_MCP_ANSWERED_INPUTS:
+            raise ValueError(
+                "MCP answered-input history exceeds "
+                f"{MAX_DURABLE_MCP_ANSWERED_INPUTS} entries"
+            )
+        try:
+            task_json = json.dumps(
+                task,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            answered_inputs_json = json.dumps(
+                answered_inputs,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            task_bytes = len(task_json.encode("utf-8"))
+            answered_input_bytes = len(answered_inputs_json.encode("utf-8"))
+        except (TypeError, ValueError, OverflowError, UnicodeEncodeError) as exc:
+            raise ValueError("MCP durable task state must be strict JSON") from exc
+        if task_bytes > MAX_DURABLE_MCP_TASK_STATE_BYTES:
+            raise ValueError(
+                "MCP durable task state exceeds "
+                f"{MAX_DURABLE_MCP_TASK_STATE_BYTES} UTF-8 bytes"
+            )
+        if answered_input_bytes > MAX_DURABLE_MCP_ANSWERED_INPUTS_BYTES:
+            raise ValueError(
+                "MCP answered-input history exceeds "
+                f"{MAX_DURABLE_MCP_ANSWERED_INPUTS_BYTES} UTF-8 bytes"
+            )
         now = _serialize_datetime(_utc_now())
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             existing = conn.execute(
                 "SELECT session_id, call_id, server_fingerprint FROM mcp_tasks "
                 "WHERE server_name = ? AND task_id = ?",
@@ -3256,6 +4031,15 @@ class SessionStore:
                 )
             if existing is not None and str(existing["server_fingerprint"]) != server_fingerprint:
                 raise ValueError("MCP durable task server identity changed")
+            if existing is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM mcp_tasks WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if int(row["count"]) >= MAX_DURABLE_MCP_TASKS_PER_SESSION:
+                    raise ValueError(
+                        "MCP durable task capacity exceeded for this session"
+                    )
             conn.execute(
                 """
                 INSERT INTO mcp_tasks (
@@ -3289,8 +4073,8 @@ class SessionStore:
                     server_fingerprint,
                     protocol_version,
                     status,
-                    json.dumps(task, ensure_ascii=False, sort_keys=True),
-                    json.dumps(answered_inputs, ensure_ascii=False, sort_keys=True),
+                    task_json,
+                    answered_inputs_json,
                     now,
                     now,
                 ),
@@ -3299,7 +4083,7 @@ class SessionStore:
     def delete_mcp_task(self, server_name: str, task_id: str) -> None:
         """Drop one MCP task handle after Ash no longer needs to resume it."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "DELETE FROM mcp_tasks WHERE server_name = ? AND task_id = ?",
                 (server_name, task_id),
@@ -3308,17 +4092,22 @@ class SessionStore:
     def list_mcp_tasks(self, session_id: str) -> list[sqlite3.Row]:
         """Return durable MCP task records for one session oldest-first."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
-            return conn.execute(
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
                 "SELECT * FROM mcp_tasks WHERE session_id = ? "
-                "ORDER BY created_at, task_id",
-                (session_id,),
+                "ORDER BY created_at, task_id LIMIT ?",
+                (session_id, MAX_DURABLE_MCP_TASKS_PER_SESSION + 1),
             ).fetchall()
+        if len(rows) > MAX_DURABLE_MCP_TASKS_PER_SESSION:
+            raise SessionStorageError(
+                "durable MCP task count exceeds the supported session capacity"
+            )
+        return rows
 
     def delete_mcp_task_for_call(self, session_id: str, call_id: str) -> None:
         """Drop a durable MCP handle after its Ash tool result is committed."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "DELETE FROM mcp_tasks WHERE session_id = ? AND call_id = ?",
                 (session_id, call_id),
@@ -3329,7 +4118,7 @@ class SessionStore:
     ) -> sqlite3.Row | None:
         """Return one persisted tool call bound to a recovery task."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             return conn.execute(
                 "SELECT * FROM tool_calls WHERE session_id = ? AND turn_id = ? "
                 "AND call_id = ?",
@@ -3356,7 +4145,7 @@ class SessionStore:
         Returns ``True`` when this transaction inserted the tool-result message.
         """
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             call = conn.execute(
                 "SELECT executed, error FROM tool_calls WHERE session_id = ? "
                 "AND turn_id = ? AND call_id = ?",
@@ -3442,7 +4231,11 @@ class SessionStore:
     ) -> AuditLogRecord:
         """Append one tamper-evident audit event for a session."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
+            # Reserve the SQLite writer before reading the chain tail. Without
+            # this, two processes can hash against the same previous record and
+            # then serialize their inserts into a forked audit chain.
+            conn.execute("BEGIN IMMEDIATE")
             return self._append_audit_log_in_connection(
                 conn,
                 session_id,
@@ -3466,8 +4259,14 @@ class SessionStore:
     ) -> AuditLogRecord:
         """Append one chained audit entry into an existing transaction."""
 
+        from ash.core.redaction import redact_text, redact_value
+
         event_time = timestamp or _utc_now()
-        details_json = _canonical_json(details)
+        redacted_target = redact_text(target_resource)
+        redacted_details = redact_value(details)
+        if not isinstance(redacted_details, dict):
+            raise SessionStorageError("redacted audit details are not an object")
+        details_json = _canonical_json(redacted_details)
         previous_row = conn.execute(
             """
             SELECT sha256_hash FROM audit_logs
@@ -3486,7 +4285,7 @@ class SessionStore:
             session_id=session_id,
             timestamp=event_time,
             action_type=action_type,
-            target_resource=target_resource,
+            target_resource=redacted_target,
             details_json=details_json,
             result=result,
             previous_hash=previous_hash,
@@ -3503,7 +4302,7 @@ class SessionStore:
                 session_id,
                 _serialize_datetime(event_time),
                 action_type,
-                target_resource,
+                redacted_target,
                 details_json,
                 result,
                 event_hash,
@@ -3514,7 +4313,7 @@ class SessionStore:
             log_id=int(cursor.lastrowid or 0),
             session_id=session_id,
             action_type=action_type,
-            target_resource=target_resource,
+            target_resource=redacted_target,
             details=json.loads(details_json),
             result=result,
             timestamp=event_time,
@@ -3525,7 +4324,7 @@ class SessionStore:
     def list_audit_logs(self, session_id: str) -> list[AuditLogRecord]:
         """Return audit log records for a session in append order."""
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             rows = conn.execute(
                 """
                 SELECT log_id, session_id, timestamp, action_type, target_resource,
@@ -3541,14 +4340,54 @@ class SessionStore:
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise _invalid_stored_data_error(self.db_path) from exc
 
+    def iter_audit_logs(
+        self,
+        session_id: str,
+        *,
+        batch_size: int = 256,
+    ) -> Iterator[AuditLogRecord]:
+        """Yield audit records in append order without materializing the chain."""
+
+        if batch_size < 1 or batch_size > 4096:
+            raise ValueError("audit batch_size must be between 1 and 4096")
+        try:
+            with closing(self._connect()) as conn:
+                cursor = conn.execute(
+                    """
+                    SELECT log_id, session_id, timestamp, action_type, target_resource,
+                           details_json, result, sha256_hash, previous_hash
+                    FROM audit_logs
+                    WHERE session_id = ?
+                    ORDER BY log_id ASC
+                    """,
+                    (session_id,),
+                )
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    for row in rows:
+                        yield _audit_record_from_row(row)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
+
     def verify_audit_log(self, session_id: str) -> list[str]:
         """Return integrity errors for a session audit chain."""
 
         errors: list[str] = []
+        omitted = 0
         previous_hash = ""
-        for record in self.list_audit_logs(session_id):
+
+        def record_error(message: str) -> None:
+            nonlocal omitted
+            if len(errors) < MAX_AUDIT_VERIFICATION_ERRORS:
+                errors.append(message)
+            else:
+                omitted += 1
+
+        for record in self.iter_audit_logs(session_id):
             if record.previous_hash != previous_hash:
-                errors.append(f"audit log {record.log_id} previous_hash mismatch")
+                record_error(f"audit log {record.log_id} previous_hash mismatch")
             expected_hash = _audit_hash(
                 session_id=record.session_id,
                 timestamp=record.timestamp,
@@ -3559,8 +4398,12 @@ class SessionStore:
                 previous_hash=record.previous_hash,
             )
             if record.sha256_hash != expected_hash:
-                errors.append(f"audit log {record.log_id} sha256_hash mismatch")
+                record_error(f"audit log {record.log_id} sha256_hash mismatch")
             previous_hash = record.sha256_hash
+        if omitted:
+            errors.append(
+                f"{omitted} additional audit verification error(s) omitted"
+            )
         return errors
 
     # --- sprint + checklist persistence (Sprint 12 / V5) ---------------
@@ -3578,7 +4421,7 @@ class SessionStore:
         for the same ``idx`` are updated in place.
         """
 
-        with closing(get_db_connection(self.db_path)) as conn, conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO sprints (
@@ -3651,7 +4494,7 @@ class SessionStore:
             SprintState,
         )
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 """
                 SELECT sprint_id, session_id, goal, state, contract_json,
@@ -3703,37 +4546,94 @@ class SessionStore:
             except (KeyError, TypeError, ValueError, OverflowError) as exc:
                 raise _invalid_stored_data_error(self.db_path) from exc
 
-    def list_session_sprints(self, session_id: str) -> list[str]:
-        """Return the sprint ids persisted against a session, newest first."""
+    def load_latest_active_sprint(self, session_id: str) -> Any | None:
+        """Load only the newest planning/active sprint for a session."""
 
-        with closing(get_db_connection(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT sprint_id FROM sprints
+                WHERE session_id = ? AND state IN ('planning', 'active')
+                ORDER BY created_at DESC, sprint_id DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        execution = self.load_sprint(str(row["sprint_id"]))
+        return None if execution.is_terminal else execution
+
+    def list_session_sprints(self, session_id: str) -> list[str]:
+        """Return sprint IDs persisted against a session, newest first."""
+
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
-                SELECT sprint_id FROM sprints WHERE session_id = ?
-                ORDER BY created_at DESC
+                SELECT sprint_id FROM sprints
+                WHERE session_id = ?
+                ORDER BY created_at DESC, sprint_id DESC
                 """,
                 (session_id,),
             ).fetchall()
-        return [r["sprint_id"] for r in rows]
+        return [str(row["sprint_id"]) for row in rows]
 
     def get_recent_session_summaries(
         self,
         project_path: str,
         limit: int = 5,
     ) -> list[str]:
-        """Return plain-text content of the N most recent sessions for a project."""
-        with closing(get_db_connection(self.db_path)) as conn, conn:
-            rows = conn.execute(
+        """Return bounded recent transcript tails for recent project sessions."""
+
+        if not 1 <= limit <= MAX_RECENT_SESSION_CONTEXT_SESSIONS:
+            raise ValueError(
+                "recent session limit must be between 1 and "
+                f"{MAX_RECENT_SESSION_CONTEXT_SESSIONS}"
+            )
+        summaries: list[str] = []
+        with closing(self._connect()) as conn:
+            session_rows = conn.execute(
                 """
-                SELECT s.session_id,
-                       GROUP_CONCAT(m.content, '\n') as messages
-                FROM sessions s
-                JOIN messages m ON m.session_id = s.session_id
-                WHERE s.project_key = ?
-                GROUP BY s.session_id
-                ORDER BY s.created_at DESC
+                SELECT session_id
+                FROM sessions
+                WHERE project_key = ?
+                  AND EXISTS (
+                      SELECT 1 FROM messages
+                      WHERE messages.session_id = sessions.session_id
+                  )
+                ORDER BY COALESCE(updated_at, created_at) DESC, session_id DESC
                 LIMIT ?
                 """,
                 (normalize_project_path(project_path), limit),
             ).fetchall()
-        return [row["messages"] for row in rows]
+            for session_row in session_rows:
+                message_rows = conn.execute(
+                    """
+                    SELECT substr(content, 1, ?) AS content
+                    FROM messages
+                    WHERE session_id = ?
+                    ORDER BY message_id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        MAX_RECENT_SESSION_CONTEXT_CHARS,
+                        session_row["session_id"],
+                        MAX_RECENT_SESSION_CONTEXT_MESSAGES,
+                    ),
+                ).fetchall()
+                newest_first: list[str] = []
+                used = 0
+                for row in message_rows:
+                    content = str(row["content"] or "")
+                    separator = 1 if newest_first else 0
+                    remaining = (
+                        MAX_RECENT_SESSION_CONTEXT_CHARS - used - separator
+                    )
+                    if remaining <= 0:
+                        break
+                    clipped = content[:remaining]
+                    newest_first.append(clipped)
+                    used += separator + len(clipped)
+                if newest_first:
+                    summaries.append("\n".join(reversed(newest_first)))
+        return summaries

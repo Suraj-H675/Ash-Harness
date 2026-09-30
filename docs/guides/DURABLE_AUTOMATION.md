@@ -78,8 +78,9 @@ contract is intentionally narrow:
   worker also disables process dumpability so the child cannot recover the
   signing secret from the worker parent via `/proc/<pid>/environ`. Because Ash
   does not yet have an equivalent parent-process environment isolation primitive
-  on macOS or Windows, unattended jobs configured with `--webhook-secret-env`
-  fail closed there; unsigned webhook delivery remains cross-platform. Do not
+  on macOS, unattended jobs configured with `--webhook-secret-env` fail closed
+  there; unsigned webhook delivery remains supported. WSL2 follows the Linux
+  behavior. Do not
   reuse the signing variable for provider, command, web search, A2A, MCP, plugin,
   or other tool credentials.
 
@@ -145,9 +146,9 @@ systemctl --user enable --now ash-cron-project.service
 systemctl --user status ash-cron-project.service
 ```
 
-On macOS use a per-user `launchd` agent, and on Windows use Task Scheduler or a
-service manager, with the project as the working directory and `ash cron
-worker` as the command. Do not rely on a terminal window remaining open.
+On macOS use a per-user `launchd` agent. On Windows, run Ash inside WSL2 and
+use the Linux/systemd approach from the WSL distribution. Do not rely on a
+terminal window remaining open.
 
 `ash cron status` reports enabled jobs, active runs, and fresh worker
 heartbeats. `ash doctor` performs read-only SQLite integrity and foreign-key

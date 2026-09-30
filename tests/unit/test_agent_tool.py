@@ -4,11 +4,15 @@ import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from ash.agents.shared_state import SharedState
 from ash.agents.tasks import AgentTaskError
+from ash.agents.worktree import WorktreeLease
 from ash.config import AshConfig
 from ash.core.loop import AshLoop
 from ash.providers.base import ProviderABC, StreamChunk
@@ -54,6 +58,242 @@ async def test_spawn_agent_uses_provider_and_persists_report(tmp_path) -> None:
         "agent.task.succeeded",
     ]
     assert all(event["task_id"] == durable[0].task_id for event in emitted)
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_spawn_reserves_agent_id_before_worker_registration(
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingProvider(ProviderABC):
+        model_name = "blocking"
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            started.set()
+            await release.wait()
+            yield StreamChunk(content="done", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text)
+
+    state = SharedState(tmp_path / "agents.db")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, BlockingProvider)
+    try:
+        first = await tool.run(
+            role="reviewer",
+            task="first",
+            agent_id="duplicate-worker",
+            background=True,
+            isolation="shared",
+        )
+        second = await tool.run(
+            role="reviewer",
+            task="second",
+            agent_id="duplicate-worker",
+            background=True,
+            isolation="shared",
+        )
+
+        assert first.success is True
+        assert second.success is False
+        assert "already running" in (second.error or "")
+        assert len(tool._tasks) == 1
+        assert len(state.tasks.list_tasks()) == 1
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+        release.set()
+        await asyncio.wait_for(tool._tasks["duplicate-worker"], timeout=2)
+        await asyncio.sleep(0)
+        assert "duplicate-worker" not in tool._active_agent_ids
+    finally:
+        release.set()
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_rejects_full_workspace_queue_before_provider_allocation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.tasks as tasks_module
+
+    monkeypatch.setattr(tasks_module, "MAX_NONTERMINAL_TASKS_PER_WORKSPACE", 1)
+    state = SharedState(tmp_path / "agents.db")
+    state.tasks.create_task(
+        "already queued",
+        task_id="already-queued",
+        metadata={"workspace": str(tmp_path.resolve())},
+    )
+    provider_calls = 0
+
+    def provider_factory() -> FakeProvider:
+        nonlocal provider_calls
+        provider_calls += 1
+        return FakeProvider()
+
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, provider_factory)
+    try:
+        result = await tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="blocked-worker",
+        )
+
+        assert result.success is False
+        assert "nonterminal queue limit reached" in (result.error or "")
+        assert provider_calls == 0
+        assert [task.task_id for task in state.tasks.list_tasks()] == [
+            "already-queued"
+        ]
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_releases_durable_capacity_when_start_transition_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        memory_backend="off",
+        max_concurrent_agents=1,
+    )
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider, config=config)
+    original_start = state.tasks.start_task
+    start_calls = 0
+
+    def fail_first_start(task_id: str, token: str):
+        nonlocal start_calls
+        start_calls += 1
+        if start_calls == 1:
+            raise RuntimeError("simulated start transition failure")
+        return original_start(task_id, token)
+
+    monkeypatch.setattr(state.tasks, "start_task", fail_first_start)
+    try:
+        with pytest.raises(RuntimeError, match="simulated start transition failure"):
+            await tool.run(
+                role="reviewer",
+                task="inspect tests",
+                agent_id="failed-start-worker",
+                isolation="shared",
+            )
+
+        first = state.tasks.list_tasks()[0]
+        assert first.state == "failed"
+
+        second = await tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="replacement-worker",
+            isolation="shared",
+        )
+
+        assert second.success is True
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_queued_agent_requeues_when_start_transition_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        memory_backend="off",
+        max_concurrent_agents=1,
+    )
+    queued = state.tasks.create_task(
+        "inspect tests",
+        role="reviewer",
+        max_attempts=2,
+        metadata={
+            "agent_id": "queued-worker",
+            "background": True,
+            "isolation": "shared",
+            "workspace": str(tmp_path.resolve()),
+        },
+    )
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider, config=config)
+    original_start = state.tasks.start_task
+    start_calls = 0
+
+    def fail_first_start(task_id: str, token: str):
+        nonlocal start_calls
+        start_calls += 1
+        if start_calls == 1:
+            raise RuntimeError("simulated queued start failure")
+        return original_start(task_id, token)
+
+    monkeypatch.setattr(state.tasks, "start_task", fail_first_start)
+    try:
+        with pytest.raises(RuntimeError, match="simulated queued start failure"):
+            await tool.run_queued_task(
+                queued.task_id,
+                require_dispatchable=False,
+                wait=True,
+            )
+
+        retry = state.tasks.get_task(queued.task_id)
+        assert retry is not None
+        assert retry.state == "queued"
+        assert retry.owner_agent_id is None
+        assert retry.attempt == 1
+
+        result = await tool.run_queued_task(
+            queued.task_id,
+            require_dispatchable=False,
+            wait=True,
+        )
+
+        assert result.success is True
+        completed = state.tasks.get_task(queued.task_id)
+        assert completed is not None
+        assert completed.state == "succeeded"
+        assert completed.attempt == 2
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_loop_construction_failure_closes_provider(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TrackingProvider(FakeProvider):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    provider = TrackingProvider()
+
+    def fail_loop(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("worker loop construction failed")
+
+    monkeypatch.setattr("ash.tools.agent.AshLoop", fail_loop)
+    state = SharedState(tmp_path / "agents.db")
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        lambda: provider,
+    )
+
+    result = await tool.run(role="reviewer", task="inspect tests", agent_id="worker")
+
+    assert result.success is False
+    assert "worker loop construction failed" in (result.error or "")
+    assert provider.close_calls == 1
     await tool.aclose()
 
 
@@ -244,6 +484,74 @@ async def test_subagent_lease_terminalization_serializes_with_renewal(
 
 
 @pytest.mark.asyncio
+async def test_worktree_creation_cleanup_terminalizes_before_repeated_cancellation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.agent as agent_module
+
+    accept_started = asyncio.Event()
+    remove_started = asyncio.Event()
+    release_remove = asyncio.Event()
+
+    class BlockingWorktreeManager:
+        def __init__(self, _repository, _storage_root) -> None:
+            pass
+
+        async def create(self, agent_id: str) -> WorktreeLease:
+            return WorktreeLease(
+                agent_id,
+                tmp_path / "isolated",
+                f"ash-agent/{agent_id}",
+                "base",
+            )
+
+        async def accept_git_artifacts(self, _lease, _artifacts) -> None:
+            accept_started.set()
+            await asyncio.Event().wait()
+
+        async def remove(self, *_args, **_kwargs) -> None:
+            remove_started.set()
+            await release_remove.wait()
+
+    monkeypatch.setattr(agent_module, "WorktreeManager", BlockingWorktreeManager)
+    state = SharedState(tmp_path / "agents.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        model="openai/test",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider, config=config)
+    running = asyncio.create_task(
+        tool.run(
+            role="coder",
+            task="prepare isolated worktree",
+            agent_id="cleanup-coder",
+            isolation="worktree",
+        )
+    )
+    await asyncio.wait_for(accept_started.wait(), timeout=1)
+
+    running.cancel()
+    await asyncio.wait_for(remove_started.wait(), timeout=1)
+    running.cancel()
+    await asyncio.sleep(0)
+
+    assert running.done() is False
+    durable = state.tasks.list_tasks()[0]
+    assert durable.state == "running"
+
+    release_remove.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, timeout=1)
+
+    durable = state.tasks.list_tasks()[0]
+    assert durable.state == "cancelled"
+    assert durable.error == "subagent spawn cancelled during worktree creation"
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_worker_fences_recovery_before_first_provider_request(tmp_path) -> None:
     state = SharedState(tmp_path / "agents.db")
 
@@ -324,7 +632,7 @@ async def test_foreground_read_only_agent_can_run_provider_in_subprocess(
         "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
     )
     monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross")
-    state = SharedState(tmp_path / "agents.db")
+    state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
@@ -452,7 +760,10 @@ async def test_foreground_coder_subprocess_uses_live_approval_and_syncs_rule(
     monkeypatch.setenv(
         "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
     )
-    state = SharedState(tmp_path / "state" / "agents.db")
+    state = SharedState(
+        tmp_path / "state" / "agents.db",
+        workspace=tmp_path,
+    )
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
@@ -596,7 +907,10 @@ async def test_foreground_coder_subprocess_exact_scope_does_not_cross_call(
     monkeypatch.setenv(
         "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
     )
-    state = SharedState(tmp_path / "scope-state" / "agents.db")
+    state = SharedState(
+        tmp_path / "scope-state" / "agents.db",
+        workspace=tmp_path,
+    )
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "scope-db",
@@ -682,7 +996,10 @@ async def test_live_approval_capability_is_not_in_subprocess_environment(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(agent_module, "communicate_process", fake_communicate_process)
     monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
-    state = SharedState(tmp_path / "cap-state" / "agents.db")
+    state = SharedState(
+        tmp_path / "cap-state" / "agents.db",
+        workspace=tmp_path,
+    )
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "cap-db",
@@ -737,6 +1054,265 @@ async def test_live_approval_capability_is_not_in_subprocess_environment(
 
 
 @pytest.mark.asyncio
+async def test_foreground_subprocess_cleans_tree_after_unexpected_communication_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.agent as agent_module
+
+    class FakeProcess:
+        returncode = None
+
+    process = FakeProcess()
+    cleanup = AsyncMock(return_value=(None, False))
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    async def fail_communicate(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("subagent communication failed")
+
+    monkeypatch.setenv("OPENAI_API_KEY", "subagent-cleanup-secret")
+    monkeypatch.setattr(
+        agent_module,
+        "prepare_process_tree",
+        lambda *args, **kwargs: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(agent_module.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(agent_module, "communicate_process", fail_communicate)
+    monkeypatch.setattr(
+        agent_module,
+        "settle_process_tree_after_cancellation",
+        cleanup,
+        raising=False,
+    )
+    state = SharedState(
+        tmp_path / "communication-state" / "agents.db",
+        workspace=tmp_path,
+    )
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "communication-db",
+        model="openai/communication-child",
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        lambda: FakeProvider(),
+        config=config,
+        provider_config_backed=True,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="subagent communication failed"):
+            await tool.run(
+                role="reviewer",
+                task="exercise communication cleanup",
+                agent_id="communication-reviewer",
+            )
+
+        cleanup.assert_awaited_once()
+        assert cleanup.await_args is not None
+        assert cleanup.await_args.args[0] is process
+        durable = state.tasks.list_tasks()
+        assert len(durable) == 1
+        assert durable[0].state == "cancelled"
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_foreground_subprocess_cancellation_settles_tree_before_repeating(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.sandbox.process_utils as process_utils
+    import ash.tools.agent as agent_module
+
+    class FakeProcess:
+        returncode = None
+
+    process = FakeProcess()
+    communication_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        return process
+
+    async def communicate(*args, **kwargs):
+        del args, kwargs
+        communication_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def cleanup(target, *, plan=None, grace_seconds=1.0):
+        del plan, grace_seconds
+        assert target is process
+        cleanup_started.set()
+        await release_cleanup.wait()
+        cleanup_finished.set()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "subagent-cancel-secret")
+    monkeypatch.setattr(
+        agent_module,
+        "prepare_process_tree",
+        lambda *args, **kwargs: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(agent_module.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(agent_module, "communicate_process", communicate)
+    monkeypatch.setattr(process_utils, "terminate_process_tree", cleanup)
+    state = SharedState(
+        tmp_path / "cancel-state" / "agents.db",
+        workspace=tmp_path,
+    )
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "cancel-db",
+        model="openai/cancel-child",
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        lambda: FakeProvider(),
+        config=config,
+        provider_config_backed=True,
+    )
+    task = asyncio.create_task(
+        tool.run(
+            role="reviewer",
+            task="exercise repeated cancellation",
+            agent_id="cancel-reviewer",
+        )
+    )
+    try:
+        await asyncio.wait_for(communication_started.wait(), timeout=1)
+        task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        assert cleanup_finished.is_set() is False
+
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+        assert cleanup_finished.is_set() is True
+        durable = state.tasks.list_tasks()
+        assert len(durable) == 1
+        assert durable[0].state == "cancelled"
+    finally:
+        release_cleanup.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_foreground_subprocess_launch_cancellation_settles_spawned_tree(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.sandbox.process_utils as process_utils
+    import ash.tools.agent as agent_module
+
+    class FakeProcess:
+        returncode = None
+
+    process = FakeProcess()
+    launch_started = asyncio.Event()
+    release_launch = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def spawn(*args, **kwargs):
+        del args, kwargs
+        launch_started.set()
+        await release_launch.wait()
+        return process
+
+    async def cleanup(target, *, plan=None, grace_seconds=1.0):
+        del plan, grace_seconds
+        assert target is process
+        cleanup_started.set()
+        await release_cleanup.wait()
+        cleanup_finished.set()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "subagent-launch-cancel-secret")
+    monkeypatch.setattr(
+        agent_module,
+        "prepare_process_tree",
+        lambda *args, **kwargs: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(agent_module.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(process_utils, "terminate_process_tree", cleanup)
+    state = SharedState(
+        tmp_path / "launch-cancel-state" / "agents.db",
+        workspace=tmp_path,
+    )
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "launch-cancel-db",
+        model="openai/launch-cancel-child",
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        lambda: FakeProvider(),
+        config=config,
+        provider_config_backed=True,
+    )
+    task = asyncio.create_task(
+        tool.run(
+            role="reviewer",
+            task="exercise launch cancellation cleanup",
+            agent_id="launch-cancel-reviewer",
+        )
+    )
+    try:
+        await asyncio.wait_for(launch_started.wait(), timeout=1)
+        task.cancel()
+        release_launch.set()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+        task.cancel()
+        await asyncio.sleep(0)
+
+        assert task.done() is False
+        assert cleanup_finished.is_set() is False
+
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+        assert cleanup_finished.is_set() is True
+        durable = state.tasks.list_tasks()
+        assert len(durable) == 1
+        assert durable[0].state == "cancelled"
+    finally:
+        release_launch.set()
+        release_cleanup.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_live_approval_server_closes_when_subprocess_launch_fails(
     tmp_path, monkeypatch
 ) -> None:
@@ -765,7 +1341,10 @@ async def test_live_approval_server_closes_when_subprocess_launch_fails(
         fail_create_subprocess_exec,
     )
     monkeypatch.setenv("OPENAI_API_KEY", "launch-failure-secret")
-    state = SharedState(tmp_path / "launch-state" / "agents.db")
+    state = SharedState(
+        tmp_path / "launch-state" / "agents.db",
+        workspace=tmp_path,
+    )
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "launch-db",
@@ -800,6 +1379,111 @@ async def test_live_approval_server_closes_when_subprocess_launch_fails(
             await asyncio.open_connection(endpoint.host, endpoint.port)
     finally:
         await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_live_approval_cleanup_failure_preserves_subprocess_error_and_retries(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.agent as agent_module
+    from ash.agents.approval_channel import ApprovalEndpoint
+
+    created_servers = []
+
+    class FlakyApprovalServer:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.close_calls = 0
+            created_servers.append(self)
+
+        async def start(self):
+            return ApprovalEndpoint(
+                host="127.0.0.1",
+                port=12345,
+                token="ab" * 32,
+                task_id=self.kwargs["task_id"],
+                agent_id=self.kwargs["agent_id"],
+                attempt=self.kwargs["attempt"],
+            )
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("approval cleanup failed once")
+
+    class FakeProcess:
+        returncode = None
+
+    async def spawn(*_args, **_kwargs):
+        return FakeProcess()
+
+    async def fail_communication(*_args, **_kwargs):
+        raise RuntimeError("subprocess communication failed")
+
+    async def cleanup_process(*_args, **_kwargs):
+        return None, False
+
+    monkeypatch.setattr(agent_module, "ForegroundApprovalServer", FlakyApprovalServer)
+    monkeypatch.setattr(
+        agent_module,
+        "prepare_process_tree",
+        lambda **_kwargs: SimpleNamespace(spawn_options={}),
+    )
+    monkeypatch.setattr(agent_module.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(agent_module, "communicate_process", fail_communication)
+    monkeypatch.setattr(
+        agent_module,
+        "settle_process_tree_after_cancellation",
+        cleanup_process,
+    )
+    state = SharedState(
+        tmp_path / "approval-cleanup-state" / "agents.db",
+        workspace=tmp_path,
+    )
+    durable = state.tasks.create_task(
+        "exercise approval cleanup",
+        role="coder",
+        metadata={"agent_id": "approval-cleanup-coder"},
+    )
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "approval-cleanup-db",
+        model="openai/approval-cleanup-child",
+        agent_execution_mode="subprocess",
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        lambda: FakeProvider(),
+        config=config,
+        provider_config_backed=True,
+    )
+
+    with pytest.raises(RuntimeError, match="subprocess communication failed") as captured:
+        await tool._execute_subprocess_task(
+            durable_task=durable,
+            agent_id="approval-cleanup-coder",
+            policy=PermissionPolicy("interactive"),
+            agent_definition=None,
+            require_dispatchable=False,
+            live_approval=True,
+        )
+
+    assert len(created_servers) == 1
+    server = created_servers[0]
+    assert server.close_calls == 1
+    assert server in tool._retired_approval_servers
+    assert any(
+        "subagent approval cleanup failed" in note
+        for note in captured.value.__notes__
+    )
+
+    await tool.aclose()
+
+    assert server.close_calls == 2
+    assert tool._retired_approval_servers == set()
 
 
 @pytest.mark.asyncio
@@ -865,7 +1549,10 @@ async def test_foreground_subprocess_cancel_during_live_approval_fails_closed(
     monkeypatch.setenv(
         "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
     )
-    state = SharedState(tmp_path / "cancel-state" / "agents.db")
+    state = SharedState(
+        tmp_path / "cancel-state" / "agents.db",
+        workspace=tmp_path,
+    )
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "cancel-db",
@@ -960,7 +1647,7 @@ async def test_background_agent_runs_provider_in_subprocess(tmp_path, monkeypatc
     monkeypatch.setenv(
         "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
     )
-    state = SharedState(tmp_path / "agents.db")
+    state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
@@ -1009,6 +1696,89 @@ async def test_background_agent_runs_provider_in_subprocess(tmp_path, monkeypatc
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_subprocess_monitor_cleanup_survives_stop_message_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider)
+    cancelled = asyncio.Event()
+
+    async def blocked_monitor() -> ToolResult:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monitor = asyncio.create_task(blocked_monitor())
+    tool._subprocess_tasks["cleanup-agent"] = monitor
+    tool._subprocess_task_ids.add("cleanup-task")
+
+    async def fail_stop_message(*args, **kwargs) -> None:
+        del args, kwargs
+        raise RuntimeError("subagent stop message persistence failed")
+
+    monkeypatch.setattr(state, "send_message_async", fail_stop_message)
+
+    try:
+        await tool.aclose()
+
+        assert cancelled.is_set()
+        assert monitor.done()
+        assert not tool._subprocess_tasks
+        assert not tool._subprocess_task_ids
+    finally:
+        if not monitor.done():
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_close_settles_before_propagating_cancellation(
+    tmp_path,
+) -> None:
+    state = SharedState(tmp_path / "agents.db")
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider)
+    cancel_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resistant_dispatcher() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_seen.set()
+            await release.wait()
+
+    dispatcher = asyncio.create_task(resistant_dispatcher())
+    tool._dispatcher_task = dispatcher
+    closing = asyncio.create_task(tool.aclose())
+    await asyncio.wait_for(cancel_seen.wait(), timeout=1)
+
+    try:
+        closing.cancel()
+        await asyncio.sleep(0)
+
+        assert closing.done() is False
+        assert state._closed is False
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(closing, timeout=1)
+
+        assert dispatcher.done() is True
+        assert tool._dispatcher_task is None
+        assert state._closed is True
+    finally:
+        release.set()
+        if not dispatcher.done():
+            dispatcher.cancel()
+            await asyncio.gather(dispatcher, return_exceptions=True)
+        if not state._closed:
+            state.close()
 
 
 @pytest.mark.asyncio
@@ -1087,7 +1857,10 @@ async def test_background_coder_subprocess_keeps_durable_approval_path(
     monkeypatch.setenv(
         "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
     )
-    state = SharedState(tmp_path / "state" / "agents.db")
+    state = SharedState(
+        tmp_path / "state" / "agents.db",
+        workspace=tmp_path,
+    )
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
@@ -1188,7 +1961,7 @@ async def test_background_coder_subprocess_keeps_durable_approval_path(
 async def test_subprocess_dispatcher_reserves_task_before_child_claim(
     tmp_path, monkeypatch
 ) -> None:
-    state = SharedState(tmp_path / "agents.db")
+    state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
     config = AshConfig(
         workspace_root=tmp_path,
         agent_execution_mode="subprocess",
@@ -1343,7 +2116,7 @@ async def test_background_subprocess_stop_cancels_durable_task(
     monkeypatch.setenv(
         "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
     )
-    state = SharedState(tmp_path / "agents.db")
+    state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
     config = AshConfig(
         workspace_root=tmp_path,
         model="openai/slow-child",
@@ -1455,7 +2228,10 @@ async def test_background_subprocess_stop_cleans_coder_worktree(
     monkeypatch.setenv(
         "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
     )
-    state = SharedState(tmp_path / "state" / "agents.db")
+    state = SharedState(
+        tmp_path / "state" / "agents.db",
+        workspace=repository,
+    )
     config = AshConfig(
         workspace_root=repository,
         db_directory=tmp_path / "state",
@@ -1524,7 +2300,7 @@ async def test_subprocess_mode_preserves_opaque_python_provider_factory(tmp_path
         calls += 1
         return FakeProvider()
 
-    state = SharedState(tmp_path / "agents.db")
+    state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
     config = AshConfig(
         workspace_root=tmp_path,
         agent_execution_mode="subprocess",
@@ -1567,7 +2343,7 @@ async def test_interactive_coder_subprocess_without_live_broker_falls_back_in_pr
         calls += 1
         return LocalProvider()
 
-    state = SharedState(tmp_path / "agents.db")
+    state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
     config = AshConfig(
         workspace_root=tmp_path,
         agent_execution_mode="subprocess",

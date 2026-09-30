@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ash.safety.environment import resolve_host_executable
+from ash.safety.git import read_only_git_args, read_only_git_environment
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.sandbox.process_utils import (
     ProcessTreeUnavailable,
@@ -90,20 +91,23 @@ def git_branch(root: Path) -> str:
         git = resolve_host_executable("git", workspace_root=root, cwd=root)
         if git is None:
             return "none"
+        environment = read_only_git_environment()
         result = _run_git_probe(
-            [git, "symbolic-ref", "--quiet", "--short", "HEAD"],
+            [git, *read_only_git_args(["symbolic-ref", "--quiet", "--short", "HEAD"])],
             root=root,
             guard=guard,
             expected_identity=expected_identity,
+            environment=environment,
         )
         branch = result.stdout.strip()
         if branch:
             return terminal_safe_text(branch, single_line=True)
         detached = _run_git_probe(
-            [git, "rev-parse", "--short", "HEAD"],
+            [git, *read_only_git_args(["rev-parse", "--short", "HEAD"])],
             root=root,
             guard=guard,
             expected_identity=expected_identity,
+            environment=environment,
         ).stdout.strip()
         return (
             f"@{terminal_safe_text(detached, single_line=True)}"
@@ -126,6 +130,7 @@ def _run_git_probe(
     root: Path,
     guard: SafetyGuard,
     expected_identity: tuple[int, int],
+    environment: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
     with prepare_scoped_process_launch(
         command,
@@ -142,6 +147,7 @@ def _run_git_probe(
                 capture_output=True,
                 text=True,
                 timeout=0.25,
+                env=environment,
             )
         return subprocess.run(
             list(launch.argv),
@@ -150,4 +156,5 @@ def _run_git_probe(
             capture_output=True,
             text=True,
             timeout=0.25,
+            env=environment,
         )

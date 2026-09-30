@@ -27,6 +27,43 @@ Ash is a local-first, provider-neutral coding environment that can:
 - keep every model action inside explicit approval, trust, path, network,
   sandbox, redaction, and audit boundaries.
 
+### Platform support
+
+Ash supports native **Linux** and **macOS** on Python 3.12 through 3.14.
+Windows users should run Ash inside **WSL2**, which follows the supported Linux
+runtime path. Native Windows is intentionally not supported yet; the CLI and
+public installer fail fast there instead of entering partially tested platform
+branches.
+
+### Installation
+
+Production installs come from an **immutable GitHub Release**, not from a
+moving branch. The verified install path uses GitHub's release attestation and
+asset verification before executing Ash's standalone installer:
+
+```bash
+repo="Suraj-H675/Ash-Harness"
+tag="$(gh release view -R "$repo" --json tagName,isImmutable --jq 'select(.isImmutable == true) | .tagName')"
+test -n "$tag" || { echo >&2 "No immutable Ash release is available."; exit 1; }
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+gh release verify "$tag" -R "$repo"
+gh release download "$tag" -R "$repo" --pattern install-ash.py --dir "$tmp"
+gh release verify-asset "$tag" "$tmp/install-ash.py" -R "$repo"
+python3 -I "$tmp/install-ash.py" --ref "$tag"
+```
+
+This requires the GitHub CLI (`gh`). The installer preserves an existing
+pipx/uv-managed Ash installation when possible, resolves the wheel from that
+same immutable release, downloads it into a private temporary directory, and
+verifies the exact byte count and GitHub SHA-256 digest itself before invoking
+the package manager. pipx/uv then install that already-verified local wheel;
+the hash fragment is retained only as defense in depth. Optional capability
+packs such as `--extra browser` remain available on that wheel install.
+Development setup and release-maintainer instructions are intentionally
+separate; see [Contributing](CONTRIBUTING.md) and
+[Releasing Ash](docs/guides/RELEASING.md).
+
 ## Capability overview
 
 ### Provider and model layer
@@ -58,8 +95,9 @@ The provider layer also provides:
   `ash providers test`, with catalog and model-call readiness reported separately;
 - provider and model capability metadata for native tools, vision,
   reasoning, locality, context, and output budgets;
-- isolated named profiles for separate model, provider, credential, and local
-  state contexts;
+- isolated named profiles for separate model, provider, credential, and SQLite
+  runtime state; user-installed extensions, trust, and permission policy remain
+  global to the Ash user;
 - ordered model failover before the first streamed response chunk;
 - one harness-owned retry policy for classified pre-output transient failures;
 - `Retry-After` handling, jittered exponential backoff, and provider-keyed
@@ -105,7 +143,7 @@ Ash includes a complete coding-tool surface:
 | Area | Capabilities |
 | --- | --- |
 | Files | Ranged reads, file creation, atomic writes, exact replacement, multi-edit operations, whole-file edits, and patch application |
-| Text and structure | Directory listing, bounded globbing, ripgrep-backed text/regex search, Python search fallback, symbol lookup, and reference lookup |
+| Text and structure | Directory listing, bounded globbing, descriptor-scoped bounded text/regex search, symbol lookup, and reference lookup |
 | Code intelligence | Incremental Tree-sitter repository maps for Python, JavaScript/JSX, TypeScript/TSX, Go, Rust, Java, C, C++, and C# |
 | Git | Status, bounded diffs, log inspection, explicit-scope commits, secret scanning, Git-hook error reporting, and worktree-aware review |
 | Processes | Foreground commands, managed background jobs, live bounded stdout/stderr, stdin, polling, stopping, and cleanup |
@@ -133,9 +171,15 @@ Ash manages context as a first-class runtime resource:
 - project-root-aware repository maps with active-file ranking;
 - searchable redacted session memory;
 - explicit project memory indexing, search, clear, and privacy export;
-- deterministic in-memory semantic search;
-- optional Chroma vector search;
-- SQLite FTS5 lexical fallback; and
+- private per-workspace SQLite project memory under Ash-owned state;
+- SQLite FTS5 lexical retrieval by default, with transactional document
+  replacement and bounded stale-file reconciliation;
+- optional semantic retrieval only when the user explicitly configures OpenAI
+  embeddings or the `local-embeddings` ONNX capability pack, with lexical
+  fallback when embeddings are unavailable and no hidden embedding API calls
+  by default; choosing OpenAI embeddings sends the text being indexed and
+  memory-search queries to OpenAI for embedding, while `none` and ONNX keep
+  embedding work local; and
 - bounded batch indexing for large projects without one database transaction
   per file.
 
@@ -224,10 +268,9 @@ Safety is part of the harness contract rather than an optional prompt:
 
 Shell and executable extension work can use a fail-closed isolation layer:
 
-- Bubblewrap on Linux;
+- Bubblewrap 0.12.0 or newer on Linux;
 - `sandbox-exec` on macOS;
-- Docker with the packaged `ash-sandbox` baseline, including Docker Desktop on
-  Windows; or
+- Docker with the packaged `ash-sandbox` baseline; or
 - explicitly reported direct execution when no isolation backend is available.
 
 Isolated commands default to disabled network access, a scrubbed environment,
@@ -236,6 +279,20 @@ User-owned sandbox configuration cannot be weakened by project configuration.
 Git hooks, MCP stdio servers, and plugin runtimes use the same conservative
 environment boundary. Unsafe auto-approval is disabled unless an operator
 explicitly opts into the compatibility escape hatch.
+
+Docker sandbox execution also defaults to a **4096 MiB RAM limit, 2 CPU cores,
+and 256 processes**. `sandbox_docker_memory_mb` and `sandbox_docker_cpus` are
+user-owned settings; setting either numeric limit to `0` disables that Docker
+limit. Docker's memory setting is a RAM cap; additional swap availability
+follows the Docker daemon/kernel policy. Bubblewrap and macOS `sandbox-exec` do
+not claim equivalent aggregate CPU/memory containment.
+
+For ordinary mutable Docker command sessions, `/workspace` is a Docker-daemon
+host bind mount so edits flow back to the real repository. That boundary assumes
+the local OS account and Docker daemon host are trusted against concurrent
+replacement of the workspace pathname. Executable plugins use the stronger
+snapshot path instead: validated plugin bytes are staged into an Ash-owned
+Docker volume and mounted read-only at execution time.
 
 ### Web and browser automation
 
@@ -318,7 +375,10 @@ Ash is extensible without changing the core runtime:
 - namespacing and dependency constraints to prevent collisions;
 - local-directory and trusted HTTPS Git repository sources;
 - signed catalogs with pinned Ed25519 trust keys and bounded redirect-free
-  caching; catalog v2 binds a lowercase publisher namespace into the signed
+  caching; persistent marketplace registrations bind both the signing key ID
+  and the SHA-256 fingerprint of the verified public key, so replacing key
+  material under a reused ID requires explicit re-registration/replacement;
+  catalog v2 binds a lowercase publisher namespace into the signed
   payload, repeatable `--catalog` inputs can be searched together, and
   `@publisher/plugin` selects an exact publisher when names overlap;
 - persistent, profile-scoped `ash marketplace list/add/remove` registration
@@ -329,6 +389,19 @@ Ash is extensible without changing the core runtime:
   version, signed publisher, and source-origin provenance transactionally with
   plugin replacement/uninstall; local replacements clear stale remote
   provenance;
+- plugin Git acquisition runs with a scrubbed non-interactive environment, an
+  Ash-owned empty home/config directory, and user/system Git configuration,
+  credential prompts, askpass, templates, and inherited proxy/secret overrides
+  disabled;
+- lifecycle mutations serialize dependency-topology decisions with activation
+  state changes, reject replacements/updates that would newly break installed
+  reverse dependencies, and keep provenance aligned with the live tree across
+  ordinary failures and process crashes. A durable per-root lifecycle journal
+  records the exact tree/provenance/activation transition before publication;
+  interrupted pre-commit work rolls back, committed work is finalized on the
+  next lifecycle/runtime discovery, transaction-owned stage/backup/quarantine
+  directories are never discovered as plugins, and recovery verifies the
+  plugin-root plus managed activation-state parent identities before mutation;
 - `ash extensions update NAME` and `/plugins update NAME` update one tracked
   plugin through that provenance: direct Git refs use resolved-commit no-op
   detection, catalog installs are re-resolved through the currently verified
@@ -338,7 +411,10 @@ Ash is extensible without changing the core runtime:
   tracked plugin in deterministic order, preserve each plugin's independent
   atomic update boundary, continue after per-plugin failures, and report
   updated/unchanged/error outcomes; the CLI returns a failing status when any
-  tracked update fails;
+  tracked update fails. Coordinated version transitions that require multiple
+  mutually dependent plugins to change atomically are intentionally rejected
+  rather than exposing a temporarily broken dependency graph; a true
+  multi-plugin transaction remains a marketplace parity gap;
 - validation for traversal, links, malformed manifests, oversized components,
   missing dependencies, and unsafe replacements;
 - update, enable, disable, uninstall, inventory, search, and atomic live reload;
@@ -347,7 +423,8 @@ Ash is extensible without changing the core runtime:
 - ordinary approval, audit, hook, sandbox, and dry-run policy around plugins;
 - modern Markdown `SKILL.md` instruction skills that do not execute embedded
   code;
-- opt-in legacy executable-skill compatibility; and
+- a library-only legacy executable-skill compatibility API that remains outside
+  the default runtime/CLI because it executes user-authored code in-process; and
 - bounded lifecycle hooks for sessions, turns, models, tools, errors, and
   policy gates.
 
@@ -381,15 +458,17 @@ Ash exposes or consumes the following integration surfaces:
 | Surface | Capability |
 | --- | --- |
 | ACP v1 | Stdio editor/agent host integration with new/load/list/close plus durable fork/resume session lifecycle, prompts, cancellation, tool progress, usage, text, bounded inline images, resource links, and stdio/HTTP/SSE MCP support |
-| A2A 1.0 | Authenticated Agent Card, JSON-RPC, HTTP+JSON routes, task polling, streaming, cancellation, context continuation, inspection, and outbound delegation |
-| HTTP API | Authenticated synchronous turns, live SSE turn events, session fork, and session tree endpoints |
+| A2A 1.0 | Authenticated Agent Card, JSON-RPC, HTTP+JSON routes, bounded concurrent task execution, task polling, streaming, cancellation, context continuation, inspection, and outbound delegation |
+| HTTP API | Authenticated bounded-concurrency synchronous turns, live SSE turn events, steering, session fork, and session tree endpoints |
 | JSON-RPC | Structured runtime and session integration for external hosts |
 | LSP 3.18 | Managed lazy language servers for diagnostics, hover, definitions, references, implementations, symbols, and call hierarchy |
 | Python SDK | Async client access to turns, sessions, plans, steering, events, usage, storage, automation, and agent delegation |
 
-Managed LSP detects installed basedpyright/pyright,
+Managed LSP detects host-installed basedpyright/pyright,
 typescript-language-server, gopls, rust-analyzer, clangd, and
-lua-language-server processes. It never downloads a server, rejects
+lua-language-server processes. Trusted project configuration can explicitly
+select a workspace-local server, but project executables are not implicitly
+auto-detected. It never downloads a server, rejects
 out-of-workspace semantic results, and does not expose rename or code-action
 operations yet.
 
@@ -418,6 +497,9 @@ The operational surface includes:
   diagnostics;
 - database integrity checks, consistent backups, validated restore, redacted
   debug bundles, metrics, and tamper-evident audit export;
+- opt-in `ASH_DEBUG=1` structured diagnostics in private rotating
+  `~/.ash/logs/ash.jsonl`, with secret redaction and session/turn/tool
+  correlation while normal human logs remain on stderr;
 - explicit update/version checks with no background telemetry;
 - selective reset of configuration, sessions, cache, or all local state;
 - idempotent installation and repair behavior that preserves selected optional
@@ -428,8 +510,8 @@ The operational surface includes:
 ## Project shape
 
 Ash is a typed Python package with a public `ash.*` namespace and a console
-entry point. Optional capability packs keep server, vector, browser, ACP, and
-A2A dependencies separate from the lean core. The repository contains:
+entry point. Optional capability packs keep server, local embeddings, browser,
+ACP, and A2A dependencies separate from the lean core. The repository contains:
 
 - the installable harness and runtime under `src/ash/`;
 - unit, integration, packaging, and real-browser coverage under `tests/`;
@@ -448,6 +530,7 @@ including [permissions and managed policy](docs/guides/PERMISSIONS.md),
 Ash deliberately reports unsupported or partial surfaces instead of pretending
 they are complete:
 
+- native Windows execution is not currently supported; use WSL2;
 - subscription-based provider authentication is not included;
 - remote browser CDP and direct takeover of pre-existing tabs are not exposed;
 - ACP audio/embedded-resource, session delete, additional directories, modes,

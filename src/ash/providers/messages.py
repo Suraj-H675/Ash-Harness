@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -22,9 +23,47 @@ from ash.safe_io import strict_json_loads
 
 MAX_CANONICAL_MESSAGES = 10_000
 MAX_IMAGE_BASE64_CHARS = 14_000_000
+MAX_CANONICAL_CONTENT_BLOCKS = 64
+MAX_CANONICAL_CONTENT_BYTES = 16 * 1024 * 1024
+MAX_TOOL_CALL_ID_BYTES = 512
+MAX_TOOL_CALL_ARGUMENT_BYTES = 2 * 1024 * 1024
+MAX_PROVIDER_TOOL_NAME_CHARS = 64
+PROVIDER_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SUPPORTED_IMAGE_MEDIA_TYPES = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp"}
 )
+
+
+def _validate_tool_call_id(value: str) -> str:
+    try:
+        size = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("tool call ID must be valid UTF-8 text") from exc
+    if size > MAX_TOOL_CALL_ID_BYTES:
+        raise ValueError(
+            f"tool call ID exceeds {MAX_TOOL_CALL_ID_BYTES} UTF-8 bytes"
+        )
+    return value
+
+
+def _validate_tool_call_argument_bytes(encoded: str) -> None:
+    try:
+        size = len(encoded.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("tool-call arguments must be valid UTF-8 text") from exc
+    if size > MAX_TOOL_CALL_ARGUMENT_BYTES:
+        raise ValueError(
+            "tool-call arguments exceed "
+            f"{MAX_TOOL_CALL_ARGUMENT_BYTES} UTF-8 bytes"
+        )
+
+
+def validate_provider_tool_name(value: Any) -> str:
+    if not isinstance(value, str) or not PROVIDER_TOOL_NAME.fullmatch(value):
+        raise ValueError(
+            "provider tool name must match [A-Za-z0-9_-]{1,64}"
+        )
+    return value
 
 
 class TextContentBlock(BaseModel):
@@ -69,11 +108,22 @@ class CanonicalToolCall(BaseModel):
     name: str = Field(..., min_length=1)
     arguments: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("call_id")
+    @classmethod
+    def validate_call_id(cls, value: str) -> str:
+        return _validate_tool_call_id(value)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return validate_provider_tool_name(value)
+
     @field_validator("arguments", mode="before")
     @classmethod
     def parse_arguments(cls, value: Any) -> Any:
         if not isinstance(value, str):
             return value
+        _validate_tool_call_argument_bytes(value)
         try:
             parsed = strict_json_loads(value)
         except (json.JSONDecodeError, ValueError) as exc:
@@ -85,9 +135,14 @@ class CanonicalToolCall(BaseModel):
     @model_validator(mode="after")
     def validate_arguments(self) -> "CanonicalToolCall":
         try:
-            json.dumps(self.arguments, allow_nan=False)
+            encoded = json.dumps(
+                self.arguments,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError("tool-call arguments must be JSON serializable") from exc
+        _validate_tool_call_argument_bytes(encoded)
         return self
 
     def to_wire(self) -> dict[str, Any]:
@@ -104,6 +159,63 @@ class CanonicalMessage(BaseModel):
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[CanonicalToolCall] | None = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def validate_content_size(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                size = len(value.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise ValueError("message content must be valid UTF-8 text") from exc
+            if size > MAX_CANONICAL_CONTENT_BYTES:
+                raise ValueError(
+                    "message content exceeds "
+                    f"{MAX_CANONICAL_CONTENT_BYTES} UTF-8 bytes"
+                )
+            return value
+        if not isinstance(value, list):
+            return value
+        if len(value) > MAX_CANONICAL_CONTENT_BLOCKS:
+            raise ValueError(
+                "message content blocks exceed "
+                f"the limit of {MAX_CANONICAL_CONTENT_BLOCKS}"
+            )
+        total = 0
+        for block in value:
+            payload: Any
+            if isinstance(block, TextContentBlock):
+                payload = block.text
+            elif isinstance(block, ImageContentBlock):
+                payload = block.data
+            elif isinstance(block, Mapping):
+                block_type = block.get("type")
+                payload = (
+                    block.get("text")
+                    if block_type == "text"
+                    else block.get("data")
+                    if block_type == "image"
+                    else None
+                )
+            else:
+                payload = None
+            if not isinstance(payload, str):
+                continue
+            try:
+                total += len(payload.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise ValueError("message content must be valid UTF-8 text") from exc
+            if total > MAX_CANONICAL_CONTENT_BYTES:
+                raise ValueError(
+                    "message content exceeds "
+                    f"{MAX_CANONICAL_CONTENT_BYTES} UTF-8 bytes"
+                )
+        return value
+
+    @field_validator("tool_call_id")
+    @classmethod
+    def validate_tool_call_id(cls, value: str | None) -> str | None:
+        return None if value is None else _validate_tool_call_id(value)
 
     @model_validator(mode="after")
     def validate_role_contract(self) -> "CanonicalMessage":

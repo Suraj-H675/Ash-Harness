@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
-from ash.plugins.anchored_fs import AnchoredDirectory
+from ash.safety.anchored_fs import AnchoredDirectory
 
 MAX_PLUGIN_FILES = 10_000
 MAX_PLUGIN_BYTES = 256 * 1024 * 1024

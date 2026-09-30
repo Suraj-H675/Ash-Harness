@@ -16,6 +16,84 @@ from ash.agents.tasks import (
 )
 
 
+def test_agent_task_store_closes_connection_when_schema_init_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.tasks as tasks_module
+    from ash.agents.tasks import AgentTaskStore
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.row_factory = None
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FakeConnection()
+
+    class FakeDatabase:
+        path = tmp_path / "agents.db"
+
+        def connect(self, **kwargs):
+            del kwargs
+            return connection
+
+    class FakePinnedSQLiteDatabase:
+        @staticmethod
+        def prepare(*args, **kwargs):
+            del args, kwargs
+            return FakeDatabase()
+
+    monkeypatch.setattr(
+        tasks_module,
+        "PinnedSQLiteDatabase",
+        FakePinnedSQLiteDatabase,
+    )
+    monkeypatch.setattr(
+        AgentTaskStore,
+        "_init_db",
+        lambda self, busy_timeout_ms: (_ for _ in ()).throw(
+            RuntimeError(f"schema init failed at {busy_timeout_ms}")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="schema init failed"):
+        AgentTaskStore(tmp_path / "agents.db")
+
+    assert connection.closed is True
+
+
+def test_agent_task_store_close_retries_failed_connection_cleanup() -> None:
+    from ash.agents.tasks import AgentTaskStore
+
+    class FlakyConnection:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("task connection close failed once")
+
+    store = object.__new__(AgentTaskStore)
+    store._lock = threading.RLock()
+    store._closed = False
+    store._conn = FlakyConnection()
+
+    with pytest.raises(RuntimeError, match="task connection close failed once"):
+        store.close()
+
+    assert store._conn.close_calls == 1
+    assert store._closed is False
+
+    store.close()
+
+    assert store._conn.close_calls == 2
+    assert store._closed is True
+
+
 def test_agent_state_stores_reject_linked_database_file_and_parent(
     tmp_path: Path,
 ) -> None:
@@ -51,6 +129,54 @@ def test_agent_state_stores_reject_linked_database_file_and_parent(
         }
     assert "agent_status" not in tables
     assert "agent_tasks" not in tables
+
+
+def test_shared_state_parent_swap_cannot_redirect_sqlite_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    import ash.sqlite_utils as sqlite_utils
+
+    state_dir = tmp_path / "state"
+    moved_dir = tmp_path / "state-original"
+    replacement = tmp_path / "replacement"
+    state_dir.mkdir()
+    replacement.mkdir()
+    victim = replacement / "agents.db"
+    with sqlite3.connect(victim) as connection:
+        connection.execute("CREATE TABLE marker(value TEXT)")
+        connection.execute("INSERT INTO marker(value) VALUES ('keep')")
+
+    real_connect = sqlite_utils.sqlite3.connect
+    swapped = False
+
+    def connect_then_swap(*args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            state_dir.rename(moved_dir)
+            replacement.rename(state_dir)
+            swapped = True
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite_utils.sqlite3, "connect", connect_then_swap)
+
+    with pytest.raises(ValueError, match="parent identity changed"):
+        SharedState(state_dir / "agents.db")
+
+    assert swapped is True
+    with real_connect(state_dir / "agents.db") as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        marker = connection.execute("SELECT value FROM marker").fetchone()[0]
+    assert tables == {"marker"}
+    assert marker == "keep"
+    assert not Path(f"{state_dir / 'agents.db'}-wal").exists()
+    assert not Path(f"{state_dir / 'agents.db'}-shm").exists()
 
 
 def test_durable_task_json_rejects_duplicate_fields() -> None:
@@ -159,6 +285,55 @@ def test_atomic_capacity_limit_is_shared_across_connections(tmp_path: Path) -> N
     finally:
         first_state.close()
         second_state.close()
+
+
+def test_nonterminal_task_budget_is_workspace_scoped_and_terminal_tasks_free_capacity(
+    state: SharedState,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.tasks as tasks_module
+
+    monkeypatch.setattr(tasks_module, "MAX_NONTERMINAL_TASKS_PER_WORKSPACE", 2)
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    alias_a = workspace_a / "nested" / ".."
+
+    first = state.tasks.create_task(
+        "first",
+        task_id="workspace-a-first",
+        metadata={"workspace": str(alias_a)},
+    )
+    state.tasks.create_task(
+        "second",
+        task_id="workspace-a-second",
+        metadata={"workspace": str(workspace_a)},
+    )
+
+    assert first.metadata["workspace"] == str(workspace_a.resolve())
+    with pytest.raises(AgentTaskError, match="nonterminal queue limit reached"):
+        state.tasks.create_task(
+            "overflow",
+            task_id="workspace-a-overflow",
+            metadata={"workspace": str(workspace_a)},
+        )
+
+    other = state.tasks.create_task(
+        "other workspace",
+        task_id="workspace-b-first",
+        metadata={"workspace": str(workspace_b)},
+    )
+    assert other.state == "queued"
+
+    state.tasks.cancel_task("workspace-a-first", workspace=workspace_a)
+    replacement = state.tasks.create_task(
+        "replacement",
+        task_id="workspace-a-replacement",
+        metadata={"workspace": str(workspace_a)},
+    )
+
+    assert replacement.state == "queued"
+    assert state.tasks.get_task("workspace-a-first").state == "cancelled"
 
 
 def test_stale_lease_is_requeued_then_exhausted(
@@ -729,6 +904,46 @@ def test_task_contract_rejects_missing_dependencies_and_non_json_metadata(
         state.tasks.create_task("bad", metadata={"value": float("nan")})
     with pytest.raises(ValueError, match="portable identifier"):
         state.tasks.create_task("bad", task_id="not portable")
+
+
+def test_task_dependency_fan_in_is_bounded(
+    state: SharedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.tasks as tasks_module
+
+    monkeypatch.setattr(tasks_module, "MAX_TASK_DEPENDENCIES", 2)
+    for task_id in ("dep-a", "dep-b", "dep-c"):
+        state.tasks.create_task(task_id, task_id=task_id)
+
+    with pytest.raises(ValueError, match="dependencies exceed the limit of 2"):
+        state.tasks.create_task(
+            "fan-in",
+            task_id="fan-in",
+            dependencies=["dep-a", "dep-b", "dep-c"],
+        )
+
+
+def test_task_artifact_count_is_bounded_and_legacy_overflow_fails_closed(
+    state: SharedState,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.tasks as tasks_module
+
+    monkeypatch.setattr(tasks_module, "MAX_ARTIFACTS_PER_TASK", 2)
+    state.tasks.create_task("produce", task_id="produce")
+    state.tasks.add_artifact("produce", kind="file", uri="one.txt")
+    state.tasks.add_artifact("produce", kind="file", uri="two.txt")
+
+    with pytest.raises(AgentTaskError, match="artifact limit reached"):
+        state.tasks.add_artifact("produce", kind="file", uri="three.txt")
+
+    monkeypatch.setattr(tasks_module, "MAX_ARTIFACTS_PER_TASK", 3)
+    state.tasks.add_artifact("produce", kind="file", uri="three.txt")
+    monkeypatch.setattr(tasks_module, "MAX_ARTIFACTS_PER_TASK", 2)
+
+    with pytest.raises(AgentTaskError, match="stored task artifact count exceeds"):
+        state.tasks.list_artifacts("produce")
 
 
 def test_task_events_are_ordered_redacted_and_cursor_replayable(

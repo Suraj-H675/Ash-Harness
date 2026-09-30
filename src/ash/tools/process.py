@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import platform
 import uuid
 from collections.abc import Awaitable
 from contextlib import AbstractContextManager, nullcontext
@@ -19,7 +18,6 @@ from ash.core.redaction import (
     StreamingRedactor,
     redact_text,
 )
-from ash.safety.environment import resolve_host_executable
 from ash.safety.guard import SafetyGuard
 from ash.sandbox.process_utils import (
     ProcessTreeError,
@@ -30,14 +28,13 @@ from ash.sandbox.process_utils import (
     terminate_process_tree,
 )
 from ash.sandbox import (
-    SANDBOX_TIER_BWRAP,
     SANDBOX_TIER_SCOPED,
     SandboxBackendUnavailable,
     SandboxInvocation,
     SandboxManager,
 )
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
-from ash.tools.command import build_scrubbed_command_env, validate_windows_shell_command
+from ash.tools.command import build_scrubbed_command_env
 
 
 def _directory_identity(path: Path) -> tuple[int, int] | None:
@@ -243,7 +240,6 @@ class BackgroundProcessTool(BaseTool):
             )
         self._prune_terminal_history()
         self.safety_guard.validate_command(args.command)
-        validate_windows_shell_command(args.command)
         if (
             self._project_root_identity is not None
             and _directory_identity(self.safety_guard.project_root)
@@ -261,29 +257,7 @@ class BackgroundProcessTool(BaseTool):
         environment = build_scrubbed_command_env(
             self.safety_guard.project_root, self.environment_allowlist
         )
-        isolated = (
-            self.sandbox_manager is not None
-            and self.sandbox_manager.tier >= SANDBOX_TIER_BWRAP
-        )
-        if isolated or platform.system() != "Windows":
-            argv = ["/bin/sh", "-c", args.command]
-        else:
-            powershell = resolve_host_executable(
-                "powershell.exe",
-                workspace_root=self.safety_guard.project_root,
-                cwd=cwd,
-                search_path=environment.get("PATH"),
-            )
-            if powershell is None:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=(
-                        "PowerShell executable is unavailable outside the workspace; "
-                        "background command was not started."
-                    ),
-                )
-            argv = [powershell, "-NoProfile", "-Command", args.command]
+        argv = ["/bin/sh", "-c", args.command]
         backend_name = "scoped"
         try:
             process_tree_plan = prepare_process_tree(
@@ -314,38 +288,27 @@ class BackgroundProcessTool(BaseTool):
                 )
             with invocation_context as invocation:
                 backend_name = invocation.backend_name
-                if platform.system() != "Windows":
-                    with prepare_scoped_process_launch(
-                        invocation.argv,
-                        cwd=invocation.cwd,
-                        guard=self.safety_guard,
-                        search_path=environment.get("PATH"),
-                        expected_cwd_identity=expected_cwd_identity,
-                    ) as launch:
-                        inherited_fds = tuple(
-                            dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
-                        )
-                        spawn_options = dict(process_tree_plan.spawn_options)
-                        if inherited_fds:
-                            spawn_options["pass_fds"] = inherited_fds
-                        process = await asyncio.create_subprocess_exec(
-                            *launch.argv,
-                            cwd=launch.cwd,
-                            env=environment,
-                            stdin=asyncio.subprocess.PIPE,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                            **spawn_options,
-                        )
-                else:
+                with prepare_scoped_process_launch(
+                    invocation.argv,
+                    cwd=invocation.cwd,
+                    guard=self.safety_guard,
+                    search_path=environment.get("PATH"),
+                    expected_cwd_identity=expected_cwd_identity,
+                ) as launch:
+                    inherited_fds = tuple(
+                        dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
+                    )
+                    spawn_options = dict(process_tree_plan.spawn_options)
+                    if inherited_fds:
+                        spawn_options["pass_fds"] = inherited_fds
                     process = await asyncio.create_subprocess_exec(
-                        *invocation.argv,
-                        cwd=invocation.cwd,
+                        *launch.argv,
+                        cwd=launch.cwd,
                         env=environment,
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
-                        **process_tree_plan.spawn_options,
+                        **spawn_options,
                     )
         except SandboxBackendUnavailable as exc:
             return ToolResult(
@@ -458,16 +421,27 @@ class BackgroundProcessTool(BaseTool):
 
     async def aclose(self) -> None:
         jobs = tuple(self.jobs.values())
-        await asyncio.gather(
-            *(
-                _allow_natural_process_exit(job.process)
-                for job in jobs
-                if job.process.returncode is None
+        _, grace_error, grace_cancelled = await _settle_cleanup(
+            asyncio.gather(
+                *(
+                    _allow_natural_process_exit(job.process)
+                    for job in jobs
+                    if job.process.returncode is None
+                ),
+                return_exceptions=True,
             )
         )
-        active_jobs = tuple(job for job in jobs if job.process.returncode is None)
+        cleanup_jobs = tuple(
+            job
+            for job in jobs
+            if job.process.returncode is None
+            or (
+                not job.process_tree_plan.is_windows
+                and any(not reader.done() for reader in job.readers)
+            )
+        )
         cleanup_results, cleanup_error, cleanup_cancelled = await _settle_cleanup(
-            _terminate_background_jobs(active_jobs)
+            _terminate_background_jobs(cleanup_jobs)
         )
         failures: list[BaseException] = []
         if cleanup_error is not None:
@@ -485,8 +459,10 @@ class BackgroundProcessTool(BaseTool):
                 return_exceptions=True,
             )
         )
-        if cleanup_cancelled or reader_cancelled:
+        if grace_cancelled or cleanup_cancelled or reader_cancelled:
             cancellation = asyncio.CancelledError()
+            if grace_error is not None:
+                cancellation.add_note(f"natural-exit grace failed: {grace_error}")
             for failure in failures:
                 cancellation.add_note(f"Process-tree cleanup failed: {failure}")
             if reader_error is not None:
