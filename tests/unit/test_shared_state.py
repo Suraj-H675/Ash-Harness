@@ -5,6 +5,7 @@ import threading
 import pytest
 import ash.agents.shared_state as shared_state_module
 from ash.agents.shared_state import SharedState
+from ash.agents.tasks import AgentTaskStore
 import tempfile
 from pathlib import Path
 
@@ -61,6 +62,69 @@ def test_shared_state_closes_connection_when_schema_init_fails(
         SharedState(tmp_path / "agents.db")
 
     assert connection.closed is True
+
+
+def test_open_existing_uses_parent_initialized_schema_without_ddl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "agents.db"
+    parent = SharedState(database)
+    task = parent.tasks.create_task("existing durable task", task_id="existing-task")
+
+    def unexpected_init(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("open_existing must not run schema initialization")
+
+    monkeypatch.setattr(SharedState, "_init_db", unexpected_init)
+    monkeypatch.setattr(AgentTaskStore, "_init_db", unexpected_init)
+    child = SharedState.open_existing(database)
+    try:
+        loaded = child.tasks.get_task(task.task_id)
+        assert loaded is not None
+        assert loaded.description == "existing durable task"
+    finally:
+        child.close()
+        parent.close()
+
+
+def test_open_existing_does_not_create_missing_agent_database(tmp_path: Path) -> None:
+    database = tmp_path / "missing" / "agents.db"
+
+    with pytest.raises(ValueError, match="does not exist"):
+        SharedState.open_existing(database)
+
+    assert not database.exists()
+    assert not database.parent.exists()
+
+
+def test_shared_state_rollback_journal_supports_multiple_owners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.sqlite_utils as sqlite_utils
+
+    monkeypatch.setattr(
+        sqlite_utils,
+        "preferred_sqlite_journal_mode",
+        lambda version=None: "DELETE",
+    )
+    database = tmp_path / "agents.db"
+    first = SharedState(database)
+    second = SharedState(database)
+    try:
+        task = first.tasks.create_task(
+            "rollback journal task",
+            task_id="rollback-journal-task",
+        )
+        loaded = second.tasks.get_task(task.task_id)
+
+        assert first._conn.execute("PRAGMA journal_mode").fetchone()[0].upper() == "DELETE"
+        assert loaded is not None
+        assert loaded.description == "rollback journal task"
+    finally:
+        second.close()
+        first.close()
 
 
 @pytest.mark.asyncio

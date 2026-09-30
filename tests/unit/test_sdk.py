@@ -546,6 +546,7 @@ async def test_sdk_delegates_durable_graph_with_injected_agent_provider(
         db_directory=tmp_path / "db",
         memory_backend="off",
         safety_tier="auto_approve",
+        allow_unsafe_auto_approve=True,
     )
     client = await AshClient.create(
         config=config,
@@ -617,6 +618,7 @@ async def test_sdk_delegation_respects_explicit_deny_without_creating_tasks(
         db_directory=tmp_path / "db",
         memory_backend="off",
         safety_tier="auto_approve",
+        allow_unsafe_auto_approve=True,
     )
     client = await AshClient.create(
         config=config,

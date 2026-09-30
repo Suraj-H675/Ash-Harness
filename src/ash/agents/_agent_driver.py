@@ -145,7 +145,7 @@ async def _run_durable_task(spec: dict[str, Any]) -> int:
         else None
     )
 
-    shared_state = SharedState(Path(db_path), workspace=workspace)
+    shared_state = SharedState.open_existing(Path(db_path), workspace=workspace)
     try:
         if approval_endpoint is not None:
             durable_task = shared_state.tasks.get_task(task_id)

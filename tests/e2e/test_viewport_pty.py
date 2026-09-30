@@ -68,8 +68,38 @@ asyncio.run(main())
             ["tmux", "resize-window", "-t", session, "-x", "40", "-y", "10"],
             check=True,
         )
+
+        resized_capture = ""
+        resized = False
+        resize_deadline = time.monotonic() + 5
+        while time.monotonic() < resize_deadline:
+            pane_size = subprocess.run(
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    target,
+                    "#{pane_width}x#{pane_height}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            resized_capture = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", target],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            if pane_size == "40x10" and "smoke>" in resized_capture:
+                resized = True
+                break
+            time.sleep(0.05)
+        assert resized, resized_capture
+
         subprocess.run(["tmux", "send-keys", "-t", target, "-l", "hello"], check=True)
-        subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+        subprocess.run(["tmux", "send-keys", "-t", target, "C-m"], check=True)
 
         capture = ""
         deadline = time.monotonic() + 5

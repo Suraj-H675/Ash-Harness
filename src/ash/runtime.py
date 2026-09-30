@@ -331,15 +331,10 @@ def build_tools(
             )
             tools.append(spawn_tool)
             if runtime_config is not None:
-                delegate_state = SharedState(
-                    agent_db_path,
-                    workspace=safety_guard.project_root,
-                )
-                owned_closers.append(delegate_state.close)
                 tools.append(
                     DelegateAgentsTool(
                         safety_guard,
-                        delegate_state,
+                        spawn_state,
                         spawn_tool,
                         runtime_config,
                     )

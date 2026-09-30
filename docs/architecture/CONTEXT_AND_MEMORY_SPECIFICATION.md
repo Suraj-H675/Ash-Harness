@@ -262,7 +262,10 @@ replacement cannot expose mixed document generations.
 
 Vectors are stored as bounded little-endian `float32` values with a validated
 dimension. Corrupt or incompatible payloads fail closed. The database runs in
-WAL mode and Ash keeps database/WAL/SHM files private on POSIX systems.
+Ash uses WAL mode on SQLite runtimes containing the upstream WAL-reset
+corruption fix and falls back to rollback-journal mode on affected
+versions. Database and any SQLite sidecar files remain private on POSIX
+systems.
 
 On Linux, SQLite is opened through the held directory descriptor
 (`/proc/self/fd/<dirfd>/memory.db`), so ordinary replacement of the visible

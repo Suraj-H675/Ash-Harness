@@ -2968,9 +2968,18 @@ def test_store_restricts_database_and_wal_sidecar_permissions(
             workspace=workspace,
             schedule=build_schedule(every="1h", now=now),
         )
-        sidecars = [database, Path(f"{database}-wal"), Path(f"{database}-shm")]
-        assert all(path.exists() for path in sidecars)
-        assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in sidecars)
+        sqlite_files = [
+            path
+            for path in (
+                database,
+                Path(f"{database}-wal"),
+                Path(f"{database}-shm"),
+                Path(f"{database}-journal"),
+            )
+            if path.exists()
+        ]
+        assert database in sqlite_files
+        assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in sqlite_files)
 
 
 def test_worker_heartbeat_and_soft_delete(

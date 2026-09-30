@@ -2,9 +2,9 @@
 
 The :class:`SharedState` is the SQLite-backed coordination layer that
 the lead orchestrator and its subagents read from / write to while
-running concurrently. Per the V6 architecture in
-ASH_MASTER_PLAN_V2.md, the database MUST run in WAL mode so multiple
-agents can read and write without blocking each other.
+running concurrently. Ash uses WAL on SQLite releases containing the
+upstream WAL-reset corruption fix and falls back to rollback-journal
+mode on affected SQLite runtimes.
 
 Tables (per ARCHITECTURAL_SPECIFICATION.md section 3.3):
 
@@ -33,7 +33,11 @@ from pathlib import Path
 from typing import Any, Iterable, Literal
 
 from ash.agents.tasks import AgentTaskStore
-from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
+from ash.sqlite_utils import (
+    PinnedSQLiteDatabase,
+    SQLitePathError,
+    configure_sqlite_journal_mode,
+)
 
 
 # --- public type aliases ---------------------------------------------------
@@ -94,6 +98,7 @@ class SharedState:
         *,
         workspace: Path | str | None = None,
         busy_timeout_ms: int = 5000,
+        _initialize_schema: bool = True,
     ) -> None:
         self.workspace = (
             str(Path(workspace).expanduser().resolve())
@@ -111,6 +116,7 @@ class SharedState:
             self._database = PinnedSQLiteDatabase.prepare(
                 db_path,
                 label="agent shared-state database",
+                create=_initialize_schema,
             )
             self.db_path = str(self._database.path)
             # check_same_thread=False because the connection is used by the
@@ -126,11 +132,16 @@ class SharedState:
         self._conn_lock = threading.RLock()
         self._closed = False
         try:
-            self._init_db()
+            if _initialize_schema:
+                self._init_db()
+            else:
+                self._configure_existing_db(busy_timeout_ms)
+                self._verify_schema()
             self.tasks = AgentTaskStore(
                 self.db_path,
                 busy_timeout_ms=busy_timeout_ms,
                 _database=self._database,
+                _initialize_schema=_initialize_schema,
             )
         except BaseException as primary_error:
             self._closed = True
@@ -141,6 +152,46 @@ class SharedState:
                     f"agent shared-state connection cleanup failed: {cleanup_error}"
                 )
             raise
+
+    @classmethod
+    def open_existing(
+        cls,
+        db_path: Path | str,
+        *,
+        workspace: Path | str | None = None,
+        busy_timeout_ms: int = 5000,
+    ) -> "SharedState":
+        """Open a parent-initialized agent database without running schema DDL."""
+
+        return cls(
+            db_path,
+            workspace=workspace,
+            busy_timeout_ms=busy_timeout_ms,
+            _initialize_schema=False,
+        )
+
+    def _configure_existing_db(self, busy_timeout_ms: int) -> None:
+        with self._conn_lock:
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+
+    def _verify_schema(self) -> None:
+        required = {"agent_status", "ipc_messages", "sprints"}
+        placeholders = ",".join("?" for _ in required)
+        with self._conn_lock:
+            rows = self._conn.execute(
+                f"SELECT name FROM sqlite_master "
+                f"WHERE type = 'table' AND name IN ({placeholders})",
+                tuple(sorted(required)),
+            ).fetchall()
+        present = {str(row["name"]) for row in rows}
+        missing = sorted(required - present)
+        if missing:
+            raise ValueError(
+                "agent shared-state database schema is incomplete: "
+                + ", ".join(missing)
+            )
 
     def _scope_agent_id(self, agent_id: str) -> str:
         if not isinstance(agent_id, str) or not agent_id.strip():
@@ -320,9 +371,9 @@ class SharedState:
 
     def _init_db(self) -> None:
         with self._conn_lock, self._conn:
+            configure_sqlite_journal_mode(self._conn)
             self._conn.executescript(
                 """
-                PRAGMA journal_mode=WAL;
                 PRAGMA synchronous=NORMAL;
                 PRAGMA foreign_keys=ON;
                 PRAGMA busy_timeout=5000;

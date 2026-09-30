@@ -108,7 +108,7 @@ def test_build_tools_closes_partial_agent_state_when_plugin_build_fails(
                 active_plugins=[],
             )
 
-        assert len(created) == 2
+        assert len(created) == 1
         assert all(state._closed for state in created)
     finally:
         for state in created:
@@ -269,7 +269,7 @@ def test_runtime_loop_construction_failure_closes_unpublished_stateful_tools(
                 run_maintenance=False,
             )
 
-        assert len(created) == 2
+        assert len(created) == 1
         assert all(state._closed for state in created)
     finally:
         for state in created:
@@ -321,7 +321,7 @@ def test_runtime_post_loop_setup_failure_closes_unpublished_stateful_tools(
                 run_maintenance=False,
             )
 
-        assert len(created) == 2
+        assert len(created) == 1
         assert all(state._closed for state in created)
     finally:
         for state in created:

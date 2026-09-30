@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,63 @@ from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 
 class SQLitePathError(RuntimeError):
     """A SQLite path could not be bound to one stable local file identity."""
+
+
+def sqlite_wal_is_safe(
+    version: tuple[int, ...] | None = None,
+) -> bool:
+    """Return whether the SQLite runtime contains the WAL-reset corruption fix."""
+
+    raw = tuple(version or sqlite3.sqlite_version_info)
+    padded = (raw + (0, 0, 0))[:3]
+    if padded >= (3, 51, 3):
+        return True
+    major_minor = padded[:2]
+    return (
+        major_minor == (3, 50)
+        and padded >= (3, 50, 7)
+        or major_minor == (3, 44)
+        and padded >= (3, 44, 6)
+    )
+
+
+def preferred_sqlite_journal_mode(
+    version: tuple[int, ...] | None = None,
+) -> str:
+    """Choose WAL only when the runtime includes SQLite's WAL-reset fix."""
+
+    return "WAL" if sqlite_wal_is_safe(version) else "DELETE"
+
+
+def configure_sqlite_journal_mode(connection: sqlite3.Connection) -> str:
+    """Apply Ash's corruption-safe journal mode and return the selected mode."""
+
+    expected = preferred_sqlite_journal_mode()
+    current_row = connection.execute("PRAGMA journal_mode").fetchone()
+    current = str(current_row[0]).upper() if current_row else ""
+    if current == expected:
+        return expected
+    row = connection.execute(f"PRAGMA journal_mode={expected}").fetchone()
+    actual = str(row[0]).upper() if row else ""
+    if actual != expected:
+        raise sqlite3.OperationalError(
+            f"SQLite refused journal mode {expected}; active mode is {actual or 'unknown'}"
+        )
+    return expected
+
+
+def _canonicalize_platform_alias_prefix(path: Path) -> Path:
+    """Resolve only stable OS-owned root aliases before anchored traversal."""
+
+    if sys.platform != "darwin" or not path.is_absolute() or len(path.parts) < 2:
+        return path
+    alias = Path(path.anchor) / path.parts[1]
+    if alias not in {Path("/var"), Path("/tmp"), Path("/etc")}:
+        return path
+    resolved_alias = Path(os.path.realpath(alias))
+    if not resolved_alias.is_absolute():
+        return path
+    return resolved_alias.joinpath(*path.parts[2:])
 
 
 @dataclass(frozen=True)
@@ -35,14 +93,16 @@ class PinnedSQLiteDatabase:
         path: str | Path,
         *,
         label: str,
+        create: bool = True,
     ) -> "PinnedSQLiteDatabase":
         database = Path(os.path.abspath(Path(path).expanduser()))
+        database = _canonicalize_platform_alias_prefix(database)
         if not database.name:
             raise SQLitePathError(f"{label} path must name a file")
         try:
             with AnchoredDirectory.open(
                 database.parent,
-                create=True,
+                create=create,
                 private=False,
                 pin_path=True,
             ) as directory:
@@ -51,6 +111,8 @@ class PinnedSQLiteDatabase:
                 created = False
                 descriptor = -1
                 if metadata is None:
+                    if not create:
+                        raise SQLitePathError(f"{label} does not exist: {database}")
                     descriptor = directory.create_file(database.name, mode=0o600)
                     created = True
                     metadata = os.fstat(descriptor)
@@ -99,6 +161,10 @@ class PinnedSQLiteDatabase:
                 raise SQLitePathError(
                     f"{label} path contains a symlink or junction: {database}"
                 ) from exc
+            raise SQLitePathError(f"cannot bind {label} {database}: {exc}") from exc
+        except FileNotFoundError as exc:
+            if not create:
+                raise SQLitePathError(f"{label} does not exist: {database}") from exc
             raise SQLitePathError(f"cannot bind {label} {database}: {exc}") from exc
         except OSError as exc:
             raise SQLitePathError(f"cannot bind {label} {database}: {exc}") from exc

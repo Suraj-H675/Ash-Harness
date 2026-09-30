@@ -30,7 +30,11 @@ from ash.automation.schedules import first_fire_time, next_fire_time
 from ash.automation.delivery import normalize_webhook_settings
 from ash.core.events import EventContext, envelope_event
 from ash.core.redaction import redact_text
-from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
+from ash.sqlite_utils import (
+    PinnedSQLiteDatabase,
+    SQLitePathError,
+    configure_sqlite_journal_mode,
+)
 
 
 MAX_JOB_NAME_BYTES = 256
@@ -142,9 +146,9 @@ class AutomationStore:
                     f"v{schema_version} is newer than supported "
                     f"v{AUTOMATION_SCHEMA_VERSION}"
                 )
+            configure_sqlite_journal_mode(self._conn)
             self._conn.executescript(
                 f"""
-                PRAGMA journal_mode=WAL;
                 PRAGMA synchronous=FULL;
                 PRAGMA foreign_keys=ON;
                 PRAGMA busy_timeout={int(busy_timeout_ms)};

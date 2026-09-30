@@ -20,7 +20,11 @@ from typing import Any, Literal, Sequence
 from ash.core.events import envelope_event
 from ash.core.redaction import redact_text
 from ash.safe_io import strict_json_loads
-from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
+from ash.sqlite_utils import (
+    PinnedSQLiteDatabase,
+    SQLitePathError,
+    configure_sqlite_journal_mode,
+)
 
 TaskState = Literal[
     "queued",
@@ -148,11 +152,13 @@ class AgentTaskStore:
         *,
         busy_timeout_ms: int = 5000,
         _database: PinnedSQLiteDatabase | None = None,
+        _initialize_schema: bool = True,
     ) -> None:
         try:
             self._database = _database or PinnedSQLiteDatabase.prepare(
                 db_path,
                 label="agent task database",
+                create=_initialize_schema,
             )
             self.db_path = str(self._database.path)
             self._conn = self._database.connect(
@@ -166,7 +172,11 @@ class AgentTaskStore:
         self._lock = threading.RLock()
         self._closed = False
         try:
-            self._init_db(busy_timeout_ms)
+            if _initialize_schema:
+                self._init_db(busy_timeout_ms)
+            else:
+                self._configure_existing_db(busy_timeout_ms)
+                self._verify_schema()
         except BaseException as primary_error:
             self._closed = True
             try:
@@ -177,6 +187,33 @@ class AgentTaskStore:
                 )
             raise
 
+    def _configure_existing_db(self, busy_timeout_ms: int) -> None:
+        with self._lock:
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+
+    def _verify_schema(self) -> None:
+        required = {
+            "agent_tasks",
+            "agent_task_dependencies",
+            "agent_artifacts",
+            "agent_task_events",
+        }
+        placeholders = ",".join("?" for _ in required)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT name FROM sqlite_master "
+                f"WHERE type = 'table' AND name IN ({placeholders})",
+                tuple(sorted(required)),
+            ).fetchall()
+        present = {str(row["name"]) for row in rows}
+        missing = sorted(required - present)
+        if missing:
+            raise AgentTaskError(
+                "agent task database schema is incomplete: " + ", ".join(missing)
+            )
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
@@ -186,9 +223,9 @@ class AgentTaskStore:
 
     def _init_db(self, busy_timeout_ms: int) -> None:
         with self._lock, self._conn:
+            configure_sqlite_journal_mode(self._conn)
             self._conn.executescript(
                 f"""
-                PRAGMA journal_mode=WAL;
                 PRAGMA synchronous=NORMAL;
                 PRAGMA foreign_keys=ON;
                 PRAGMA busy_timeout={int(busy_timeout_ms)};

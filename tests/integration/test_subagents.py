@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 import ash.agents.orchestrator as orchestrator_module
+from ash.sqlite_utils import preferred_sqlite_journal_mode
 
 from ash.agents import (
     AGENT_ROLES,
@@ -30,11 +31,11 @@ import tempfile
 # ---------------------------------------------------------------------------
 
 
-def test_shared_state_enables_wal_mode(tmp_path: Path) -> None:
+def test_shared_state_uses_safe_journal_mode(tmp_path: Path) -> None:
     ss = SharedState(tmp_path / "state.db")
     with sqlite3.connect(str(tmp_path / "state.db")) as conn:
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-    assert mode.lower() == "wal"
+    assert mode.upper() == preferred_sqlite_journal_mode()
     ss.close()
 
 

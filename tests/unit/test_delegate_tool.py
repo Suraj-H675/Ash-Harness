@@ -178,15 +178,16 @@ def _tools(tmp_path: Path, *, max_concurrency: int = 2):
         memory_backend="off",
     )
     db_path = config.db_directory / "agents.db"
+    state = SharedState(db_path)
     spawn = SpawnAgentTool(
         SafetyGuard(tmp_path),
-        SharedState(db_path),
+        state,
         RecordingProvider,
         config=config,
     )
     delegate = DelegateAgentsTool(
         SafetyGuard(tmp_path),
-        SharedState(db_path),
+        state,
         spawn,
         config,
     )
@@ -242,16 +243,17 @@ async def test_delegate_agents_runs_provider_in_subprocess(
         memory_backend="off",
     )
     db_path = config.db_directory / "agents.db"
+    state = SharedState(db_path)
     spawn = SpawnAgentTool(
         SafetyGuard(tmp_path),
-        SharedState(db_path),
+        state,
         parent_factory,
         config=config,
         provider_config_backed=True,
     )
     delegate = DelegateAgentsTool(
         SafetyGuard(tmp_path),
-        SharedState(db_path),
+        state,
         spawn,
         config,
     )
@@ -345,16 +347,17 @@ async def test_delegate_subprocess_retry_survives_failed_child_exit(
         memory_backend="off",
     )
     db_path = config.db_directory / "agents.db"
+    state = SharedState(db_path)
     spawn = SpawnAgentTool(
         SafetyGuard(tmp_path),
-        SharedState(db_path),
+        state,
         forbidden_parent_factory,
         config=config,
         provider_config_backed=True,
     )
     delegate = DelegateAgentsTool(
         SafetyGuard(tmp_path),
-        SharedState(db_path),
+        state,
         spawn,
         config,
     )
@@ -386,7 +389,6 @@ async def test_delegate_subprocess_retry_survives_failed_child_exit(
         }
     finally:
         await spawn.aclose()
-        delegate._shared_state.close()
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5)

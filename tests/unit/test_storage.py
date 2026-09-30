@@ -21,6 +21,7 @@ from ash.commands.storage import (
 )
 from ash.core.session import SessionStorageError, SessionStore
 from ash.cli import main
+from ash import sqlite_utils
 
 
 def test_storage_check_does_not_create_missing_database(tmp_path: Path) -> None:
@@ -30,6 +31,62 @@ def test_storage_check_does_not_create_missing_database(tmp_path: Path) -> None:
     assert check.ok is False
     assert not path.exists()
     assert '"ok": false' in render_storage_check(check, json_output=True)
+
+
+def test_darwin_sqlite_path_canonicalizes_only_system_root_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sqlite_utils.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        sqlite_utils.os.path,
+        "realpath",
+        lambda path: "/private/var" if Path(path) == Path("/var") else str(path),
+    )
+
+    canonical = sqlite_utils._canonicalize_platform_alias_prefix(
+        Path("/var/folders/user-controlled-link/state.db")
+    )
+
+    assert canonical == Path("/private/var/folders/user-controlled-link/state.db")
+
+
+@pytest.mark.parametrize(
+    ("version", "safe"),
+    [
+        ((3, 44, 5), False),
+        ((3, 44, 6), True),
+        ((3, 49, 0), False),
+        ((3, 50, 6), False),
+        ((3, 50, 7), True),
+        ((3, 51, 2), False),
+        ((3, 51, 3), True),
+        ((3, 53, 1), True),
+    ],
+)
+def test_sqlite_wal_safety_tracks_upstream_fixed_versions(
+    version: tuple[int, int, int],
+    safe: bool,
+) -> None:
+    assert sqlite_utils.sqlite_wal_is_safe(version) is safe
+    assert sqlite_utils.preferred_sqlite_journal_mode(version) == (
+        "WAL" if safe else "DELETE"
+    )
+
+
+def test_configure_sqlite_journal_mode_falls_back_on_vulnerable_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "journal-mode.db"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0].upper() == "WAL"
+        monkeypatch.setattr(
+            sqlite_utils,
+            "preferred_sqlite_journal_mode",
+            lambda version=None: "DELETE",
+        )
+        assert sqlite_utils.configure_sqlite_journal_mode(connection) == "DELETE"
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].upper() == "DELETE"
 
 
 def test_storage_human_output_sanitizes_database_diagnostics() -> None:

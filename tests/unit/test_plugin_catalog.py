@@ -1174,6 +1174,9 @@ def test_git_install_closes_isolated_git_home_descriptor_on_clone_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    failing_git = tmp_path / "failing-git"
+    failing_git.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    failing_git.chmod(0o755)
     git_home_directories: list[AnchoredDirectory] = []
     original_create_child = AnchoredDirectory.create_child
 
@@ -1190,7 +1193,7 @@ def test_git_install_closes_isolated_git_home_descriptor_on_clone_failure(
     monkeypatch.setattr(AnchoredDirectory, "create_child", capture_child)
     monkeypatch.setattr(
         "ash.plugins.lifecycle.resolve_host_executable",
-        lambda *args, **kwargs: "/bin/false",
+        lambda *args, **kwargs: str(failing_git),
     )
 
     with pytest.raises(PluginLifecycleError, match="could not clone plugin source"):

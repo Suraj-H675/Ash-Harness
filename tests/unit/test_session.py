@@ -21,6 +21,7 @@ from ash.core.session import (
     get_db_connection,
     write_transaction,
 )
+from ash.sqlite_utils import preferred_sqlite_journal_mode
 
 
 def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
@@ -1404,6 +1405,10 @@ def test_manual_backup_never_copies_replacement_during_regular_file_aba_swap(
     )
 
 
+@pytest.mark.skipif(
+    preferred_sqlite_journal_mode() != "WAL",
+    reason="runtime intentionally avoids WAL because its SQLite version is vulnerable",
+)
 def test_manual_backup_rejects_live_uncoordinated_wal_then_succeeds_after_close(
     tmp_path: Path,
 ) -> None:
@@ -1975,12 +1980,15 @@ def test_audit_append_serializes_chain_tail_read(
     assert first_store.verify_audit_log(session.session_id) == []
 
 
-def test_connection_uses_wal_pragmas_and_foreign_keys(tmp_path: Path) -> None:
+def test_connection_uses_safe_journal_mode_and_foreign_keys(tmp_path: Path) -> None:
     db_path = tmp_path / "session_store.db"
 
     conn = get_db_connection(db_path)
     try:
-        assert conn.execute("PRAGMA journal_mode;").fetchone()[0].lower() == "wal"
+        assert (
+            conn.execute("PRAGMA journal_mode;").fetchone()[0].upper()
+            == preferred_sqlite_journal_mode()
+        )
         assert conn.execute("PRAGMA synchronous;").fetchone()[0] == 1
         assert conn.execute("PRAGMA foreign_keys;").fetchone()[0] == 1
     finally:

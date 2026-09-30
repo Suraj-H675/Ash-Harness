@@ -27,7 +27,11 @@ from ash.safe_io import (
     strict_json_loads,
     validate_unlinked_file_path,
 )
-from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
+from ash.sqlite_utils import (
+    PinnedSQLiteDatabase,
+    SQLitePathError,
+    configure_sqlite_journal_mode,
+)
 
 try:
     import fcntl
@@ -1010,7 +1014,7 @@ def get_db_connection(
             )
         conn._ash_coordination_release = release  # type: ignore[attr-defined]
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
+        configure_sqlite_journal_mode(conn)
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
         return conn

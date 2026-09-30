@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ash.core.session import normalize_project_path
-from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
+from ash.sqlite_utils import (
+    PinnedSQLiteDatabase,
+    SQLitePathError,
+    configure_sqlite_journal_mode,
+)
 
 
 REMOTE_TASK_SCHEMA_VERSION = 2
@@ -78,9 +82,9 @@ class RemoteTaskStore:
                         f"v{schema_version} is newer than supported "
                         f"v{REMOTE_TASK_SCHEMA_VERSION}"
                     )
+                configure_sqlite_journal_mode(self._conn)
                 self._conn.executescript(
                     """
-                    PRAGMA journal_mode=WAL;
                     PRAGMA synchronous=FULL;
                     PRAGMA busy_timeout=5000;
 

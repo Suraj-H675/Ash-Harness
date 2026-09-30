@@ -19,6 +19,7 @@ from typing import Iterator, Sequence
 
 from ash.context.compaction import Chunk
 from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
+from ash.sqlite_utils import configure_sqlite_journal_mode
 
 
 MEMORY_SCHEMA_VERSION = 1
@@ -168,7 +169,7 @@ class SQLiteMemoryIndex:
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
             if initialize:
-                connection.execute("PRAGMA journal_mode=WAL")
+                configure_sqlite_journal_mode(connection)
                 connection.execute("PRAGMA synchronous=NORMAL")
             if pin >= 0 and not directory.same_entry(self._name, pin):
                 raise MemoryIndexError(
