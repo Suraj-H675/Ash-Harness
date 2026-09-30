@@ -16,6 +16,7 @@ from ash.memory.sqlite_index import (
     MemoryIndexError,
     SQLiteMemoryIndex,
 )
+from ash.sqlite_utils import preferred_sqlite_journal_mode
 
 
 def _chunk(path: str, content: str, *, start: int = 1, end: int = 1) -> Chunk:
@@ -168,6 +169,10 @@ def test_vector_search_reads_one_embedding_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if preferred_sqlite_journal_mode() != "WAL":
+        pytest.skip(
+            "snapshot-with-concurrent-writer behavior requires safe SQLite WAL mode"
+        )
     reader = _index(tmp_path)
     writer = SQLiteMemoryIndex(
         reader.db_path,

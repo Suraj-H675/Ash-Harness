@@ -93,6 +93,7 @@ class AutomationStore:
         self._clock = clock
         self._lock = threading.RLock()
         self._closed = False
+        self._journal_mode = ""
         try:
             self._conn = self._database.connect(
                 label="automation database",
@@ -146,7 +147,7 @@ class AutomationStore:
                     f"v{schema_version} is newer than supported "
                     f"v{AUTOMATION_SCHEMA_VERSION}"
                 )
-            configure_sqlite_journal_mode(self._conn)
+            self._journal_mode = configure_sqlite_journal_mode(self._conn)
             self._conn.executescript(
                 f"""
                 PRAGMA synchronous=FULL;
@@ -1838,7 +1839,12 @@ class _ImmediateTransaction:
             self.store._lock.release()
             raise AutomationError("automation store is closed")
         try:
+            if self.store._journal_mode != "WAL":
+                self.store._database.verify(label="automation database")
             self.store._conn.execute("BEGIN IMMEDIATE")
+        except SQLitePathError as exc:
+            self.store._lock.release()
+            raise AutomationError(str(exc)) from exc
         except sqlite3.Error as exc:
             self.store._lock.release()
             raise AutomationError(

@@ -53,6 +53,7 @@ from ash.core.session import SessionStore, get_db_connection
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.sdk import AshResult
+from ash.sqlite_utils import preferred_sqlite_journal_mode
 from ash.tools.automation import ListAutomationsTool, ManageAutomationTool
 
 
@@ -1159,13 +1160,63 @@ async def test_automation_maintenance_prunes_through_open_store_after_file_set_s
             if path.exists():
                 path.rename(state / destination)
 
-        await worker._run_maintenance()
-
-        assert store.get_run(original_claim.run.run_id) is None
+        if preferred_sqlite_journal_mode() == "WAL":
+            await worker._run_maintenance()
+            assert store.get_run(original_claim.run.run_id) is None
+        else:
+            with pytest.raises(AutomationError, match="file identity changed"):
+                await worker._run_maintenance()
         with AutomationStore(
             state / "automation.db", clock=lambda: clock[0]
         ) as visible_store:
             assert visible_store.get_run(replacement_run_id) is not None
+    finally:
+        store.close()
+
+
+def test_rollback_journal_store_rejects_visible_database_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.sqlite_utils as sqlite_utils
+
+    monkeypatch.setattr(
+        sqlite_utils,
+        "preferred_sqlite_journal_mode",
+        lambda version=None: "DELETE",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "automation.db"
+    replacement = tmp_path / "replacement.db"
+    store = AutomationStore(database)
+    try:
+        with AutomationStore(replacement) as replacement_store:
+            replacement_store.create_job(
+                name="replacement",
+                prompt="noop",
+                workspace=workspace,
+                schedule=build_schedule(
+                    every="1h",
+                    now=datetime.now(timezone.utc),
+                ),
+                enabled=False,
+            )
+
+        database.rename(tmp_path / "original.db")
+        replacement.rename(database)
+
+        with pytest.raises(AutomationError, match="file identity changed"):
+            store.create_job(
+                name="must-not-write",
+                prompt="noop",
+                workspace=workspace,
+                schedule=build_schedule(
+                    every="1h",
+                    now=datetime.now(timezone.utc),
+                ),
+                enabled=False,
+            )
     finally:
         store.close()
 
