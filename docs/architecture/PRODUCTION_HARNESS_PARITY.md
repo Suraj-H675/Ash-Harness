@@ -11,14 +11,19 @@ This is the authoritative product checklist. Older roadmap files describe
 historical intent and do not prove that a feature works.
 
 This checklist measures Ash against its own required behavior; it is not a
-claim that Ash is feature-equivalent to every public harness. “Verified
+claim that Ash is feature-equivalent to every public harness. Competitor scope
+is evidence, not an automatic backlog: gateway/chat-channel/mobile/voice
+surfaces matter only when they solve a real Ash product requirement. “Verified
 locally” means the Ash implementation and its available tests support the
 listed contract. It does not imply production maturity, ecosystem breadth,
 native client coverage, or interoperability with every comparator.
 
 ## Evidence Rules
 
-- **Verified:** wired into the installed CLI and covered by an end-to-end test.
+- **Verified:** wired into the installed product and covered by appropriate
+  end-to-end/integration evidence.
+- **Verified hosted:** behavior that specifically depends on a supported host
+  or CI environment has also passed on that real hosted environment.
 - **Partial:** code exists, but behavior, wiring, portability, or tests are incomplete.
 - **Placeholder:** surface exists but returns canned data or targets a nonexistent service.
 - **Missing:** no usable implementation exists.
@@ -36,8 +41,37 @@ native client coverage, or interoperability with every comparator.
 - Hermes Agent source: <https://github.com/NousResearch/hermes-agent>
 - OpenCode source: <https://github.com/anomalyco/opencode>
 - Aider source: <https://github.com/Aider-AI/aider>
+- Codex Goals: <https://developers.openai.com/cookbook/examples/codex/using-goals-in-codex>
 
-Research is clean-room: proprietary or leaked source is not used.
+Research is clean-room: proprietary or leaked source is not used. Public
+benchmark framing was refreshed on 2026-09-30 against current official/public
+documentation.
+
+## Mission Finish Lines
+
+These are the finite gates for deciding whether the Ash mission is actually
+complete. They supersede the previous hardening-phase F1-F5 gates without
+reopening already-verified areas mechanically.
+
+1. **M1 — Evidence and claims:** current comparator research, support scope,
+   parity statuses, and public claims agree with verified reality. Evidence-only
+   gaps are either closed or explicitly scoped.
+2. **M2 — Supported-host production core:** Linux/macOS safety, sandboxing,
+   terminal UX/accessibility, resource containment, recovery, and security
+   boundaries have realistic supported-host evidence and no material known
+   production gap.
+3. **M3 — Interoperability confidence:** provider, local-model, MCP, LSP,
+   browser, and IDE/remote protocol claims have enough real implementation or
+   vendor/runtime conformance evidence to justify their support claims.
+4. **M4 — High-value harness parity:** evaluate remaining comparator advantages
+   by real coding-harness value. Implement the ones that materially strengthen
+   Ash (for example durable long-horizon objectives if Ash lacks an equivalent),
+   and explicitly reject unrelated scope rather than copying feature counts.
+5. **M5 — Final mission audit:** realistic first-run, advanced, interrupted,
+   hostile/failure, packaging, performance, security, and maintenance journeys
+   are revalidated; docs are truthful; supported-host CI is green; and the final
+   benchmark no longer identifies a material core-harness weakness that should
+   be fixed before calling Ash first-class and production-worthy.
 
 ## 1. Installation And Setup
 
@@ -257,7 +291,7 @@ Research is clean-room: proprietary or leaked source is not used.
 | Database migrations | Verified locally | Schema version table, transactional ordered migration, future-version refusal, and backups |
 | Corruption recovery | Verified locally | Read-only integrity diagnostics plus validated backup and pre-restore preservation |
 | Offline test suite | Verified locally | Session-wide test isolation establishes a synthetic HOME/USERPROFILE/XDG/AppData profile before collection, isolates global Git config, and blocks non-loopback Python DNS/socket connections while preserving loopback/Unix-socket integration tests; the complete local suite passes under those guards without live-network or real-home dependencies |
-| Cross-platform CI | Partial | The configured Linux and macOS matrix covers Python 3.12, 3.13, and 3.14 on both supported native hosts, with packaging smoke gates in CI. Native Windows CI is intentionally absent because native Windows is outside the supported host matrix; the expanded matrix still requires hosted-run evidence before this row can be promoted from Partial |
+| Cross-platform CI | Verified hosted | The configured Linux and macOS matrix covers Python 3.12, 3.13, and 3.14 on both supported native hosts, with packaging smoke gates in CI. The full supported-host matrix is green in hosted CI as of commit `18e3fb5`. Native Windows CI is intentionally absent because native Windows is outside the supported host matrix |
 | Packaging CI | Verified locally | Wheel/sdist build, minimal clean install, artifact metadata/content, CLI/config/trust, repo-map import, optional dependency absence, and missing-extra behavior are exercised |
 | Security tests | Partial | Command bypass coverage includes shell-expanded destructive options, dynamic executables, common process/shell wrappers, entry-time workspace identity pinning plus descriptor-anchored POSIX cwd race regressions across foreground/background command, direct/scoped sandbox execution (including nested cwd after whole-workspace replacement), direct Git, patch, managed worktree Git, LSP, MCP stdio, durable automation, command-hook execution, direct executable-plugin launch, and repository-map Git-ignore evaluation. Ash-owned read-only Git disables pagers/fsmonitor/signature verification/external diff/textconv, discovers effective clean/smudge/process filter driver names (including trusted user-global includes), shadows executable filters to no-op command-scope values, pins the worktree to the selected workspace, and rejects repository-local/worktree config that redirects attributes, excludes, diff ordering, mailmap, or includes through host paths while preserving system/global user policy. Repository-map `check-ignore` now performs the same local/worktree provenance check before Git ignore evaluation; malformed or repository-controlled external ignore/include policy fails closed rather than shaping model context from host files. Ash-managed agent worktree Git uses a scrubbed environment, an Ash-owned empty hooks directory for every operation, disabled fsmonitor/signature/external-diff/textconv behavior, the original repository/cwd identity across config preflight and mutation, and fails closed when local/worktree config defines executable filters, merge drivers, diff helpers, local includes, or host-path indirections. MCP stdio launch now resolves every bare command to an absolute host executable before spawn while excluding its trusted cwd/source/current workspace from PATH shadowing; explicit relative project commands are canonicalized against the pinned project source root when no cwd is declared, and manager/client share the same resolver and cwd identity. Linux Bubblewrap requires security-supported 0.12.0+, a private user namespace with nested-userns creation disabled, descriptor-bound workspace/extra mounts, and a minimal `/etc` compatibility set that excludes host machine identity; Docker executable-plugin code requires descriptor-anchored immutable capture from the discovered plugin inode, is streamed into an Ash-owned daemon volume mounted read-only at runtime, and fails closed instead of falling back to a live host bind when anchored capture is unavailable; ordinary Docker workspace binds remain daemon-resolved host paths, while concurrent replacement by an independently hostile same-account host process is explicitly outside Ash's supported local application boundary. Descriptor-scoped custom-command reads reject post-validation link swaps; whole-workspace replacement is rejected across normal turns, scoped I/O, project memory, REPL workspace-aware commands, MCP reload/reconnect, executable-plugin runtime reload, live project-instruction refresh, read-only Git multi-stage preflight, repo-map Git ignore evaluation, and managed worktree Git orchestration. Mixed-generation A→B→A regressions additionally reject transient project hook config and bind discovered plugin manifests to their plugin-root inode, skill metadata/resources to the discovered package inode, custom-agent instructions and custom-command templates to their source-file inode, trusted project MCP configs to their source-root identity, and trusted project LSP/A2A config reads directly to the runtime's pinned workspace guard; built-in LSP autodetection no longer treats executable workspace dependencies as installed servers without explicit trusted project configuration; tool/event redaction covers assigned/header secrets, supported provider keys, GitHub/Slack/Stripe bearer credentials, and complete or chunk-split PEM private keys, including background-process streaming and durable runtime-event replay. Remaining gaps include consistent aggregate CPU/memory containment across isolation backends plus continued broader path-bypass/sandbox-escape review. |
 | Performance tests | Verified locally | Lightweight CLI import graph and installed version startup are regression-tested under one second; bounded large-repository memory indexing is covered by a 170-file offline benchmark; long-session memory proves 1,000-file indexing plus 20 exact-recall rounds with bounded indexing and sub-50 ms recall; cached transcript redraw tests prove only changed Markdown is re-rendered and enforce generous latency ceilings for both a 200-entry interactive transcript and the 1,000-entry bounded history |
@@ -282,9 +316,13 @@ Research is clean-room: proprietary or leaked source is not used.
 
 Ash is a credible local-first terminal coding harness with unusually broad
 implemented primitives for sessions, safety, tools, MCP, local delegation, and
-automation. It is **not at the same overall level** as Hermes Agent, OpenClaw,
-OpenCode, Claude Code, Codex CLI, Gemini CLI, or Aider as a complete product.
-The differences are product-scope differences, not merely missing polish:
+automation. The previous production-hardening/re-audit phase is complete, but
+the **Ash mission is not complete yet**: supported-host/core evidence gaps and
+interoperability gaps remain, and some high-value coding-harness capabilities
+still need an explicit product decision or implementation before Ash should be
+called first-class and production-worthy without qualification.
+
+Current comparators also cover materially different product categories:
 
 - OpenClaw is a gateway product with many chat channels, multi-agent routing,
   mobile nodes, media/voice surfaces, a browser Control UI, dozens of providers,
@@ -301,9 +339,10 @@ The differences are product-scope differences, not merely missing polish:
   [Gemini CLI feature index](https://geminicli.com/docs/), and
   [Aider feature overview](https://aider.chat/).
 
-Ash should be described as **strong local coding-core parity, incomplete
-product parity, and a WIP**. The missing gateway/channel/mobile/media/cloud
-surfaces, subscription/OAuth provider breadth, remote browser CDP/direct
-existing-tab control, and richer remote-agent modalities are
-material roadmap items rather than claims that should be hidden behind a
-“verified” label.
+Ash should currently be described as **strong local coding-core parity with
+remaining supported-host/interoperability/product gaps, and a WIP**. Missing
+gateway/channel/mobile/media surfaces are comparator scope differences, not
+automatic Ash debt. Subscription/provider auth breadth, remote browser control,
+richer remote-agent modalities, persistent long-horizon objective workflows,
+and other comparator advantages must be evaluated under M3/M4 for actual Ash
+user value before becoming roadmap commitments.

@@ -138,7 +138,11 @@ jobs:
         run: uv run --locked pytest -q tests/e2e/test_browser_playwright.py --timeout=120 --timeout-method=thread
 
   viewport-pty-e2e:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -148,10 +152,14 @@ jobs:
           version: "0.12.17"
           enable-cache: true
           python-version: "3.12"
-      - name: Install tmux
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes tmux
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
       - run: uv sync --locked --group dev
       - name: Real viewport PTY integration
         env:
