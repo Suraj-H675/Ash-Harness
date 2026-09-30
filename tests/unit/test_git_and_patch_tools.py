@@ -608,6 +608,11 @@ async def test_run_git_uses_supplied_sandbox_manager(
     assert stdout == "sandboxed"
     assert stderr == ""
     command = manager.run.await_args.args[0]
+    metadata = os.stat(tmp_path)
+    assert manager.run.await_args.kwargs["expected_cwd_identity"] == (
+        metadata.st_dev,
+        metadata.st_ino,
+    )
     if expected_executable is None:
         assert Path(command[0]).stem.casefold() == "git"
         assert Path(command[0]).is_absolute()

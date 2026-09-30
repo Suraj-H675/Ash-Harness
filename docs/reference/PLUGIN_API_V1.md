@@ -160,11 +160,13 @@ transaction artifact.
 
 ## Isolation and policy
 
-Executable plugins are denied by default unless Bubblewrap or the configured
-local Docker sandbox is available. macOS `sandbox-exec` is not sufficient for
-plugins because it cannot provide the required host-read isolation; macOS
-therefore uses Docker for executable plugins. WSL2 follows the Linux host path.
-Native Windows is not currently supported. The installed plugin root is mounted read-only,
+Executable plugins are denied by default unless the configured Docker sandbox
+can provide both full host-read isolation and aggregate CPU/memory containment.
+Bubblewrap is still available for approval-gated command execution, but is not
+sufficient for executable plugin code because it does not impose Ash-owned
+aggregate resource limits; macOS `sandbox-exec` is also insufficient because it
+cannot provide the required host-read isolation. WSL2 follows the Linux host
+path. Native Windows is not currently supported. The installed plugin root is mounted read-only,
 temporary storage is isolated, the network is disabled, and the environment
 contains only operational values such as `PATH`, `HOME`, locale, and Python I/O
 settings. Ash credentials and arbitrary host environment variables are not
@@ -172,9 +174,9 @@ forwarded; only isolated temporary storage is writable.
 
 For emergency compatibility, a user may set
 `ASH_ALLOW_UNSAFE_PLUGIN_RUNTIME=true` or the equivalent user configuration.
-This is deliberately not accepted from project `.ash/config.toml`. It runs
-plugin code as the current user with host access and should only be used for
-code the user fully trusts.
+This is deliberately not accepted from project `.ash/config.toml`. It may run
+plugin code without the normal isolation/resource guarantees and should only be
+used for code the user fully trusts.
 
 Isolation does not replace Ash policy. Each namespaced plugin tool follows the
 same permission decision, user approval, hook lifecycle, middleware, audit log,

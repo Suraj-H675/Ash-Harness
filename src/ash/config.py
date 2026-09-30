@@ -676,7 +676,8 @@ class AshConfig(BaseSettings):
     allow_unsafe_plugin_runtime: bool = Field(
         False,
         description=(
-            "Allow executable plugins without OS filesystem and network isolation."
+            "Allow executable plugins without full OS isolation and aggregate "
+            "CPU/memory containment."
         ),
     )
     sandbox_backend: str = Field(

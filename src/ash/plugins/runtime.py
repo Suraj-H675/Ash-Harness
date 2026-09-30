@@ -237,10 +237,17 @@ class PluginHostClient:
     async def _ensure_started(self) -> None:
         if self.running:
             return
-        if not self.sandbox_manager.is_fully_isolated() and not self.allow_unisolated:
+        if (
+            (
+                not self.sandbox_manager.is_fully_isolated()
+                or not self.sandbox_manager.has_aggregate_resource_limits()
+            )
+            and not self.allow_unisolated
+        ):
             raise PluginRuntimeError(
-                "executable plugin refused: no OS sandbox is available; install a "
-                "supported sandbox or explicitly set "
+                "executable plugin refused: full OS isolation plus aggregate CPU and "
+                "memory containment are required; use the bounded Docker sandbox or "
+                "explicitly set "
                 "ASH_ALLOW_UNSAFE_PLUGIN_RUNTIME=true"
             )
         self._stderr_chunks.clear()
@@ -630,6 +637,7 @@ def build_plugin_runtime_tools(
             workspace_root=plugin.root,
             workspace_read_only=True,
             require_read_isolation=True,
+            require_resource_containment=not allow_unisolated,
             network=False,
             timeout_seconds=max(1, int(plugin.manifest.runtime.timeout_seconds)),
             backend_preference=backend_preference,

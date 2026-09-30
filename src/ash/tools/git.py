@@ -927,6 +927,7 @@ async def _run_prepared_git(
                 timeout=30,
                 env=environment,
                 passthrough_env_names=allowlist,
+                expected_cwd_identity=expected_cwd_identity,
             )
         except SandboxBackendUnavailable as exc:
             return 126, "", f"sandbox unavailable for git command: {exc}"

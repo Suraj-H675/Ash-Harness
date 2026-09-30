@@ -4,7 +4,7 @@ import sys
 import tarfile
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -293,7 +293,7 @@ async def test_isolated_plugin_host_pins_root_across_path_swap(
         return argv
 
     monkeypatch.setattr(BubblewrapSandbox, "wrap", swap_after_wrap)
-    client = PluginHostClient(plugin, manager, allow_unisolated=False)
+    client = PluginHostClient(plugin, manager, allow_unisolated=True)
     try:
         result = await client.call_tool("echo", {"text": "ORIGINAL"})
         assert result.output == "ORIGINAL"
@@ -1171,6 +1171,57 @@ def test_runtime_tool_names_are_portable_and_collisions_are_rejected(
             docker_image="ash-sandbox:latest",
             allow_unisolated=True,
         )
+
+
+def test_safe_plugin_runtime_prefers_resource_bounded_docker(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path / "plugin")
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=True),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        tools = build_plugin_runtime_tools(
+            [plugin],
+            SafetyGuard(tmp_path),
+            backend_preference="auto",
+            docker_image="ash-sandbox:latest",
+            docker_memory_mb=1024,
+            docker_cpus=1.0,
+            allow_unisolated=False,
+        )
+
+    assert len(tools) == 1
+    manager = tools[0].client.sandbox_manager
+    assert manager.backend_name == "docker"
+    assert manager.require_resource_containment is True
+    assert manager.has_aggregate_resource_limits() is True
+
+
+@pytest.mark.asyncio
+async def test_safe_plugin_runtime_refuses_native_only_sandbox(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path / "plugin")
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=True),
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+    ):
+        tools = build_plugin_runtime_tools(
+            [plugin],
+            SafetyGuard(tmp_path),
+            backend_preference="auto",
+            docker_image="ash-sandbox:latest",
+            allow_unisolated=False,
+        )
+
+    result = await tools[0].run(text="blocked")
+
+    assert result.success is False
+    assert "aggregate CPU and memory containment" in (result.error or "")
+    assert "ASH_ALLOW_UNSAFE_PLUGIN_RUNTIME=true" in (result.error or "")
 
 
 @pytest.mark.asyncio
