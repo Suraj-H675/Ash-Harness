@@ -148,7 +148,7 @@ reopening already-verified areas mechanically.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | Multiline editor | Verified locally | Prompt-toolkit editor with persistent history and multiline bindings |
-| Responsive full-screen TUI | Partial | Transcript-owned prompt-toolkit viewport, narrow/wide resize reflow, page navigation, live tail, terminal restoration, and inline fallback are locally verified; native Windows is outside the supported host matrix and Windows users run the Linux path through WSL2 |
+| Responsive full-screen TUI | Verified hosted | Transcript-owned prompt-toolkit viewport, narrow/wide resize reflow, page navigation, live tail, terminal restoration, and inline fallback are covered by real tmux PTY E2E on both supported native hosts (Linux and macOS) in hosted CI; native Windows is outside the supported host matrix and Windows users run the Linux path through WSL2 |
 | Streaming transcript | Verified locally | Immutable semantic user/assistant/reasoning/tool/approval/status/error entries, bounded mutable live cells, rich cached Markdown, command output routing, and durable-session hydration |
 | Markdown/code rendering | Verified locally | Streamed Rich Markdown with fenced-code highlighting and bounded repaint frequency |
 | Diff preview | Verified locally | Bounded unified and selectable persisted side-by-side previews for writes/replacements/patches are wired into the interactive approval flow |

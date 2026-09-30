@@ -120,3 +120,103 @@ asyncio.run(main())
             check=False,
             capture_output=True,
         )
+
+
+@pytest.mark.skipif(
+    os.name == "nt"
+    or shutil.which("tmux") is None
+    or os.environ.get("ASH_RUN_PTY_TESTS") != "1",
+    reason="set ASH_RUN_PTY_TESTS=1 with a POSIX tmux pseudo-terminal",
+)
+def test_screen_reader_mode_is_linear_in_real_terminal(tmp_path: Path) -> None:
+    session = f"ash-screen-reader-{os.getpid()}-{time.monotonic_ns()}"
+    code = """
+import asyncio
+from pathlib import Path
+from ash.ui.prompt import PromptInput
+from ash.ui.terminal import TerminalUI
+
+async def main():
+    ui = TerminalUI(screen_reader_mode=True, show_token_meter=True)
+    with ui.begin_turn():
+        ui.print_thought("checking accessibility")
+        ui.print_token("**accessible output**")
+    ui.finalize_turn()
+
+    prompt = PromptInput(
+        history_path=Path(%r),
+        tui_mode="viewport",
+        screen_reader_mode=True,
+    )
+    try:
+        value = await prompt.read("accessible> ")
+    finally:
+        prompt.close()
+    print("SCREEN_READER_RESULT=" + value, flush=True)
+    await asyncio.sleep(5)
+
+asyncio.run(main())
+""" % str(tmp_path / "screen-reader-history")
+    target = f"{session}:0.0"
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "-s",
+                session,
+                sys.executable,
+                "-c",
+                code,
+            ],
+            check=True,
+            cwd=Path(__file__).parents[2],
+        )
+        subprocess.run(
+            ["tmux", "set-option", "-t", session, "remain-on-exit", "on"],
+            check=True,
+        )
+
+        capture = ""
+        ready_deadline = time.monotonic() + 5
+        while time.monotonic() < ready_deadline:
+            capture = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", target],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            if "accessible>" in capture:
+                break
+            time.sleep(0.05)
+        assert "accessible>" in capture
+        assert "Reasoning: checking accessibility" in capture
+        assert "accessible output" in capture
+        assert "╭" not in capture
+
+        subprocess.run(["tmux", "send-keys", "-t", target, "-l", "hello"], check=True)
+        subprocess.run(["tmux", "send-keys", "-t", target, "C-m"], check=True)
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            capture = subprocess.run(
+                ["tmux", "capture-pane", "-p", "-t", target],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            if "SCREEN_READER_RESULT=hello" in capture:
+                break
+            time.sleep(0.05)
+        assert "SCREEN_READER_RESULT=hello" in capture
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session],
+            check=False,
+            capture_output=True,
+        )
