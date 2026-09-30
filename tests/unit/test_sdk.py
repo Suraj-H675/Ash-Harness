@@ -100,7 +100,10 @@ async def test_async_sdk_rejects_unisolated_auto_approve(tmp_path, monkeypatch) 
         safety_tier="auto_approve",
     )
 
-    with pytest.raises(SandboxBackendUnavailable, match="does not isolate"):
+    with pytest.raises(
+        SandboxBackendUnavailable,
+        match="aggregate CPU and memory containment",
+    ):
         await AshClient.create(config=config, provider=SDKProvider())
 
 
