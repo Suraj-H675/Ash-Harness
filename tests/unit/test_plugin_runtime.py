@@ -119,9 +119,10 @@ def _plugin(
     timeout: float = 1.0,
     schema: dict | None = None,
     python_executable: str | None = None,
+    host_source: str = HOST_SOURCE,
 ) -> DiscoveredPlugin:
     root.mkdir(parents=True, exist_ok=True)
-    (root / "runtime.py").write_text(HOST_SOURCE, encoding="utf-8")
+    (root / "runtime.py").write_text(host_source, encoding="utf-8")
     manifest = PluginManifest.from_dict(
         {
             "name": "example-plugin",
@@ -161,8 +162,14 @@ def _tool(
     timeout: float = 1.0,
     allow_unisolated: bool = True,
     schema: dict | None = None,
+    host_source: str = HOST_SOURCE,
 ) -> PluginRuntimeTool:
-    plugin = _plugin(tmp_path / "plugin", timeout=timeout, schema=schema)
+    plugin = _plugin(
+        tmp_path / "plugin",
+        timeout=timeout,
+        schema=schema,
+        host_source=host_source,
+    )
     client = PluginHostClient(
         plugin,
         _direct_manager(plugin.root),
@@ -548,13 +555,12 @@ async def test_crashed_plugin_call_is_not_automatically_replayed(
 
 @pytest.mark.asyncio
 async def test_plugin_protocol_version_mismatch_is_rejected(tmp_path: Path) -> None:
-    tool = _tool(tmp_path)
-    (tool.plugin.root / "runtime.py").write_text(
-        """import json, sys
+    tool = _tool(
+        tmp_path,
+        host_source="""import json, sys
 request = json.loads(sys.stdin.readline())
 print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"protocol_version": 2}}), flush=True)
 """,
-        encoding="utf-8",
     )
 
     result = await tool.run(text="hello")
