@@ -93,6 +93,16 @@ def plugin_tool_name(plugin_name: str, tool_name: str) -> str:
     return namespaced_plugin_tool_name(plugin_name, tool_name)
 
 
+def _validate_plugin_initialize_response(initialized: Any) -> None:
+    if (
+        not isinstance(initialized, dict)
+        or initialized.get("protocol_version") != PLUGIN_RUNTIME_PROTOCOL_VERSION
+    ):
+        raise PluginRuntimeError(
+            "plugin initialize response has an unsupported protocol_version"
+        )
+
+
 class PluginHostClient:
     """Own one lazily started JSON-RPC subprocess for a discovered plugin."""
 
@@ -333,14 +343,11 @@ class PluginHostClient:
         except Exception:
             await self._discard_process()
             raise
-        if (
-            not isinstance(initialized, dict)
-            or initialized.get("protocol_version") != PLUGIN_RUNTIME_PROTOCOL_VERSION
-        ):
+        try:
+            _validate_plugin_initialize_response(initialized)
+        except PluginRuntimeError:
             await self._discard_process()
-            raise PluginRuntimeError(
-                "plugin initialize response has an unsupported protocol_version"
-            )
+            raise
 
     async def _stage_docker_plugin_workspace(self) -> str:
         """Capture the discovered plugin inode and stage immutable bytes in Docker."""
