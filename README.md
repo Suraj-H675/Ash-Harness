@@ -37,9 +37,17 @@ branches.
 
 ### Installation
 
-Production installs come from an **immutable GitHub Release**, not from a
-moving branch. The verified install path uses GitHub's release attestation and
-asset verification before executing Ash's standalone installer:
+Ash's intended production install path is an **immutable GitHub Release**, not
+a moving branch. The release workflow builds and attests the artifacts and the
+installer verifies the selected release before installation.
+
+**Current status:** no immutable Ash GitHub Release has been published yet, so
+the production-install path is not currently available to end users. Until a
+real release is published and its clean-machine install/upgrade journey is
+verified, Ash must not claim a completed production distribution experience.
+Development setup is documented in [Contributing](CONTRIBUTING.md).
+
+Once a verified immutable release exists, the intended install flow is:
 
 ```bash
 repo="Suraj-H675/Ash-Harness"
@@ -570,6 +578,9 @@ they are complete:
 - LSP rename and code actions are not exposed; and
 - a broad messaging-channel gateway is not currently part of Ash.
 
-Ash is production-worthy within the documented supported scope above. The
-qualified boundaries are intentional support limits, not untracked completeness
-claims or hidden mission blockers.
+Ash is not yet justified as fully production-ready under the project Charter.
+The current implementation is strong, but the post-closure Charter audit
+reopened the final mission gate because the documented production release does
+not yet exist and whole-product parity still has material gaps, including
+production observability/tracing. Qualified boundaries above remain truthful
+support limits rather than claims of feature identity with every comparator.

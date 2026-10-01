@@ -75,7 +75,8 @@ reopening already-verified areas mechanically.
    benchmark no longer identifies a material core-harness weakness that should
    be fixed before calling Ash first-class and production-worthy.
 
-Current gate state: **M1-M5 are closed/current.** Partial capability rows below
+Current gate state: **M1-M4 are closed/current; M5 is reopened after the
+2026-10-01 Charter-level post-closure audit.** Partial capability rows below
 remain deliberately qualified and do
 not imply broader support than their recorded evidence.
 
@@ -125,9 +126,38 @@ sign-in/model-discovery/Responses completion journey, the stronger live
 function-call continuation also passed, and the final comparator pass did not
 identify another material Ash coding-core gap.
 
-### M5 final audit — closed 2026-10-01
+### M5 post-closure Charter audit — reopened 2026-10-01
 
-The final mission audit is complete:
+The earlier M5 closure was too optimistic. Re-reading
+`01_ASH_CHARTER.md` against the actual repository and current competitors
+identified material whole-product gaps that the previous bounded audit did not
+justify dismissing:
+
+- **Production distribution is not real yet.** The release workflow is
+  implemented, but the repository currently has no published GitHub Release.
+  README's immutable-release install flow therefore has nothing a first-time
+  production user can actually install. A real immutable release plus
+  clean-machine install, upgrade, repair, and rollback evidence is required.
+- **Production observability is materially behind strong current harnesses.**
+  Ash has secret-redacted logs, debug bundles, local usage metrics, audit
+  records, and correlation IDs, but no OpenTelemetry/OTLP trace export,
+  Prometheus-compatible metrics surface, or equivalent end-to-end run/model/
+  tool/context tracing plane. This is a direct Charter dimension, not optional
+  feature-count parity.
+- **Interoperability breadth is still explicitly partial.** The API-key
+  provider row and local-model row remain Partial because live vendor/runtime
+  conformance is much narrower than the deterministic protocol coverage,
+  especially for LM Studio/vLLM and multi-vendor hosted providers.
+- **Several whole-product surfaces remain materially behind current strong
+  harnesses.** Browser control is still loopback/isolated-context only rather
+  than remote/direct selected-tab or computer-use breadth; the plugin
+  marketplace lacks a first-party hosted/curated ecosystem and coordinated
+  multi-plugin transactions; MCP, ACP, and A2A intentionally leave meaningful
+  protocol modalities unadvertised. These may ultimately remain scoped
+  differences, but the Charter requires explicit evidence that they do not
+  create a material whole-product weakness before closure.
+
+Evidence that remains valid from the previous audit:
 
 - **First-run, interrupted, maintenance, and performance journeys:** a bounded
   representative pack passed **42/42** tests covering fresh setup/process
@@ -158,9 +188,9 @@ The final mission audit is complete:
   current verdict, while older research/audit files are explicitly labeled as
   dated evidence rather than competing product truth.
 
-M5 is closed. Future work is normal product evolution inside or beyond Ash's
-documented scope; it is no longer required to satisfy this production-harness
-mission.
+M5 closes only after the blockers above are resolved or reclassified with
+stronger whole-product evidence. Until then, Ash must not claim the production
+harness mission is complete.
 
 ## 1. Installation And Setup
 
@@ -406,9 +436,10 @@ mission.
 
 ## Overall parity verdict
 
-Ash is a first-class, production-worthy local-first terminal coding harness
-within its documented supported scope. The production-hardening/re-audit
-mission is complete: **M1-M5 are closed/current**.
+Ash is a strong local-first terminal coding harness with substantial verified
+production engineering, but the project Charter does **not** currently justify
+calling the mission complete or claiming unqualified first-class parity with
+the strongest current harnesses. **M5 is reopened.**
 
 Current comparators also cover materially different product categories:
 
@@ -427,10 +458,9 @@ Current comparators also cover materially different product categories:
   [Gemini CLI feature index](https://geminicli.com/docs/), and
   [Aider feature overview](https://aider.chat/).
 
-Ash should currently be described as **a production-worthy terminal coding
-harness with strong coding-core parity on supported Linux/macOS hosts (and WSL2
-through the supported Linux path)**. This is not a claim of feature identity
-with broader assistant/gateway products. Missing gateway/channel/mobile/media
-surfaces are comparator scope differences, not automatic Ash debt. Qualified
-Partial rows remain deliberate support-boundary statements rather than hidden
-mission blockers.
+Ash should currently be described as **a strong, heavily hardened terminal
+coding harness that is close to the target but still in final whole-product
+production/parity work**. It has strong coding-core parity on supported
+Linux/macOS hosts (and WSL2 through the supported Linux path), but it is not
+truthful to claim parity "in everything" with leading harnesses while the
+reopened M5 blockers and qualified Partial rows remain.
