@@ -535,7 +535,8 @@ def test_manager_reports_sandbox_exec_as_partial_isolation(tmp_path: Path) -> No
     assert status["isolated"] is False
     assert status["filesystem"] == "host-read;workspace-write"
     assert status["network"] == "blocked"
-    assert "host file reads" in status["detail"]
+    assert "does not restrict host file reads" in status["detail"]
+    assert "macOS may still deny particular paths independently" in status["detail"]
     assert "full filesystem isolation" in status["remediation"]
 
 

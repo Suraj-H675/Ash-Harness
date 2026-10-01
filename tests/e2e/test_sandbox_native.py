@@ -71,6 +71,8 @@ fi
         if sys.platform.startswith("linux"):
             assert "HOST_READ=blocked" in result.stdout
         else:
-            assert "HOST_READ=allowed" in result.stdout
+            # Ash's sandbox-exec profile does not provide host-read isolation,
+            # but macOS may independently deny access to particular paths.
+            assert manager.status()["filesystem"] == "host-read;workspace-write"
     finally:
         outside_write.unlink(missing_ok=True)

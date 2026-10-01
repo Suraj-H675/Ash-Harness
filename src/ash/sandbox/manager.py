@@ -418,7 +418,8 @@ class SandboxManager:
             network = "enabled" if self.network else "blocked"
             detail = (
                 "macOS sandbox-exec contains workspace writes and network access, "
-                "but host file reads remain available; full isolation and "
+                "but Ash does not restrict host file reads; macOS may still deny "
+                "particular paths independently. Full isolation and "
                 "aggregate CPU/memory containment are unavailable, so safe "
                 "auto-approval is disabled."
             )
