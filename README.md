@@ -582,6 +582,34 @@ they are complete:
 Ash is not yet justified as fully production-ready under the project Charter.
 The current implementation is strong, but the post-closure Charter audit
 reopened the final mission gate because the documented production release does
-not yet exist and whole-product parity still has material gaps, including
-production observability/tracing. Qualified boundaries above remain truthful
-support limits rather than claims of feature identity with every comparator.
+not yet exist and whole-product parity still has material gaps. Production
+observability is now available as an explicit opt-in OpenTelemetry/OTLP
+trace-and-metrics path; qualified boundaries above remain truthful support
+limits rather than claims of feature identity with every comparator.
+
+### Observability
+
+Ash can export **content-free OpenTelemetry traces and metrics** over OTLP/HTTP
+when the optional `observability` extra is installed and the user explicitly
+enables it. It is off by default and project configuration cannot enable it or
+redirect its collector.
+
+Typical user-owned configuration:
+
+```toml
+observability_enabled = true
+observability_otlp_endpoint = "http://127.0.0.1:4318"
+observability_sample_rate = 1.0
+```
+
+The same settings are available as `ASH_OBSERVABILITY_*` environment
+variables. Standard `OTEL_EXPORTER_OTLP_ENDPOINT` or per-signal trace/metric
+endpoint variables are honored only after Ash observability has been explicitly
+enabled.
+
+Exported telemetry covers turn, provider-request, tool, retry/circuit, token,
+context, outcome, and duration signals. Ash does **not** export prompts,
+assistant responses, tool arguments/results, file paths, credential material,
+or provider error messages. Run `ash setup status` or `ash doctor` to inspect
+the effective state. See
+[Observability](docs/reference/OBSERVABILITY.md) for the full contract.

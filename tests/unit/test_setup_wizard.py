@@ -980,6 +980,13 @@ def test_setup_status_shows_actionable_optional_capability_next_steps(
                 "web_search": {"configured": False},
                 "browser": {"installed": False},
                 "mcp": {"configured": False},
+                "observability": {
+                    "enabled": False,
+                    "available": True,
+                    "ready": False,
+                    "sample_rate": 1.0,
+                    "content_capture": False,
+                },
                 "memory": {"backend": "sqlite"},
                 "sandbox": {"backend": "auto"},
             },
@@ -992,6 +999,8 @@ def test_setup_status_shows_actionable_optional_capability_next_steps(
     assert "ash setup web" in output
     assert "ash setup browser" in output
     assert "ash mcp add" in output
+    assert "Observability" in output
+    assert "ASH_OBSERVABILITY_ENABLED" in output
 
 
 class TestProbeModels:
@@ -1304,6 +1313,8 @@ class TestCmdSetup:
             web_search_provider="auto",
             memory_backend="sqlite",
             sandbox_backend="auto",
+            observability_enabled=False,
+            observability_sample_rate=1.0,
             workspace_root=tmp_path,
         )
         monkeypatch.setattr("ash.config.AshConfig.load", lambda: config)
@@ -1322,6 +1333,8 @@ class TestCmdSetup:
         assert payload["provider"]["ready"] is True
         assert payload["fallback_models"] == ["ollama/local"]
         assert payload["capabilities"]["memory"]["backend"] == "sqlite"
+        assert payload["capabilities"]["observability"]["enabled"] is False
+        assert payload["capabilities"]["observability"]["content_capture"] is False
         assert "sk-status-secret" not in json.dumps(payload)
 
     def test_status_human_output_sanitizes_untrusted_model_identifier(
@@ -1339,6 +1352,8 @@ class TestCmdSetup:
             web_search_provider="auto",
             memory_backend="sqlite",
             sandbox_backend="auto",
+            observability_enabled=False,
+            observability_sample_rate=1.0,
             workspace_root=tmp_path,
         )
 

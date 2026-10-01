@@ -13,6 +13,7 @@ from ash.commands.doctor import (
     _check_browser,
     _check_credentials,
     _check_lsp,
+    _check_observability,
     _check_storage,
     _check_connectivity,
     _check_web_search,
@@ -589,6 +590,52 @@ def test_web_search_doctor_reports_auto_detection(
 
     assert check.status == "pass"
     assert "brave" in check.message
+
+
+def test_observability_doctor_reports_off_by_default() -> None:
+    check = _check_observability(AshConfig())
+
+    assert check.status == "pass"
+    assert "disabled" in check.message
+
+
+def test_observability_doctor_reports_ready_without_echoing_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ash.observability._module_available",
+        lambda _name: True,
+    )
+    endpoint = "https://collector.example/private-team"
+    check = _check_observability(
+        AshConfig(
+            observability_enabled=True,
+            observability_otlp_endpoint=endpoint,
+            observability_sample_rate=0.25,
+        )
+    )
+
+    assert check.status == "pass"
+    assert "sample_rate=0.25" in check.message
+    assert "content_capture=false" in check.message
+    assert endpoint not in check.message
+
+
+def test_observability_doctor_reports_missing_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ash.observability._module_available",
+        lambda _name: True,
+    )
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", raising=False)
+
+    check = _check_observability(AshConfig(observability_enabled=True))
+
+    assert check.status == "fail"
+    assert "endpoints are incomplete" in check.message
 
 
 def test_browser_doctor_distinguishes_missing_extra_and_binary(

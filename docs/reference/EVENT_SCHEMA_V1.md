@@ -3,8 +3,8 @@
 Ash exposes one additive event envelope across `--output-format stream-json`,
 the Python SDK, and HTTP server-sent events. JSON-RPC clients discover the
 current event schema through `initialize.capabilities.event_schema_version`.
-The runtime batches redacted events into SQLite schema v8 so clients can replay
-them after disconnects or process restarts.
+The runtime batches redacted events into the durable session database so clients
+can replay them after disconnects or process restarts.
 
 ## Wire fields
 
@@ -63,6 +63,24 @@ Recovery emits one terminal `tool.error` per unfinished call before the
 aggregate `session.recovery` event. A recovered record with `dispatched: false`
 is a confirmed unstarted call and therefore has `ambiguous: false`.
 
+## Model request lifecycle
+
+Every provider completion attempt emits:
+
+- `model.request.started` with provider/model identity, attempt number,
+  message/tool counts, and whether the native tool protocol is active;
+- exactly one of `model.request.completed`, `model.request.error`, or
+  `model.request.cancelled` for that request operation ID.
+
+Completed events include provider-reported or estimated token/cache usage and
+the normalized stop category. Error events include bounded operational
+classification such as HTTP status, retryability, whether output was already
+emitted, and the exception class name. Provider error text is not part of this
+stable lifecycle contract.
+
+These events make retry/failover behavior observable without requiring
+consumers to infer provider attempts from assistant deltas.
+
 ## Turn completion identity
 
 `turn.completed` preserves the legacy model-only `model` field and may also
@@ -96,3 +114,9 @@ event, and a `next_sequence` cursor at protocol boundaries. Cursors are
 exclusive. Repeating a request is safe because event IDs are unique and event
 insertion is idempotent. Persisted event payloads pass through Ash's secret
 redactor; live UI delivery is unchanged.
+
+External runtime observers such as Ash's OpenTelemetry adapter receive a
+stricter, content-free projection of the live event stream. That projection
+retains envelope IDs and allowlisted operational fields but removes prompts,
+assistant output, tool arguments/results, file paths, denial/error text, and
+other content-bearing values before observer code runs.

@@ -853,6 +853,9 @@ def test_project_config_cannot_override_user_owned_controls(
                 'browser_cdp_url = "http://127.0.0.1:9222"',
                 "browser_cdp_reuse_storage_state = true",
                 'openai_auth_mode = "chatgpt"',
+                "observability_enabled = true",
+                'observability_otlp_endpoint = "https://attacker.example/otel"',
+                "observability_sample_rate = 0.99",
                 "lsp_enabled = true",
                 "automation_enabled = true",
                 "automation_max_concurrent_runs = 32",
@@ -905,6 +908,9 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.browser_cdp_url == ""
     assert config.browser_cdp_reuse_storage_state is False
     assert config.openai_auth_mode == "api_key"
+    assert config.observability_enabled is False
+    assert config.observability_otlp_endpoint == ""
+    assert config.observability_sample_rate == 1.0
     assert config.plugin_marketplaces == {}
     assert config.plugin_marketplace_key_ids == {}
     assert config.plugin_marketplace_key_fingerprints == {}
@@ -937,6 +943,9 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "browser_cdp_url" in diagnostics
     assert "browser_cdp_reuse_storage_state" in diagnostics
     assert "openai_auth_mode" in diagnostics
+    assert "observability_enabled" in diagnostics
+    assert "observability_otlp_endpoint" in diagnostics
+    assert "observability_sample_rate" in diagnostics
     assert "plugin_marketplaces" in diagnostics
     assert "plugin_marketplace_key_ids" in diagnostics
     assert "plugin_marketplace_key_fingerprints" in diagnostics
@@ -968,6 +977,25 @@ def test_sandbox_configuration_is_validated() -> None:
         AshConfig(sandbox_docker_memory_mb=5)
     with pytest.raises(ValueError, match="sandbox_docker_cpus"):
         AshConfig(sandbox_docker_cpus=-1)
+
+
+def test_observability_endpoint_is_user_owned_and_credential_free() -> None:
+    config = AshConfig(
+        observability_enabled=True,
+        observability_otlp_endpoint="https://otel.example/collector/",
+        observability_sample_rate=0.25,
+    )
+    assert config.observability_enabled is True
+    assert config.observability_otlp_endpoint == "https://otel.example/collector"
+    assert config.observability_sample_rate == 0.25
+
+    for invalid in (
+        "ftp://otel.example",
+        "https://user:secret@otel.example",
+        "https://otel.example/path?token=secret",
+    ):
+        with pytest.raises(ValueError, match="observability_otlp_endpoint"):
+            AshConfig(observability_otlp_endpoint=invalid)
 
 
 def test_command_environment_allowlist_is_validated_and_deduplicated() -> None:

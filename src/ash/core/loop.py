@@ -232,6 +232,117 @@ class LoopUI(Protocol):
     def show_plan(self, execution: Any) -> bool: ...
 
 
+class RuntimeEventObserver(Protocol):
+    """Non-critical sink for content-free operational telemetry."""
+
+    def on_event(self, event: dict[str, Any]) -> None: ...
+    def close(self) -> None: ...
+
+
+_OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
+    "context.usage": frozenset({"current", "maximum"}),
+    "model.request.started": frozenset(
+        {
+            "provider",
+            "model",
+            "attempt",
+            "max_attempts",
+            "message_count",
+            "tool_count",
+            "native_tools",
+        }
+    ),
+    "model.request.completed": frozenset(
+        {
+            "provider",
+            "model",
+            "attempt",
+            "prompt_tokens",
+            "completion_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "usage_source",
+            "stop_category",
+        }
+    ),
+    "model.request.error": frozenset(
+        {
+            "provider",
+            "model",
+            "attempt",
+            "status_code",
+            "retriable",
+            "emitted_output",
+            "error_type",
+        }
+    ),
+    "model.request.cancelled": frozenset({"provider", "model", "attempt"}),
+    "provider.retrying": frozenset(
+        {"attempt", "max_attempts", "delay_seconds", "status_code"}
+    ),
+    "provider.circuit_opened": frozenset(
+        {"provider", "failures", "cooldown_seconds"}
+    ),
+    "tool.requested": frozenset({"tool"}),
+    "tool.started": frozenset({"tool"}),
+    "tool.completed": frozenset(
+        {
+            "tool",
+            "success",
+            "truncated",
+            "dispatched",
+            "ambiguous",
+            "replayed",
+            "replay_policy",
+        }
+    ),
+    "tool.error": frozenset(
+        {
+            "tool",
+            "success",
+            "truncated",
+            "dispatched",
+            "ambiguous",
+            "replayed",
+            "replay_policy",
+        }
+    ),
+    "tool.denied": frozenset({"tool"}),
+    "tool.skipped": frozenset(
+        {
+            "tool",
+            "success",
+            "truncated",
+            "dispatched",
+            "ambiguous",
+            "replayed",
+            "replay_policy",
+        }
+    ),
+}
+_OBSERVER_ENVELOPE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "event_id",
+        "timestamp",
+        "source",
+        "session_id",
+        "turn_id",
+        "operation_id",
+        "parent_event_id",
+        "type",
+    }
+)
+
+
+def _observer_event_projection(event: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(event.get("type", ""))
+    allowed = _OBSERVER_ENVELOPE_FIELDS | _OBSERVER_EVENT_FIELDS.get(
+        event_type, frozenset()
+    )
+    return {key: event[key] for key in allowed if key in event}
+
+
 DEFAULT_MAX_TURN_ITERATIONS = 10
 FILE_WRITE_TOOLS = {
     "write_file",
@@ -1004,6 +1115,7 @@ class AshLoop:
         mcp_interactions: "MCPInteractionController | None" = None,
         config: "AshConfig | None" = None,
         max_steering_messages: int = 20,
+        event_observer: "RuntimeEventObserver | None" = None,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -1032,6 +1144,8 @@ class AshLoop:
         self._pending_runtime_event_bytes = 0
         self._runtime_event_flush_failure_reported = False
         self._runtime_event_backlog_drop_reported = False
+        self._event_observer = event_observer
+        self._event_observer_failed = False
         set_event_enricher = getattr(self.ui, "set_event_enricher", None)
         if callable(set_event_enricher):
             set_event_enricher(self._envelope_event)
@@ -1239,6 +1353,16 @@ class AshLoop:
                 self._flush_runtime_events()
             except BaseException as exc:  # noqa: BLE001 - cleanup must continue
                 flush_error = exc
+            if self._event_observer is not None:
+                observer = self._event_observer
+                self._event_observer = None
+                try:
+                    await asyncio.to_thread(observer.close)
+                except BaseException:  # noqa: BLE001 - observability is fail-open
+                    _log.warning(
+                        "runtime observability shutdown failed; Ash resources "
+                        "will continue closing"
+                    )
             mcp_runtime_error: BaseException | None = None
             if self._mcp_runtime is not None:
                 try:
@@ -1512,6 +1636,15 @@ class AshLoop:
     def _emit_event(self, payload: dict[str, Any]) -> None:
         event = self._envelope_event(payload)
         self.ui.emit_event(event)
+        if self._event_observer is not None and not self._event_observer_failed:
+            try:
+                self._event_observer.on_event(_observer_event_projection(event))
+            except Exception:  # noqa: BLE001 - observability is fail-open
+                self._event_observer_failed = True
+                _log.warning(
+                    "runtime observability observer failed; external telemetry "
+                    "is disabled for this runtime"
+                )
         if event["type"] in {"turn.completed", "turn.cancelled", "turn.error"}:
             self._flush_runtime_events_nonfatal(force=True)
 
@@ -3725,7 +3858,9 @@ class AshLoop:
 
     @property
     def active_model_id(self) -> str:
-        configured_model = self._config.model if self._config is not None else None
+        configured_model = (
+            getattr(self._config, "model", None) if self._config is not None else None
+        )
         return _provider_model_id(self.provider, configured_model)
 
     def _active_model_pricing(self) -> dict[str, float]:
@@ -3736,7 +3871,11 @@ class AshLoop:
         )
         provider_model = self.active_model_id
         configured_model = (
-            self._config.model
+            getattr(
+                self._config,
+                "model",
+                f"custom/{self.provider.model_name}",
+            )
             if self._config is not None
             else f"custom/{self.provider.model_name}"
         )
@@ -4062,6 +4201,11 @@ class AshLoop:
         request_timeout = float(
             getattr(self._config, "provider_request_timeout_seconds", 1800.0)
         )
+        active_request_id: str | None = None
+        active_request_attempt = 0
+        provider_family = str(
+            getattr(self.provider, "provider_family", "custom") or "custom"
+        )
 
         try:
             self.provider_circuit_breaker.before_request(self._provider_circuit_key)
@@ -4069,6 +4213,21 @@ class AshLoop:
                 attempt = 1
                 while True:
                     emitted_output = False
+                    active_request_attempt = attempt
+                    active_request_id = str(uuid4())
+                    self._emit_event(
+                        {
+                            "type": "model.request.started",
+                            "operation_id": active_request_id,
+                            "provider": provider_family,
+                            "model": self.active_model_id,
+                            "attempt": attempt,
+                            "max_attempts": maximum_attempts,
+                            "message_count": len(canonical_messages),
+                            "tool_count": len(openai_tools or ()),
+                            "native_tools": native_protocol,
+                        }
+                    )
                     try:
                         deadline = asyncio.get_running_loop().time() + request_timeout
                         stream = self.provider.stream_chat(
@@ -4331,6 +4490,20 @@ class AshLoop:
                         raise
                     except Exception as exc:  # noqa: BLE001
                         failure = classify_provider_failure(exc)
+                        self._emit_event(
+                            {
+                                "type": "model.request.error",
+                                "operation_id": active_request_id,
+                                "provider": provider_family,
+                                "model": self.active_model_id,
+                                "attempt": attempt,
+                                "status_code": failure.status_code,
+                                "retriable": failure.retriable,
+                                "emitted_output": emitted_output,
+                                "error_type": type(exc).__name__,
+                            }
+                        )
+                        active_request_id = None
                         if (
                             emitted_output
                             or not failure.retriable
@@ -4433,6 +4606,55 @@ class AshLoop:
                             f"{reused[0]}"
                         )
                 self.provider_circuit_breaker.record_success(self._provider_circuit_key)
+                self._emit_event(
+                    {
+                        "type": "model.request.completed",
+                        "operation_id": active_request_id,
+                        "provider": provider_family,
+                        "model": self.active_model_id,
+                        "attempt": active_request_attempt,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "cache_read_tokens": cache_read_tokens,
+                        "cache_write_tokens": cache_write_tokens,
+                        "usage_source": usage_source,
+                        "stop_category": completion_stop_category(
+                            terminal_stop_reason
+                        ).value,
+                    }
+                )
+                active_request_id = None
+        except asyncio.CancelledError:
+            if active_request_id is not None:
+                self._emit_event(
+                    {
+                        "type": "model.request.cancelled",
+                        "operation_id": active_request_id,
+                        "provider": provider_family,
+                        "model": self.active_model_id,
+                        "attempt": active_request_attempt,
+                    }
+                )
+                active_request_id = None
+            raise
+        except Exception as exc:
+            if active_request_id is not None:
+                failure = classify_provider_failure(exc)
+                self._emit_event(
+                    {
+                        "type": "model.request.error",
+                        "operation_id": active_request_id,
+                        "provider": provider_family,
+                        "model": self.active_model_id,
+                        "attempt": active_request_attempt,
+                        "status_code": failure.status_code,
+                        "retriable": failure.retriable,
+                        "emitted_output": False,
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                active_request_id = None
+            raise
         finally:
             self.ui.finalize_turn()
 

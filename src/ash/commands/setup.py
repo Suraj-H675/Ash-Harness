@@ -206,6 +206,7 @@ def _provider_status(config, descriptor: ProviderDescriptor) -> str:
 def _setup_status_payload(config) -> dict[str, Any]:
     """Return the secret-free setup inventory used by human and JSON output."""
 
+    from ash.observability import observability_status
     from ash.profiles import active_profile_name
 
     model = str(getattr(config, "model", "") or "")
@@ -214,6 +215,7 @@ def _setup_status_payload(config) -> dict[str, Any]:
     workspace_root = getattr(config, "workspace_root", Path.cwd())
     if not isinstance(workspace_root, Path):
         workspace_root = Path.cwd()
+    telemetry = observability_status(config)
     return {
         "profile": active_profile_name(),
         "model": model or None,
@@ -231,6 +233,18 @@ def _setup_status_payload(config) -> dict[str, Any]:
             },
             "browser": {"installed": _browser_is_installed()},
             "mcp": {"configured": (workspace_root / ".mcp.json").is_file()},
+            "observability": {
+                "enabled": telemetry.enabled,
+                "available": telemetry.available,
+                "ready": bool(
+                    telemetry.enabled
+                    and telemetry.available
+                    and telemetry.traces_endpoint
+                    and telemetry.metrics_endpoint
+                ),
+                "sample_rate": telemetry.sample_rate,
+                "content_capture": telemetry.content_capture,
+            },
             "memory": {"backend": str(getattr(config, "memory_backend", "sqlite"))},
             "sandbox": {"backend": str(getattr(config, "sandbox_backend", "auto"))},
         },
@@ -258,6 +272,19 @@ def _render_setup_status(
     provider_state = "ready to test" if provider["ready"] else "needs setup"
     fallback_count = len(payload["fallback_models"])
     capabilities = payload["capabilities"]
+    observability = capabilities["observability"]
+    if not observability["enabled"]:
+        observability_status_text = "off"
+        observability_next = "set ASH_OBSERVABILITY_ENABLED=true"
+    elif not observability["available"]:
+        observability_status_text = "needs extra"
+        observability_next = "install observability extra"
+    elif not observability["ready"]:
+        observability_status_text = "needs endpoint"
+        observability_next = "set ASH_OBSERVABILITY_OTLP_ENDPOINT"
+    else:
+        observability_status_text = "ready"
+        observability_next = ""
     optional = [
         (
             "Web search",
@@ -273,6 +300,11 @@ def _render_setup_status(
             "MCP",
             "configured" if capabilities["mcp"]["configured"] else "none",
             "" if capabilities["mcp"]["configured"] else "ash mcp add …",
+        ),
+        (
+            "Observability",
+            observability_status_text,
+            observability_next,
         ),
         ("Memory", str(capabilities["memory"]["backend"]), ""),
         ("Sandbox", str(capabilities["sandbox"]["backend"]), ""),

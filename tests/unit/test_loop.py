@@ -1748,6 +1748,71 @@ class EventUI(TerminalUI):
 
 
 @pytest.mark.asyncio
+async def test_runtime_event_observer_receives_content_free_projection(tmp_path):
+    class Observer:
+        def __init__(self):
+            self.events = []
+            self.closed = 0
+
+        def on_event(self, event):
+            self.events.append(event)
+
+        def close(self):
+            self.closed += 1
+
+    observer = Observer()
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "observer.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+        event_observer=observer,
+    )
+    await loop.start_session()
+
+    loop._emit_event(
+        {
+            "type": "tool.completed",
+            "call_id": "call-secret",
+            "tool": "browser_type",
+            "success": False,
+            "arguments": {"text": "SECRET-PASSWORD"},
+            "output": "SECRET-RESULT",
+            "error": "SECRET-ERROR",
+            "reason": "SECRET-REASON",
+            "replay_policy": "never",
+        }
+    )
+    loop._emit_event(
+        {
+            "type": "turn.completed",
+            "response": "SECRET-ASSISTANT-RESPONSE",
+            "usage": {"prompt_tokens": 100},
+        }
+    )
+
+    assert len(observer.events) == 2
+    tool_event, turn_event = observer.events
+    assert tool_event["type"] == "tool.completed"
+    assert tool_event["tool"] == "browser_type"
+    assert tool_event["success"] is False
+    assert tool_event["operation_id"] == "call-secret"
+    assert "arguments" not in tool_event
+    assert "output" not in tool_event
+    assert "error" not in tool_event
+    assert "reason" not in tool_event
+    assert turn_event["type"] == "turn.completed"
+    assert "response" not in turn_event
+    assert "usage" not in turn_event
+    assert "SECRET-" not in repr(observer.events)
+
+    await loop.aclose()
+    assert observer.closed == 1
+
+
+@pytest.mark.asyncio
 async def test_provider_replay_state_persists_and_returns_to_next_request(tmp_path):
     class ReplayStateProvider(ProviderABC):
         model_name = "replay-state"
@@ -2649,8 +2714,12 @@ async def test_queued_steering_is_persisted_and_applied_to_running_turn(tmp_path
         event["type"] for event in ui.events if event["type"] != "assistant.delta"
     ] == [
         "turn.started",
+        "model.request.started",
         "turn.steering.queued",
+        "model.request.completed",
         "turn.steering.applied",
+        "model.request.started",
+        "model.request.completed",
         "turn.usage",
         "turn.completed",
     ]
@@ -3825,9 +3894,13 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
         event["type"] for event in ui.events if event["type"] != "assistant.delta"
     ] == [
         "turn.started",
+        "model.request.started",
+        "model.request.completed",
         "tool.requested",
         "tool.started",
         "tool.completed",
+        "model.request.started",
+        "model.request.completed",
         "turn.usage",
         "turn.completed",
     ]

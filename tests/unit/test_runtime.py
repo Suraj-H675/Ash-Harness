@@ -33,6 +33,150 @@ class RuntimeProvider(ProviderABC):
             yield
 
 
+@pytest.mark.asyncio
+async def test_runtime_owns_observability_observer_until_loop_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Observer:
+        def __init__(self) -> None:
+            self.closed = 0
+            self.events: list[dict] = []
+
+        def on_event(self, event: dict) -> None:
+            self.events.append(event)
+
+        def close(self) -> None:
+            self.closed += 1
+
+    observer = Observer()
+    monkeypatch.setattr(
+        "ash.observability.build_observability_observer",
+        lambda _config: observer,
+    )
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        automation_enabled=False,
+        lsp_enabled=False,
+        repo_map_enabled=False,
+        observability_enabled=True,
+        observability_otlp_endpoint="https://otel.example",
+    )
+
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+
+    assert runtime.loop._event_observer is observer
+    assert observer.closed == 0
+    await runtime.loop.aclose()
+    assert observer.closed == 1
+
+
+def test_runtime_startup_failure_closes_observability_observer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.runtime as runtime_module
+
+    class Observer:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def on_event(self, event: dict) -> None:
+            del event
+
+        def close(self) -> None:
+            self.closed += 1
+
+    observer = Observer()
+    monkeypatch.setattr(
+        "ash.observability.build_observability_observer",
+        lambda _config: observer,
+    )
+
+    def fail_loop(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("loop construction failed")
+
+    monkeypatch.setattr(runtime_module, "AshLoop", fail_loop)
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        automation_enabled=False,
+        lsp_enabled=False,
+        repo_map_enabled=False,
+        observability_enabled=True,
+        observability_otlp_endpoint="https://otel.example",
+    )
+
+    with pytest.raises(RuntimeError, match="loop construction failed"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            workspace_trusted=False,
+            run_maintenance=False,
+        )
+
+    assert observer.closed == 1
+
+
+def test_observability_setup_failure_rolls_back_previously_owned_runtime_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.runtime as runtime_module
+
+    rolled_back: list[str] = []
+
+    def fake_build_tools(*args, **kwargs):
+        del args
+        rollback = kwargs["_startup_rollback"]
+        rollback.append(lambda: rolled_back.append("tools"))
+        return {}
+
+    def fail_observability(_config):
+        raise RuntimeError("collector configuration failed")
+
+    monkeypatch.setattr(runtime_module, "build_tools", fake_build_tools)
+    monkeypatch.setattr(
+        "ash.observability.build_observability_observer",
+        fail_observability,
+    )
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        automation_enabled=False,
+        lsp_enabled=False,
+        repo_map_enabled=False,
+        observability_enabled=True,
+        observability_otlp_endpoint="https://otel.example",
+    )
+
+    with pytest.raises(RuntimeError, match="collector configuration failed"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            workspace_trusted=False,
+            run_maintenance=False,
+        )
+
+    assert rolled_back == ["tools"]
+
+
 def test_build_runtime_rejects_unsupported_platform_before_side_effects(
     tmp_path, monkeypatch
 ) -> None:

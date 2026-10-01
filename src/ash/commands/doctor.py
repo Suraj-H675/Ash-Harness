@@ -114,6 +114,46 @@ def _check_web_search(config: AshConfig) -> DoctorCheck:
     )
 
 
+def _check_observability(config: AshConfig) -> DoctorCheck:
+    from ash.observability import (
+        ObservabilityError,
+        observability_status,
+        resolve_observability_endpoints,
+    )
+
+    status = observability_status(config)
+    if not status.enabled:
+        return DoctorCheck(
+            "observability",
+            "pass",
+            "OpenTelemetry export is disabled (default)",
+        )
+    if not status.available:
+        return DoctorCheck(
+            "observability",
+            "fail",
+            "OpenTelemetry export is enabled but the optional runtime is not installed",
+            "Install Ash with the observability extra, then rerun ash doctor.",
+        )
+    try:
+        resolve_observability_endpoints(config)
+    except ObservabilityError as exc:
+        return DoctorCheck(
+            "observability",
+            "fail",
+            str(exc),
+            "Set ASH_OBSERVABILITY_OTLP_ENDPOINT or both standard OTLP signal endpoints.",
+        )
+    return DoctorCheck(
+        "observability",
+        "pass",
+        (
+            "OTLP/HTTP traces and metrics are enabled; "
+            f"sample_rate={status.sample_rate:g}; content_capture=false"
+        ),
+    )
+
+
 def _check_browser(config: AshConfig | None = None) -> DoctorCheck:
     from ash.install import pipx_install_command
 
@@ -594,6 +634,7 @@ async def run_doctor(*, connect: bool = False) -> list[DoctorCheck]:
             ),
             _check_credentials(config),
             _check_web_search(config),
+            _check_observability(config),
             _check_browser(config),
             _check_workspace(config),
             _check_storage(config),

@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
 from pydantic import Field, PrivateAttr, field_validator, model_validator
@@ -551,6 +552,38 @@ class AshConfig(BaseSettings):
         gt=0.0,
         le=3600.0,
         description="Provider circuit cooldown before a half-open probe.",
+    )
+    observability_enabled: bool = Field(
+        False,
+        description=(
+            "Enable opt-in content-free OpenTelemetry traces and metrics. "
+            "Outbound telemetry remains disabled unless explicitly enabled."
+        ),
+    )
+    observability_otlp_endpoint: str = Field(
+        "",
+        description=(
+            "User-owned OTLP/HTTP collector base endpoint. When empty, an "
+            "explicitly enabled runtime may use OTEL_EXPORTER_OTLP_ENDPOINT."
+        ),
+    )
+    observability_sample_rate: float = Field(
+        1.0,
+        ge=0.0,
+        le=1.0,
+        description="Head-sampling probability for Ash OpenTelemetry traces.",
+    )
+    observability_export_interval_seconds: float = Field(
+        15.0,
+        ge=1.0,
+        le=300.0,
+        description="Periodic OTLP metric export interval in seconds.",
+    )
+    observability_export_timeout_seconds: float = Field(
+        5.0,
+        ge=0.5,
+        le=30.0,
+        description="Maximum time for one OTLP export request.",
     )
     context_compaction_threshold: float = Field(
         0.80,
@@ -1251,6 +1284,33 @@ class AshConfig(BaseSettings):
         from ash.tools.browser import _validate_cdp_url
 
         return _validate_cdp_url(normalized)
+
+    @field_validator("observability_otlp_endpoint")
+    @classmethod
+    def validate_observability_otlp_endpoint(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        try:
+            parsed = urlsplit(normalized)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("observability_otlp_endpoint must be a valid URL") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "observability_otlp_endpoint must be a credential-free HTTP(S) "
+                "base URL without query or fragment"
+            )
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("observability_otlp_endpoint port is invalid")
+        return normalized.rstrip("/")
 
     @field_validator("web_search_provider")
     @classmethod

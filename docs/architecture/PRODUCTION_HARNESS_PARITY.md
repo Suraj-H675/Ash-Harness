@@ -138,12 +138,15 @@ justify dismissing:
   README's immutable-release install flow therefore has nothing a first-time
   production user can actually install. A real immutable release plus
   clean-machine install, upgrade, repair, and rollback evidence is required.
-- **Production observability is materially behind strong current harnesses.**
-  Ash has secret-redacted logs, debug bundles, local usage metrics, audit
-  records, and correlation IDs, but no OpenTelemetry/OTLP trace export,
-  Prometheus-compatible metrics surface, or equivalent end-to-end run/model/
-  tool/context tracing plane. This is a direct Charter dimension, not optional
-  feature-count parity.
+- **Production observability gap — addressed locally.** Ash now has an opt-in,
+  user-owned OpenTelemetry/OTLP HTTP trace-and-metrics plane with locally owned
+  SDK providers, parented turn/model/tool spans, retry/circuit/context/token
+  metrics, bounded sampling/export controls, setup/doctor diagnostics, and
+  fail-open exporter behavior. The observer boundary is structurally
+  content-free: prompts, assistant output, tool arguments/results, paths,
+  credential material, and provider error text are stripped before observers
+  receive events. A real loopback OTLP collector test verifies trace and metric
+  protobuf export and the absence of injected secret content on the wire.
 - **Interoperability breadth is still explicitly partial.** The API-key
   provider row and local-model row remain Partial because live vendor/runtime
   conformance is much narrower than the deterministic protocol coverage,

@@ -632,8 +632,12 @@ def build_runtime(
         lsp_manager=lsp_manager,
         _startup_rollback=startup_rollback,
     )
-
     try:
+        from ash.observability import build_observability_observer
+
+        event_observer = build_observability_observer(config)
+        if event_observer is not None:
+            startup_rollback.append(event_observer.close)
         loop = AshLoop(
             session_store=store,
             provider=active_provider,
@@ -664,6 +668,7 @@ def build_runtime(
             auto_index_memory=trusted and config.memory_auto_index,
             auto_index_max_files=config.memory_auto_index_max_files,
             auto_index_max_bytes_per_file=config.memory_auto_index_max_bytes_per_file,
+            event_observer=event_observer,
         )
         from ash.tools.goals import UpdateGoalTool
 
