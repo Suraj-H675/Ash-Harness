@@ -4,8 +4,8 @@
 WSL2 through the supported Linux runtime path; native Windows is intentionally
 outside the supported/tested host matrix.
 Authentication is limited to API keys, custom OpenAI-compatible endpoints,
-and local model runtimes. Subscription model-provider login is out of scope;
-MCP OAuth is part of the remote MCP transport boundary.
+local model runtimes, and the M4 work-in-progress for optional OpenAI
+ChatGPT-plan sign-in. MCP OAuth is part of the remote MCP transport boundary.
 
 This is the authoritative product checklist. Older roadmap files describe
 historical intent and do not prove that a feature works.
@@ -42,9 +42,11 @@ native client coverage, or interoperability with every comparator.
 - OpenCode source: <https://github.com/anomalyco/opencode>
 - Aider source: <https://github.com/Aider-AI/aider>
 - Codex Goals: <https://developers.openai.com/cookbook/examples/codex/using-goals-in-codex>
+- OpenAI Sign in with ChatGPT for open-source apps:
+  <https://developers.openai.com/siwc/token-sharing-open-source>
 
 Research is clean-room: proprietary or leaked source is not used. Public
-benchmark framing was refreshed on 2026-09-30 against current official/public
+benchmark framing was refreshed on 2026-10-01 against current official/public
 documentation.
 
 ## Mission Finish Lines
@@ -76,6 +78,38 @@ reopening already-verified areas mechanically.
 Current gate state: **M1, M2, and M3 are closed/current; M4 is active; M5 is
 queued.** Partial capability rows below remain deliberately qualified and do
 not imply broader support than their recorded evidence.
+
+### M4 product decisions
+
+The remaining comparator differences have now been reduced to explicit product
+decisions rather than an open-ended feature inventory:
+
+- **Implement — optional OpenAI ChatGPT-plan sign-in.** OpenAI now provides an
+  official open-source OAuth/PKCE flow that lets eligible users run supported
+  Responses API requests using their ChatGPT plan without configuring an API
+  key. This materially reduces first-run friction for a coding harness. Ash must
+  implement it as a distinct auth/transport path: private refreshable
+  credentials, exact loopback OAuth validation, scope checks, explicit
+  login/logout/status, public Responses API requests with `store=false` and
+  streaming enabled, and clean fallback to the existing API-key route.
+- **No separate M4 gap — remote browser control.** Ash already owns a managed
+  Playwright browser and explicit loopback CDP attachment with guarded browser
+  policy. Cross-machine browser relays/control planes are useful to gateway or
+  remote-operations products, but are not a material missing coding-harness
+  primitive while ACP/A2A/HTTP/SDK integration remains available for remote
+  hosts.
+- **No separate M4 gap — richer remote-agent modalities.** Ash already has
+  durable local agent DAGs, official ACP client/server interoperability, and
+  authenticated A2A delegation/task recovery. Additional presentation or
+  deployment modalities become work only when a concrete coding workflow
+  requires them.
+- **Explicitly rejected for Ash core — gateway/chat-channel/mobile/voice/media
+  breadth.** Those are central to general assistant/gateway products such as
+  OpenClaw, but do not materially improve Ash's terminal-first coding-harness
+  mission enough to justify the product, security, and maintenance surface.
+
+M4 closes when the ChatGPT-plan path above is production-worthy and the
+rejections remain valid under a final comparator pass.
 
 ## 1. Installation And Setup
 
@@ -347,7 +381,6 @@ Current comparators also cover materially different product categories:
 Ash should currently be described as **strong local coding-core parity with
 remaining product-parity work, and a WIP**. Missing
 gateway/channel/mobile/media surfaces are comparator scope differences, not
-automatic Ash debt. Subscription/provider auth breadth, remote browser control,
-richer remote-agent modalities, and other comparator advantages are M4 product
-decisions and become roadmap
-commitments only when they materially improve Ash as a coding harness.
+automatic Ash debt. The one surviving M4 product gap is optional OpenAI
+ChatGPT-plan sign-in; remote-browser relays and richer remote-agent presentation
+modalities are not separate core gaps under the current product decision.
