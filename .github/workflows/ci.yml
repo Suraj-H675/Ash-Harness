@@ -228,7 +228,7 @@ jobs:
         run: |
           uv venv "$RUNNER_TEMP/ash-mcp-sdk" --python 3.12 --no-python-downloads
           uv pip install --python "$RUNNER_TEMP/ash-mcp-sdk/bin/python" "mcp==2.2.0"
-      - name: Official MCP SDK stdio conformance
+      - name: Official MCP SDK stdio and Streamable HTTP conformance
         env:
           ASH_MCP_SDK_PYTHON: ${{ runner.temp }}/ash-mcp-sdk/bin/python
         run: uv run --locked pytest -q tests/e2e/test_mcp_official_sdk.py --timeout=120 --timeout-method=thread
