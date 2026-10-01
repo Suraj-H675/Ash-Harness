@@ -40,11 +40,31 @@ class StatusLine:
         self.refresh_seconds = refresh_seconds
         self._last_refresh = 0.0
         self._cached = ""
+        self._cached_header = ""
+        self._cached_footer = ""
 
     def __call__(self) -> str:
+        """Return the compact all-in-one toolbar used by inline mode."""
+
+        self._refresh()
+        return self._cached
+
+    def header(self) -> str:
+        """Return stable workspace identity for the viewport header."""
+
+        self._refresh()
+        return self._cached_header
+
+    def footer(self) -> str:
+        """Return runtime/usage health for the viewport footer."""
+
+        self._refresh()
+        return self._cached_footer
+
+    def _refresh(self) -> None:
         now = time.monotonic()
         if self._cached and now - self._last_refresh < self.refresh_seconds:
-            return self._cached
+            return
         self._last_refresh = now
         session = self.loop.current_session
         session_id = session.session_id[:8] if session else "none"
@@ -69,16 +89,30 @@ class StatusLine:
         if not self.sandbox.is_fully_isolated():
             sandbox_label += "!"
         display_model = terminal_safe_text(self.config.model, single_line=True)
-        display_root = terminal_safe_text(str(self.loop.project_root), single_line=True)
-        self._cached = (
-            f" {display_model} | {self.loop.permission_policy.mode.value} | "
-            f"git:{git_branch(self.loop.project_root)} | "
-            f"ctx ~{self.loop._last_context_tokens}/{maximum} | "
-            f"cache:{cache_read}r/{cache_write}w | "
-            f"{'~' if estimated_cost > 0 else ''}${cost:.4f} | sb:{sandbox_label} | "
-            f"s:{session_id} | {display_root} "
-        )
-        return self._cached
+        root_name = self.loop.project_root.name or str(self.loop.project_root)
+        display_root = terminal_safe_text(root_name, single_line=True)
+        branch = git_branch(self.loop.project_root)
+
+        identity = [
+            display_model,
+            self.loop.permission_policy.mode.value,
+        ]
+        if branch != "none":
+            identity.append(f"git {branch}")
+        identity.append(display_root)
+
+        runtime = [
+            f"ctx ~{self.loop._last_context_tokens}/{maximum}",
+            f"sandbox {sandbox_label}",
+            f"{'~' if estimated_cost > 0 else ''}${cost:.4f}",
+        ]
+        if cache_read or cache_write:
+            runtime.append(f"cache {cache_read}r/{cache_write}w")
+        runtime.append(f"session {session_id}")
+
+        self._cached_header = "  ·  ".join(identity)
+        self._cached_footer = "  ·  ".join(runtime)
+        self._cached = f" {self._cached_header}  ·  {self._cached_footer} "
 
 
 def git_branch(root: Path) -> str:

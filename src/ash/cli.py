@@ -645,6 +645,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
     prompt_input = PromptInput(
         status_provider=status_line,
+        header_provider=status_line.header,
+        viewport_status_provider=status_line.footer,
         extra_commands=[command.name for command in discovered_commands],
         input_mode=config.input_mode,
         keybindings=config.keybindings,

@@ -44,14 +44,62 @@ from ash.ui.theme import Theme, get_theme, viewport_styles
 validate_history_path = _validate_history_path
 
 _ENTRY_STYLE = {
-    "user": ("class:user-prefix", "you"),
-    "assistant": ("class:assistant-prefix", "ash"),
-    "reasoning": ("class:reasoning-prefix", "reasoning"),
-    "tool": ("class:tool-prefix", "tool"),
-    "approval": ("class:approval-prefix", "approval"),
-    "status": ("class:status-prefix", "status"),
-    "error": ("class:error-prefix", "error"),
+    "user": ("class:user-prefix", "YOU"),
+    "assistant": ("class:assistant-prefix", "ASH"),
+    "reasoning": ("class:reasoning-prefix", "THINK"),
+    "tool": ("class:tool-prefix", "TOOL"),
+    "approval": ("class:approval-prefix", "APPROVAL"),
+    "status": ("class:status-prefix", "STATUS"),
+    "error": ("class:error-prefix", "ERROR"),
 }
+
+
+_DEFAULT_ENTRY_TITLES = {
+    "user": {"", "user", "you"},
+    "assistant": {"", "assistant", "ash"},
+    "reasoning": {"", "reasoning", "think"},
+    "tool": {"", "tool"},
+    "approval": {"", "approval"},
+    "status": {"", "status"},
+    "error": {"", "error"},
+}
+
+
+def _entry_heading(entry: TranscriptEntry) -> tuple[str, str]:
+    style, label = _ENTRY_STYLE[entry.kind]
+    title = terminal_safe_text(entry.title, single_line=True)
+    if title.casefold() not in _DEFAULT_ENTRY_TITLES[entry.kind]:
+        return style, f"{label}  ·  {title}"
+    return style, label
+
+
+def _entry_body(entry: TranscriptEntry) -> str:
+    safe = terminal_safe_text(entry.content) or " "
+    if entry.kind == "tool" and entry.title and "\n" not in safe:
+        title = terminal_safe_text(entry.title, single_line=True)
+        prefix = f"{title} ["
+        if safe.startswith(prefix) and safe.endswith("]"):
+            safe = safe[len(prefix) : -1] or "completed"
+    return "  " + safe.replace("\n", "\n  ")
+
+
+def _fit_segments(value: str, width: int) -> str:
+    if width <= 0 or not value:
+        return ""
+    if len(value) <= width:
+        return value
+    parts = [part.strip() for part in value.split("  ·  ") if part.strip()]
+    kept: list[str] = []
+    for part in parts:
+        candidate = "  ·  ".join((*kept, part))
+        if len(candidate) > width:
+            break
+        kept.append(part)
+    if kept:
+        return "  ·  ".join(kept)
+    if width == 1:
+        return "…"
+    return value[: width - 1].rstrip() + "…"
 
 
 def format_transcript(entries: tuple[TranscriptEntry, ...]) -> AnyFormattedText:
@@ -61,13 +109,13 @@ def format_transcript(entries: tuple[TranscriptEntry, ...]) -> AnyFormattedText:
     for index, entry in enumerate(entries):
         if index:
             fragments.append(("", "\n\n"))
-        style, default_title = _ENTRY_STYLE[entry.kind]
-        title = terminal_safe_text(entry.title or default_title, single_line=True)
-        fragments.append((style, f"{title} > "))
+        style, heading = _entry_heading(entry)
+        fragments.append((style, heading))
+        fragments.append(("", "\n"))
         body_style = "class:reasoning" if entry.kind == "reasoning" else ""
-        fragments.append((body_style, terminal_safe_text(entry.content) or " "))
+        fragments.append((body_style, _entry_body(entry)))
         if not entry.finalized:
-            fragments.append(("class:streaming", "  ..."))
+            fragments.append(("class:streaming", "  …"))
     return FormattedText(fragments)
 
 
@@ -88,9 +136,9 @@ class RichTranscriptFormatter:
         for index, entry in enumerate(entries):
             if index:
                 fragments.append(("", "\n\n"))
-            style, default_title = _ENTRY_STYLE[entry.kind]
-            title = terminal_safe_text(entry.title or default_title, single_line=True)
-            fragments.append((style, f"{title} > "))
+            style, heading = _entry_heading(entry)
+            fragments.append((style, heading))
+            fragments.append(("", "\n"))
             if entry.kind == "assistant" and entry.content:
                 safe_content = terminal_safe_text(entry.content)
                 key = (entry.entry_id, safe_content, width)
@@ -99,15 +147,12 @@ class RichTranscriptFormatter:
                 if rendered is None:
                     rendered = self._render_markdown(safe_content, width=width)
                     self._cache[key] = rendered
-                fragments.append(("", "\n"))
                 fragments.extend(to_formatted_text(rendered))
             else:
                 body_style = "class:reasoning" if entry.kind == "reasoning" else ""
-                fragments.append(
-                    (body_style, terminal_safe_text(entry.content) or " ")
-                )
+                fragments.append((body_style, _entry_body(entry)))
             if not entry.finalized:
-                fragments.append(("class:streaming", "  ..."))
+                fragments.append(("class:streaming", "  …"))
         if len(self._cache) > max(32, len(live_keys) * 4):
             self._cache = {
                 key: value for key, value in self._cache.items() if key in live_keys
@@ -139,6 +184,7 @@ class TranscriptViewport:
         history: History | None = None,
         completer: Any = None,
         status_provider: Callable[[], str] | None = None,
+        header_provider: Callable[[], str] | None = None,
         input_mode: str = "emacs",
         keybindings: dict[str, list[str]] | None = None,
         theme: str = "dark",
@@ -149,6 +195,7 @@ class TranscriptViewport:
             raise ValueError("input_mode must be emacs or vi")
         self.transcript = transcript
         self.status_provider = status_provider or (lambda: "")
+        self.header_provider = header_provider or (lambda: "")
         self._prompt = "> "
         self._running = False
         self._follow_tail = True
@@ -174,9 +221,8 @@ class TranscriptViewport:
             always_hide_cursor=True,
             get_vertical_scroll=lambda _: self._vertical_scroll,
         )
-        self.prompt_control = FormattedTextControl(
-            lambda: [("class:prompt", self._prompt)]
-        )
+        self.header_control = FormattedTextControl(self._header_text)
+        self.prompt_control = FormattedTextControl(self._composer_label)
         composer = HSplit(
             [
                 Window(self.prompt_control, height=1, dont_extend_height=True),
@@ -190,6 +236,11 @@ class TranscriptViewport:
         )
         root = HSplit(
             [
+                Window(
+                    self.header_control,
+                    height=1,
+                    style="class:header",
+                ),
                 self.transcript_window,
                 Window(height=1, char="─", style="class:separator"),
                 composer,
@@ -233,10 +284,53 @@ class TranscriptViewport:
     def _transcript_text(self) -> AnyFormattedText:
         app = get_app_or_none()
         width = app.output.get_size().columns if app is self.application else 80
-        return self._formatter.format(self.transcript.snapshot(), width=width)
+        entries = self.transcript.snapshot()
+        if not entries:
+            return FormattedText(
+                [
+                    ("class:empty-title", "\n  Ready"),
+                    (
+                        "class:muted",
+                        "\n  Ask about this workspace, attach @files, or type /help.",
+                    ),
+                ]
+            )
+        return self._formatter.format(entries, width=width)
+
+    def _header_text(self) -> AnyFormattedText:
+        identity = terminal_safe_text(self.header_provider(), single_line=True)
+        app = get_app_or_none()
+        width = app.output.get_size().columns if app is self.application else 80
+        identity = _fit_segments(identity, max(0, width - len(" ASH   ") - 1))
+        fragments: list[tuple[str, str]] = [
+            ("class:header-brand", " ASH "),
+        ]
+        if identity:
+            fragments.extend(
+                [
+                    ("class:header-meta", "  "),
+                    ("class:header", identity),
+                    ("class:header", " "),
+                ]
+            )
+        return FormattedText(fragments)
+
+    def _composer_label(self) -> AnyFormattedText:
+        raw = terminal_safe_text(self._prompt, single_line=True).strip()
+        if raw in {"", ">"}:
+            label = "ASK ASH"
+        elif raw.casefold() == "steer>":
+            label = "STEER"
+        else:
+            label = raw.rstrip(" >:")
+        return FormattedText([("class:composer-label", f" {label} ")])
 
     def _status_text(self) -> AnyFormattedText:
-        return FormattedText([("", f" {self.status_provider()} ")])
+        value = terminal_safe_text(self.status_provider(), single_line=True)
+        app = get_app_or_none()
+        width = app.output.get_size().columns if app is self.application else 80
+        fitted = _fit_segments(value, max(0, width - 2))
+        return FormattedText([("", f" {fitted} ")])
 
     def _on_transcript_event(self, event: TranscriptEvent) -> None:
         del event

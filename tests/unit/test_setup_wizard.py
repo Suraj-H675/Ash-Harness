@@ -853,7 +853,7 @@ def test_provider_catalog_render_exposes_full_breadth(
     _render_provider_catalog(config, list(PROVIDERS))
 
     output = capsys.readouterr().out
-    assert "17 routes available" in output
+    assert "Providers  ·  17 routes" in output
     assert "OpenRouter" in output
     assert "Hugging Face" in output
     assert "Google Gemini" in output
@@ -901,6 +901,97 @@ def test_model_picker_bounds_large_catalog_and_filters(
     assert "Showing 18 of 30 matches" in output
     assert "provider/model-30" in output
     assert "provider/model-29" not in output
+
+
+def test_model_picker_makes_current_default_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands.setup import _prompt_model_list
+
+    models = [f"provider/model-{index:02d}" for index in range(1, 31)]
+    current = "provider/model-30"
+    monkeypatch.setattr("builtins.input", _fake_input([""]))
+
+    assert _prompt_model_list(models, current) == current
+
+    output = capsys.readouterr().out
+    assert "Current" in output
+    assert current in output
+    assert "Enter keeps it" in output
+
+
+def test_provider_catalog_has_compact_narrow_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from io import StringIO
+
+    from rich.console import Console
+
+    from ash.commands.setup import PROVIDERS, _render_provider_catalog
+
+    stream = StringIO()
+    monkeypatch.setattr(
+        "ash.commands.setup._setup_console",
+        lambda: Console(file=stream, width=40, force_terminal=False),
+    )
+    monkeypatch.setattr(
+        "ash.commands.setup.get_env_value",
+        lambda _name: None,
+    )
+
+    _render_provider_catalog(
+        SimpleNamespace(model="", openai_auth_mode="api_key"),
+        list(PROVIDERS),
+    )
+
+    output = stream.getvalue()
+    assert "Providers  ·  17 routes" in output
+    assert "OpenRouter" in output
+    assert "Hugging Face" in output
+    assert "Type" not in output
+    assert "About" not in output
+    assert " key" in output
+    assert "local" in output
+
+
+def test_setup_status_shows_actionable_optional_capability_next_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from io import StringIO
+
+    from rich.console import Console
+
+    from ash.commands.setup import _render_setup_status
+
+    stream = StringIO()
+    monkeypatch.setattr(
+        "ash.commands.setup._setup_console",
+        lambda: Console(file=stream, width=100, force_terminal=False),
+    )
+    monkeypatch.setattr(
+        "ash.commands.setup._setup_status_payload",
+        lambda _config: {
+            "profile": "default",
+            "model": "openai/gpt-test",
+            "provider": {"name": "OpenAI", "ready": True},
+            "fallback_models": [],
+            "capabilities": {
+                "web_search": {"configured": False},
+                "browser": {"installed": False},
+                "mcp": {"configured": False},
+                "memory": {"backend": "sqlite"},
+                "sandbox": {"backend": "auto"},
+            },
+        },
+    )
+
+    _render_setup_status(SimpleNamespace())
+
+    output = stream.getvalue()
+    assert "ash setup web" in output
+    assert "ash setup browser" in output
+    assert "ash mcp add" in output
 
 
 class TestProbeModels:

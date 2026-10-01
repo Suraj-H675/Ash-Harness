@@ -44,9 +44,9 @@ def test_format_transcript_preserves_semantics_and_streaming_state() -> None:
 
     rendered = _plain(format_transcript(transcript.snapshot()))
 
-    assert "you > inspect this" in rendered
-    assert "ash > working  ..." in rendered
-    assert "read_file > read_file [completed]" in rendered
+    assert "YOU\n  inspect this" in rendered
+    assert "ASH\n  working  …" in rendered
+    assert "TOOL  ·  read_file\n  completed" in rendered
 
 
 def test_rich_transcript_formatter_renders_markdown_and_caches_cells() -> None:
@@ -138,6 +138,32 @@ async def test_viewport_submits_input_and_can_be_reused(tmp_path: Path) -> None:
         pipe.send_text("again\r")
         assert await second == "again"
         viewport.close()
+
+
+def test_viewport_chrome_separates_identity_runtime_and_composer(
+    tmp_path: Path,
+) -> None:
+    viewport = TranscriptViewport(
+        Transcript(),
+        history_path=tmp_path / "history",
+        header_provider=lambda: "openai/gpt-test  ·  interactive  ·  project",
+        status_provider=lambda: (
+            "ctx ~100/1000  ·  $0.0010  ·  sandbox docker  ·  session abc123"
+        ),
+        output=DummyOutput(),
+    )
+
+    assert _plain(viewport._header_text()) == (
+        " ASH   openai/gpt-test  ·  interactive  ·  project "
+    )
+    assert "Ready" in _plain(viewport._transcript_text())
+    assert "/help" in _plain(viewport._transcript_text())
+    assert _plain(viewport._composer_label()) == " ASK ASH "
+    assert "sandbox docker" in _plain(viewport._status_text())
+
+    viewport._prompt = "steer> "
+    assert _plain(viewport._composer_label()) == " STEER "
+    viewport.close()
 
 
 @pytest.mark.asyncio

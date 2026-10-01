@@ -41,11 +41,38 @@ def test_status_line_includes_runtime_git_cost_and_sandbox(tmp_path: Path) -> No
     rendered = StatusLine(loop, config, sandbox, refresh_seconds=60)()
 
     assert "ctx ~123/900" in rendered
-    assert "cache:7r/2w" in rendered
+    assert "cache 7r/2w" in rendered
     assert "~$0.0123" in rendered
-    assert "sb:scoped" in rendered
-    assert "sb:scoped!" in rendered
-    assert f"s:{session.session_id[:8]}" in rendered
+    assert "sandbox scoped!" in rendered
+    assert f"session {session.session_id[:8]}" in rendered
+
+
+def test_status_line_splits_viewport_identity_from_runtime(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    loop = SimpleNamespace(
+        current_session=session,
+        session_store=store,
+        permission_policy=PermissionPolicy("interactive"),
+        project_root=tmp_path,
+        _last_context_tokens=250,
+    )
+    config = AshConfig(
+        workspace_root=tmp_path,
+        model="openai/gpt-test",
+        max_context_tokens=2000,
+        max_completion_tokens=500,
+    )
+    sandbox = SimpleNamespace(backend_name="docker", is_fully_isolated=lambda: True)
+    status = StatusLine(loop, config, sandbox, refresh_seconds=60)
+
+    assert status.header() == (
+        f"openai/gpt-test  ·  interactive  ·  {tmp_path.name}"
+    )
+    assert status.footer() == (
+        f"ctx ~250/1500  ·  sandbox docker  ·  $0.0000  ·  "
+        f"session {session.session_id[:8]}"
+    )
 
 
 def test_status_line_sanitizes_persisted_model_controls(tmp_path: Path) -> None:

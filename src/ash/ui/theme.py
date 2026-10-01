@@ -27,8 +27,14 @@ class Theme:
     streaming: str
     prompt: str
     composer: str
+    composer_label: str
     separator: str
+    header: str
+    header_brand: str
+    header_meta: str
     status: str
+    empty_title: str
+    muted: str
     border_primary: str
     border_approval: str
     approval_prompt: str
@@ -49,8 +55,14 @@ DARK_THEME = Theme(
     streaming="italic #808080",
     prompt="bold #5fd7ff",
     composer="bg:#1c1c1c",
+    composer_label="bold #5fd7ff bg:#1c1c1c",
     separator="#444444",
-    status="bg:#262626 #bcbcbc",
+    header="bg:#161616 #d0d0d0",
+    header_brand="bold #5fd7ff bg:#161616",
+    header_meta="bg:#161616 #808080",
+    status="bg:#202020 #a8a8a8",
+    empty_title="bold #d0d0d0",
+    muted="#808080",
     border_primary="cyan",
     border_approval="yellow",
     approval_prompt="bold yellow",
@@ -72,8 +84,14 @@ LIGHT_THEME = Theme(
     streaming="italic #777777",
     prompt="bold #005faf",
     composer="bg:#eaeaea #111111",
+    composer_label="bold #005faf bg:#eaeaea",
     separator="#999999",
-    status="bg:#dddddd #222222",
+    header="bg:#f2f2f2 #222222",
+    header_brand="bold #005faf bg:#f2f2f2",
+    header_meta="bg:#f2f2f2 #666666",
+    status="bg:#dddddd #333333",
+    empty_title="bold #222222",
+    muted="#666666",
     border_primary="#005faf",
     border_approval="#96500a",
     approval_prompt="bold #96500a",
@@ -120,6 +138,12 @@ def viewport_styles(theme: Theme) -> dict[str, str]:
         "streaming": theme.streaming,
         "prompt": theme.prompt,
         "composer": theme.composer,
+        "composer-label": theme.composer_label,
         "separator": theme.separator,
+        "header": theme.header,
+        "header-brand": theme.header_brand,
+        "header-meta": theme.header_meta,
         "status": theme.status,
+        "empty-title": theme.empty_title,
+        "muted": theme.muted,
     }

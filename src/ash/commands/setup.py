@@ -262,17 +262,20 @@ def _render_setup_status(
         (
             "Web search",
             "configured" if capabilities["web_search"]["configured"] else "not configured",
+            "" if capabilities["web_search"]["configured"] else "ash setup web",
         ),
         (
             "Browser",
             "installed" if capabilities["browser"]["installed"] else "optional",
+            "" if capabilities["browser"]["installed"] else "ash setup browser",
         ),
         (
             "MCP",
             "configured" if capabilities["mcp"]["configured"] else "none",
+            "" if capabilities["mcp"]["configured"] else "ash mcp add …",
         ),
-        ("Memory", str(capabilities["memory"]["backend"])),
-        ("Sandbox", str(capabilities["sandbox"]["backend"])),
+        ("Memory", str(capabilities["memory"]["backend"]), ""),
+        ("Sandbox", str(capabilities["sandbox"]["backend"]), ""),
     ]
     summary = Table.grid(padding=(0, 2))
     summary.add_column(style="dim", no_wrap=True)
@@ -301,11 +304,17 @@ def _render_setup_status(
     )
     table.add_column("Capability", style="bold")
     table.add_column("Status")
-    for capability, status in optional:
-        table.add_row(
+    show_next = console.width >= 68
+    if show_next:
+        table.add_column("Next", style="dim")
+    for capability, status, next_step in optional:
+        cells: list[Any] = [
             Text(terminal_safe_text(capability, single_line=True), style="bold"),
             _setup_status_text(terminal_safe_text(status, single_line=True)),
-        )
+        ]
+        if show_next:
+            cells.append(terminal_safe_text(next_step or "—", single_line=True))
+        table.add_row(*cells)
     console.print(table)
 
 
@@ -1731,7 +1740,17 @@ def _render_model_list(
     table.add_column("Model", style="bold")
     table.add_column("State", no_wrap=True)
     shown = visible[:SETUP_MODEL_PREVIEW_LIMIT]
+    if current and current in visible and current not in shown and shown:
+        shown[-1] = current
     positions = {model: index for index, model in enumerate(models, 1)}
+    if current:
+        console.print(
+            Text.assemble(
+                ("  Current  ", "dim"),
+                (terminal_safe_text(current, single_line=True), "bold"),
+                ("  ·  Enter keeps it", "dim"),
+            )
+        )
     for model in shown:
         state = Text("current", style="green") if model == current else Text("")
         table.add_row(
@@ -1745,7 +1764,7 @@ def _render_model_list(
         console.print(
             Text(
                 f"  Showing {len(shown)} of {len(visible)} matches. "
-                "Type /text to filter the catalog.",
+                "Type /text to filter the catalog; Enter keeps the current model.",
                 style="dim",
             )
         )
@@ -1753,7 +1772,8 @@ def _render_model_list(
         console.print(
             Text(
                 "  Enter a number or exact model name. "
-                "Use /text to search, all to reset, b to go back.",
+                "Use /text to search, all to reset, b to go back"
+                + (", or Enter to keep the current model." if current else "."),
                 style="dim",
             )
         )
@@ -1764,40 +1784,66 @@ def _render_provider_catalog(
     descriptors: list[ProviderDescriptor] | tuple[ProviderDescriptor, ...],
 ) -> None:
     console = _setup_console()
+    width = console.width
     table = Table(
-        title=f"Provider catalog  ·  {len(PROVIDERS)} routes available",
-        box=box.ROUNDED,
+        title=f"Providers  ·  {len(PROVIDERS)} routes",
+        box=box.ROUNDED if width >= 52 else box.SIMPLE,
         border_style="bright_black",
         header_style="bold",
-        pad_edge=True,
+        pad_edge=width >= 52,
     )
     table.add_column("#", justify="right", style="dim", no_wrap=True)
-    table.add_column("Provider", style="bold", no_wrap=True)
-    table.add_column("Type", style="dim", no_wrap=True)
+    table.add_column("Provider", style="bold", no_wrap=width >= 48)
+    show_type = width >= 68
+    if show_type:
+        table.add_column("Type", style="dim", no_wrap=True)
     table.add_column("Status", no_wrap=True)
-    show_about = console.width >= 90
+    show_about = width >= 112
     if show_about:
         table.add_column("About")
     positions = {descriptor.id: index for index, descriptor in enumerate(PROVIDERS, 1)}
     for descriptor in descriptors:
         status = _provider_status(config, descriptor)
+        display_status = _compact_provider_status(status) if width < 60 else status
         cells: list[Any] = [
             str(positions[descriptor.id]),
             terminal_safe_text(descriptor.name, single_line=True),
-            terminal_safe_text(descriptor.category, single_line=True),
-            _setup_status_text(status),
         ]
+        if show_type:
+            cells.append(terminal_safe_text(descriptor.category, single_line=True))
+        cells.append(_setup_status_text(display_status))
         if show_about:
             cells.append(terminal_safe_text(descriptor.description, single_line=True))
         table.add_row(*cells)
     console.print(table)
-    console.print(
-        Text(
-            "  Search with /text (for example /open or /local). "
-            "Type all to reset; c cancels.",
-            style="dim",
+    hint = (
+        "  /text search  ·  all reset  ·  c cancel"
+        if width < 52
+        else (
+            "  Search with /text (for example /gateway or /local). "
+            "Type all to reset; c cancels."
         )
     )
+    console.print(Text(hint, style="dim"))
+
+
+def _compact_provider_status(status: str) -> str:
+    normalized = status.casefold()
+    if "signed in" in normalized:
+        return "signed in"
+    if "permission" in normalized:
+        return "consent"
+    if "sign-in" in normalized or "sign in" in normalized:
+        return "sign in"
+    if "detected" in normalized or "ready" in normalized:
+        return "ready"
+    if "needs key" in normalized:
+        return "key"
+    if "available" in normalized or "local" in normalized:
+        return "local"
+    if "manual" in normalized:
+        return "manual"
+    return status
 
 
 def _prompt_provider(config) -> ProviderDescriptor:
