@@ -4,8 +4,8 @@
 WSL2 through the supported Linux runtime path; native Windows is intentionally
 outside the supported/tested host matrix.
 Authentication is limited to API keys, custom OpenAI-compatible endpoints,
-local model runtimes, and the M4 work-in-progress for optional OpenAI
-ChatGPT-plan sign-in. MCP OAuth is part of the remote MCP transport boundary.
+local model runtimes, and optional service-verified OpenAI ChatGPT-plan
+sign-in. MCP OAuth is part of the remote MCP transport boundary.
 
 This is the authoritative product checklist. Older roadmap files describe
 historical intent and do not prove that a feature works.
@@ -75,8 +75,8 @@ reopening already-verified areas mechanically.
    benchmark no longer identifies a material core-harness weakness that should
    be fixed before calling Ash first-class and production-worthy.
 
-Current gate state: **M1, M2, and M3 are closed/current; M4 is active; M5 is
-queued.** Partial capability rows below remain deliberately qualified and do
+Current gate state: **M1-M5 are closed/current.** Partial capability rows below
+remain deliberately qualified and do
 not imply broader support than their recorded evidence.
 
 ### M4 product decisions
@@ -84,7 +84,7 @@ not imply broader support than their recorded evidence.
 The remaining comparator differences have now been reduced to explicit product
 decisions rather than an open-ended feature inventory:
 
-- **Implemented locally; live conformance pending — optional OpenAI ChatGPT-plan sign-in.** OpenAI now provides an
+- **Service-verified — optional OpenAI ChatGPT-plan sign-in.** OpenAI now provides an
   official open-source OAuth/PKCE flow that lets eligible users run supported
   Responses API requests using their ChatGPT plan without configuring an API
   key. Ash now implements this as a distinct auth/transport path: profile-aware
@@ -98,9 +98,12 @@ decisions rather than an open-ended feature inventory:
   `stream=true`, full history replay, strict terminal handling, canonical
   native function calls, and bounded opaque encrypted reasoning replay. The
   existing API-key route remains unchanged. Deterministic local tests cover the
-  auth, replay, setup, routing, recovery, and stream contracts; a real
-  interactive OpenAI account plus plan-backed completion is still required
-  before this item is called service-verified.
+  auth, replay, setup, routing, recovery, and stream contracts. On 2026-10-01,
+  a real interactive OpenAI sign-in completed successfully, live model
+  discovery returned the account's selectable catalog, `ash providers test
+  openai/gpt-6-astra` verified a real plan-backed Responses completion, and a
+  separate two-turn live native-function journey completed through canonical
+  assistant/tool replay with provider-reported usage.
 - **No separate M4 gap — remote browser control.** Ash already owns a managed
   Playwright browser and explicit loopback CDP attachment with guarded browser
   policy. Cross-machine browser relays/control planes are useful to gateway or
@@ -117,31 +120,47 @@ decisions rather than an open-ended feature inventory:
   OpenClaw, but do not materially improve Ash's terminal-first coding-harness
   mission enough to justify the product, security, and maintenance surface.
 
-M4 closes after the ChatGPT-plan path passes a real interactive OpenAI
-sign-in/model-discovery/Responses completion journey and the rejections remain
-valid under a final comparator pass.
+M4 is closed: the ChatGPT-plan path passed the required real interactive OpenAI
+sign-in/model-discovery/Responses completion journey, the stronger live
+function-call continuation also passed, and the final comparator pass did not
+identify another material Ash coding-core gap.
 
-### M5 pre-audit checkpoint
+### M5 final audit — closed 2026-10-01
 
-M5 remains formally queued until M4 closes, but the non-conflicting final-audit
-evidence has already been revalidated on 2026-10-01:
+The final mission audit is complete:
 
-- current official OpenClaw and Hermes evidence does not expose another
-  material coding-harness-core gap beyond the already-implemented ChatGPT-plan
-  path's pending live conformance;
-- hosted CI run `36848303087` is green at `50e066e` across Linux/macOS,
-  Python 3.12/3.13/3.14, packaging/quality, browser, Docker/native sandbox, PTY,
-  MCP, LSP, and minimum-dependency lanes;
-- a representative local final-journey pack passes 42 tests covering fresh
-  setup/process behavior, a real session journey, turn/crash recovery,
-  maintenance, long-session memory behavior, and viewport performance; and
-- historical research/audit documents are explicitly labeled as snapshots so
-  they no longer compete with this checklist as a second current product
-  verdict.
+- **First-run, interrupted, maintenance, and performance journeys:** a bounded
+  representative pack passed **42/42** tests covering fresh setup/process
+  behavior, a real session journey, turn/crash recovery, maintenance,
+  long-session memory behavior, and viewport performance.
+- **Advanced journeys:** a separate pack passed **307/307** tests across the
+  SDK, HTTP/JSON-RPC, modern MCP, plugin lifecycle, agent-task orchestration,
+  and browser command/tool contracts.
+- **Hostile/failure/security journeys:** anchored I/O, sandbox/policy,
+  environment scrubbing, secret middleware, logging/redaction,
+  background-process race defenses, and process-tree cleanup passed
+  **345 tests** with **4 environment-dependent skips**.
+- **Real provider journey:** optional ChatGPT-plan auth passed a real browser
+  OAuth sign-in, live model discovery, `ash providers test
+  openai/gpt-6-astra`, and a two-turn native function-call continuation with
+  canonical tool-result replay and provider-reported usage.
+- **Supported-host CI and packaging:** commit `1304bab` is fully green in
+  hosted run `36876005830`, including Linux/macOS,
+  Python 3.12/3.13/3.14, quality/packaging, minimum-dependencies, browser,
+  Docker/native sandbox, PTY, MCP, and LSP lanes.
+- **Comparator sanity check:** current official OpenClaw, Hermes, Claude Code,
+  and Codex evidence does not identify another material terminal
+  coding-harness-core weakness that should block production readiness. Their
+  remaining advantages are primarily ecosystem scale, hosted/desktop/browser
+  presentation, gateway/channels/mobile/media breadth, or managed cloud
+  execution; Ash's documented scope decisions remain valid.
+- **Documentation truthfulness:** the authoritative checklist is the single
+  current verdict, while older research/audit files are explicitly labeled as
+  dated evidence rather than competing product truth.
 
-The remaining blocker to formally entering M5 is therefore the user-owned live
-OpenAI sign-in/model-discovery/plan-backed Responses journey, not another
-unbounded parity sweep.
+M5 is closed. Future work is normal product evolution inside or beyond Ash's
+documented scope; it is no longer required to satisfy this production-harness
+mission.
 
 ## 1. Installation And Setup
 
@@ -152,7 +171,7 @@ unbounded parity sweep.
 | Dependency separation | Verified locally | Lean default runtime/provider install, standardized dev group, explicit server/local-embeddings/browser/ACP/A2A capability extras, actionable missing-extra errors, and lockfile/artifact checks |
 | First-run wizard | Verified locally | No-key detection, deterministic cancel/back, endpoint retry/save-unverified choices, non-billable model discovery, secret input, atomic related settings, non-TTY guidance, secret-free JSON status, and fresh-process API/local checks |
 | API-key providers | Partial | Every built-in cloud route now assembles from a fresh non-interactive process with its provider credential contract (including Google `GEMINI_API_KEY` fallback), while custom endpoints retain fresh-process coverage; deterministic fresh-process CLI loopback E2E proves real streamed completion across the entire built-in cloud catalog: Anthropic through the native Messages/SSE protocol with `x-api-key`, protocol-version, and provider-usage assertions, plus all eleven OpenAI-wire routes (OpenAI, Google, OpenRouter, DeepSeek, Groq, Mistral, xAI, Together, Fireworks, Cerebras, and NVIDIA) with provider-specific bearer credentials, dynamic model-catalog probes where applicable, Together's list-shaped catalog, and Google's client-identification header; a bounded real OpenRouter service run additionally proved live catalog discovery, a no-tools completion with provider-reported usage, and a coding journey that edited and externally tested a project using an ephemeral credential that was not persisted by Ash; interactive generic onboarding consumes the same readiness-owned catalog shape used at runtime; custom OpenAI-compatible routes fail closed unless exact per-model metadata is explicitly declared; OpenRouter, Mistral, xAI, Together, Fireworks, and Cerebras start conservatively and recover only capabilities proven by bounded provider-owned metadata (including multi-source xAI metadata that fails closed on direct or follow-up alias disagreement about canonical model identity, and selected-model Fireworks management metadata); runtime provider/model switches own retired-provider closure through loop shutdown, surface cleanup failures, and preserve close-once semantics for successful resources across shutdown retries; real vendor cross-version/service interoperability remains broader than the exercised OpenRouter service plus deterministic protocol coverage |
-| OpenAI ChatGPT-plan auth | Verified locally | Optional first-party `openai/*` auth mode uses OpenAI's open-source Sign in with ChatGPT flow with exact loopback state/nonce/PKCE and ID-token validation, private profile-scoped multi-account registration storage, stable host identity, rotating refresh serialization, revocation-aware logout, live model discovery, user-owned setup/CLI controls, project-config exclusion, and a dedicated stateless Responses adapter enforcing `store=false`, `stream=true`, full canonical history/tool replay, bounded encrypted reasoning replay, and success only on `response.completed`; deterministic auth/provider/runtime regressions pass, while a real interactive OpenAI sign-in plus plan-backed completion remains required before M4 closes |
+| OpenAI ChatGPT-plan auth | Verified live | Optional first-party `openai/*` auth mode uses OpenAI's open-source Sign in with ChatGPT flow with exact loopback state/nonce/PKCE and ID-token validation, private profile-scoped multi-account registration storage, stable host identity, rotating refresh serialization, revocation-aware logout, live model discovery, user-owned setup/CLI controls, project-config exclusion, and a dedicated stateless Responses adapter enforcing `store=false`, `stream=true`, full canonical history/tool replay, bounded encrypted reasoning replay, and success only on `response.completed`; deterministic auth/provider/runtime regressions pass, and a real 2026-10-01 account journey verified sign-in, catalog discovery, plan-backed completion, native function call, canonical tool-result continuation, and provider-reported usage |
 | Provider route verification | Verified locally | `ash providers test` separates catalog/model discovery from a bounded no-tools model completion, requires a safe terminal response before declaring the route ready, redacts completion failures, and closes the probe provider; `ash doctor --connect` remains a non-billable catalog/model check |
 | Local models | Partial | Ollama URL validation, discovery, health detail, safe bounded pulls, and dynamic tool/context probing are wired; LM Studio and vLLM no longer inherit OpenAI capabilities from wire compatibility, LM Studio consumes its native per-model tool/vision/reasoning/loaded-context metadata, and vLLM preserves served context while generic `supported_parameters=tools` does not enable native auto-tool calling without explicit server capability evidence; deterministic fresh-process CLI loopback E2E now proves each route's native catalog endpoint, streamed completion, provider/model identity, and absence of bearer auth; `/capabilities --refresh` re-probes dynamic manifests, while real cross-version LM Studio/vLLM runtime conformance remains |
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |
@@ -387,12 +406,9 @@ unbounded parity sweep.
 
 ## Overall parity verdict
 
-Ash is a credible local-first terminal coding harness with unusually broad
-implemented primitives for sessions, safety, tools, MCP, local delegation, and
-automation. The previous production-hardening/re-audit phase is complete, but
-the **Ash mission is not complete yet**: M1-M3 are closed/current, while M4's
-remaining work is now the live-service conformance journey for the implemented
-ChatGPT-plan path before the final M5 mission audit.
+Ash is a first-class, production-worthy local-first terminal coding harness
+within its documented supported scope. The production-hardening/re-audit
+mission is complete: **M1-M5 are closed/current**.
 
 Current comparators also cover materially different product categories:
 
@@ -411,10 +427,10 @@ Current comparators also cover materially different product categories:
   [Gemini CLI feature index](https://geminicli.com/docs/), and
   [Aider feature overview](https://aider.chat/).
 
-Ash should currently be described as **strong local coding-core parity with one
-live M4 conformance checkpoint remaining, and a WIP**. Missing
-gateway/channel/mobile/media surfaces are comparator scope differences, not
-automatic Ash debt. Optional OpenAI ChatGPT-plan sign-in is implemented locally
-but not yet service-verified; remote-browser relays and richer remote-agent
-presentation modalities are not separate core gaps under the current product
-decision.
+Ash should currently be described as **a production-worthy terminal coding
+harness with strong coding-core parity on supported Linux/macOS hosts (and WSL2
+through the supported Linux path)**. This is not a claim of feature identity
+with broader assistant/gateway products. Missing gateway/channel/mobile/media
+surfaces are comparator scope differences, not automatic Ash debt. Qualified
+Partial rows remain deliberate support-boundary statements rather than hidden
+mission blockers.

@@ -558,8 +558,9 @@ Ash deliberately reports unsupported or partial surfaces instead of pretending
 they are complete:
 
 - native Windows execution is not currently supported; use WSL2;
-- OpenAI ChatGPT-plan authentication is implemented but still requires a real
-  live account/inference conformance pass before Ash claims M4 complete;
+- OpenAI ChatGPT-plan authentication is service-verified through real browser
+  sign-in, model discovery, plan-backed Responses completion, and native
+  function-call continuation;
 - remote browser CDP and direct takeover of pre-existing tabs are not exposed;
 - ACP audio/embedded-resource, session delete, additional directories, modes,
   terminal/filesystem callbacks, and registry publication are not advertised
@@ -569,4 +570,6 @@ they are complete:
 - LSP rename and code actions are not exposed; and
 - a broad messaging-channel gateway is not currently part of Ash.
 
-Ash is a work in progress (WIP).
+Ash is production-worthy within the documented supported scope above. The
+qualified boundaries are intentional support limits, not untracked completeness
+claims or hidden mission blockers.

@@ -109,8 +109,9 @@ Useful local entry points include:
 ### Product delta — 2026-10-01
 
 - Optional first-party OpenAI Sign in with ChatGPT and plan-backed Responses
-  routing is implemented locally; one real interactive account/model/completion
-  conformance journey remains before M4 can close.
+  routing is implemented and service-verified through a real browser sign-in,
+  live model discovery, a plan-backed completion, and a native function-call
+  continuation journey.
 - Broad messaging gateway, channel, mobile, voice, and media breadth remains a
   genuine comparator difference but is explicitly rejected as Ash-core scope,
   not left as automatic roadmap debt.
@@ -118,7 +119,7 @@ Useful local entry points include:
   integration, and durable task primitives remain sufficient for the coding
   workflows Ash currently claims; remote browser relays and richer presentation
   modalities are not separate M4 gaps.
-- The supported Linux/macOS CI matrix is green at commit `50e066e`, including
+- The supported Linux/macOS CI matrix is green at commit `1304bab`, including
   packaging, browser, native/Docker sandbox, PTY, MCP, LSP, and minimum-
   dependency lanes.
 
