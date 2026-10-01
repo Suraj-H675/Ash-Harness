@@ -1,14 +1,17 @@
 # Ash Harness Research and Target Architecture
 
-Status: active architecture record  
+Status: research and target-architecture evidence record
 Research date: 2026-08-27<br>
-Latest parity refresh: 2026-08-30
+Latest product-delta review: 2026-10-01
 Scope: local coding harness plus extensible general-purpose agent platform
 
-This document supersedes earlier project plans as a source of architectural
-direction. Earlier Markdown files remain historical inputs, not requirements.
-Decisions here come from the running Ash implementation, current protocol
-specifications, and the reference repositories pinned below.
+This document preserves comparator research, architecture analysis, and dated
+snapshots. It is **not** the authoritative current product verdict. Current
+mission gates, support scope, parity decisions, and verified implementation
+status live in
+[PRODUCTION_HARNESS_PARITY.md](./PRODUCTION_HARNESS_PARITY.md). Older rows below
+remain historical evidence and must not be read as current gaps merely because
+they use words such as "current" inside their dated section.
 
 No source code from a reference repository was copied during this audit. Ash
 is distributed under the MIT license; reference behavior is used for design
@@ -98,6 +101,26 @@ Useful local entry points include:
 - Pi: `ref/pi/packages/agent` and `ref/pi/packages/coding-agent/src/core`.
 
 ## First-Party Harness Parity Refresh — 2026-08-30
+
+> **Historical refresh.** The matrix in this section records the 2026-08-30
+> evidence state. The 2026-10-01 product-delta review did not rewrite historical
+> cells. Use the production parity checklist for today's Ash status.
+
+### Product delta — 2026-10-01
+
+- Optional first-party OpenAI Sign in with ChatGPT and plan-backed Responses
+  routing is implemented locally; one real interactive account/model/completion
+  conformance journey remains before M4 can close.
+- Broad messaging gateway, channel, mobile, voice, and media breadth remains a
+  genuine comparator difference but is explicitly rejected as Ash-core scope,
+  not left as automatic roadmap debt.
+- Managed browser automation, loopback CDP attachment, ACP/A2A remote
+  integration, and durable task primitives remain sufficient for the coding
+  workflows Ash currently claims; remote browser relays and richer presentation
+  modalities are not separate M4 gaps.
+- The supported Linux/macOS CI matrix is green at commit `50e066e`, including
+  packaging, browser, native/Docker sandbox, PTY, MCP, LSP, and minimum-
+  dependency lanes.
 
 ### Method and Status Semantics
 

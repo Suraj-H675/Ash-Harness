@@ -1,5 +1,10 @@
 # Ash parity audit — 2026-09-01
 
+> **Historical snapshot.** This audit records the 2026-09-01 state and its
+> continuation checkpoints; it is not the current product verdict. For current
+> mission gates, parity decisions, support scope, and verified evidence, use
+> [PRODUCTION_HARNESS_PARITY.md](../architecture/PRODUCTION_HARNESS_PARITY.md).
+
 ## Blunt answer
 
 No. Ash is not currently on the same overall level as Hermes Agent, OpenClaw,
