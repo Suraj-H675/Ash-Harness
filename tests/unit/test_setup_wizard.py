@@ -838,6 +838,71 @@ def test_setup_numbered_prompts_reject_unbounded_numeric_input(
     assert "\u202e" not in output
 
 
+def test_provider_catalog_render_exposes_full_breadth(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands.setup import PROVIDERS, _render_provider_catalog
+
+    monkeypatch.setattr(
+        "ash.commands.setup.get_env_value",
+        lambda _name: None,
+    )
+    config = SimpleNamespace(model="", openai_auth_mode="api_key")
+
+    _render_provider_catalog(config, list(PROVIDERS))
+
+    output = capsys.readouterr().out
+    assert "17 routes available" in output
+    assert "OpenRouter" in output
+    assert "Hugging Face" in output
+    assert "Google Gemini" in output
+    assert "Ollama" in output
+    assert "LM Studio" in output
+    assert "vLLM" in output
+    assert "Custom endpoint" in output
+    assert "manual setup" in output
+
+
+def test_provider_picker_accepts_name_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import _prompt_provider
+
+    monkeypatch.setattr(
+        "ash.commands.setup.get_env_value",
+        lambda _name: None,
+    )
+    monkeypatch.setattr("builtins.input", _fake_input(["/router", "openrouter"]))
+
+    selected = _prompt_provider(
+        SimpleNamespace(model="", openai_auth_mode="api_key")
+    )
+
+    assert selected.id == "openrouter"
+
+
+def test_model_picker_bounds_large_catalog_and_filters(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands.setup import _prompt_model_list
+
+    models = [f"provider/model-{index:02d}" for index in range(1, 31)]
+    monkeypatch.setattr(
+        "builtins.input",
+        _fake_input(["/model-30", "30"]),
+    )
+
+    assert _prompt_model_list(models, "") == "provider/model-30"
+
+    output = capsys.readouterr().out
+    assert "30 discovered" in output
+    assert "Showing 18 of 30 matches" in output
+    assert "provider/model-30" in output
+    assert "provider/model-29" not in output
+
+
 class TestProbeModels:
     """Tests for _probe_models and _probe_ollama_models."""
 

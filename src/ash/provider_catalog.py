@@ -54,7 +54,7 @@ BUILTIN_PROVIDERS: tuple[ProviderDescriptor, ...] = (
         "openai",
         "OpenAI",
         "Cloud API",
-        "GPT models via the OpenAI Chat Completions API",
+        "GPT models via API key or an eligible ChatGPT plan",
         "https://api.openai.com/v1",
         "OPENAI_API_KEY",
     ),
@@ -74,6 +74,14 @@ BUILTIN_PROVIDERS: tuple[ProviderDescriptor, ...] = (
         "Multi-provider routing with one OpenAI-compatible endpoint",
         "https://openrouter.ai/api/v1",
         "OPENROUTER_API_KEY",
+    ),
+    ProviderDescriptor(
+        "huggingface",
+        "Hugging Face",
+        "Gateway",
+        "Hundreds of hosted models through Hugging Face Inference Providers",
+        "https://router.huggingface.co/v1",
+        "HF_TOKEN",
     ),
     ProviderDescriptor(
         "deepseek",

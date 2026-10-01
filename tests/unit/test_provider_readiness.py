@@ -712,6 +712,80 @@ def test_lmstudio_connection_uses_native_capability_catalog() -> None:
     assert connection.catalog_endpoint == "http://localhost:1234/api/v1/models"
 
 
+def test_huggingface_connection_uses_inference_provider_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HF_TOKEN", "hf-test")
+
+    connection = readiness.resolve_provider_connection(
+        _config("huggingface/openai/gpt-oss-120b")
+    )
+
+    assert connection.base_url == "https://router.huggingface.co/v1"
+    assert connection.catalog_endpoint == "https://router.huggingface.co/v1/models"
+    assert connection.catalog_format == "huggingface"
+    assert connection.headers["Authorization"] == "Bearer hf-test"
+
+
+def test_huggingface_catalog_uses_live_provider_capability_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "openai/gpt-oss-120b",
+                        "architecture": {
+                            "input_modalities": ["text", "image"],
+                        },
+                        "providers": [
+                            {
+                                "provider": "groq",
+                                "status": "live",
+                                "context_length": 131072,
+                                "supports_tools": True,
+                            },
+                            {
+                                "provider": "cerebras",
+                                "status": "live",
+                                "context_length": 65536,
+                                "supports_tools": True,
+                            },
+                            {
+                                "provider": "offline-provider",
+                                "status": "offline",
+                                "context_length": 4096,
+                                "supports_tools": False,
+                            },
+                        ],
+                    }
+                ]
+            },
+            request=request,
+        ),
+    )
+
+    (metadata,) = readiness.probe_model_catalog_metadata(
+        "https://router.huggingface.co/v1/models",
+        headers={"Authorization": "Bearer hf-test"},
+        catalog_format="huggingface",
+    )
+
+    assert metadata.model_id == "openai/gpt-oss-120b"
+    assert metadata.native_tools is True
+    assert metadata.vision is None
+    assert metadata.input_modalities == frozenset({"text", "image"})
+    assert metadata.context_window == 65536
+    assert "openai/gpt-oss-120b:groq" in metadata.aliases
+    assert "openai/gpt-oss-120b:cerebras" in metadata.aliases
+    assert "openai/gpt-oss-120b:fastest" in metadata.aliases
+    assert "openai/gpt-oss-120b:cheapest" in metadata.aliases
+    assert "openai/gpt-oss-120b:preferred" in metadata.aliases
+
+
 def test_catalog_metadata_does_not_promote_malformed_capability_values(monkeypatch) -> None:
     patch_catalog_client(
         monkeypatch,

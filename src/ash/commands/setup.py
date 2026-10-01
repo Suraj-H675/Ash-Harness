@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urlsplit
 
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -112,6 +113,7 @@ WEB_SEARCH_PROVIDERS = (
 )
 _PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 BROWSER_INSTALL_TIMEOUT_SECONDS = 300
+SETUP_MODEL_PREVIEW_LIMIT = 18
 
 
 @dataclass(frozen=True)
@@ -142,9 +144,47 @@ def _setup_console() -> Console:
     )
 
 
+def _setup_status_text(label: str) -> Text:
+    normalized = label.casefold()
+    if any(token in normalized for token in ("ready", "detected", "signed in", "configured")):
+        return Text(label, style="green")
+    if any(token in normalized for token in ("needs", "required", "disabled")):
+        return Text(label, style="yellow")
+    if "local" in normalized or "available" in normalized:
+        return Text(label, style="cyan")
+    if "manual" in normalized:
+        return Text(label, style="cyan")
+    return Text(label, style="dim")
+
+
+def _print_setup_banner() -> None:
+    console = _setup_console()
+    title = Text()
+    title.append("ASH", style="bold cyan")
+    title.append("  /  SETUP", style="bold")
+    body = Text(
+        "Configure the model route and the capabilities Ash can use in this profile."
+    )
+    body.append("\n")
+    body.append(
+        "Provider → model → optional capabilities → verification",
+        style="dim",
+    )
+    console.print(
+        Panel(
+            body,
+            title=title,
+            border_style="bright_black",
+            padding=(1, 2),
+        )
+    )
+
+
 def _provider_status(config, descriptor: ProviderDescriptor) -> str:
     """Describe whether a catalog provider has enough local setup to try."""
 
+    if descriptor.id == "openai-compatible":
+        return "manual setup"
     if descriptor.local:
         return "available to test"
     if descriptor.id == "openai" and getattr(config, "openai_auth_mode", "") == "chatgpt":
@@ -234,31 +274,37 @@ def _render_setup_status(
         ("Memory", str(capabilities["memory"]["backend"])),
         ("Sandbox", str(capabilities["sandbox"]["backend"])),
     ]
-    summary = Text()
-    summary.append(terminal_safe_text(provider_name, single_line=True), style="bold")
-    summary.append("  ")
-    summary.append(terminal_safe_text(model, single_line=True), style="dim")
-    summary.append("\nProfile: ")
-    summary.append(terminal_safe_text(profile, single_line=True))
-    summary.append("  •  Provider route: ")
-    summary.append(terminal_safe_text(provider_state, single_line=True))
-    summary.append("  •  Fallbacks: ")
-    summary.append(str(fallback_count))
+    summary = Table.grid(padding=(0, 2))
+    summary.add_column(style="dim", no_wrap=True)
+    summary.add_column()
+    summary.add_row("Profile", terminal_safe_text(profile, single_line=True))
+    summary.add_row(
+        "Provider",
+        Text(terminal_safe_text(provider_name, single_line=True), style="bold"),
+    )
+    summary.add_row("Model", terminal_safe_text(model, single_line=True))
+    summary.add_row("Route", _setup_status_text(provider_state))
+    summary.add_row("Fallbacks", str(fallback_count))
     console.print(
         Panel(
             summary,
             title=terminal_safe_text(title, single_line=True),
-            border_style="cyan",
-            padding=(0, 1),
+            border_style="bright_black",
+            padding=(1, 2),
         )
     )
-    table = Table(show_header=True, header_style="bold cyan", box=None, pad_edge=False)
+    table = Table(
+        show_header=True,
+        header_style="bold",
+        box=box.SIMPLE,
+        pad_edge=False,
+    )
     table.add_column("Capability", style="bold")
     table.add_column("Status")
     for capability, status in optional:
         table.add_row(
             Text(terminal_safe_text(capability, single_line=True), style="bold"),
-            Text(terminal_safe_text(status, single_line=True)),
+            _setup_status_text(terminal_safe_text(status, single_line=True)),
         )
     console.print(table)
 
@@ -334,7 +380,7 @@ def run_setup_wizard(args) -> SetupOutcome:
         return SetupOutcome.ERROR
 
     # Banner
-    _print_header("Ash Setup Wizard")
+    _print_setup_banner()
     _render_setup_status(config, title="Before you begin")
 
     # Check for old ash.toml and offer migration
@@ -709,28 +755,13 @@ def select_provider_and_model(config) -> SetupOutcome:
     """Show provider list, route to provider flow, verify model."""
     while True:
         _print_header("Select your inference provider")
-        print("Choose a provider. Existing keys and local runtimes are marked:\n")
-        table = Table(show_header=True, header_style="bold cyan", box=None, pad_edge=False)
-        table.add_column("#", justify="right")
-        table.add_column("Provider", style="bold")
-        table.add_column("Route")
-        table.add_column("Setup")
-        for i, descriptor in enumerate(PROVIDERS, 1):
-            table.add_row(
-                str(i),
-                descriptor.name,
-                descriptor.category,
-                _provider_status(config, descriptor),
-            )
-        _setup_console().print(table)
+        print(
+            "Ash supports the routes below directly. "
+            "Choose by number, provider name, or provider ID.\n"
+        )
 
         try:
-            choice = _prompt_choice(
-                "Enter a number",
-                [str(i) for i in range(1, len(PROVIDERS) + 1)],
-                default=0,
-            )
-            descriptor = PROVIDERS[choice]
+            descriptor = _prompt_provider(config)
             provider_id = descriptor.id
             current = _get_current_model_for_provider(config, provider_id)
             if provider_id == "anthropic":
@@ -1642,23 +1673,34 @@ def _require_secure_provider_transport(
 
 def _prompt_model_list(models: list[str], current: str) -> str:
     """Show models and return a selection, or raise a navigation signal."""
-    print("\n  Available models:")
-    for i, m in enumerate(models, 1):
-        marker = " (current)" if m == current else ""
-        print(
-            f"    [{i}] {terminal_safe_text(m, single_line=True)}{marker}"
-        )
+    visible = list(models)
 
     while True:
+        _render_model_list(models, visible, current)
         val = input(
-            "\n  Select a model (number or name, 'b' back, 'c' cancel): "
+            "\n  Model › "
         ).strip()
         if not val:
+            if current and current in models:
+                return current
             continue
         if val.casefold() in ("c", "q", "cancel", "quit"):
             raise SetupCancelled
         if val.casefold() in ("b", "back"):
             raise SetupBack
+        if val.casefold() in ("all", "*"):
+            visible = list(models)
+            continue
+        if val.startswith("/"):
+            query = val[1:].strip().casefold()
+            if not query:
+                visible = list(models)
+                continue
+            visible = [model for model in models if query in model.casefold()]
+            if not visible:
+                print(f"  No models match {val[1:].strip()!r}.")
+                visible = list(models)
+            continue
         if val.isdigit():
             try:
                 idx = int(val) - 1
@@ -1670,6 +1712,169 @@ def _prompt_model_list(models: list[str], current: str) -> str:
             print("  Invalid number.")
         else:
             return val
+
+
+def _render_model_list(
+    models: list[str],
+    visible: list[str],
+    current: str,
+) -> None:
+    console = _setup_console()
+    table = Table(
+        title=f"Models  ·  {len(models)} discovered",
+        box=box.ROUNDED,
+        border_style="bright_black",
+        header_style="bold",
+        pad_edge=True,
+    )
+    table.add_column("#", justify="right", style="dim", no_wrap=True)
+    table.add_column("Model", style="bold")
+    table.add_column("State", no_wrap=True)
+    shown = visible[:SETUP_MODEL_PREVIEW_LIMIT]
+    positions = {model: index for index, model in enumerate(models, 1)}
+    for model in shown:
+        state = Text("current", style="green") if model == current else Text("")
+        table.add_row(
+            str(positions[model]),
+            terminal_safe_text(model, single_line=True),
+            state,
+        )
+    console.print()
+    console.print(table)
+    if len(visible) > len(shown):
+        console.print(
+            Text(
+                f"  Showing {len(shown)} of {len(visible)} matches. "
+                "Type /text to filter the catalog.",
+                style="dim",
+            )
+        )
+    else:
+        console.print(
+            Text(
+                "  Enter a number or exact model name. "
+                "Use /text to search, all to reset, b to go back.",
+                style="dim",
+            )
+        )
+
+
+def _render_provider_catalog(
+    config,
+    descriptors: list[ProviderDescriptor] | tuple[ProviderDescriptor, ...],
+) -> None:
+    console = _setup_console()
+    table = Table(
+        title=f"Provider catalog  ·  {len(PROVIDERS)} routes available",
+        box=box.ROUNDED,
+        border_style="bright_black",
+        header_style="bold",
+        pad_edge=True,
+    )
+    table.add_column("#", justify="right", style="dim", no_wrap=True)
+    table.add_column("Provider", style="bold", no_wrap=True)
+    table.add_column("Type", style="dim", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    show_about = console.width >= 90
+    if show_about:
+        table.add_column("About")
+    positions = {descriptor.id: index for index, descriptor in enumerate(PROVIDERS, 1)}
+    for descriptor in descriptors:
+        status = _provider_status(config, descriptor)
+        cells: list[Any] = [
+            str(positions[descriptor.id]),
+            terminal_safe_text(descriptor.name, single_line=True),
+            terminal_safe_text(descriptor.category, single_line=True),
+            _setup_status_text(status),
+        ]
+        if show_about:
+            cells.append(terminal_safe_text(descriptor.description, single_line=True))
+        table.add_row(*cells)
+    console.print(table)
+    console.print(
+        Text(
+            "  Search with /text (for example /open or /local). "
+            "Type all to reset; c cancels.",
+            style="dim",
+        )
+    )
+
+
+def _prompt_provider(config) -> ProviderDescriptor:
+    visible = list(PROVIDERS)
+    current_provider = str(getattr(config, "model", "") or "").partition("/")[0]
+    default = next(
+        (
+            descriptor
+            for descriptor in PROVIDERS
+            if descriptor.id == current_provider
+        ),
+        None,
+    )
+    while True:
+        _render_provider_catalog(config, visible)
+        suffix = f" [{default.name}]" if default is not None else ""
+        value = input(f"\n  Provider{suffix} › ").strip()
+        if not value and default is not None:
+            return default
+        if value.casefold() in {"c", "cancel", "q", "quit"}:
+            raise SetupCancelled
+        if value.casefold() in {"all", "*"}:
+            visible = list(PROVIDERS)
+            continue
+        if value.startswith("/"):
+            query = value[1:].strip().casefold()
+            if not query:
+                visible = list(PROVIDERS)
+                continue
+            visible = [
+                descriptor
+                for descriptor in PROVIDERS
+                if query
+                in " ".join(
+                    (
+                        descriptor.id,
+                        descriptor.name,
+                        descriptor.category,
+                        descriptor.description,
+                    )
+                ).casefold()
+            ]
+            if not visible:
+                print(f"  No providers match {value[1:].strip()!r}.")
+                visible = list(PROVIDERS)
+            continue
+        if value.isdigit():
+            try:
+                index = int(value) - 1
+            except ValueError:
+                print("  Invalid choice.")
+                continue
+            if 0 <= index < len(PROVIDERS):
+                return PROVIDERS[index]
+            print("  Invalid choice.")
+            continue
+        query = value.casefold()
+        exact = [
+            descriptor
+            for descriptor in PROVIDERS
+            if query in {descriptor.id.casefold(), descriptor.name.casefold()}
+        ]
+        if len(exact) == 1:
+            return exact[0]
+        matches = [
+            descriptor
+            for descriptor in PROVIDERS
+            if query in descriptor.id.casefold()
+            or query in descriptor.name.casefold()
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            visible = matches
+            print(f"  {len(matches)} providers match {value!r}; narrow the search.")
+            continue
+        print("  Invalid choice.")
 
 
 def _prompt_choice(prompt: str, options: list[str], default: int) -> int:
@@ -1709,13 +1914,14 @@ def _prompt_setup_text(prompt: str, *, allow_empty: bool = False) -> str:
 
 
 def _print_header(title: str) -> None:
-    _setup_console().print(
-        Panel(
-            Text(terminal_safe_text(title, single_line=True)),
-            border_style="cyan",
-            padding=(0, 1),
-        )
-    )
+    console = _setup_console()
+    line = Text()
+    line.append("━━ ", style="bright_black")
+    line.append(terminal_safe_text(title, single_line=True), style="bold")
+    line.append(" ", style="bold")
+    line.append("━" * 8, style="bright_black")
+    console.print()
+    console.print(line)
 
 
 def _print_info(msg: str) -> None:

@@ -32,7 +32,14 @@ class ProviderConfigurationError(ValueError):
 
 
 CatalogFormat = Literal[
-    "openai", "anthropic", "ollama", "lmstudio", "together", "xai", "fireworks"
+    "openai",
+    "anthropic",
+    "ollama",
+    "lmstudio",
+    "together",
+    "xai",
+    "fireworks",
+    "huggingface",
 ]
 AuthMode = Literal["bearer", "anthropic", "none", "chatgpt"]
 MAX_PROVIDER_CATALOG_BYTES = 2_000_000
@@ -180,6 +187,12 @@ _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
         "https://openrouter.ai/api/v1",
         "OPENROUTER_API_BASE",
         "openai",
+        "bearer",
+    ),
+    "huggingface": (
+        "https://router.huggingface.co/v1",
+        "HUGGINGFACE_API_BASE",
+        "huggingface",
         "bearer",
     ),
     "mistral": (
@@ -577,6 +590,30 @@ def probe_model_catalog_metadata(
             for value in raw_aliases
             if isinstance(value, str) and value and value != model_id
         ) if isinstance(raw_aliases, list) else frozenset()
+        huggingface_live_providers: list[dict[str, object]] = []
+        if catalog_format == "huggingface":
+            raw_providers = item.get("providers")
+            if isinstance(raw_providers, list):
+                huggingface_live_providers = [
+                    provider
+                    for provider in raw_providers
+                    if isinstance(provider, dict) and provider.get("status") == "live"
+                ]
+            provider_aliases = {
+                f"{model_id}:{provider_id}"
+                for provider in huggingface_live_providers
+                if isinstance((provider_id := provider.get("provider")), str)
+                and provider_id
+            }
+            aliases = frozenset(
+                {
+                    *aliases,
+                    *provider_aliases,
+                    f"{model_id}:fastest",
+                    f"{model_id}:cheapest",
+                    f"{model_id}:preferred",
+                }
+            )
         supported = item.get("supported_parameters")
         if isinstance(supported, list):
             parameters = frozenset(
@@ -613,6 +650,13 @@ def probe_model_catalog_metadata(
         if catalog_format == "fireworks":
             native_tools = _catalog_boolean(item, "supportsTools")
             vision = _catalog_boolean(item, "supportsImageInput")
+        elif catalog_format == "huggingface" and huggingface_live_providers:
+            tool_support = [
+                provider.get("supports_tools")
+                for provider in huggingface_live_providers
+            ]
+            if all(isinstance(value, bool) for value in tool_support):
+                native_tools = all(bool(value) for value in tool_support)
         if reasoning is None and catalog_format == "lmstudio":
             reasoning_config = capability_data.get("reasoning")
             if isinstance(reasoning_config, dict):
@@ -650,6 +694,19 @@ def probe_model_catalog_metadata(
             or _positive_catalog_integer(item.get("context_length"))
             or _positive_catalog_integer(item.get("contextLength"))
         )
+        if catalog_format == "huggingface" and huggingface_live_providers:
+            provider_contexts = [
+                value
+                for provider in huggingface_live_providers
+                if (
+                    value := _positive_catalog_integer(
+                        provider.get("context_length")
+                    )
+                )
+                is not None
+            ]
+            if provider_contexts:
+                context_window = min(provider_contexts)
         max_output = (
             _positive_catalog_integer(top_provider_data.get("max_completion_tokens"))
             or _positive_catalog_integer(limit_data.get("max_completion_tokens"))

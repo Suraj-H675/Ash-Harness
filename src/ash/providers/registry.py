@@ -202,6 +202,7 @@ def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderAB
         "vllm",
         "openai-compatible",
         "google",
+        "huggingface",
         "nvidia",
         "xai",
         "together",

@@ -84,6 +84,7 @@ Supported built-in routes include:
 | Anthropic | Claude models through the Anthropic Messages API |
 | OpenAI | GPT models through the OpenAI API using an API key or optional Sign in with ChatGPT plan auth |
 | OpenRouter | Multi-provider gateway routing |
+| Hugging Face | Inference Providers gateway to hundreds of hosted chat models |
 | DeepSeek | Chat and reasoning models |
 | Groq | Fast hosted open models |
 | Mistral | Mistral models through an OpenAI-compatible endpoint |
