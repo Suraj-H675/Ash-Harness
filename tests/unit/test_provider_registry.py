@@ -235,6 +235,34 @@ def test_google_registry_accepts_gemini_api_key_fallback(
     assert provider._api_key == "legacy-compatible-key"
 
 
+def test_openai_chatgpt_route_builds_without_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.openai_chatgpt import OpenAIChatGPTProvider
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    provider = create_default_provider_registry().build(
+        AshConfig(
+            model="openai/gpt-test",
+            openai_auth_mode="chatgpt",
+        )
+    )
+
+    assert isinstance(provider, OpenAIChatGPTProvider)
+    assert provider.model_name == "gpt-test"
+    assert provider.provider_family == "openai"
+
+
+def test_openai_gpt6_models_are_reasoning_capable() -> None:
+    from ash.providers.capabilities import infer_capabilities
+
+    capabilities = infer_capabilities("openai", "gpt-6.1-sol")
+
+    assert capabilities.native_tools is True
+    assert capabilities.vision is True
+    assert capabilities.reasoning is True
+
+
 def test_openrouter_capabilities_are_not_assumed_from_openai_wire_protocol(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

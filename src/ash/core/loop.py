@@ -3411,7 +3411,14 @@ class AshLoop:
                 role="assistant",
                 content=assistant_text,
                 timestamp=_utc_now(),
-                metadata={"tool_calls": tool_calls} if tool_calls else {},
+                metadata={
+                    **({"tool_calls": tool_calls} if tool_calls else {}),
+                    **(
+                        {"provider_state": model_completion.provider_state}
+                        if model_completion.provider_state
+                        else {}
+                    ),
+                },
             )
             persisted_metadata = redact_value(assistant_message.metadata)
             assert isinstance(persisted_metadata, dict)
@@ -4042,6 +4049,7 @@ class AshLoop:
         usage_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
         native_tool_calls_from_api: list[CanonicalToolCall] = []
         reasoning_blocks: list[dict[str, Any]] = []
+        provider_state: list[dict[str, Any]] = []
         retained_completion_bytes = 0
         stream_chunk_count = 0
         saw_terminal = False
@@ -4192,6 +4200,18 @@ class AshLoop:
                                 )
                             if chunk.reasoning:
                                 reasoning_blocks.extend(chunk.reasoning)
+                            if chunk.provider_state:
+                                if provider_state:
+                                    raise ProviderCompletionError(
+                                        "provider emitted provider replay state more "
+                                        "than once in one completion"
+                                    )
+                                if not chunk.is_done:
+                                    raise ProviderCompletionError(
+                                        "provider emitted replay state before its "
+                                        "terminal chunk"
+                                    )
+                                provider_state = [dict(item) for item in chunk.provider_state]
                             chunk_has_output = bool(
                                 chunk.content
                                 or chunk.tool_call_delta
@@ -4371,6 +4391,7 @@ class AshLoop:
                         cache_write_tokens = 0
                         usage_source = "unavailable"
                         reasoning_blocks.clear()
+                        provider_state.clear()
                         retained_completion_bytes = 0
                         stream_chunk_count = 0
                         attempt += 1
@@ -4454,6 +4475,7 @@ class AshLoop:
             usage_source=usage_source,
             stop_reason=terminal_stop_reason,
             reasoning_blocks=reasoning_blocks,
+            provider_state=provider_state,
         )
 
     def _handle_event(
@@ -5812,6 +5834,10 @@ class AshLoop:
                     msg_dict["tool_calls"] = self._provider_history_tool_calls(
                         message.metadata["tool_calls"]
                     )
+                if message.role == "assistant" and message.metadata.get(
+                    "provider_state"
+                ):
+                    msg_dict["provider_state"] = message.metadata["provider_state"]
                 # OpenAI requires tool_call_id on role=tool messages.
                 if message.role == "tool" and message.metadata.get("call_id"):
                     msg_dict["tool_call_id"] = message.metadata["call_id"]
@@ -5997,6 +6023,10 @@ class AshLoop:
                 msg_dict["tool_calls"] = self._provider_history_tool_calls(
                     message.metadata["tool_calls"]
                 )
+            if message.role == "assistant" and message.metadata.get(
+                "provider_state"
+            ):
+                msg_dict["provider_state"] = message.metadata["provider_state"]
             if message.role == "tool" and message.metadata.get("call_id"):
                 msg_dict["tool_call_id"] = message.metadata["call_id"]
             messages.append(msg_dict)

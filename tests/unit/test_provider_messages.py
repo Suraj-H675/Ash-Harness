@@ -254,6 +254,57 @@ def test_canonical_message_rejects_invalid_role_or_content_contracts(
         normalize_messages([message])
 
 
+def test_canonical_provider_state_accepts_only_bounded_reasoning_items() -> None:
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": "checked the file"}],
+        "encrypted_content": "opaque",
+        "status": "completed",
+    }
+
+    assert normalize_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "provider_state": [reasoning],
+            }
+        ]
+    )[0]["provider_state"] == [reasoning]
+
+    with pytest.raises(ValueError, match="only reasoning items"):
+        normalize_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "provider_state": [{"type": "function_call"}],
+                }
+            ]
+        )
+    with pytest.raises(ValueError, match="only on assistant"):
+        normalize_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "hello",
+                    "provider_state": [reasoning],
+                }
+            ]
+        )
+    with pytest.raises(ValueError, match="unsupported field"):
+        normalize_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "provider_state": [{**reasoning, "unsafe": "injected"}],
+                }
+            ]
+        )
+
+
 def test_canonical_tool_arguments_must_be_strict_json() -> None:
     with pytest.raises(ValueError, match="JSON serializable"):
         CanonicalToolCall(

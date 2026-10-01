@@ -832,6 +832,8 @@ def _validate_imported_provider_message(message: Message) -> None:
     }
     if message.role == "assistant" and "tool_calls" in message.metadata:
         payload["tool_calls"] = message.metadata["tool_calls"]
+    if message.role == "assistant" and "provider_state" in message.metadata:
+        payload["provider_state"] = message.metadata["provider_state"]
     if message.role == "tool" and message.metadata.get("call_id"):
         payload["tool_call_id"] = message.metadata["call_id"]
     try:

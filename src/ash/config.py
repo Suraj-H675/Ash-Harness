@@ -871,6 +871,13 @@ class AshConfig(BaseSettings):
         default_factory=dict,
         description="Custom OpenAI-compatible providers with base URL, key env name, and models.",
     )
+    openai_auth_mode: str = Field(
+        "api_key",
+        description=(
+            "User-owned authentication route for first-party OpenAI models: "
+            "api_key or chatgpt. Project configuration cannot set this field."
+        ),
+    )
 
     repo_map_exclude_patterns: list[str] = Field(
         default_factory=lambda: [
@@ -1013,6 +1020,14 @@ class AshConfig(BaseSettings):
         normalized = value.casefold()
         if normalized not in {"none", "onnx", "openai"}:
             raise ValueError("embedding_provider must be none, onnx, or openai")
+        return normalized
+
+    @field_validator("openai_auth_mode")
+    @classmethod
+    def validate_openai_auth_mode(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"api_key", "chatgpt"}:
+            raise ValueError("openai_auth_mode must be api_key or chatgpt")
         return normalized
 
     @field_validator("prompt_cache_retention")

@@ -229,6 +229,34 @@ def test_goal_lifecycle_is_durable_bounded_and_redacted(tmp_path: Path) -> None:
     assert completed.completed_at is not None
     assert store.load_current_goal(session.session_id) is None
 
+
+def test_session_preserves_opaque_provider_replay_state(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "provider-state.db")
+    session = store.create_session(str(tmp_path))
+    now = datetime.now(timezone.utc)
+    replay_state = [
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [],
+            "status": "completed",
+            "encrypted_content": "opaque-encrypted-reasoning",
+        }
+    ]
+
+    store.save_message(
+        session.session_id,
+        Message(
+            role="assistant",
+            content="",
+            timestamp=now,
+            metadata={"provider_state": replay_state},
+        ),
+    )
+
+    loaded = store.load_session(session.session_id)
+    assert loaded.messages[-1].metadata["provider_state"] == replay_state
+
     replacement = store.create_goal(
         session.session_id,
         "Follow-up cleanup",

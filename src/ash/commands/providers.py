@@ -9,7 +9,6 @@ import os
 from dataclasses import replace
 from io import StringIO
 from typing import TYPE_CHECKING, Any
-
 from rich.console import Console
 from rich.table import Table
 
@@ -22,6 +21,7 @@ from ash.providers.readiness import (
     ProviderVerificationError,
     verify_provider_connection,
 )
+from ash.providers.openai_chatgpt_verification import verify_chatgpt_plan_connection
 from ash.ui.safe_text import terminal_safe_text
 
 if TYPE_CHECKING:
@@ -45,7 +45,13 @@ def provider_catalog_payload() -> dict[str, Any]:
                 "description": descriptor.description,
                 "protocol": descriptor.protocol,
                 "base_url": descriptor.base_url,
-                "auth": "none" if descriptor.local else "api-key",
+                "auth": (
+                    "none"
+                    if descriptor.local
+                    else "api-key-or-chatgpt"
+                    if descriptor.id == "openai"
+                    else "api-key"
+                ),
                 "key_env": descriptor.key_env,
                 "key_envs": list(descriptor.key_envs),
                 "local": descriptor.local,
@@ -82,6 +88,8 @@ def render_provider_catalog(*, json_output: bool = False) -> str:
             (
                 "none"
                 if descriptor.local
+                else "API key / ChatGPT plan"
+                if descriptor.id == "openai"
                 else " / ".join(descriptor.key_envs) or "api key"
             ),
             descriptor.base_url,
@@ -321,7 +329,18 @@ def test_provider(
         if model
         else config.model_copy(update={"fallback_models": []})
     )
-    verification = verify_provider_connection(test_config, timeout=timeout)
+    from ash.providers.identifiers import parse_model_string
+
+    selected_provider, _selected_model = parse_model_string(test_config.model)
+    if (
+        selected_provider == "openai"
+        and getattr(test_config, "openai_auth_mode", "api_key") == "chatgpt"
+    ):
+        verification = asyncio.run(
+            verify_chatgpt_plan_connection(test_config, timeout=timeout)
+        )
+    else:
+        verification = verify_provider_connection(test_config, timeout=timeout)
     if not verification.selected_model_available:
         return verification
     completion_verified, completion_error = asyncio.run(

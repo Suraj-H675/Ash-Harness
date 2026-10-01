@@ -74,7 +74,7 @@ Supported built-in routes include:
 | Route | Models and behavior |
 | --- | --- |
 | Anthropic | Claude models through the Anthropic Messages API |
-| OpenAI | GPT models through the OpenAI API |
+| OpenAI | GPT models through the OpenAI API using an API key or optional Sign in with ChatGPT plan auth |
 | OpenRouter | Multi-provider gateway routing |
 | DeepSeek | Chat and reasoning models |
 | Groq | Fast hosted open models |
@@ -109,8 +109,13 @@ The provider layer also provides:
 - provider usage normalization with explicit provider, estimated, or mixed
   accounting when a service does not return token usage.
 
-Subscription-based model-provider login is not currently part of the provider
-surface. MCP OAuth is supported separately for protected MCP servers.
+OpenAI additionally supports optional **Sign in with ChatGPT** for eligible
+ChatGPT plans. Run `ash auth chatgpt login` to register/sign in, inspect saved
+registrations with `ash auth chatgpt accounts`, switch with
+`ash auth chatgpt use CLIENT_ID`, and clear the active session with
+`ash auth chatgpt logout`. This path uses OpenAI's public Responses API with
+stateless history replay; the existing OpenAI API-key route remains the default.
+MCP OAuth is supported separately for protected MCP servers.
 
 ### Agent runtime
 
@@ -553,7 +558,8 @@ Ash deliberately reports unsupported or partial surfaces instead of pretending
 they are complete:
 
 - native Windows execution is not currently supported; use WSL2;
-- subscription-based provider authentication is not included;
+- OpenAI ChatGPT-plan authentication is implemented but still requires a real
+  live account/inference conformance pass before Ash claims M4 complete;
 - remote browser CDP and direct takeover of pre-existing tabs are not exposed;
 - ACP audio/embedded-resource, session delete, additional directories, modes,
   terminal/filesystem callbacks, and registry publication are not advertised

@@ -11,6 +11,7 @@ from ash.commands.doctor import (
     _check_a2a,
     _check_automation,
     _check_browser,
+    _check_credentials,
     _check_lsp,
     _check_storage,
     _check_connectivity,
@@ -20,6 +21,7 @@ from ash.automation.schedules import build_schedule
 from ash.automation.store import AutomationStore
 from ash.config import AshConfig
 from ash.lsp.config import LSPServerConfig
+from ash.providers.readiness import ProviderConnection, ProviderVerification
 from .provider_test_helpers import patch_catalog_client
 
 
@@ -125,6 +127,69 @@ async def test_connectivity_uses_runtime_openai_override_and_validates_model(
     request, _ = requests[0]
     assert str(request.url) == "https://gateway.invalid/v1/models"
     assert request.headers["authorization"] == "Bearer gateway-secret"
+
+
+def test_chatgpt_credentials_do_not_require_openai_api_key(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Store:
+        def credential_state(self):
+            return "usable"
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "ash.providers.openai_chatgpt_auth.ChatGPTCredentialStore",
+        Store,
+    )
+
+    check = _check_credentials(
+        AshConfig(
+            model="openai/gpt-plan",
+            openai_auth_mode="chatgpt",
+            workspace_root=tmp_path,
+        )
+    )
+
+    assert check.status == "pass"
+    assert "usable" in check.message
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_connectivity_uses_plan_model_verification(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    async def verify(config, *, timeout=10.0):
+        calls.append((config.model, timeout))
+        return ProviderVerification(
+            connection=ProviderConnection(
+                provider="openai",
+                model_name="gpt-plan",
+                base_url="https://api.openai.com/v1",
+                catalog_endpoint="https://api.openai.com/v1/models",
+                catalog_format="openai",
+                auth_mode="chatgpt",
+                uses_default_base_url=True,
+            ),
+            models=("gpt-plan",),
+            selected_model_available=True,
+        )
+
+    monkeypatch.setattr(
+        "ash.commands.doctor.verify_chatgpt_plan_connection",
+        verify,
+    )
+    check = await _check_connectivity(
+        AshConfig(
+            model="openai/gpt-plan",
+            openai_auth_mode="chatgpt",
+            workspace_root=tmp_path,
+        )
+    )
+
+    assert check.status == "pass"
+    assert calls == [("openai/gpt-plan", 10.0)]
 
 
 @pytest.mark.asyncio

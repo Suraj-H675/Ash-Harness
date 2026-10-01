@@ -91,7 +91,9 @@ def _openai(model: str) -> ProviderCapabilities:
     return ProviderCapabilities(
         native_tools=True,
         vision=True,
-        reasoning=any(token in name for token in ("gpt-5", "o1", "o3", "o4")),
+        reasoning=any(
+            token in name for token in ("gpt-5", "gpt-6", "o1", "o3", "o4")
+        ),
     )
 
 

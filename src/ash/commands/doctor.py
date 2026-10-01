@@ -24,6 +24,7 @@ from ash.providers.readiness import (
     resolve_provider_connection,
     verify_provider_connection,
 )
+from ash.providers.openai_chatgpt_verification import verify_chatgpt_plan_connection
 from ash.safe_io import validate_unlinked_file_path
 from ash.sandbox import SandboxManager
 from ash.safety.browser_process import run_browser_subprocess
@@ -41,6 +42,27 @@ class DoctorCheck:
 
 
 def _check_credentials(config: AshConfig) -> DoctorCheck:
+    if config.provider == "openai" and config.openai_auth_mode == "chatgpt":
+        from ash.providers.openai_chatgpt_auth import ChatGPTCredentialStore
+
+        state = ChatGPTCredentialStore().credential_state()
+        if state in {"usable", "refreshable"}:
+            return DoctorCheck(
+                "credentials",
+                "pass",
+                f"ChatGPT plan credentials are {state}",
+            )
+        remedy = (
+            "Run ash auth chatgpt login CLIENT_ID for the saved registration."
+            if state in {"signed_out", "expired"}
+            else "Run ash auth chatgpt login or ash setup model."
+        )
+        return DoctorCheck(
+            "credentials",
+            "fail",
+            f"ChatGPT plan credentials are {state}",
+            remedy,
+        )
     try:
         connection = resolve_provider_connection(config)
     except (ProviderConfigurationError, ValueError) as exc:
@@ -497,10 +519,13 @@ def _check_lsp(config: AshConfig) -> DoctorCheck:
 
 async def _check_connectivity(config: AshConfig) -> DoctorCheck:
     try:
-        verification = await asyncio.to_thread(
-            verify_provider_connection,
-            config,
-        )
+        if config.provider == "openai" and config.openai_auth_mode == "chatgpt":
+            verification = await verify_chatgpt_plan_connection(config)
+        else:
+            verification = await asyncio.to_thread(
+                verify_provider_connection,
+                config,
+            )
     except (ProviderConfigurationError, ValueError) as exc:
         return DoctorCheck("connectivity", "fail", str(exc), "Run ash setup.")
     except ProviderVerificationError as exc:

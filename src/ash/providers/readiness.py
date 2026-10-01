@@ -34,7 +34,7 @@ class ProviderConfigurationError(ValueError):
 CatalogFormat = Literal[
     "openai", "anthropic", "ollama", "lmstudio", "together", "xai", "fireworks"
 ]
-AuthMode = Literal["bearer", "anthropic", "none"]
+AuthMode = Literal["bearer", "anthropic", "none", "chatgpt"]
 MAX_PROVIDER_CATALOG_BYTES = 2_000_000
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
 GOOGLE_API_CLIENT_HEADER = f"ash-harness-oai/{__version__}"
@@ -78,6 +78,8 @@ class ProviderConnection:
     def credential_description(self) -> str:
         if self.auth_mode == "none":
             return "no API key is required"
+        if self.auth_mode == "chatgpt":
+            return "ChatGPT plan sign-in is configured"
         return "API key is configured"
 
 

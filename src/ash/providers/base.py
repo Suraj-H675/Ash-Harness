@@ -10,7 +10,7 @@ from typing import Any, AsyncGenerator, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, field_validator
 from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
-from ash.providers.messages import CanonicalToolCall, MessageInput
+from ash.providers.messages import CanonicalMessage, CanonicalToolCall, MessageInput
 
 
 MAX_PROVIDER_USAGE_TOKENS = 2**53 - 1
@@ -61,8 +61,14 @@ class StreamChunk(BaseModel):
         default=None,
         max_length=MAX_PROVIDER_REASONING_BLOCKS_PER_CHUNK,
     )
+    provider_state: list[dict[str, Any]] | None = Field(default=None, max_length=64)
 
-    @field_validator("native_tool_calls", "reasoning", "reasoning_blocks", mode="before")
+    @field_validator(
+        "native_tool_calls",
+        "reasoning",
+        "reasoning_blocks",
+        mode="before",
+    )
     @classmethod
     def validate_structured_stream_payload(cls, value: Any) -> Any:
         if value is None:
@@ -88,6 +94,20 @@ class StreamChunk(BaseModel):
                 f"{MAX_PROVIDER_CHUNK_STRUCTURED_BYTES} UTF-8 bytes"
             )
         return value
+
+    @field_validator("provider_state", mode="before")
+    @classmethod
+    def validate_provider_replay_state(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        validated = CanonicalMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "provider_state": value,
+            }
+        )
+        return validated.provider_state
 
     @field_validator("content", "tool_call_delta")
     @classmethod
@@ -138,6 +158,21 @@ class CompletionOutcome(BaseModel):
         default_factory=list,
         max_length=MAX_PROVIDER_REASONING_BLOCKS_PER_CHUNK,
     )
+    provider_state: list[dict[str, Any]] = Field(default_factory=list, max_length=64)
+
+    @field_validator("provider_state", mode="before")
+    @classmethod
+    def validate_provider_replay_state(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        validated = CanonicalMessage.model_validate(
+            {
+                "role": "assistant",
+                "content": "",
+                "provider_state": value,
+            }
+        )
+        return validated.provider_state or []
 
 
 _COMPLETE_STOP_REASONS = frozenset(

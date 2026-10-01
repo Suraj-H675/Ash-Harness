@@ -37,6 +37,7 @@ ENV_KEYS = [
     "ANTHROPIC_API_BASE",
     "OPENAI_API_KEY",
     "OPENAI_API_BASE",
+    "ASH_OPENAI_AUTH_MODE",
     "GOOGLE_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_BASE",
@@ -851,6 +852,7 @@ def test_project_config_cannot_override_user_owned_controls(
                 "browser_timeout_seconds = 120",
                 'browser_cdp_url = "http://127.0.0.1:9222"',
                 "browser_cdp_reuse_storage_state = true",
+                'openai_auth_mode = "chatgpt"',
                 "lsp_enabled = true",
                 "automation_enabled = true",
                 "automation_max_concurrent_runs = 32",
@@ -902,6 +904,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.browser_timeout_seconds == 30
     assert config.browser_cdp_url == ""
     assert config.browser_cdp_reuse_storage_state is False
+    assert config.openai_auth_mode == "api_key"
     assert config.plugin_marketplaces == {}
     assert config.plugin_marketplace_key_ids == {}
     assert config.plugin_marketplace_key_fingerprints == {}
@@ -933,6 +936,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "browser_timeout_seconds" in diagnostics
     assert "browser_cdp_url" in diagnostics
     assert "browser_cdp_reuse_storage_state" in diagnostics
+    assert "openai_auth_mode" in diagnostics
     assert "plugin_marketplaces" in diagnostics
     assert "plugin_marketplace_key_ids" in diagnostics
     assert "plugin_marketplace_key_fingerprints" in diagnostics

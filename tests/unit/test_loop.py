@@ -1748,6 +1748,80 @@ class EventUI(TerminalUI):
 
 
 @pytest.mark.asyncio
+async def test_provider_replay_state_persists_and_returns_to_next_request(tmp_path):
+    class ReplayStateProvider(ProviderABC):
+        model_name = "replay-state"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self):
+            self.messages = []
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(str(text).split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del temperature, tools
+            self.calls += 1
+            self.messages.append(messages)
+            if self.calls == 1:
+                yield StreamChunk(
+                    content="first",
+                    is_done=True,
+                    stop_reason="stop",
+                    provider_state=[
+                        {
+                            "type": "reasoning",
+                            "id": "rs_loop",
+                            "summary": [],
+                            "status": "completed",
+                            "encrypted_content": "opaque-loop-state",
+                        }
+                    ],
+                )
+            else:
+                yield StreamChunk(
+                    content="second",
+                    is_done=True,
+                    stop_reason="stop",
+                )
+
+    store = SessionStore(tmp_path / "provider-replay.db")
+    provider = ReplayStateProvider()
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+    session = await loop.start_session()
+
+    assert await loop.run_turn("first request") == "first"
+    persisted = store.load_session(session.session_id)
+    assistant = next(
+        message for message in persisted.messages if message.role == "assistant"
+    )
+    assert assistant.metadata["provider_state"] == [
+        {
+            "type": "reasoning",
+            "id": "rs_loop",
+            "summary": [],
+            "status": "completed",
+            "encrypted_content": "opaque-loop-state",
+        }
+    ]
+
+    assert await loop.run_turn("second request") == "second"
+    replayed = [
+        message
+        for message in provider.messages[1]
+        if message.get("role") == "assistant"
+    ]
+    assert replayed[-1]["provider_state"] == assistant.metadata["provider_state"]
+
+
+@pytest.mark.asyncio
 async def test_runtime_tools_start_once_after_session_is_available(tmp_path):
     guard = SafetyGuard(tmp_path)
     tool = StartTool(guard)

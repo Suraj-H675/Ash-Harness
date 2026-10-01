@@ -2304,6 +2304,40 @@ def _main_impl(argv: list[str] | None = None) -> int:
     )
     providers_test.add_argument("--json", action="store_true")
     providers_test.add_argument("--timeout", type=float, default=10.0)
+    auth_parser = subparsers.add_parser(
+        "auth",
+        help="Manage user-owned provider authentication sessions",
+    )
+    auth_providers = auth_parser.add_subparsers(dest="auth_provider", required=True)
+    chatgpt_auth = auth_providers.add_parser(
+        "chatgpt",
+        help="Manage optional OpenAI ChatGPT-plan authentication",
+    )
+    chatgpt_actions = chatgpt_auth.add_subparsers(
+        dest="chatgpt_auth_action",
+        required=True,
+    )
+    chatgpt_status = chatgpt_actions.add_parser("status")
+    chatgpt_status.add_argument("--json", action="store_true")
+    chatgpt_login = chatgpt_actions.add_parser(
+        "login",
+        help="Continue with ChatGPT using a new or saved registration",
+    )
+    chatgpt_login.add_argument(
+        "client_id",
+        nargs="?",
+        help="Saved issued client ID to reauthorize; omit to register another account",
+    )
+    chatgpt_login.add_argument("--json", action="store_true")
+    chatgpt_logout = chatgpt_actions.add_parser("logout")
+    chatgpt_logout.add_argument("--json", action="store_true")
+    chatgpt_accounts = chatgpt_actions.add_parser("accounts")
+    chatgpt_accounts.add_argument("--json", action="store_true")
+    chatgpt_use = chatgpt_actions.add_parser("use")
+    chatgpt_use.add_argument("client_id")
+    chatgpt_use.add_argument("--json", action="store_true")
+    chatgpt_models = chatgpt_actions.add_parser("models")
+    chatgpt_models.add_argument("--json", action="store_true")
     doctor_parser = subparsers.add_parser(
         "doctor", help="Diagnose local setup and runtime dependencies"
     )
@@ -3130,6 +3164,101 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 json_output=getattr(args, "json", False),
             )
         parser.error(f"unsupported profile action: {args.profile_action}")
+
+    if args.command == "auth":
+        if args.auth_provider != "chatgpt":
+            parser.error(f"unsupported auth provider: {args.auth_provider}")
+        from ash.commands.chatgpt_auth import (
+            list_chatgpt_models,
+            login_chatgpt,
+            logout_chatgpt,
+            render_chatgpt_accounts,
+            render_chatgpt_models,
+            render_chatgpt_status,
+            use_chatgpt_account,
+        )
+        from ash.providers.openai_chatgpt_auth import ChatGPTAuthError
+
+        try:
+            action = args.chatgpt_auth_action
+            if action == "status":
+                print(render_chatgpt_status(json_output=args.json))
+                return 0
+            if action == "accounts":
+                print(render_chatgpt_accounts(json_output=args.json))
+                return 0
+            if action == "login":
+                account = asyncio.run(login_chatgpt(args.client_id))
+                payload = {
+                    "ok": account.plan_enabled,
+                    "email": account.email,
+                    "client_id": account.client_id,
+                    "plan_enabled": account.plan_enabled,
+                }
+                if args.json:
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    email = terminal_safe_text(
+                        account.email or "(email unavailable)",
+                        single_line=True,
+                    )
+                    print(f"ChatGPT account: {email}")
+                    print(
+                        "ChatGPT plan usage: "
+                        + ("enabled" if account.plan_enabled else "not enabled")
+                    )
+                    if not account.plan_enabled:
+                        print(
+                            "The registration was retained, but Ash did not switch "
+                            "OpenAI inference to ChatGPT-plan auth."
+                        )
+                return 0 if account.plan_enabled else 2
+            if action == "logout":
+                cleared_account, remote_confirmed = asyncio.run(logout_chatgpt())
+                payload = {
+                    "ok": True,
+                    "had_active_account": cleared_account is not None,
+                    "remote_revocation_confirmed": remote_confirmed,
+                }
+                if args.json:
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print("ChatGPT credentials cleared locally.")
+                    if not remote_confirmed:
+                        print(
+                            "Remote revocation was not confirmed; disconnect Ash in "
+                            "ChatGPT Settings if needed."
+                        )
+                return 0
+            if action == "use":
+                account = use_chatgpt_account(args.client_id)
+                payload = {
+                    "ok": account.plan_enabled and account.signed_in,
+                    "email": account.email,
+                    "client_id": account.client_id,
+                    "plan_enabled": account.plan_enabled,
+                    "signed_in": account.signed_in,
+                }
+                if args.json:
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print(
+                        "Active ChatGPT registration: "
+                        + terminal_safe_text(account.client_id, single_line=True)
+                    )
+                return 0 if payload["ok"] else 2
+            if action == "models":
+                models = asyncio.run(list_chatgpt_models())
+                print(render_chatgpt_models(models, json_output=args.json))
+                return 0
+        except (ChatGPTAuthError, KeyError, OSError, ValueError) as exc:
+            message = terminal_safe_text(str(exc), single_line=True)
+            if getattr(args, "json", False):
+                print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+            else:
+                print(f"ChatGPT auth failed: {message}", file=sys.stderr)
+            return 2
+        parser.error(f"unsupported ChatGPT auth action: {args.chatgpt_auth_action}")
 
     if args.command == "providers":
         from ash.commands.providers import (

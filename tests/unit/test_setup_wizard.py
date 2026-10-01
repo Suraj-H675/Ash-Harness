@@ -250,7 +250,7 @@ class TestOpenAIFlow:
         )
         monkeypatch.setattr(
             "builtins.input",
-            _fake_input(["https://gateway.example/v1/", "1"]),
+            _fake_input(["2", "https://gateway.example/v1/", "1"]),
         )
 
         with (
@@ -260,14 +260,129 @@ class TestOpenAIFlow:
             ) as probe,
             patch("ash.commands.setup.save_env_values") as save,
         ):
-            _flow_openai("")
+            _flow_openai("", SimpleNamespace(openai_auth_mode="api_key"))
 
         probe.assert_called_once_with("https://gateway.example/v1", "sk-openai")
         assert save.call_args.args[0] == {
             "OPENAI_API_KEY": "sk-openai",
             "OPENAI_API_BASE": "https://gateway.example/v1",
+            "ASH_OPENAI_AUTH_MODE": "api_key",
             "ASH_MODEL": "openai/gateway-model",
         }
+
+    def test_chatgpt_plan_flow_saves_auth_mode_without_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, _flow_openai
+        from ash.providers.openai_chatgpt_auth import ChatGPTAccount
+
+        account = ChatGPTAccount(
+            client_id="oaiapp_setup-client",
+            subject="subject",
+            email="user@example.com",
+            issuer="https://auth.openai.com",
+            ext_agent_host_id="urn:uuid:00000000-0000-4000-8000-000000000001",
+            id_token="id-token",
+            access_token="access-token",
+            refresh_token="refresh-token",
+            token_type="Bearer",
+            scopes=("chatgpt.tokens.use.direct",),
+            expires_at=9_999_999_999.0,
+            earliest_refresh_at=0.0,
+            saved_at=1.0,
+        )
+
+        class Store:
+            def active(self):
+                return account
+
+        class Manager:
+            async def list_models(self):
+                return (("gpt-plan", "GPT Plan"),)
+
+        monkeypatch.setattr("builtins.input", _fake_input(["1", "1"]))
+        monkeypatch.setattr(
+            "ash.providers.openai_chatgpt_auth.ChatGPTCredentialStore",
+            Store,
+        )
+        monkeypatch.setattr(
+            "ash.providers.openai_chatgpt_auth.ChatGPTAuthManager",
+            Manager,
+        )
+        with patch("ash.commands.setup.save_env_values") as save:
+            result = _flow_openai(
+                "",
+                SimpleNamespace(openai_auth_mode="chatgpt"),
+            )
+
+        assert result == SetupOutcome.SUCCESS
+        assert save.call_args.args[0] == {
+            "ASH_OPENAI_AUTH_MODE": "chatgpt",
+            "ASH_MODEL": "openai/gpt-plan",
+        }
+
+    def test_chatgpt_setup_reauthorizes_saved_registration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, _flow_openai
+        from ash.providers.openai_chatgpt_auth import ChatGPTAccount
+
+        signed_out = ChatGPTAccount(
+            client_id="oaiapp_saved-client",
+            subject="subject",
+            email="user@example.com",
+            issuer="https://auth.openai.com",
+            ext_agent_host_id="urn:uuid:00000000-0000-4000-8000-000000000001",
+            id_token="",
+            access_token="",
+            refresh_token="",
+            token_type="Bearer",
+            scopes=(),
+            expires_at=0.0,
+            earliest_refresh_at=0.0,
+            saved_at=1.0,
+        )
+        enabled = ChatGPTAccount(
+            **{
+                **signed_out.__dict__,
+                "id_token": "id-token",
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "scopes": ("chatgpt.tokens.use.direct",),
+                "expires_at": 9_999_999_999.0,
+            }
+        )
+        login_client_ids: list[str | None] = []
+
+        class Store:
+            def active(self):
+                return signed_out
+
+        class Manager:
+            async def login(self, *, client_id=None):
+                login_client_ids.append(client_id)
+                return enabled
+
+            async def list_models(self):
+                return (("gpt-plan", "GPT Plan"),)
+
+        monkeypatch.setattr("builtins.input", _fake_input(["1", "1"]))
+        monkeypatch.setattr(
+            "ash.providers.openai_chatgpt_auth.ChatGPTCredentialStore",
+            Store,
+        )
+        monkeypatch.setattr(
+            "ash.providers.openai_chatgpt_auth.ChatGPTAuthManager",
+            Manager,
+        )
+        with patch("ash.commands.setup.save_env_values"):
+            result = _flow_openai(
+                "",
+                SimpleNamespace(openai_auth_mode="chatgpt"),
+            )
+
+        assert result == SetupOutcome.SUCCESS
+        assert login_client_ids == ["oaiapp_saved-client"]
 
 
 @pytest.mark.parametrize(

@@ -6,6 +6,7 @@ storage to ~/.ash/.env and ~/.ash/ash.toml.
 
 from __future__ import annotations
 
+import asyncio
 import getpass
 import hashlib
 import importlib.util
@@ -146,6 +147,15 @@ def _provider_status(config, descriptor: ProviderDescriptor) -> str:
 
     if descriptor.local:
         return "available to test"
+    if descriptor.id == "openai" and getattr(config, "openai_auth_mode", "") == "chatgpt":
+        from ash.providers.openai_chatgpt_auth import ChatGPTCredentialStore
+
+        state = ChatGPTCredentialStore().credential_state()
+        if state in {"usable", "refreshable"}:
+            return "ChatGPT signed in"
+        if state == "plan_disabled":
+            return "ChatGPT plan permission needed"
+        return "ChatGPT sign-in needed"
     return (
         "key detected"
         if any(get_env_value(name) for name in descriptor.key_envs)
@@ -726,7 +736,7 @@ def select_provider_and_model(config) -> SetupOutcome:
             if provider_id == "anthropic":
                 return _flow_anthropic(current)
             if provider_id == "openai":
-                return _flow_openai(current)
+                return _flow_openai(current, config)
             if provider_id == "deepseek":
                 return _flow_deepseek(current)
             if provider_id == "groq":
@@ -834,9 +844,77 @@ def _flow_anthropic(current: str) -> SetupOutcome:
     return SetupOutcome.SUCCESS
 
 
-def _flow_openai(current: str) -> SetupOutcome:
-    """OpenAI setup: API key, optional base URL override, model selection."""
+def _flow_openai(current: str, config) -> SetupOutcome:
+    """OpenAI setup: ChatGPT plan sign-in or API key, then model selection."""
     _print_header("OpenAI Configuration")
+
+    current_mode = str(getattr(config, "openai_auth_mode", "api_key"))
+    default = 0 if current_mode == "chatgpt" else 1
+    auth_choice = _prompt_choice(
+        "Choose OpenAI authentication",
+        [
+            "Continue with ChatGPT (use eligible ChatGPT plan)",
+            "OpenAI API key",
+        ],
+        default=default,
+    )
+    if auth_choice == 0:
+        from ash.providers.openai_chatgpt_auth import (
+            ChatGPTAuthError,
+            ChatGPTAuthManager,
+            ChatGPTCredentialStore,
+        )
+
+        manager = ChatGPTAuthManager()
+        store = ChatGPTCredentialStore()
+        account = store.active()
+        if account is None or not account.signed_in or not account.plan_enabled:
+            print(
+                "  Continue with ChatGPT will open your browser. "
+                "Eligible ChatGPT plans can authorize Ash for inference."
+            )
+            try:
+                account = asyncio.run(
+                    manager.login(
+                        client_id=(
+                            account.client_id
+                            if account is not None
+                            else None
+                        )
+                    )
+                )
+            except ChatGPTAuthError as exc:
+                print(
+                    "  ChatGPT sign-in failed: "
+                    + terminal_safe_text(str(exc), single_line=True)
+                )
+                return SetupOutcome.ERROR
+        if not account.plan_enabled:
+            print(
+                "  ChatGPT sign-in completed, but plan usage was not authorized. "
+                "The registration was retained without switching Ash inference."
+            )
+            return SetupOutcome.ERROR
+        try:
+            catalog = asyncio.run(manager.list_models())
+        except ChatGPTAuthError as exc:
+            print(
+                "  Could not load ChatGPT-plan models: "
+                + terminal_safe_text(str(exc), single_line=True)
+            )
+            return SetupOutcome.ERROR
+        models = [slug for slug, _display_name in catalog]
+        selected = _prompt_model_list(models, current)
+        save_env_values(
+            {
+                "ASH_OPENAI_AUTH_MODE": "chatgpt",
+                "ASH_MODEL": f"openai/{selected}",
+            }
+        )
+        _print_info(
+            "Configured OpenAI to use the selected ChatGPT account and plan."
+        )
+        return SetupOutcome.SUCCESS
 
     api_key = _prompt_api_key("OPENAI_API_KEY", "OpenAI API key")
 
@@ -856,6 +934,7 @@ def _flow_openai(current: str) -> SetupOutcome:
 
     settings = {
         "OPENAI_API_KEY": api_key,
+        "ASH_OPENAI_AUTH_MODE": "api_key",
         "ASH_MODEL": f"openai/{model}",
     }
     if base_url_override:
@@ -1237,6 +1316,17 @@ def _print_verification_status(verified: bool) -> None:
 
 def _has_provider_configured(config) -> bool:
     """Return whether the selected model can be assembled by the runtime."""
+
+    if (
+        getattr(config, "provider", "") == "openai"
+        and getattr(config, "openai_auth_mode", "") == "chatgpt"
+    ):
+        from ash.providers.openai_chatgpt_auth import ChatGPTCredentialStore
+
+        return ChatGPTCredentialStore().credential_state() in {
+            "usable",
+            "refreshable",
+        }
 
     from ash.providers.readiness import (
         ProviderConfigurationError,

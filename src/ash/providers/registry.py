@@ -138,6 +138,19 @@ def _build_anthropic(config: "AshConfig", model_name: str) -> ProviderABC:
 
 
 def _build_openai(config: "AshConfig", model_name: str) -> ProviderABC:
+    provider: ProviderABC
+    if config.openai_auth_mode == "chatgpt":
+        from ash.providers.openai_chatgpt import OpenAIChatGPTProvider
+
+        provider = OpenAIChatGPTProvider(model_name=model_name)
+        provider.configure_max_tokens(config.max_completion_tokens)
+        provider.configure_prompt_cache(
+            enabled=False,
+            cache_key="",
+            retention=config.prompt_cache_retention,
+        )
+        return provider
+
     from ash.providers.openai import OpenAIProvider
     from ash.providers.readiness import resolve_provider_connection
 

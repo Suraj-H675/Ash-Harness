@@ -28,6 +28,10 @@ MAX_CANONICAL_CONTENT_BYTES = 16 * 1024 * 1024
 MAX_TOOL_CALL_ID_BYTES = 512
 MAX_TOOL_CALL_ARGUMENT_BYTES = 2 * 1024 * 1024
 MAX_PROVIDER_TOOL_NAME_CHARS = 64
+MAX_PROVIDER_STATE_ITEMS = 64
+MAX_PROVIDER_STATE_BYTES = 4 * 1024 * 1024
+MAX_PROVIDER_REASONING_SUMMARIES = 64
+MAX_PROVIDER_REASONING_TEXT_BYTES = 256 * 1024
 PROVIDER_TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SUPPORTED_IMAGE_MEDIA_TYPES = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp"}
@@ -159,6 +163,7 @@ class CanonicalMessage(BaseModel):
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[CanonicalToolCall] | None = None
+    provider_state: list[dict[str, Any]] | None = None
 
     @field_validator("content", mode="before")
     @classmethod
@@ -228,6 +233,27 @@ class CanonicalMessage(BaseModel):
             raise ValueError("tool_call_id is valid only on tool messages")
         if self.tool_calls and self.role != "assistant":
             raise ValueError("tool_calls are valid only on assistant messages")
+        if self.provider_state is not None:
+            if self.role != "assistant":
+                raise ValueError("provider_state is valid only on assistant messages")
+            if len(self.provider_state) > MAX_PROVIDER_STATE_ITEMS:
+                raise ValueError(
+                    f"provider_state exceeds {MAX_PROVIDER_STATE_ITEMS} items"
+                )
+            for item in self.provider_state:
+                _validate_provider_reasoning_state(item)
+            try:
+                encoded = json.dumps(
+                    self.provider_state,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError, UnicodeEncodeError) as exc:
+                raise ValueError("provider_state must be bounded JSON data") from exc
+            if len(encoded) > MAX_PROVIDER_STATE_BYTES:
+                raise ValueError(
+                    f"provider_state exceeds {MAX_PROVIDER_STATE_BYTES} UTF-8 bytes"
+                )
         if isinstance(self.content, list):
             if self.role not in {"user", "assistant"}:
                 raise ValueError("content blocks require a user or assistant role")
@@ -239,6 +265,52 @@ class CanonicalMessage(BaseModel):
 
     def to_wire(self) -> dict[str, Any]:
         return self.model_dump(mode="python", exclude_none=True)
+
+
+def _validate_provider_reasoning_state(item: Any) -> None:
+    if not isinstance(item, dict) or item.get("type") != "reasoning":
+        raise ValueError("provider_state currently accepts only reasoning items")
+    allowed = {"type", "id", "summary", "status", "encrypted_content"}
+    unknown = set(item) - allowed
+    if unknown:
+        raise ValueError(
+            "provider_state reasoning item contains unsupported field(s): "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    item_id = item.get("id")
+    encrypted = item.get("encrypted_content")
+    summary = item.get("summary")
+    status = item.get("status")
+    if not isinstance(item_id, str) or not item_id or len(item_id) > 1024:
+        raise ValueError("provider_state reasoning item has an invalid id")
+    if not isinstance(encrypted, str) or not encrypted:
+        raise ValueError(
+            "provider_state reasoning item requires encrypted_content"
+        )
+    if not isinstance(summary, list) or len(summary) > MAX_PROVIDER_REASONING_SUMMARIES:
+        raise ValueError("provider_state reasoning summary is invalid")
+    for entry in summary:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"type", "text"}
+            or entry.get("type") != "summary_text"
+            or not isinstance(entry.get("text"), str)
+        ):
+            raise ValueError("provider_state reasoning summary entry is invalid")
+        try:
+            size = len(entry["text"].encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                "provider_state reasoning summary must be valid UTF-8"
+            ) from exc
+        if size > MAX_PROVIDER_REASONING_TEXT_BYTES:
+            raise ValueError("provider_state reasoning summary is too large")
+    if status is not None and status not in {
+        "in_progress",
+        "completed",
+        "incomplete",
+    }:
+        raise ValueError("provider_state reasoning status is invalid")
 
 
 MessageInput: TypeAlias = CanonicalMessage | Mapping[str, Any]
