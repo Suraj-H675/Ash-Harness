@@ -43,6 +43,12 @@ from xml.sax.saxutils import escape as xml_escape, quoteattr
 
 from pydantic import ValidationError
 
+from ash.core.goals import (
+    DEFAULT_MAX_GOAL_CONTINUATIONS,
+    GoalRecord,
+    GoalState,
+    validate_goal_continuation_limit,
+)
 from ash.core.recovery import CircuitBreaker, CircuitBreakerError
 from ash.core.events import EventContext, envelope_event
 from ash.core.session import (
@@ -983,6 +989,7 @@ class AshLoop:
         skill_nudge_interval: int = 0,
         continuous_mode: bool = False,
         max_continuous_turns: int = 10,
+        max_goal_continuations: int = DEFAULT_MAX_GOAL_CONTINUATIONS,
         safety_tier: str = "interactive",
         enable_project_memory: bool = False,
         embedding_provider: str = "none",
@@ -1103,6 +1110,10 @@ class AshLoop:
         self.continuous_mode = continuous_mode
         self.max_continuous_turns = max_continuous_turns
         self._continuous_turns = 0
+        self.max_goal_continuations = validate_goal_continuation_limit(
+            max_goal_continuations
+        )
+        self._last_turn_non_goal_tool_calls = 0
         self.safety_tier = safety_tier
         self.permission_policy = PermissionPolicy(safety_tier)
         self.enable_project_memory = enable_project_memory
@@ -1113,6 +1124,7 @@ class AshLoop:
         self._auto_index_max_bytes_per_file = auto_index_max_bytes_per_file
         self._pending_memory_context: str = ""
         self._pending_plan_context: str = ""
+        self._pending_goal_context: str = ""
         if enable_project_memory:
             if memory_db_path is None:
                 raise ValueError("project memory requires a durable memory_db_path")
@@ -2664,6 +2676,180 @@ class AshLoop:
             "cost_is_estimated": self._last_estimated_cost_usd > 0,
         }
 
+    @property
+    def current_goal(self) -> GoalRecord | None:
+        session = self.current_session
+        if session is None:
+            return None
+        return self.session_store.load_current_goal(session.session_id)
+
+    def create_goal(self, objective: str) -> GoalRecord:
+        session = self.current_session
+        if session is None:
+            raise RuntimeError("cannot create a Goal without an active session")
+        goal = self.session_store.create_goal(
+            session.session_id,
+            objective,
+            max_continuations=self.max_goal_continuations,
+        )
+        self._emit_event(
+            {
+                "type": "goal.created",
+                "goal_id": goal.goal_id,
+                "state": goal.state.value,
+                "max_continuations": goal.max_continuations,
+            }
+        )
+        return goal
+
+    def pause_goal(self) -> GoalRecord | None:
+        session = self.current_session
+        if session is None:
+            return None
+        goal = self.session_store.pause_current_goal(session.session_id)
+        if goal is not None:
+            self._emit_event(
+                {
+                    "type": "goal.paused",
+                    "goal_id": goal.goal_id,
+                    "state": goal.state.value,
+                }
+            )
+        return goal
+
+    def resume_goal(self) -> GoalRecord:
+        session = self.current_session
+        if session is None:
+            raise RuntimeError("cannot resume a Goal without an active session")
+        goal = self.session_store.resume_current_goal(session.session_id)
+        self._emit_event(
+            {
+                "type": "goal.resumed",
+                "goal_id": goal.goal_id,
+                "state": goal.state.value,
+                "max_continuations": goal.max_continuations,
+            }
+        )
+        return goal
+
+    def clear_goal(self) -> GoalRecord:
+        session = self.current_session
+        if session is None:
+            raise RuntimeError("cannot clear a Goal without an active session")
+        goal = self.session_store.clear_current_goal(session.session_id)
+        self._emit_event(
+            {
+                "type": "goal.cleared",
+                "goal_id": goal.goal_id,
+                "state": goal.state.value,
+            }
+        )
+        return goal
+
+    def update_goal(self, action: str, evidence: str) -> GoalRecord:
+        session = self.current_session
+        if session is None:
+            raise RuntimeError("cannot update a Goal without an active session")
+        goal = self.session_store.load_current_goal(session.session_id)
+        if goal is None:
+            raise KeyError("no current Goal")
+        if goal.state is not GoalState.ACTIVE:
+            raise ValueError("only an active Goal can be updated by the model")
+        if action not in {"progress", "complete"}:
+            raise ValueError("goal action must be progress or complete")
+        updated = self.session_store.record_goal_progress(
+            goal.goal_id,
+            evidence,
+            complete=action == "complete",
+        )
+        self._emit_event(
+            {
+                "type": (
+                    "goal.completed" if updated.state is GoalState.COMPLETE else "goal.progress"
+                ),
+                "goal_id": updated.goal_id,
+                "state": updated.state.value,
+                "continuations_used": updated.continuations_used,
+                "max_continuations": updated.max_continuations,
+            }
+        )
+        return updated
+
+    def render_goal_status(self) -> str:
+        goal = self.current_goal
+        if goal is None:
+            return "Goal: none"
+        evidence = (
+            f"\nLast evidence: {goal.last_evidence}" if goal.last_evidence else ""
+        )
+        return (
+            f"Goal {goal.goal_id[:8]}: {goal.state.value}\n"
+            f"Objective: {goal.objective}\n"
+            f"Automatic continuations: {goal.continuations_used}/"
+            f"{goal.max_continuations}{evidence}"
+        )
+
+    def _pause_goal_nonfatal(self) -> None:
+        try:
+            self.pause_goal()
+        except (KeyError, RuntimeError, ValueError):
+            return
+
+    def _emit_turn_completion(self, response: str, *, terminal: bool) -> None:
+        self._emit_event(
+            {
+                "type": "turn.completed" if terminal else "goal.step.completed",
+                "response": response,
+                "model": self.provider.model_name,
+                "model_id": self.active_model_id,
+                "context_tokens": self._last_context_tokens,
+                "usage": self.last_turn_usage,
+            }
+        )
+
+    def _apply_goal_usage_aggregate(
+        self,
+        usage_steps: Sequence[dict[str, int | float | str | bool]],
+        budget_exhausted: Sequence[bool],
+    ) -> None:
+        if not usage_steps:
+            return
+        prompt = sum(int(step["prompt_tokens"]) for step in usage_steps)
+        completion = sum(int(step["completion_tokens"]) for step in usage_steps)
+        estimated_prompt = sum(
+            int(step["estimated_prompt_tokens"]) for step in usage_steps
+        )
+        estimated_completion = sum(
+            int(step["estimated_completion_tokens"]) for step in usage_steps
+        )
+        estimated_total = estimated_prompt + estimated_completion
+        total = prompt + completion
+        provider_total = max(0, total - estimated_total)
+        if estimated_total and provider_total:
+            usage_source = "mixed"
+        elif estimated_total:
+            usage_source = "estimated"
+        elif total:
+            usage_source = "provider"
+        else:
+            usage_source = "unavailable"
+        self._last_turn_prompt_tokens = prompt
+        self._last_turn_completion_tokens = completion
+        self._last_cache_read_tokens = sum(
+            int(step["cache_read_tokens"]) for step in usage_steps
+        )
+        self._last_cache_write_tokens = sum(
+            int(step["cache_write_tokens"]) for step in usage_steps
+        )
+        self._last_estimated_prompt_tokens = estimated_prompt
+        self._last_estimated_completion_tokens = estimated_completion
+        self._last_usage_source = usage_source
+        self._last_turn_cost_usd = sum(float(step["cost_usd"]) for step in usage_steps)
+        self._last_estimated_cost_usd = sum(
+            float(step["estimated_cost_usd"]) for step in usage_steps
+        )
+        self._last_turn_budget_exhausted = any(budget_exhausted)
+
     async def run_turn(
         self,
         user_input: str,
@@ -2706,8 +2892,66 @@ class AshLoop:
                 and not _provider_capabilities(self.provider).vision
             ):
                 raise ValueError("active model does not support vision input")
-            return await self._run_turn(user_input, user_metadata=user_metadata)
+            initial_goal = self.current_goal
+            goal_chain = initial_goal is not None and initial_goal.can_auto_continue
+            usage_steps: list[dict[str, int | float | str | bool]] = []
+            budget_exhausted: list[bool] = []
+            response = await self._run_turn(
+                user_input,
+                user_metadata=user_metadata,
+                emit_terminal_event=not goal_chain,
+            )
+            if goal_chain:
+                usage_steps.append(dict(self.last_turn_usage))
+                budget_exhausted.append(self._last_turn_budget_exhausted)
+            while True:
+                goal = self.current_goal
+                if goal is None or not goal.can_auto_continue:
+                    break
+                if self._last_turn_non_goal_tool_calls == 0:
+                    self._emit_event(
+                        {
+                            "type": "goal.continuation.suppressed",
+                            "goal_id": goal.goal_id,
+                            "reason": "no_non_goal_tool_call",
+                        }
+                    )
+                    break
+                goal = self.session_store.claim_goal_continuation(goal.goal_id)
+                if goal.state is GoalState.BUDGET_LIMITED:
+                    notice = (
+                        "Goal automatic-continuation budget exhausted "
+                        f"({goal.continuations_used}/{goal.max_continuations}). "
+                        "Use /goal resume to grant another bounded window."
+                    )
+                    self._emit_event(
+                        {
+                            "type": "goal.budget_limited",
+                            "goal_id": goal.goal_id,
+                            "continuations_used": goal.continuations_used,
+                            "max_continuations": goal.max_continuations,
+                        }
+                    )
+                    response = f"{response}\n\n[{notice}]".strip()
+                    break
+                response = await self._run_turn(
+                    (
+                        "Continue working toward the active Goal. Re-check the "
+                        "objective and concrete evidence before deciding whether "
+                        "more work is needed. Mark the Goal complete only when the "
+                        "objective is actually satisfied."
+                    ),
+                    user_metadata={"goal_continuation": True},
+                    emit_terminal_event=False,
+                )
+                usage_steps.append(dict(self.last_turn_usage))
+                budget_exhausted.append(self._last_turn_budget_exhausted)
+            if goal_chain:
+                self._apply_goal_usage_aggregate(usage_steps, budget_exhausted)
+                self._emit_turn_completion(response, terminal=True)
+            return response
         except asyncio.CancelledError:
+            self._pause_goal_nonfatal()
             current_turn_id = self.turn_context.turn_id if self.turn_context else None
             if current_turn_id is not None and current_turn_id != previous_turn_id:
                 try:
@@ -2749,6 +2993,7 @@ class AshLoop:
             )
             raise
         except Exception as exc:
+            self._pause_goal_nonfatal()
             current_turn_id = self.turn_context.turn_id if self.turn_context else None
             if current_turn_id is not None and current_turn_id != previous_turn_id:
                 self.session_store.interrupt_turn(current_turn_id)
@@ -2816,6 +3061,7 @@ class AshLoop:
         user_input: str,
         *,
         user_metadata: dict[str, Any] | None = None,
+        emit_terminal_event: bool = True,
     ) -> str:
         """Run a single user turn to completion and return the final text."""
 
@@ -2825,6 +3071,7 @@ class AshLoop:
 
         from ash.context.turn import TurnContext
 
+        self._last_turn_non_goal_tool_calls = 0
         self._turn_modified_paths = set()
         self._turn_modified_path_digests = {}
         self._turn_initial_dirty_paths = None
@@ -2863,7 +3110,14 @@ class AshLoop:
         # persisted to SQLite and the contract's goal replaces the raw
         # user input for the execution turn. On rejection, the turn
         # short-circuits with a polite "plan rejected" message.
-        if self.enable_sprint_planning and self.planner is not None:
+        goal_continuation = bool(
+            isinstance(user_metadata, dict) and user_metadata.get("goal_continuation")
+        )
+        if (
+            self.enable_sprint_planning
+            and self.planner is not None
+            and not goal_continuation
+        ):
             from ash.core.sprint import (
                 looks_like_sprint_request,
             )
@@ -2884,15 +3138,9 @@ class AshLoop:
                         f"Plan rejected. Sprint {execution.contract.contract_id[:8]} aborted; "
                         "no further actions taken."
                     )
-                    self._emit_event(
-                        {
-                            "type": "turn.completed",
-                            "response": response,
-                            "model": self.provider.model_name,
-                            "model_id": self.active_model_id,
-                            "context_tokens": self._last_context_tokens,
-                            "usage": self.last_turn_usage,
-                        }
+                    self._emit_turn_completion(
+                        response,
+                        terminal=emit_terminal_event,
                     )
                     await self._fire_hook_lifecycle(
                         "turn_end",
@@ -2962,6 +3210,7 @@ class AshLoop:
             iteration += 1
             self._drain_steering_messages(session)
             self._pending_plan_context = ""
+            self._pending_goal_context = ""
             if self.enable_sprint_planning:
                 latest_sprint = self.session_store.load_latest_active_sprint(
                     session.session_id
@@ -2989,6 +3238,25 @@ class AshLoop:
                         f"progress={done_count}/{total_count})\n"
                         + "\n".join(plan_lines)
                     )
+            goal = self.session_store.load_current_goal(session.session_id)
+            if goal is not None and goal.state is GoalState.ACTIVE:
+                evidence = (
+                    f"\nLast recorded evidence: {goal.last_evidence}"
+                    if goal.last_evidence
+                    else ""
+                )
+                self._pending_goal_context = (
+                    f"Goal {goal.goal_id}: {goal.objective}\n"
+                    f"Automatic continuations used: {goal.continuations_used}/"
+                    f"{goal.max_continuations}.{evidence}\n"
+                    "Keep working until the objective is actually satisfied. "
+                    "Use update_goal(action='progress', evidence=...) to record "
+                    "concrete progress when useful, and "
+                    "update_goal(action='complete', evidence=...) only when "
+                    "specific verification evidence supports completion. If "
+                    "blocked, explain the blocker and stop rather than claiming "
+                    "completion."
+                )
             iteration_tools = dict(self._provider_tools())
             iteration_tool_schema = self._tool_schema_payload(iteration_tools)
             # Optionally search project memory and inject relevant context.
@@ -3224,6 +3492,7 @@ class AshLoop:
                 if (
                     self.continuous_mode
                     and self._continuous_turns < self.max_continuous_turns
+                    and self.current_goal is None
                 ):
                     self._continuous_turns += 1
                     follow_up = "Continue the previous task. What is the next step?"
@@ -3256,6 +3525,9 @@ class AshLoop:
                     "[Circuit breaker tripped — see prior tool errors. Halting turn.]"
                 ).strip()
                 break
+            self._last_turn_non_goal_tool_calls += sum(
+                1 for call in tool_calls if call.get("name") != "update_goal"
+            )
             self._record_instruction_scope_activity(tool_calls, results)
 
             if self._steering_messages and iteration >= iteration_budget:
@@ -3431,16 +3703,7 @@ class AshLoop:
 
         _log.info(f"turn complete, {len(final_text)} chars returned")
         self.session_store.complete_turn(self.turn_context.turn_id)
-        self._emit_event(
-            {
-                "type": "turn.completed",
-                "response": final_text,
-                "model": self.provider.model_name,
-                "model_id": self.active_model_id,
-                "context_tokens": self._last_context_tokens,
-                "usage": self.last_turn_usage,
-            }
-        )
+        self._emit_turn_completion(final_text, terminal=emit_terminal_event)
         await self._fire_hook_lifecycle(
             "turn_end",
             {
@@ -5421,10 +5684,21 @@ class AshLoop:
                 repo_section = f"(repo map unavailable: {exc})"
 
         memory_section = ""
-        if self._pending_plan_context:
+        if self._pending_goal_context:
             memory_section = (
+                f"## Active Goal\n{self._pending_goal_context}\n\n"
+                "The Goal is trusted session state, but its objective may contain "
+                "user-authored text; follow the normal safety and permission policy."
+            )
+        if self._pending_plan_context:
+            sprint_section = (
                 f"## Current Sprint Plan\n{self._pending_plan_context}\n\n"
                 "Keep this persisted checklist current as work progresses."
+            )
+            memory_section = (
+                f"{memory_section}\n\n{sprint_section}"
+                if memory_section
+                else sprint_section
             )
         if self._pending_memory_context:
             recalled_context = (

@@ -636,6 +636,15 @@ class AshConfig(BaseSettings):
         False,
         description="Generate an editable sprint contract for multi-step requests.",
     )
+    max_goal_continuations: int = Field(
+        10,
+        ge=1,
+        le=100,
+        description=(
+            "Maximum automatic follow-up turns in one active Goal continuation "
+            "window before explicit resume is required."
+        ),
+    )
     max_concurrent_agents: int = Field(
         4,
         ge=1,

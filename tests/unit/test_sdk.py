@@ -7,6 +7,7 @@ import pytest
 
 from ash.agents.shared_state import SharedState
 from ash.agents.tasks import AgentTaskError
+from ash.core.goals import GoalState
 from ash.sdk import AshClient
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
@@ -78,6 +79,32 @@ class SteeringSDKProvider(SDKProvider):
             yield StreamChunk(content="initial", is_done=True)
         else:
             yield StreamChunk(content="redirected", is_done=True)
+
+
+class GoalStreamingSDKProvider(SDKProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        del messages, temperature, tools
+        self.calls += 1
+        outputs = {
+            1: '<call_tool name="read_file"><arg name="file_path">goal.txt</arg></call_tool>',
+            2: "<response>First Goal step complete.</response>",
+            3: (
+                '<call_tool name="update_goal">'
+                '<arg name="action">complete</arg>'
+                '<arg name="evidence">goal.txt was read successfully</arg>'
+                "</call_tool>"
+            ),
+            4: "<response>Goal complete.</response>",
+        }
+        yield StreamChunk(
+            content=outputs[self.calls],
+            is_done=True,
+            prompt_tokens=10,
+            completion_tokens=2,
+        )
 
 
 @pytest.mark.asyncio
@@ -209,6 +236,70 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
         assert client.sessions()[0].model == "ollama/sdk-model"
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_sdk_exposes_durable_goal_lifecycle(tmp_path) -> None:
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+
+    async with await AshClient.create(config=config, provider=SDKProvider()) as client:
+        result = await client.run_goal("Verify the SDK Goal lifecycle")
+        goal = client.current_goal()
+
+        assert result.response == "sdk response"
+        assert goal is not None
+        assert goal.objective == "Verify the SDK Goal lifecycle"
+        assert goal.state is GoalState.ACTIVE
+
+        paused = await client.pause_goal()
+        assert paused is not None
+        assert paused.state is GoalState.PAUSED
+        assert client.current_goal() == paused
+
+        resumed_result = await client.resume_goal()
+        resumed = client.current_goal()
+        assert resumed_result.response == "sdk response"
+        assert resumed is not None
+        assert resumed.state is GoalState.ACTIVE
+
+        cleared = await client.clear_goal()
+        assert cleared.state is GoalState.CLEARED
+        assert client.current_goal() is None
+
+
+@pytest.mark.asyncio
+async def test_sdk_goal_stream_has_one_terminal_event_and_aggregate_usage(
+    tmp_path,
+) -> None:
+    (tmp_path / "goal.txt").write_text("evidence\n", encoding="utf-8")
+    provider = GoalStreamingSDKProvider()
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+
+    async with await AshClient.create(config=config, provider=provider) as client:
+        client.loop.create_goal("Read goal.txt and verify it")
+        events = [event async for event in client.stream_prompt("Start the Goal")]
+
+    event_types = [event.type for event in events]
+    assert event_types.count("goal.step.completed") == 2
+    assert event_types.count("turn.completed") == 1
+    assert event_types[-1] == "turn.completed"
+    terminal = events[-1]
+    usage = terminal.data["usage"]
+    assert usage["prompt_tokens"] == 40
+    assert usage["completion_tokens"] == 8
+    assert provider.calls == 4
 
 
 @pytest.mark.asyncio

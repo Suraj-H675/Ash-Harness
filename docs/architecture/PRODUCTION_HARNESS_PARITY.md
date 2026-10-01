@@ -146,6 +146,7 @@ not imply broader support than their recorded evidence.
 | Crash recovery | Verified locally | Approved tool intent is persisted before dispatch. Real Linux SIGKILL/restart probes prove pre-dispatch calls remain not-run, dispatched non-file side effects are marked ambiguous without replay, hash-proven in-flight edits are compensated, pre-finalization or independently changed files are preserved for inspection, active sessions are protected by a cross-process runtime lease so a second process cannot misclassify a live turn as crashed, and a later resume remains idempotent after the active owner exits |
 | Session retention | Verified locally | Configurable automatic cleanup plus explicit project prune and vacuum |
 | Cost/token history | Verified locally | Built-in pricing defaults for current major Anthropic, OpenAI, DeepSeek, and Groq models; explicit user pricing overrides remain authoritative |
+| Persistent long-horizon Goals | Verified locally | One durable foreground Goal per session persists objective, bounded redacted evidence, lifecycle, and continuation usage in SQLite; model-visible Goal context survives ordinary turn boundaries; automatic continuation requires a real non-Goal tool action and is bounded by a configurable 1–100-turn window; completion requires explicit evidence; cancellation/runtime failure pauses conservatively; pause/resume/clear are host-owned controls; SDK and interactive `/goal` surfaces share the same state |
 
 ## 5. CLI And TUI Experience
 
@@ -180,6 +181,7 @@ not imply broader support than their recorded evidence.
 | `/rename`, `/fork`, `/tree` | Verified locally | Atomic complete-turn transcript forks, durable parent/root lineage, redacted branch metadata, stable parent-first navigation, and tree-aware retention across CLI/SDK/HTTP/JSON-RPC |
 | `/compact`, `/context` | Verified locally | Context compaction, budget inspection, and last-turn cache hit metrics; explicit bounded workspace memory indexing is available from the REPL |
 | `/cancel` | Verified locally | Cancel the active provider/tool turn while retaining already completed work |
+| `/goal` | Verified locally | Create/status/pause/resume/clear one durable foreground Goal; resume grants a fresh bounded continuation window and immediately returns to normal permissioned turn execution |
 | `/clear`, `/rewind`, `/undo` | Verified locally | New-session clear, complete-turn transcript rewind with optional `--files`, and conflict-aware latest file undo |
 | `/diff` | Verified locally | Current, staged, path-scoped Git diff plus latest per-turn checkpoint diff with conflict refusal |
 | `/review` | Verified locally | Bounded reviews for worktree/untracked, staged, commit, or current branch versus base |
@@ -346,6 +348,6 @@ Ash should currently be described as **strong local coding-core parity with
 remaining product-parity work, and a WIP**. Missing
 gateway/channel/mobile/media surfaces are comparator scope differences, not
 automatic Ash debt. Subscription/provider auth breadth, remote browser control,
-richer remote-agent modalities, persistent long-horizon objective workflows,
-and other comparator advantages are M4 product decisions and become roadmap
+richer remote-agent modalities, and other comparator advantages are M4 product
+decisions and become roadmap
 commitments only when they materially improve Ash as a coding harness.

@@ -9,12 +9,14 @@ from typing import Any, AsyncGenerator
 
 import pytest
 
+from ash.core.goals import GoalState
 from ash.core.loop import AshLoop
 from ash.core.recovery import CircuitBreaker
 from ash.core.session import SessionStore
 from ash.providers.base import StreamChunk
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
+from ash.tools.goals import UpdateGoalTool
 from ash.ui.terminal import TerminalUI
 
 
@@ -181,6 +183,220 @@ def test_tool_call_turn_executes_and_loops_back_to_provider(
     tool_response = session.messages[2].content
     assert '<tool_response name="read_file"' in tool_response
     assert "FILE CONTENT" in tool_response
+
+
+def _attach_goal_tool(loop: AshLoop, safety_guard: SafetyGuard) -> None:
+    goal_tool = UpdateGoalTool(safety_guard, loop.update_goal)
+    loop.tools[goal_tool.name] = goal_tool
+
+
+def test_active_goal_auto_continues_real_work_until_verified_complete(
+    tmp_workspace: Path,
+    safety_guard: SafetyGuard,
+    session_store: SessionStore,
+) -> None:
+    provider = FakeProvider(
+        scripts=[
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
+            ["<response>Initial evidence collected.</response>"],
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
+            [
+                '<call_tool name="update_goal">'
+                '<arg name="action">complete</arg>'
+                '<arg name="evidence">Verified x.py after a second read</arg>'
+                "</call_tool>"
+            ],
+            ["<response>Goal verified complete.</response>"],
+        ]
+    )
+    read_tool = CountingReadTool(safety_guard, output="FILE CONTENT")
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=tmp_workspace,
+        tools={read_tool.name: read_tool},
+        max_goal_continuations=3,
+    )
+    _attach_goal_tool(loop, safety_guard)
+    asyncio.run(loop.start_session())
+    goal = loop.create_goal("Read x.py twice and verify the result")
+    emitted: list[dict[str, Any]] = []
+    original_emit = loop._emit_event
+
+    def capture_event(event: dict[str, Any]) -> None:
+        emitted.append(dict(event))
+        original_emit(event)
+
+    loop._emit_event = capture_event  # type: ignore[method-assign]
+
+    response = asyncio.run(loop.run_turn("Start the active Goal"))
+
+    assert response == "Goal verified complete."
+    assert read_tool.calls == 2
+    assert provider._call_count == 5
+    assert session_store.load_goal(goal.goal_id).state is GoalState.COMPLETE
+    assert session_store.load_current_goal(goal.session_id) is None
+    first_system = provider.received_messages[0][0]["content"]
+    assert "## Active Goal" in first_system
+    assert goal.objective in first_system
+    assert [event["type"] for event in emitted].count("goal.step.completed") == 2
+    terminal = [event for event in emitted if event["type"] == "turn.completed"]
+    assert len(terminal) == 1
+    step_usage = [
+        event["usage"]
+        for event in emitted
+        if event["type"] == "goal.step.completed"
+    ]
+    assert terminal[0]["usage"]["prompt_tokens"] == sum(
+        int(usage["prompt_tokens"]) for usage in step_usage
+    )
+    assert terminal[0]["usage"]["completion_tokens"] == sum(
+        int(usage["completion_tokens"]) for usage in step_usage
+    )
+
+
+def test_active_goal_does_not_spin_after_no_tool_work(
+    tmp_workspace: Path,
+    safety_guard: SafetyGuard,
+    session_store: SessionStore,
+) -> None:
+    provider = FakeProvider(scripts=[["<response>I need more input.</response>"]])
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=tmp_workspace,
+    )
+    asyncio.run(loop.start_session())
+    goal = loop.create_goal("Investigate the issue")
+
+    response = asyncio.run(loop.run_turn("Start the active Goal"))
+
+    assert response == "I need more input."
+    assert provider._call_count == 1
+    assert session_store.load_goal(goal.goal_id).state is GoalState.ACTIVE
+    assert session_store.load_goal(goal.goal_id).continuations_used == 0
+
+
+def test_goal_bookkeeping_alone_does_not_justify_auto_continuation(
+    tmp_workspace: Path,
+    safety_guard: SafetyGuard,
+    session_store: SessionStore,
+) -> None:
+    provider = FakeProvider(
+        scripts=[
+            [
+                '<call_tool name="update_goal">'
+                '<arg name="action">progress</arg>'
+                '<arg name="evidence">No external work completed yet</arg>'
+                "</call_tool>"
+            ],
+            ["<response>Blocked pending more information.</response>"],
+        ]
+    )
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=tmp_workspace,
+    )
+    _attach_goal_tool(loop, safety_guard)
+    asyncio.run(loop.start_session())
+    goal = loop.create_goal("Resolve the blocker")
+
+    response = asyncio.run(loop.run_turn("Start the active Goal"))
+
+    assert response == "Blocked pending more information."
+    assert provider._call_count == 2
+    persisted = session_store.load_goal(goal.goal_id)
+    assert persisted.state is GoalState.ACTIVE
+    assert persisted.continuations_used == 0
+    assert persisted.last_evidence == "No external work completed yet"
+
+
+def test_active_goal_stops_at_automatic_continuation_budget(
+    tmp_workspace: Path,
+    safety_guard: SafetyGuard,
+    session_store: SessionStore,
+) -> None:
+    provider = FakeProvider(
+        scripts=[
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
+            ["<response>First pass.</response>"],
+            [
+                '<call_tool name="read_file"><arg name="file_path">x.py</arg></call_tool>'
+            ],
+            ["<response>Second pass still needs work.</response>"],
+        ]
+    )
+    read_tool = CountingReadTool(safety_guard)
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=tmp_workspace,
+        tools={read_tool.name: read_tool},
+        max_goal_continuations=1,
+    )
+    asyncio.run(loop.start_session())
+    goal = loop.create_goal("Keep reading until verified")
+
+    response = asyncio.run(loop.run_turn("Start the active Goal"))
+
+    persisted = session_store.load_goal(goal.goal_id)
+    assert persisted.state is GoalState.BUDGET_LIMITED
+    assert persisted.continuations_used == 1
+    assert provider._call_count == 4
+    assert read_tool.calls == 2
+    assert "automatic-continuation budget exhausted (1/1)" in response
+
+
+@pytest.mark.asyncio
+async def test_cancelling_active_goal_pauses_it_durably(
+    tmp_workspace: Path,
+    safety_guard: SafetyGuard,
+    session_store: SessionStore,
+) -> None:
+    started = asyncio.Event()
+
+    class BlockingProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            started.set()
+            await asyncio.Event().wait()
+            yield StreamChunk(content="", is_done=True)  # pragma: no cover
+
+    provider = BlockingProvider(scripts=[])
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=tmp_workspace,
+    )
+    await loop.start_session()
+    goal = loop.create_goal("Finish work unless interrupted")
+    turn = asyncio.create_task(loop.run_turn("Start the active Goal"))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    persisted = session_store.load_goal(goal.goal_id)
+    assert persisted.state is GoalState.PAUSED
+    assert session_store.load_current_goal(goal.session_id) == persisted
 
 
 def test_tool_call_record_persisted_with_approval_and_result(

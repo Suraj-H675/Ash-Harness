@@ -20,6 +20,14 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, PrivateAttr
 
+from ash.core.goals import (
+    MAX_GOAL_EVIDENCE_BYTES,
+    MAX_GOAL_OBJECTIVE_BYTES,
+    GoalRecord,
+    GoalState,
+    bounded_goal_text,
+    validate_goal_continuation_limit,
+)
 from ash.providers.identifiers import MAX_MODEL_IDENTIFIER_BYTES
 
 from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
@@ -49,7 +57,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 15
+CURRENT_SCHEMA_VERSION = 16
 SQLITE_INTEGER_MAX = 2**63 - 1
 SQLITE_REAL_MAX = sys.float_info.max
 MAX_SESSION_IMPORT_BYTES = 64 * 1024 * 1024
@@ -1187,6 +1195,8 @@ class SessionStore:
                 self._migrate_v14(conn)
             if from_version < 15:
                 self._migrate_v15(conn)
+            if from_version < 16:
+                self._migrate_v16(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -1623,6 +1633,44 @@ class SessionStore:
             (15, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v16(self, conn: sqlite3.Connection) -> None:
+        """Add durable session-scoped Goal lifecycle state."""
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS goals (
+                goal_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                state TEXT NOT NULL
+                    CHECK(state IN (
+                        'active','paused','complete','budget_limited','cleared'
+                    )),
+                max_continuations INTEGER NOT NULL
+                    CHECK(max_continuations BETWEEN 1 AND 100),
+                continuations_used INTEGER NOT NULL DEFAULT 0
+                    CHECK(continuations_used >= 0),
+                last_evidence TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                completed_at TIMESTAMP,
+                FOREIGN KEY(session_id)
+                    REFERENCES sessions(session_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_goals_session_updated
+                ON goals(session_id, updated_at DESC, goal_id DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_goals_one_current_per_session
+                ON goals(session_id)
+                WHERE state IN ('active','paused','budget_limited');
+            """
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (16, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -1922,6 +1970,31 @@ class SessionStore:
                 CREATE INDEX IF NOT EXISTS idx_sprints_session_state_created
                     ON sprints(session_id, state, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_checklist_sprint ON checklist_items(sprint_id);
+
+                CREATE TABLE IF NOT EXISTS goals (
+                    goal_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    state TEXT NOT NULL
+                        CHECK(state IN (
+                            'active','paused','complete','budget_limited','cleared'
+                        )),
+                    max_continuations INTEGER NOT NULL
+                        CHECK(max_continuations BETWEEN 1 AND 100),
+                    continuations_used INTEGER NOT NULL DEFAULT 0
+                        CHECK(continuations_used >= 0),
+                    last_evidence TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    completed_at TIMESTAMP,
+                    FOREIGN KEY(session_id)
+                        REFERENCES sessions(session_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_goals_session_updated
+                    ON goals(session_id, updated_at DESC, goal_id DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_goals_one_current_per_session
+                    ON goals(session_id)
+                    WHERE state IN ('active','paused','budget_limited');
 
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     version INTEGER PRIMARY KEY,
@@ -4409,6 +4482,266 @@ class SessionStore:
                 f"{omitted} additional audit verification error(s) omitted"
             )
         return errors
+
+    # --- durable Goal persistence ---------------------------------------
+
+    @staticmethod
+    def _goal_record_from_row(row: sqlite3.Row) -> GoalRecord:
+        try:
+            return GoalRecord(
+                goal_id=str(row["goal_id"]),
+                session_id=str(row["session_id"]),
+                objective=str(row["objective"]),
+                state=GoalState(str(row["state"])),
+                max_continuations=int(row["max_continuations"]),
+                continuations_used=int(row["continuations_used"]),
+                last_evidence=str(row["last_evidence"] or ""),
+                created_at=_deserialize_datetime(row["created_at"]),
+                updated_at=_deserialize_datetime(row["updated_at"]),
+                completed_at=(
+                    _deserialize_datetime(row["completed_at"])
+                    if row["completed_at"]
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise SessionStorageError("stored Goal data is invalid") from exc
+
+    def create_goal(
+        self,
+        session_id: str,
+        objective: str,
+        *,
+        max_continuations: int,
+    ) -> GoalRecord:
+        """Create the single current Goal for a session."""
+
+        from ash.core.redaction import redact_text
+
+        normalized_objective = bounded_goal_text(
+            redact_text(objective),
+            label="goal objective",
+            maximum=MAX_GOAL_OBJECTIVE_BYTES,
+        )
+        limit = validate_goal_continuation_limit(max_continuations)
+        goal_id = str(uuid4())
+        now = _utc_now()
+        with closing(self._connect()) as conn, conn:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                is None
+            ):
+                raise KeyError(f"Session not found: {session_id}")
+            current = conn.execute(
+                """
+                SELECT goal_id FROM goals
+                WHERE session_id = ?
+                  AND state IN ('active','paused','budget_limited')
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if current is not None:
+                raise ValueError(
+                    "session already has a current Goal; clear or complete it first"
+                )
+            conn.execute(
+                """
+                INSERT INTO goals (
+                    goal_id, session_id, objective, state,
+                    max_continuations, continuations_used, last_evidence,
+                    created_at, updated_at, completed_at
+                )
+                VALUES (?, ?, ?, 'active', ?, 0, '', ?, ?, NULL)
+                """,
+                (
+                    goal_id,
+                    session_id,
+                    normalized_objective,
+                    limit,
+                    _serialize_datetime(now),
+                    _serialize_datetime(now),
+                ),
+            )
+        return self.load_goal(goal_id)
+
+    def load_goal(self, goal_id: str) -> GoalRecord:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT goal_id, session_id, objective, state,
+                       max_continuations, continuations_used, last_evidence,
+                       created_at, updated_at, completed_at
+                FROM goals WHERE goal_id = ?
+                """,
+                (goal_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Goal not found: {goal_id}")
+        return self._goal_record_from_row(row)
+
+    def load_current_goal(self, session_id: str) -> GoalRecord | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT goal_id, session_id, objective, state,
+                       max_continuations, continuations_used, last_evidence,
+                       created_at, updated_at, completed_at
+                FROM goals
+                WHERE session_id = ?
+                  AND state IN ('active','paused','budget_limited')
+                ORDER BY updated_at DESC, goal_id DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+        return None if row is None else self._goal_record_from_row(row)
+
+    def record_goal_progress(
+        self,
+        goal_id: str,
+        evidence: str,
+        *,
+        complete: bool = False,
+    ) -> GoalRecord:
+        """Persist bounded evidence, optionally completing an active Goal."""
+
+        from ash.core.redaction import redact_text
+
+        normalized_evidence = bounded_goal_text(
+            redact_text(evidence),
+            label="goal evidence",
+            maximum=MAX_GOAL_EVIDENCE_BYTES,
+        )
+        now = _utc_now()
+        next_state = GoalState.COMPLETE if complete else GoalState.ACTIVE
+        with closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT state FROM goals WHERE goal_id = ?",
+                (goal_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Goal not found: {goal_id}")
+            if GoalState(str(row["state"])) is not GoalState.ACTIVE:
+                raise ValueError("only an active Goal can record progress")
+            conn.execute(
+                """
+                UPDATE goals
+                SET state = ?, last_evidence = ?, updated_at = ?, completed_at = ?
+                WHERE goal_id = ?
+                """,
+                (
+                    next_state.value,
+                    normalized_evidence,
+                    _serialize_datetime(now),
+                    _serialize_datetime(now) if complete else None,
+                    goal_id,
+                ),
+            )
+        return self.load_goal(goal_id)
+
+    def pause_current_goal(self, session_id: str) -> GoalRecord | None:
+        """Pause the current Goal without discarding progress evidence."""
+
+        goal = self.load_current_goal(session_id)
+        if goal is None:
+            return None
+        if goal.state is GoalState.PAUSED:
+            return goal
+        now = _utc_now()
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
+                UPDATE goals
+                SET state = 'paused', updated_at = ?
+                WHERE goal_id = ?
+                  AND state IN ('active','budget_limited')
+                """,
+                (_serialize_datetime(now), goal.goal_id),
+            )
+        return self.load_goal(goal.goal_id)
+
+    def resume_current_goal(self, session_id: str) -> GoalRecord:
+        """Activate a paused/budget-limited Goal with a fresh continuation window."""
+
+        goal = self.load_current_goal(session_id)
+        if goal is None:
+            raise KeyError("no current Goal")
+        if goal.state is GoalState.ACTIVE:
+            return goal
+        now = _utc_now()
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
+                UPDATE goals
+                SET state = 'active', continuations_used = 0, updated_at = ?
+                WHERE goal_id = ?
+                  AND state IN ('paused','budget_limited')
+                """,
+                (_serialize_datetime(now), goal.goal_id),
+            )
+        return self.load_goal(goal.goal_id)
+
+    def clear_current_goal(self, session_id: str) -> GoalRecord:
+        """Clear a current Goal without representing it as completed."""
+
+        goal = self.load_current_goal(session_id)
+        if goal is None:
+            raise KeyError("no current Goal")
+        now = _utc_now()
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
+                UPDATE goals
+                SET state = 'cleared', updated_at = ?
+                WHERE goal_id = ?
+                  AND state IN ('active','paused','budget_limited')
+                """,
+                (_serialize_datetime(now), goal.goal_id),
+            )
+        return self.load_goal(goal.goal_id)
+
+    def claim_goal_continuation(self, goal_id: str) -> GoalRecord:
+        """Atomically consume one continuation or mark the Goal budget-limited."""
+
+        now = _utc_now()
+        with closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                """
+                SELECT state, max_continuations, continuations_used
+                FROM goals WHERE goal_id = ?
+                """,
+                (goal_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Goal not found: {goal_id}")
+            state = GoalState(str(row["state"]))
+            if state is GoalState.ACTIVE:
+                used = int(row["continuations_used"])
+                limit = int(row["max_continuations"])
+                if used >= limit:
+                    conn.execute(
+                        """
+                        UPDATE goals
+                        SET state = 'budget_limited', updated_at = ?
+                        WHERE goal_id = ? AND state = 'active'
+                        """,
+                        (_serialize_datetime(now), goal_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE goals
+                        SET continuations_used = continuations_used + 1,
+                            updated_at = ?
+                        WHERE goal_id = ? AND state = 'active'
+                        """,
+                        (_serialize_datetime(now), goal_id),
+                    )
+        return self.load_goal(goal_id)
 
     # --- sprint + checklist persistence (Sprint 12 / V5) ---------------
 

@@ -46,6 +46,10 @@ READ_ONLY_TOOLS = frozenset(
         "recover_remote_agent_task",
         "remote_agent_task_status",
         "list_automations",
+        # Goal progress mutates only Ash-owned session bookkeeping. Treat it
+        # like other safe model-state tools so it never prompts for approval;
+        # DRY_RUN still denies it before this read-only/safe-state branch.
+        "update_goal",
         "browser_snapshot",
         "browser_tabs",
         "ask_user",

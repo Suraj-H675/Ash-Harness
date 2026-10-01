@@ -24,6 +24,25 @@ def test_plan_mode_allows_reads() -> None:
     assert decision.action == PolicyAction.ALLOW
 
 
+def test_goal_bookkeeping_is_safe_but_still_obeys_fail_closed_policy() -> None:
+    arguments = {"action": "progress", "evidence": "targeted tests pass"}
+    assert (
+        PermissionPolicy("interactive").evaluate("update_goal", arguments).action
+        == PolicyAction.ALLOW
+    )
+    assert (
+        PermissionPolicy("dry_run").evaluate("update_goal", arguments).action
+        == PolicyAction.DENY
+    )
+    managed_deny = PermissionRule.create(RuleEffect.DENY, "update_goal")
+    assert (
+        PermissionPolicy("interactive", managed_rules=[managed_deny])
+        .evaluate("update_goal", arguments)
+        .action
+        == PolicyAction.DENY
+    )
+
+
 @pytest.mark.parametrize(
     "tool_name", ["find_symbol", "find_references", "search_tools"]
 )

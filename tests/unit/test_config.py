@@ -608,6 +608,15 @@ def test_sprint_planning_can_be_enabled_from_config() -> None:
     assert config.enable_sprint_planning is True
 
 
+def test_goal_continuation_budget_is_bounded() -> None:
+    assert AshConfig().max_goal_continuations == 10
+    assert AshConfig(max_goal_continuations=100).max_goal_continuations == 100
+    with pytest.raises(ValueError):
+        AshConfig(max_goal_continuations=0)
+    with pytest.raises(ValueError):
+        AshConfig(max_goal_continuations=101)
+
+
 def test_terminal_keybinding_collisions_are_rejected() -> None:
     with pytest.raises(ValueError, match="assigned to both"):
         AshConfig(

@@ -206,13 +206,31 @@ versioned SQLite storage. Ash supports:
   checks;
 - crash recovery based on persisted tool intent and hash-proven file state;
 - recovery reports for in-flight, incomplete, conflicting, or ambiguous work;
-  and
+- one durable foreground Goal per session, with persisted objective/evidence,
+  bounded automatic continuation, no-spin suppression, explicit pause/resume/
+  clear controls, and interruption-safe pausing; and
 - persisted token, cache, usage, and cost history with estimated portions
   clearly labeled.
 
 Recovery is conservative: completed work is retained, direct file edits are
 compensated only when hashes prove what happened, and non-file side effects
 are never guessed or silently replayed.
+
+### Persistent Goals
+
+Use `/goal <objective>` for a foreground objective that should keep advancing
+across ordinary turn boundaries until it is verified complete, paused, blocked,
+or reaches its continuation window. `/goal` shows status; `/goal pause`,
+`/goal resume`, and `/goal clear` control the lifecycle. The default automatic
+continuation window is 10 turns and is configurable with
+`max_goal_continuations` from 1 through 100.
+
+The model can only record bounded progress evidence or mark the current Goal
+complete; creation, pause, resume, and clear remain user/host-owned controls.
+Automatic continuation requires a real non-Goal tool action in the preceding
+turn, so bookkeeping or an empty answer cannot create a spin loop. Cancellation
+or a runtime failure pauses the Goal conservatively. Goals are session-scoped
+foreground work; use durable automation for scheduled or unattended jobs.
 
 ### Terminal experience
 
@@ -466,7 +484,7 @@ Ash exposes or consumes the following integration surfaces:
 | HTTP API | Authenticated bounded-concurrency synchronous turns, live SSE turn events, steering, session fork, and session tree endpoints |
 | JSON-RPC | Structured runtime and session integration for external hosts |
 | LSP 3.18 | Managed lazy language servers for diagnostics, hover, definitions, references, implementations, symbols, and call hierarchy |
-| Python SDK | Async client access to turns, sessions, plans, steering, events, usage, storage, automation, and agent delegation |
+| Python SDK | Async client access to turns, durable Goals, sessions, plans, steering, events, usage, storage, automation, and agent delegation |
 
 Managed LSP detects host-installed basedpyright/pyright,
 typescript-language-server, gopls, rust-analyzer, clangd, and

@@ -927,6 +927,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             if command.name == "status":
                 session = loop.current_session
+                goal = loop.current_goal
                 capabilities = loop.provider.capabilities
                 provider_circuit = loop.provider_circuit_breaker.snapshot(
                     loop._provider_circuit_key
@@ -945,6 +946,12 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"Mode: {loop.safety_tier}",
                             f"Session: {session.session_id if session else '(none)'}",
                             f"Title: {(session.title or '(untitled)') if session else '(none)'}",
+                            "Goal: "
+                            + (
+                                f"{goal.state.value} ({goal.goal_id[:8]})"
+                                if goal is not None
+                                else "none"
+                            ),
                             f"Recovered interrupted turns: {loop.recovered_turns}",
                             "Recovery attention: "
                             + (
@@ -1305,6 +1312,54 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     + ("enabled" if loop.enable_sprint_planning else "disabled")
                 )
                 continue
+            if command.name == "goal":
+                if loop.current_session is None:
+                    await loop.start_session()
+                if not arguments:
+                    print(loop.render_goal_status(), flush=True)
+                    continue
+                action = arguments[0].casefold()
+                if len(arguments) == 1 and action == "pause":
+                    goal = loop.pause_goal()
+                    print(
+                        loop.render_goal_status()
+                        if goal is not None
+                        else "Goal: none",
+                        flush=True,
+                    )
+                    continue
+                if len(arguments) == 1 and action == "clear":
+                    try:
+                        loop.clear_goal()
+                    except KeyError as exc:
+                        _print_classified_error(exc)
+                    else:
+                        print("Goal cleared.", flush=True)
+                    continue
+                if len(arguments) == 1 and action == "resume":
+                    try:
+                        goal = loop.resume_goal()
+                    except KeyError as exc:
+                        _print_classified_error(exc)
+                        continue
+                    print(loop.render_goal_status(), flush=True)
+                    user_input = (
+                        "Resume work on the active Goal and continue toward its "
+                        f"verified completion: {goal.objective}"
+                    )
+                    parsed_command = None
+                    expand_mentions = False
+                else:
+                    objective = " ".join(arguments).strip()
+                    try:
+                        goal = loop.create_goal(objective)
+                    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                        _print_classified_error(exc)
+                        continue
+                    print(loop.render_goal_status(), flush=True)
+                    user_input = goal.objective
+                    parsed_command = None
+                    expand_mentions = False
             if command.name == "skills":
                 result = await loop.tools["list_skills"].run(query=" ".join(arguments))
                 print(result.output or "No matching skills.", flush=True)

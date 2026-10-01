@@ -651,6 +651,7 @@ def build_runtime(
             max_steering_messages=config.steering_queue_limit,
             planner=Planner(active_provider) if config.enable_sprint_planning else None,
             enable_sprint_planning=config.enable_sprint_planning,
+            max_goal_continuations=config.max_goal_continuations,
             safety_tier=config.safety_tier,
             on_tool_approval=approval_callback,
             mcp_configs=mcp_configs,
@@ -664,6 +665,12 @@ def build_runtime(
             auto_index_max_files=config.memory_auto_index_max_files,
             auto_index_max_bytes_per_file=config.memory_auto_index_max_bytes_per_file,
         )
+        from ash.tools.goals import UpdateGoalTool
+
+        goal_tool = UpdateGoalTool(guard, loop.update_goal)
+        goal_tool.set_event_sink(loop._emit_event)
+        loop.tools[goal_tool.name] = goal_tool
+        tools[goal_tool.name] = goal_tool
     except BaseException as primary_error:
         _rollback_startup_owners(startup_rollback, primary_error)
         raise

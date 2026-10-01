@@ -22,6 +22,7 @@ from ash.automation.schedules import build_schedule
 from ash.automation.store import AutomationError, AutomationStore
 from ash.config import AshConfig
 from ash.core.events import EVENT_SCHEMA_VERSION, envelope_event, event_data
+from ash.core.goals import GoalRecord
 from ash.core.loop import AshLoop
 from ash.core.redaction import redact_text
 from ash.core.session import SessionLineage, SessionSummary
@@ -290,6 +291,58 @@ class AshClient:
     ) -> AshResult:
         async with self._turn_lock:
             return await self._prompt_unlocked(text, user_metadata=user_metadata)
+
+    async def run_goal(
+        self,
+        objective: str,
+        *,
+        user_metadata: dict[str, Any] | None = None,
+    ) -> AshResult:
+        """Create the session's durable Goal and begin working on it immediately."""
+
+        async with self._turn_lock:
+            self._require_runtime_open()
+            if not self._started:
+                await self._start_unlocked()
+            self.loop.create_goal(objective)
+            return await self._prompt_unlocked(
+                objective,
+                user_metadata=user_metadata,
+            )
+
+    def current_goal(self) -> GoalRecord | None:
+        """Return the active/paused/budget-limited Goal for this session."""
+
+        self._require_runtime_open()
+        return self.loop.current_goal
+
+    async def pause_goal(self) -> GoalRecord | None:
+        """Pause automatic continuation for the current Goal."""
+
+        async with self._turn_lock:
+            self._require_runtime_open()
+            return self.loop.pause_goal()
+
+    async def resume_goal(self) -> AshResult:
+        """Resume the current Goal and immediately run another bounded work turn."""
+
+        async with self._turn_lock:
+            self._require_runtime_open()
+            goal = self.loop.resume_goal()
+            return await self._prompt_unlocked(
+                (
+                    "Resume work on the active Goal and continue toward its "
+                    f"verified completion: {goal.objective}"
+                ),
+                user_metadata={"goal_resume": True},
+            )
+
+    async def clear_goal(self) -> GoalRecord:
+        """Clear the current Goal without representing it as completed."""
+
+        async with self._turn_lock:
+            self._require_runtime_open()
+            return self.loop.clear_goal()
 
     async def steer(self, text: str) -> int:
         """Queue guidance for the currently running turn without waiting on it."""

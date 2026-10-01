@@ -58,6 +58,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "/capabilities [--refresh]",
     ),
     SlashCommand("plan", "Toggle editable sprint planning", "/plan [on|off]"),
+    SlashCommand(
+        "goal",
+        "Run a durable session objective until verified, paused, or bounded",
+        "/goal [pause|resume|clear|OBJECTIVE]",
+    ),
     SlashCommand("skills", "List available instruction skills", "/skills [query]"),
     SlashCommand(
         "plugins",

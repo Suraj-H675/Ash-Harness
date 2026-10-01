@@ -187,7 +187,6 @@ concurrently modified files, and unrelated staged work are preserved rather than
 absorbed into the commit.
 
 ### 2.7 `lsp`
-
 Queries managed Language Server Protocol 3.18 processes for semantic code
 intelligence. Supported operations are `status`, `diagnostics`, `hover`,
 `definition`, `references`, `implementation`, `documentSymbol`,
@@ -213,6 +212,27 @@ intelligence. Supported operations are `status`, `diagnostics`, `hover`,
 * Post-edit diagnostics are advisory and share one three-second overall
   deadline for at most 20 edited files; they cannot turn a successful edit
   into a failed edit result.
+
+### 2.8 `update_goal`
+Records bounded evidence for the single current session Goal.
+
+* **Arguments Schema**:
+  ```python
+  class UpdateGoalArgs(BaseModel):
+      action: Literal["progress", "complete"]
+      evidence: str = Field(min_length=1, max_length=16_384)
+  ```
+* **Lifecycle limits**:
+  1. The tool cannot create, pause, resume, or clear a Goal.
+  2. `progress` stores redacted evidence while keeping the Goal active.
+  3. `complete` is accepted only for an active Goal and moves it to terminal
+     `complete` state with the supplied verification evidence.
+  4. Goal bookkeeping never counts as productive work for automatic
+     continuation; at least one non-Goal tool call is required to continue.
+* **Safety**:
+  Goal updates mutate only Ash-owned session state, so normal interactive/plan
+  policy may allow them without an approval prompt. Dry-run mode still denies
+  them, and managed/user deny rules retain precedence.
 
 ---
 

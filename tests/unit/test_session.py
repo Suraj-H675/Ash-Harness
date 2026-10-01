@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from ash.core.goals import GoalState
 from ash.core.session import (
     Message,
     SessionResolutionError,
@@ -68,7 +69,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     with get_db_connection(db_path) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 15
+            == 16
         )
         assert "mcp_tasks" in table_names
         assert {
@@ -99,6 +100,9 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         }.issubset(session_columns)
         assert {"idx_sessions_parent", "idx_sessions_root_depth"}.issubset(index_names)
         assert "idx_sprints_session_state_created" in index_names
+        assert "idx_goals_session_updated" in index_names
+        assert "idx_goals_one_current_per_session" in index_names
+        assert "goals" in table_names
         assert "turn_id" in {
             row["name"] for row in conn.execute("PRAGMA table_info(messages)")
         }
@@ -129,11 +133,11 @@ def test_v15_migration_adds_context_summary_message_count(tmp_path: Path) -> Non
 
     migrated = SessionStore(db_path)
 
-    assert len(list(tmp_path.glob("v14.db.before-v15-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v14.db.before-v16-migration.*.backup"))) == 1
     with get_db_connection(db_path) as conn:
         assert conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 15
+        ).fetchone()[0] == 16
         columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(sessions)")
         }
@@ -148,6 +152,92 @@ def test_v15_migration_adds_context_summary_message_count(tmp_path: Path) -> Non
     loaded = migrated.load_session(session.session_id)
     assert loaded.context_summary == "legacy summary"
     assert loaded.context_summary_message_count == 0
+
+
+def test_v16_migration_adds_durable_goals(tmp_path: Path) -> None:
+    db_path = tmp_path / "v15.db"
+    store = SessionStore(db_path)
+    session = store.create_session(str(tmp_path))
+
+    with closing(get_db_connection(db_path)) as conn, conn:
+        conn.execute("DROP TABLE goals")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 16")
+
+    migrated = SessionStore(db_path)
+
+    assert len(list(tmp_path.glob("v15.db.before-v16-migration.*.backup"))) == 1
+    with get_db_connection(db_path) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 16
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'goals'"
+        ).fetchone() is not None
+    goal = migrated.create_goal(
+        session.session_id,
+        "Finish the migration",
+        max_continuations=3,
+    )
+    assert goal.state is GoalState.ACTIVE
+
+
+def test_goal_lifecycle_is_durable_bounded_and_redacted(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "goals.db")
+    session = store.create_session(str(tmp_path))
+    goal = store.create_goal(
+        session.session_id,
+        "Fix auth with OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
+        max_continuations=2,
+    )
+
+    assert goal.state is GoalState.ACTIVE
+    assert "sk-proj-" not in goal.objective
+    assert store.load_current_goal(session.session_id) == goal
+    with pytest.raises(ValueError, match="already has a current Goal"):
+        store.create_goal(session.session_id, "Second Goal", max_continuations=2)
+
+    goal = store.record_goal_progress(
+        goal.goal_id,
+        "Observed OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz in fixture",
+    )
+    assert "sk-proj-" not in goal.last_evidence
+
+    goal = store.claim_goal_continuation(goal.goal_id)
+    assert goal.continuations_used == 1
+    assert goal.state is GoalState.ACTIVE
+    goal = store.claim_goal_continuation(goal.goal_id)
+    assert goal.continuations_used == 2
+    assert goal.state is GoalState.ACTIVE
+    goal = store.claim_goal_continuation(goal.goal_id)
+    assert goal.state is GoalState.BUDGET_LIMITED
+
+    goal = store.resume_current_goal(session.session_id)
+    assert goal.state is GoalState.ACTIVE
+    assert goal.continuations_used == 0
+    goal = store.pause_current_goal(session.session_id)
+    assert goal is not None
+    assert goal.state is GoalState.PAUSED
+    goal = store.resume_current_goal(session.session_id)
+    assert goal.state is GoalState.ACTIVE
+
+    completed = store.record_goal_progress(
+        goal.goal_id,
+        "Targeted tests pass",
+        complete=True,
+    )
+    assert completed.state is GoalState.COMPLETE
+    assert completed.completed_at is not None
+    assert store.load_current_goal(session.session_id) is None
+
+    replacement = store.create_goal(
+        session.session_id,
+        "Follow-up cleanup",
+        max_continuations=1,
+    )
+    cleared = store.clear_current_goal(session.session_id)
+    assert cleared.goal_id == replacement.goal_id
+    assert cleared.state is GoalState.CLEARED
+    assert store.load_current_goal(session.session_id) is None
 
 
 def test_runtime_session_load_uses_persisted_compaction_window(tmp_path: Path) -> None:
@@ -479,11 +569,11 @@ def test_v12_migration_adds_mcp_task_table_with_backup(tmp_path: Path) -> None:
 
     SessionStore(db_path)
 
-    assert len(list(tmp_path.glob("v11.db.before-v15-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v11.db.before-v16-migration.*.backup"))) == 1
     with get_db_connection(db_path) as conn:
         assert conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 15
+        ).fetchone()[0] == 16
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type = 'table' AND name = 'mcp_tasks'"
@@ -525,7 +615,7 @@ def test_v13_migration_binds_existing_mcp_task_table_to_server_identity(
 
     SessionStore(db_path)
 
-    assert len(list(tmp_path.glob("v12.db.before-v15-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v12.db.before-v16-migration.*.backup"))) == 1
     with get_db_connection(db_path) as conn:
         columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(mcp_tasks)")
@@ -533,7 +623,7 @@ def test_v13_migration_binds_existing_mcp_task_table_to_server_identity(
         assert "server_fingerprint" in columns
         assert conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 15
+        ).fetchone()[0] == 16
 
 
 def test_v14_migration_scopes_tool_call_and_event_ids_to_sessions(
@@ -625,11 +715,11 @@ def test_v14_migration_scopes_tool_call_and_event_ids_to_sessions(
 
     migrated = SessionStore(db_path)
 
-    assert len(list(tmp_path.glob("v13.db.before-v15-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v13.db.before-v16-migration.*.backup"))) == 1
     with get_db_connection(db_path) as conn:
         assert conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 15
+        ).fetchone()[0] == 16
     assert migrated.load_session(first.session_id).tool_calls[0].call_id == (
         "shared-call-id"
     )
@@ -737,7 +827,7 @@ def test_legacy_database_is_backed_up_and_migrated(tmp_path: Path) -> None:
     store = SessionStore(db_path)
 
     assert store.load_session("legacy").session_id == "legacy"
-    backups = list(tmp_path.glob("legacy.db.before-v15-migration.*.backup"))
+    backups = list(tmp_path.glob("legacy.db.before-v16-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as conn:
         assert conn.execute("SELECT session_id FROM sessions").fetchone()[0] == "legacy"
@@ -795,7 +885,7 @@ def test_v7_migration_preserves_checkpoints_and_adds_call_granularity(
         call_id="call-2",
     )
     assert len(migrated.file_checkpoints_for_turns(session.session_id, ["turn-1"])) == 2
-    assert len(list(tmp_path.glob("v6.db.before-v15-migration.*.backup"))) == 1
+    assert len(list(tmp_path.glob("v6.db.before-v16-migration.*.backup"))) == 1
 
 
 def test_session_forks_form_a_durable_redacted_tree(tmp_path: Path) -> None:
