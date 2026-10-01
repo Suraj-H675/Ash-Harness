@@ -106,10 +106,14 @@ def main() -> None:
 
     artifact: Path | None = None
     with installer._prepared_package_spec(
-        ["browser"],
+        ["browser", "observability"],
         ref=ref,
         release_opener=opener,
     ) as package_spec:
+        if not package_spec.startswith("ash-ai[browser,observability] @ "):
+            raise AssertionError(
+                "standalone installer lost requested capability extras"
+            )
         requirement = package_spec.split(" @ ", 1)[1]
         parsed = urllib.parse.urlsplit(requirement)
         if parsed.scheme != "file":

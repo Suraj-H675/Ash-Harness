@@ -33,7 +33,14 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 REPOSITORY_URL = "https://github.com/Suraj-H675/Ash-Harness.git"
 _RELEASES_API = "https://api.github.com/repos/Suraj-H675/Ash-Harness/releases"
 _GITHUB_API_VERSION = "2026-03-10"
-SUPPORTED_EXTRAS = ("a2a", "acp", "browser", "local-embeddings", "server")
+SUPPORTED_EXTRAS = (
+    "a2a",
+    "acp",
+    "browser",
+    "local-embeddings",
+    "observability",
+    "server",
+)
 _SUPPORTED_EXTRA_SET = frozenset(SUPPORTED_EXTRAS)
 _PACKAGE_NAME = "ash-ai"
 _EXTRAS_PATTERN = re.compile(

@@ -133,11 +133,22 @@ The earlier M5 closure was too optimistic. Re-reading
 identified material whole-product gaps that the previous bounded audit did not
 justify dismissing:
 
-- **Production distribution is not real yet.** The release workflow is
-  implemented, but the repository currently has no published GitHub Release.
-  README's immutable-release install flow therefore has nothing a first-time
-  production user can actually install. A real immutable release plus
-  clean-machine install, upgrade, repair, and rollback evidence is required.
+- **Production distribution is not real yet, but the local release path is
+  hardened.** The repository still has no published GitHub Release, so README's
+  immutable-release install flow has nothing a first-time production user can
+  actually install. The standalone installer now has a package-extra drift
+  guard, includes the observability pack, and passes a stateful verified-release
+  journey covering first install, upgrade, same-release repair, explicit
+  older-ref rollback, and capability preservation. Release CI installs every
+  published optional pack. A fresh local release rehearsal also builds the
+  wheel from a fresh sdist, passes the minimal installed-wheel journey (including
+  a real subprocess subagent), passes the standalone installer on Python 3.10,
+  and installs/imports the built wheel with the observability extra in an
+  isolated Python 3.12 environment. The live repository still reports immutable
+  releases disabled; GitHub's enable endpoint returned HTTP 500 during this
+  audit, so the first immutable release remains externally blocked. A real
+  immutable release plus post-publication clean-machine verification is still
+  required.
 - **Production observability gap — addressed locally.** Ash now has an opt-in,
   user-owned OpenTelemetry/OTLP HTTP trace-and-metrics plane with locally owned
   SDK providers, parented turn/model/tool spans, retry/circuit/context/token

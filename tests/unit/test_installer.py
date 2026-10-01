@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.parse
 from types import SimpleNamespace
 from pathlib import Path
@@ -16,6 +17,7 @@ import pytest
 from ash.installer import (
     InstallError,
     InstallResult,
+    SUPPORTED_EXTRAS,
     _corrupt_ash_metadata,
     _ensure_shell_path,
     _read_bounded_file,
@@ -134,6 +136,14 @@ def _generated_ash_launcher(directory: str) -> str:
 
 def _current_runtime_python() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def test_installer_capability_extras_match_published_package_extras() -> None:
+    project = tomllib.loads(
+        Path("pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+
+    assert SUPPORTED_EXTRAS == tuple(sorted(project["optional-dependencies"]))
 
 
 def test_existing_pipx_install_is_rebuilt_without_exposing_uv_edge_cases() -> None:
@@ -426,6 +436,102 @@ def test_release_ref_installs_the_immutable_hashed_wheel() -> None:
     assert outcome.version == "ash 0.2.0"
     assert installed_artifact is not None
     assert not installed_artifact.exists()
+
+
+def test_release_journey_install_upgrade_repair_and_explicit_rollback() -> None:
+    state = {
+        "installed": False,
+        "version": "",
+        "extras": (),
+    }
+    target_version = ""
+
+    def pipx_payload() -> str:
+        if not state["installed"]:
+            return '{"venvs": {}}'
+        extras = state["extras"]
+        rendered_extras = f"[{','.join(extras)}]" if extras else ""
+        return json.dumps(
+            {
+                "venvs": {
+                    "ash-ai": {
+                        "metadata": {
+                            "python_version": "Python 3.14.7",
+                            "main_package": {
+                                "package_or_url": f"ash-ai{rendered_extras}",
+                                "app_paths": [
+                                    {
+                                        "__Path__": "/isolated/bin/ash",
+                                        "__type__": "Path",
+                                    }
+                                ],
+                            },
+                        }
+                    }
+                }
+            }
+        )
+
+    def runner(command, **kwargs):
+        del kwargs
+        if command == ["/usr/bin/pipx", "list", "--json"]:
+            return _completed(stdout=pipx_payload())
+        if command[1:3] == ["install", "--force"]:
+            requirement = command[-1]
+            package = requirement.split(" @ ", 1)[0]
+            if "[" in package:
+                rendered = package.split("[", 1)[1].removesuffix("]")
+                state["extras"] = tuple(sorted(rendered.split(",")))
+            else:
+                state["extras"] = ()
+            state["version"] = target_version
+            state["installed"] = True
+            return _completed()
+        if command == ["/isolated/bin/ash", "--version"]:
+            return _completed(stdout=f"ash {state['version']}\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    def run_release(
+        version: str,
+        *,
+        extras: list[str] | None = None,
+    ) -> InstallResult:
+        nonlocal target_version
+        target_version = version
+        ref = f"ash-v{version}"
+        wheel = f"release wheel {version}\n".encode()
+        return install(
+            extras=extras or [],
+            ref=ref,
+            runtime_python="3.14",
+            runner=runner,
+            which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
+            environ={
+                "PATH": f"/isolated/bin{os.pathsep}/usr/bin",
+                "PIPX_BIN_DIR": "/isolated/bin",
+            },
+            release_opener=_release_opener(
+                ref=ref,
+                wheel_name=f"ash_ai-{version}-py3-none-any.whl",
+                wheel_bytes=wheel,
+            ),
+        )
+
+    first = run_release("0.1.0", extras=["browser"])
+    assert first.version == "ash 0.1.0"
+    assert state["extras"] == ("browser",)
+
+    upgraded = run_release("0.2.0")
+    assert upgraded.version == "ash 0.2.0"
+    assert state["extras"] == ("browser",)
+
+    repaired = run_release("0.2.0", extras=["observability"])
+    assert repaired.version == "ash 0.2.0"
+    assert state["extras"] == ("browser", "observability")
+
+    rolled_back = run_release("0.1.0")
+    assert rolled_back.version == "ash 0.1.0"
+    assert state["extras"] == ("browser", "observability")
 
 
 def test_release_ref_rejects_mutable_wheel_before_manager_mutation() -> None:

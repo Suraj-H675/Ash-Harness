@@ -25,6 +25,8 @@ OPTIONAL_DISTRIBUTIONS = {
     "fastapi",
     "numpy",
     "onnxruntime",
+    "opentelemetry-exporter-otlp-proto-http",
+    "opentelemetry-sdk",
     "playwright",
     "tokenizers",
     "uvicorn",
@@ -82,6 +84,14 @@ def assert_distribution_metadata() -> None:
         for marker in marked["tokenizers"]
     )
     assert any('extra == "browser"' in marker for marker in marked["playwright"])
+    assert any(
+        'extra == "observability"' in marker
+        for marker in marked["opentelemetry-sdk"]
+    )
+    assert any(
+        'extra == "observability"' in marker
+        for marker in marked["opentelemetry-exporter-otlp-proto-http"]
+    )
 
     packaged = {str(path).replace("\\", "/") for path in installed.files or ()}
     assert {
@@ -223,9 +233,11 @@ def verify_installed_subagent_subprocess(*, workspace: Path, root: Path) -> None
         workspace_root=workspace,
         db_directory=root / "provider-db",
         model="openai/wheel-child",
+        openai_auth_mode="api_key",
         agent_execution_mode="subprocess",
         memory_backend="off",
     )
+    assert config.openai_auth_mode == "api_key"
 
     def forbidden_parent_factory() -> ProviderABC:
         raise AssertionError("installed subprocess must rebuild provider in child")

@@ -22,6 +22,11 @@ the published release. If GitHub reports it as mutable, the workflow deletes
 that release, leaves the existing tag in place, and fails so the same workflow
 run can be retried after the repository setting is corrected.
 
+Run this check **before pushing the release tag**. The standard Actions
+`GITHUB_TOKEN` is intentionally not granted repository-administration access,
+so release CI does not rely on a privileged settings credential just to perform
+this preflight.
+
 ## Release contract
 
 1. Update `project.version` in `pyproject.toml` and its lockfile as needed.
@@ -51,6 +56,12 @@ from the fresh sdist, smoke-tested, checksummed, and attested; it does not
 perform a second client-side build from the Git tag. The temporary wheel is
 removed after the manager finishes, and the installed `ash --version` must also
 match the requested `ash-v<version>` release tag.
+
+Re-running the same verified immutable ref repairs the managed environment.
+Installing a newer immutable ref upgrades it. Installing an older verified
+immutable ref is the supported explicit rollback path. Supported capability
+extras already present in the managed installation are preserved across
+upgrade, repair, and rollback.
 
 ## Verify a published release
 

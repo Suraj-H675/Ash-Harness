@@ -44,7 +44,7 @@ jobs:
 
       - run: uv lock --check
       - run: uv audit --preview-features audit-command --locked
-      - run: uv sync --locked --group dev --extra server --extra browser --extra acp --extra a2a --extra local-embeddings
+      - run: uv sync --locked --group dev --all-extras
       - run: uv run --locked ruff check src tests
       - run: uv run --locked mypy src/ash
       - run: uv run --locked pytest -q --timeout=120 --timeout-method=thread
