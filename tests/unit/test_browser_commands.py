@@ -49,6 +49,7 @@ async def test_browser_command_connect_defaults_to_loopback_without_mutating_con
     config = SimpleNamespace(
         browser_cdp_url="",
         browser_cdp_reuse_storage_state=False,
+        browser_timeout_seconds=30,
     )
 
     rendered = await _handle_browser_command(loop, config, ["connect"])
@@ -70,6 +71,7 @@ async def test_browser_command_connect_reuse_is_explicit_and_disconnects_to_mana
     config = SimpleNamespace(
         browser_cdp_url="http://127.0.0.1:9333",
         browser_cdp_reuse_storage_state=True,
+        browser_timeout_seconds=30,
     )
 
     connected = await _handle_browser_command(
@@ -98,6 +100,7 @@ async def test_browser_command_rejects_unknown_actions_and_extra_disconnect_args
     config = SimpleNamespace(
         browser_cdp_url="",
         browser_cdp_reuse_storage_state=False,
+        browser_timeout_seconds=30,
     )
 
     with pytest.raises(ValueError, match="Usage: /browser"):
@@ -119,9 +122,52 @@ async def test_browser_status_sanitizes_endpoint_for_terminal_output() -> None:
     config = SimpleNamespace(
         browser_cdp_url="",
         browser_cdp_reuse_storage_state=False,
+        browser_timeout_seconds=30,
     )
 
     rendered = await _handle_browser_command(loop, config, ["status"])
 
     assert "\x1b[2J" not in rendered
     assert "\\x1b[2J" in rendered
+
+
+@pytest.mark.asyncio
+async def test_browser_inspect_is_read_only_and_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _FakeBrowserLoop()
+    config = SimpleNamespace(
+        browser_cdp_url="http://127.0.0.1:9222",
+        browser_cdp_reuse_storage_state=False,
+        browser_timeout_seconds=12,
+    )
+
+    async def inspect(_url: str, *, timeout_seconds: float):
+        assert timeout_seconds == 12
+        return {
+            "endpoint": "http://127.0.0.1:9222",
+            "contexts": [
+                {
+                    "index": 0,
+                    "tabs": [
+                        {
+                            "title": "Signed in\x1b[2J",
+                            "url": "https://example.com/path?token=secret",
+                        }
+                    ],
+                    "tabs_truncated": False,
+                }
+            ],
+            "contexts_truncated": False,
+        }
+
+    monkeypatch.setattr("ash.tools.browser.inspect_cdp_source", inspect)
+
+    rendered = await _handle_browser_command(loop, config, ["inspect"])
+
+    assert loop.calls == []
+    assert "CDP source browser (read-only inspection)" in rendered
+    assert "Context 0: 1 visible tab(s)" in rendered
+    assert "\x1b[2J" not in rendered
+    assert "\\x1b[2J" in rendered
+    assert "Ash will not control these tabs directly" in rendered

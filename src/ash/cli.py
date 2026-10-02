@@ -56,7 +56,8 @@ MAX_CLI_INPUT_BYTES = 1_000_000
 MAX_CRON_PROMPT_BYTES = 64 * 1024
 DEFAULT_BROWSER_CDP_URL = "http://127.0.0.1:9222"
 BROWSER_COMMAND_USAGE = (
-    "Usage: /browser [status|connect [URL] [--reuse-storage-state]|disconnect]"
+    "Usage: /browser [status|inspect [URL]|connect [URL] "
+    "[--reuse-storage-state]|disconnect]"
 )
 
 
@@ -585,18 +586,61 @@ async def _handle_browser_command(
             raise ValueError(BROWSER_COMMAND_USAGE)
         status = await loop.configure_browser_runtime(cdp_url=None)
         return _render_browser_runtime_status(status)
+    if action == "inspect":
+        if len(arguments) > 2:
+            raise ValueError(BROWSER_COMMAND_USAGE)
+        from ash.tools.browser import inspect_cdp_source
+
+        target = (
+            arguments[1]
+            if len(arguments) == 2
+            else config.browser_cdp_url or DEFAULT_BROWSER_CDP_URL
+        )
+        inventory = await inspect_cdp_source(
+            target,
+            timeout_seconds=config.browser_timeout_seconds,
+        )
+        lines = [
+            "CDP source browser (read-only inspection)",
+            "Endpoint: "
+            + terminal_safe_text(str(inventory["endpoint"]), single_line=True),
+        ]
+        contexts = inventory["contexts"]
+        if not contexts:
+            lines.append("Contexts: none")
+        for context in contexts:
+            index = int(context["index"])
+            tabs = list(context["tabs"])
+            lines.append(f"Context {index}: {len(tabs)} visible tab(s)")
+            for tab_index, tab in enumerate(tabs, 1):
+                title = terminal_safe_text(str(tab["title"]), single_line=True)
+                url = terminal_safe_text(str(tab["url"]), single_line=True)
+                lines.append(f"  [{tab_index}] {title} — {url}")
+            if context.get("tabs_truncated"):
+                lines.append("  … additional tabs omitted")
+        if inventory.get("contexts_truncated"):
+            lines.append("… additional contexts omitted")
+        lines.append(
+            "Ash will not control these tabs directly; --reuse-storage-state "
+            "copies bounded state into an isolated Ash context."
+        )
+        return "\n".join(lines)
     if action != "connect":
         raise ValueError(BROWSER_COMMAND_USAGE)
 
     cdp_url = ""
     reuse_storage_state = False
-    for argument in arguments[1:]:
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
         if argument == "--reuse-storage-state":
             reuse_storage_state = True
+            index += 1
             continue
         if argument.startswith("-") or cdp_url:
             raise ValueError(BROWSER_COMMAND_USAGE)
         cdp_url = argument
+        index += 1
     target = cdp_url or config.browser_cdp_url or DEFAULT_BROWSER_CDP_URL
     status = await loop.configure_browser_runtime(
         cdp_url=target,

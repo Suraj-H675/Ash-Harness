@@ -13,7 +13,7 @@ from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
 import ash.tools.browser as browser_module
-from ash.tools.browser import BrowserSession, build_browser_tools
+from ash.tools.browser import BrowserSession, build_browser_tools, inspect_cdp_source
 from ash.tools.browser_proxy import BrowserPolicyProxy
 from ash.tools.web import _resolve_public_addresses
 
@@ -394,6 +394,13 @@ async def test_real_chromium_cdp_attach_uses_isolated_context_and_preserves_owne
                 "sameSite": "Lax",
             }]
         )
+
+        inventory = await inspect_cdp_source(
+            f"http://127.0.0.1:{port}",
+            timeout_seconds=15,
+        )
+        assert len(inventory["contexts"]) == 1
+        assert inventory["contexts"][0]["tabs"][0]["title"] == "owner-alive"
 
         session = BrowserSession(
             timeout_seconds=15,

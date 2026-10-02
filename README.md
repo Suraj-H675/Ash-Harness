@@ -356,9 +356,13 @@ provides:
 - disabled service workers and blocked password-field filling;
 - ephemeral contexts by default;
 - optional Ash-owned persistent browser profiles; and
-- runtime `/browser connect` / `disconnect` / `status` switching for a
+- runtime `/browser inspect` plus `connect` / `disconnect` / `status`
+  switching for a
   loopback Chromium CDP endpoint, with candidate preflight and an Ash-owned
   isolated context;
+- read-only source-browser inspection showing bounded, terminal-safe tab titles
+  and redacted URLs before attachment; inspection does not read cookies,
+  storage, DOM content, or take control of those tabs;
 - explicit `--reuse-storage-state` copying of bounded cookies/local storage
   from the attached browser into Ash's isolated context; and
 - deterministic browser cleanup and health diagnostics.

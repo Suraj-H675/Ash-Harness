@@ -26,11 +26,13 @@ from ash.safety.scoped_io import atomic_write_scoped_bytes
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.browser_proxy import BrowserPolicyProxy
 from ash.tools.web import _normalize_allowed_domains, _validate_public_url
+from ash.ui.safe_text import terminal_safe_text
 
 
 MAX_SNAPSHOT_CHARS = 30_000
 MAX_INTERACTIVE_ELEMENTS = 150
 MAX_CDP_STORAGE_STATE_BYTES = 4 * 1024 * 1024
+MAX_CDP_SOURCE_TABS = 64
 MAX_BROWSER_TABS = 32
 TAB_ID_PATTERN = r"t[0-9a-f]{8}-[1-9][0-9]{0,8}"
 BROWSER_TOOL_NAMES = frozenset(
@@ -1568,3 +1570,73 @@ def browser_session_from_tools(
     if len(sessions) != 1:
         return None
     return next(iter(sessions.values()))
+
+
+async def inspect_cdp_source(
+    cdp_url: str,
+    *,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Inspect one loopback CDP browser without taking ownership of its tabs."""
+
+    if not 1.0 <= timeout_seconds <= 120.0:
+        raise ValueError("browser timeout must be between 1 and 120 seconds")
+    endpoint = _validate_cdp_url(cdp_url)
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        from ash.install import pipx_install_command
+
+        raise BrowserUnavailableError(
+            f"Run `{pipx_install_command('browser')}`, then "
+            "`ash setup browser` to enable browser tools."
+        ) from exc
+    playwright: Any | None = None
+    browser: Any | None = None
+    try:
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.connect_over_cdp(
+            endpoint,
+            timeout=int(timeout_seconds * 1000),
+        )
+        contexts = list(browser.contexts)
+        contexts_truncated = False
+        rendered: list[dict[str, Any]] = []
+        for context_index, context in enumerate(contexts):
+            pages = list(context.pages)
+            pages_truncated = len(pages) > MAX_CDP_SOURCE_TABS
+            tabs: list[dict[str, str]] = []
+            for page in pages[:MAX_CDP_SOURCE_TABS]:
+                try:
+                    title = terminal_safe_text(
+                        _redact_browser_text(_single_line(str(await page.title())))[:200],
+                        single_line=True,
+                    )
+                except Exception:
+                    title = "(unavailable)"
+                tabs.append(
+                    {
+                        "title": title,
+                        "url": terminal_safe_text(
+                            _redact_browser_url(str(page.url)),
+                            single_line=True,
+                        )[:2048],
+                    }
+                )
+            rendered.append(
+                {
+                    "index": context_index,
+                    "tabs": tabs,
+                    "tabs_truncated": pages_truncated,
+                }
+            )
+        return {
+            "endpoint": endpoint,
+            "contexts": rendered,
+            "contexts_truncated": contexts_truncated,
+        }
+    finally:
+        if browser is not None:
+            await browser.close()
+        if playwright is not None:
+            await playwright.stop()

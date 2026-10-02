@@ -30,6 +30,7 @@ from ash.tools.browser import (
     BrowserSnapshotTool,
     BrowserTabsTool,
     BrowserTypeTool,
+    inspect_cdp_source,
     _redact_browser_url,
     _validate_browser_url,
     _validate_cdp_url,
@@ -1766,6 +1767,35 @@ async def test_browser_cdp_uses_isolated_policy_context_and_optional_storage() -
     assert context_kwargs["storage_state"]["cookies"][0]["name"] == "session"
     assert context_kwargs["proxy"]["bypass"] == "<-loopback>"
     assert context_kwargs["proxy"]["server"].startswith("http://127.0.0.1:")
+    attached.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_inspect_cdp_source_lists_tabs_without_storage_access() -> None:
+    page = MagicMock()
+    page.title = AsyncMock(return_value="Account\x1b[2J")
+    page.url = "https://example.com/private?token=secret"
+    context = MagicMock()
+    context.pages = [page]
+    context.storage_state = AsyncMock()
+    attached = MagicMock()
+    attached.contexts = [context]
+    attached.close = AsyncMock()
+    playwright = MagicMock()
+    playwright.chromium.connect_over_cdp = AsyncMock(return_value=attached)
+    playwright.stop = AsyncMock()
+    factory = MagicMock()
+    factory.start = AsyncMock(return_value=playwright)
+
+    with patch("playwright.async_api.async_playwright", return_value=factory):
+        result = await inspect_cdp_source("http://127.0.0.1:9222")
+
+    assert result["contexts"][0]["index"] == 0
+    assert result["contexts"][0]["tabs"][0]["title"] == "Account\\x1b[2J"
+    assert result["contexts"][0]["tabs"][0]["url"] == (
+        "https://example.com/private?token=[REDACTED]"
+    )
+    context.storage_state.assert_not_awaited()
     attached.close.assert_awaited_once()
 
 
