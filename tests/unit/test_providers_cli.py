@@ -141,6 +141,107 @@ def test_provider_test_rendering_never_includes_credentials() -> None:
     assert json.loads(rendered)["ok"] is True
 
 
+@pytest.mark.asyncio
+async def test_provider_catalog_verification_uses_chatgpt_plan_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import providers
+    from ash.config import AshConfig
+
+    config = AshConfig(
+        model="openai/gpt-plan",
+        openai_auth_mode="chatgpt",
+        fallback_models=["anthropic/claude-sonnet-4-6"],
+    )
+    verification = ProviderVerification(
+        connection=ProviderConnection(
+            provider="openai",
+            model_name="gpt-plan",
+            base_url="https://chatgpt.com/backend-api/codex",
+            catalog_endpoint="https://chatgpt.com/backend-api/codex/models",
+            catalog_format="openai",
+            auth_mode="chatgpt",
+        ),
+        models=("gpt-plan",),
+        selected_model_available=True,
+    )
+    seen = []
+
+    async def verify_chatgpt(probe_config, *, timeout):
+        seen.append((probe_config, timeout))
+        return verification
+
+    def fail_api_key_probe(*args, **kwargs):
+        raise AssertionError("API-key catalog path must not run for ChatGPT-plan auth")
+
+    monkeypatch.setattr(
+        providers,
+        "verify_chatgpt_plan_connection",
+        verify_chatgpt,
+    )
+    monkeypatch.setattr(providers, "verify_provider_connection", fail_api_key_probe)
+
+    result = await providers.verify_provider_catalog(config, timeout=2.5)
+
+    assert result is verification
+    assert len(seen) == 1
+    probe_config, timeout = seen[0]
+    assert probe_config.fallback_models == []
+    assert probe_config.model == "openai/gpt-plan"
+    assert timeout == 2.5
+
+
+@pytest.mark.asyncio
+async def test_provider_catalog_verification_uses_api_key_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import providers
+    from ash.config import AshConfig
+
+    config = AshConfig(
+        model="openai/gpt-api",
+        openai_auth_mode="api_key",
+        fallback_models=["anthropic/claude-sonnet-4-6"],
+    )
+    verification = ProviderVerification(
+        connection=ProviderConnection(
+            provider="openai",
+            model_name="gpt-api",
+            base_url="https://api.openai.com/v1",
+            catalog_endpoint="https://api.openai.com/v1/models",
+            catalog_format="openai",
+            auth_mode="bearer",
+            api_key="secret",
+        ),
+        models=("gpt-api",),
+        selected_model_available=True,
+    )
+    seen = []
+
+    def verify_api_key(probe_config, *, timeout):
+        seen.append((probe_config, timeout))
+        return verification
+
+    async def fail_chatgpt(*args, **kwargs):
+        raise AssertionError("ChatGPT-plan catalog path must not run for API-key auth")
+
+    monkeypatch.setattr(providers, "verify_provider_connection", verify_api_key)
+    monkeypatch.setattr(
+        providers,
+        "verify_chatgpt_plan_connection",
+        fail_chatgpt,
+    )
+
+    result = await providers.verify_provider_catalog(config, timeout=3.0)
+
+    assert result is verification
+    assert len(seen) == 1
+    probe_config, timeout = seen[0]
+    assert probe_config.fallback_models == []
+    assert probe_config.model == "openai/gpt-api"
+    assert timeout == 3.0
+
+
 def test_provider_test_does_not_report_ready_when_completion_probe_fails(
     monkeypatch,
 ) -> None:

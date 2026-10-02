@@ -255,13 +255,41 @@ def _configured_model_catalog(config: AshConfig) -> list[str]:
     return list(dict.fromkeys(catalog))
 
 
+def _model_catalog(
+    config: AshConfig,
+    discovered: list[str] | None = None,
+) -> list[str]:
+    """Merge static/configured models with a bounded live-discovery result."""
+
+    return list(
+        dict.fromkeys(
+            [
+                *_configured_model_catalog(config),
+                *(discovered or []),
+            ]
+        )
+    )
+
+
+def _grouped_model_catalog(
+    config: AshConfig,
+    discovered: list[str] | None = None,
+) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for model_string in _model_catalog(config, discovered):
+        provider, model = _parse_model_string(model_string)
+        grouped.setdefault(provider, []).append(model)
+    return grouped
+
+
 def _render_model_list(
     config: AshConfig,
     *,
     numbered: bool = False,
+    discovered: list[str] | None = None,
 ) -> str:
     """Render known models for interactive or machine-independent display."""
-    from ash.providers.capabilities import infer_capabilities
+    from ash.providers.registry import configured_model_capabilities
 
     # Determine current provider/model
     try:
@@ -269,15 +297,9 @@ def _render_model_list(
     except ValueError:
         current_provider, current_model = "anthropic", config.model
 
-    # Group by provider
-    grouped: dict[str, list[str]] = {}
-    for m in _configured_model_catalog(config):
-        prov, mod = _parse_model_string(m)
-        grouped.setdefault(prov, []).append(mod)
-
     lines = ["Available models:"]
     number = 0
-    for prov, models in grouped.items():
+    for prov, models in _grouped_model_catalog(config, discovered).items():
         display_provider = terminal_safe_text(prov.capitalize(), single_line=True)
         lines.append(f"\n{display_provider}:")
         for model in models:
@@ -287,7 +309,10 @@ def _render_model_list(
                 if prov == current_provider and model == current_model
                 else ""
             )
-            capabilities = infer_capabilities(prov, model)
+            capabilities = configured_model_capabilities(
+                config,
+                f"{prov}/{model}",
+            )
             labels = [
                 label
                 for label, enabled in (
@@ -447,39 +472,13 @@ async def _refresh_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str
 async def _discover_live_model_catalog(config: AshConfig) -> list[str]:
     """Probe the selected provider's live catalog with a short timeout."""
 
-    from ash.commands.setup import (
-        _probe_anthropic_models_detailed,
-        _probe_models_detailed,
-        _probe_ollama_models_detailed,
-    )
-    from ash.providers.readiness import resolve_provider_connection
+    from ash.commands.providers import verify_provider_catalog
 
-    provider, model_name = _parse_model_string(config.model)
-    connection = resolve_provider_connection(
-        config.model_copy(update={"model": f"{provider}/{model_name}"})
-    )
-    if connection.provider == "anthropic":
-        models = await asyncio.to_thread(
-            lambda: _probe_anthropic_models_detailed(
-                api_key=connection.api_key,
-                base_url=connection.base_url,
-            )
-        )
-    elif connection.provider == "ollama":
-        models = await asyncio.to_thread(
-            lambda: _probe_ollama_models_detailed(connection.base_url)
-        )
-    else:
-        models = await asyncio.to_thread(
-            lambda: _probe_models_detailed(
-                connection.base_url,
-                connection.api_key or None,
-            )
-        )
-    prefix = connection.provider
+    verification = await verify_provider_catalog(config)
+    prefix = verification.connection.provider
     return [
         f"{prefix}/{model}"
-        for model in models.models
+        for model in verification.models
         if isinstance(model, str) and model
     ]
 
@@ -512,15 +511,30 @@ async def _interactive_model_picker(
     loop: AshLoop,
     prompt_input: Any,
     write_output: Any,
+    *,
+    discovered: list[str] | None = None,
 ) -> None:
     """Show models grouped by provider, let user pick by provider number."""
-    write_output(_render_model_list(config, numbered=True))
+    write_output(
+        _render_model_list(
+            config,
+            numbered=True,
+            discovered=discovered or [],
+        )
+    )
     choice = (await prompt_input.read("Pick a number (or 'c' to cancel)> ")).strip()
     if choice.lower() == "c":
         return
     try:
         idx = int(choice) - 1
-        catalog = _configured_model_catalog(config)
+        catalog = [
+            f"{provider}/{model}"
+            for provider, models in _grouped_model_catalog(
+                config,
+                discovered or [],
+            ).items()
+            for model in models
+        ]
         model_str = catalog[idx]
     except (ValueError, IndexError):
         write_output("Invalid selection.", file=sys.stderr)
@@ -723,6 +737,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     if interactions is not None:
         interactions.sampling_review = turn_controller.review_mcp_sampling
         interactions.elicitation_callback = turn_controller.request_mcp_elicitation
+    live_model_catalogs: dict[str, list[str]] = {}
 
     async def reload_plugin_components() -> PluginReloadResult:
         nonlocal custom_commands, discovered_commands
@@ -2170,7 +2185,18 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             and parsed_command[0].name == "model"
             and not parsed_command[1]
         ):
-            await _interactive_model_picker(config, loop, prompt_input, print)
+            cached_live_models = [
+                model
+                for models in live_model_catalogs.values()
+                for model in models
+            ]
+            await _interactive_model_picker(
+                config,
+                loop,
+                prompt_input,
+                print,
+                discovered=cached_live_models,
+            )
             continue
 
         # /model provider/model → switch to full string
@@ -2210,6 +2236,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             if refresh:
                 try:
                     live_models = await _discover_live_model_catalog(config)
+                    provider, _model = _parse_model_string(config.model)
+                    live_model_catalogs[provider] = live_models
                     print(render_model_catalog_refresh(config, live_models))
                 except Exception as exc:
                     print(

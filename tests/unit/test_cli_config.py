@@ -1185,6 +1185,92 @@ def test_model_catalog_rendering_and_shared_input_picker() -> None:
     assert output[-1] == f"Switched to {AVAILABLE_MODELS[1]}"
 
 
+def test_model_picker_can_switch_to_cached_live_discovery() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from ash.cli import (
+        AVAILABLE_MODELS,
+        _grouped_model_catalog,
+        _interactive_model_picker,
+    )
+    from ash.config import AshConfig
+
+    config = AshConfig(model=AVAILABLE_MODELS[0])
+    discovered = ["openai/live-model"]
+    rendered_order = [
+        f"{provider}/{model}"
+        for provider, models in _grouped_model_catalog(config, discovered).items()
+        for model in models
+    ]
+    live_index = rendered_order.index("openai/live-model") + 1
+
+    class Prompt:
+        async def read(self, prompt: str) -> str:
+            assert prompt.startswith("Pick a number")
+            return str(live_index)
+
+    selected = []
+    output = []
+    loop = SimpleNamespace(switch_model=selected.append)
+
+    asyncio.run(
+        _interactive_model_picker(
+            config,
+            loop,
+            Prompt(),
+            output.append,
+            discovered=discovered,
+        )
+    )
+
+    assert "Openai:" in output[0]
+    assert "live-model" in output[0]
+    assert selected == ["openai/live-model"]
+    assert config.model == "openai/live-model"
+
+
+@pytest.mark.asyncio
+async def test_live_model_discovery_uses_normalized_provider_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.cli import _discover_live_model_catalog
+    from ash.config import AshConfig
+    from ash.providers.readiness import ProviderConnection, ProviderVerification
+
+    verification = ProviderVerification(
+        connection=ProviderConnection(
+            provider="openai",
+            model_name="gpt-current",
+            base_url="https://example.test",
+            catalog_endpoint="https://example.test/models",
+            catalog_format="openai",
+            auth_mode="chatgpt",
+        ),
+        models=("gpt-live-a", "gpt-live-b"),
+        selected_model_available=True,
+    )
+
+    async def verify(config, *, timeout=10.0):
+        assert config.openai_auth_mode == "chatgpt"
+        assert timeout == 10.0
+        return verification
+
+    monkeypatch.setattr(
+        "ash.commands.providers.verify_provider_catalog",
+        verify,
+    )
+    config = AshConfig(
+        model="openai/gpt-current",
+        openai_auth_mode="chatgpt",
+    )
+
+    assert await _discover_live_model_catalog(config) == [
+        "openai/gpt-live-a",
+        "openai/gpt-live-b",
+    ]
+
+
 def test_model_catalog_includes_configured_custom_models() -> None:
     from ash.cli import _configured_model_catalog, _render_model_list
     from ash.config import AshConfig

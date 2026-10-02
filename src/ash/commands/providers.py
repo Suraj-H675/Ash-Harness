@@ -33,6 +33,31 @@ MAX_PROVIDER_TEST_RESPONSE_CHARS = 4096
 _PROVIDER_TEST_PROMPT = "Reply with exactly OK."
 
 
+async def verify_provider_catalog(
+    config: "AshConfig",
+    *,
+    timeout: float = 10.0,
+) -> ProviderVerification:
+    """Verify the configured provider's live model catalog without a completion."""
+
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("provider catalog timeout must be positive and finite")
+    probe_config = config.model_copy(update={"fallback_models": []})
+    from ash.providers.identifiers import parse_model_string
+
+    selected_provider, _selected_model = parse_model_string(probe_config.model)
+    if (
+        selected_provider == "openai"
+        and getattr(probe_config, "openai_auth_mode", "api_key") == "chatgpt"
+    ):
+        return await verify_chatgpt_plan_connection(probe_config, timeout=timeout)
+    return await asyncio.to_thread(
+        verify_provider_connection,
+        probe_config,
+        timeout=timeout,
+    )
+
+
 def provider_catalog_payload() -> dict[str, Any]:
     """Return the safe, declarative provider catalog for scripts and UIs."""
 
@@ -329,18 +354,7 @@ def test_provider(
         if model
         else config.model_copy(update={"fallback_models": []})
     )
-    from ash.providers.identifiers import parse_model_string
-
-    selected_provider, _selected_model = parse_model_string(test_config.model)
-    if (
-        selected_provider == "openai"
-        and getattr(test_config, "openai_auth_mode", "api_key") == "chatgpt"
-    ):
-        verification = asyncio.run(
-            verify_chatgpt_plan_connection(test_config, timeout=timeout)
-        )
-    else:
-        verification = verify_provider_connection(test_config, timeout=timeout)
+    verification = asyncio.run(verify_provider_catalog(test_config, timeout=timeout))
     if not verification.selected_model_available:
         return verification
     completion_verified, completion_error = asyncio.run(
@@ -375,4 +389,5 @@ __all__ = [
     "render_provider_catalog",
     "render_provider_test",
     "test_provider",
+    "verify_provider_catalog",
 ]

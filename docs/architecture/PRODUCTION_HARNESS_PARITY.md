@@ -225,14 +225,34 @@ readiness, failover, and observability tests**. The complete affected
 core-loop/failover files additionally pass **184 tests**. Ruff, targeted Mypy,
 and `git diff --check` are green.
 
-This slice advances P1C/P1D/P1E but does not close them. Explicitly remaining:
-unified live model discovery/switching across API-key and ChatGPT-plan auth,
-provider-owned capability truth for fast-changing hosted models rather than
-stale name heuristics, correct representation of unknown model pricing instead
-of implying zero cost, the P1A enterprise-route decision, P1B same-provider
-credential/account resilience, supported local-runtime lifecycle and real
-Ollama/LM Studio/vLLM conformance, and adapter-level cancellation/stream-cleanup
-verification.
+This slice advances P1C/P1D/P1E but does not close them.
+
+### P1 progress — discovery and switching slice 2
+
+Provider catalog discovery now has one auth-aware dispatch path that returns the
+same `ProviderVerification` contract for ordinary API-key/local/custom routes
+and first-party OpenAI ChatGPT-plan auth. `ash providers test` and REPL live
+catalog refresh therefore cannot silently diverge on which OpenAI credential
+path they use.
+
+The REPL keeps successful `/models --refresh` results in a session-local
+per-provider cache. Plain `/model` remains instant and network-independent while
+merging those refreshed models into its normal numbered picker, so a model that
+was discovered live is directly switchable without hand-typing its identifier.
+The picker and renderer share one grouped ordering, preventing displayed
+numbers from resolving to a different model when a refreshed model belongs to
+an earlier provider group. Static/configured models remain available when live
+discovery fails.
+
+The complete affected CLI/provider unit files pass **95 tests**. Ruff, targeted
+Mypy, and `git diff --check` are green.
+
+P1 remains open. Explicitly remaining: provider-owned capability truth for
+fast-changing hosted models rather than stale name heuristics, correct
+representation of unknown model pricing instead of implying zero cost, the P1A
+enterprise-route decision, P1B same-provider credential/account resilience,
+supported local-runtime lifecycle and real Ollama/LM Studio/vLLM conformance,
+and adapter-level cancellation/stream-cleanup verification.
 
 ### M4 product decisions
 
