@@ -44,10 +44,8 @@ AVAILABLE_MODELS: list[str] = [
     "ollama/qwen2.5-coder:7b",
     "deepseek/deepseek-flash",
     "deepseek/deepseek-v4-pro",
-    "groq/llama-3.3-70b-versatile",
-    "groq/llama-3.1-8b-instant",
-    "groq/qwen3.3-32b",
-    "groq/compound-mini",
+    "groq/openai/gpt-oss-120b",
+    "groq/openai/gpt-oss-20b",
     "openai-compatible/<your-model>",
 ]
 MAX_SESSION_IMPORT_BYTES = 50 * 1024 * 1024

@@ -1038,9 +1038,15 @@ DEFAULT_MODEL_PRICING_USD_PER_MILLION: dict[str, dict[str, float]] = {
         "output": 2.0,
         "cache_read": 0.025,
     },
-    "groq/llama-3.3-70b-versatile": {
-        "input": 0.59,
-        "output": 0.79,
+    "groq/openai/gpt-oss-120b": {
+        "input": 0.15,
+        "output": 0.60,
+        "cache_read": 0.075,
+    },
+    "groq/openai/gpt-oss-20b": {
+        "input": 0.075,
+        "output": 0.30,
+        "cache_read": 0.037,
     },
 }
 

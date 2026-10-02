@@ -772,10 +772,22 @@ class _FakeOpenAICompletions:
         return _AsyncChunkStream(self._chunks)
 
 
+class _FakeOpenAIModels:
+    def __init__(self, model: Any) -> None:
+        self.model = model
+        self.requested: list[str] = []
+
+    async def retrieve(self, model: str) -> Any:
+        self.requested.append(model)
+        return self.model
+
+
 class _FakeOpenAIClient:
-    def __init__(self, chunks: list[Any]) -> None:
+    def __init__(self, chunks: list[Any], *, model_info: Any | None = None) -> None:
         self.completions = _FakeOpenAICompletions(chunks)
         self.chat = SimpleNamespace(completions=self.completions)
+        if model_info is not None:
+            self.models = _FakeOpenAIModels(model_info)
         self.closed = False
 
     async def close(self) -> None:
@@ -1301,6 +1313,153 @@ async def test_deepseek_preserves_provider_cache_read_usage(
     assert chunks[-1].completion_tokens == 20
     assert chunks[-1].cache_read_tokens == 60
     assert chunks[-1].usage_source == "provider"
+
+
+@pytest.mark.asyncio
+async def test_groq_uses_live_limits_with_exact_model_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.groq import GroqProvider
+
+    client = _FakeOpenAIClient(
+        [],
+        model_info=SimpleNamespace(
+            model_extra={
+                "active": True,
+                "context_window": 120_000,
+                "max_completion_tokens": 60_000,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "ash.providers.groq.openai.AsyncOpenAI",
+        lambda **_: client,
+    )
+    provider = GroqProvider("openai/gpt-oss-120b", "key")
+
+    assert provider.capabilities == ProviderCapabilities(
+        native_tools=True,
+        reasoning=True,
+        context_window=131_072,
+        max_output_tokens=65_536,
+    )
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=True,
+        reasoning=True,
+        context_window=120_000,
+        max_output_tokens=60_000,
+    )
+    assert client.models.requested == ["openai/gpt-oss-120b"]
+
+
+@pytest.mark.asyncio
+async def test_groq_unknown_model_keeps_semantics_conservative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.groq import GroqProvider
+
+    client = _FakeOpenAIClient(
+        [],
+        model_info=SimpleNamespace(
+            active=True,
+            context_window=98_304,
+            max_completion_tokens=8_192,
+        ),
+    )
+    monkeypatch.setattr(
+        "ash.providers.groq.openai.AsyncOpenAI",
+        lambda **_: client,
+    )
+    provider = GroqProvider("future-model", "key")
+
+    assert provider.capabilities == ProviderCapabilities()
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        context_window=98_304,
+        max_output_tokens=8_192,
+    )
+
+
+@pytest.mark.asyncio
+async def test_groq_inactive_model_fails_capabilities_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.groq import GroqProvider
+
+    client = _FakeOpenAIClient(
+        [],
+        model_info=SimpleNamespace(
+            active=False,
+            context_window=131_072,
+            max_completion_tokens=65_536,
+        ),
+    )
+    monkeypatch.setattr(
+        "ash.providers.groq.openai.AsyncOpenAI",
+        lambda **_: client,
+    )
+    provider = GroqProvider("openai/gpt-oss-120b", "key")
+
+    assert await provider.detect_capabilities() == ProviderCapabilities()
+
+
+def test_groq_current_known_model_capabilities_are_exact() -> None:
+    from ash.providers.capabilities import ProviderCapabilities, groq_capabilities
+
+    assert groq_capabilities("openai/gpt-oss-20b") == ProviderCapabilities(
+        native_tools=True,
+        reasoning=True,
+        context_window=131_072,
+        max_output_tokens=65_536,
+    )
+    assert groq_capabilities("llama-3.3-70b-versatile") == ProviderCapabilities(
+        native_tools=True,
+        context_window=131_072,
+        max_output_tokens=32_768,
+    )
+    assert groq_capabilities("llama-3.1-8b-instant") == ProviderCapabilities(
+        native_tools=True,
+        context_window=131_072,
+        max_output_tokens=131_072,
+    )
+    assert groq_capabilities("qwen/qwen3.8-27b") == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=131_072,
+        max_output_tokens=16_384,
+    )
+    assert groq_capabilities("groq/compound-mini") == ProviderCapabilities()
+
+
+@pytest.mark.asyncio
+async def test_groq_preserves_cache_usage_and_uses_current_completion_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.groq import GroqProvider
+
+    usage = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=20,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=64),
+    )
+    client = _FakeOpenAIClient(
+        [_openai_chunk(content="answer", finish_reason="stop", usage=usage)]
+    )
+    monkeypatch.setattr(
+        "ash.providers.groq.openai.AsyncOpenAI",
+        lambda **_: client,
+    )
+    provider = GroqProvider("openai/gpt-oss-20b", "key")
+    provider.configure_max_tokens(4096)
+
+    chunks = [chunk async for chunk in provider.stream_chat([])]
+
+    assert chunks[-1].cache_read_tokens == 64
+    assert client.completions.kwargs["max_completion_tokens"] == 4096
+    assert "max_tokens" not in client.completions.kwargs
 
 
 @pytest.mark.parametrize(

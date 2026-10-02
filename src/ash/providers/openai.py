@@ -50,6 +50,16 @@ def openai_compatible_reasoning_delta(delta: Any, *, provider: str) -> str:
     return value
 
 
+def openai_compatible_cache_read_tokens(usage: Any) -> int:
+    """Return cached prompt tokens from OpenAI-compatible provider usage."""
+
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = getattr(details, "cached_tokens", None)
+    if cached is None:
+        cached = getattr(usage, "prompt_cache_hit_tokens", 0)
+    return cached if isinstance(cached, int) and not isinstance(cached, bool) else 0
+
+
 class _PartialToolCall:
     """Accumulates a streaming tool call's name + arguments until complete."""
 
@@ -262,13 +272,12 @@ class OpenAIProvider(ProviderABC):
             usage = getattr(chunk, "usage", None)
             if not choices:
                 if usage is not None:
-                    details = getattr(usage, "prompt_tokens_details", None)
                     yield StreamChunk(
                         is_done=True,
                         model=self._model_name,
                         prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
                         completion_tokens=(getattr(usage, "completion_tokens", 0) or 0),
-                        cache_read_tokens=getattr(details, "cached_tokens", 0) or 0,
+                        cache_read_tokens=openai_compatible_cache_read_tokens(usage),
                         usage_source="provider",
                     )
                 continue
@@ -323,8 +332,7 @@ class OpenAIProvider(ProviderABC):
                 if usage is not None:
                     prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
                     completion_tokens = getattr(usage, "completion_tokens", 0) or 0
-                    details = getattr(usage, "prompt_tokens_details", None)
-                    cache_read_tokens = getattr(details, "cached_tokens", 0) or 0
+                    cache_read_tokens = openai_compatible_cache_read_tokens(usage)
                 stop_reason = choice.finish_reason
                 for partial in partials.values():
                     completed.append(

@@ -97,13 +97,6 @@ def _openai(model: str) -> ProviderCapabilities:
     )
 
 
-def _reasoning_by_name(model: str) -> ProviderCapabilities:
-    return ProviderCapabilities(
-        native_tools=True,
-        reasoning="reason" in model.casefold(),
-    )
-
-
 def deepseek_capabilities(model: str) -> ProviderCapabilities:
     name = model.casefold()
     if name in {
@@ -128,6 +121,45 @@ def deepseek_capabilities(model: str) -> ProviderCapabilities:
     return ProviderCapabilities()
 
 
+def groq_capabilities(model: str) -> ProviderCapabilities:
+    name = model.casefold()
+    if name in {"openai/gpt-oss-120b", "openai/gpt-oss-20b"}:
+        return ProviderCapabilities(
+            native_tools=True,
+            reasoning=True,
+            context_window=131_072,
+            max_output_tokens=65_536,
+        )
+    if name == "llama-3.1-8b-instant":
+        return ProviderCapabilities(
+            native_tools=True,
+            context_window=131_072,
+            max_output_tokens=131_072,
+        )
+    if name == "llama-3.3-70b-versatile":
+        return ProviderCapabilities(
+            native_tools=True,
+            context_window=131_072,
+            max_output_tokens=32_768,
+        )
+    if name == "qwen/qwen3.8-27b":
+        return ProviderCapabilities(
+            native_tools=True,
+            vision=True,
+            reasoning=True,
+            context_window=131_072,
+            max_output_tokens=16_384,
+        )
+    if name == "openai/gpt-oss-safeguard-20b":
+        return ProviderCapabilities(
+            native_tools=True,
+            reasoning=True,
+            context_window=131_072,
+            max_output_tokens=65_536,
+        )
+    return ProviderCapabilities()
+
+
 def _local_conservative(model: str) -> ProviderCapabilities:
     del model
     return ProviderCapabilities(native_tools=False, local=True)
@@ -138,7 +170,7 @@ def create_default_capability_registry() -> CapabilityRegistry:
     registry.register("anthropic", _anthropic)
     registry.register("openai", _openai)
     registry.register("deepseek", deepseek_capabilities)
-    registry.register("groq", _reasoning_by_name)
+    registry.register("groq", groq_capabilities)
     registry.register("ollama", _local_conservative)
     registry.register("lmstudio", _local_conservative)
     registry.register("vllm", _local_conservative)

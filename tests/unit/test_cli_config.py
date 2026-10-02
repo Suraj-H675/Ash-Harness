@@ -1194,6 +1194,17 @@ def test_model_catalog_advertises_current_deepseek_models_only() -> None:
     assert "deepseek/deepseek-reasoner" not in AVAILABLE_MODELS
 
 
+def test_model_catalog_uses_current_groq_production_defaults() -> None:
+    from ash.cli import AVAILABLE_MODELS
+
+    assert "groq/openai/gpt-oss-120b" in AVAILABLE_MODELS
+    assert "groq/openai/gpt-oss-20b" in AVAILABLE_MODELS
+    assert "groq/llama-3.3-70b-versatile" not in AVAILABLE_MODELS
+    assert "groq/llama-3.1-8b-instant" not in AVAILABLE_MODELS
+    assert "groq/qwen3.3-32b" not in AVAILABLE_MODELS
+    assert "groq/compound-mini" not in AVAILABLE_MODELS
+
+
 def test_model_picker_can_switch_to_cached_live_discovery() -> None:
     import asyncio
     from types import SimpleNamespace

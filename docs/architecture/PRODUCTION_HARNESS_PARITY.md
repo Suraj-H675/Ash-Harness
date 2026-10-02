@@ -335,6 +335,54 @@ decision, P1B same-provider credential/account resilience, supported
 local-runtime lifecycle and real Ollama/LM Studio/vLLM conformance, and
 adapter-level cancellation/stream-cleanup verification.
 
+### P1 progress — Groq current-model truth slice 5
+
+Ash no longer treats Groq's model catalog as a timeless static list. The
+generic picker now exposes only the current generally available production
+text models `openai/gpt-oss-120b` and `openai/gpt-oss-20b`. The older
+`llama-3.1-8b-instant` and `llama-3.3-70b-versatile` IDs were removed from
+generic defaults because Groq retired them for free/developer tiers in August
+2026, while still permitting committed-spend Enterprise access. Those IDs
+remain recognized when an entitled account returns them through live model
+discovery. `groq/compound-mini` is no longer advertised because Groq
+decommissioned it on 2026-09-21. `qwen/qwen3.8-27b` is recognized accurately
+when live-discovered but remains non-default because Groq labels it Preview.
+
+Groq capability resolution now combines an exact first-party semantic manifest
+with live provider-owned model metadata. Known GPT-OSS models advertise native
+tools and reasoning; Enterprise Llama models advertise native tools without
+invented reasoning/vision support; Qwen 3.8 advertises tools, reasoning and
+vision. Unknown IDs remain conservative. At session capability negotiation the
+adapter retrieves Groq's own model record, fails closed for inactive models,
+and adopts provider-reported context and max-completion limits instead of
+assuming the static documentation value is still current.
+
+The Groq wire path now uses `max_completion_tokens` rather than the deprecated
+`max_tokens` request field. Provider-reported prompt-cache hits from
+`prompt_tokens_details.cached_tokens` flow into Ash usage accounting. Built-in
+pricing for the two production GPT-OSS defaults reflects Groq's current
+published input/output rates and 50%-discount cached-input rates; Enterprise
+and Preview routes without stable general pricing continue to surface as
+unknown unless the user configures an explicit rate.
+
+Evidence was rechecked against Groq's first-party documentation on 2026-10-02,
+including:
+`https://console.groq.com/docs/models`,
+`https://console.groq.com/docs/deprecations`,
+`https://console.groq.com/docs/reasoning`,
+`https://console.groq.com/docs/prompt-caching`,
+`https://console.groq.com/docs/api-reference`,
+`https://console.groq.com/docs/model/openai/gpt-oss-120b`, and
+`https://console.groq.com/docs/model/openai/gpt-oss-20b`.
+
+The full affected provider/registry/readiness/CLI/loop gate passes **389
+tests**. Ruff, targeted Mypy, and `git diff --check` are green.
+
+P1 remains open. Explicitly remaining: the P1A enterprise-route decision, P1B
+same-provider credential/account resilience, supported local-runtime lifecycle
+and real Ollama/LM Studio/vLLM conformance, and adapter-level
+cancellation/stream-cleanup verification.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product

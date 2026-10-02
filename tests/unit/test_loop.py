@@ -6223,6 +6223,23 @@ def test_deepseek_time_tiered_pricing_is_unknown_without_user_override(
     assert loop._active_model_pricing() == {}
 
 
+def test_groq_gpt_oss_default_pricing_includes_cached_input_discount() -> None:
+    assert DEFAULT_MODEL_PRICING_USD_PER_MILLION[
+        "groq/openai/gpt-oss-120b"
+    ] == {
+        "input": 0.15,
+        "output": 0.60,
+        "cache_read": 0.075,
+    }
+    assert DEFAULT_MODEL_PRICING_USD_PER_MILLION[
+        "groq/openai/gpt-oss-20b"
+    ] == {
+        "input": 0.075,
+        "output": 0.30,
+        "cache_read": 0.037,
+    }
+
+
 @pytest.mark.asyncio
 async def test_default_pricing_applies_without_user_config(tmp_path):
     """Known model IDs get real costs without manual pricing config."""

@@ -19,6 +19,7 @@ from ash.providers.messages import CanonicalToolCall, MessageInput
 from ash.providers.openai import (
     _owned_openai_http_client,
     account_openai_compatible_stream_bytes,
+    openai_compatible_cache_read_tokens,
     openai_compatible_reasoning_delta,
     prepare_openai_messages,
 )
@@ -31,14 +32,6 @@ from ash.providers.readiness import (
     redact_provider_error,
     require_secure_provider_transport,
 )
-
-
-def _cache_read_tokens(usage: Any) -> int:
-    details = getattr(usage, "prompt_tokens_details", None)
-    cached = getattr(details, "cached_tokens", None)
-    if cached is None:
-        cached = getattr(usage, "prompt_cache_hit_tokens", 0)
-    return cached if isinstance(cached, int) and not isinstance(cached, bool) else 0
 
 
 class DeepSeekProvider(ProviderABC):
@@ -179,7 +172,7 @@ class DeepSeekProvider(ProviderABC):
                         completion_tokens=(
                             getattr(usage, "completion_tokens", 0) or 0
                         ),
-                        cache_read_tokens=_cache_read_tokens(usage),
+                        cache_read_tokens=openai_compatible_cache_read_tokens(usage),
                         usage_source="provider",
                     )
                 continue
@@ -231,7 +224,7 @@ class DeepSeekProvider(ProviderABC):
                 if usage is not None:
                     prompt_tokens = usage.prompt_tokens or 0
                     completion_tokens = usage.completion_tokens or 0
-                    cache_read_tokens = _cache_read_tokens(usage)
+                    cache_read_tokens = openai_compatible_cache_read_tokens(usage)
                 stop_reason = choice.finish_reason
                 for partial in partials.values():
                     completed.append(CanonicalToolCall.model_validate(partial))

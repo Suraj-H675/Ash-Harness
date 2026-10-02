@@ -13,10 +13,12 @@ import openai  # type: ignore[import-not-found]
 
 from ash.context.tokens import AnthropicTokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.providers.capabilities import ProviderCapabilities, groq_capabilities
 from ash.providers.messages import CanonicalToolCall, MessageInput
 from ash.providers.openai import (
     _owned_openai_http_client,
     account_openai_compatible_stream_bytes,
+    openai_compatible_cache_read_tokens,
     openai_compatible_reasoning_delta,
     prepare_openai_messages,
 )
@@ -32,7 +34,7 @@ class GroqProvider(ProviderABC):
 
     def __init__(
         self,
-        model_name: str = "llama-3.3-70b-versatile",
+        model_name: str = "openai/gpt-oss-120b",
         api_key: str = "",
         *,
         base_url: str | None = None,
@@ -51,10 +53,49 @@ class GroqProvider(ProviderABC):
         require_secure_provider_transport(self._base_url, provider="groq")
         self._token_counter = token_counter or AnthropicTokenCounter()
         self._client: Any | None = None
+        self._dynamic_capabilities: ProviderCapabilities | None = None
 
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return self._dynamic_capabilities or groq_capabilities(self._model_name)
+
+    async def detect_capabilities(
+        self,
+        *,
+        refresh: bool = False,
+    ) -> ProviderCapabilities:
+        if self._dynamic_capabilities is not None and not refresh:
+            return self._dynamic_capabilities
+
+        baseline = groq_capabilities(self._model_name)
+        try:
+            model = await self._resolve_client().models.retrieve(self._model_name)
+        except Exception as exc:  # noqa: BLE001
+            self._dynamic_capabilities = None
+            detail = redact_provider_error(str(exc), self._api_key)
+            raise RuntimeError(f"Groq model metadata error: {detail}") from exc
+
+        active = _model_field(model, "active")
+        if active is False:
+            self._dynamic_capabilities = ProviderCapabilities()
+            return self._dynamic_capabilities
+
+        context_window = _positive_int(_model_field(model, "context_window"))
+        max_output_tokens = _positive_int(
+            _model_field(model, "max_completion_tokens")
+        )
+        self._dynamic_capabilities = ProviderCapabilities(
+            native_tools=baseline.native_tools,
+            vision=baseline.vision,
+            reasoning=baseline.reasoning,
+            context_window=context_window or baseline.context_window,
+            max_output_tokens=max_output_tokens or baseline.max_output_tokens,
+        )
+        return self._dynamic_capabilities
 
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
@@ -89,7 +130,7 @@ class GroqProvider(ProviderABC):
         if tools:
             kwargs["tools"] = tools
         if hasattr(self, "_max_tokens"):
-            kwargs["max_tokens"] = self._max_tokens
+            kwargs["max_completion_tokens"] = self._max_tokens
         try:
             client = self._resolve_client()
             stream = await client.chat.completions.create(**kwargs)
@@ -114,6 +155,7 @@ class GroqProvider(ProviderABC):
                         completion_tokens=(
                             getattr(usage, "completion_tokens", 0) or 0
                         ),
+                        cache_read_tokens=openai_compatible_cache_read_tokens(usage),
                         usage_source="provider",
                     )
                 continue
@@ -135,6 +177,7 @@ class GroqProvider(ProviderABC):
             is_done = choice.finish_reason is not None
             prompt_tokens = 0
             completion_tokens = 0
+            cache_read_tokens = 0
             stop_reason = None
 
             if hasattr(delta, "tool_calls") and delta.tool_calls:
@@ -164,6 +207,7 @@ class GroqProvider(ProviderABC):
                 if usage is not None:
                     prompt_tokens = usage.prompt_tokens or 0
                     completion_tokens = usage.completion_tokens or 0
+                    cache_read_tokens = openai_compatible_cache_read_tokens(usage)
                 stop_reason = choice.finish_reason
                 for partial in partials.values():
                     completed.append(CanonicalToolCall.model_validate(partial))
@@ -175,6 +219,7 @@ class GroqProvider(ProviderABC):
                 model=self._model_name,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                cache_read_tokens=cache_read_tokens,
                 usage_source=(
                     "provider"
                     if is_done and usage is not None
@@ -198,3 +243,19 @@ class GroqProvider(ProviderABC):
             await client.close()
             if self._client is client:
                 self._client = None
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _model_field(model: Any, name: str) -> Any:
+    value = getattr(model, name, None)
+    if value is not None:
+        return value
+    extra = getattr(model, "model_extra", None)
+    if isinstance(extra, dict):
+        return extra.get(name)
+    return None
