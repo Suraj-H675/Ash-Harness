@@ -1792,9 +1792,24 @@ async def test_runtime_event_observer_receives_content_free_projection(tmp_path)
             "usage": {"prompt_tokens": 100},
         }
     )
+    loop._emit_event(
+        {
+            "type": "model.request.error",
+            "provider": "openai",
+            "model": "gpt-test",
+            "attempt": 1,
+            "status_code": 429,
+            "retriable": True,
+            "failure_category": "rate_limit",
+            "credential_profile": "OPENAI_BACKUP",
+            "credential_pool_size": 2,
+            "api_key": "SECRET-API-KEY",
+            "error": "SECRET-PROVIDER-ERROR",
+        }
+    )
 
-    assert len(observer.events) == 2
-    tool_event, turn_event = observer.events
+    assert len(observer.events) == 3
+    tool_event, turn_event, provider_event = observer.events
     assert tool_event["type"] == "tool.completed"
     assert tool_event["tool"] == "browser_type"
     assert tool_event["success"] is False
@@ -1806,6 +1821,11 @@ async def test_runtime_event_observer_receives_content_free_projection(tmp_path)
     assert turn_event["type"] == "turn.completed"
     assert "response" not in turn_event
     assert "usage" not in turn_event
+    assert provider_event["failure_category"] == "rate_limit"
+    assert provider_event["credential_profile"] == "OPENAI_BACKUP"
+    assert provider_event["credential_pool_size"] == 2
+    assert "api_key" not in provider_event
+    assert "error" not in provider_event
     assert "SECRET-" not in repr(observer.events)
 
     await loop.aclose()
@@ -7210,6 +7230,121 @@ async def test_provider_does_not_retry_permanent_or_partial_failure(tmp_path):
     with pytest.raises(ConnectionError, match="stream disconnected"):
         await partial_loop._stream_one_completion([])
     assert partial.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_does_not_retry_after_reasoning_only_output(tmp_path) -> None:
+    class ReasoningProvider(ProviderABC):
+        model_name = "reasoning-partial"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            self.calls += 1
+            yield StreamChunk(
+                reasoning=[{"type": "thinking", "thinking": "partial"}],
+            )
+            raise ConnectionError("stream disconnected after reasoning")
+
+    provider = ReasoningProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "reasoning-partial.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="openai/test",
+            provider_max_attempts=3,
+            provider_retry_base_delay=0,
+        ),
+    )
+
+    with pytest.raises(
+        ConnectionError,
+        match="stream disconnected after reasoning",
+    ):
+        await loop._stream_one_completion([])
+
+    assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_credential_rotation_is_one_model_attempt_with_profile_telemetry(
+    tmp_path,
+) -> None:
+    from ash.providers.credential_pool import CredentialPoolProvider
+
+    class APIError(RuntimeError):
+        status_code = 401
+
+    class CredentialProvider(ProviderABC):
+        provider_family = "openai"
+        model_name = "gpt-test"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self, *, fail: bool) -> None:
+            self.fail = fail
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            self.calls += 1
+            if self.fail:
+                raise APIError("invalid key")
+            yield StreamChunk(content="recovered")
+            yield StreamChunk(is_done=True, stop_reason="stop")
+
+    primary = CredentialProvider(fail=True)
+    backup = CredentialProvider(fail=False)
+    provider = CredentialPoolProvider(
+        [primary, backup],
+        ["OPENAI_PRIMARY", "OPENAI_BACKUP"],
+    )
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "credential-rotation-events.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+        config=AshConfig(
+            model="openai/gpt-test",
+            provider_max_attempts=3,
+            provider_retry_base_delay=0,
+        ),
+    )
+
+    outcome = await loop._stream_one_completion([])
+
+    assert outcome.text == "recovered"
+    assert primary.calls == 1
+    assert backup.calls == 1
+    started = next(
+        event for event in ui.events if event["type"] == "model.request.started"
+    )
+    completed = next(
+        event for event in ui.events if event["type"] == "model.request.completed"
+    )
+    assert started["attempt"] == 1
+    assert started["credential_profile"] == "OPENAI_PRIMARY"
+    assert started["credential_pool_size"] == 2
+    assert completed["attempt"] == 1
+    assert completed["credential_profile"] == "OPENAI_BACKUP"
+    assert completed["credential_pool_size"] == 2
+    assert not any(
+        event["type"] == "provider.retrying"
+        for event in ui.events
+    )
+    assert loop._provider_circuit_key == "openai/gpt-test"
 
 
 @pytest.mark.asyncio

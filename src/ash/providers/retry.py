@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from enum import Enum
 from typing import Any
 
 
@@ -20,12 +21,22 @@ NON_RETRYABLE_RATE_LIMIT_MARKERS = (
 MAX_PROVIDER_CIRCUIT_STATES = 256
 
 
+class ProviderFailureCategory(str, Enum):
+    AUTH = "auth"
+    BILLING = "billing"
+    RATE_LIMIT = "rate_limit"
+    TRANSIENT = "transient"
+    REQUEST = "request"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class ProviderFailure:
     message: str
     retriable: bool
     status_code: int | None = None
     retry_after: float | None = None
+    category: ProviderFailureCategory = ProviderFailureCategory.UNKNOWN
 
 
 class ProviderHTTPError(RuntimeError):
@@ -160,7 +171,33 @@ def classify_provider_failure(error: BaseException) -> ProviderFailure:
     )
     if explicit_retriable is not None:
         retriable = explicit_retriable
-    return ProviderFailure(message, retriable, status_code, retry_after)
+    if status_code in {401, 403}:
+        category = ProviderFailureCategory.AUTH
+    elif status_code == 402 or (
+        status_code == 429
+        and any(marker in lowered for marker in NON_RETRYABLE_RATE_LIMIT_MARKERS)
+    ):
+        category = ProviderFailureCategory.BILLING
+    elif status_code == 429 or "rate_limit" in lowered:
+        category = ProviderFailureCategory.RATE_LIMIT
+    elif (
+        connection_failure
+        or (status_code is not None and status_code >= 500)
+        or status_code in {408, 409, 425}
+        or "timeout" in lowered
+    ):
+        category = ProviderFailureCategory.TRANSIENT
+    elif status_code in {400, 404, 405, 410, 413, 415, 422}:
+        category = ProviderFailureCategory.REQUEST
+    else:
+        category = ProviderFailureCategory.UNKNOWN
+    return ProviderFailure(
+        message,
+        retriable,
+        status_code,
+        retry_after,
+        category,
+    )
 
 
 def retry_delay(
@@ -204,6 +241,12 @@ def _status_code(error: BaseException) -> int | None:
 
 
 def _retry_after_seconds(error: BaseException) -> float | None:
+    direct = getattr(error, "retry_after", None)
+    if direct is not None:
+        try:
+            return max(0.0, float(direct))
+        except (TypeError, ValueError, OverflowError):
+            pass
     response = getattr(error, "response", None)
     headers: Any = getattr(response, "headers", None) or getattr(error, "headers", None)
     if headers is None:

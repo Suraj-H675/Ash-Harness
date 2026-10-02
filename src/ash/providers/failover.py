@@ -15,6 +15,7 @@ from ash.providers.base import (
     ProviderTerminalError,
     StreamChunk,
     completion_stop_category,
+    stream_chunk_commits_provider,
 )
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.messages import MessageInput
@@ -130,7 +131,7 @@ class FailoverProvider(ProviderABC):
                 async for chunk in provider.stream_chat(
                     messages, temperature=temperature, tools=tools
                 ):
-                    has_output = _chunk_commits_provider(chunk)
+                    has_output = stream_chunk_commits_provider(chunk)
                     if (
                         chunk.is_done
                         and completion_stop_category(chunk.stop_reason)
@@ -197,16 +198,3 @@ class FailoverProvider(ProviderABC):
             raise RuntimeError(
                 f"failed to close {len(failures)} failover provider(s)"
             ) from failures[0]
-
-
-def _chunk_commits_provider(chunk: StreamChunk) -> bool:
-    """Return whether this chunk exposes model output/state that forbids replay."""
-
-    return bool(
-        chunk.content
-        or chunk.tool_call_delta
-        or chunk.native_tool_calls
-        or chunk.reasoning
-        or chunk.reasoning_blocks
-        or chunk.provider_state
-    )

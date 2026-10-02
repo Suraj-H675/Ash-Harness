@@ -1538,6 +1538,22 @@ def test_explain_config_reports_sources_and_masks_secrets(
     assert entries["custom_providers"].value["local"]["api_key"] == "loca...alue"
 
 
+def test_explain_config_shows_credential_env_references_not_secret_values() -> None:
+    from ash.commands import config as cli_config
+    from ash.config import AshConfig
+
+    config = AshConfig(
+        provider_api_key_envs={
+            "openai": ["OPENAI_PRIMARY", "OPENAI_BACKUP"],
+        }
+    )
+    entries = {entry.field: entry for entry in cli_config.explain_config(config)}
+
+    assert entries["provider_api_key_envs"].value == {
+        "openai": ["OPENAI_PRIMARY", "OPENAI_BACKUP"],
+    }
+
+
 def test_render_config_explain_json_is_machine_readable() -> None:
     from ash.commands.config import ConfigExplanation, render_config_explain
 

@@ -35,6 +35,8 @@ MAX_DOTENV_FILE_BYTES = 1024 * 1024
 MAX_PLUGIN_MARKETPLACES = 32
 MAX_PLUGIN_MARKETPLACE_SOURCE_CHARS = 4096
 MAX_FALLBACK_MODELS = 16
+MAX_PROVIDER_CREDENTIAL_PROVIDERS = 32
+MAX_PROVIDER_CREDENTIAL_ENVS = 8
 
 _INITIAL_USER_CONFIG_PATH = Path.home() / ".ash" / "ash.toml"
 _INITIAL_DOTENV_PATH = Path.home() / ".ash" / ".env"
@@ -904,6 +906,13 @@ class AshConfig(BaseSettings):
         default_factory=dict,
         description="Custom OpenAI-compatible providers with base URL, key env name, and models.",
     )
+    provider_api_key_envs: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "User-owned ordered API-key environment references per provider. "
+            "Raw credentials are never stored in this setting."
+        ),
+    )
     vertex_project: str = Field(
         "",
         max_length=128,
@@ -1102,6 +1111,64 @@ class AshConfig(BaseSettings):
         normalized = value.strip().casefold()
         if normalized not in {"api_key", "chatgpt"}:
             raise ValueError("openai_auth_mode must be api_key or chatgpt")
+        return normalized
+
+    @field_validator("provider_api_key_envs", mode="before")
+    @classmethod
+    def validate_provider_api_key_envs(cls, value: Any) -> dict[str, list[str]]:
+        from ash.providers.identifiers import PROVIDER_NAME
+
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                "provider_api_key_envs must map provider names to environment lists"
+            )
+        if len(value) > MAX_PROVIDER_CREDENTIAL_PROVIDERS:
+            raise ValueError(
+                "provider_api_key_envs contains too many provider entries"
+            )
+        normalized: dict[str, list[str]] = {}
+        for raw_provider, raw_envs in value.items():
+            provider = str(raw_provider).strip().casefold()
+            if PROVIDER_NAME.fullmatch(provider) is None:
+                raise ValueError(
+                    "provider_api_key_envs keys must be provider identifiers"
+                )
+            if not isinstance(raw_envs, (list, tuple)):
+                raise ValueError(
+                    f"provider_api_key_envs.{provider} must be a list"
+                )
+            if not raw_envs or len(raw_envs) > MAX_PROVIDER_CREDENTIAL_ENVS:
+                raise ValueError(
+                    f"provider_api_key_envs.{provider} must contain between 1 and "
+                    f"{MAX_PROVIDER_CREDENTIAL_ENVS} environment names"
+                )
+            envs: list[str] = []
+            for raw_name in raw_envs:
+                if not isinstance(raw_name, str):
+                    raise ValueError(
+                        f"provider_api_key_envs.{provider} entries must be strings"
+                    )
+                name = raw_name.strip()
+                first = name[:1]
+                if len(name) > 128 or not name or not (
+                    first.isascii() and (first.isalpha() or first == "_")
+                ):
+                    raise ValueError(
+                        "provider_api_key_envs entries must be environment variable names"
+                    )
+                if not all(
+                    character.isascii()
+                    and (character.isalnum() or character == "_")
+                    for character in name
+                ):
+                    raise ValueError(
+                        "provider_api_key_envs entries must be environment variable names"
+                    )
+                if name not in envs:
+                    envs.append(name)
+            normalized[provider] = envs
         return normalized
 
     @field_validator("azure_auth_mode")

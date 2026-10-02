@@ -139,6 +139,31 @@ The two Azure auth modes are isolated when Ash rebuilds providers in subprocess
 workers so stale API keys are not forwarded into Entra runs and Entra identity
 material is not forwarded into API-key runs.
 
+API-key providers can also use ordered same-provider credential rotation without
+storing raw keys in Ash config or SQLite. Configure only environment-variable
+references in the user-owned Ash TOML:
+
+    [provider_api_key_envs]
+    openai = ["OPENAI_PRIMARY", "OPENAI_BACKUP"]
+    openrouter = ["OPENROUTER_WORK", "OPENROUTER_BACKUP"]
+
+Set those variables in the process environment or the active Ash profile's
+private dotenv file. Every referenced variable must be present and non-empty
+before runtime construction. Ash tries them in order, keeps the most recently
+successful credential sticky for later requests, and rotates only before any
+retained model output/state on authentication failures, billing/quota
+exhaustion, or rate limits. Rate-limit cooldowns honor bounded Retry-After
+hints. Request-shape errors and transient network/server failures do not change
+credentials; they remain owned by Ash's normal request-retry path. Cross-model
+fallback happens only after the same-provider credential route cannot proceed.
+
+Credential-pool state is session-local and secret-free: ash config explain can
+show the configured environment references, and observability records only the
+active reference name/count and failure category. Credential values are never
+written to TOML, SQLite, runtime events, or telemetry. Switching provider
+accounts may also reset provider-side prompt-cache or routing affinity, so a
+rotation can change latency or cost even when the model ID stays the same.
+
 OpenAI additionally supports optional **Sign in with ChatGPT** for eligible
 ChatGPT plans. Run `ash auth chatgpt login` to register/sign in, inspect saved
 registrations with `ash auth chatgpt accounts`, switch with

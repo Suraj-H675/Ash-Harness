@@ -297,3 +297,16 @@ class ProviderABC(ABC):
         if isinstance(declared, ProviderCapabilities):
             return declared
         return infer_capabilities(self.provider_family, self.model_name)
+
+
+def stream_chunk_commits_provider(chunk: StreamChunk) -> bool:
+    """Return whether a chunk exposes retained model output/state."""
+
+    return bool(
+        chunk.content
+        or chunk.tool_call_delta
+        or chunk.native_tool_calls
+        or chunk.reasoning
+        or chunk.reasoning_blocks
+        or chunk.provider_state
+    )

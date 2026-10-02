@@ -286,6 +286,15 @@ class OpenTelemetryEventObserver:
                     ),
                     "ash.model.tool_count": self._safe_int(event.get("tool_count")),
                 }
+                credential_profile = self._safe_string(
+                    event.get("credential_profile"),
+                    maximum=128,
+                )
+                if credential_profile:
+                    attributes["ash.provider.credential_profile"] = credential_profile
+                    attributes["ash.provider.credential_pool_size"] = self._safe_int(
+                        event.get("credential_pool_size")
+                    )
                 span = self._tracer.start_span(
                     f"chat {model or 'model'}",
                     context=self._parent_context(turn_id),
@@ -326,6 +335,20 @@ class OpenTelemetryEventObserver:
                 retry_attributes: dict[str, Any] = {}
                 if isinstance(status_code, int) and not isinstance(status_code, bool):
                     retry_attributes["http.response.status_code"] = status_code
+                failure_category = self._safe_string(
+                    event.get("failure_category"),
+                    maximum=32,
+                )
+                if failure_category:
+                    retry_attributes["ash.provider.failure_category"] = failure_category
+                credential_profile = self._safe_string(
+                    event.get("credential_profile"),
+                    maximum=128,
+                )
+                if credential_profile:
+                    retry_attributes["ash.provider.credential_profile"] = (
+                        credential_profile
+                    )
                 self._provider_retries.add(1, attributes=retry_attributes)
                 return
 
@@ -372,21 +395,48 @@ class OpenTelemetryEventObserver:
         }[event_type]
         provider = _gen_ai_provider_name(self._safe_string(event.get("provider")))
         model = self._safe_string(event.get("model")) or "unknown"
-        attrs = {
+        attrs: dict[str, Any] = {
             "outcome": outcome,
             "gen_ai.provider.name": provider,
             "gen_ai.request.model": model,
         }
+        credential_profile = self._safe_string(
+            event.get("credential_profile"),
+            maximum=128,
+        )
+        if credential_profile:
+            attrs["ash.provider.credential_profile"] = credential_profile
+            attrs["ash.provider.credential_pool_size"] = self._safe_int(
+                event.get("credential_pool_size")
+            )
         self._model_requests.add(1, attributes=attrs)
         state = self._model_spans.pop(operation_id, None)
         if state is not None:
             state.span.set_attribute("ash.outcome", outcome)
             state.span.set_attribute("gen_ai.provider.name", provider or "custom")
             state.span.set_attribute("gen_ai.response.model", model)
+            if credential_profile:
+                state.span.set_attribute(
+                    "ash.provider.credential_profile",
+                    credential_profile,
+                )
+                state.span.set_attribute(
+                    "ash.provider.credential_pool_size",
+                    self._safe_int(event.get("credential_pool_size")),
+                )
             if outcome == "error":
                 error_type = self._safe_string(event.get("error_type"), maximum=256)
                 if error_type:
                     state.span.set_attribute("error.type", error_type)
+                failure_category = self._safe_string(
+                    event.get("failure_category"),
+                    maximum=32,
+                )
+                if failure_category:
+                    state.span.set_attribute(
+                        "ash.provider.failure_category",
+                        failure_category,
+                    )
                 state.span.set_status(self._trace.Status(self._trace.StatusCode.ERROR))
             elif outcome == "cancelled":
                 state.span.set_attribute("ash.cancelled", True)

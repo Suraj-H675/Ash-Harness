@@ -103,6 +103,50 @@ treated as anonymous.
 These custom-provider auth modes are separate from the first-party OpenAI
 `openai_auth_mode`; ChatGPT-plan tokens are never reused for custom endpoints.
 
+## Same-provider API-key credential pools
+
+Ash supports ordered API-key credential pools for Ash-owned built-in API-key
+routes and configured custom bearer routes. The user config stores only
+environment-variable references under provider_api_key_envs; raw keys remain
+in the process environment or the active Ash profile's private dotenv file.
+Project config cannot define or reorder these references.
+
+    [provider_api_key_envs]
+    openai = ["OPENAI_PRIMARY", "OPENAI_BACKUP"]
+
+All referenced variables are validated before any child provider is built.
+When a pool is active, isolated workers receive the referenced credential
+variables instead of the provider's default/stale API-key variable. Azure
+API-key pools likewise do not inherit Entra identity material; cloud-identity
+routes such as Vertex ADC, Bedrock AWS credentials, Azure Entra, Ollama, and
+OpenAI ChatGPT-plan auth are intentionally outside this API-key pool.
+
+Within one provider/model route, Ash prefers the most recently successful
+credential. Before retained model output/state, HTTP 401/403 failures, explicit
+billing/quota exhaustion, and rate limits can place that credential on a
+bounded session-local cooldown and advance to the next ordered credential.
+Rate-limit cooldowns honor bounded Retry-After values. Bad requests, model/
+context/format errors, connection failures, and ordinary 5xx responses do not
+rotate credentials; those remain subject to the normal request retry and
+cross-model failover layers. Once text, tool output, reasoning, reasoning
+blocks, or provider replay state has been exposed, neither credential rotation
+nor outer provider retry/failover may replay the request.
+
+The same rule applies during dynamic capability detection so an unusable
+primary credential does not prevent session startup when another configured
+credential can verify the same model. If every credential is cooling down,
+the pool exposes the earliest bounded retry interval to the existing retry/
+failover layer instead of busy-looping. Pool snapshots and OpenTelemetry use
+only the validated environment-reference name, pool size, cooldown reason, and
+failure category; key values never cross those diagnostic boundaries.
+
+Credential changes can invalidate provider-side cache/account/routing affinity.
+Ash therefore does not promise identical prompt-cache hit rates, latency, or
+billing behavior after rotation even though the selected provider/model route
+is unchanged. External process-backed dynamic credential helpers remain a
+separate P1B capability rather than being approximated by storing command
+strings in this first pool implementation.
+
 Wire compatibility does not imply model capability. Custom routes therefore
 fail closed for native tools, vision, and reasoning unless the user declares
 capabilities for the exact model. Optional limits are positive integers:

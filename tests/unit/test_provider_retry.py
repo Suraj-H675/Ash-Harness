@@ -9,6 +9,7 @@ from ash.providers.retry import (
     ProviderCircuitBreaker,
     ProviderCircuitOpen,
     ProviderFailure,
+    ProviderFailureCategory,
     classify_provider_failure,
     retry_delay,
 )
@@ -36,6 +37,45 @@ def test_quota_exhaustion_is_not_retried() -> None:
         APIError("You exceeded your current quota; check billing", 429)
     )
     assert failure.retriable is False
+    assert failure.category is ProviderFailureCategory.BILLING
+
+
+def test_billing_word_on_bad_request_does_not_rotate_credentials() -> None:
+    failure = classify_provider_failure(
+        APIError("invalid billing address field", 400)
+    )
+
+    assert failure.category is ProviderFailureCategory.REQUEST
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_failures_are_categorized(status: int) -> None:
+    failure = classify_provider_failure(APIError("invalid credential", status))
+
+    assert failure.category is ProviderFailureCategory.AUTH
+
+
+def test_rate_limit_failure_is_categorized() -> None:
+    failure = classify_provider_failure(
+        APIError("too many requests", 429, {"retry-after": "7"})
+    )
+
+    assert failure.category is ProviderFailureCategory.RATE_LIMIT
+    assert failure.retry_after == 7.0
+
+
+@pytest.mark.parametrize("status", [500, 503])
+def test_server_failures_are_transient(status: int) -> None:
+    failure = classify_provider_failure(APIError("overloaded", status))
+
+    assert failure.category is ProviderFailureCategory.TRANSIENT
+
+
+@pytest.mark.parametrize("status", [400, 404, 422])
+def test_request_failures_do_not_rotate_credentials(status: int) -> None:
+    failure = classify_provider_failure(APIError("invalid request", status))
+
+    assert failure.category is ProviderFailureCategory.REQUEST
 
 
 def test_wrapped_connection_and_status_errors_are_classified() -> None:
@@ -88,6 +128,17 @@ def test_retry_delay_prefers_header_and_caps_backoff(monkeypatch) -> None:
         )
         == 5.0
     )
+
+
+def test_classifier_accepts_direct_retry_after_hint() -> None:
+    class CoolingDown(RuntimeError):
+        status_code = 429
+        retry_after = 12.5
+
+    failure = classify_provider_failure(CoolingDown("all credentials cooling down"))
+
+    assert failure.category is ProviderFailureCategory.RATE_LIMIT
+    assert failure.retry_after == 12.5
 
 
 def test_provider_circuit_opens_cools_down_and_resets() -> None:

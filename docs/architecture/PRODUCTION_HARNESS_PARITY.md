@@ -476,17 +476,79 @@ verification are green. The built wheel publishes the azure extra with
 azure-core[aio], azure-identity, and the compatible OpenAI range while keeping
 those dependencies out of the base install.
 
-P1B remains open. The explicit remaining work is same-provider credential
-profiles and rotation: user-owned credential-source references, successful
-profile stickiness, bounded cooldowns, Retry-After-aware health, and rotation
-only for classified pre-output credential/rate-limit/quota failures before
-cross-model failover. Existing ChatGPT multi-account auth remains intact and
-unsupported private subscription credentials will not be borrowed.
+P1B remains open here for the dynamic external-credential-helper portion of the
+gate. The following slice implements ordered user-owned API-key references,
+stickiness, bounded cooldowns, Retry-After-aware health, and classified
+pre-output rotation before cross-model failover. Existing ChatGPT multi-account
+auth remains intact and unsupported private subscription credentials will not
+be borrowed.
 
 Evidence was rechecked against Microsoft first-party Azure v1 documentation on
 2026-10-02:
 https://learn.microsoft.com/en-us/azure/ai-foundry/openai/api-version-lifecycle
 https://learn.microsoft.com/en-us/azure/ai-services/reference/sdk-package-resources
+
+### P1 progress — same-provider API-key resilience slice 8
+
+P1B now has a production-grade static credential-rotation layer for API-key
+routes without turning Ash into a second secret vault. User-owned
+provider_api_key_envs stores only an ordered list of environment-variable
+references for a provider. References are bounded, validated, deduplicated,
+excluded from project config, and all must resolve before any child provider is
+constructed. Raw key values remain in the process environment or private Ash
+profile dotenv and are not written to TOML, SQLite, session history, runtime
+events, or telemetry.
+
+The registry nests a CredentialPoolProvider inside each model route and leaves
+the existing FailoverProvider outside it. That gives the intended ordering:
+same-provider credential recovery first, then model/provider fallback. The
+public ProviderRegistry factory contract remains unchanged, so third-party
+registrations are not silently opted into credential semantics they did not
+declare.
+
+The pool uses one shared provider-neutral failure classifier with the core
+retry loop. Authentication failures (401/403), explicit billing/quota failures
+and rate limits can rotate credentials only before retained model output/state.
+Successful credentials become sticky. Authentication, billing and default
+rate-limit cooldowns are bounded and session-local; provider Retry-After hints
+are honored up to the safety ceiling. Request/format/model errors and ordinary
+transient network/server failures do not rotate credentials and continue
+through Ash's established retry/failover policy. If every credential is
+cooling down, the pool emits a bounded retry hint instead of polling.
+
+Replay safety is now consistent across all automatic recovery layers:
+CredentialPoolProvider, FailoverProvider and the core request retry loop all
+use the same retained-output/state commit predicate covering text, XML/native
+tool output, reasoning, reasoning blocks and provider replay state. Metadata/
+usage-only chunks remain safe to abandon before a retry.
+
+Subprocess isolation is least-privilege for pools: only explicitly referenced
+credential variables cross the worker boundary, while stale provider defaults
+and unrelated secrets are omitted. Azure API-key pools additionally exclude
+Entra identity variables. Secret-free request events and OpenTelemetry expose
+only the active reference name, pool size and failure category. ash config
+explain shows the validated reference names while continuing to mask actual
+secret-bearing config fields.
+
+The complete affected provider/runtime/config/CLI/observability gate passes
+**859 tests**; focused credential/security/telemetry checks are also green with
+Ruff and targeted Mypy. No
+dependency or config-schema migration is required for this additive user-owned
+field.
+
+P1B remains open for one deliberately separate capability: a bounded external
+credential helper for short-lived/vault/SSO-generated API keys. Current
+comparator evidence still shows this is materially useful: OpenClaw resolves
+named auth/secret references and rotates profiles before model fallback, while
+Claude Code supports apiKeyHelper for externally generated credentials. Ash
+will not fake this with arbitrary shell strings inside provider config; the
+helper needs an explicit execution, timeout, output, environment, caching and
+secret-redaction boundary before P1B can close.
+
+Current comparator references rechecked on 2026-10-02:
+https://docs.openclaw.ai/models
+https://docs.openclaw.ai/gateway/config-secrets-env
+https://code.claude.com/docs/en/settings
 
 ### M4 product decisions
 

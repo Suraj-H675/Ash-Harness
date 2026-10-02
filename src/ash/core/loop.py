@@ -83,6 +83,7 @@ from ash.providers.base import (
     ProviderTerminalError,
     TokenCounterLike,
     completion_stop_category,
+    stream_chunk_commits_provider,
 )
 from ash.providers.failover import FailoverProvider
 from ash.providers.capabilities import ProviderCapabilities
@@ -250,6 +251,8 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "message_count",
             "tool_count",
             "native_tools",
+            "credential_profile",
+            "credential_pool_size",
         }
     ),
     "model.request.completed": frozenset(
@@ -263,6 +266,8 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "cache_write_tokens",
             "usage_source",
             "stop_category",
+            "credential_profile",
+            "credential_pool_size",
         }
     ),
     "model.request.error": frozenset(
@@ -272,13 +277,32 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "attempt",
             "status_code",
             "retriable",
+            "failure_category",
             "emitted_output",
             "error_type",
+            "credential_profile",
+            "credential_pool_size",
         }
     ),
-    "model.request.cancelled": frozenset({"provider", "model", "attempt"}),
+    "model.request.cancelled": frozenset(
+        {
+            "provider",
+            "model",
+            "attempt",
+            "credential_profile",
+            "credential_pool_size",
+        }
+    ),
     "provider.retrying": frozenset(
-        {"attempt", "max_attempts", "delay_seconds", "status_code"}
+        {
+            "attempt",
+            "max_attempts",
+            "delay_seconds",
+            "status_code",
+            "failure_category",
+            "credential_profile",
+            "credential_pool_size",
+        }
     ),
     "provider.circuit_opened": frozenset(
         {"provider", "failures", "cooldown_seconds"}
@@ -714,7 +738,7 @@ def _validate_turn_metadata(
 
 def _provider_circuit_key(provider: ProviderABC) -> str:
     nested = getattr(provider, "providers", None)
-    if isinstance(nested, list) and nested:
+    if isinstance(provider, FailoverProvider) and isinstance(nested, list) and nested:
         identities = [
             f"{getattr(item, 'provider_family', 'custom')}/{item.model_name}"
             for item in nested
@@ -749,13 +773,59 @@ def _provider_request_identity(
     nested = getattr(provider, "providers", None)
     request_provider = (
         nested[0]
-        if isinstance(nested, list) and nested
+        if isinstance(provider, FailoverProvider)
+        and isinstance(nested, list)
+        and nested
         else provider
     )
     family = str(
         getattr(request_provider, "provider_family", "custom") or "custom"
     )
     return family, _provider_model_id(request_provider, configured_model)
+
+
+def _provider_credential_context(
+    provider: ProviderABC,
+) -> tuple[str | None, int]:
+    """Return the active secret-free credential profile ID and pool size."""
+
+    current: ProviderABC = provider
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        active_profile = getattr(current, "active_profile", None)
+        profile_ids = getattr(current, "profile_ids", None)
+        if (
+            isinstance(active_profile, str)
+            and active_profile
+            and isinstance(profile_ids, tuple)
+        ):
+            return active_profile, len(profile_ids)
+        nested = getattr(current, "providers", None)
+        if not isinstance(nested, list) or not nested:
+            break
+        index = getattr(current, "active_index", 0)
+        if not isinstance(index, int) or isinstance(index, bool):
+            index = 0
+        if index < 0 or index >= len(nested):
+            index = 0
+        child = nested[index]
+        if not isinstance(child, ProviderABC):
+            break
+        current = child
+    return None, 0
+
+
+def _provider_credential_event_fields(
+    provider: ProviderABC,
+) -> dict[str, str | int]:
+    profile, count = _provider_credential_context(provider)
+    if profile is None:
+        return {}
+    return {
+        "credential_profile": profile,
+        "credential_pool_size": count,
+    }
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness. You are pairing with a developer to write, edit, test, and debug code in the local workspace.
@@ -4253,6 +4323,7 @@ class AshLoop:
                             "message_count": len(canonical_messages),
                             "tool_count": len(openai_tools or ()),
                             "native_tools": native_protocol,
+                            **_provider_credential_event_fields(self.provider),
                         }
                     )
                     try:
@@ -4398,11 +4469,7 @@ class AshLoop:
                                         "terminal chunk"
                                     )
                                 provider_state = [dict(item) for item in chunk.provider_state]
-                            chunk_has_output = bool(
-                                chunk.content
-                                or chunk.tool_call_delta
-                                or chunk.native_tool_calls
-                            )
+                            chunk_has_output = stream_chunk_commits_provider(chunk)
                             if saw_terminal and chunk_has_output:
                                 raise ProviderCompletionError(
                                     "provider emitted output after its terminal chunk"
@@ -4526,8 +4593,10 @@ class AshLoop:
                                 "attempt": attempt,
                                 "status_code": failure.status_code,
                                 "retriable": failure.retriable,
+                                "failure_category": failure.category.value,
                                 "emitted_output": emitted_output,
                                 "error_type": type(exc).__name__,
+                                **_provider_credential_event_fields(self.provider),
                             }
                         )
                         active_request_id = None
@@ -4572,7 +4641,9 @@ class AshLoop:
                                 "max_attempts": maximum_attempts,
                                 "delay_seconds": delay,
                                 "status_code": failure.status_code,
+                                "failure_category": failure.category.value,
                                 "reason": safe_reason,
+                                **_provider_credential_event_fields(self.provider),
                             }
                         )
                         _log.warning(
@@ -4651,6 +4722,7 @@ class AshLoop:
                         "stop_category": completion_stop_category(
                             terminal_stop_reason
                         ).value,
+                        **_provider_credential_event_fields(self.provider),
                     }
                 )
                 active_request_id = None
@@ -4663,6 +4735,7 @@ class AshLoop:
                         "provider": provider_family,
                         "model": self.active_model_id,
                         "attempt": active_request_attempt,
+                        **_provider_credential_event_fields(self.provider),
                     }
                 )
                 active_request_id = None
@@ -4679,8 +4752,10 @@ class AshLoop:
                         "attempt": active_request_attempt,
                         "status_code": failure.status_code,
                         "retriable": failure.retriable,
+                        "failure_category": failure.category.value,
                         "emitted_output": False,
                         "error_type": type(exc).__name__,
+                        **_provider_credential_event_fields(self.provider),
                     }
                 )
                 active_request_id = None

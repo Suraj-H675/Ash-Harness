@@ -7,6 +7,7 @@ import pytest
 
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.credential_pool import CredentialPoolProvider
 from ash.providers.failover import FailoverProvider
 from ash.providers.registry import (
     ProviderRegistry,
@@ -353,6 +354,141 @@ def test_openai_chatgpt_route_builds_without_api_key(
     assert isinstance(provider, OpenAIChatGPTProvider)
     assert provider.model_name == "gpt-test"
     assert provider.provider_family == "openai"
+
+
+def test_openai_api_key_pool_uses_ordered_user_envs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_PRIMARY", "primary-key")
+    monkeypatch.setenv("OPENAI_BACKUP", "backup-key")
+
+    provider = create_default_provider_registry().build(
+        AshConfig(
+            model="openai/gpt-test",
+            provider_api_key_envs={
+                "openai": ["OPENAI_PRIMARY", "OPENAI_BACKUP"],
+            },
+        )
+    )
+
+    assert isinstance(provider, CredentialPoolProvider)
+    assert provider.profile_ids == ("OPENAI_PRIMARY", "OPENAI_BACKUP")
+    assert [item._api_key for item in provider.providers] == [
+        "primary-key",
+        "backup-key",
+    ]
+
+
+def test_credential_pool_is_nested_inside_model_failover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_PRIMARY", "primary-key")
+    monkeypatch.setenv("OPENAI_BACKUP", "backup-key")
+
+    provider = create_default_provider_registry().build(
+        AshConfig(
+            model="openai/model-a",
+            fallback_models=["openai/model-b"],
+            provider_api_key_envs={
+                "openai": ["OPENAI_PRIMARY", "OPENAI_BACKUP"],
+            },
+        )
+    )
+
+    assert isinstance(provider, FailoverProvider)
+    assert all(
+        isinstance(item, CredentialPoolProvider)
+        for item in provider.providers
+    )
+    assert [item.model_name for item in provider.providers] == [
+        "model-a",
+        "model-b",
+    ]
+
+
+def test_credential_pool_rejects_missing_referenced_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_PRIMARY", raising=False)
+
+    with pytest.raises(ValueError, match="OPENAI_PRIMARY.*missing or empty"):
+        create_default_provider_registry().build(
+            AshConfig(
+                model="openai/gpt-test",
+                provider_api_key_envs={"openai": ["OPENAI_PRIMARY"]},
+            )
+        )
+
+
+def test_credential_pool_rejects_non_api_key_auth_modes() -> None:
+    with pytest.raises(ValueError, match="does not support API-key credential pools"):
+        create_default_provider_registry().build(
+            AshConfig(
+                model="openai/gpt-test",
+                openai_auth_mode="chatgpt",
+                provider_api_key_envs={"openai": ["OPENAI_PRIMARY"]},
+            )
+        )
+
+    with pytest.raises(ValueError, match="does not support API-key credential pools"):
+        create_default_provider_registry().build(
+            AshConfig(
+                model="ollama/qwen-test",
+                provider_api_key_envs={"ollama": ["OLLAMA_KEY"]},
+            )
+        )
+
+
+def test_replacing_builtin_factory_revokes_ash_credential_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = create_default_provider_registry()
+    registry.register(
+        "openai",
+        lambda config, model: RegistryProvider(model),
+        replace=True,
+    )
+    monkeypatch.setenv("OPENAI_PRIMARY", "primary-key")
+
+    with pytest.raises(
+        ValueError,
+        match="active provider factory.*does not support.*credential pools",
+    ):
+        registry.build(
+            AshConfig(
+                model="openai/gpt-test",
+                provider_api_key_envs={"openai": ["OPENAI_PRIMARY"]},
+            )
+        )
+
+
+def test_custom_bearer_provider_supports_api_key_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PRIVATE_PRIMARY", "primary-key")
+    monkeypatch.setenv("PRIVATE_BACKUP", "backup-key")
+    provider = create_default_provider_registry().build(
+        AshConfig(
+            model="private/model-a",
+            custom_providers={
+                "private": {
+                    "base_url": "https://gateway.example/v1",
+                    "auth_mode": "bearer",
+                }
+            },
+            provider_api_key_envs={
+                "private": ["PRIVATE_PRIMARY", "PRIVATE_BACKUP"],
+            },
+        )
+    )
+
+    assert isinstance(provider, CredentialPoolProvider)
+    assert provider.provider_family == "private"
+    assert [item._api_key for item in provider.providers] == [
+        "primary-key",
+        "backup-key",
+    ]
 
 
 def test_openai_gpt6_models_are_reasoning_capable() -> None:

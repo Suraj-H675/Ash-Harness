@@ -224,6 +224,8 @@ def test_observer_exports_content_free_correlated_spans_and_metrics() -> None:
             message_count=4,
             tool_count=1,
             native_tools=True,
+            credential_profile="OPENAI_PRIMARY",
+            credential_pool_size=2,
             prompt="SECRET-PROMPT",
         )
     )
@@ -254,6 +256,8 @@ def test_observer_exports_content_free_correlated_spans_and_metrics() -> None:
             completion_tokens=7,
             cache_read_tokens=3,
             cache_write_tokens=2,
+            credential_profile="OPENAI_BACKUP",
+            credential_pool_size=2,
             response="SECRET-RESPONSE",
         )
     )
@@ -273,6 +277,8 @@ def test_observer_exports_content_free_correlated_spans_and_metrics() -> None:
     assert tool.context == ("parent", turn)
     assert model.attributes["gen_ai.provider.name"] == "gcp.gemini"
     assert model.attributes["ash.operation.id"] == "request-1"
+    assert model.attributes["ash.provider.credential_profile"] == "OPENAI_BACKUP"
+    assert model.attributes["ash.provider.credential_pool_size"] == 2
     assert tool.attributes["ash.operation.id"] == "call-1"
     assert all(span.ended for span in spans)
 
@@ -316,6 +322,8 @@ def test_observer_records_error_type_without_error_message() -> None:
             provider="openai",
             model="gpt-test",
             attempt=1,
+            credential_profile="OPENAI_PRIMARY",
+            credential_pool_size=2,
         )
     )
     observer.on_event(
@@ -325,14 +333,49 @@ def test_observer_records_error_type_without_error_message() -> None:
             provider="openai",
             model="gpt-test",
             error_type="TimeoutError",
+            failure_category="transient",
+            credential_profile="OPENAI_BACKUP",
+            credential_pool_size=2,
             error="SECRET provider failure",
         )
     )
 
     model = tracer_provider.tracer.spans[-1]
     assert model.attributes["error.type"] == "TimeoutError"
+    assert model.attributes["ash.provider.failure_category"] == "transient"
+    assert model.attributes["ash.provider.credential_profile"] == "OPENAI_BACKUP"
     assert "SECRET" not in repr(model.attributes)
     assert model.status is not None
+
+
+def test_observer_retry_metric_uses_secret_free_profile_and_category() -> None:
+    tracer_provider = _TracerProvider()
+    meter_provider = _MeterProvider()
+    observer = OpenTelemetryEventObserver(
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+    )
+    observer._trace = _Trace()  # type: ignore[assignment]
+
+    observer.on_event(
+        _event(
+            "provider.retrying",
+            status_code=429,
+            failure_category="rate_limit",
+            credential_profile="OPENAI_BACKUP",
+        )
+    )
+
+    assert meter_provider.meter.instruments["ash.provider.retries"].points == [
+        (
+            1.0,
+            {
+                "http.response.status_code": 429,
+                "ash.provider.failure_category": "rate_limit",
+                "ash.provider.credential_profile": "OPENAI_BACKUP",
+            },
+        )
+    ]
 
 
 def test_goal_step_completion_closes_its_turn_span() -> None:

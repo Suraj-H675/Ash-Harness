@@ -16,13 +16,22 @@ from ash.providers.capabilities import (
     get_capability_registry,
 )
 from ash.providers.identifiers import PROVIDER_NAME, parse_model_string
-from ash.provider_catalog import BUILTIN_PROVIDER_IDS
+from ash.provider_catalog import BUILTIN_PROVIDER_IDS, get_provider_descriptor
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
 
 
 ProviderFactory = Callable[["AshConfig", str], ProviderABC]
+CredentialProviderFactory = Callable[["AshConfig", str, str], ProviderABC]
+
+
+def _credential_builder(factory: Callable[..., ProviderABC]) -> CredentialProviderFactory:
+    return lambda config, model, api_key: factory(
+        config,
+        model,
+        api_key_override=api_key,
+    )
 
 
 class ProviderRegistry:
@@ -30,6 +39,7 @@ class ProviderRegistry:
 
     def __init__(self, capability_registry: CapabilityRegistry | None = None) -> None:
         self._factories: dict[str, ProviderFactory] = {}
+        self._credential_factories: dict[str, CredentialProviderFactory] = {}
         self._capabilities = capability_registry or get_capability_registry()
         self._owned_capability_resolvers: dict[str, CapabilityResolver] = {}
         self._lock = RLock()
@@ -50,6 +60,7 @@ class ProviderRegistry:
         with self._lock:
             if normalized in self._factories and not replace:
                 raise ValueError(f"provider {normalized!r} is already registered")
+            self._credential_factories.pop(normalized, None)
             if capabilities is not None:
                 self._capabilities.register(
                     normalized,
@@ -61,10 +72,26 @@ class ProviderRegistry:
                 self._owned_capability_resolvers[normalized] = capabilities
             self._factories[normalized] = factory
 
+    def _enable_api_key_pool(
+        self,
+        name: str,
+        factory: CredentialProviderFactory,
+    ) -> None:
+        normalized = name.strip().casefold()
+        if not callable(factory):
+            raise TypeError("credential provider factory must be callable")
+        with self._lock:
+            if normalized not in self._factories:
+                raise ValueError(
+                    f"provider {normalized!r} must be registered before enabling pools"
+                )
+            self._credential_factories[normalized] = factory
+
     def unregister(self, name: str) -> bool:
         normalized = name.strip().casefold()
         with self._lock:
             removed = self._factories.pop(normalized, None) is not None
+            self._credential_factories.pop(normalized, None)
             resolver = self._owned_capability_resolvers.pop(normalized, None)
             if resolver is not None:
                 self._capabilities.unregister(normalized, resolver=resolver)
@@ -94,7 +121,41 @@ class ProviderRegistry:
         provider_name, model_name = parse_model_string(config.model)
         with self._lock:
             factory = self._factories.get(provider_name)
+            credential_factory = self._credential_factories.get(provider_name)
             resolver = self._owned_capability_resolvers.get(provider_name)
+        credential_envs = _configured_api_key_envs(config, provider_name)
+        if credential_envs:
+            if not _pool_auth_mode_allowed(config, provider_name):
+                raise ValueError(
+                    f"provider {provider_name!r} does not support API-key credential pools"
+                )
+            if credential_factory is None:
+                if factory is not None or provider_name not in config.custom_providers:
+                    raise ValueError(
+                        f"active provider factory for {provider_name!r} does not "
+                        "support Ash API-key credential pools"
+                    )
+                def custom_credential_factory(
+                    cfg: "AshConfig",
+                    model: str,
+                    api_key: str,
+                ) -> ProviderABC:
+                    return _build_custom_openai_provider(
+                        cfg,
+                        provider_name,
+                        model,
+                        api_key_override=api_key,
+                    )
+
+                credential_factory = custom_credential_factory
+            return _build_credential_pool(
+                config,
+                provider_name,
+                model_name,
+                credential_envs,
+                credential_factory=credential_factory,
+                resolver=resolver,
+            )
         if factory is not None:
             provider = factory(config, model_name)
             if provider.provider_family == "custom":
@@ -112,6 +173,73 @@ class ProviderRegistry:
         raise ValueError(f"Unknown provider in model string: {provider_name!r}")
 
 
+def _configured_api_key_envs(
+    config: "AshConfig",
+    provider_name: str,
+) -> tuple[str, ...]:
+    raw = getattr(config, "provider_api_key_envs", {})
+    if not isinstance(raw, dict):
+        return ()
+    envs = raw.get(provider_name, ())
+    return tuple(str(item) for item in envs)
+
+
+def _pool_auth_mode_allowed(
+    config: "AshConfig",
+    provider_name: str,
+) -> bool:
+    if provider_name == "openai":
+        return config.openai_auth_mode == "api_key"
+    if provider_name == "azure":
+        return config.azure_auth_mode == "api_key"
+    custom = config.custom_providers.get(provider_name)
+    if not isinstance(custom, dict):
+        return provider_name not in {"vertex", "bedrock", "ollama"}
+    declared_auth = str(custom.get("auth_mode") or "").strip().casefold()
+    if not declared_auth:
+        declared_auth = (
+            "bearer"
+            if custom.get("key_env") or custom.get("api_key")
+            else "none"
+        )
+    return declared_auth == "bearer"
+
+
+def _build_credential_pool(
+    config: "AshConfig",
+    provider_name: str,
+    model_name: str,
+    credential_envs: tuple[str, ...],
+    *,
+    credential_factory: CredentialProviderFactory,
+    resolver: CapabilityResolver | None,
+) -> ProviderABC:
+    from ash.providers.credential_pool import CredentialPoolProvider
+
+    resolved_keys: list[tuple[str, str]] = []
+    for env_name in credential_envs:
+        api_key = os.environ.get(env_name, "")
+        if not api_key:
+            raise ValueError(
+                f"configured credential environment variable {env_name!r} "
+                f"for provider {provider_name!r} is missing or empty"
+            )
+        resolved_keys.append((env_name, api_key))
+
+    providers: list[ProviderABC] = []
+    for env_name, api_key in resolved_keys:
+        provider = credential_factory(config, model_name, api_key)
+        if resolver is not None:
+            capabilities = resolver(model_name)
+            if not isinstance(capabilities, ProviderCapabilities):
+                raise TypeError(
+                    "capability resolver must return ProviderCapabilities"
+                )
+            provider._ash_declared_capabilities = capabilities
+        providers.append(provider)
+    return CredentialPoolProvider(providers, list(credential_envs))
+
+
 def prompt_cache_key(config: "AshConfig") -> str:
     """Return a stable workspace key without disclosing the workspace path."""
 
@@ -120,11 +248,19 @@ def prompt_cache_key(config: "AshConfig") -> str:
     return f"ash-project-{digest}"
 
 
-def _build_anthropic(config: "AshConfig", model_name: str) -> ProviderABC:
+def _build_anthropic(
+    config: "AshConfig",
+    model_name: str,
+    *,
+    api_key_override: str | None = None,
+) -> ProviderABC:
     from ash.providers.anthropic import AnthropicProvider
     from ash.providers.readiness import resolve_provider_connection
 
-    connection = resolve_provider_connection(config)
+    connection = resolve_provider_connection(
+        config,
+        api_key_override=api_key_override,
+    )
     provider = AnthropicProvider(
         model_name=model_name,
         api_key=connection.api_key,
@@ -138,9 +274,16 @@ def _build_anthropic(config: "AshConfig", model_name: str) -> ProviderABC:
     return provider
 
 
-def _build_openai(config: "AshConfig", model_name: str) -> ProviderABC:
+def _build_openai(
+    config: "AshConfig",
+    model_name: str,
+    *,
+    api_key_override: str | None = None,
+) -> ProviderABC:
     provider: ProviderABC
     if config.openai_auth_mode == "chatgpt":
+        if api_key_override is not None:
+            raise ValueError("OpenAI ChatGPT auth does not accept API-key profiles")
         from ash.providers.openai_chatgpt import OpenAIChatGPTProvider
 
         provider = OpenAIChatGPTProvider(model_name=model_name)
@@ -155,7 +298,10 @@ def _build_openai(config: "AshConfig", model_name: str) -> ProviderABC:
     from ash.providers.openai import OpenAIProvider
     from ash.providers.readiness import resolve_provider_connection
 
-    connection = resolve_provider_connection(config)
+    connection = resolve_provider_connection(
+        config,
+        api_key_override=api_key_override,
+    )
     provider = OpenAIProvider(
         model_name=model_name,
         api_key=connection.api_key,
@@ -181,11 +327,19 @@ def _fireworks_capability_endpoint(model_name: str) -> str | None:
     return f"https://api.fireworks.ai/v1/{model_name}"
 
 
-def _build_openai_compatible(config: "AshConfig", model_name: str) -> ProviderABC:
+def _build_openai_compatible(
+    config: "AshConfig",
+    model_name: str,
+    *,
+    api_key_override: str | None = None,
+) -> ProviderABC:
     from ash.providers.openai import OpenAIProvider
     from ash.providers.readiness import CatalogFormat, resolve_provider_connection
 
-    connection = resolve_provider_connection(config)
+    connection = resolve_provider_connection(
+        config,
+        api_key_override=api_key_override,
+    )
     provider: ProviderABC
     if connection.provider == "openrouter":
         from ash.providers.openrouter import OpenRouterProvider
@@ -273,11 +427,19 @@ def _build_ollama(config: "AshConfig", model_name: str) -> ProviderABC:
     return provider
 
 
-def _build_deepseek(config: "AshConfig", model_name: str) -> ProviderABC:
+def _build_deepseek(
+    config: "AshConfig",
+    model_name: str,
+    *,
+    api_key_override: str | None = None,
+) -> ProviderABC:
     from ash.providers.deepseek import DeepSeekProvider
     from ash.providers.readiness import resolve_provider_connection
 
-    connection = resolve_provider_connection(config)
+    connection = resolve_provider_connection(
+        config,
+        api_key_override=api_key_override,
+    )
     provider = DeepSeekProvider(
         model_name=model_name,
         api_key=connection.api_key,
@@ -289,11 +451,19 @@ def _build_deepseek(config: "AshConfig", model_name: str) -> ProviderABC:
     return provider
 
 
-def _build_groq(config: "AshConfig", model_name: str) -> ProviderABC:
+def _build_groq(
+    config: "AshConfig",
+    model_name: str,
+    *,
+    api_key_override: str | None = None,
+) -> ProviderABC:
     from ash.providers.groq import GroqProvider
     from ash.providers.readiness import resolve_provider_connection
 
-    connection = resolve_provider_connection(config)
+    connection = resolve_provider_connection(
+        config,
+        api_key_override=api_key_override,
+    )
     provider = GroqProvider(
         model_name=model_name,
         api_key=connection.api_key,
@@ -344,11 +514,19 @@ def _build_bedrock(config: "AshConfig", model_name: str) -> ProviderABC:
     return provider
 
 
-def _build_azure(config: "AshConfig", model_name: str) -> ProviderABC:
+def _build_azure(
+    config: "AshConfig",
+    model_name: str,
+    *,
+    api_key_override: str | None = None,
+) -> ProviderABC:
     from ash.providers.azure import AzureProvider
     from ash.providers.readiness import resolve_provider_connection
 
-    connection = resolve_provider_connection(config)
+    connection = resolve_provider_connection(
+        config,
+        api_key_override=api_key_override,
+    )
     provider = AzureProvider(
         model_name=model_name,
         base_url=connection.base_url,
@@ -444,11 +622,16 @@ def _build_custom_openai_provider(
     config: "AshConfig",
     provider_name: str,
     model_name: str,
+    *,
+    api_key_override: str | None = None,
 ) -> ProviderABC:
     from ash.providers.openai import OpenAIProvider
     from ash.providers.readiness import resolve_provider_connection
 
-    connection = resolve_provider_connection(config)
+    connection = resolve_provider_connection(
+        config,
+        api_key_override=api_key_override,
+    )
     provider = OpenAIProvider(
         model_name=model_name,
         api_key=connection.api_key or None,
@@ -467,14 +650,38 @@ def _build_custom_openai_provider(
 def create_default_provider_registry() -> ProviderRegistry:
     registry = ProviderRegistry()
     registry.register("anthropic", _build_anthropic)
+    registry._enable_api_key_pool(
+        "anthropic",
+        _credential_builder(_build_anthropic),
+    )
     registry.register("openai", _build_openai)
+    registry._enable_api_key_pool(
+        "openai",
+        _credential_builder(_build_openai),
+    )
     registry.register("openai-compatible", _build_openai_compatible)
+    registry._enable_api_key_pool(
+        "openai-compatible",
+        _credential_builder(_build_openai_compatible),
+    )
     registry.register("ollama", _build_ollama)
     registry.register("deepseek", _build_deepseek)
+    registry._enable_api_key_pool(
+        "deepseek",
+        _credential_builder(_build_deepseek),
+    )
     registry.register("groq", _build_groq)
+    registry._enable_api_key_pool(
+        "groq",
+        _credential_builder(_build_groq),
+    )
     registry.register("vertex", _build_vertex)
     registry.register("bedrock", _build_bedrock)
     registry.register("azure", _build_azure)
+    registry._enable_api_key_pool(
+        "azure",
+        _credential_builder(_build_azure),
+    )
     for provider_id in sorted(
         BUILTIN_PROVIDER_IDS
         - {
@@ -489,6 +696,12 @@ def create_default_provider_registry() -> ProviderRegistry:
         }
     ):
         registry.register(provider_id, _build_openai_compatible)
+        descriptor = get_provider_descriptor(provider_id)
+        if descriptor is not None and descriptor.key_envs:
+            registry._enable_api_key_pool(
+                provider_id,
+                _credential_builder(_build_openai_compatible),
+            )
     return registry
 
 

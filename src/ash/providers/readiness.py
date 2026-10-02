@@ -310,8 +310,18 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
     ]
     keys: set[str] = set()
     custom_providers = getattr(config, "custom_providers", {})
+    provider_api_key_envs = getattr(config, "provider_api_key_envs", {})
     for model in models:
         provider, _ = parse_model_string(model)
+        configured_pool_envs = (
+            provider_api_key_envs.get(provider, ())
+            if isinstance(provider_api_key_envs, dict)
+            else ()
+        )
+        if isinstance(configured_pool_envs, (list, tuple)):
+            keys.update(str(item) for item in configured_pool_envs)
+        else:
+            configured_pool_envs = ()
         if provider == "vertex":
             keys.update(
                 {
@@ -349,7 +359,8 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
                 getattr(config, "azure_auth_mode", "entra") or "entra"
             ).strip().casefold()
             if azure_auth_mode == "api_key":
-                keys.add("AZURE_OPENAI_API_KEY")
+                if not configured_pool_envs:
+                    keys.add("AZURE_OPENAI_API_KEY")
             else:
                 keys.update(
                     {
@@ -377,7 +388,7 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
         if builtin is not None:
             keys.add(builtin[1])
         key_envs = _BUILTIN_KEY_ENVS.get(provider, ())
-        if provider != "azure":
+        if provider != "azure" and not configured_pool_envs:
             keys.update(key_envs)
         custom = (
             custom_providers.get(provider)
@@ -386,7 +397,7 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
         )
         if isinstance(custom, dict):
             declared_key_env = str(custom.get("key_env") or "").strip()
-            if declared_key_env:
+            if declared_key_env and not configured_pool_envs:
                 keys.add(declared_key_env)
     return {key: os.environ[key] for key in sorted(keys) if key in os.environ}
 
@@ -464,7 +475,11 @@ def _require_key(provider: str, key_env: str, key: str) -> str:
     )
 
 
-def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
+def resolve_provider_connection(
+    config: "AshConfig",
+    *,
+    api_key_override: str | None = None,
+) -> ProviderConnection:
     """Resolve the provider route used for construction and connectivity checks.
 
     Custom endpoints declare authentication explicitly.  Older entries that
@@ -547,7 +562,9 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
             api_key = _require_key(
                 "azure",
                 "AZURE_OPENAI_API_KEY",
-                os.environ.get("AZURE_OPENAI_API_KEY", ""),
+                api_key_override
+                if api_key_override is not None
+                else os.environ.get("AZURE_OPENAI_API_KEY", ""),
             )
             resolved_auth_mode: AuthMode = "bearer"
         elif auth_mode == "entra":
@@ -594,7 +611,9 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
             api_key = _require_key(
                 provider,
                 " or ".join(key_envs),
-                _first_environment_value(key_envs),
+                api_key_override
+                if api_key_override is not None
+                else _first_environment_value(key_envs),
             )
             require_secure_provider_transport(base_url, provider=provider)
         return ProviderConnection(
@@ -628,7 +647,11 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
         custom_auth_mode: AuthMode = "bearer"
         source = key_env or "configured API key"
         api_key = _require_key(
-            provider, source, os.environ.get(key_env, "") or inline_key
+            provider,
+            source,
+            api_key_override
+            if api_key_override is not None
+            else os.environ.get(key_env, "") or inline_key,
         )
         require_secure_provider_transport(base_url, provider=provider)
     else:

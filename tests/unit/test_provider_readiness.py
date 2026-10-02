@@ -127,6 +127,51 @@ def test_provider_runtime_environment_honors_custom_key_env(monkeypatch) -> None
     }
 
 
+def test_provider_runtime_environment_uses_only_explicit_pool_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "stale-default")
+    monkeypatch.setenv("OPENAI_PRIMARY", "primary-secret")
+    monkeypatch.setenv("OPENAI_BACKUP", "backup-secret")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross")
+    config = SimpleNamespace(
+        model="openai/gpt-test",
+        fallback_models=[],
+        custom_providers={},
+        provider_api_key_envs={
+            "openai": ["OPENAI_PRIMARY", "OPENAI_BACKUP"],
+        },
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "OPENAI_BACKUP": "backup-secret",
+        "OPENAI_PRIMARY": "primary-secret",
+    }
+
+
+def test_custom_pool_does_not_forward_declared_default_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PRIVATE_GATEWAY_TOKEN", "stale-default")
+    monkeypatch.setenv("PRIVATE_PRIMARY", "primary-secret")
+    config = SimpleNamespace(
+        model="private/model",
+        fallback_models=[],
+        custom_providers={
+            "private": {
+                "base_url": "https://gateway.example/v1",
+                "auth_mode": "bearer",
+                "key_env": "PRIVATE_GATEWAY_TOKEN",
+            }
+        },
+        provider_api_key_envs={"private": ["PRIVATE_PRIMARY"]},
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "PRIVATE_PRIMARY": "primary-secret"
+    }
+
+
 def test_provider_runtime_environment_scopes_vertex_and_bedrock_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -216,6 +261,35 @@ def test_provider_runtime_environment_scopes_azure_api_key_without_entra_secrets
     assert readiness.provider_runtime_environment(config) == {
         "AZURE_OPENAI_API_KEY": "azure-key",
         "AZURE_OPENAI_BASE_URL": "https://resource.openai.azure.com/openai/v1",
+    }
+
+
+def test_provider_runtime_environment_azure_pool_excludes_stale_default_and_entra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "AZURE_OPENAI_BASE_URL",
+        "https://resource.openai.azure.com/openai/v1",
+    )
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "stale-default")
+    monkeypatch.setenv("AZURE_PRIMARY", "primary-key")
+    monkeypatch.setenv("AZURE_BACKUP", "backup-key")
+    monkeypatch.setenv("AZURE_CLIENT_ID", "must-not-cross")
+    monkeypatch.setenv("AZURE_CLIENT_SECRET", "must-not-cross")
+    config = SimpleNamespace(
+        model="azure/deployment-a",
+        fallback_models=[],
+        custom_providers={},
+        azure_auth_mode="api_key",
+        provider_api_key_envs={
+            "azure": ["AZURE_PRIMARY", "AZURE_BACKUP"],
+        },
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "AZURE_BACKUP": "backup-key",
+        "AZURE_OPENAI_BASE_URL": "https://resource.openai.azure.com/openai/v1",
+        "AZURE_PRIMARY": "primary-key",
     }
 
 

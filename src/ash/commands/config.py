@@ -49,6 +49,7 @@ _NON_SECRET_TOKEN_KEYS = frozenset(
         "show_token_meter",
     }
 )
+_NON_SECRET_REFERENCE_FIELDS = frozenset({"provider_api_key_envs"})
 MAX_CONFIG_FILE_BYTES = 1024 * 1024
 MAX_ENV_FILE_BYTES = 1024 * 1024
 MAX_MIGRATION_STATE_BYTES = 1024 * 1024
@@ -733,6 +734,8 @@ def _is_secret_name(name: str) -> bool:
     normalized = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
     normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
     normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").casefold()
+    if normalized in _NON_SECRET_REFERENCE_FIELDS:
+        return False
     if normalized in {
         "authorization",
         "authorizations",
