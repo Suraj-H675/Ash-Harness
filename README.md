@@ -41,13 +41,14 @@ Ash's intended production install path is an **immutable GitHub Release**, not
 a moving branch. The release workflow builds and attests the artifacts and the
 installer verifies the selected release before installation.
 
-**Current status:** no immutable Ash GitHub Release has been published yet, so
-the production-install path is not currently available to end users. Until a
-real release is published and its clean-machine install/upgrade journey is
-verified, Ash must not claim a completed production distribution experience.
-Development setup is documented in [Contributing](CONTRIBUTING.md).
+**Current status:** the first production release,
+[`ash-v0.1.0`](https://github.com/Suraj-H675/Ash-Harness/releases/tag/ash-v0.1.0),
+is published and GitHub reports it as immutable. Its release attestation and
+installer asset verify successfully. A clean isolated pipx install from the
+published wheel and a same-ref repair journey both pass, including preservation
+of the `observability` capability pack.
 
-Once a verified immutable release exists, the intended install flow is:
+The production install flow is:
 
 ```bash
 repo="Suraj-H675/Ash-Harness"

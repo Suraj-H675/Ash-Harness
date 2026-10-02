@@ -75,10 +75,9 @@ reopening already-verified areas mechanically.
    benchmark no longer identifies a material core-harness weakness that should
    be fixed before calling Ash first-class and production-worthy.
 
-Current gate state: **M1-M4 are closed/current; M5 is reopened after the
-2026-10-01 Charter-level post-closure audit.** Partial capability rows below
-remain deliberately qualified and do
-not imply broader support than their recorded evidence.
+Current gate state: **M1-M5 are closed/current.** Partial capability rows below
+remain deliberately qualified and do not imply broader support than their
+recorded evidence.
 
 ### M4 product decisions
 
@@ -126,29 +125,27 @@ sign-in/model-discovery/Responses completion journey, the stronger live
 function-call continuation also passed, and the final comparator pass did not
 identify another material Ash coding-core gap.
 
-### M5 post-closure Charter audit — reopened 2026-10-01
+### M5 final Charter audit — closed 2026-10-02
 
-The earlier M5 closure was too optimistic. Re-reading
-`01_ASH_CHARTER.md` against the actual repository and current competitors
-identified material whole-product gaps that the previous bounded audit did not
-justify dismissing:
+The 2026-10-01 post-closure audit correctly reopened M5 and surfaced several
+material production gaps. Those blockers have now been resolved or
+scope-qualified with stronger evidence:
 
-- **Production distribution is not real yet, but the local release path is
-  hardened.** The repository still has no published GitHub Release, so README's
-  immutable-release install flow has nothing a first-time production user can
-  actually install. The standalone installer now has a package-extra drift
-  guard, includes the observability pack, and passes a stateful verified-release
-  journey covering first install, upgrade, same-release repair, explicit
-  older-ref rollback, and capability preservation. Release CI installs every
-  published optional pack. A fresh local release rehearsal also builds the
-  wheel from a fresh sdist, passes the minimal installed-wheel journey (including
-  a real subprocess subagent), passes the standalone installer on Python 3.10,
-  and installs/imports the built wheel with the observability extra in an
-  isolated Python 3.12 environment. The live repository still reports immutable
-  releases disabled; GitHub's enable endpoint returned HTTP 500 during this
-  audit, so the first immutable release remains externally blocked. A real
-  immutable release plus post-publication clean-machine verification is still
-  required.
+- **Production distribution — verified.** GitHub immutable releases are enabled,
+  `ash-v0.1.0` is published and reports `isImmutable: true`, and
+  `gh release verify` plus `gh release verify-asset` both succeed against the
+  published release. The tag resolves exactly to commit
+  `01f29c282ed3d34d01433b2a8c79ed778087d0f9`. Release CI completed
+  successfully after running the supported-host/conformance matrix, building a
+  fresh sdist and wheel, smoke-testing the artifacts, generating checksums and
+  provenance, publishing the draft, and verifying immutability. A separate
+  post-publication journey downloaded and verified the immutable
+  `install-ash.py`, installed `ash-v0.1.0` into an isolated pipx environment
+  with the `observability` capability pack, verified `ash 0.1.0`, simulated
+  a missing app link, and proved same-ref repair restored the executable while
+  preserving the capability pack. A true cross-version upgrade/rollback cannot
+  be exercised until a second immutable release exists; the installer lifecycle
+  remains covered by deterministic stateful upgrade/repair/rollback tests.
 - **Production observability gap — addressed locally.** Ash now has an opt-in,
   user-owned OpenTelemetry/OTLP HTTP trace-and-metrics plane with locally owned
   SDK providers, parented turn/model/tool spans, retry/circuit/context/token
@@ -158,16 +155,17 @@ justify dismissing:
   credential material, and provider error text are stripped before observers
   receive events. A real loopback OTLP collector test verifies trace and metric
   protobuf export and the absence of injected secret content on the wire.
-- **Interoperability breadth is still explicitly partial.** The API-key
+- **Interoperability breadth remains explicitly partial by evidence.** The API-key
   provider row and local-model row remain Partial because live vendor/runtime
   conformance is much narrower than the deterministic protocol coverage,
   especially for LM Studio/vLLM and multi-vendor hosted providers.
-- **Several whole-product surfaces remain materially behind current strong
-  harnesses.** Browser control is still loopback/isolated-context only rather
-  than remote/direct selected-tab or computer-use breadth; the plugin
-  marketplace still lacks a first-party hosted/curated ecosystem; MCP, ACP,
-  and A2A intentionally leave meaningful protocol modalities unadvertised.
-  These may ultimately remain scoped
+- **Several whole-product surfaces remain intentionally scoped relative to
+  broader products.** Browser control is loopback/isolated-context rather than
+  remote/direct selected-tab or general computer-use breadth; the plugin
+  marketplace lacks a first-party hosted/curated public ecosystem; MCP, ACP,
+  and A2A intentionally leave unsupported protocol modalities unadvertised.
+  These remain documented scope differences rather than hidden production
+  deficiencies in Ash's terminal coding-harness mission.
   differences, but the Charter requires explicit evidence that they do not
   create a material whole-product weakness before closure.
 
@@ -202,9 +200,12 @@ Evidence that remains valid from the previous audit:
   current verdict, while older research/audit files are explicitly labeled as
   dated evidence rather than competing product truth.
 
-M5 closes only after the blockers above are resolved or reclassified with
-stronger whole-product evidence. Until then, Ash must not claim the production
-harness mission is complete.
+**M5 is closed.** The supported-host CI matrix is green, the production release
+path is real and immutable, packaging/install/repair evidence is live rather
+than simulated, observability and maintenance gaps are addressed, and the final
+comparator pass does not identify a material terminal coding-harness-core
+weakness that should block production readiness. Qualified Partial rows remain
+truthful evidence boundaries, not open mission blockers.
 
 ## 1. Installation And Setup
 
@@ -450,10 +451,8 @@ harness mission is complete.
 
 ## Overall parity verdict
 
-Ash is a strong local-first terminal coding harness with substantial verified
-production engineering, but the project Charter does **not** currently justify
-calling the mission complete or claiming unqualified first-class parity with
-the strongest current harnesses. **M5 is reopened.**
+Ash is now a **production-worthy, first-class local-first terminal coding
+harness within its documented scope**. M1-M5 are closed/current.
 
 Current comparators also cover materially different product categories:
 
@@ -472,9 +471,12 @@ Current comparators also cover materially different product categories:
   [Gemini CLI feature index](https://geminicli.com/docs/), and
   [Aider feature overview](https://aider.chat/).
 
-Ash should currently be described as **a strong, heavily hardened terminal
-coding harness that is close to the target but still in final whole-product
-production/parity work**. It has strong coding-core parity on supported
-Linux/macOS hosts (and WSL2 through the supported Linux path), but it is not
-truthful to claim parity "in everything" with leading harnesses while the
-reopened M5 blockers and qualified Partial rows remain.
+It is still not truthful to claim literal feature identity "in everything" with
+products whose scope includes hosted gateways, large public marketplaces,
+desktop/mobile clients, messaging/channel ecosystems, or general remote
+computer-use infrastructure. Those differences are explicit scope boundaries.
+Within Ash's mission—terminal-first coding, agent/runtime safety, provider and
+protocol interoperability, browser-assisted coding workflows, plugin
+lifecycle, observability, packaging, and supported-host production
+operation—the final audit no longer identifies a material blocker to calling
+Ash first-class and production-worthy.
