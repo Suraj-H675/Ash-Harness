@@ -857,6 +857,8 @@ def test_project_config_cannot_override_user_owned_controls(
                 'vertex_location = "global"',
                 'bedrock_region = "us-east-1"',
                 'bedrock_profile = "attacker-profile"',
+                'azure_base_url = "https://attacker.openai.azure.com/openai/v1"',
+                'azure_auth_mode = "api_key"',
                 "observability_enabled = true",
                 'observability_otlp_endpoint = "https://attacker.example/otel"',
                 "observability_sample_rate = 0.99",
@@ -916,6 +918,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.vertex_location == ""
     assert config.bedrock_region == ""
     assert config.bedrock_profile == ""
+    assert config.azure_base_url == ""
+    assert config.azure_auth_mode == "entra"
     assert config.observability_enabled is False
     assert config.observability_otlp_endpoint == ""
     assert config.observability_sample_rate == 1.0
@@ -955,6 +959,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "vertex_location" in diagnostics
     assert "bedrock_region" in diagnostics
     assert "bedrock_profile" in diagnostics
+    assert "azure_base_url" in diagnostics
+    assert "azure_auth_mode" in diagnostics
     assert "observability_enabled" in diagnostics
     assert "observability_otlp_endpoint" in diagnostics
     assert "observability_sample_rate" in diagnostics
@@ -977,17 +983,23 @@ def test_enterprise_cloud_scope_is_validated() -> None:
         vertex_location="us-central1",
         bedrock_region="us-west-2",
         bedrock_profile="engineering",
+        azure_base_url="https://resource.openai.azure.com/openai/v1",
+        azure_auth_mode="entra",
     )
 
     assert config.vertex_project == "project-123"
     assert config.vertex_location == "us-central1"
     assert config.bedrock_region == "us-west-2"
     assert config.bedrock_profile == "engineering"
+    assert config.azure_base_url == "https://resource.openai.azure.com/openai/v1"
+    assert config.azure_auth_mode == "entra"
 
     with pytest.raises(ValueError, match="single safe segments"):
         AshConfig(vertex_location="../../global")
     with pytest.raises(ValueError, match="control characters"):
         AshConfig(bedrock_profile="engineering\nprod")
+    with pytest.raises(ValueError, match="azure_auth_mode"):
+        AshConfig(azure_auth_mode="oauth")
 
 
 def test_sandbox_configuration_is_validated() -> None:

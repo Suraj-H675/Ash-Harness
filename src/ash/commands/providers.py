@@ -107,6 +107,8 @@ def provider_catalog_payload() -> dict[str, Any]:
                     if descriptor.id == "vertex"
                     else "aws-sigv4"
                     if descriptor.id == "bedrock"
+                    else "azure-key-or-entra"
+                    if descriptor.id == "azure"
                     else "api-key-or-chatgpt"
                     if descriptor.id == "openai"
                     else "api-key"
@@ -147,6 +149,12 @@ def render_provider_catalog(*, json_output: bool = False) -> str:
             (
                 "none"
                 if descriptor.local
+                else "Google ADC"
+                if descriptor.id == "vertex"
+                else "AWS SigV4"
+                if descriptor.id == "bedrock"
+                else "API key / Entra"
+                if descriptor.id == "azure"
                 else "API key / ChatGPT plan"
                 if descriptor.id == "openai"
                 else " / ".join(descriptor.key_envs) or "api key"
@@ -406,7 +414,7 @@ def test_provider(
     from ash.providers.identifiers import parse_model_string
 
     provider_name, _model_name = parse_model_string(test_config.model)
-    if provider_name in {"vertex", "bedrock"}:
+    if provider_name in {"vertex", "bedrock", "azure"}:
         connection = resolve_provider_connection(test_config)
         verification = ProviderVerification(
             connection=connection,

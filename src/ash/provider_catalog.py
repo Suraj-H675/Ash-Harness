@@ -82,6 +82,14 @@ BUILTIN_PROVIDERS: tuple[ProviderDescriptor, ...] = (
         "https://bedrock-runtime.amazonaws.com",
     ),
     ProviderDescriptor(
+        "azure",
+        "Azure OpenAI / Foundry",
+        "Enterprise cloud",
+        "Azure v1 OpenAI-compatible inference with API key or Microsoft Entra ID",
+        "https://RESOURCE.openai.azure.com/openai/v1",
+        "AZURE_OPENAI_API_KEY",
+    ),
+    ProviderDescriptor(
         "openrouter",
         "OpenRouter",
         "Gateway",

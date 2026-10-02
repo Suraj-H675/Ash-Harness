@@ -208,6 +208,24 @@ def _provider_status(config, descriptor: ProviderDescriptor) -> str:
             or os.environ.get("AWS_DEFAULT_REGION", "").strip()
         )
         return "AWS scope configured" if region else "needs AWS region"
+    if descriptor.id == "azure":
+        base_url = (
+            str(getattr(config, "azure_base_url", "") or "").strip()
+            or os.environ.get("AZURE_OPENAI_BASE_URL", "").strip()
+            or os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
+        )
+        auth_mode = str(
+            getattr(config, "azure_auth_mode", "entra") or "entra"
+        ).strip().casefold()
+        if not base_url:
+            return "needs Azure endpoint"
+        if auth_mode == "entra":
+            return "Entra scope configured"
+        return (
+            "key detected"
+            if os.environ.get("AZURE_OPENAI_API_KEY")
+            else "needs key"
+        )
     if descriptor.id == "openai" and getattr(config, "openai_auth_mode", "") == "chatgpt":
         from ash.providers.openai_chatgpt_auth import ChatGPTCredentialStore
 
@@ -838,6 +856,8 @@ def select_provider_and_model(config) -> SetupOutcome:
                 return _flow_vertex(current, config)
             if provider_id == "bedrock":
                 return _flow_bedrock(current, config)
+            if provider_id == "azure":
+                return _flow_azure(current, config)
             if provider_id == "ollama":
                 return _flow_ollama(current)
             if provider_id == "openai-compatible":
@@ -1238,6 +1258,115 @@ def _flow_bedrock(current: str, config) -> SetupOutcome:
     _print_info(
         "Bedrock discovery returns candidate IDs; run ash providers test to "
         "verify that the selected ID supports Runtime Chat Completions."
+    )
+    return SetupOutcome.SUCCESS
+
+
+def _flow_azure(current: str, config) -> SetupOutcome:
+    """Azure v1 setup with explicit endpoint and key or Entra authentication."""
+
+    _print_header("Azure OpenAI / Foundry Configuration")
+    from ash.providers.azure import (
+        AzureBackendUnavailable,
+        AzureCredentialError,
+        AzureProvider,
+        normalize_azure_openai_base_url,
+    )
+
+    current_base_url = (
+        str(getattr(config, "azure_base_url", "") or "").strip()
+        or os.environ.get("AZURE_OPENAI_BASE_URL", "").strip()
+        or os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
+    )
+    base_url = _prompt_setup_text(
+        f"  Azure endpoint{f' [{current_base_url}]' if current_base_url else ''}: ",
+        allow_empty=bool(current_base_url),
+    )
+    base_url = base_url or current_base_url
+    try:
+        base_url = normalize_azure_openai_base_url(base_url)
+    except ValueError as exc:
+        print(
+            "  Invalid Azure endpoint: "
+            + terminal_safe_text(str(exc), single_line=True)
+        )
+        return SetupOutcome.ERROR
+
+    current_auth = str(
+        getattr(config, "azure_auth_mode", "entra") or "entra"
+    ).strip().casefold()
+    auth_mode = _prompt_setup_text(
+        f"  Authentication (entra/api_key) [{current_auth}]: ",
+        allow_empty=True,
+    ).strip().casefold()
+    auth_mode = auth_mode or current_auth
+    if auth_mode not in {"entra", "api_key"}:
+        print("  Authentication must be entra or api_key.")
+        return SetupOutcome.ERROR
+
+    api_key = ""
+    if auth_mode == "api_key":
+        api_key = _prompt_api_key(
+            "AZURE_OPENAI_API_KEY",
+            "Azure OpenAI API key",
+        )
+    else:
+        provider: AzureProvider | None = None
+        verification_error: Exception | None = None
+        try:
+            provider = AzureProvider(
+                "credential-probe",
+                base_url=base_url,
+                auth_mode="entra",
+            )
+            asyncio.run(provider.verify_credentials())
+        except (
+            AzureBackendUnavailable,
+            AzureCredentialError,
+            ValueError,
+        ) as exc:
+            verification_error = exc
+        finally:
+            if provider is not None:
+                try:
+                    asyncio.run(provider.aclose())
+                except Exception as exc:  # noqa: BLE001 - cleanup must be reported
+                    if verification_error is None:
+                        verification_error = RuntimeError(
+                            "Azure credential cleanup failed "
+                            f"({type(exc).__name__})"
+                        )
+        if verification_error is not None:
+            print(
+                "  Azure Entra verification failed: "
+                + terminal_safe_text(
+                    str(verification_error),
+                    single_line=True,
+                )
+            )
+            return SetupOutcome.ERROR
+
+    prompt = "  Azure deployment/model name"
+    if current:
+        prompt += f" [{terminal_safe_text(current, single_line=True)}]"
+    model = _prompt_setup_text(prompt + ": ", allow_empty=bool(current)) or current
+    if not model:
+        print("  Azure deployment/model name is required.")
+        return SetupOutcome.ERROR
+
+    settings = {
+        "ASH_AZURE_BASE_URL": base_url,
+        "ASH_AZURE_AUTH_MODE": auth_mode,
+        "ASH_MODEL": f"azure/{model}",
+    }
+    if auth_mode == "api_key":
+        settings["AZURE_OPENAI_API_KEY"] = api_key
+    else:
+        settings["AZURE_OPENAI_API_KEY"] = ""
+    save_env_values(settings)
+    _print_info(
+        "Azure route configured. Run ash providers test to verify the selected "
+        "deployment with a bounded completion."
     )
     return SetupOutcome.SUCCESS
 
@@ -2055,6 +2184,8 @@ def _compact_provider_status(status: str) -> str:
         return "scope"
     if "aws region" in normalized:
         return "region"
+    if "azure endpoint" in normalized:
+        return "endpoint"
     if "available" in normalized or "local" in normalized:
         return "local"
     if "manual" in normalized:

@@ -163,6 +163,62 @@ def test_provider_runtime_environment_scopes_vertex_and_bedrock_credentials(
     }
 
 
+def test_provider_runtime_environment_scopes_azure_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "AZURE_OPENAI_BASE_URL",
+        "https://resource.openai.azure.com/openai/v1",
+    )
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
+    monkeypatch.setenv("AZURE_CLIENT_ID", "client-id")
+    monkeypatch.setenv("AZURE_TENANT_ID", "tenant-id")
+    monkeypatch.setenv("AZURE_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("AZURE_FEDERATED_TOKEN_FILE", "/tmp/federated-token")
+    monkeypatch.setenv("AZURE_TOKEN_CREDENTIALS", "prod")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross")
+
+    config = SimpleNamespace(
+        model="azure/deployment-a",
+        fallback_models=[],
+        custom_providers={},
+        azure_auth_mode="entra",
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "AZURE_CLIENT_ID": "client-id",
+        "AZURE_CLIENT_SECRET": "client-secret",
+        "AZURE_FEDERATED_TOKEN_FILE": "/tmp/federated-token",
+        "AZURE_OPENAI_BASE_URL": "https://resource.openai.azure.com/openai/v1",
+        "AZURE_TENANT_ID": "tenant-id",
+        "AZURE_TOKEN_CREDENTIALS": "prod",
+    }
+
+
+def test_provider_runtime_environment_scopes_azure_api_key_without_entra_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "AZURE_OPENAI_BASE_URL",
+        "https://resource.openai.azure.com/openai/v1",
+    )
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
+    monkeypatch.setenv("AZURE_CLIENT_ID", "must-not-cross")
+    monkeypatch.setenv("AZURE_CLIENT_SECRET", "must-not-cross")
+
+    config = SimpleNamespace(
+        model="azure/deployment-a",
+        fallback_models=[],
+        custom_providers={},
+        azure_auth_mode="api_key",
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "AZURE_OPENAI_API_KEY": "azure-key",
+        "AZURE_OPENAI_BASE_URL": "https://resource.openai.azure.com/openai/v1",
+    }
+
+
 def test_probe_model_catalog_metadata_preserves_openrouter_capability_fields(
     monkeypatch,
 ) -> None:
@@ -707,6 +763,66 @@ def test_bedrock_connection_uses_partition_resolved_runtime_endpoint(
     assert connection.catalog_endpoint == ""
     assert connection.auth_mode == "aws_sigv4"
     assert connection.headers == {}
+
+
+def test_azure_entra_connection_uses_explicit_v1_route() -> None:
+    config = SimpleNamespace(
+        model="azure/deployment-a",
+        azure_base_url="https://resource.openai.azure.com",
+        azure_auth_mode="entra",
+        custom_providers={},
+    )
+
+    connection = readiness.resolve_provider_connection(config)
+
+    assert connection.base_url == "https://resource.openai.azure.com/openai/v1"
+    assert connection.catalog_endpoint == ""
+    assert connection.auth_mode == "azure_entra"
+    assert connection.api_key == ""
+    assert connection.headers == {}
+
+
+def test_azure_api_key_connection_requires_and_preserves_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
+    config = SimpleNamespace(
+        model="azure/deployment-a",
+        azure_base_url=(
+            "https://resource.services.ai.azure.com/api/projects/project-a"
+        ),
+        azure_auth_mode="api_key",
+        custom_providers={},
+    )
+
+    connection = readiness.resolve_provider_connection(config)
+
+    assert connection.base_url == (
+        "https://resource.services.ai.azure.com/api/projects/project-a/openai/v1"
+    )
+    assert connection.auth_mode == "bearer"
+    assert connection.api_key == "azure-key"
+    assert connection.headers == {"Authorization": "Bearer azure-key"}
+
+
+def test_azure_connection_can_take_endpoint_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "AZURE_OPENAI_ENDPOINT",
+        "https://resource.openai.azure.com",
+    )
+    config = SimpleNamespace(
+        model="azure/deployment-a",
+        azure_base_url="",
+        azure_auth_mode="entra",
+        custom_providers={},
+    )
+
+    connection = readiness.resolve_provider_connection(config)
+
+    assert connection.base_url == "https://resource.openai.azure.com/openai/v1"
+    assert connection.auth_mode == "azure_entra"
 
 
 @pytest.mark.parametrize(

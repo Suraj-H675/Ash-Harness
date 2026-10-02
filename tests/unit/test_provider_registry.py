@@ -135,6 +135,7 @@ def test_registry_builds_fallback_chain_through_same_factories() -> None:
 def test_default_registry_exposes_builtins_without_constructing_them() -> None:
     assert create_default_provider_registry().names() == (
         "anthropic",
+        "azure",
         "bedrock",
         "cerebras",
         "deepseek",
@@ -223,6 +224,28 @@ def test_vertex_registry_builds_explicit_scoped_route() -> None:
         "https://us-central1-aiplatform.googleapis.com/v1/projects/project-123/"
         "locations/us-central1/endpoints/openapi"
     )
+    assert result.capabilities == ProviderCapabilities()
+
+
+def test_azure_registry_builds_api_key_route_conservatively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.azure import AzureProvider
+    from ash.providers.capabilities import ProviderCapabilities
+
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
+    result = create_default_provider_registry().build(
+        AshConfig(
+            model="azure/deployment-a",
+            azure_base_url="https://resource.openai.azure.com",
+            azure_auth_mode="api_key",
+        )
+    )
+
+    assert isinstance(result, AzureProvider)
+    assert result.provider_family == "azure"
+    assert result.model_name == "deployment-a"
+    assert result._base_url == "https://resource.openai.azure.com/openai/v1"
     assert result.capabilities == ProviderCapabilities()
 
 

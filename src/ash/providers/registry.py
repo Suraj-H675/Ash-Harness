@@ -344,6 +344,21 @@ def _build_bedrock(config: "AshConfig", model_name: str) -> ProviderABC:
     return provider
 
 
+def _build_azure(config: "AshConfig", model_name: str) -> ProviderABC:
+    from ash.providers.azure import AzureProvider
+    from ash.providers.readiness import resolve_provider_connection
+
+    connection = resolve_provider_connection(config)
+    provider = AzureProvider(
+        model_name=model_name,
+        base_url=connection.base_url,
+        auth_mode=str(getattr(config, "azure_auth_mode", "entra") or "entra"),
+        api_key=connection.api_key,
+    )
+    provider.configure_max_tokens(config.max_completion_tokens)
+    return provider
+
+
 def _custom_model_capabilities(
     config: "AshConfig",
     provider_name: str,
@@ -459,9 +474,19 @@ def create_default_provider_registry() -> ProviderRegistry:
     registry.register("groq", _build_groq)
     registry.register("vertex", _build_vertex)
     registry.register("bedrock", _build_bedrock)
+    registry.register("azure", _build_azure)
     for provider_id in sorted(
         BUILTIN_PROVIDER_IDS
-        - {"anthropic", "openai", "deepseek", "groq", "ollama", "vertex", "bedrock"}
+        - {
+            "anthropic",
+            "openai",
+            "deepseek",
+            "groq",
+            "ollama",
+            "vertex",
+            "bedrock",
+            "azure",
+        }
     ):
         registry.register(provider_id, _build_openai_compatible)
     return registry

@@ -417,9 +417,9 @@ setup gate passes **704 tests**. The narrower enterprise lifecycle gate passes
 wheel/sdist build validation are green.
 
 P1A closure does not claim live AWS/GCP service conformance; credentialed cloud
-calls remain in P1E. Azure OpenAI/Foundry Entra or managed-identity support is
-tracked under P1B because the remaining gap is credential/profile selection and
-refresh rather than generic provider count.
+calls remain in P1E. Azure OpenAI/Foundry identity work is tracked under P1B
+because it is an authentication/credential concern rather than provider-count
+coverage.
 
 Evidence was rechecked against current first-party AWS and Google cloud
 documentation on 2026-10-02. AWS recommends bedrock-runtime for new
@@ -431,6 +431,62 @@ Primary references:
 https://docs.aws.amazon.com/bedrock/latest/userguide/inference-chat-completions.html
 https://docs.aws.amazon.com/bedrock/latest/userguide/models-api-compatibility.html
 https://docs.cloud.google.com/vertex-ai/generative-ai/docs/samples/generativeaionvertexai-gemini-chat-completions-non-streaming
+
+### P1 progress — Azure identity and failover commit boundary slice 7
+
+The first P1B implementation slice closes two prerequisites without declaring
+the full authentication-resilience gate complete.
+
+First, automatic provider failover now treats every retained model output/state
+as a commit point. In addition to visible text and tool calls, reasoning,
+reasoning blocks, and provider replay state now prohibit switching to another
+provider after a partial response. Usage/model/diagnostic metadata that does not
+become assistant history remains non-committing, so a provider can still fail
+over safely before any model output/state has been exposed. This is required
+before adding same-provider credential rotation; otherwise a reasoning-only
+partial response could be silently mixed with a backup provider.
+
+Second, Ash now has a first-class Azure OpenAI / Microsoft Foundry v1 route:
+
+- the user owns the public Azure v1 resource/project endpoint and authentication
+  mode; project config cannot redirect either;
+- API-key mode uses the core OpenAI dependency and needs no Azure SDK;
+- Entra/managed-identity mode uses the optional azure capability pack,
+  azure-identity, and the official async bearer-token provider with
+  https://ai.azure.com/.default;
+- async Azure Identity transport is explicit through azure-core[aio], after a
+  real optional-extra constructor smoke exposed that plain azure-identity alone
+  does not install aiohttp;
+- the provider owns and closes credentials it creates, setup fails closed on
+  credential cleanup errors, and recent access tokens exist only in a bounded
+  in-memory redaction window;
+- isolated provider workers forward only API-key material in API-key mode and
+  only Entra/workload/managed-identity environment in Entra mode;
+- Azure model/deployment discovery remains non-authoritative, so readiness is
+  established by a bounded real completion just like the other enterprise
+  routes whose management inventory does not prove OpenAI-wire compatibility;
+- capabilities remain conservative because Azure wire compatibility does not
+  prove tools, vision, reasoning, or model limits for the selected deployment.
+
+The complete affected Azure/failover/provider/config/setup/installer/loop gate
+passes **695 tests**. The focused Azure/failover gate passes **57 tests**.
+Ruff, targeted Mypy, pinned uv lock validation, git diff checks, a real
+Azure-Identity async constructor/close smoke, and wheel/sdist metadata
+verification are green. The built wheel publishes the azure extra with
+azure-core[aio], azure-identity, and the compatible OpenAI range while keeping
+those dependencies out of the base install.
+
+P1B remains open. The explicit remaining work is same-provider credential
+profiles and rotation: user-owned credential-source references, successful
+profile stickiness, bounded cooldowns, Retry-After-aware health, and rotation
+only for classified pre-output credential/rate-limit/quota failures before
+cross-model failover. Existing ChatGPT multi-account auth remains intact and
+unsupported private subscription credentials will not be borrowed.
+
+Evidence was rechecked against Microsoft first-party Azure v1 documentation on
+2026-10-02:
+https://learn.microsoft.com/en-us/azure/ai-foundry/openai/api-version-lifecycle
+https://learn.microsoft.com/en-us/azure/ai-services/reference/sdk-package-resources
 
 ### M4 product decisions
 

@@ -320,6 +320,127 @@ class TestEnterpriseCloudFlows:
             "ASH_MODEL": "bedrock/us.anthropic.model",
         }
 
+    def test_azure_entra_setup_verifies_identity_and_scrubs_saved_key(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, _flow_azure
+
+        events: list[str] = []
+
+        class Provider:
+            def __init__(self, model, *, base_url, auth_mode):
+                assert model == "credential-probe"
+                assert base_url == "https://resource.openai.azure.com/openai/v1"
+                assert auth_mode == "entra"
+
+            async def verify_credentials(self) -> None:
+                events.append("verified")
+
+            async def aclose(self) -> None:
+                events.append("closed")
+
+        monkeypatch.setattr("ash.providers.azure.AzureProvider", Provider)
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(
+                [
+                    "https://resource.openai.azure.com",
+                    "entra",
+                    "deployment-a",
+                ]
+            ),
+        )
+
+        with patch("ash.commands.setup.save_env_values") as save:
+            result = _flow_azure(
+                "",
+                SimpleNamespace(azure_base_url="", azure_auth_mode="entra"),
+            )
+
+        assert result == SetupOutcome.SUCCESS
+        assert events == ["verified", "closed"]
+        assert save.call_args.args[0] == {
+            "ASH_AZURE_BASE_URL": "https://resource.openai.azure.com/openai/v1",
+            "ASH_AZURE_AUTH_MODE": "entra",
+            "ASH_MODEL": "azure/deployment-a",
+            "AZURE_OPENAI_API_KEY": "",
+        }
+
+    def test_azure_api_key_setup_persists_selected_key(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, _flow_azure
+
+        monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(
+            "ash.commands.setup.getpass.getpass",
+            _FakeGetpass("azure-key"),
+        )
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(
+                [
+                    "https://resource.openai.azure.com",
+                    "api_key",
+                    "deployment-a",
+                ]
+            ),
+        )
+
+        with patch("ash.commands.setup.save_env_values") as save:
+            result = _flow_azure(
+                "",
+                SimpleNamespace(azure_base_url="", azure_auth_mode="entra"),
+            )
+
+        assert result == SetupOutcome.SUCCESS
+        assert save.call_args.args[0] == {
+            "ASH_AZURE_BASE_URL": "https://resource.openai.azure.com/openai/v1",
+            "ASH_AZURE_AUTH_MODE": "api_key",
+            "ASH_MODEL": "azure/deployment-a",
+            "AZURE_OPENAI_API_KEY": "azure-key",
+        }
+
+    def test_azure_entra_setup_fails_closed_on_credential_cleanup_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, _flow_azure
+
+        class Provider:
+            def __init__(self, model, *, base_url, auth_mode):
+                assert model == "credential-probe"
+                assert base_url == "https://resource.openai.azure.com/openai/v1"
+                assert auth_mode == "entra"
+
+            async def verify_credentials(self) -> None:
+                return None
+
+            async def aclose(self) -> None:
+                raise RuntimeError("close failed")
+
+        monkeypatch.setattr("ash.providers.azure.AzureProvider", Provider)
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(
+                [
+                    "https://resource.openai.azure.com",
+                    "entra",
+                ]
+            ),
+        )
+
+        with patch("ash.commands.setup.save_env_values") as save:
+            result = _flow_azure(
+                "",
+                SimpleNamespace(azure_base_url="", azure_auth_mode="entra"),
+            )
+
+        assert result == SetupOutcome.ERROR
+        save.assert_not_called()
+
 
 class TestOpenAIFlow:
     def test_custom_base_url_is_used_for_discovery_and_saved_atomically(
@@ -598,12 +719,17 @@ def test_enterprise_cloud_setup_status_uses_scope_not_api_key(
 
     vertex = get_provider_descriptor("vertex")
     bedrock = get_provider_descriptor("bedrock")
+    azure = get_provider_descriptor("azure")
     assert vertex is not None
     assert bedrock is not None
+    assert azure is not None
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
     monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
     monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
 
     assert (
         _provider_status(
@@ -624,6 +750,17 @@ def test_enterprise_cloud_setup_status_uses_scope_not_api_key(
     )
     assert _provider_status(SimpleNamespace(), vertex) == "needs project/location"
     assert _provider_status(SimpleNamespace(), bedrock) == "needs AWS region"
+    assert (
+        _provider_status(
+            SimpleNamespace(
+                azure_base_url="https://resource.openai.azure.com/openai/v1",
+                azure_auth_mode="entra",
+            ),
+            azure,
+        )
+        == "Entra scope configured"
+    )
+    assert _provider_status(SimpleNamespace(), azure) == "needs Azure endpoint"
 
 
 @pytest.mark.parametrize(
@@ -973,9 +1110,9 @@ def test_provider_catalog_render_exposes_full_breadth(
     _render_provider_catalog(config, list(PROVIDERS))
 
     output = capsys.readouterr().out
-    assert "Providers  ·  20 routes" in output
+    assert "Providers  ·  21 routes" in output
     assert "OpenRou" in output
-    assert "Hugging Face" in output
+    assert "Hugging" in output
     assert "Vercel AI Gateway" in output
     assert "Google Gemini" in output
     assert "Ollama" in output
@@ -1067,7 +1204,7 @@ def test_provider_catalog_has_compact_narrow_layout(
     )
 
     output = stream.getvalue()
-    assert "Providers  ·  20 routes" in output
+    assert "Providers  ·  21 routes" in output
     assert "OpenRouter" in output
     assert "Hugging Face" in output
     assert "Type" not in output

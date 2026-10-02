@@ -931,6 +931,20 @@ class AshConfig(BaseSettings):
             "Optional user-owned AWS shared-config profile for Amazon Bedrock."
         ),
     )
+    azure_base_url: str = Field(
+        "",
+        max_length=2048,
+        description=(
+            "User-owned Azure OpenAI / Foundry v1 resource or project endpoint."
+        ),
+    )
+    azure_auth_mode: str = Field(
+        "entra",
+        description=(
+            "User-owned Azure authentication route: entra or api_key. "
+            "Project configuration cannot set this field."
+        ),
+    )
     openai_auth_mode: str = Field(
         "api_key",
         description=(
@@ -1088,6 +1102,14 @@ class AshConfig(BaseSettings):
         normalized = value.strip().casefold()
         if normalized not in {"api_key", "chatgpt"}:
             raise ValueError("openai_auth_mode must be api_key or chatgpt")
+        return normalized
+
+    @field_validator("azure_auth_mode")
+    @classmethod
+    def validate_azure_auth_mode(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"entra", "api_key"}:
+            raise ValueError("azure_auth_mode must be entra or api_key")
         return normalized
 
     @field_validator(

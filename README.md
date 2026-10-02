@@ -87,6 +87,7 @@ Supported built-in routes include:
 | Google Gemini API | Gemini models through Google AI Studio's OpenAI-compatible endpoint |
 | Google Vertex AI | Enterprise OpenAI-compatible inference through explicit project/location scope and Google Application Default Credentials (gcp extra) |
 | Amazon Bedrock | Bedrock Runtime OpenAI Chat Completions through the AWS credential chain and SigV4 (aws extra) |
+| Azure OpenAI / Foundry | Azure v1 OpenAI-compatible inference through an API key or Microsoft Entra / managed identity (azure extra for Entra) |
 | OpenRouter | Multi-provider gateway routing |
 | Hugging Face | Inference Providers gateway to hundreds of hosted chat models |
 | Vercel AI Gateway | One API key for hundreds of routed models through an OpenAI-compatible gateway |
@@ -113,7 +114,7 @@ The provider layer also provides:
 - isolated named profiles for separate model, provider, credential, and SQLite
   runtime state; user-installed extensions, trust, and permission policy remain
   global to the Ash user;
-- ordered model failover before the first streamed response chunk;
+- ordered model failover only before the first retained model output/state;
 - one harness-owned retry policy for classified pre-output transient failures;
 - `Retry-After` handling, jittered exponential backoff, and provider-keyed
   circuit breakers with half-open recovery;
@@ -131,6 +132,12 @@ credential/profile chain through the official OpenAI Bedrock provider and the
 recommended bedrock-runtime endpoint. AWS native model/profile discovery is
 shown as candidate discovery only; ash providers test performs the bounded
 completion that actually verifies Runtime Chat Completions compatibility.
+Azure requires an explicit user-owned public Azure v1 resource/project endpoint;
+API-key mode works through the base install, while Entra/managed-identity mode
+uses the optional azure capability pack and Microsoft DefaultAzureCredential.
+The two Azure auth modes are isolated when Ash rebuilds providers in subprocess
+workers so stale API keys are not forwarded into Entra runs and Entra identity
+material is not forwarded into API-key runs.
 
 OpenAI additionally supports optional **Sign in with ChatGPT** for eligible
 ChatGPT plans. Run `ash auth chatgpt login` to register/sign in, inspect saved

@@ -84,7 +84,7 @@ jobs:
           version: "0.12.17"
           enable-cache: true
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --locked --group dev --extra server --extra browser --extra acp --extra a2a --extra aws --extra gcp --extra local-embeddings
+      - run: uv sync --locked --group dev --extra server --extra browser --extra acp --extra a2a --extra aws --extra azure --extra gcp --extra local-embeddings
       - run: uv run --locked pytest -v --timeout=120 --timeout-method=thread
 
   minimum-dependencies:

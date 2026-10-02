@@ -41,7 +41,15 @@ CatalogFormat = Literal[
     "fireworks",
     "huggingface",
 ]
-AuthMode = Literal["bearer", "anthropic", "none", "chatgpt", "adc", "aws_sigv4"]
+AuthMode = Literal[
+    "bearer",
+    "anthropic",
+    "none",
+    "chatgpt",
+    "adc",
+    "aws_sigv4",
+    "azure_entra",
+]
 MAX_PROVIDER_CATALOG_BYTES = 2_000_000
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
 GOOGLE_API_CLIENT_HEADER = f"ash-harness-oai/{__version__}"
@@ -91,6 +99,8 @@ class ProviderConnection:
             return "Google Application Default Credentials are configured"
         if self.auth_mode == "aws_sigv4":
             return "AWS credential-chain SigV4 authentication is configured"
+        if self.auth_mode == "azure_entra":
+            return "Microsoft Entra / managed identity authentication is configured"
         return "API key is configured"
 
 
@@ -333,13 +343,42 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
                     "AWS_EC2_METADATA_DISABLED",
                 }
             )
+        if provider == "azure":
+            keys.update({"AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_ENDPOINT"})
+            azure_auth_mode = str(
+                getattr(config, "azure_auth_mode", "entra") or "entra"
+            ).strip().casefold()
+            if azure_auth_mode == "api_key":
+                keys.add("AZURE_OPENAI_API_KEY")
+            else:
+                keys.update(
+                    {
+                        "AZURE_CLIENT_ID",
+                        "AZURE_TENANT_ID",
+                        "AZURE_CLIENT_SECRET",
+                        "AZURE_CLIENT_CERTIFICATE_PATH",
+                        "AZURE_CLIENT_CERTIFICATE_PASSWORD",
+                        "AZURE_CLIENT_SEND_CERTIFICATE_CHAIN",
+                        "AZURE_FEDERATED_TOKEN_FILE",
+                        "AZURE_AUTHORITY_HOST",
+                        "AZURE_TOKEN_CREDENTIALS",
+                        "AZURE_POD_IDENTITY_AUTHORITY_HOST",
+                        "IDENTITY_ENDPOINT",
+                        "IDENTITY_HEADER",
+                        "IDENTITY_SERVER_THUMBPRINT",
+                        "MSI_ENDPOINT",
+                        "MSI_SECRET",
+                        "IMDS_ENDPOINT",
+                    }
+                )
         if provider == "ollama":
             keys.add("OLLAMA_API_BASE")
         builtin = _BUILTIN_CONNECTIONS.get(provider)
         if builtin is not None:
             keys.add(builtin[1])
         key_envs = _BUILTIN_KEY_ENVS.get(provider, ())
-        keys.update(key_envs)
+        if provider != "azure":
+            keys.update(key_envs)
         custom = (
             custom_providers.get(provider)
             if isinstance(custom_providers, dict)
@@ -487,6 +526,45 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
             catalog_endpoint="",
             catalog_format="openai",
             auth_mode="aws_sigv4",
+            uses_default_base_url=True,
+        )
+    if provider == "azure":
+        from ash.providers.azure import normalize_azure_openai_base_url
+
+        azure_url = (
+            str(getattr(config, "azure_base_url", "") or "").strip()
+            or os.environ.get("AZURE_OPENAI_BASE_URL", "").strip()
+            or os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
+        )
+        try:
+            base_url = normalize_azure_openai_base_url(azure_url)
+        except ValueError as exc:
+            raise ProviderConfigurationError(str(exc)) from exc
+        auth_mode = str(
+            getattr(config, "azure_auth_mode", "entra") or "entra"
+        ).strip().casefold()
+        if auth_mode == "api_key":
+            api_key = _require_key(
+                "azure",
+                "AZURE_OPENAI_API_KEY",
+                os.environ.get("AZURE_OPENAI_API_KEY", ""),
+            )
+            resolved_auth_mode: AuthMode = "bearer"
+        elif auth_mode == "entra":
+            api_key = ""
+            resolved_auth_mode = "azure_entra"
+        else:
+            raise ProviderConfigurationError(
+                "Azure auth mode must be entra or api_key"
+            )
+        return ProviderConnection(
+            provider="azure",
+            model_name=model_name,
+            base_url=base_url,
+            catalog_endpoint="",
+            catalog_format="openai",
+            auth_mode=resolved_auth_mode,
+            api_key=api_key,
             uses_default_base_url=True,
         )
     if provider == "ollama":

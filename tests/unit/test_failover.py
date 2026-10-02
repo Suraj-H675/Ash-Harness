@@ -74,6 +74,71 @@ async def test_failover_never_replays_after_output() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "committed_chunk",
+    [
+        StreamChunk(reasoning=[{"type": "thinking", "thinking": "private"}]),
+        StreamChunk(reasoning_blocks=[{"type": "thinking", "thinking": "private"}]),
+        StreamChunk(
+            provider_state=[
+                {
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                }
+            ]
+        ),
+    ],
+)
+async def test_failover_never_replays_after_retained_provider_state(
+    committed_chunk: StreamChunk,
+) -> None:
+    class PartialProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            yield committed_chunk
+            raise ConnectionError("disconnected after retained state")
+
+    provider = FailoverProvider(
+        [PartialProvider("primary"), FakeProvider("backup")]
+    )
+    chunks: list[StreamChunk] = []
+
+    with pytest.raises(ConnectionError, match="disconnected after retained state"):
+        async for chunk in provider.stream_chat([]):
+            chunks.append(chunk)
+
+    assert chunks == [committed_chunk]
+    assert provider.model_name == "primary"
+
+
+@pytest.mark.asyncio
+async def test_failover_can_switch_after_usage_only_metadata() -> None:
+    class UsageOnlyProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            yield StreamChunk(
+                prompt_tokens=12,
+                completion_tokens=3,
+                usage_source="provider",
+                model="primary",
+                metadata={"request_id": "req-1"},
+            )
+            raise ConnectionError("disconnected before model output")
+
+    provider = FailoverProvider(
+        [UsageOnlyProvider("primary"), FakeProvider("backup")]
+    )
+
+    chunks = [chunk async for chunk in provider.stream_chat([])]
+
+    assert chunks[0].prompt_tokens == 12
+    assert chunks[-1].content == "backup"
+    assert provider.model_name == "backup"
+
+
+@pytest.mark.asyncio
 async def test_failover_failure_diagnostics_are_request_scoped() -> None:
     primary = FakeProvider("primary", error=RuntimeError("first"))
     backup = FakeProvider("backup", error=RuntimeError("second"))

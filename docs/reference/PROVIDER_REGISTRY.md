@@ -76,10 +76,22 @@ ListFoundationModels and ListInferenceProfiles results are candidate IDs because
 AWS API compatibility is model-specific; only the completion probe establishes
 that the selected ID supports Runtime Chat Completions.
 
-Project configuration cannot set Vertex project/location or Bedrock
-region/profile. These are user-owned controls, and isolated provider workers
-receive only the Google/AWS credential-chain environment required by an active
-or fallback enterprise route.
+The azure route uses Microsoft's GA OpenAI-compatible v1 surface. The user owns
+the exact public Azure resource/project endpoint and chooses either api_key or
+entra; project configuration cannot change either setting. API-key mode uses
+the ordinary OpenAI SDK path and needs no Azure SDK dependency. Entra mode uses
+the optional azure capability pack, constructs async DefaultAzureCredential,
+and passes Microsoft's async bearer-token provider into the same OpenAI adapter.
+Tokens are retained only in a bounded in-memory redaction window and are never
+written to Ash config or session storage. Ash owns and closes credentials it
+creates. Azure deployment/model IDs are explicit because Ash does not treat
+Azure's management-plane inventory as an authoritative OpenAI model catalog;
+ash providers test verifies the selected deployment with a bounded completion.
+
+Project configuration cannot set Vertex project/location, Bedrock
+region/profile, or Azure endpoint/auth mode. These are user-owned controls, and
+isolated provider workers receive only the cloud credential-chain environment
+required by an active or fallback enterprise route.
 
 Custom OpenAI-compatible provider records use `auth_mode = "bearer"` or
 `auth_mode = "none"`. Bearer mode requires its declared key source to be
@@ -113,8 +125,9 @@ implements an OpenAI-compatible HTTP API.
 Every provider request attempt is finite even for custom provider
 implementations. `provider_request_timeout_seconds` defaults to 1800 seconds
 and accepts values from 1 second through 24 hours. A timeout is eligible for
-Ash's normal provider retry path only when the attempt produced no output; once
-assistant/tool output has started, the request is never replayed automatically.
+Ash's normal provider retry path only when the attempt produced no retained
+model output/state; once text, tool output, reasoning, reasoning blocks, or
+provider replay state has started, the request is never replayed automatically.
 
 The core loop also bounds retained provider output independently of adapter
 behavior: one completion may retain at most 16 MiB across text, XML tool-call
@@ -148,10 +161,11 @@ ambiguous-alias, or different-model metadata keeps the conservative path.
 For routes with an authoritative model catalog, connectivity diagnostics must
 receive a successful catalog containing the selected model. A reachable catalog
 endpoint with an empty catalog or a different model is reported as not ready.
-Enterprise routes may have no authoritative OpenAI catalog: Vertex requires an
-explicit model ID, while Bedrock native discovery is candidate-only. For those
-routes, ash providers test treats a successful bounded completion as the
-authoritative readiness signal. ash setup remains the remediation path.
+Enterprise routes may have no authoritative OpenAI catalog: Vertex and Azure
+require an explicit model/deployment ID, while Bedrock native discovery is
+candidate-only. For those routes, ash providers test treats a successful
+bounded completion as the authoritative readiness signal. ash setup remains the
+remediation path.
 
 Provider registration executes trusted Python code in the Ash host. It is an
 embedding API, not the future untrusted plugin ABI. Out-of-process plugins must

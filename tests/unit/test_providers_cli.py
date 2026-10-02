@@ -108,15 +108,18 @@ def test_provider_catalog_is_secret_free_and_includes_local_and_gateway_routes()
         "vllm",
         "vertex",
         "bedrock",
+        "azure",
     } <= provider_ids
     assert all("API_KEY" not in json.dumps(item) or item["key_env"] for item in payload["providers"])
     google = next(item for item in payload["providers"] if item["id"] == "google")
     openai = next(item for item in payload["providers"] if item["id"] == "openai")
     vertex = next(item for item in payload["providers"] if item["id"] == "vertex")
     bedrock = next(item for item in payload["providers"] if item["id"] == "bedrock")
+    azure = next(item for item in payload["providers"] if item["id"] == "azure")
     assert openai["auth"] == "api-key-or-chatgpt"
     assert vertex["auth"] == "google-adc"
     assert bedrock["auth"] == "aws-sigv4"
+    assert azure["auth"] == "azure-key-or-entra"
     assert google["key_env"] == "GOOGLE_API_KEY"
     assert google["key_envs"] == ["GOOGLE_API_KEY", "GEMINI_API_KEY"]
     rendered = render_provider_catalog()
@@ -125,6 +128,8 @@ def test_provider_catalog_is_secret_free_and_includes_local_and_gateway_routes()
     assert "lmstudio" in rendered
     assert "GOOGLE_API_KEY" in rendered
     assert "GEMINI_API_KEY" in rendered
+    assert "API key /" in rendered
+    assert "Entra" in rendered
 
 
 def test_provider_test_rendering_never_includes_credentials() -> None:
@@ -369,6 +374,36 @@ def test_bedrock_provider_test_uses_completion_as_authority(
     assert result.selected_model_available is False
     assert result.catalog_authoritative is False
     assert result.models == ("us.anthropic.model",)
+    assert result.completion_attempted is True
+    assert result.completion_verified is True
+    assert result.ready_to_use is True
+
+
+def test_azure_provider_test_uses_completion_as_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import providers
+    from ash.config import AshConfig
+
+    provider = _ScriptedProbeProvider(
+        chunks=[
+            StreamChunk(content="OK"),
+            StreamChunk(is_done=True, stop_reason="stop"),
+        ]
+    )
+    _install_probe_provider(monkeypatch, provider)
+    config = AshConfig(
+        model="azure/deployment-a",
+        azure_base_url="https://resource.openai.azure.com/openai/v1",
+        azure_auth_mode="entra",
+    )
+
+    result = providers.test_provider(config, timeout=1.0)
+
+    assert result.connection.provider == "azure"
+    assert result.selected_model_available is False
+    assert result.catalog_authoritative is False
+    assert result.models == ("deployment-a",)
     assert result.completion_attempted is True
     assert result.completion_verified is True
     assert result.ready_to_use is True

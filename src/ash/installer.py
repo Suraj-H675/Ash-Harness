@@ -37,6 +37,7 @@ SUPPORTED_EXTRAS = (
     "a2a",
     "acp",
     "aws",
+    "azure",
     "browser",
     "gcp",
     "local-embeddings",
