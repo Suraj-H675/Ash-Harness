@@ -738,6 +738,29 @@ async def test_ollama_stream_chat_handles_chunked_ndjson_and_usage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ollama_preserves_streamed_thinking_on_terminal_chunk() -> None:
+    lines = [
+        b'{"message":{"content":"","thinking":"consider "},"done":false}\n',
+        b'{"message":{"content":"","thinking":"carefully"},"done":false}\n',
+        b'{"message":{"content":"answer","thinking":""},"done":true,'
+        b'"done_reason":"stop"}\n',
+    ]
+    provider = OllamaProvider(
+        model_name="thinking-model",
+        client=_FakeOllamaClient(b"", chunks=lines),  # type: ignore[arg-type]
+    )
+
+    chunks = [chunk async for chunk in provider.stream_chat([])]
+
+    assert chunks[0].reasoning is None
+    assert chunks[1].reasoning is None
+    assert chunks[-1].reasoning == [
+        {"type": "thinking", "thinking": "consider carefully"}
+    ]
+    assert chunks[-1].content == "answer"
+
+
+@pytest.mark.asyncio
 async def test_ollama_rejects_an_oversized_stream(monkeypatch) -> None:
     monkeypatch.setattr("ash.providers.ollama.MAX_OLLAMA_STREAM_BYTES", 8)
     provider = OllamaProvider(
@@ -801,6 +824,67 @@ async def test_ollama_detects_tools_and_context_from_model_metadata():
     assert again is capabilities
     assert provider.capabilities.native_tools is True
     assert provider.capabilities.context_window == 32768
+
+
+@pytest.mark.asyncio
+async def test_ollama_prefers_declared_capabilities_and_architecture_context():
+    class CurrentMetadataClient:
+        @asynccontextmanager
+        async def stream(self, *args, **kwargs):
+            yield httpx.Response(
+                200,
+                json={
+                    "capabilities": ["completion", "tools", "vision", "thinking"],
+                    "thinking": {
+                        "values": [False, "low", "medium", "high"],
+                        "default": "medium",
+                    },
+                    "model_info": {
+                        "general.architecture": "llama",
+                        "llama.context_length": 131072,
+                    },
+                },
+            )
+
+    provider = OllamaProvider(
+        model_name="current-model",
+        client=CurrentMetadataClient(),  # type: ignore[arg-type]
+    )
+
+    capabilities = await provider.detect_capabilities()
+
+    assert capabilities.native_tools is True
+    assert capabilities.vision is True
+    assert capabilities.reasoning is True
+    assert capabilities.local is True
+    assert capabilities.context_window == 131072
+
+
+@pytest.mark.asyncio
+async def test_ollama_malformed_declared_capabilities_fail_conservative():
+    class MalformedMetadataClient:
+        @asynccontextmanager
+        async def stream(self, *args, **kwargs):
+            yield httpx.Response(
+                200,
+                json={
+                    "capabilities": {"tools": True},
+                    "details": {"families": ["tools"]},
+                    "template": "Use {{ .ToolCall }}",
+                },
+            )
+
+    provider = OllamaProvider(
+        model_name="malformed-model",
+        client=MalformedMetadataClient(),  # type: ignore[arg-type]
+    )
+
+    capabilities = await provider.detect_capabilities()
+
+    assert capabilities.native_tools is False
+    assert capabilities.vision is False
+    assert capabilities.reasoning is False
+    assert capabilities.local is True
 
 
 class _StaticAsyncClient:

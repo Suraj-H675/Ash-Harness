@@ -5894,6 +5894,59 @@ async def test_failover_turn_prices_each_completion_by_serving_model(tmp_path) -
     assert store.get_session_usage(session.session_id).cost_usd == pytest.approx(expected)
 
 
+@pytest.mark.asyncio
+async def test_failover_model_events_identify_requested_and_serving_provider(
+    tmp_path,
+) -> None:
+    class PrimaryProvider(ProviderABC):
+        model_name = "primary"
+        provider_family = "anthropic"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            raise ConnectionError("primary unavailable")
+            yield  # pragma: no cover
+
+    class BackupProvider(ProviderABC):
+        model_name = "backup"
+        provider_family = "openai"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="backup", is_done=True, stop_reason="stop")
+
+    provider = FailoverProvider([PrimaryProvider(), BackupProvider()])
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "failover-events.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+        config=AshConfig(model="anthropic/primary"),
+    )
+
+    assert (await loop._stream_one_completion([])).text == "backup"
+    assert (await loop._stream_one_completion([])).text == "backup"
+
+    started = [event for event in ui.events if event["type"] == "model.request.started"]
+    completed = [
+        event for event in ui.events if event["type"] == "model.request.completed"
+    ]
+    assert [(event["provider"], event["model"]) for event in started] == [
+        ("anthropic", "anthropic/primary"),
+        ("anthropic", "anthropic/primary"),
+    ]
+    assert [(event["provider"], event["model"]) for event in completed] == [
+        ("openai", "openai/backup"),
+        ("openai", "openai/backup"),
+    ]
+
+
 def test_empty_model_pricing_entry_falls_back_to_provider_family(tmp_path) -> None:
     class FamilyProvider(ProviderABC):
         model_name = "test"

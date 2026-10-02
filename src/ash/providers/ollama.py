@@ -83,29 +83,69 @@ class OllamaProvider(ProviderABC):
                     if not isinstance(families, list):
                         families = []
                     template = str(payload.get("template", "")).casefold()
-                    supports_tools = any(
-                        family in {"tools", "function-calling"}
-                        for family in families
-                    ) or any(
-                        marker in template
-                        for marker in ("tool_call", "tools", "function_call")
+                    raw_capabilities = payload.get("capabilities")
+                    if raw_capabilities is None:
+                        declared_capabilities = None
+                    elif isinstance(raw_capabilities, list):
+                        declared_capabilities = {
+                            item.casefold()
+                            for item in raw_capabilities
+                            if isinstance(item, str)
+                        }
+                    else:
+                        declared_capabilities = set()
+                    supports_tools = (
+                        "tools" in declared_capabilities
+                        if declared_capabilities is not None
+                        else any(
+                            family in {"tools", "function-calling"}
+                            for family in families
+                        )
+                        or any(
+                            marker in template
+                            for marker in ("tool_call", "tools", "function_call")
+                        )
                     )
+                    supports_vision = bool(
+                        declared_capabilities
+                        and "vision" in declared_capabilities
+                    )
+                    supports_reasoning = bool(
+                        declared_capabilities
+                        and "thinking" in declared_capabilities
+                    )
+                    thinking = payload.get("thinking")
+                    if isinstance(thinking, dict):
+                        values = thinking.get("values")
+                        if isinstance(values, list) and any(
+                            value is True
+                            or (isinstance(value, str) and bool(value.strip()))
+                            for value in values
+                        ):
+                            supports_reasoning = True
                     model_info = payload.get("model_info")
-                    context_window = (
-                        model_info.get("general.context_length")
+                    context_windows = (
+                        [
+                            value
+                            for key, value in model_info.items()
+                            if isinstance(key, str)
+                            and (
+                                key == "general.context_length"
+                                or key.endswith(".context_length")
+                            )
+                            and isinstance(value, int)
+                            and not isinstance(value, bool)
+                            and value > 0
+                        ]
                         if isinstance(model_info, dict)
-                        else None
+                        else []
                     )
                     self._dynamic_capabilities = ProviderCapabilities(
                         native_tools=bool(supports_tools),
+                        vision=supports_vision,
+                        reasoning=supports_reasoning,
                         local=True,
-                        context_window=(
-                            int(context_window)
-                            if isinstance(context_window, int)
-                            and not isinstance(context_window, bool)
-                            and context_window > 0
-                            else None
-                        ),
+                        context_window=min(context_windows) if context_windows else None,
                     )
         except Exception:  # noqa: BLE001 - capability probing is best-effort
             pass
@@ -152,6 +192,7 @@ class OllamaProvider(ProviderABC):
         pending_tool_calls: list[tuple[CanonicalToolCall, bool]] = []
         explicit_tool_call_ids: set[str] = set()
         tool_call_sequence = 0
+        thinking_parts: list[str] = []
         client = self._resolve_client()
         try:
             async with client.stream(
@@ -179,6 +220,13 @@ class OllamaProvider(ProviderABC):
                         raise RuntimeError(
                             "Ollama stream contained non-text message content"
                         )
+                    thinking = message.get("thinking", "")
+                    if not isinstance(thinking, str):
+                        raise RuntimeError(
+                            "Ollama stream contained non-text thinking content"
+                        )
+                    if thinking:
+                        thinking_parts.append(thinking)
                     is_done = data.get("done", False)
                     if not isinstance(is_done, bool):
                         raise RuntimeError(
@@ -254,6 +302,11 @@ class OllamaProvider(ProviderABC):
                         native_tool_calls=(
                             [call for call, _ in pending_tool_calls]
                             if is_done
+                            else None
+                        ),
+                        reasoning=(
+                            [{"type": "thinking", "thinking": "".join(thinking_parts)}]
+                            if is_done and thinking_parts
                             else None
                         ),
                     )

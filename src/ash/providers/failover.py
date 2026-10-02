@@ -51,21 +51,23 @@ class FailoverProvider(ProviderABC):
     @property
     def capabilities(self) -> ProviderCapabilities:
         capabilities = [provider.capabilities for provider in self.providers]
-        context_windows = [
-            item.context_window for item in capabilities if item.context_window is not None
-        ]
-        output_limits = [
-            item.max_output_tokens
-            for item in capabilities
-            if item.max_output_tokens is not None
-        ]
+        context_windows = [item.context_window for item in capabilities]
+        output_limits = [item.max_output_tokens for item in capabilities]
         return ProviderCapabilities(
             native_tools=all(item.native_tools for item in capabilities),
             vision=all(item.vision for item in capabilities),
             reasoning=all(item.reasoning for item in capabilities),
             local=all(item.local for item in capabilities),
-            context_window=min(context_windows) if context_windows else None,
-            max_output_tokens=min(output_limits) if output_limits else None,
+            context_window=(
+                min(value for value in context_windows if value is not None)
+                if all(value is not None for value in context_windows)
+                else None
+            ),
+            max_output_tokens=(
+                min(value for value in output_limits if value is not None)
+                if all(value is not None for value in output_limits)
+                else None
+            ),
         )
 
     def count_tokens(self, text: str) -> int:
@@ -119,6 +121,8 @@ class FailoverProvider(ProviderABC):
         last_error: Exception | None = None
         failures: list[str] = []
         for index, provider in enumerate(self.providers):
+            self.active_index = index
+            self.provider_family = provider.provider_family
             emitted_output = False
             exposed_terminal = False
             saw_terminal = False
@@ -142,8 +146,6 @@ class FailoverProvider(ProviderABC):
                     emitted_output = emitted_output or has_output
                     saw_terminal = saw_terminal or chunk.is_done
                     exposed_terminal = exposed_terminal or chunk.is_done
-                    self.active_index = index
-                    self.provider_family = provider.provider_family
                     yield chunk
                 if not saw_terminal:
                     raise ProviderIncompleteStreamError(

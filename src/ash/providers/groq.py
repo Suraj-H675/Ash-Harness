@@ -17,6 +17,7 @@ from ash.providers.messages import CanonicalToolCall, MessageInput
 from ash.providers.openai import (
     _owned_openai_http_client,
     account_openai_compatible_stream_bytes,
+    openai_compatible_reasoning_delta,
     prepare_openai_messages,
 )
 from ash.providers.readiness import (
@@ -99,6 +100,7 @@ class GroqProvider(ProviderABC):
         partials: dict[int, Any] = {}
         completed: list[CanonicalToolCall] = []
         stream_bytes = 0
+        reasoning_parts: list[str] = []
 
         async for chunk in stream:
             choices = getattr(chunk, "choices", None) or []
@@ -122,6 +124,14 @@ class GroqProvider(ProviderABC):
             stream_bytes = account_openai_compatible_stream_bytes(
                 stream_bytes, content, provider="Groq"
             )
+            reasoning_delta = openai_compatible_reasoning_delta(
+                delta, provider="Groq"
+            )
+            if reasoning_delta:
+                stream_bytes = account_openai_compatible_stream_bytes(
+                    stream_bytes, reasoning_delta, provider="Groq"
+                )
+                reasoning_parts.append(reasoning_delta)
             is_done = choice.finish_reason is not None
             prompt_tokens = 0
             completion_tokens = 0
@@ -172,8 +182,15 @@ class GroqProvider(ProviderABC):
                 ),
                 stop_reason=stop_reason,
                 native_tool_calls=list(completed) if completed else None,
+                reasoning=(
+                    [{"type": "thinking", "thinking": "".join(reasoning_parts)}]
+                    if is_done and reasoning_parts
+                    else None
+                ),
             )
             completed.clear()
+            if is_done:
+                reasoning_parts.clear()
 
     async def aclose(self) -> None:
         client = self._client

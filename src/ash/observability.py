@@ -381,6 +381,8 @@ class OpenTelemetryEventObserver:
         state = self._model_spans.pop(operation_id, None)
         if state is not None:
             state.span.set_attribute("ash.outcome", outcome)
+            state.span.set_attribute("gen_ai.provider.name", provider or "custom")
+            state.span.set_attribute("gen_ai.response.model", model)
             if outcome == "error":
                 error_type = self._safe_string(event.get("error_type"), maximum=256)
                 if error_type:

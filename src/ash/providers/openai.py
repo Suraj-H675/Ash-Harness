@@ -37,6 +37,19 @@ def account_openai_compatible_stream_bytes(
     return total
 
 
+def openai_compatible_reasoning_delta(delta: Any, *, provider: str) -> str:
+    """Return current or legacy reasoning text from one completion delta."""
+
+    value = getattr(delta, "reasoning", None)
+    if value is None or value == "":
+        value = getattr(delta, "reasoning_content", None)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise RuntimeError(f"{provider} stream contained non-text reasoning")
+    return value
+
+
 class _PartialToolCall:
     """Accumulates a streaming tool call's name + arguments until complete."""
 
@@ -237,6 +250,7 @@ class OpenAIProvider(ProviderABC):
         # Completed native tool calls ready to emit.
         completed: list[CanonicalToolCall] = []
         stream_bytes = 0
+        reasoning_parts: list[str] = []
 
         async for chunk in stream:
             choices = getattr(chunk, "choices", None) or []
@@ -260,6 +274,14 @@ class OpenAIProvider(ProviderABC):
             stream_bytes = account_openai_compatible_stream_bytes(
                 stream_bytes, content, provider="OpenAI"
             )
+            reasoning_delta = openai_compatible_reasoning_delta(
+                delta, provider="OpenAI"
+            )
+            if reasoning_delta:
+                stream_bytes = account_openai_compatible_stream_bytes(
+                    stream_bytes, reasoning_delta, provider="OpenAI"
+                )
+                reasoning_parts.append(reasoning_delta)
             is_done = choice.finish_reason is not None
             prompt_tokens = 0
             completion_tokens = 0
@@ -325,9 +347,16 @@ class OpenAIProvider(ProviderABC):
                 # Yield a COPY so completed.clear() after yield doesn't affect
                 # the StreamChunk's reference.
                 native_tool_calls=list(completed) if completed else None,
+                reasoning=(
+                    [{"type": "thinking", "thinking": "".join(reasoning_parts)}]
+                    if is_done and reasoning_parts
+                    else None
+                ),
             )
             # Clear emitted calls so they are not yielded again.
             completed.clear()
+            if is_done:
+                reasoning_parts.clear()
 
     async def aclose(self) -> None:
         client = self._client

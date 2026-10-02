@@ -362,6 +362,22 @@ def test_resolve_local_openai_compatible_provider_never_requires_a_key(
     assert result.headers == {}
 
 
+def test_verify_ollama_connection_accepts_implicit_latest_tag(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"models": [{"name": "llama3:latest"}]},
+            request=request,
+        ),
+    )
+
+    result = verify_provider_connection(_config("ollama/llama3"))
+
+    assert result.models == ("llama3:latest",)
+    assert result.selected_model_available is True
+
+
 def test_probe_model_catalog_metadata_preserves_mistral_capabilities(monkeypatch) -> None:
     patch_catalog_client(
         monkeypatch,

@@ -75,9 +75,164 @@ reopening already-verified areas mechanically.
    benchmark no longer identifies a material core-harness weakness that should
    be fixed before calling Ash first-class and production-worthy.
 
-Current gate state: **M1-M5 are closed/current.** Partial capability rows below
-remain deliberately qualified and do not imply broader support than their
-recorded evidence.
+Current production-foundation gate state: **M1-M5 are closed/current.** They
+establish that Ash is production-worthy within its documented terminal
+coding-harness scope; they do **not** establish literal whole-product parity
+with every leading harness. Partial capability rows below remain deliberately
+qualified and do not imply broader support than their recorded evidence.
+
+## Whole-Product Leading-Harness Parity Program
+
+The next finite program asks a stronger question than M1-M5:
+
+> Is there any important user need for which a leading current harness makes
+> Ash materially second-rate, unless Ash deliberately and defensibly chooses a
+> different product boundary?
+
+This is not a feature-count exercise. A comparator capability closes a gap when
+Ash matches or exceeds the underlying user outcome, solves it differently with
+comparable quality, or explicitly rejects it after current evidence shows that
+it would not materially improve Ash. A gate is not closed merely because a
+document says so; current implementation, realistic tests, real service/runtime
+evidence where warranted, and truthful user-facing claims must support closure.
+
+The program is intentionally finite:
+
+0. **P0 — Production foundation — CLOSED.** M1-M5, immutable release
+   ash-v0.1.0, supported-host CI, packaging/install/repair, safety,
+   recovery, observability, and production-core evidence remain the completed
+   baseline. Reopen P0 only for new contradictory evidence or a regression that
+   directly invalidates that baseline.
+1. **P1 — Provider/model parity — OPEN.** Close material gaps in provider
+   breadth and correctness, authentication/subscription paths, discovery and
+   switching, capability metadata, tool/reasoning/multimodal semantics,
+   streaming/cancellation, usage/cost normalization, failover/routing, local
+   runtimes, onboarding, and real-provider/runtime conformance. Closure requires
+   a current comparator pass plus enough real vendor/runtime evidence for every
+   support claim that materially depends on external behavior.
+2. **P2 — Agent/workspace parity — NOT STARTED.** Evaluate and close material
+   gaps in subagent orchestration, durable/background work, worktree/workspace
+   isolation, delegation, steering, recovery, remote execution where it solves
+   real coding workflows, and multi-workspace ergonomics.
+3. **P3 — Web/computer interaction parity — NOT STARTED.** Evaluate browser
+   control breadth, signed-in browser workflows, web research/fetch ergonomics,
+   browser attachment/remote operation, and whether general computer use is a
+   justified Ash capability rather than copying broader assistant products.
+4. **P4 — Extensibility/ecosystem parity — NOT STARTED.** Evaluate plugins,
+   skills, MCP, hooks, custom commands, discovery, installation, updating,
+   provenance/trust, and marketplace/ecosystem experience. Hosted ecosystem
+   breadth is work only when it materially improves real Ash usage.
+5. **P5 — Interfaces and anywhere-access parity — NOT STARTED.** Determine
+   whether remote access, web UI, messaging surfaces, companion clients, or
+   other access modalities solve important Ash workflows; implement justified
+   gaps and explicitly reject unrelated product categories.
+6. **P6 — User-experience parity — NOT STARTED.** Benchmark the complete
+   journey from installation and onboarding through model selection, coding,
+   approvals, sessions, debugging, interruption/recovery, updates, and
+   troubleshooting. Close material friction even when the underlying backend
+   capability already exists.
+7. **P7 — Final adversarial comparator pass — NOT STARTED.** Re-run current
+   evidence against the strongest relevant harnesses, including OpenClaw,
+   Hermes, Claude Code, Codex CLI, Gemini CLI, OpenCode, Aider, and any newer
+   serious comparator. Confirm no material user-value gap was missed or hidden
+   by Ash's existing architecture or docs.
+8. **P8 — Whole-product parity decision gate — NOT STARTED.** Every remaining
+   material comparator advantage must be classified with evidence as
+   matched/exceeded, solved differently to comparable quality, explicitly
+   out-of-scope for a defensible product reason, or still open. Only when no
+   important unresolved user need remains may Ash claim whole-product
+   leading-harness parity. Literal feature identity is never the criterion.
+
+**Active gate: P1 — Provider/model parity.** Do not start P2 merely because P1
+work is slow or because another interesting gap is discovered. Record
+cross-gate findings for later and close P1 first.
+
+### P1 finite closure checklist
+
+P1 is split into bounded sub-gates so provider work cannot become an endless
+catalog-expansion exercise:
+
+1. **P1A — Provider and enterprise route coverage — OPEN.** Re-evaluate the
+   direct providers, gateways, and enterprise-hosted model routes that serious
+   coding-harness users actually need. Ash already covers Anthropic, OpenAI,
+   Google AI Studio, OpenRouter, Hugging Face Inference Providers, Vercel AI
+   Gateway, DeepSeek, Groq, Mistral, xAI, Together, Fireworks, Cerebras,
+   NVIDIA, Ollama, LM Studio, vLLM, and explicit custom OpenAI-compatible
+   endpoints. Current comparator evidence makes enterprise cloud routes such as
+   Amazon Bedrock and Google Vertex AI a real remaining question rather than a
+   provider-count target. Add only routes whose governance, billing, deployment,
+   or authentication value cannot already be met cleanly through Ash's existing
+   surfaces.
+2. **P1B — Authentication and credential resilience — OPEN.** Preserve the
+   verified ChatGPT-plan multi-account path and cross-provider model fallback,
+   then close any material same-provider credential/profile rotation,
+   subscription/OAuth, expiry, quota, or account-selection gap. Do not borrow
+   another product's private credentials or unsupported OAuth flow merely to
+   increase auth-method count.
+3. **P1C — Model discovery and capability semantics — OPEN.** Verify that
+   model catalogs, aliases, context/output limits, vision, reasoning, native
+   tools, usage, prompt caching, streaming terminal semantics, and model
+   switching remain provider-owned and fail conservatively when metadata is
+   absent or contradictory. Fix concrete incorrect assumptions rather than
+   hard-coding fast-changing model lists.
+4. **P1D — Local runtime parity — OPEN.** Close the material difference between
+   merely connecting to Ollama/LM Studio/vLLM and a strong local-model user
+   journey. Decide with evidence whether Ash should manage runtime/model
+   lifecycle itself or integrate cleanly with runtime-owned lifecycle commands;
+   validate capability discovery, context sizing, tool calling, streaming,
+   cancellation, health/readiness, and realistic coding turns on supported
+   local runtimes.
+5. **P1E — Real service/runtime conformance and claims — OPEN.** Run the
+   smallest set of live provider/runtime journeys that materially changes
+   confidence, keep unsupported claims qualified, and finish with a current
+   comparator pass. P1 closes only when no important provider/model user need
+   remains materially weaker without a deliberate product reason.
+
+Work P1A-P1E in evidence-driven slices; several may advance together when one
+implementation legitimately spans them, but do not declare P1 closed until all
+five are resolved.
+
+### P1 progress — provider correctness slice 1
+
+The first P1 implementation slice fixed confirmed correctness gaps in provider
+surfaces Ash already claims rather than expanding the catalog for feature-count
+parity:
+
+- OpenAI-compatible streaming now preserves current `reasoning` and legacy
+  `reasoning_content` deltas as bounded canonical reasoning instead of silently
+  dropping them. The shared path covers the generic OpenAI-compatible adapter,
+  DeepSeek, and Groq while retaining Ash's existing no-replay-after-output
+  boundary by exposing the accumulated reasoning only with the provider's
+  terminal chunk.
+- DeepSeek usage now preserves provider-reported prompt-cache hits so cached
+  input is not treated as ordinary uncached input by downstream accounting.
+- Ollama capability negotiation consumes current declared tool, vision, and
+  thinking metadata, retains older metadata/template probing only when the
+  current capability field is absent, fails conservatively on malformed
+  declared capability metadata, accepts architecture-qualified context-length
+  metadata, preserves streamed `message.thinking`, and treats an omitted model
+  tag as the documented `:latest` alias during readiness verification.
+- Failover capability aggregation no longer advertises a context or output
+  ceiling when any child limit is unknown. Failover also binds active
+  provider/model identity before each child attempt, so runtime events,
+  pricing selection, and observability identify the provider that actually
+  served a successful backup rather than pairing the primary identity with a
+  backup model. OpenTelemetry retains the requested model separately from the
+  response model.
+
+Focused validation after the final boundary changes passes **165 provider,
+readiness, failover, and observability tests**. The complete affected
+core-loop/failover files additionally pass **184 tests**. Ruff, targeted Mypy,
+and `git diff --check` are green.
+
+This slice advances P1C/P1D/P1E but does not close them. Explicitly remaining:
+unified live model discovery/switching across API-key and ChatGPT-plan auth,
+provider-owned capability truth for fast-changing hosted models rather than
+stale name heuristics, correct representation of unknown model pricing instead
+of implying zero cost, the P1A enterprise-route decision, P1B same-provider
+credential/account resilience, supported local-runtime lifecycle and real
+Ollama/LM Studio/vLLM conformance, and adapter-level cancellation/stream-cleanup
+verification.
 
 ### M4 product decisions
 

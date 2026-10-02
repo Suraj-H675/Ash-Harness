@@ -903,12 +903,24 @@ def _openai_chunk(
     content: str = "",
     finish_reason: str | None = None,
     usage: Any = None,
+    reasoning: str | None = None,
+    reasoning_content: str | None = None,
 ) -> Any:
     choices = []
-    if finish_reason is not None or content:
+    if (
+        finish_reason is not None
+        or content
+        or reasoning is not None
+        or reasoning_content is not None
+    ):
+        delta = SimpleNamespace(content=content, tool_calls=None)
+        if reasoning is not None:
+            delta.reasoning = reasoning
+        if reasoning_content is not None:
+            delta.reasoning_content = reasoning_content
         choices.append(
             SimpleNamespace(
-                delta=SimpleNamespace(content=content, tool_calls=None),
+                delta=delta,
                 finish_reason=finish_reason,
             )
         )
@@ -1012,6 +1024,120 @@ async def test_openai_prompt_cache_and_usage_only_chunk() -> None:
 
     await provider.aclose()
     assert client.closed is False
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "reasoning_field"),
+    [
+        ("openai", "reasoning"),
+        ("deepseek", "reasoning_content"),
+        ("groq", "reasoning"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_openai_compatible_providers_preserve_streamed_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_name: str,
+    reasoning_field: str,
+) -> None:
+    from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.groq import GroqProvider
+    from ash.providers.openai import OpenAIProvider
+
+    client = _FakeOpenAIClient(
+        [
+            _openai_chunk(**{reasoning_field: "consider "}),
+            _openai_chunk(**{reasoning_field: "carefully"}),
+            _openai_chunk(content="answer", finish_reason="stop"),
+        ]
+    )
+    if provider_name == "openai":
+        provider = OpenAIProvider("test", "key", client=client)
+    elif provider_name == "deepseek":
+        monkeypatch.setattr(
+            "ash.providers.deepseek.openai.AsyncOpenAI", lambda **_: client
+        )
+        provider = DeepSeekProvider("test", "key")
+    else:
+        monkeypatch.setattr("ash.providers.groq.openai.AsyncOpenAI", lambda **_: client)
+        provider = GroqProvider("test", "key")
+
+    chunks = [chunk async for chunk in provider.stream_chat([])]
+
+    assert chunks[0].reasoning is None
+    assert chunks[1].reasoning is None
+    assert chunks[-1].reasoning == [
+        {"type": "thinking", "thinking": "consider carefully"}
+    ]
+    assert chunks[-1].content == "answer"
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_reasoning_counts_toward_stream_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.providers.openai as openai_module
+    from ash.providers.openai import OpenAIProvider
+
+    monkeypatch.setattr(openai_module, "MAX_OPENAI_COMPATIBLE_STREAM_BYTES", 8)
+    provider = OpenAIProvider(
+        "test",
+        "key",
+        client=_FakeOpenAIClient([_openai_chunk(reasoning="x" * 9)]),
+    )
+
+    with pytest.raises(RuntimeError, match="OpenAI stream exceeded 8 bytes"):
+        _ = [chunk async for chunk in provider.stream_chat([])]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_rejects_non_text_reasoning() -> None:
+    from ash.providers.openai import OpenAIProvider
+
+    delta = SimpleNamespace(content="", tool_calls=None, reasoning={"bad": "shape"})
+    chunk = SimpleNamespace(
+        choices=[SimpleNamespace(delta=delta, finish_reason=None)],
+        usage=None,
+    )
+    provider = OpenAIProvider(
+        "test",
+        "key",
+        client=_FakeOpenAIClient([chunk]),
+    )
+
+    with pytest.raises(RuntimeError, match="non-text reasoning"):
+        _ = [item async for item in provider.stream_chat([])]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_preserves_provider_cache_read_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.deepseek import DeepSeekProvider
+
+    usage = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=20,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=60),
+        prompt_cache_hit_tokens=60,
+    )
+    client = _FakeOpenAIClient(
+        [
+            _openai_chunk(content="answer"),
+            _openai_chunk(finish_reason="stop", usage=usage),
+        ]
+    )
+    monkeypatch.setattr(
+        "ash.providers.deepseek.openai.AsyncOpenAI", lambda **_: client
+    )
+    provider = DeepSeekProvider("deepseek-reasoner", "key")
+
+    chunks = [chunk async for chunk in provider.stream_chat([])]
+
+    assert chunks[-1].prompt_tokens == 100
+    assert chunks[-1].completion_tokens == 20
+    assert chunks[-1].cache_read_tokens == 60
+    assert chunks[-1].usage_source == "provider"
 
 
 @pytest.mark.parametrize(

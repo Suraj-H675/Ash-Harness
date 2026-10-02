@@ -356,6 +356,33 @@ def test_failover_capabilities_are_conservative_across_entire_chain() -> None:
     )
 
 
+def test_failover_keeps_limits_unknown_when_any_child_limit_is_unknown() -> None:
+    class CapProvider(FakeProvider):
+        def __init__(self, name: str, caps: ProviderCapabilities) -> None:
+            super().__init__(name)
+            self._caps = caps
+
+        @property
+        def capabilities(self):
+            return self._caps
+
+    provider = FailoverProvider(
+        [
+            CapProvider(
+                "known",
+                ProviderCapabilities(
+                    context_window=128_000,
+                    max_output_tokens=8_000,
+                ),
+            ),
+            CapProvider("unknown", ProviderCapabilities()),
+        ]
+    )
+
+    assert provider.capabilities.context_window is None
+    assert provider.capabilities.max_output_tokens is None
+
+
 def test_failover_token_count_uses_conservative_maximum_across_chain() -> None:
     class TokenProvider(FakeProvider):
         def __init__(self, name: str, multiplier: int) -> None:

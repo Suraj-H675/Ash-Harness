@@ -816,6 +816,13 @@ def verify_provider_connection(
     )
     models = tuple(item.model_id for item in metadata)
     selected = select_provider_model_metadata(metadata, connection.model_name)
+    if selected is None and connection.provider == "ollama":
+        final_segment = connection.model_name.rsplit("/", 1)[-1]
+        if ":" not in final_segment:
+            selected = select_provider_model_metadata(
+                metadata,
+                f"{connection.model_name}:latest",
+            )
     return ProviderVerification(
         connection=connection,
         models=models,

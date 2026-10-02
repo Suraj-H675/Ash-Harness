@@ -741,6 +741,23 @@ def _provider_model_id(
     return f"{family}/{model_name}"
 
 
+def _provider_request_identity(
+    provider: ProviderABC, configured_model: str | None = None
+) -> tuple[str, str]:
+    """Return the provider/model that a new request will try first."""
+
+    nested = getattr(provider, "providers", None)
+    request_provider = (
+        nested[0]
+        if isinstance(nested, list) and nested
+        else provider
+    )
+    family = str(
+        getattr(request_provider, "provider_family", "custom") or "custom"
+    )
+    return family, _provider_model_id(request_provider, configured_model)
+
+
 SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness. You are pairing with a developer to write, edit, test, and debug code in the local workspace.
 
 ### Workspace Context
@@ -4203,8 +4220,12 @@ class AshLoop:
         )
         active_request_id: str | None = None
         active_request_attempt = 0
-        provider_family = str(
-            getattr(self.provider, "provider_family", "custom") or "custom"
+        configured_model = (
+            getattr(self._config, "model", None) if self._config is not None else None
+        )
+        provider_family, request_model_id = _provider_request_identity(
+            self.provider,
+            configured_model,
         )
 
         try:
@@ -4220,7 +4241,7 @@ class AshLoop:
                             "type": "model.request.started",
                             "operation_id": active_request_id,
                             "provider": provider_family,
-                            "model": self.active_model_id,
+                            "model": request_model_id,
                             "attempt": attempt,
                             "max_attempts": maximum_attempts,
                             "message_count": len(canonical_messages),
@@ -4610,7 +4631,10 @@ class AshLoop:
                     {
                         "type": "model.request.completed",
                         "operation_id": active_request_id,
-                        "provider": provider_family,
+                        "provider": str(
+                            getattr(self.provider, "provider_family", "custom")
+                            or "custom"
+                        ),
                         "model": self.active_model_id,
                         "attempt": active_request_attempt,
                         "prompt_tokens": prompt_tokens,

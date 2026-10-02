@@ -425,3 +425,38 @@ def test_real_otlp_http_export_is_content_free() -> None:
     assert b"SECRET-" not in payload
     assert b"gpt-test" in payload
     assert b"ash" in payload
+
+
+def test_model_span_records_actual_response_identity_after_failover() -> None:
+    tracer_provider = _TracerProvider()
+    meter_provider = _MeterProvider()
+    observer = OpenTelemetryEventObserver(
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+    )
+    observer._trace = _Trace()  # type: ignore[assignment]
+
+    observer.on_event(
+        _event(
+            "model.request.started",
+            operation_id="request-1",
+            provider="anthropic",
+            model="anthropic/primary",
+            attempt=1,
+        )
+    )
+    observer.on_event(
+        _event(
+            "model.request.completed",
+            operation_id="request-1",
+            provider="openai",
+            model="openai/backup",
+            prompt_tokens=10,
+            completion_tokens=2,
+        )
+    )
+
+    (span,) = tracer_provider.tracer.spans
+    assert span.attributes["gen_ai.request.model"] == "anthropic/primary"
+    assert span.attributes["gen_ai.provider.name"] == "openai"
+    assert span.attributes["gen_ai.response.model"] == "openai/backup"
