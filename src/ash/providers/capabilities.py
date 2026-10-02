@@ -263,6 +263,40 @@ def google_requires_tool_thought_signature(model: str) -> bool:
     return name.startswith("gemini-3") and name in _GOOGLE_FUNCTION_CALLING_MODELS
 
 
+def vertex_google_capabilities(model: str) -> ProviderCapabilities:
+    """Return exact Google Gemini capabilities on Vertex OpenAI compatibility."""
+
+    name = model.casefold()
+    if not name.startswith("google/"):
+        return ProviderCapabilities()
+    gemini_model = name.removeprefix("google/")
+    base = google_capabilities(gemini_model)
+    if base == ProviderCapabilities():
+        return base
+    if gemini_model == "gemini-3.8-flash":
+        return ProviderCapabilities(
+            native_tools=True,
+            vision=True,
+            reasoning=True,
+            context_window=1_048_576,
+            max_output_tokens=65_536,
+        )
+    return ProviderCapabilities(
+        native_tools=base.native_tools,
+        vision=base.vision,
+        reasoning=base.reasoning,
+    )
+
+
+def vertex_google_requires_tool_thought_signature(model: str) -> bool:
+    """Return whether a verified Vertex Gemini route requires signature replay."""
+
+    name = model.casefold()
+    return name.startswith("google/") and google_requires_tool_thought_signature(
+        name.removeprefix("google/")
+    )
+
+
 def deepseek_capabilities(model: str) -> ProviderCapabilities:
     name = model.casefold()
     if name in {

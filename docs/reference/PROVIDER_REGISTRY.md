@@ -98,7 +98,13 @@ bearer credentials from Google Application Default Credentials. The token
 callable refreshes ADC without persisting tokens in Ash config and retains only
 a bounded in-memory history for provider-error redaction. Vertex does not expose
 a trustworthy live OpenAI model catalog for Ash, so the model ID is explicit
-and ash providers test verifies it with a bounded completion.
+and ash providers test verifies it with a bounded completion. For exact Google
+Gemini IDs whose Vertex Chat Completions contract is documented, Ash can still
+declare the verified tools, vision, reasoning, and model-limit floor without
+guessing from arbitrary publisher/model names. Current Gemini 3 tool calls use
+the same opaque Google thought-signature protocol as the direct Gemini
+OpenAI-compatible route, but Vertex replay state is sealed under a distinct
+`vertex` route identity so state cannot cross those provider boundaries.
 
 The bedrock route requires an explicit AWS Region and optionally a profile,
 uses the optional aws extra, and delegates AWS credential-chain refresh and

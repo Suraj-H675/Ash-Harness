@@ -579,6 +579,8 @@ def _build_vertex(config: "AshConfig", model_name: str) -> ProviderABC:
         model_name=model_name,
         project=project,
         location=location,
+        replay_state_directory=config.db_directory / "provider-replay-state",
+        replay_state_trusted_root=config.db_directory.parent,
     )
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider

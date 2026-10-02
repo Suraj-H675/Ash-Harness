@@ -722,6 +722,37 @@ guide, image-understanding guide, and OpenAI-compatibility documentation:
 P1C remains open for the remaining hosted-provider capability/usage/cache and
 model-switch semantics; P1D/P1E remain separate finish gates.
 
+### P1 progress — Vertex Gemini capability/replay slice 13
+
+The enterprise Vertex route previously treated every deployment/model ID as
+capability-unknown, which was correct for arbitrary publisher IDs but too
+conservative for Google's own documented Gemini Chat Completions models. Ash
+now gives exact verified `google/gemini-*` IDs their documented tools, vision,
+and reasoning floor while leaving unknown/non-Google Vertex model IDs
+conservative. Gemini 3.8 Flash additionally carries Vertex's documented
+1,048,576-token context and 65,536-token output limits.
+
+Vertex Gemini tool turns now share the same bounded thought-signature replay
+implementation as the direct Google route. The reusable helper captures the
+OpenAI-compatible `extra_content.google.thought_signature`, seals it before
+persistence, restores it on the matching assistant tool call, and fails locally
+when a required Gemini 3 signature cannot be recovered. Direct Gemini state is
+sealed as `google` and Vertex state as `vertex`, preventing cross-route replay.
+Unknown Vertex models do not initialize this replay machinery.
+
+Evidence was rechecked on 2026-10-02 against Google Cloud's Gemini 3.8 Flash
+model page, Vertex OpenAI function-calling sample, OpenAI compatibility guide,
+and thought-signature documentation. Gemini 3.8 Flash is documented with Chat
+Completions, multimodal input, thinking, function calling, a 1,048,576-token
+context window, and 65,536 maximum output tokens; Gemini 3 requires prior
+function-call thought signatures to be returned or the provider rejects the
+request.
+
+P1C remains open for the remaining hosted-provider capability/usage/cache and
+model-switch semantics. Azure deployment IDs and Bedrock model/profile IDs stay
+conservative until provider-owned evidence can identify their runtime
+capabilities safely; P1D/P1E remain separate finish gates.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product

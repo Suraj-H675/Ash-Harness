@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -40,6 +42,40 @@ def test_vertex_openai_base_url_requires_explicit_safe_scope() -> None:
     )
     with pytest.raises(ValueError, match="safe path segment"):
         vertex_openai_base_url("project-123", "../../global")
+
+
+def test_vertex_current_gemini_capabilities_are_exact_and_unknowns_conservative() -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+
+    current = VertexProvider(
+        "google/gemini-3.8-flash",
+        project="project-123",
+        location="global",
+        token_provider=GoogleAdcTokenProvider(
+            credentials=_Credentials(token="token", valid=True),
+            request="request",
+        ),
+        client=SimpleNamespace(),
+    )
+    unknown = VertexProvider(
+        "google/gemini-future",
+        project="project-123",
+        location="global",
+        token_provider=GoogleAdcTokenProvider(
+            credentials=_Credentials(token="token", valid=True),
+            request="request",
+        ),
+        client=SimpleNamespace(),
+    )
+
+    assert current.capabilities == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_048_576,
+        max_output_tokens=65_536,
+    )
+    assert unknown.capabilities == ProviderCapabilities()
 
 
 @pytest.mark.asyncio
@@ -94,6 +130,171 @@ async def test_vertex_provider_redacts_recent_adc_token_from_provider_error() ->
     message = str(exc_info.value)
     assert "sensitive-adc-token" not in message
     assert "[REDACTED]" in message
+
+
+@pytest.mark.asyncio
+async def test_vertex_seals_and_replays_gemini_thought_signature(tmp_path) -> None:
+    from ash.providers.replay_state import ProviderReplayStateCipher
+
+    class Stream:
+        def __init__(self, chunks: list[Any]) -> None:
+            self.chunks = chunks
+
+        def __aiter__(self):
+            async def generate():
+                for chunk in self.chunks:
+                    yield chunk
+
+            return generate()
+
+    class Completions:
+        def __init__(self, chunks: list[Any]) -> None:
+            self.chunks = chunks
+            self.kwargs: dict[str, Any] = {}
+
+        async def create(self, **kwargs: Any) -> Stream:
+            self.kwargs = kwargs
+            return Stream(self.chunks)
+
+    signature = "opaque-vertex-thought-signature"
+    tool_call = SimpleNamespace(
+        index=0,
+        id="call-1",
+        function=SimpleNamespace(name="read_file", arguments="{}"),
+        extra_content={"google": {"thought_signature": signature}},
+    )
+    terminal = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content="", tool_calls=None),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=None,
+    )
+    first_completions = Completions(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="", tool_calls=[tool_call]),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            ),
+            terminal,
+        ]
+    )
+    state_dir = tmp_path / "provider-state"
+    first = VertexProvider(
+        "google/gemini-3.8-flash",
+        project="project-123",
+        location="global",
+        replay_state_cipher=ProviderReplayStateCipher(
+            state_dir,
+            trusted_root=tmp_path,
+        ),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=first_completions)
+        ),
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    first_chunks = [
+        chunk
+        async for chunk in first.stream_chat(
+            [{"role": "user", "content": "read it"}],
+            tools=tools,
+        )
+    ]
+    first_terminal = first_chunks[-1]
+    assert first_terminal.provider_state is not None
+    assert signature not in json.dumps(first_terminal.provider_state)
+    assert first_terminal.provider_state[0]["provider"] == "vertex"
+    assert first_terminal.native_tool_calls is not None
+
+    second_completions = Completions(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="done", tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+        ]
+    )
+    second = VertexProvider(
+        "google/gemini-3.8-flash",
+        project="project-123",
+        location="global",
+        replay_state_cipher=ProviderReplayStateCipher(
+            state_dir,
+            trusted_root=tmp_path,
+        ),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=second_completions)
+        ),
+    )
+    history = [
+        {"role": "user", "content": "read it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                call.to_wire() for call in first_terminal.native_tool_calls
+            ],
+            "provider_state": first_terminal.provider_state,
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "file contents"},
+    ]
+
+    _ = [chunk async for chunk in second.stream_chat(history, tools=tools)]
+
+    replayed = second_completions.kwargs["messages"][1]
+    assert replayed["tool_calls"][0]["extra_content"] == {
+        "google": {"thought_signature": signature}
+    }
+
+
+@pytest.mark.asyncio
+async def test_vertex_gemini3_tool_history_fails_closed_without_signature_state() -> None:
+    class Completions:
+        async def create(self, **kwargs: Any) -> Any:
+            del kwargs
+            raise AssertionError("invalid replay must fail before provider request")
+
+    provider = VertexProvider(
+        "google/gemini-3.8-flash",
+        project="project-123",
+        location="global",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=Completions())),
+    )
+    history = [
+        {"role": "user", "content": "read it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "call-1", "name": "read_file", "arguments": {}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "contents"},
+    ]
+
+    with pytest.raises(RuntimeError, match="missing required thought-signature"):
+        _ = [chunk async for chunk in provider.stream_chat(history, tools=[])]
 
 
 @pytest.mark.asyncio

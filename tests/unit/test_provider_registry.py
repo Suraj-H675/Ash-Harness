@@ -229,6 +229,33 @@ def test_vertex_registry_builds_explicit_scoped_route() -> None:
     assert result.capabilities == ProviderCapabilities()
 
 
+def test_vertex_registry_enables_current_gemini_capabilities_and_replay(
+    tmp_path,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.vertex import VertexProvider
+
+    result = create_default_provider_registry().build(
+        AshConfig(
+            model="vertex/google/gemini-3.8-flash",
+            vertex_project="project-123",
+            vertex_location="global",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+        )
+    )
+
+    assert isinstance(result, VertexProvider)
+    assert result.capabilities == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_048_576,
+        max_output_tokens=65_536,
+    )
+    assert result._google_replay is not None
+
+
 def test_azure_registry_builds_api_key_route_conservatively(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

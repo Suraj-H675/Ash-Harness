@@ -5,10 +5,20 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 from urllib.parse import quote
 
+from ash.providers.capabilities import (
+    ProviderCapabilities,
+    vertex_google_capabilities,
+    vertex_google_requires_tool_thought_signature,
+)
+from ash.providers.google_replay import GoogleThoughtSignatureReplay
+from ash.providers.messages import MessageInput
 from ash.providers.openai import OpenAIProvider
+from ash.providers.replay_state import ProviderReplayStateCipher
 
 
 _VERTEX_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -111,11 +121,35 @@ class VertexProvider(OpenAIProvider):
         project: str,
         location: str,
         token_provider: GoogleAdcTokenProvider | None = None,
+        replay_state_directory: Path | None = None,
+        replay_state_trusted_root: Path | None = None,
+        replay_state_cipher: ProviderReplayStateCipher | None = None,
         client: Any | None = None,
     ) -> None:
         self.project = _safe_vertex_segment(project, label="project")
         self.location = _safe_vertex_segment(location, label="location").casefold()
         self._adc = token_provider or GoogleAdcTokenProvider()
+        model_capabilities = vertex_google_capabilities(model_name)
+        cipher = replay_state_cipher
+        if (
+            model_capabilities.native_tools
+            and cipher is None
+            and replay_state_directory is not None
+        ):
+            cipher = ProviderReplayStateCipher(
+                replay_state_directory,
+                trusted_root=replay_state_trusted_root
+                or replay_state_directory.parent,
+            )
+        self._google_replay = (
+            GoogleThoughtSignatureReplay(
+                cipher,
+                state_provider="vertex",
+                requires_signature=vertex_google_requires_tool_thought_signature,
+            )
+            if model_capabilities.native_tools
+            else None
+        )
         super().__init__(
             model_name=model_name,
             api_key=self._adc,
@@ -123,6 +157,37 @@ class VertexProvider(OpenAIProvider):
             error_secrets_supplier=self._adc.redaction_secrets,
             client=client,
         )
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return vertex_google_capabilities(self.model_name)
+
+    def _prepare_messages(
+        self,
+        messages: Sequence[MessageInput],
+    ) -> list[dict[str, Any]]:
+        prepared = super()._prepare_messages(messages)
+        replay = self._google_replay
+        if replay is None:
+            return prepared
+        return replay.prepare_messages(messages, prepared, model_name=self.model_name)
+
+    def _capture_tool_call_provider_data(
+        self,
+        partial: Any,
+        tool_call: Any,
+    ) -> tuple[str, ...]:
+        replay = self._google_replay
+        return replay.capture_tool_call(partial, tool_call) if replay is not None else ()
+
+    def _provider_state_for_tool_calls(
+        self,
+        partials: Sequence[Any],
+    ) -> list[dict[str, Any]] | None:
+        replay = self._google_replay
+        if replay is None:
+            return None
+        return replay.provider_state(partials, model_name=self.model_name)
 
     async def verify_credentials(self) -> None:
         """Resolve/refresh ADC without issuing a model request."""
