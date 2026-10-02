@@ -570,6 +570,13 @@ def test_probe_model_catalog_refuses_plaintext_credentials_before_network(
             catalog_format="openai",
         )
 
+    with pytest.raises(readiness.ProviderVerificationError, match="must use HTTPS"):
+        readiness.probe_model_catalog(
+            "http://gateway.example/v1/models/gemini-3.8-flash",
+            headers={"x-goog-api-key": "google-secret"},
+            catalog_format="google",
+        )
+
 
 def test_resolve_local_openai_compatible_provider_never_requires_a_key(
     monkeypatch,
@@ -625,6 +632,40 @@ def test_probe_model_catalog_metadata_preserves_mistral_capabilities(monkeypatch
     assert entry.vision is True
     assert entry.reasoning is None
     assert entry.context_window == 262_144
+
+
+def test_probe_google_model_metadata_preserves_native_limits_and_thinking(
+    monkeypatch,
+) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "name": "models/gemini-3.8-flash-001",
+                "baseModelId": "gemini-3.8-flash",
+                "inputTokenLimit": 1_000_000,
+                "outputTokenLimit": 64_000,
+                "supportedGenerationMethods": ["generateContent", "countTokens"],
+                "thinking": True,
+            },
+            request=request,
+        ),
+    )
+
+    (entry,) = readiness.probe_model_catalog_metadata(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash",
+        headers={"x-goog-api-key": "secret"},
+        catalog_format="google",
+    )
+
+    assert entry.model_id == "gemini-3.8-flash"
+    assert entry.aliases == frozenset({"gemini-3.8-flash-001"})
+    assert entry.reasoning is True
+    assert entry.context_window == 1_000_000
+    assert entry.max_output_tokens == 64_000
+    assert entry.native_tools is None
+    assert entry.vision is None
 
 
 def test_probe_cerebras_public_catalog_preserves_capabilities(monkeypatch) -> None:

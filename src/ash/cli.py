@@ -40,6 +40,7 @@ AVAILABLE_MODELS: list[str] = [
     "openai/gpt-6-astra",
     "openai/gpt-6.1-sol",
     "openai/gpt-6-luna",
+    "google/gemini-3.8-flash",
     "ollama/llama3",
     "ollama/qwen2.5-coder:7b",
     "deepseek/deepseek-flash",

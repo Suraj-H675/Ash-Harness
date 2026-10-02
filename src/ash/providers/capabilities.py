@@ -219,6 +219,50 @@ def _openai(model: str) -> ProviderCapabilities:
     return _OPENAI_STATIC_CAPABILITIES.get(model.casefold(), ProviderCapabilities())
 
 
+_GOOGLE_FUNCTION_CALLING_MODELS = frozenset(
+    {
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    }
+)
+
+
+def google_capabilities(model: str) -> ProviderCapabilities:
+    """Return exact first-party Gemini declarations verified by Ash."""
+
+    name = model.casefold()
+    if name not in _GOOGLE_FUNCTION_CALLING_MODELS:
+        return ProviderCapabilities()
+    if name == "gemini-3.8-flash":
+        return ProviderCapabilities(
+            native_tools=True,
+            vision=True,
+            reasoning=True,
+            context_window=1_000_000,
+            max_output_tokens=64_000,
+        )
+    return ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+    )
+
+
+def google_requires_tool_thought_signature(model: str) -> bool:
+    """Return whether an exact Gemini 3 tool model requires signature replay."""
+
+    name = model.casefold()
+    return name.startswith("gemini-3") and name in _GOOGLE_FUNCTION_CALLING_MODELS
+
+
 def deepseek_capabilities(model: str) -> ProviderCapabilities:
     name = model.casefold()
     if name in {
@@ -291,6 +335,7 @@ def create_default_capability_registry() -> CapabilityRegistry:
     registry = CapabilityRegistry()
     registry.register("anthropic", _anthropic)
     registry.register("openai", _openai)
+    registry.register("google", google_capabilities)
     registry.register("deepseek", deepseek_capabilities)
     registry.register("groq", groq_capabilities)
     registry.register("ollama", _local_conservative)

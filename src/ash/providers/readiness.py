@@ -34,6 +34,7 @@ class ProviderConfigurationError(ValueError):
 CatalogFormat = Literal[
     "openai",
     "anthropic",
+    "google",
     "ollama",
     "lmstudio",
     "together",
@@ -696,7 +697,7 @@ def _redact_catalog_error(message: str, headers: Mapping[str, str]) -> str:
             if value.casefold().startswith("bearer "):
                 token = value.split(None, 1)[1]
                 redacted = redacted.replace(token, "[REDACTED]")
-        elif normalized == "x-api-key":
+        elif normalized in {"x-api-key", "x-goog-api-key"}:
             redacted = redacted.replace(value, "[REDACTED]")
     return redacted
 
@@ -731,7 +732,8 @@ def probe_model_catalog_metadata(
     """Fetch bounded model metadata while treating unknown fields conservatively."""
 
     credentialed = any(
-        name.casefold() in {"authorization", "x-api-key"} and bool(value)
+        name.casefold() in {"authorization", "x-api-key", "x-goog-api-key"}
+        and bool(value)
         for name, value in headers.items()
     )
     if credentialed:
@@ -778,6 +780,11 @@ def probe_model_catalog_metadata(
             raise ProviderVerificationError("provider returned an invalid model catalog")
         items = [payload]
         identifier = "name"
+    elif catalog_format == "google":
+        if not isinstance(payload, dict):
+            raise ProviderVerificationError("provider returned an invalid model catalog")
+        items = [payload]
+        identifier = "baseModelId"
     else:
         if catalog_format == "ollama":
             collection, identifier = "models", "name"
@@ -799,6 +806,12 @@ def probe_model_catalog_metadata(
         if catalog_format == "lmstudio" and item.get("type") == "embedding":
             continue
         model_id = item.get(identifier)
+        if catalog_format == "google" and (
+            not isinstance(model_id, str) or not model_id
+        ):
+            resource_name = item.get("name")
+            if isinstance(resource_name, str) and resource_name.startswith("models/"):
+                model_id = resource_name.removeprefix("models/")
         if not isinstance(model_id, str) or not model_id or model_id in seen:
             continue
         seen.add(model_id)
@@ -808,6 +821,12 @@ def probe_model_catalog_metadata(
             for value in raw_aliases
             if isinstance(value, str) and value and value != model_id
         ) if isinstance(raw_aliases, list) else frozenset()
+        if catalog_format == "google":
+            resource_name = item.get("name")
+            if isinstance(resource_name, str) and resource_name.startswith("models/"):
+                resource_id = resource_name.removeprefix("models/")
+                if resource_id and resource_id != model_id:
+                    aliases = frozenset({*aliases, resource_id})
         huggingface_live_providers: list[dict[str, object]] = []
         if catalog_format == "huggingface":
             raw_providers = item.get("providers")
@@ -868,6 +887,14 @@ def probe_model_catalog_metadata(
         if catalog_format == "fireworks":
             native_tools = _catalog_boolean(item, "supportsTools")
             vision = _catalog_boolean(item, "supportsImageInput")
+        elif catalog_format == "google":
+            methods = item.get("supportedGenerationMethods")
+            if isinstance(methods, list):
+                parameters = frozenset(
+                    value for value in methods if isinstance(value, str) and value
+                )
+            if "generateContent" in parameters:
+                reasoning = _catalog_boolean(item, "thinking")
         elif catalog_format == "huggingface" and huggingface_live_providers:
             tool_support = [
                 provider.get("supports_tools")
@@ -912,6 +939,8 @@ def probe_model_catalog_metadata(
             or _positive_catalog_integer(item.get("context_length"))
             or _positive_catalog_integer(item.get("contextLength"))
         )
+        if catalog_format == "google":
+            context_window = _positive_catalog_integer(item.get("inputTokenLimit"))
         if catalog_format == "huggingface" and huggingface_live_providers:
             provider_contexts = [
                 value
@@ -931,6 +960,8 @@ def probe_model_catalog_metadata(
             or _positive_catalog_integer(item.get("max_completion_tokens"))
             or _positive_catalog_integer(item.get("max_output_tokens"))
         )
+        if catalog_format == "google":
+            max_output = _positive_catalog_integer(item.get("outputTokenLimit"))
         models.append(
             ProviderModelMetadata(
                 model_id=model_id,

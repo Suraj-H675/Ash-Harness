@@ -687,6 +687,41 @@ versioning, current model pages, and tool-use documentation on 2026-10-02.
 P1C remains open for the remaining hosted-provider discovery/capability
 semantics; this slice does not consume the separate P1D/P1E closure work.
 
+### P1 progress — Google Gemini capability/replay slice 12
+
+Google's OpenAI-compatible model list remains the availability/discovery
+surface, but the first-party route now probes the selected model through
+Google's native Models API for richer provider-owned input/output token limits
+and thinking metadata. The native metadata request uses Google's
+`x-goog-api-key` contract and the same bounded HTTPS/redaction protections as
+other credentialed catalogs. Exact documented Gemini function-calling models
+provide the offline tools/vision/reasoning floor; unknown IDs remain
+conservative, and provider-owned metadata can narrow a conflicting claim.
+
+This slice also closes a multi-step tool-loop correctness gap. Gemini 3
+requires thought signatures to be returned during function calling, including
+through Google's OpenAI compatibility layer. Ash now captures
+`tool_calls[].extra_content.google.thought_signature`, seals it in durable
+provider replay state, and restores it onto the matching assistant tool call
+before the next request. Missing required Gemini 3 replay state fails locally
+with a clear error rather than reaching Google as a known-invalid request.
+Operator-overridden Google endpoints remain conservative and do not inherit
+this first-party protocol requirement merely from the provider name.
+
+Evidence was rechecked on 2026-10-02 against Google's first-party Models API,
+Gemini model overview, function-calling guide, thought-signature guide, token
+guide, image-understanding guide, and OpenAI-compatibility documentation:
+`https://ai.google.dev/api/models`,
+`https://ai.google.dev/gemini-api/docs/models`,
+`https://ai.google.dev/gemini-api/docs/function-calling`,
+`https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures`,
+`https://ai.google.dev/gemini-api/docs/tokens`,
+`https://ai.google.dev/gemini-api/docs/image-understanding`, and
+`https://ai.google.dev/gemini-api/docs/openai`.
+
+P1C remains open for the remaining hosted-provider capability/usage/cache and
+model-switch semantics; P1D/P1E remain separate finish gates.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product

@@ -1363,6 +1363,7 @@ def test_model_capability_display_covers_budgets_and_custom_models() -> None:
     assert "context 1,000,000" in rendered
     assert "output 128,000" in rendered
     assert "claude-opus-5-5 [tools, vision, reasoning]" in list_rendered
+    assert "gemini-3.8-flash [tools, vision, reasoning]" in list_rendered
 
 
 def test_custom_model_capability_display_uses_configured_declaration() -> None:

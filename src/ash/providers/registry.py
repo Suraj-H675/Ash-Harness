@@ -7,6 +7,7 @@ import os
 import re
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import quote
 
 from ash.providers.base import ProviderABC
 from ash.providers.capabilities import (
@@ -14,6 +15,7 @@ from ash.providers.capabilities import (
     CapabilityResolver,
     ProviderCapabilities,
     get_capability_registry,
+    google_capabilities,
     openai_uses_responses_api,
 )
 from ash.providers.identifiers import PROVIDER_NAME, parse_model_string
@@ -454,6 +456,28 @@ def _build_openai_compatible(
                 catalog_endpoint = fireworks_endpoint
                 catalog_format = "fireworks"
 
+        declared_capabilities = None
+        replay_state_cipher = None
+        google_thought_signature_replay = False
+        if connection.provider == "google" and connection.uses_default_base_url:
+            from ash.providers.replay_state import ProviderReplayStateCipher
+
+            catalog_endpoint = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                + quote(model_name, safe="")
+            )
+            catalog_format = "google"
+            catalog_headers = {
+                **connection.client_headers,
+                "x-goog-api-key": connection.api_key,
+            }
+            declared_capabilities = google_capabilities(model_name)
+            replay_state_cipher = ProviderReplayStateCipher(
+                config.db_directory / "provider-replay-state",
+                trusted_root=config.db_directory.parent,
+            )
+            google_thought_signature_replay = True
+
         provider = CatalogOpenAIProvider(
             model_name=model_name,
             api_key=connection.api_key,
@@ -466,6 +490,9 @@ def _build_openai_compatible(
             allow_anonymous=connection.auth_mode == "none",
             local=connection.provider in {"lmstudio", "vllm"},
             default_headers=connection.client_headers,
+            declared_capabilities=declared_capabilities,
+            replay_state_cipher=replay_state_cipher,
+            google_thought_signature_replay=google_thought_signature_replay,
         )
     else:
         provider = OpenAIProvider(

@@ -63,12 +63,13 @@ def openai_compatible_cache_read_tokens(usage: Any) -> int:
 class _PartialToolCall:
     """Accumulates a streaming tool call's name + arguments until complete."""
 
-    __slots__ = ("id", "name", "arguments")
+    __slots__ = ("id", "name", "arguments", "provider_data")
 
     def __init__(self, id: str, name: str) -> None:
         self.id = id
         self.name = name
         self.arguments = ""
+        self.provider_data: dict[str, str] = {}
 
 
 async def _strip_authorization_header(request: httpx.Request) -> None:
@@ -235,6 +236,27 @@ class OpenAIProvider(ProviderABC):
         self._prompt_cache_key = cache_key
         self._prompt_cache_retention = retention
 
+    def _prepare_messages(
+        self,
+        messages: Sequence[MessageInput],
+    ) -> list[dict[str, Any]]:
+        return prepare_openai_messages(messages)
+
+    def _capture_tool_call_provider_data(
+        self,
+        partial: _PartialToolCall,
+        tool_call: Any,
+    ) -> tuple[str, ...]:
+        del partial, tool_call
+        return ()
+
+    def _provider_state_for_tool_calls(
+        self,
+        partials: Sequence[_PartialToolCall],
+    ) -> list[dict[str, Any]] | None:
+        del partials
+        return None
+
     async def stream_chat(
         self,
         messages: Sequence[MessageInput],
@@ -243,7 +265,7 @@ class OpenAIProvider(ProviderABC):
     ) -> AsyncGenerator[StreamChunk, None]:
         kwargs: dict[str, Any] = {
             "model": self._model_name,
-            "messages": prepare_openai_messages(messages),
+            "messages": self._prepare_messages(messages),
             "temperature": temperature,
             "stream": True,
         }
@@ -335,6 +357,12 @@ class OpenAIProvider(ProviderABC):
                             stream_bytes, partials[idx].name, provider="OpenAI"
                         )
                     partial = partials[idx]
+                    for retained in self._capture_tool_call_provider_data(partial, tc):
+                        stream_bytes = account_openai_compatible_stream_bytes(
+                            stream_bytes,
+                            retained,
+                            provider="OpenAI",
+                        )
                     if tc.function.arguments:
                         stream_bytes = account_openai_compatible_stream_bytes(
                             stream_bytes,
@@ -350,6 +378,9 @@ class OpenAIProvider(ProviderABC):
                     completion_tokens = getattr(usage, "completion_tokens", 0) or 0
                     cache_read_tokens = openai_compatible_cache_read_tokens(usage)
                 stop_reason = choice.finish_reason
+                provider_state = self._provider_state_for_tool_calls(
+                    tuple(partials.values())
+                )
                 for partial in partials.values():
                     completed.append(
                         CanonicalToolCall.model_validate(
@@ -361,6 +392,8 @@ class OpenAIProvider(ProviderABC):
                         )
                     )
                 partials.clear()
+            else:
+                provider_state = None
 
             yield StreamChunk(
                 content=content,
@@ -381,6 +414,7 @@ class OpenAIProvider(ProviderABC):
                     if is_done and reasoning_parts
                     else None
                 ),
+                provider_state=provider_state,
             )
             # Clear emitted calls so they are not yielded again.
             completed.clear()

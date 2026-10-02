@@ -956,6 +956,24 @@ def _openai_tool_chunk(arguments: str) -> Any:
     )
 
 
+def _google_tool_chunk(arguments: str, *, signature: str) -> Any:
+    tool_call = SimpleNamespace(
+        index=0,
+        id="call-1",
+        function=SimpleNamespace(name="read_file", arguments=arguments),
+        extra_content={"google": {"thought_signature": signature}},
+    )
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content="", tool_calls=[tool_call]),
+                finish_reason=None,
+            )
+        ],
+        usage=None,
+    )
+
+
 @pytest.mark.parametrize(
     ("provider_name", "error_name"),
     [
@@ -1213,6 +1231,145 @@ async def test_openai_compatible_providers_preserve_streamed_reasoning(
         {"type": "thinking", "thinking": "consider carefully"}
     ]
     assert chunks[-1].content == "answer"
+
+
+@pytest.mark.asyncio
+async def test_google_seals_and_replays_openai_compatible_thought_signature(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from ash.providers.capabilities import google_capabilities
+    from ash.providers.openai_compatible import CatalogOpenAIProvider
+    from ash.providers.replay_state import ProviderReplayStateCipher
+
+    signature = "opaque-google-thought-signature"
+    terminal = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content="", tool_calls=None),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=None,
+    )
+    state_dir = tmp_path / "provider-state"
+    first_client = _FakeOpenAIClient(
+        [_google_tool_chunk("{}", signature=signature), terminal]
+    )
+    first = CatalogOpenAIProvider(
+        "gemini-3.8-flash",
+        "key",
+        provider_family="google",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        catalog_endpoint="https://example.test/models",
+        catalog_format="openai",
+        catalog_headers={},
+        declared_capabilities=google_capabilities("gemini-3.8-flash"),
+        replay_state_cipher=ProviderReplayStateCipher(
+            state_dir,
+            trusted_root=tmp_path,
+        ),
+        google_thought_signature_replay=True,
+        client=first_client,
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    first_chunks = [
+        chunk
+        async for chunk in first.stream_chat(
+            [{"role": "user", "content": "read it"}],
+            tools=tools,
+        )
+    ]
+    first_terminal = first_chunks[-1]
+    assert first_terminal.provider_state is not None
+    assert signature not in json.dumps(first_terminal.provider_state)
+    assert first_terminal.native_tool_calls is not None
+
+    second_client = _FakeOpenAIClient(
+        [_openai_chunk(content="done", finish_reason="stop")]
+    )
+    second = CatalogOpenAIProvider(
+        "gemini-3.8-flash",
+        "key",
+        provider_family="google",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        catalog_endpoint="https://example.test/models",
+        catalog_format="openai",
+        catalog_headers={},
+        declared_capabilities=google_capabilities("gemini-3.8-flash"),
+        replay_state_cipher=ProviderReplayStateCipher(
+            state_dir,
+            trusted_root=tmp_path,
+        ),
+        google_thought_signature_replay=True,
+        client=second_client,
+    )
+    history = [
+        {"role": "user", "content": "read it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                call.to_wire() for call in first_terminal.native_tool_calls
+            ],
+            "provider_state": first_terminal.provider_state,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "file contents",
+        },
+    ]
+
+    _ = [chunk async for chunk in second.stream_chat(history, tools=tools)]
+
+    replayed = second_client.completions.kwargs["messages"][1]
+    assert replayed["tool_calls"][0]["extra_content"] == {
+        "google": {"thought_signature": signature}
+    }
+
+
+@pytest.mark.asyncio
+async def test_google_gemini3_tool_history_fails_closed_without_signature_state() -> None:
+    from ash.providers.capabilities import google_capabilities
+    from ash.providers.openai_compatible import CatalogOpenAIProvider
+
+    provider = CatalogOpenAIProvider(
+        "gemini-3.8-flash",
+        "key",
+        provider_family="google",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        catalog_endpoint="https://example.test/models",
+        catalog_format="openai",
+        catalog_headers={},
+        declared_capabilities=google_capabilities("gemini-3.8-flash"),
+        google_thought_signature_replay=True,
+        client=_FakeOpenAIClient([]),
+    )
+    history = [
+        {"role": "user", "content": "read it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "call-1", "name": "read_file", "arguments": {}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "contents"},
+    ]
+
+    with pytest.raises(RuntimeError, match="missing required thought-signature"):
+        _ = [chunk async for chunk in provider.stream_chat(history, tools=[])]
 
 
 @pytest.mark.asyncio

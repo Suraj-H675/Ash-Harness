@@ -28,6 +28,23 @@ verified model IDs because the Models API does not expose generic client-tool
 support. An operator-overridden Anthropic base URL does not inherit
 first-party capabilities before its own endpoint proves metadata.
 
+The first-party `google/*` route keeps Google's OpenAI-compatible inference
+surface, while capability negotiation probes the selected model through
+Google's native Models API using `x-goog-api-key`. Provider-owned model
+metadata supplies input/output token limits and thinking support; exact
+first-party declarations supply function calling and image-input support only
+for models Google documents for those capabilities. Unknown IDs remain
+conservative, and an operator-overridden Google base URL does not inherit
+first-party assumptions.
+
+Gemini 3 OpenAI-compatible function calls carry a Google thought signature
+that must be replayed during multi-step tool use. Ash captures
+`tool_calls[].extra_content.google.thought_signature`, seals the opaque value in
+the same durable provider replay store used for other provider-owned reasoning
+state, and restores it on the matching assistant tool call before the next
+request. Required Gemini 3 signature history that cannot be recovered fails
+locally instead of being sent as a known-invalid provider request.
+
 ```python
 from ash.providers import (
     ProviderABC,

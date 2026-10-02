@@ -645,6 +645,21 @@ def test_openai_current_models_use_responses_for_api_keys(
     assert provider.capabilities.native_tools is True
 
 
+def test_google_current_model_has_exact_offline_capability_floor() -> None:
+    from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
+
+    assert infer_capabilities(
+        "google", "gemini-3.8-flash"
+    ) == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=64_000,
+    )
+    assert infer_capabilities("google", "future-gemini") == ProviderCapabilities()
+
+
 def test_anthropic_current_capabilities_are_exact_and_unknowns_fail_closed() -> None:
     from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
 
@@ -1057,6 +1072,103 @@ async def test_mistral_negotiates_capabilities_from_provider_catalog(
         context_window=131_072,
     )
     await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_google_uses_native_selected_model_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
+    provider = create_default_provider_registry().build(
+        AshConfig(model="google/gemini-3.8-flash")
+    )
+    calls: list[tuple[str, str, dict[str, str]]] = []
+
+    def probe(endpoint, *, catalog_format, headers, **kwargs):
+        del kwargs
+        calls.append((endpoint, catalog_format, dict(headers)))
+        assert catalog_format == "google"
+        return (
+            ProviderModelMetadata(
+                model_id="gemini-3.8-flash",
+                reasoning=True,
+                context_window=1_000_000,
+                max_output_tokens=64_000,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata", probe
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=64_000,
+    )
+    assert len(calls) == 1
+    assert calls[0][0].endswith("/v1beta/models/gemini-3.8-flash")
+    assert calls[0][1] == "google"
+    assert calls[0][2]["x-goog-api-key"] == "google-key"
+    assert "Authorization" not in calls[0][2]
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_google_native_alias_inherits_verified_base_model_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
+    provider = create_default_provider_registry().build(
+        AshConfig(model="google/gemini-3.8-flash-001")
+    )
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata",
+        lambda *args, **kwargs: (
+            ProviderModelMetadata(
+                model_id="gemini-3.8-flash",
+                aliases=frozenset({"gemini-3.8-flash-001"}),
+                reasoning=True,
+                context_window=1_000_000,
+                max_output_tokens=64_000,
+            ),
+        ),
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=64_000,
+    )
+    assert provider._canonical_model_id == "gemini-3.8-flash"
+    await provider.aclose()
+
+
+def test_google_overridden_endpoint_does_not_inherit_first_party_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
+    monkeypatch.setenv("GOOGLE_API_BASE", "https://gateway.example.test/v1")
+
+    provider = create_default_provider_registry().build(
+        AshConfig(model="google/gemini-3.8-flash")
+    )
+
+    assert provider.capabilities == ProviderCapabilities()
+    assert provider._catalog_format == "openai"
+    assert provider._google_thought_signature_replay is False
 
 
 @pytest.mark.asyncio
