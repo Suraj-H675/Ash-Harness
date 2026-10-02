@@ -778,6 +778,10 @@ def _signal_known_process_group(group: int, signum: int) -> None:
         killpg(group, signum)
     except ProcessLookupError:
         pass
+    except PermissionError as exc:
+        raise ProcessTreeTerminationError(
+            "POSIX process-group signaling was denied by the operating system"
+        ) from exc
 
 
 def _process_group_exists(group: int | None) -> bool:

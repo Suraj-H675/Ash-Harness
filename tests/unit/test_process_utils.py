@@ -838,6 +838,36 @@ async def test_posix_termination_targets_process_group() -> None:
     process.wait.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_posix_termination_wraps_process_group_permission_denial() -> None:
+    process = Mock(pid=4321, returncode=None)
+    process.wait = AsyncMock()
+    plan = ProcessTreePlan(
+        {"start_new_session": True},
+        None,
+        Path.cwd(),
+        "darwin",
+    )
+
+    with (
+        patch(
+            "ash.sandbox.process_utils._descendant_pids",
+            return_value=[],
+        ),
+        patch(
+            "ash.sandbox.process_utils.os.killpg",
+            side_effect=PermissionError("denied"),
+        ),
+        pytest.raises(
+            ProcessTreeTerminationError,
+            match="signaling was denied",
+        ),
+    ):
+        await terminate_process_tree(process, plan=plan)
+
+    process.wait.assert_not_awaited()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process tree semantics")
 @pytest.mark.asyncio
 async def test_shared_group_termination_kills_only_target_descendant_tree(
