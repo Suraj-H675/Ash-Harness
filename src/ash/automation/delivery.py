@@ -152,6 +152,7 @@ async def prepare_webhook(
             "estimated_prompt_tokens": lease.run.estimated_prompt_tokens,
             "estimated_completion_tokens": lease.run.estimated_completion_tokens,
             "estimated_cost_usd": lease.run.estimated_cost_usd,
+            "cost_known": lease.run.cost_known,
             "created_at": lease.run.created_at.isoformat(),
             "started_at": (
                 lease.run.started_at.isoformat() if lease.run.started_at else None

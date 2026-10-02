@@ -57,7 +57,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 16
+CURRENT_SCHEMA_VERSION = 17
 SQLITE_INTEGER_MAX = 2**63 - 1
 SQLITE_REAL_MAX = sys.float_info.max
 MAX_SESSION_IMPORT_BYTES = 64 * 1024 * 1024
@@ -634,10 +634,15 @@ class SessionUsage(BaseModel):
     estimated_prompt_tokens: int = 0
     estimated_completion_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    pricing_unknown_turns: int = 0
 
     @property
     def has_estimates(self) -> bool:
         return bool(self.estimated_prompt_tokens or self.estimated_completion_tokens)
+
+    @property
+    def cost_known(self) -> bool:
+        return self.pricing_unknown_turns == 0
 
 
 class StoredRuntimeEvent(BaseModel):
@@ -1199,6 +1204,8 @@ class SessionStore:
                 self._migrate_v15(conn)
             if from_version < 16:
                 self._migrate_v16(conn)
+            if from_version < 17:
+                self._migrate_v17(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -1673,6 +1680,26 @@ class SessionStore:
             (16, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v17(self, conn: sqlite3.Connection) -> None:
+        """Persist whether historical session cost totals have complete pricing."""
+
+        added = not _column_exists(conn, "sessions", "pricing_unknown_turns")
+        if added:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN "
+                "pricing_unknown_turns INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(pricing_unknown_turns >= 0)"
+            )
+            conn.execute(
+                "UPDATE sessions SET pricing_unknown_turns = "
+                "CASE WHEN COALESCE(total_tokens, 0) > 0 THEN 1 ELSE 0 END"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (17, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -1849,7 +1876,9 @@ class SessionStore:
                     total_cache_write_tokens INTEGER DEFAULT 0,
                     estimated_prompt_tokens INTEGER DEFAULT 0,
                     estimated_completion_tokens INTEGER DEFAULT 0,
-                    estimated_cost_usd REAL DEFAULT 0
+                    estimated_cost_usd REAL DEFAULT 0,
+                    pricing_unknown_turns INTEGER NOT NULL DEFAULT 0
+                        CHECK(pricing_unknown_turns >= 0)
                 );
 
                 CREATE TABLE IF NOT EXISTS messages (
@@ -2462,7 +2491,8 @@ class SessionStore:
                 "COALESCE(total_cost_usd, 0) AS cost_usd, "
                 "COALESCE(estimated_prompt_tokens, 0) AS estimated_prompt_tokens, "
                 "COALESCE(estimated_completion_tokens, 0) AS estimated_completion_tokens, "
-                "COALESCE(estimated_cost_usd, 0) AS estimated_cost_usd "
+                "COALESCE(estimated_cost_usd, 0) AS estimated_cost_usd, "
+                "COALESCE(pricing_unknown_turns, 0) AS pricing_unknown_turns "
                 "FROM sessions WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
@@ -2487,7 +2517,9 @@ class SessionStore:
                            AS estimated_prompt_tokens,
                        COALESCE(SUM(estimated_completion_tokens), 0)
                            AS estimated_completion_tokens,
-                       COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                       COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                       COALESCE(SUM(pricing_unknown_turns), 0)
+                           AS pricing_unknown_turns
                 FROM sessions
                 """
             ).fetchone()
@@ -3120,6 +3152,7 @@ class SessionStore:
                     "estimated_prompt_tokens": 0,
                     "estimated_completion_tokens": 0,
                     "estimated_cost_usd": 0.0,
+                    "pricing_unknown_turns": 0,
                 }
                 if turn_ids:
                     placeholders = ",".join("?" for _ in turn_ids)
@@ -3134,6 +3167,10 @@ class SessionStore:
                         except (TypeError, json.JSONDecodeError):
                             usage = {}
                         for key in usage_totals:
+                            if key == "pricing_unknown_turns":
+                                if usage.get("cost_known") is False:
+                                    usage_totals[key] += 1
+                                continue
                             value = usage.get(key, 0)
                             if isinstance(value, (int, float)) and not isinstance(
                                 value, bool
@@ -3173,7 +3210,8 @@ class SessionStore:
                     "total_cost_usd = MAX(0, COALESCE(total_cost_usd, 0) - ?), "
                     "estimated_prompt_tokens = MAX(0, COALESCE(estimated_prompt_tokens, 0) - ?), "
                     "estimated_completion_tokens = MAX(0, COALESCE(estimated_completion_tokens, 0) - ?), "
-                    "estimated_cost_usd = MAX(0, COALESCE(estimated_cost_usd, 0) - ?) "
+                    "estimated_cost_usd = MAX(0, COALESCE(estimated_cost_usd, 0) - ?), "
+                    "pricing_unknown_turns = MAX(0, COALESCE(pricing_unknown_turns, 0) - ?) "
                     "WHERE session_id = ?",
                     (
                         usage_totals["prompt_tokens"]
@@ -3186,8 +3224,14 @@ class SessionStore:
                         usage_totals["estimated_prompt_tokens"],
                         usage_totals["estimated_completion_tokens"],
                         usage_totals["estimated_cost_usd"],
+                        usage_totals["pricing_unknown_turns"],
                         session_id,
                     ),
+                )
+                conn.execute(
+                    "UPDATE sessions SET pricing_unknown_turns = 0 "
+                    "WHERE session_id = ? AND COALESCE(total_tokens, 0) = 0",
+                    (session_id,),
                 )
                 if restored_checkpoint_turn_ids:
                     placeholders = ",".join("?" for _ in restored_checkpoint_turn_ids)
@@ -3874,8 +3918,12 @@ class SessionStore:
         estimated_prompt_tokens: int = 0,
         estimated_completion_tokens: int = 0,
         estimated_cost_usd: float = 0.0,
+        cost_known: bool = True,
     ) -> None:
         """Accumulate one turn's token and explicitly configured cost totals."""
+
+        if not isinstance(cost_known, bool):
+            raise TypeError("cost_known must be boolean")
 
         with closing(self._connect()) as conn, conn:
             conn.execute(
@@ -3889,7 +3937,8 @@ class SessionStore:
                     total_cache_write_tokens = COALESCE(total_cache_write_tokens, 0) + ?,
                     estimated_prompt_tokens = COALESCE(estimated_prompt_tokens, 0) + ?,
                     estimated_completion_tokens = COALESCE(estimated_completion_tokens, 0) + ?,
-                    estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + ?
+                    estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + ?,
+                    pricing_unknown_turns = COALESCE(pricing_unknown_turns, 0) + ?
                 WHERE session_id = ?
                 """,
                 (
@@ -3902,6 +3951,7 @@ class SessionStore:
                     estimated_prompt_tokens,
                     estimated_completion_tokens,
                     estimated_cost_usd,
+                    0 if cost_known else 1,
                     session_id,
                 ),
             )

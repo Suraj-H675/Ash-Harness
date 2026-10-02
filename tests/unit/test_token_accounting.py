@@ -25,6 +25,7 @@ def test_session_token_totals_accumulate(tmp_path) -> None:
         estimated_prompt_tokens=0,
         estimated_completion_tokens=2,
         estimated_cost_usd=0.006,
+        cost_known=False,
     )
 
     from ash.core.session import get_db_connection
@@ -34,7 +35,8 @@ def test_session_token_totals_accumulate(tmp_path) -> None:
         row = connection.execute(
             "SELECT total_tokens, total_prompt_tokens, total_completion_tokens, "
             "total_cache_read_tokens, total_cache_write_tokens, total_cost_usd "
-            ", estimated_prompt_tokens, estimated_completion_tokens, estimated_cost_usd "
+            ", estimated_prompt_tokens, estimated_completion_tokens, estimated_cost_usd, "
+            "pricing_unknown_turns "
             "FROM sessions WHERE session_id = ?",
             (session.session_id,),
         ).fetchone()
@@ -49,6 +51,7 @@ def test_session_token_totals_accumulate(tmp_path) -> None:
     assert row["estimated_prompt_tokens"] == 4
     assert row["estimated_completion_tokens"] == 3
     assert row["estimated_cost_usd"] == 0.01
+    assert row["pricing_unknown_turns"] == 1
     usage = store.get_session_usage(session.session_id)
     assert usage.total_tokens == 42
     assert usage.prompt_tokens == 30
@@ -60,3 +63,15 @@ def test_session_token_totals_accumulate(tmp_path) -> None:
     assert usage.estimated_completion_tokens == 3
     assert usage.estimated_cost_usd == 0.01
     assert usage.has_estimates is True
+    assert usage.cost_known is False
+
+
+def test_session_usage_pricing_known_when_all_turns_are_priced(tmp_path) -> None:
+    store = SessionStore(tmp_path / "known.db")
+    session = store.create_session(str(tmp_path))
+
+    store.save_session_token_stats(session.session_id, 4, 2, 0.001, cost_known=True)
+
+    usage = store.get_session_usage(session.session_id)
+    assert usage.pricing_unknown_turns == 0
+    assert usage.cost_known is True

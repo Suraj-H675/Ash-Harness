@@ -44,7 +44,7 @@ MAX_ERROR_BYTES = 16 * 1024
 MAX_EVENT_BYTES = 128 * 1024
 AUTOMATION_EVENT_RETENTION_DAYS = 365
 MAX_AUTOMATION_JOBS_PER_WORKSPACE = 1000
-AUTOMATION_SCHEMA_VERSION = 3
+AUTOMATION_SCHEMA_VERSION = 4
 
 _V2_RUN_COLUMNS = {
     "cache_read_tokens": "INTEGER NOT NULL DEFAULT 0",
@@ -61,6 +61,10 @@ _V2_RUN_COLUMNS = {
 _V3_JOB_COLUMNS = {
     "webhook_url": "TEXT",
     "webhook_secret_env": "TEXT",
+}
+
+_V4_RUN_COLUMNS = {
+    "cost_known": "INTEGER NOT NULL DEFAULT 1 CHECK(cost_known IN (0,1))",
 }
 
 
@@ -212,6 +216,7 @@ class AutomationStore:
                     estimated_prompt_tokens INTEGER NOT NULL DEFAULT 0,
                     estimated_completion_tokens INTEGER NOT NULL DEFAULT 0,
                     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    cost_known INTEGER NOT NULL DEFAULT 1 CHECK(cost_known IN (0,1)),
                     created_at REAL NOT NULL,
                     started_at REAL,
                     finished_at REAL
@@ -279,6 +284,8 @@ class AutomationStore:
                 self._migrate_runs_to_v2()
             if schema_version < 3:
                 self._migrate_jobs_to_v3()
+            if schema_version < 4:
+                self._migrate_runs_to_v4()
             self._conn.execute(f"PRAGMA user_version = {AUTOMATION_SCHEMA_VERSION}")
 
     def _migrate_runs_to_v2(self) -> None:
@@ -307,6 +314,27 @@ class AutomationStore:
                 continue
             self._conn.execute(
                 f"ALTER TABLE automation_jobs ADD COLUMN {name} {declaration}"
+            )
+
+    def _migrate_runs_to_v4(self) -> None:
+        existing = {
+            str(row["name"])
+            for row in self._conn.execute(
+                "PRAGMA table_info(automation_runs)"
+            ).fetchall()
+        }
+        added = False
+        for name, declaration in _V4_RUN_COLUMNS.items():
+            if name in existing:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE automation_runs ADD COLUMN {name} {declaration}"
+            )
+            added = True
+        if added:
+            self._conn.execute(
+                "UPDATE automation_runs SET cost_known = 0 "
+                "WHERE prompt_tokens + completion_tokens > 0"
             )
 
     def create_job(
@@ -731,6 +759,7 @@ class AutomationStore:
         estimated_prompt_tokens: int = 0,
         estimated_completion_tokens: int = 0,
         estimated_cost_usd: float = 0.0,
+        cost_known: bool = True,
     ) -> AutomationRun:
         identifier = _identifier(run_id, "run id")
         token_values = (
@@ -754,6 +783,8 @@ class AutomationStore:
             raise ValueError("usage values must be non-negative")
         if usage_source not in {"unavailable", "provider", "estimated", "mixed"}:
             raise ValueError("usage_source is invalid")
+        if not isinstance(cost_known, bool):
+            raise TypeError("cost_known must be boolean")
         normalized_response = _optional_bounded_text(
             response, MAX_RESPONSE_BYTES, middle=True
         )
@@ -777,6 +808,7 @@ class AutomationStore:
                     cache_read_tokens = ?, cache_write_tokens = ?, cost_usd = ?,
                     usage_source = ?, estimated_prompt_tokens = ?,
                     estimated_completion_tokens = ?, estimated_cost_usd = ?,
+                    cost_known = ?,
                     finished_at = ?, lease_token_hash = NULL, lease_expires_at = NULL
                 WHERE run_id = ?
                 """,
@@ -794,6 +826,7 @@ class AutomationStore:
                     int(estimated_prompt_tokens),
                     int(estimated_completion_tokens),
                     float(estimated_cost_usd),
+                    int(cost_known),
                     now,
                     identifier,
                 ),
@@ -825,6 +858,7 @@ class AutomationStore:
                 estimated_prompt_tokens=estimated_prompt_tokens,
                 estimated_completion_tokens=estimated_completion_tokens,
                 estimated_cost_usd=estimated_cost_usd,
+                cost_known=cost_known,
             )
             self._enqueue_delivery_locked(job_id, identifier, now)
         return self._required_run(identifier)
@@ -1923,6 +1957,7 @@ def _run_from_row(row: sqlite3.Row) -> AutomationRun:
         estimated_prompt_tokens=int(row["estimated_prompt_tokens"]),
         estimated_completion_tokens=int(row["estimated_completion_tokens"]),
         estimated_cost_usd=float(row["estimated_cost_usd"]),
+        cost_known=bool(row["cost_known"]),
         trigger=str(row["trigger"]),  # type: ignore[arg-type]
     )
 

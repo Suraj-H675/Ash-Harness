@@ -254,6 +254,40 @@ enterprise-route decision, P1B same-provider credential/account resilience,
 supported local-runtime lifecycle and real Ollama/LM Studio/vLLM conformance,
 and adapter-level cancellation/stream-cleanup verification.
 
+### P1 progress — pricing provenance slice 3
+
+Ash no longer treats missing trusted model pricing as evidence that inference
+was free. Runtime usage now carries an explicit `cost_known` signal while
+retaining numeric `cost_usd` as the subtotal that can actually be calculated
+from known rates. If any completion in a turn lacks pricing, the turn and its
+SDK/result surfaces report pricing as unknown rather than presenting `$0` as a
+complete cost. Automatic Goal continuations preserve the same aggregate rule.
+
+Session storage schema v17 adds a rewind-safe `pricing_unknown_turns` counter.
+New turns increment it only when pricing is incomplete; rewinds subtract the
+removed turns' persisted provenance and a fully rewound empty session returns
+to known-zero state. Pre-v17 sessions with historical token usage are
+conservatively migrated as pricing-unknown because older schemas did not retain
+enough provenance to prove their stored cost total is complete. Forked sessions
+continue to own usage totals independently.
+
+The distinction propagates through `SessionUsage`, SDK results, the terminal
+status line, local metrics JSON/text, and durable automations. Automation
+schema v4 persists `cost_known`, conservatively marks historical runs with token
+usage as unknown, carries the flag through subprocess execution, worker
+persistence, CLI/JSON output, and webhook delivery, and never renders an
+unknown-priced run as `$0.000000`.
+
+Validation passes **124 session/storage/status tests**, **198 loop/SDK tests**,
+and **130 automation tests**. Ruff, targeted Mypy, and `git diff --check` are
+green.
+
+P1 remains open. Explicitly remaining: provider-owned capability truth for
+fast-changing hosted models, the P1A enterprise-route decision, P1B
+same-provider credential/account resilience, supported local-runtime lifecycle
+and real Ollama/LM Studio/vLLM conformance, and adapter-level
+cancellation/stream-cleanup verification.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product

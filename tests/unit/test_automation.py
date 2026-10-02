@@ -1413,7 +1413,43 @@ def test_due_claim_is_atomic_advances_and_completes(
     )
     assert completed.status == "succeeded"
     assert completed.session_id == "session-1"
+    assert completed.cost_known is True
     assert store.get_job(job.job_id, workspace=workspace).consecutive_failures == 0
+
+
+def test_automation_run_preserves_unknown_pricing_in_payload_and_text(
+    tmp_path: Path,
+    store: AutomationStore,
+) -> None:
+    from ash.commands.automation import render_runs, run_payload
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="unknown pricing",
+        prompt="Run unpriced model",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+    )
+    claim = store.claim_manual(job.job_id, workspace=workspace, worker_id="worker")
+
+    finished = store.finish_run(
+        claim.run.run_id,
+        claim.token,
+        status="succeeded",
+        prompt_tokens=10,
+        completion_tokens=5,
+        cost_usd=0.0,
+        usage_source="provider",
+        cost_known=False,
+    )
+
+    assert finished.cost_known is False
+    assert run_payload(finished)["cost_known"] is False
+    rendered = render_runs([finished])
+    assert "cost=unknown" in rendered
+    assert "cost=$0.000000" not in rendered
 
 
 @pytest.mark.parametrize(
@@ -2186,7 +2222,7 @@ def test_store_migrates_true_v1_run_rows_to_v2(tmp_path: Path) -> None:
         }
         version = int(migrated._conn.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == AUTOMATION_SCHEMA_VERSION == 3
+    assert version == AUTOMATION_SCHEMA_VERSION == 4
     assert {
         "cache_read_tokens",
         "cache_write_tokens",
@@ -2194,12 +2230,14 @@ def test_store_migrates_true_v1_run_rows_to_v2(tmp_path: Path) -> None:
         "estimated_prompt_tokens",
         "estimated_completion_tokens",
         "estimated_cost_usd",
+        "cost_known",
     } <= columns
     assert len(runs) == 1
     assert runs[0].prompt_tokens == 7
     assert runs[0].completion_tokens == 3
     assert runs[0].usage_source == "unavailable"
     assert runs[0].cache_read_tokens == 0
+    assert runs[0].cost_known is False
 
 
 def test_store_migrates_true_v2_jobs_to_v3(tmp_path: Path) -> None:
@@ -2270,7 +2308,7 @@ def test_store_migrates_true_v2_jobs_to_v3(tmp_path: Path) -> None:
         ).fetchone()[0]
         version = int(migrated._conn.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == AUTOMATION_SCHEMA_VERSION == 3
+    assert version == AUTOMATION_SCHEMA_VERSION == 4
     assert {"webhook_url", "webhook_secret_env"} <= job_columns
     assert delivery_table == 1
     assert loaded is not None
@@ -3253,6 +3291,7 @@ async def test_worker_executes_due_prompt_through_client(
     assert runs[0].estimated_prompt_tokens == 4
     assert runs[0].estimated_completion_tokens == 2
     assert runs[0].estimated_cost_usd == 0.006
+    assert runs[0].cost_known is True
     assert client.closed is True
     assert store.list_workers(workspace) == []
 

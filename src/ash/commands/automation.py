@@ -116,7 +116,10 @@ def run_payload(run: AutomationRun) -> dict[str, Any]:
         "estimated_prompt_tokens": run.estimated_prompt_tokens,
         "estimated_completion_tokens": run.estimated_completion_tokens,
         "estimated_cost_usd": run.estimated_cost_usd,
-        "cost_is_estimated": run.estimated_cost_usd > 0,
+        "cost_known": run.cost_known,
+        "cost_is_estimated": (
+            run.usage_source in {"estimated", "mixed"} and run.cost_known
+        ),
         "created_at": run.created_at.isoformat(),
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
@@ -181,10 +184,19 @@ def render_runs(runs: list[AutomationRun], *, json_output: bool = False) -> str:
     for run in runs:
         usage = run.prompt_tokens + run.completion_tokens
         approximate = "~" if run.usage_source in {"estimated", "mixed"} else ""
+        cost = (
+            f"{approximate}${run.cost_usd:.6f}"
+            if run.cost_known
+            else (
+                f"unknown (known ${run.cost_usd:.6f})"
+                if run.cost_usd > 0
+                else "unknown"
+            )
+        )
         lines.append(
             f"{run.run_id}  {run.status}  job={run.job_id} "
             f"scheduled={run.scheduled_for.isoformat()} tokens={usage} "
-            f"cost={approximate}${run.cost_usd:.6f} usage={run.usage_source}"
+            f"cost={cost} usage={run.usage_source}"
         )
         if run.error:
             lines.append(f"  error: {run.error}")

@@ -1236,6 +1236,7 @@ class AshLoop:
         self._last_usage_source = "unavailable"
         self._last_turn_cost_usd = 0.0
         self._last_estimated_cost_usd = 0.0
+        self._last_cost_known = True
         self.skill_nudge_interval = skill_nudge_interval
         self._iterations_since_skill_use = 0
         self.continuous_mode = continuous_mode
@@ -2823,7 +2824,8 @@ class AshLoop:
             ),
             "cost_usd": self._last_turn_cost_usd,
             "estimated_cost_usd": self._last_estimated_cost_usd,
-            "cost_is_estimated": self._last_estimated_cost_usd > 0,
+            "cost_known": self._last_cost_known,
+            "cost_is_estimated": has_estimates and self._last_cost_known,
         }
 
     @property
@@ -2997,6 +2999,9 @@ class AshLoop:
         self._last_turn_cost_usd = sum(float(step["cost_usd"]) for step in usage_steps)
         self._last_estimated_cost_usd = sum(
             float(step["estimated_cost_usd"]) for step in usage_steps
+        )
+        self._last_cost_known = all(
+            bool(step.get("cost_known", True)) for step in usage_steps
         )
         self._last_turn_budget_exhausted = any(budget_exhausted)
 
@@ -3348,6 +3353,7 @@ class AshLoop:
         total_estimated_completion_tokens = 0
         total_turn_cost_usd = 0.0
         total_estimated_cost_usd = 0.0
+        turn_cost_known = True
         turn_budget_exhausted = False
         usage_sources: set[str] = set()
         turn_token_budget = int(getattr(self._config, "max_turn_total_tokens", 0))
@@ -3515,6 +3521,8 @@ class AshLoop:
             turn_cache_write_tokens = model_completion.cache_write_tokens
             turn_usage_source = model_completion.usage_source
             completion_pricing = self._active_model_pricing()
+            if not completion_pricing:
+                turn_cost_known = False
             total_turn_cost_usd += _calculate_turn_cost(
                 prompt_tokens=turn_prompt_tokens,
                 completion_tokens=turn_completion_tokens,
@@ -3741,6 +3749,7 @@ class AshLoop:
         self._last_usage_source = usage_source
         self._last_turn_cost_usd = turn_cost_usd
         self._last_estimated_cost_usd = estimated_cost_usd
+        self._last_cost_known = turn_cost_known
         usage_payload = self.last_turn_usage
         self.turn_context.set("usage", usage_payload)
         self.session_store.save_turn_usage(self.turn_context.turn_id, usage_payload)
@@ -3756,6 +3765,7 @@ class AshLoop:
                 estimated_prompt_tokens=estimated_prompt,
                 estimated_completion_tokens=estimated_completion,
                 estimated_cost_usd=estimated_cost_usd,
+                cost_known=turn_cost_known,
             )
 
         if self.auto_commit:

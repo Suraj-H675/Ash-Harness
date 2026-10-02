@@ -978,6 +978,7 @@ class AutomationWorkerService:
                     estimated_prompt_tokens=result.estimated_prompt_tokens,
                     estimated_completion_tokens=result.estimated_completion_tokens,
                     estimated_cost_usd=result.estimated_cost_usd,
+                    cost_known=result.cost_known,
                 )
             return self.store.finish_run(
                 claim.run.run_id,
@@ -994,6 +995,7 @@ class AutomationWorkerService:
                 estimated_prompt_tokens=result.estimated_prompt_tokens,
                 estimated_completion_tokens=result.estimated_completion_tokens,
                 estimated_cost_usd=result.estimated_cost_usd,
+                cost_known=result.cost_known,
             )
         except asyncio.CancelledError as cancellation:
             cancellation_requested = True

@@ -83,6 +83,7 @@ class AutomationRun:
     estimated_prompt_tokens: int = 0
     estimated_completion_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    cost_known: bool = True
     trigger: Literal["scheduled", "manual"] = "scheduled"
 
 

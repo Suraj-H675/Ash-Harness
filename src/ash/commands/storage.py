@@ -561,11 +561,28 @@ def _debug_bundle_git_revision(workspace: Path) -> str:
 def render_local_metrics(summary: dict, *, json_output: bool = False) -> str:
     """Render aggregate local-only model usage metrics."""
 
+    pricing_unknown_turns = int(summary.get("pricing_unknown_turns", 0))
+    cost = float(summary["cost_usd"])
     if json_output:
         return json.dumps(
-            {"telemetry": "local_only", "metrics": summary},
+            {
+                "telemetry": "local_only",
+                "metrics": {
+                    **summary,
+                    "cost_known": pricing_unknown_turns == 0,
+                },
+            },
             sort_keys=True,
         )
+    cost_text = (
+        f"${cost:.6f}"
+        if pricing_unknown_turns == 0
+        else (
+            f"unknown (known subtotal ${cost:.6f})"
+            if cost > 0
+            else "unknown"
+        )
+    )
     return (
         f"Local model usage ({summary['session_count']} sessions): "
         f"{int(summary['total_tokens'])} tokens "
@@ -573,7 +590,7 @@ def render_local_metrics(summary: dict, *, json_output: bool = False) -> str:
         f"{int(summary['completion_tokens'])} completion), "
         f"cache {int(summary['cache_read_tokens'])}/"
         f"{int(summary['cache_write_tokens'])}, "
-        f"cost ${float(summary['cost_usd']):.6f}"
+        f"cost {cost_text}"
     )
 
 

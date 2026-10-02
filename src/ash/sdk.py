@@ -90,6 +90,7 @@ class AshResult:
     estimated_prompt_tokens: int = 0
     estimated_completion_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    cost_known: bool = True
     budget_exhausted: bool = False
 
     @property
@@ -111,7 +112,8 @@ class AshResult:
             ),
             "cost_usd": self.cost_usd,
             "estimated_cost_usd": self.estimated_cost_usd,
-            "cost_is_estimated": self.estimated_cost_usd > 0,
+            "cost_known": self.cost_known,
+            "cost_is_estimated": has_estimates and self.cost_known,
         }
 
 
@@ -380,6 +382,7 @@ class AshClient:
             estimated_prompt_tokens=int(usage["estimated_prompt_tokens"]),
             estimated_completion_tokens=int(usage["estimated_completion_tokens"]),
             estimated_cost_usd=float(usage["estimated_cost_usd"]),
+            cost_known=bool(usage["cost_known"]),
             budget_exhausted=self.loop._last_turn_budget_exhausted,
         )
 

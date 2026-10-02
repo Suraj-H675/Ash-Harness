@@ -75,6 +75,32 @@ def test_status_line_splits_viewport_identity_from_runtime(tmp_path: Path) -> No
     )
 
 
+def test_status_line_does_not_render_unknown_pricing_as_free(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.save_session_token_stats(
+        session.session_id,
+        10,
+        5,
+        0.0,
+        cost_known=False,
+    )
+    loop = SimpleNamespace(
+        current_session=session,
+        session_store=store,
+        permission_policy=PermissionPolicy("interactive"),
+        project_root=tmp_path,
+        _last_context_tokens=15,
+    )
+    config = AshConfig(workspace_root=tmp_path)
+    sandbox = SimpleNamespace(backend_name="scoped", is_fully_isolated=lambda: True)
+
+    rendered = StatusLine(loop, config, sandbox, refresh_seconds=60)()
+
+    assert "cost unknown" in rendered
+    assert "$0.0000" not in rendered
+
+
 def test_status_line_sanitizes_persisted_model_controls(tmp_path: Path) -> None:
     loop = SimpleNamespace(
         current_session=None,

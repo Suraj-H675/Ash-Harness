@@ -8,7 +8,7 @@ import pytest
 from ash.agents.shared_state import SharedState
 from ash.agents.tasks import AgentTaskError
 from ash.core.goals import GoalState
-from ash.sdk import AshClient
+from ash.sdk import AshClient, AshResult
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
@@ -422,9 +422,28 @@ async def test_async_sdk_reports_actual_failover_model_identity(tmp_path) -> Non
 
     assert result.model == "backup/backup-model"
     assert result.cost_usd == pytest.approx(0.0003)
+    assert result.cost_known is True
     completion = next(item.event for item in events if item.event.type == "turn.completed")
     assert completion.data["model"] == "backup-model"
     assert completion.data["model_id"] == "backup/backup-model"
+
+
+def test_sdk_usage_distinguishes_unknown_pricing_from_zero_cost() -> None:
+    result = AshResult(
+        response="done",
+        session_id="session",
+        model="custom/unpriced",
+        context_tokens=10,
+        prompt_tokens=8,
+        completion_tokens=2,
+        cost_usd=0.0,
+        usage_source="provider",
+        cost_known=False,
+    )
+
+    assert result.usage["cost_usd"] == 0.0
+    assert result.usage["cost_known"] is False
+    assert result.usage["cost_is_estimated"] is False
 
 
 

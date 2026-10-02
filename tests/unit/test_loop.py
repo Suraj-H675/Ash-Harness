@@ -5775,6 +5775,7 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
         "cache_hit_rate": 0.6,
         "cost_usd": pytest.approx(0.000152),
         "estimated_cost_usd": 0.0,
+        "cost_known": True,
         "cost_is_estimated": False,
     }
     report = loop._last_context_budget
@@ -5797,6 +5798,7 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     assert usage.cache_read_tokens == 60
     assert usage.cache_write_tokens == 20
     assert usage.cost_usd == pytest.approx(0.000152)
+    assert usage.cost_known is True
     assert loop.turn_context is not None
     assert store.rewind_turn_ids(session.session_id, 0) == [loop.turn_context.turn_id]
     with get_db_connection(store.db_path) as connection:
@@ -5805,6 +5807,47 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
             (loop.turn_context.turn_id,),
         ).fetchone()
     assert '"prompt_tokens": 100' in persisted_turn["usage_json"]
+
+
+@pytest.mark.asyncio
+async def test_unpriced_turn_reports_unknown_cost_and_rewind_restores_known_state(
+    tmp_path,
+) -> None:
+    store = SessionStore(tmp_path / "unknown-pricing.db")
+    config = AshConfig(
+        model="custom/cache-test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        model_pricing_usd_per_million={},
+    )
+    loop = AshLoop(
+        store,
+        CacheUsageProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=config,
+    )
+
+    session = await loop.start_session()
+    assert await loop.run_turn("measure unknown pricing") == "done"
+
+    turn_usage = loop.last_turn_usage
+    assert turn_usage["cost_usd"] == 0.0
+    assert turn_usage["cost_known"] is False
+    assert turn_usage["cost_is_estimated"] is False
+    session_usage = store.get_session_usage(session.session_id)
+    assert session_usage.cost_usd == 0.0
+    assert session_usage.pricing_unknown_turns == 1
+    assert session_usage.cost_known is False
+
+    store.rewind_session(session.session_id, 0)
+
+    rewound_usage = store.get_session_usage(session.session_id)
+    assert rewound_usage.total_tokens == 0
+    assert rewound_usage.pricing_unknown_turns == 0
+    assert rewound_usage.cost_known is True
 
 
 @pytest.mark.asyncio

@@ -72,6 +72,7 @@ class StatusLine:
         cache_read = 0
         cache_write = 0
         estimated_cost = 0.0
+        cost_known = True
         if session is not None:
             try:
                 usage = self.loop.session_store.get_session_usage(session.session_id)
@@ -79,6 +80,7 @@ class StatusLine:
                 cache_read = usage.cache_read_tokens
                 cache_write = usage.cache_write_tokens
                 estimated_cost = usage.estimated_cost_usd
+                cost_known = usage.cost_known
             except KeyError:
                 pass
         maximum = max(
@@ -101,10 +103,19 @@ class StatusLine:
             identity.append(f"git {branch}")
         identity.append(display_root)
 
+        cost_display = (
+            f"{'~' if estimated_cost > 0 else ''}${cost:.4f}"
+            if cost_known
+            else (
+                f"cost unknown (known ${cost:.4f})"
+                if cost > 0
+                else "cost unknown"
+            )
+        )
         runtime = [
             f"ctx ~{self.loop._last_context_tokens}/{maximum}",
             f"sandbox {sandbox_label}",
-            f"{'~' if estimated_cost > 0 else ''}${cost:.4f}",
+            cost_display,
         ]
         if cache_read or cache_write:
             runtime.append(f"cache {cache_read}r/{cache_write}w")

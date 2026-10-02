@@ -917,6 +917,32 @@ def test_metrics_cli_reports_local_only_aggregate(
     assert payload["metrics"]["session_count"] == 1
     assert payload["metrics"]["total_tokens"] == 15
     assert payload["metrics"]["cost_usd"] == pytest.approx(0.01)
+    assert payload["metrics"]["cost_known"] is True
+
+
+def test_metrics_cli_reports_unknown_pricing_without_calling_it_free(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.save_session_token_stats(
+        session.session_id,
+        10,
+        5,
+        0.0,
+        cost_known=False,
+    )
+
+    assert main(["--db-directory", str(tmp_path), "metrics"]) == 0
+    output = capsys.readouterr().out
+    assert "cost unknown" in output
+    assert "cost $0.000000" not in output
+
+    assert main(["--db-directory", str(tmp_path), "metrics", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["metrics"]["cost_usd"] == 0.0
+    assert payload["metrics"]["cost_known"] is False
 
 
 @pytest.mark.parametrize(
