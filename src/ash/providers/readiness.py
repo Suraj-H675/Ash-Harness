@@ -195,6 +195,12 @@ _BUILTIN_CONNECTIONS: dict[str, tuple[str, str, CatalogFormat, AuthMode]] = {
         "huggingface",
         "bearer",
     ),
+    "vercel": (
+        "https://ai-gateway.vercel.sh/v1",
+        "VERCEL_AI_GATEWAY_API_BASE",
+        "openai",
+        "bearer",
+    ),
     "mistral": (
         "https://api.mistral.ai/v1",
         "MISTRAL_API_BASE",

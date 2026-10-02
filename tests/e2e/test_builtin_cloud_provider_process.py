@@ -14,6 +14,7 @@ import pytest
 _DYNAMIC_CATALOG_PROVIDERS = {
     "google",
     "openrouter",
+    "vercel",
     "mistral",
     "xai",
     "together",
@@ -29,6 +30,11 @@ _DYNAMIC_CATALOG_PROVIDERS = {
         ("openai", "OPENAI_API_KEY", "OPENAI_API_BASE"),
         ("google", "GOOGLE_API_KEY", "GOOGLE_API_BASE"),
         ("openrouter", "OPENROUTER_API_KEY", "OPENROUTER_API_BASE"),
+        (
+            "vercel",
+            "AI_GATEWAY_API_KEY",
+            "VERCEL_AI_GATEWAY_API_BASE",
+        ),
         ("deepseek", "DEEPSEEK_API_KEY", "DEEPSEEK_API_BASE"),
         ("groq", "GROQ_API_KEY", "GROQ_API_BASE"),
         ("mistral", "MISTRAL_API_KEY", "MISTRAL_API_BASE"),

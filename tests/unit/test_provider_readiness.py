@@ -727,6 +727,21 @@ def test_huggingface_connection_uses_inference_provider_catalog(
     assert connection.headers["Authorization"] == "Bearer hf-test"
 
 
+def test_vercel_connection_uses_ai_gateway_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AI_GATEWAY_API_KEY", "vercel-test")
+
+    connection = readiness.resolve_provider_connection(
+        _config("vercel/openai/gpt-5.6-sol")
+    )
+
+    assert connection.base_url == "https://ai-gateway.vercel.sh/v1"
+    assert connection.catalog_endpoint == "https://ai-gateway.vercel.sh/v1/models"
+    assert connection.catalog_format == "openai"
+    assert connection.headers["Authorization"] == "Bearer vercel-test"
+
+
 def test_huggingface_catalog_uses_live_provider_capability_floor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

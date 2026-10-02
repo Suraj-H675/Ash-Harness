@@ -149,6 +149,7 @@ def test_default_registry_exposes_builtins_without_constructing_them() -> None:
         "openai-compatible",
         "openrouter",
         "together",
+        "vercel",
         "vllm",
         "xai",
     )
@@ -169,6 +170,11 @@ def test_default_registry_exposes_builtins_without_constructing_them() -> None:
             "huggingface",
             "HF_TOKEN",
             "https://router.huggingface.co/v1",
+        ),
+        (
+            "vercel",
+            "AI_GATEWAY_API_KEY",
+            "https://ai-gateway.vercel.sh/v1",
         ),
         ("together", "TOGETHER_API_KEY", "https://api.together.xyz/v1"),
         ("fireworks", "FIREWORKS_API_KEY", "https://api.fireworks.ai/inference/v1"),

@@ -84,6 +84,14 @@ BUILTIN_PROVIDERS: tuple[ProviderDescriptor, ...] = (
         "HF_TOKEN",
     ),
     ProviderDescriptor(
+        "vercel",
+        "Vercel AI Gateway",
+        "Gateway",
+        "Hundreds of routed models through one OpenAI-compatible gateway",
+        "https://ai-gateway.vercel.sh/v1",
+        "AI_GATEWAY_API_KEY",
+    ),
+    ProviderDescriptor(
         "deepseek",
         "DeepSeek",
         "Cloud API",

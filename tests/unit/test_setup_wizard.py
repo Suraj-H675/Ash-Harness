@@ -853,9 +853,10 @@ def test_provider_catalog_render_exposes_full_breadth(
     _render_provider_catalog(config, list(PROVIDERS))
 
     output = capsys.readouterr().out
-    assert "Providers  ·  17 routes" in output
+    assert "Providers  ·  18 routes" in output
     assert "OpenRouter" in output
     assert "Hugging Face" in output
+    assert "Vercel AI Gateway" in output
     assert "Google Gemini" in output
     assert "Ollama" in output
     assert "LM Studio" in output
@@ -946,7 +947,7 @@ def test_provider_catalog_has_compact_narrow_layout(
     )
 
     output = stream.getvalue()
-    assert "Providers  ·  17 routes" in output
+    assert "Providers  ·  18 routes" in output
     assert "OpenRouter" in output
     assert "Hugging Face" in output
     assert "Type" not in output

@@ -85,6 +85,7 @@ Supported built-in routes include:
 | OpenAI | GPT models through the OpenAI API using an API key or optional Sign in with ChatGPT plan auth |
 | OpenRouter | Multi-provider gateway routing |
 | Hugging Face | Inference Providers gateway to hundreds of hosted chat models |
+| Vercel AI Gateway | One API key for hundreds of routed models through an OpenAI-compatible gateway |
 | DeepSeek | Chat and reasoning models |
 | Groq | Fast hosted open models |
 | Mistral | Mistral models through an OpenAI-compatible endpoint |
