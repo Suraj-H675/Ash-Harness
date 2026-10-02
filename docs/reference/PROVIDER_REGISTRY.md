@@ -18,6 +18,16 @@ descriptor-anchored private storage, serializes rotating refresh-token updates
 across processes, and replays bounded opaque reasoning items required by
 `store=false` Responses conversations.
 
+The first-party `anthropic/*` route starts from exact, verified model
+declarations rather than family-name heuristics. Current offline defaults are
+Claude Fable 5.1, Opus 5.5, Sonnet 5.5, and Haiku 4.5; unknown model IDs fail
+conservative. At runtime Ash asks Anthropic's Models API for the selected
+model's provider-owned image/thinking and token-limit metadata when the SDK
+supports that endpoint, while retaining exact static tool-use evidence for
+verified model IDs because the Models API does not expose generic client-tool
+support. An operator-overridden Anthropic base URL does not inherit
+first-party capabilities before its own endpoint proves metadata.
+
 ```python
 from ash.providers import (
     ProviderABC,

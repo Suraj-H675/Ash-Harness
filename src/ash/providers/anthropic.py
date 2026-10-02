@@ -14,6 +14,7 @@ from typing import Any, AsyncGenerator
 
 from ash.context.tokens import AnthropicTokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
 from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
 from ash.providers.readiness import (
     ProviderConfigurationError,
@@ -156,10 +157,71 @@ class AnthropicProvider(ProviderABC):
         self._token_counter = token_counter or AnthropicTokenCounter()
         self._prompt_cache_enabled = False
         self._prompt_cache_retention = "memory"
+        self._dynamic_capabilities: ProviderCapabilities | None = None
 
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return self._dynamic_capabilities or super().capabilities
+
+    async def detect_capabilities(
+        self, *, refresh: bool = False
+    ) -> ProviderCapabilities:
+        """Merge provider-owned model metadata with Ash's conservative baseline."""
+
+        if self._dynamic_capabilities is not None and not refresh:
+            return self._dynamic_capabilities
+        self._dynamic_capabilities = None
+
+        client = self._resolve_client()
+        models = getattr(client, "models", None)
+        retrieve = getattr(models, "retrieve", None)
+        if not callable(retrieve):
+            return self.capabilities
+
+        info = await retrieve(self._model_name)
+        baseline = super().capabilities
+        if self._base_url is None:
+            canonical_id = str(getattr(info, "id", "") or "")
+            if canonical_id:
+                canonical = infer_capabilities("anthropic", canonical_id)
+                if canonical != ProviderCapabilities():
+                    baseline = canonical
+
+        metadata = getattr(info, "capabilities", None)
+        image_input = getattr(metadata, "image_input", None)
+        thinking = getattr(metadata, "thinking", None)
+
+        def positive_limit(value: Any) -> int | None:
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                return None
+            return value
+
+        self._dynamic_capabilities = ProviderCapabilities(
+            native_tools=baseline.native_tools,
+            vision=(
+                bool(getattr(image_input, "supported", False))
+                if image_input is not None
+                else baseline.vision
+            ),
+            reasoning=(
+                bool(getattr(thinking, "supported", False))
+                if thinking is not None
+                else baseline.reasoning
+            ),
+            context_window=(
+                positive_limit(getattr(info, "max_input_tokens", None))
+                or baseline.context_window
+            ),
+            max_output_tokens=(
+                positive_limit(getattr(info, "max_tokens", None))
+                or baseline.max_output_tokens
+            ),
+        )
+        return self._dynamic_capabilities
 
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)

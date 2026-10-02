@@ -1355,14 +1355,14 @@ def test_model_capability_display_covers_budgets_and_custom_models() -> None:
     from ash.cli import _render_model_capabilities, _render_model_list
     from ash.config import AshConfig
 
-    config = AshConfig(model="anthropic/claude-sonnet-4-6")
-    rendered = _render_model_capabilities("anthropic/claude-sonnet-4-6")
+    config = AshConfig(model="anthropic/claude-sonnet-5-5")
+    rendered = _render_model_capabilities("anthropic/claude-sonnet-5-5")
     list_rendered = _render_model_list(config)
 
     assert "tools" in rendered and "vision" in rendered and "reasoning" in rendered
     assert "context 1,000,000" in rendered
-    assert "output 64,000" in rendered
-    assert "claude-opus-4-7 [tools, vision, reasoning]" in list_rendered
+    assert "output 128,000" in rendered
+    assert "claude-opus-5-5 [tools, vision, reasoning]" in list_rendered
 
 
 def test_custom_model_capability_display_uses_configured_declaration() -> None:
@@ -1414,11 +1414,11 @@ def test_live_catalog_refresh_reports_failure_without_losing_static_catalog() ->
     from ash.cli import render_model_catalog_refresh
     from ash.config import AshConfig
 
-    config = AshConfig(model="anthropic/claude-sonnet-4-6")
+    config = AshConfig(model="anthropic/claude-sonnet-5-5")
     rendered = render_model_catalog_refresh(config, [], error="offline")
 
     assert "Live discovery unavailable: offline" in rendered
-    assert "claude-sonnet-4-6" in rendered
+    assert "claude-sonnet-5-5" in rendered
 
 
 def test_context_provenance_renders_fragment_metadata() -> None:

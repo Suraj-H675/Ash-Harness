@@ -662,6 +662,31 @@ reasoning, prompt-caching, and changelog documentation on 2026-10-02:
 P1C remains open for the remaining provider-owned discovery/capability
 semantics; this slice deliberately does not advance P1D or P1E claims.
 
+### P1 progress — Anthropic model-truth slice 11
+
+The next P1C slice removed the same class of family-wide capability assumption
+from Anthropic. Ash's offline Anthropic catalog now tracks the current Claude
+Fable 5.1 / Opus 5.5 / Sonnet 5.5 / Haiku 4.5 lineup, fixes Sonnet 4.6's
+documented 128K output ceiling, and uses exact capability declarations; unknown
+Anthropic IDs no longer inherit tools or vision merely from the provider name.
+
+For first-party Anthropic endpoints, runtime capability negotiation now uses
+the Models API when available to resolve aliases plus provider-owned image,
+thinking, context-window, and max-output metadata. Native client-tool support
+stays conservative unless the resolved model is one of Ash's exact verified
+Claude IDs because Anthropic's current Models API capability object does not
+publish a generic client-tool-use flag. Operator-overridden Anthropic base URLs
+start conservative instead of inheriting first-party model semantics.
+
+Built-in pricing now covers the current four-model lineup and distinguishes
+Anthropic's 5-minute cache-write price from the configured one-hour extended
+retention price, while explicit user pricing remains authoritative. Evidence
+was rechecked against Anthropic's first-party Models API, model overview, model
+versioning, current model pages, and tool-use documentation on 2026-10-02.
+
+P1C remains open for the remaining hosted-provider discovery/capability
+semantics; this slice does not consume the separate P1D/P1E closure work.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product

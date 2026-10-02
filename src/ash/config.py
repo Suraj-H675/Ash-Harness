@@ -440,8 +440,8 @@ class AshConfig(BaseSettings):
     _config_diagnostics: list[str] = PrivateAttr(default_factory=list)
 
     model: str = Field(
-        "anthropic/claude-sonnet-4-6",
-        description="Model in provider/model string format (e.g. anthropic/claude-sonnet-4-6, ollama/qwen3-coder)",
+        "anthropic/claude-sonnet-5-5",
+        description="Model in provider/model string format (e.g. anthropic/claude-sonnet-5-5, ollama/qwen3-coder)",
     )
     config_schema_version: int = Field(
         CURRENT_CONFIG_SCHEMA_VERSION,
@@ -512,9 +512,11 @@ class AshConfig(BaseSettings):
         default_factory=dict,
         description=(
             "Optional explicit model pricing that overrides built-in defaults: "
-            "provider/model -> {input, output, cache_read, cache_write: USD "
-            "per million tokens}. Cache rates default to the input rate when "
-            "omitted. Built-in defaults cover major Anthropic, OpenAI, "
+            "provider/model -> {input, output, cache_read, cache_write, "
+            "cache_write_1h: USD per million tokens}. cache_write_1h is used "
+            "for extended-retention caches when supplied; other cache rates "
+            "default to the input rate when omitted. Built-in defaults cover "
+            "major Anthropic, OpenAI, "
             "DeepSeek, and Groq models."
         ),
     )

@@ -6020,6 +6020,7 @@ async def test_failover_model_events_identify_requested_and_serving_provider(
     class PrimaryProvider(ProviderABC):
         model_name = "primary"
         provider_family = "anthropic"
+        _ash_declared_capabilities = ProviderCapabilities()
 
         def count_tokens(self, text):
             return len(text)
@@ -6031,6 +6032,7 @@ async def test_failover_model_events_identify_requested_and_serving_provider(
     class BackupProvider(ProviderABC):
         model_name = "backup"
         provider_family = "openai"
+        _ash_declared_capabilities = ProviderCapabilities()
 
         def count_tokens(self, text):
             return len(text)
@@ -6102,6 +6104,7 @@ def test_failover_default_pricing_uses_active_backup_model(
     class PrimaryProvider(ProviderABC):
         model_name = "primary"
         provider_family = "anthropic"
+        _ash_declared_capabilities = ProviderCapabilities()
 
         def count_tokens(self, text):
             return len(text)
@@ -6112,6 +6115,7 @@ def test_failover_default_pricing_uses_active_backup_model(
     class BackupProvider(ProviderABC):
         model_name = "backup"
         provider_family = "openai"
+        _ash_declared_capabilities = ProviderCapabilities()
 
         def count_tokens(self, text):
             return len(text)
@@ -6150,6 +6154,7 @@ def test_failover_configured_model_match_requires_same_provider_family(
     class PrimaryProvider(ProviderABC):
         model_name = "claude-sonnet-4-6"
         provider_family = "openai"
+        _ash_declared_capabilities = ProviderCapabilities()
 
         def count_tokens(self, text):
             return len(text)
@@ -6160,6 +6165,7 @@ def test_failover_configured_model_match_requires_same_provider_family(
     class BackupProvider(ProviderABC):
         model_name = "claude-sonnet-4-6"
         provider_family = "anthropic"
+        _ash_declared_capabilities = ProviderCapabilities()
 
         def count_tokens(self, text):
             return len(text)
@@ -6216,6 +6222,36 @@ def test_configured_provider_family_pricing_overrides_builtin_model_default(
     )
 
     assert loop._active_model_pricing() == {"input": 2.0, "output": 5.0}
+
+
+def test_anthropic_extended_cache_retention_uses_one_hour_write_rate(
+    tmp_path,
+) -> None:
+    class AnthropicProvider(ProviderABC):
+        model_name = "claude-sonnet-5-5"
+        provider_family = "anthropic"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="done", is_done=True)
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "anthropic-extended-cache-pricing.db"),
+        AnthropicProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="anthropic/claude-sonnet-5-5",
+            prompt_cache_retention="extended",
+        ),
+    )
+
+    pricing = loop._active_model_pricing()
+    assert pricing["cache_write"] == 4.0
+    assert pricing["cache_write_1h"] == 4.0
 
 
 def test_deepseek_time_tiered_pricing_is_unknown_without_user_override(

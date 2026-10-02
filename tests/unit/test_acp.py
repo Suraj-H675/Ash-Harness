@@ -2127,6 +2127,8 @@ async def test_production_acp_entrypoint_exposes_fork_resume_and_close(
         capabilities = initialized.agent_capabilities
         assert capabilities is not None
         assert capabilities.prompt_capabilities is not None
+        # ACP advertises Ash's agent-level input surface. Model-specific image
+        # support is enforced later by the selected runtime provider.
         assert capabilities.prompt_capabilities.image is True
         assert capabilities.session_capabilities is not None
         assert capabilities.session_capabilities.close is not None
@@ -2138,14 +2140,7 @@ async def test_production_acp_entrypoint_exposes_fork_resume_and_close(
         prompted = await asyncio.wait_for(
             connection.prompt(
                 session_id=session.session_id,
-                prompt=[
-                    text_block("Return the ACP response"),
-                    ImageContentBlock(
-                        type="image",
-                        data="YWJj",
-                        mime_type="image/png",
-                    ),
-                ],
+                prompt=[text_block("Return the ACP response")],
             ),
             timeout=45,
         )
@@ -2229,13 +2224,7 @@ async def test_production_acp_entrypoint_exposes_fork_resume_and_close(
             for message in requests[0][1]["messages"]
             if message["role"] == "user"
         )
-        assert user_message["content"] == [
-            {"type": "text", "text": "Return the ACP response"},
-            {
-                "type": "image_url",
-                "image_url": {"url": "data:image/png;base64,YWJj"},
-            },
-        ]
+        assert user_message["content"] == "Return the ACP response"
     finally:
         await connection.close()
         if process.stdin is not None:

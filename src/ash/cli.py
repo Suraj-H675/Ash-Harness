@@ -33,8 +33,9 @@ if TYPE_CHECKING:
 
 
 AVAILABLE_MODELS: list[str] = [
-    "anthropic/claude-opus-4-7",
-    "anthropic/claude-sonnet-4-6",
+    "anthropic/claude-fable-5-1",
+    "anthropic/claude-opus-5-5",
+    "anthropic/claude-sonnet-5-5",
     "anthropic/claude-haiku-4-5",
     "openai/gpt-6-astra",
     "openai/gpt-6.1-sol",
@@ -2206,7 +2207,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             model_str = " ".join(parsed_command[1]).strip()
             if "/" not in model_str:
                 print(
-                    "Error: model must be in provider/model format (e.g. anthropic/claude-sonnet-4-6)",
+                    "Error: model must be in provider/model format (e.g. anthropic/claude-sonnet-5-5)",
                     file=sys.stderr,
                 )
                 continue

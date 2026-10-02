@@ -789,10 +789,6 @@ async def test_foreground_coder_subprocess_uses_live_approval_and_syncs_rule(
     def forbidden_parent_factory() -> ProviderABC:
         raise AssertionError("foreground coder subprocess must rebuild provider in child")
 
-    monkeypatch.setenv("OPENAI_API_KEY", "approval-secret")
-    monkeypatch.setenv(
-        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
-    )
     state = SharedState(
         tmp_path / "state" / "agents.db",
         workspace=tmp_path,
@@ -800,10 +796,19 @@ async def test_foreground_coder_subprocess_uses_live_approval_and_syncs_rule(
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        model="openai/approval-child",
+        model="loopback/approval-child",
         agent_execution_mode="subprocess",
         safety_tier="interactive",
         memory_backend="off",
+        custom_providers={
+            "loopback": {
+                "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                "auth_mode": "none",
+                "model_capabilities": {
+                    "approval-child": {"native_tools": True}
+                },
+            }
+        },
     )
     parent_policy = PermissionPolicy("interactive")
     broker_calls: list[tuple[str, str, dict]] = []
@@ -936,10 +941,6 @@ async def test_foreground_coder_subprocess_exact_scope_does_not_cross_call(
     def forbidden_parent_factory() -> ProviderABC:
         raise AssertionError("foreground coder subprocess must rebuild provider in child")
 
-    monkeypatch.setenv("OPENAI_API_KEY", "scope-secret")
-    monkeypatch.setenv(
-        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
-    )
     state = SharedState(
         tmp_path / "scope-state" / "agents.db",
         workspace=tmp_path,
@@ -947,10 +948,19 @@ async def test_foreground_coder_subprocess_exact_scope_does_not_cross_call(
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "scope-db",
-        model="openai/scope-child",
+        model="loopback/scope-child",
         agent_execution_mode="subprocess",
         safety_tier="interactive",
         memory_backend="off",
+        custom_providers={
+            "loopback": {
+                "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                "auth_mode": "none",
+                "model_capabilities": {
+                    "scope-child": {"native_tools": True}
+                },
+            }
+        },
     )
     parent_policy = PermissionPolicy("interactive")
     broker_calls: list[dict] = []
@@ -1578,10 +1588,6 @@ async def test_foreground_subprocess_cancel_during_live_approval_fails_closed(
     def forbidden_parent_factory() -> ProviderABC:
         raise AssertionError("foreground subprocess must rebuild provider in child")
 
-    monkeypatch.setenv("OPENAI_API_KEY", "cancel-approval-secret")
-    monkeypatch.setenv(
-        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
-    )
     state = SharedState(
         tmp_path / "cancel-state" / "agents.db",
         workspace=tmp_path,
@@ -1589,10 +1595,19 @@ async def test_foreground_subprocess_cancel_during_live_approval_fails_closed(
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "cancel-db",
-        model="openai/cancel-approval-child",
+        model="loopback/cancel-approval-child",
         agent_execution_mode="subprocess",
         safety_tier="interactive",
         memory_backend="off",
+        custom_providers={
+            "loopback": {
+                "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                "auth_mode": "none",
+                "model_capabilities": {
+                    "cancel-approval-child": {"native_tools": True}
+                },
+            }
+        },
     )
     broker_started = asyncio.Event()
     broker_cancelled = asyncio.Event()
@@ -1886,10 +1901,6 @@ async def test_background_coder_subprocess_keeps_durable_approval_path(
     def forbidden_parent_factory() -> ProviderABC:
         raise AssertionError("background coder subprocess must rebuild provider in child")
 
-    monkeypatch.setenv("OPENAI_API_KEY", "durable-approval-secret")
-    monkeypatch.setenv(
-        "OPENAI_API_BASE", f"http://127.0.0.1:{server.server_port}/v1"
-    )
     state = SharedState(
         tmp_path / "state" / "agents.db",
         workspace=tmp_path,
@@ -1897,10 +1908,19 @@ async def test_background_coder_subprocess_keeps_durable_approval_path(
     config = AshConfig(
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
-        model="openai/durable-child",
+        model="loopback/durable-child",
         agent_execution_mode="subprocess",
         safety_tier="interactive",
         memory_backend="off",
+        custom_providers={
+            "loopback": {
+                "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                "auth_mode": "none",
+                "model_capabilities": {
+                    "durable-child": {"native_tools": True}
+                },
+            }
+        },
     )
     live_broker_calls = 0
 

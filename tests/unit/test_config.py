@@ -397,7 +397,7 @@ def test_config_loads_without_api_key(
     # Should load without ValidationError (no required api_key field)
     config = AshConfig.load()
     assert config.provider == "anthropic"
-    assert config.model == "anthropic/claude-sonnet-4-6"
+    assert config.model == "anthropic/claude-sonnet-5-5"
 
 
 def test_terminal_preferences_are_validated() -> None:
@@ -765,7 +765,7 @@ def test_untrusted_project_config_is_inert(
     config = AshConfig.load()
 
     assert config.workspace_root == root.resolve()
-    assert config.model == "anthropic/claude-sonnet-4-6"
+    assert config.model == "anthropic/claude-sonnet-5-5"
     assert config.temperature == 0.0
     assert config.config_diagnostics == ()
 
@@ -896,7 +896,7 @@ def test_project_config_cannot_override_user_owned_controls(
     config = AshConfig.load()
 
     assert config.workspace_root == root.resolve()
-    assert config.model == "anthropic/claude-sonnet-4-6"
+    assert config.model == "anthropic/claude-sonnet-5-5"
     assert config.safety_tier == "interactive"
     assert config.max_concurrent_agents == 4
     assert config.agent_token_budget == 4000
@@ -1150,7 +1150,7 @@ def test_malformed_project_config_only_fails_after_trust(
     (root / ".ash" / "config.toml").write_text("model = [", encoding="utf-8")
     monkeypatch.chdir(root)
 
-    assert AshConfig.load().model == "anthropic/claude-sonnet-4-6"
+    assert AshConfig.load().model == "anthropic/claude-sonnet-5-5"
     set_workspace_trusted(root, True)
     with pytest.raises(ValueError, match="cannot load project config"):
         AshConfig.load()

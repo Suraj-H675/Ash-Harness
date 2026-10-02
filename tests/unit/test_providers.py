@@ -1970,6 +1970,98 @@ async def test_anthropic_prompt_cache_normalizes_usage() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_anthropic_capabilities_use_provider_model_metadata() -> None:
+    from ash.providers.anthropic import AnthropicProvider
+    from ash.providers.capabilities import ProviderCapabilities
+
+    class Models:
+        async def retrieve(self, model: str) -> Any:
+            assert model == "claude-sonnet-5-5"
+            return SimpleNamespace(
+                id="claude-sonnet-5-5",
+                capabilities=SimpleNamespace(
+                    image_input=SimpleNamespace(supported=True),
+                    thinking=SimpleNamespace(supported=True),
+                ),
+                max_input_tokens=1_000_000,
+                max_tokens=128_000,
+            )
+
+    client = SimpleNamespace(
+        messages=_FakeAnthropicMessages(SimpleNamespace()),
+        models=Models(),
+    )
+    provider = AnthropicProvider(
+        model_name="claude-sonnet-5-5",
+        api_key="test-key",
+        client=client,
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=128_000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_unknown_model_metadata_keeps_tools_conservative() -> None:
+    from ash.providers.anthropic import AnthropicProvider
+    from ash.providers.capabilities import ProviderCapabilities
+
+    class Models:
+        async def retrieve(self, model: str) -> Any:
+            assert model == "future-claude"
+            return SimpleNamespace(
+                id="future-claude",
+                capabilities=SimpleNamespace(
+                    image_input=SimpleNamespace(supported=True),
+                    thinking=SimpleNamespace(supported=True),
+                ),
+                max_input_tokens=2_000_000,
+                max_tokens=256_000,
+            )
+
+    provider = AnthropicProvider(
+        model_name="future-claude",
+        api_key="test-key",
+        client=SimpleNamespace(
+            messages=_FakeAnthropicMessages(SimpleNamespace()), models=Models()
+        ),
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=False,
+        vision=True,
+        reasoning=True,
+        context_window=2_000_000,
+        max_output_tokens=256_000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_capability_probe_without_models_api_uses_static_truth() -> None:
+    from ash.providers.anthropic import AnthropicProvider
+    from ash.providers.capabilities import ProviderCapabilities
+
+    provider = AnthropicProvider(
+        model_name="claude-sonnet-5-5",
+        api_key="test-key",
+        client=SimpleNamespace(messages=_FakeAnthropicMessages(SimpleNamespace())),
+    )
+
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=128_000,
+    )
+
+
 def test_prompt_cache_retention_validation() -> None:
     from ash.providers.anthropic import AnthropicProvider
     from ash.providers.openai import OpenAIProvider

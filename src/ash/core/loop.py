@@ -1075,23 +1075,47 @@ def _calculate_turn_cost(
 
 
 DEFAULT_MODEL_PRICING_USD_PER_MILLION: dict[str, dict[str, float]] = {
+    "anthropic/claude-fable-5-1": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 0.25,
+        "cache_write": 12.50,
+        "cache_write_1h": 20.0,
+    },
+    "anthropic/claude-opus-5-5": {
+        "input": 4.0,
+        "output": 20.0,
+        "cache_read": 0.20,
+        "cache_write": 5.0,
+        "cache_write_1h": 8.0,
+    },
+    "anthropic/claude-sonnet-5-5": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.20,
+        "cache_write": 2.50,
+        "cache_write_1h": 4.0,
+    },
     "anthropic/claude-sonnet-4-6": {
         "input": 3.0,
         "output": 15.0,
         "cache_read": 0.30,
         "cache_write": 3.75,
+        "cache_write_1h": 6.0,
     },
     "anthropic/claude-opus-4-7": {
         "input": 5.0,
         "output": 25.0,
         "cache_read": 0.50,
         "cache_write": 6.25,
+        "cache_write_1h": 10.0,
     },
     "anthropic/claude-haiku-4-5": {
         "input": 1.0,
         "output": 5.0,
         "cache_read": 0.10,
         "cache_write": 1.25,
+        "cache_write_1h": 2.0,
     },
     "openai/gpt-6-astra": {
         "input": 10.0,
@@ -4038,7 +4062,15 @@ class AshLoop:
                 if default is not None:
                     pricing = default
                     break
-        return pricing or {}
+        resolved = dict(pricing or {})
+        if (
+            self._config is not None
+            and getattr(self._config, "prompt_cache_retention", "memory") == "extended"
+        ):
+            extended_cache_write = resolved.get("cache_write_1h")
+            if extended_cache_write is not None:
+                resolved["cache_write"] = extended_cache_write
+        return resolved
 
     @property
     def pending_steering_count(self) -> int:

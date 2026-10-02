@@ -75,15 +75,64 @@ class CapabilityRegistry:
         return capabilities
 
 
+_ANTHROPIC_STATIC_CAPABILITIES: dict[str, ProviderCapabilities] = {
+    "claude-fable-5-1": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=128_000,
+    ),
+    "claude-opus-5-5": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=128_000,
+    ),
+    "claude-sonnet-5-5": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=128_000,
+    ),
+    "claude-haiku-4-5": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=200_000,
+        max_output_tokens=64_000,
+    ),
+    "claude-haiku-4-5-20251001": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=200_000,
+        max_output_tokens=64_000,
+    ),
+    "claude-opus-4-7": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=128_000,
+    ),
+    "claude-sonnet-4-6": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=128_000,
+    ),
+}
+
+
 def _anthropic(model: str) -> ProviderCapabilities:
-    name = model.casefold()
-    if "opus-4-7" in name:
-        return ProviderCapabilities(True, True, True, False, 1_000_000, 128_000)
-    if "sonnet-4-6" in name:
-        return ProviderCapabilities(True, True, True, False, 1_000_000, 64_000)
-    if "haiku-4-5" in name:
-        return ProviderCapabilities(True, True, True, False, 200_000, 64_000)
-    return ProviderCapabilities(native_tools=True, vision=True)
+    return _ANTHROPIC_STATIC_CAPABILITIES.get(
+        model.casefold(),
+        ProviderCapabilities(),
+    )
 
 
 _OPENAI_RESPONSES_MODELS = frozenset(

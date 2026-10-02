@@ -645,6 +645,41 @@ def test_openai_current_models_use_responses_for_api_keys(
     assert provider.capabilities.native_tools is True
 
 
+def test_anthropic_current_capabilities_are_exact_and_unknowns_fail_closed() -> None:
+    from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
+
+    assert infer_capabilities(
+        "anthropic", "claude-sonnet-5-5"
+    ) == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=128_000,
+    )
+    assert infer_capabilities(
+        "anthropic", "claude-sonnet-4-6"
+    ).max_output_tokens == 128_000
+    assert infer_capabilities(
+        "anthropic", "unverified-future-model"
+    ) == ProviderCapabilities()
+
+
+def test_anthropic_overridden_endpoint_does_not_inherit_first_party_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("ANTHROPIC_API_BASE", "https://gateway.example.test/v1")
+
+    provider = create_default_provider_registry().build(
+        AshConfig(model="anthropic/claude-sonnet-5-5")
+    )
+
+    assert provider.capabilities == ProviderCapabilities()
+
+
 def test_openai_current_models_keep_responses_inside_credential_pool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

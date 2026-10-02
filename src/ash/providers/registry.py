@@ -310,6 +310,8 @@ def _build_anthropic(
         api_key=connection.api_key,
         base_url=None if connection.uses_default_base_url else connection.base_url,
     )
+    if not connection.uses_default_base_url:
+        provider._ash_declared_capabilities = ProviderCapabilities()
     provider.configure_max_tokens(config.max_completion_tokens)
     provider.configure_prompt_cache(
         enabled=config.prompt_cache_enabled and connection.uses_default_base_url,
