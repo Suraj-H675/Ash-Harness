@@ -22,7 +22,7 @@ from ash.plugins._lifecycle_support import (
     sync_directory_strict as _sync_directory_strict,
     validate_plugin_name as _validate_plugin_name,
 )
-from ash.plugins.errors import PluginLifecycleError
+from ash.plugins.errors import PluginDependencyError, PluginLifecycleError
 from ash.plugins.git_source import GIT_DIGEST_PATTERN, validate_plugin_git_source
 from ash.plugins.install_records import (
     MAX_PLUGIN_INSTALL_RECORDS as MAX_PLUGIN_INSTALL_RECORDS,
@@ -160,6 +160,28 @@ def recover_plugin_lifecycle(destination_root: Path | None = None) -> bool:
         raise _lifecycle_error("plugin lifecycle recovery", exc) from exc
 
 
+def load_installed_plugin_manifests(
+    destination_root: Path | None = None,
+) -> dict[str, PluginManifest]:
+    """Load the current installed plugin graph through the lifecycle anchor."""
+
+    root = (destination_root or user_plugin_root()).expanduser()
+    _require_anchored_plugin_mutation()
+    try:
+        with (
+            AnchoredDirectory.open(root, create=False) as root_directory,
+            root_directory.lock(".ash-lifecycle.lock"),
+        ):
+            _recover_plugin_lifecycle_at(root_directory, root)
+            return _installed_plugin_manifests_strict_at(root_directory)
+    except FileNotFoundError:
+        return {}
+    except PluginLifecycleError:
+        raise
+    except (AnchoredFilesystemError, OSError) as exc:
+        raise _lifecycle_error("plugin lifecycle", exc) from exc
+
+
 def _recover_plugin_lifecycle_at(
     root_directory: AnchoredDirectory,
     root: Path,
@@ -235,6 +257,24 @@ def _rollback_prepared_install_tree(
     journal: PluginLifecycleJournal,
 ) -> None:
     if journal.moved_name is not None:
+        moved = root_directory.stat(journal.moved_name)
+        if moved is None:
+            current = root_directory.stat(journal.plugin)
+            if (
+                journal.live_tree is None
+                and current is not None
+                and journal.previous_tree is not None
+                and journal.previous_tree.matches(current)
+            ):
+                # The journal is written before the existing tree is renamed.
+                # A failure during locked publication-state validation can
+                # therefore leave the original tree untouched and the planned
+                # backup name absent.
+                return
+            raise PluginLifecycleError(
+                f"cannot safely recover interrupted install for {journal.plugin!r}; "
+                "planned backup is absent"
+            )
         previous = _open_journal_moved_tree(root_directory, journal)
         try:
             current = root_directory.stat(journal.plugin)
@@ -595,6 +635,7 @@ def install_local_plugin(
         ]
         | None
     ) = None,
+    _skip_dependency_checks: bool = False,
     _install_record: PluginInstallRecord | None | object = _INSTALL_RECORD_UNCHANGED,
     _expected_install_record: PluginInstallRecord | object = _INSTALL_RECORD_UNCHANGED,
 ) -> InstalledPlugin:
@@ -746,17 +787,20 @@ def install_local_plugin(
                     name: installed.version
                     for name, installed in installed_manifests.items()
                 }
-                dependency_errors = manifest.check_dependencies(installed_versions)
-                if dependency_errors:
-                    raise PluginLifecycleError("; ".join(dependency_errors))
-                reverse_dependency_errors = _new_reverse_dependency_errors(
-                    installed_manifests,
-                    target=manifest.name,
-                    before_version=current_version,
-                    after_version=manifest.version,
-                )
-                if reverse_dependency_errors:
-                    raise PluginLifecycleError("; ".join(reverse_dependency_errors))
+                if not _skip_dependency_checks:
+                    dependency_errors = manifest.check_dependencies(installed_versions)
+                    if dependency_errors:
+                        raise PluginDependencyError("; ".join(dependency_errors))
+                    reverse_dependency_errors = _new_reverse_dependency_errors(
+                        installed_manifests,
+                        target=manifest.name,
+                        before_version=current_version,
+                        after_version=manifest.version,
+                    )
+                    if reverse_dependency_errors:
+                        raise PluginDependencyError(
+                            "; ".join(reverse_dependency_errors)
+                        )
                 if _topology_validator is not None:
                     _topology_validator(
                         manifest,
@@ -1485,6 +1529,7 @@ def install_git_plugin(
         ]
         | None
     ) = None,
+    _skip_dependency_checks: bool = False,
 ) -> InstalledPlugin:
     _require_anchored_plugin_mutation()
     try:
@@ -1679,6 +1724,7 @@ def install_git_plugin(
             _source_directory=checkout_directory,
             _snapshot=snapshot,
             _state_validator=_state_validator,
+            _skip_dependency_checks=_skip_dependency_checks,
             _install_record=install_record,
             _expected_install_record=(
                 _expected_previous_record

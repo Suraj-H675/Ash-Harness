@@ -7,6 +7,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
+from packaging.specifiers import SpecifierSet
+from packaging.version import parse as parse_version
+
 from ash.core.redaction import redact_text, redact_urls_in_text
 from ash.plugins.catalog import (
     CatalogEntry,
@@ -18,7 +21,7 @@ from ash.plugins.catalog import (
     trusted_catalog_keys_path,
 )
 from ash.plugins.inventory import ExtensionInventory
-from ash.plugins.errors import PluginLifecycleError
+from ash.plugins.errors import PluginDependencyError, PluginLifecycleError
 from ash.plugins.install_records import (
     PluginInstallRecord,
     load_plugin_install_records,
@@ -28,12 +31,19 @@ from ash.plugins.lifecycle import (
     InstalledPlugin,
     install_git_plugin,
     install_local_plugin,
+    load_installed_plugin_manifests,
     load_managed_plugin_for_update,
     recover_plugin_lifecycle,
     set_local_plugin_enabled,
     uninstall_local_plugin,
 )
-from ash.plugins.state import ExtensionState, load_extension_state
+from ash.plugins.state import (
+    ExtensionState,
+    PendingPluginUpdate,
+    begin_coordinated_plugin_update,
+    finish_coordinated_plugin_update,
+    load_extension_state,
+)
 from ash.plugins.snapshot import PluginSnapshot
 from ash.plugins.validation import validate_plugin_contents, validate_plugin_contents_at
 from ash.plugins.manifest import PluginManifest
@@ -622,12 +632,12 @@ def update_local_plugin(
         state: ExtensionState,
         manifests: Mapping[str, PluginManifest],
     ) -> None:
-        if target not in state.disabled_plugins:
-            _require_enabled_dependencies_from_manifests(
-                manifest,
-                state.disabled_plugins,
-                manifests,
-            )
+        candidate_graph = dict(manifests)
+        candidate_graph[target] = manifest
+        _require_enabled_plugin_graph(
+            candidate_graph,
+            state.disabled_plugins,
+        )
 
     if record.origin == "legacy-unknown":
         raise PluginLifecycleError(
@@ -669,6 +679,7 @@ def update_local_plugin(
                 ),
                 _expected_previous_record=record,
                 _state_validator=validate_publication_state,
+                _skip_dependency_checks=True,
             )
         else:
             installed_result = install_git_plugin(
@@ -680,6 +691,7 @@ def update_local_plugin(
                 expected=expected,
                 _expected_previous_record=record,
                 _state_validator=validate_publication_state,
+                _skip_dependency_checks=True,
             )
     else:
         installed_result = install_git_plugin(
@@ -696,6 +708,7 @@ def update_local_plugin(
             ),
             _expected_previous_record=record,
             _state_validator=validate_publication_state,
+            _skip_dependency_checks=True,
         )
 
     after = installed_result.install_record or record
@@ -715,33 +728,216 @@ def update_all_local_plugins(
     *,
     catalog: CatalogSelection = None,
 ) -> dict[str, Any]:
-    """Update every tracked plugin independently and report all outcomes."""
+    """Update tracked plugins, coordinating dependency migrations when needed."""
 
     recover_plugin_lifecycle()
     names = sorted(load_plugin_install_records())
-    results: list[dict[str, Any]] = []
-    for name in names:
-        try:
-            results.append(update_local_plugin(name, catalog=catalog))
-        except (OSError, PluginLifecycleError, ValueError) as exc:
-            results.append(
-                {
-                    "action": "update",
-                    "name": name,
-                    "status": "error",
-                    "error": redact_text(str(exc)),
-                }
+    result_by_name: dict[str, dict[str, Any]] = {}
+    dependency_failures: set[str] = set()
+    dependency_relations: dict[str, frozenset[str]] = {}
+    coordination_errors: list[str] = []
+
+    pending = load_extension_state().pending_update
+    if pending is not None:
+        resumed, resolved, error = _run_coordinated_update(
+            pending,
+            catalog=catalog,
+        )
+        result_by_name.update(resumed)
+        if error is not None:
+            coordination_errors.append(error)
+        if not resolved:
+            return _plugin_update_all_result(
+                names,
+                result_by_name,
+                coordination_errors=coordination_errors,
             )
+
+    for name in names:
+        if name in result_by_name:
+            continue
+        try:
+            result_by_name[name] = update_local_plugin(name, catalog=catalog)
+        except PluginDependencyError as exc:
+            dependency_failures.add(name)
+            dependency_relations[name] = exc.plugins
+            result_by_name[name] = _plugin_update_error(name, exc)
+        except (OSError, PluginLifecycleError, ValueError) as exc:
+            result_by_name[name] = _plugin_update_error(name, exc)
+
+    # A dependency failure can be only an ordering issue: another independent
+    # update later in the pass may have made the graph valid. Retry once before
+    # escalating to a coordinated quiesce.
+    for name in sorted(dependency_failures):
+        try:
+            result_by_name[name] = update_local_plugin(name, catalog=catalog)
+        except PluginDependencyError as exc:
+            dependency_relations[name] = exc.plugins
+            result_by_name[name] = _plugin_update_error(name, exc)
+        except (OSError, PluginLifecycleError, ValueError) as exc:
+            dependency_failures.discard(name)
+            dependency_relations.pop(name, None)
+            result_by_name[name] = _plugin_update_error(name, exc)
+        else:
+            dependency_failures.discard(name)
+            dependency_relations.pop(name, None)
+
+    if dependency_failures:
+        manifests = load_installed_plugin_manifests()
+        for component, targets in _dependency_failure_components(
+            manifests,
+            dependency_failures,
+            dependency_relations,
+        ):
+            if len(targets) < 2:
+                continue
+            try:
+                _, quiesced = begin_coordinated_plugin_update(
+                    list(component),
+                    list(targets),
+                )
+                assert quiesced.pending_update is not None
+                outcomes, resolved, error = _run_coordinated_update(
+                    quiesced.pending_update,
+                    catalog=catalog,
+                )
+                result_by_name.update(outcomes)
+                if error is not None:
+                    coordination_errors.append(error)
+                if resolved:
+                    dependency_failures.difference_update(targets)
+            except (OSError, PluginLifecycleError, ValueError) as exc:
+                coordination_errors.append(redact_text(str(exc)))
+
+    return _plugin_update_all_result(
+        names,
+        result_by_name,
+        coordination_errors=coordination_errors,
+    )
+
+
+def _plugin_update_error(name: str, exc: BaseException) -> dict[str, Any]:
+    return {
+        "action": "update",
+        "name": name,
+        "status": "error",
+        "error": redact_text(str(exc)),
+    }
+
+
+def _plugin_update_all_result(
+    names: Sequence[str],
+    result_by_name: Mapping[str, dict[str, Any]],
+    *,
+    coordination_errors: Sequence[str] = (),
+) -> dict[str, Any]:
+    results = [
+        result_by_name.get(
+            name,
+            _plugin_update_error(
+                name,
+                PluginLifecycleError("plugin update did not produce an outcome"),
+            ),
+        )
+        for name in names
+    ]
     updated = sum(result.get("status") == "updated" for result in results)
     unchanged = sum(result.get("status") == "unchanged" for result in results)
     errors = sum(result.get("status") == "error" for result in results)
-    return {
+    errors += len(coordination_errors)
+    payload: dict[str, Any] = {
         "action": "update-all",
         "updated": updated,
         "unchanged": unchanged,
         "errors": errors,
         "results": results,
     }
+    if coordination_errors:
+        payload["coordination_errors"] = [
+            redact_text(error) for error in coordination_errors
+        ]
+    pending = load_extension_state().pending_update
+    if pending is not None:
+        payload["quiesced"] = list(pending.plugins)
+    return payload
+
+
+def _run_coordinated_update(
+    pending: PendingPluginUpdate,
+    *,
+    catalog: CatalogSelection,
+) -> tuple[dict[str, dict[str, Any]], bool, str | None]:
+    outcomes: dict[str, dict[str, Any]] = {}
+    for name in pending.targets:
+        try:
+            outcomes[name] = update_local_plugin(name, catalog=catalog)
+        except (OSError, PluginLifecycleError, ValueError) as exc:
+            outcomes[name] = _plugin_update_error(name, exc)
+
+    current = load_extension_state()
+    if current.pending_update != pending:
+        return (
+            outcomes,
+            False,
+            "coordinated plugin update state changed before graph validation",
+        )
+    restore_disabled = frozenset(
+        set(current.disabled_plugins) - set(pending.restore_enabled)
+    )
+    try:
+        _require_enabled_plugin_graph(
+            load_installed_plugin_manifests(),
+            restore_disabled,
+        )
+    except PluginDependencyError as exc:
+        return outcomes, False, redact_text(str(exc))
+    try:
+        finish_coordinated_plugin_update(pending)
+    except PluginLifecycleError as exc:
+        return outcomes, False, redact_text(str(exc))
+    return outcomes, True, None
+
+
+def _dependency_failure_components(
+    manifests: Mapping[str, PluginManifest],
+    failed_targets: set[str],
+    failure_relations: Mapping[str, frozenset[str]],
+) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
+    adjacency: dict[str, set[str]] = {name: set() for name in manifests}
+    for name, manifest in manifests.items():
+        for dependency in manifest.dependencies:
+            dependency_name = dependency.get("name", "")
+            if dependency_name not in adjacency:
+                continue
+            adjacency[name].add(dependency_name)
+            adjacency[dependency_name].add(name)
+    for failed_name in failed_targets:
+        related = {
+            name
+            for name in failure_relations.get(failed_name, frozenset())
+            if name in adjacency
+        }
+        related.add(failed_name)
+        for name in related:
+            adjacency[name].update(related - {name})
+
+    groups: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    unseen = set(adjacency)
+    while unseen:
+        start = min(unseen)
+        stack = [start]
+        component: set[str] = set()
+        while stack:
+            current = stack.pop()
+            if current in component:
+                continue
+            component.add(current)
+            unseen.discard(current)
+            stack.extend(adjacency[current] - component)
+        targets = tuple(sorted(component & failed_targets))
+        if targets:
+            groups.append((tuple(sorted(component)), targets))
+    return groups
 
 
 def _plugin_update_result(
@@ -808,6 +1004,21 @@ def render_plugin_update_all(result: dict[str, Any], *, json_output: bool) -> st
             lines.append(render_plugin_action(outcome, json_output=False))
     if not lines:
         lines.append("No tracked plugins to update.")
+    for error in result.get("coordination_errors", []):
+        lines.append(
+            "Coordinated update incomplete: "
+            + terminal_safe_text(str(error), single_line=True)
+        )
+    quiesced = result.get("quiesced", [])
+    if quiesced:
+        lines.append(
+            "Temporarily disabled pending recovery: "
+            + ", ".join(
+                terminal_safe_text(str(name), single_line=True)
+                for name in quiesced
+            )
+            + ". Rerun ash extensions update --all to resume safely."
+        )
     lines.append(
         "Update summary: "
         f"{result['updated']} updated, "
@@ -829,4 +1040,36 @@ def _require_enabled_dependencies_from_manifests(
     }
     errors = manifest.check_dependencies(versions)
     if errors:
-        raise PluginLifecycleError("; ".join(errors))
+        raise PluginDependencyError("; ".join(errors))
+
+
+def _require_enabled_plugin_graph(
+    manifests: Mapping[str, PluginManifest],
+    disabled_plugins: frozenset[str],
+) -> None:
+    enabled_versions = {
+        name: manifest.version
+        for name, manifest in manifests.items()
+        if name not in disabled_plugins
+    }
+    for name in sorted(enabled_versions):
+        manifest = manifests[name]
+        for dependency in manifest.dependencies:
+            dependency_name = dependency.get("name", "")
+            requirement = dependency.get("version", "")
+            installed_version = enabled_versions.get(dependency_name)
+            if installed_version is None:
+                raise PluginDependencyError(
+                    f"{name}: Missing dependency: {dependency_name} "
+                    f"({requirement})",
+                    plugins=(name, dependency_name),
+                )
+            if not requirement:
+                continue
+            if SpecifierSet(requirement).contains(parse_version(installed_version)):
+                continue
+            raise PluginDependencyError(
+                f"{name} requires {dependency_name} {requirement}; "
+                f"installed {installed_version} does not satisfy it",
+                plugins=(name, dependency_name),
+            )

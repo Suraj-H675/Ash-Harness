@@ -1396,43 +1396,211 @@ def test_extensions_update_all_continues_after_error_and_returns_failure(
     assert load_plugin_install_records()["beta"].digest == beta_new_digest
 
 
-def test_update_all_fails_closed_on_coordinated_dependency_version_transition(
+def test_update_all_coordinates_dependency_version_transition(
     tmp_path: Path,
     isolated_home: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    base_source, base_branch, base_v1_digest = _git_plugin(
+    base_source, base_branch, _base_v1_digest = _git_plugin(
         tmp_path / "base-repo",
         name="alpha-base",
     )
-    dependent_source, dependent_branch, dependent_v1_digest = _git_plugin(
+    dependent_source, dependent_branch, _dependent_v1_digest = _git_plugin(
+        tmp_path / "dependent-repo",
+        name="z-dependent",
+        dependencies=[{"name": "alpha-base", "version": "<2"}],
+    )
+    independent_source, independent_branch, _ = _git_plugin(
+        tmp_path / "independent-repo",
+        name="m-independent",
+    )
+    install_git_plugin(base_source, ref=base_branch)
+    install_git_plugin(dependent_source, ref=dependent_branch)
+    install_git_plugin(independent_source, ref=independent_branch)
+    base_v2_digest = _commit_plugin(
+        tmp_path / "base-repo",
+        name="alpha-base",
+        version="2.0.0",
+    )
+    dependent_v2_digest = _commit_plugin(
+        tmp_path / "dependent-repo",
+        name="z-dependent",
+        version="2.0.0",
+        dependencies=[{"name": "alpha-base", "version": ">=2"}],
+    )
+    independent_v2_digest = _commit_plugin(
+        tmp_path / "independent-repo",
+        name="m-independent",
+        version="2.0.0",
+    )
+
+    assert main(["extensions", "update", "--all", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["updated"] == 3
+    assert payload["errors"] == 0
+    assert [item["status"] for item in payload["results"]] == [
+        "updated",
+        "updated",
+        "updated",
+    ]
+    records = load_plugin_install_records()
+    assert records["alpha-base"].digest == base_v2_digest
+    assert records["m-independent"].digest == independent_v2_digest
+    assert records["z-dependent"].digest == dependent_v2_digest
+    state = load_extension_state()
+    assert state.pending_update is None
+    assert state.disabled_plugins == frozenset()
+
+
+def test_update_all_coordinates_dependencies_introduced_only_by_new_versions(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    alpha_source, alpha_branch, _ = _git_plugin(
+        tmp_path / "alpha-repo",
+        name="alpha",
+    )
+    beta_source, beta_branch, _ = _git_plugin(
+        tmp_path / "beta-repo",
+        name="beta",
+    )
+    install_git_plugin(alpha_source, ref=alpha_branch)
+    install_git_plugin(beta_source, ref=beta_branch)
+    alpha_v2_digest = _commit_plugin(
+        tmp_path / "alpha-repo",
+        name="alpha",
+        version="2.0.0",
+        dependencies=[{"name": "beta", "version": ">=2"}],
+    )
+    beta_v2_digest = _commit_plugin(
+        tmp_path / "beta-repo",
+        name="beta",
+        version="2.0.0",
+        dependencies=[{"name": "alpha", "version": ">=2"}],
+    )
+
+    assert main(["extensions", "update", "--all", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["updated"] == 2
+    assert payload["errors"] == 0
+    records = load_plugin_install_records()
+    assert records["alpha"].digest == alpha_v2_digest
+    assert records["beta"].digest == beta_v2_digest
+    state = load_extension_state()
+    assert state.pending_update is None
+    assert state.disabled_plugins == frozenset()
+
+
+def test_update_all_resumes_crashed_coordinated_dependency_transition(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    base_source, base_branch, _ = _git_plugin(
+        tmp_path / "base-repo",
+        name="alpha-base",
+    )
+    dependent_source, dependent_branch, _ = _git_plugin(
         tmp_path / "dependent-repo",
         name="z-dependent",
         dependencies=[{"name": "alpha-base", "version": "<2"}],
     )
     install_git_plugin(base_source, ref=base_branch)
     install_git_plugin(dependent_source, ref=dependent_branch)
-    _commit_plugin(
+    base_v2_digest = _commit_plugin(
         tmp_path / "base-repo",
         name="alpha-base",
         version="2.0.0",
     )
-    _commit_plugin(
+    dependent_v2_digest = _commit_plugin(
         tmp_path / "dependent-repo",
         name="z-dependent",
         version="2.0.0",
         dependencies=[{"name": "alpha-base", "version": ">=2"}],
     )
 
-    assert main(["extensions", "update", "--all", "--json"]) == 1
+    _, quiesced = plugin_state.begin_coordinated_plugin_update(
+        ["alpha-base", "z-dependent"],
+        ["alpha-base", "z-dependent"],
+    )
+    assert quiesced.pending_update is not None
+    assert quiesced.disabled_plugins == frozenset({"alpha-base", "z-dependent"})
+
+    assert main(["extensions", "update", "--all", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
 
-    assert payload["updated"] == 0
-    assert payload["errors"] == 2
-    assert [item["status"] for item in payload["results"]] == ["error", "error"]
+    assert payload["updated"] == 2
+    assert payload["errors"] == 0
     records = load_plugin_install_records()
-    assert records["alpha-base"].digest == base_v1_digest
-    assert records["z-dependent"].digest == dependent_v1_digest
+    assert records["alpha-base"].digest == base_v2_digest
+    assert records["z-dependent"].digest == dependent_v2_digest
+    restored = load_extension_state()
+    assert restored.pending_update is None
+    assert restored.disabled_plugins == frozenset()
+
+
+def test_update_all_keeps_failed_coordinated_transition_quiesced_until_repaired(
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    base_source, base_branch, _ = _git_plugin(
+        tmp_path / "base-repo",
+        name="alpha-base",
+    )
+    dependent_source, dependent_branch, _ = _git_plugin(
+        tmp_path / "dependent-repo",
+        name="z-dependent",
+        dependencies=[{"name": "alpha-base", "version": "<2"}],
+    )
+    install_git_plugin(base_source, ref=base_branch)
+    install_git_plugin(dependent_source, ref=dependent_branch)
+    base_v2_digest = _commit_plugin(
+        tmp_path / "base-repo",
+        name="alpha-base",
+        version="2.0.0",
+    )
+    _commit_plugin(
+        tmp_path / "dependent-repo",
+        name="wrong-name",
+        version="2.0.0",
+        dependencies=[{"name": "alpha-base", "version": ">=2"}],
+    )
+    _, quiesced = plugin_state.begin_coordinated_plugin_update(
+        ["alpha-base", "z-dependent"],
+        ["alpha-base", "z-dependent"],
+    )
+    assert quiesced.pending_update is not None
+
+    assert main(["extensions", "update", "--all", "--json"]) == 1
+    failed = json.loads(capsys.readouterr().out)
+
+    assert failed["updated"] == 1
+    assert failed["errors"] >= 1
+    assert failed["quiesced"] == ["alpha-base", "z-dependent"]
+    state = load_extension_state()
+    assert state.pending_update == quiesced.pending_update
+    assert state.disabled_plugins == frozenset({"alpha-base", "z-dependent"})
+    assert load_plugin_install_records()["alpha-base"].digest == base_v2_digest
+
+    dependent_v2_digest = _commit_plugin(
+        tmp_path / "dependent-repo",
+        name="z-dependent",
+        version="2.0.0",
+        dependencies=[{"name": "alpha-base", "version": ">=2"}],
+    )
+
+    assert main(["extensions", "update", "--all", "--json"]) == 0
+    repaired = json.loads(capsys.readouterr().out)
+
+    assert repaired["errors"] == 0
+    assert load_plugin_install_records()["z-dependent"].digest == dependent_v2_digest
+    restored = load_extension_state()
+    assert restored.pending_update is None
+    assert restored.disabled_plugins == frozenset()
 
 
 def test_extensions_update_all_ignores_untracked_local_plugins(

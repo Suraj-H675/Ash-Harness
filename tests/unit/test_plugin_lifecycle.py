@@ -25,6 +25,7 @@ from ash.plugins.lifecycle import (
     load_extension_state,
     set_plugin_enabled,
     uninstall_local_plugin,
+    user_plugin_root,
 )
 
 
@@ -234,6 +235,101 @@ def test_enable_disable_state_is_atomic_and_private(tmp_path) -> None:
     assert state_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_coordinated_update_state_roundtrips_and_restores_activation(tmp_path) -> None:
+    state_path = tmp_path / "ash" / "extensions.json"
+    set_plugin_enabled("already-disabled", enabled=False, path=state_path)
+
+    before, quiesced = plugin_state.begin_coordinated_plugin_update(
+        ["alpha", "beta"],
+        ["alpha", "beta"],
+        path=state_path,
+    )
+
+    assert before.disabled_plugins == frozenset({"already-disabled"})
+    assert quiesced.disabled_plugins == frozenset(
+        {"already-disabled", "alpha", "beta"}
+    )
+    assert quiesced.pending_update is not None
+    assert quiesced.pending_update.plugins == ("alpha", "beta")
+    assert quiesced.pending_update.targets == ("alpha", "beta")
+    assert quiesced.pending_update.restore_enabled == ("alpha", "beta")
+    assert load_extension_state(state_path) == quiesced
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["version"] == 2
+
+    restored = plugin_state.finish_coordinated_plugin_update(
+        quiesced.pending_update,
+        path=state_path,
+    )
+
+    assert restored.pending_update is None
+    assert restored.disabled_plugins == frozenset({"already-disabled"})
+    assert load_extension_state(state_path) == restored
+    assert json.loads(state_path.read_text(encoding="utf-8"))["version"] == 2
+
+
+def test_coordinated_update_blocks_owned_activation_but_preserves_unrelated_changes(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "ash" / "extensions.json"
+    _, quiesced = plugin_state.begin_coordinated_plugin_update(
+        ["alpha", "beta"],
+        ["alpha", "beta"],
+        path=state_path,
+    )
+    assert quiesced.pending_update is not None
+
+    with pytest.raises(PluginLifecycleError, match="temporarily quiesced"):
+        set_plugin_enabled("alpha", enabled=True, path=state_path)
+
+    unrelated = set_plugin_enabled("other", enabled=False, path=state_path)
+    assert unrelated.pending_update == quiesced.pending_update
+    assert "other" in unrelated.disabled_plugins
+
+    restored = plugin_state.finish_coordinated_plugin_update(
+        quiesced.pending_update,
+        path=state_path,
+    )
+    assert restored.disabled_plugins == frozenset({"other"})
+
+
+@pytest.mark.parametrize(
+    "pending",
+    [
+        {
+            "plugins": ["beta", "alpha"],
+            "targets": ["alpha"],
+            "restore_enabled": ["alpha"],
+        },
+        {
+            "plugins": ["alpha", "alpha"],
+            "targets": ["alpha"],
+            "restore_enabled": ["alpha"],
+        },
+        {
+            "plugins": ["alpha"],
+            "targets": ["outside"],
+            "restore_enabled": ["alpha"],
+        },
+    ],
+)
+def test_invalid_coordinated_update_state_is_rejected(tmp_path, pending) -> None:
+    state_path = tmp_path / "extensions.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "disabled_plugins": ["alpha"],
+                "pending_update": pending,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PluginLifecycleError, match="pending plugin update"):
+        load_extension_state(state_path)
+
+
 def test_loading_extension_state_does_not_change_directory_mode(tmp_path) -> None:
     _require_anchored_platform()
     state_path = tmp_path / "state" / "extensions.json"
@@ -322,6 +418,34 @@ def test_uninstall_rolls_back_plugin_when_state_cleanup_fails(
 
     assert installed.root.is_dir()
     assert load_extension_state(state_path).disabled_plugins == frozenset({"example"})
+
+
+def test_prepublication_failure_recovers_when_planned_backup_was_never_moved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    first = _plugin(tmp_path / "first", version="1.0.0")
+    second = _plugin(tmp_path / "second", version="2.0.0")
+    installed = install_local_plugin(first)
+
+    def reject_publication(*_args) -> None:
+        raise PluginLifecycleError("injected publication-state rejection")
+
+    with pytest.raises(PluginLifecycleError, match="publication-state rejection"):
+        install_local_plugin(
+            second,
+            replace=True,
+            _state_validator=reject_publication,
+        )
+
+    assert json.loads((installed.root / "plugin.json").read_text())["version"] == "1.0.0"
+    root = user_plugin_root()
+    assert not (root / ".ash-lifecycle-journal.json").exists()
+    assert not list(root.glob(".example.backup-*"))
+    assert not list(root.glob(".install-*.tmp"))
 
 
 def test_invalid_extension_state_is_rejected(tmp_path) -> None:

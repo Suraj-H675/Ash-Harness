@@ -452,10 +452,13 @@ Ash is extensible without changing the core runtime:
   tracked plugin in deterministic order, preserve each plugin's independent
   atomic update boundary, continue after per-plugin failures, and report
   updated/unchanged/error outcomes; the CLI returns a failing status when any
-  tracked update fails. Coordinated version transitions that require multiple
-  mutually dependent plugins to change atomically are intentionally rejected
-  rather than exposing a temporarily broken dependency graph; a true
-  multi-plugin transaction remains a marketplace parity gap;
+  tracked update fails. Dependency migrations that cannot be made valid one
+  plugin at a time are handled as a coordinated quiesced cohort: Ash
+  atomically records and temporarily disables the connected component, applies
+  each verified plugin through its existing crash-safe replacement boundary,
+  validates the final enabled graph, then restores the component's prior
+  activation. A crash or failed candidate leaves a durable resumable quiesce
+  record instead of exposing a broken enabled graph;
 - validation for traversal, links, malformed manifests, oversized components,
   missing dependencies, and unsafe replacements;
 - update, enable, disable, uninstall, inventory, search, and atomic live reload;
