@@ -202,16 +202,17 @@ not extend P1 with unrelated work once every flag is closed.
 
 - `P1A_PROVIDER_BREADTH = CLOSED`
 - `P1B_AUTH_RESILIENCE = CLOSED`
-- `P1C_MODEL_CAPABILITY_TRUTH = OPEN`
+- `P1C_MODEL_CAPABILITY_TRUTH = CLOSED`
 - `P1D_LOCAL_RUNTIME_PARITY = OPEN`
 - `P1E_LIVE_CONFORMANCE = OPEN`
 - `P1_PROVIDER_MODEL_PARITY = OPEN` until P1A-P1E are all closed.
 
-The next unfinished checkpoint is P1C. Its finish condition is that supported
-hosted-provider model discovery, capability/limit semantics, usage, prompt
-caching, and model switching are provider-owned or exact first-party
-declarations, with unknown/conflicting evidence failing conservative. P1D and
-P1E remain separate checkpoints rather than reasons to keep expanding P1C.
+P1C's finish condition is satisfied: supported hosted-provider model discovery,
+capability/limit semantics, usage, prompt caching, and model switching now use
+provider-owned metadata or exact first-party declarations, while missing,
+ambiguous, conflicting, or deployment-opaque evidence fails conservative.
+The next unfinished checkpoint is P1D. P1E remains separate rather than a
+reason to reopen hosted-provider capability work without new concrete evidence.
 
 ### P1 progress — provider correctness slice 1
 
@@ -752,6 +753,48 @@ P1C remains open for the remaining hosted-provider capability/usage/cache and
 model-switch semantics. Azure deployment IDs and Bedrock model/profile IDs stay
 conservative until provider-owned evidence can identify their runtime
 capabilities safely; P1D/P1E remain separate finish gates.
+
+### P1 progress — hosted capability closure and Azure usage slice 14
+
+The final P1C audit rechecked every hosted route against the bounded finish
+condition instead of expanding the provider list again. Direct Anthropic,
+OpenAI, Google Gemini, DeepSeek, and Groq routes now have exact current
+first-party semantics where the provider contract supports them. Vertex Gemini
+uses exact documented Google model semantics. OpenRouter, Hugging Face, Vercel
+AI Gateway, Mistral, xAI, Together, Fireworks, Cerebras, and NVIDIA remain
+catalog-driven and conservative when provider metadata is absent or
+contradictory. Azure deployment IDs and Bedrock model/profile IDs intentionally
+remain capability-unknown because their names/inventory do not prove the
+serving model's OpenAI-wire feature set.
+
+The audit found one remaining usage defect: Azure's GA v1 Chat Completions
+contract supports `stream_options.include_usage`, but Ash inherited the generic
+custom-base default that omitted it. Azure now requests the authoritative
+trailing usage chunk and normalizes prompt, completion, and cached-input counts
+through the same terminal-tail path already used by other OpenAI-compatible
+providers. Missing provider usage elsewhere remains explicitly estimated rather
+than presented as authoritative.
+
+Prompt-cache behavior is now truthful rather than artificially uniform:
+Anthropic and current first-party OpenAI routes expose their supported cache
+controls and provider-reported read/write usage; DeepSeek and Groq preserve
+their automatic cache-hit accounting; Gemini's implicit caching remains
+provider-managed rather than receiving invented OpenAI cache controls; routes
+without a verified cache contract are left untouched. Core terminal semantics
+already reject output after a terminal chunk while accepting a compatible
+usage-only terminal tail, and runtime model switching re-runs dynamic
+capability negotiation before the next turn with provider retirement and
+rollback coverage.
+
+Azure usage evidence was rechecked against Microsoft's current first-party v1
+Chat Completions reference on 2026-10-02:
+`https://learn.microsoft.com/en-us/rest/api/aifoundry/azureopenai/chat`.
+Google caching behavior was rechecked against current Gemini API and Google
+Cloud context-caching documentation on the same date.
+
+`P1C_MODEL_CAPABILITY_TRUTH = CLOSED`. The finite P1 roadmap now advances to
+P1D local-runtime parity; live credentialed/provider conformance remains P1E
+and does not block this hosted-model semantic closure.
 
 ### M4 product decisions
 

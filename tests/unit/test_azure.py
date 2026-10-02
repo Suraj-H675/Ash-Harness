@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -116,6 +117,68 @@ def test_azure_api_key_provider_does_not_require_identity_extra() -> None:
     assert provider.provider_family == "azure"
     assert provider.model_name == "deployment-a"
     assert provider._base_url == "https://resource.openai.azure.com/openai/v1"
+
+
+@pytest.mark.asyncio
+async def test_azure_stream_requests_and_normalizes_provider_usage() -> None:
+    class Stream:
+        def __init__(self, chunks: list[Any]) -> None:
+            self.chunks = chunks
+
+        def __aiter__(self):
+            async def generate():
+                for chunk in self.chunks:
+                    yield chunk
+
+            return generate()
+
+    class Completions:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] = {}
+
+        async def create(self, **kwargs: Any) -> Stream:
+            self.kwargs = kwargs
+            usage = SimpleNamespace(
+                prompt_tokens=120,
+                completion_tokens=8,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=20),
+            )
+            return Stream(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content="done", tool_calls=None),
+                                finish_reason="stop",
+                            )
+                        ],
+                        usage=None,
+                    ),
+                    SimpleNamespace(choices=[], usage=usage),
+                ]
+            )
+
+    completions = Completions()
+    provider = AzureProvider(
+        "deployment-a",
+        base_url="https://resource.openai.azure.com",
+        auth_mode="api_key",
+        api_key="azure-key",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+
+    chunks = [
+        chunk
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "hello"}]
+        )
+    ]
+
+    assert completions.kwargs["stream_options"] == {"include_usage": True}
+    assert chunks[-1].prompt_tokens == 120
+    assert chunks[-1].completion_tokens == 8
+    assert chunks[-1].cache_read_tokens == 20
+    assert chunks[-1].usage_source == "provider"
 
 
 def test_azure_api_key_provider_requires_key() -> None:

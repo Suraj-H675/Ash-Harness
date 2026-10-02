@@ -96,6 +96,7 @@ class AzureProvider(OpenAIProvider):
             api_key=selected_key,
             base_url=normalized_url,
             error_secrets_supplier=error_secrets_supplier,
+            include_stream_usage=True,
             client=client,
         )
 

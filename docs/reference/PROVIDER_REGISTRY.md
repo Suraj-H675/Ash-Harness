@@ -125,6 +125,11 @@ written to Ash config or session storage. Ash owns and closes credentials it
 creates. Azure deployment/model IDs are explicit because Ash does not treat
 Azure's management-plane inventory as an authoritative OpenAI model catalog;
 ash providers test verifies the selected deployment with a bounded completion.
+Azure v1 explicitly supports streamed usage chunks, so Ash requests
+`stream_options.include_usage=true` and normalizes provider-reported prompt,
+completion, and cached-input counts when the stream completes. Deployment
+capabilities remain conservative because an arbitrary Azure deployment name
+does not prove which underlying model/version is serving it.
 
 Project configuration cannot set Vertex project/location, Bedrock
 region/profile, or Azure endpoint/auth mode. These are user-owned controls, and
