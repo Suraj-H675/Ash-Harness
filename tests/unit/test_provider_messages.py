@@ -254,7 +254,7 @@ def test_canonical_message_rejects_invalid_role_or_content_contracts(
         normalize_messages([message])
 
 
-def test_canonical_provider_state_accepts_only_bounded_reasoning_items() -> None:
+def test_canonical_provider_state_accepts_only_bounded_replay_items() -> None:
     reasoning = {
         "type": "reasoning",
         "id": "rs_1",
@@ -273,7 +273,25 @@ def test_canonical_provider_state_accepts_only_bounded_reasoning_items() -> None
         ]
     )[0]["provider_state"] == [reasoning]
 
-    with pytest.raises(ValueError, match="only reasoning items"):
+    sealed = {
+        "type": "sealed_provider_state",
+        "version": 1,
+        "provider": "deepseek",
+        "kind": "reasoning_content",
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ciphertext": "Y2lwaGVydGV4dA==",
+    }
+    assert normalize_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "provider_state": [sealed],
+            }
+        ]
+    )[0]["provider_state"] == [sealed]
+
+    with pytest.raises(ValueError, match="type is unsupported"):
         normalize_messages(
             [
                 {

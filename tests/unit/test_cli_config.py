@@ -1185,6 +1185,15 @@ def test_model_catalog_rendering_and_shared_input_picker() -> None:
     assert output[-1] == f"Switched to {AVAILABLE_MODELS[1]}"
 
 
+def test_model_catalog_advertises_current_deepseek_models_only() -> None:
+    from ash.cli import AVAILABLE_MODELS
+
+    assert "deepseek/deepseek-flash" in AVAILABLE_MODELS
+    assert "deepseek/deepseek-v4-pro" in AVAILABLE_MODELS
+    assert "deepseek/deepseek-chat" not in AVAILABLE_MODELS
+    assert "deepseek/deepseek-reasoner" not in AVAILABLE_MODELS
+
+
 def test_model_picker_can_switch_to_cached_live_discovery() -> None:
     import asyncio
     from types import SimpleNamespace

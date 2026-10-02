@@ -281,6 +281,8 @@ def _build_deepseek(config: "AshConfig", model_name: str) -> ProviderABC:
         model_name=model_name,
         api_key=connection.api_key,
         base_url=None if connection.uses_default_base_url else connection.base_url,
+        replay_state_directory=config.db_directory / "provider-replay-state",
+        replay_state_trusted_root=config.db_directory.parent,
     )
     provider.configure_max_tokens(config.max_completion_tokens)
     return provider

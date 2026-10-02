@@ -241,7 +241,7 @@ class CanonicalMessage(BaseModel):
                     f"provider_state exceeds {MAX_PROVIDER_STATE_ITEMS} items"
                 )
             for item in self.provider_state:
-                _validate_provider_reasoning_state(item)
+                _validate_provider_state_item(item)
             try:
                 encoded = json.dumps(
                     self.provider_state,
@@ -267,9 +267,19 @@ class CanonicalMessage(BaseModel):
         return self.model_dump(mode="python", exclude_none=True)
 
 
-def _validate_provider_reasoning_state(item: Any) -> None:
-    if not isinstance(item, dict) or item.get("type") != "reasoning":
-        raise ValueError("provider_state currently accepts only reasoning items")
+def _validate_provider_state_item(item: Any) -> None:
+    if not isinstance(item, dict):
+        raise ValueError("provider_state items must be objects")
+    if item.get("type") == "reasoning":
+        _validate_provider_reasoning_state(item)
+        return
+    if item.get("type") == "sealed_provider_state":
+        _validate_sealed_provider_state(item)
+        return
+    raise ValueError("provider_state item type is unsupported")
+
+
+def _validate_provider_reasoning_state(item: dict[str, Any]) -> None:
     allowed = {"type", "id", "summary", "status", "encrypted_content"}
     unknown = set(item) - allowed
     if unknown:
@@ -311,6 +321,51 @@ def _validate_provider_reasoning_state(item: Any) -> None:
         "incomplete",
     }:
         raise ValueError("provider_state reasoning status is invalid")
+
+
+def _validate_sealed_provider_state(item: dict[str, Any]) -> None:
+    allowed = {
+        "type",
+        "version",
+        "provider",
+        "kind",
+        "nonce",
+        "ciphertext",
+    }
+    unknown = set(item) - allowed
+    if unknown:
+        raise ValueError(
+            "sealed provider_state contains unsupported field(s): "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    if item.get("version") != 1:
+        raise ValueError("sealed provider_state version is unsupported")
+    for name in ("provider", "kind"):
+        value = item.get(name)
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 64
+            or any(ord(char) < 33 or ord(char) > 126 for char in value)
+        ):
+            raise ValueError(f"sealed provider_state {name} is invalid")
+    nonce = item.get("nonce")
+    ciphertext = item.get("ciphertext")
+    if not isinstance(nonce, str) or not nonce or len(nonce) > 64:
+        raise ValueError("sealed provider_state nonce is invalid")
+    if (
+        not isinstance(ciphertext, str)
+        or not ciphertext
+        or len(ciphertext) > MAX_PROVIDER_STATE_BYTES
+    ):
+        raise ValueError("sealed provider_state ciphertext is invalid")
+    try:
+        decoded_nonce = base64.b64decode(nonce, validate=True)
+        decoded_ciphertext = base64.b64decode(ciphertext, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("sealed provider_state encoding is invalid") from exc
+    if len(decoded_nonce) != 12 or not decoded_ciphertext:
+        raise ValueError("sealed provider_state encoding is invalid")
 
 
 MessageInput: TypeAlias = CanonicalMessage | Mapping[str, Any]

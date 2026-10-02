@@ -7,18 +7,24 @@ Base URL: https://api.deepseek.com/v1
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import openai  # type: ignore[import-not-found]
 
 from ash.context.tokens import AnthropicTokenCounter
 from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.providers.capabilities import ProviderCapabilities, deepseek_capabilities
 from ash.providers.messages import CanonicalToolCall, MessageInput
 from ash.providers.openai import (
     _owned_openai_http_client,
     account_openai_compatible_stream_bytes,
     openai_compatible_reasoning_delta,
     prepare_openai_messages,
+)
+from ash.providers.replay_state import (
+    ProviderReplayStateCipher,
+    ProviderReplayStateError,
 )
 from ash.providers.readiness import (
     normalize_provider_base_url,
@@ -40,11 +46,14 @@ class DeepSeekProvider(ProviderABC):
 
     def __init__(
         self,
-        model_name: str = "deepseek-chat",
+        model_name: str = "deepseek-flash",
         api_key: str = "",
         *,
         base_url: str | None = None,
         token_counter: TokenCounterLike | None = None,
+        replay_state_directory: Path | None = None,
+        replay_state_trusted_root: Path | None = None,
+        replay_state_cipher: ProviderReplayStateCipher | None = None,
     ) -> None:
         if not api_key:
             raise ValueError(
@@ -59,10 +68,25 @@ class DeepSeekProvider(ProviderABC):
         require_secure_provider_transport(self._base_url, provider="deepseek")
         self._token_counter = token_counter or AnthropicTokenCounter()
         self._client: Any | None = None
+        self._replay_state_cipher: ProviderReplayStateCipher | None
+        if replay_state_cipher is not None:
+            self._replay_state_cipher = replay_state_cipher
+        elif replay_state_directory is not None:
+            trusted_root = replay_state_trusted_root or replay_state_directory.parent
+            self._replay_state_cipher = ProviderReplayStateCipher(
+                replay_state_directory,
+                trusted_root=trusted_root,
+            )
+        else:
+            self._replay_state_cipher = None
 
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return deepseek_capabilities(self._model_name)
 
     def count_tokens(self, text: str) -> int:
         return self._token_counter.count(text)
@@ -88,9 +112,42 @@ class DeepSeekProvider(ProviderABC):
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
+        def replay_fields(message: Any) -> dict[str, Any]:
+            state_items = message.get("provider_state") or []
+            matching = [
+                item
+                for item in state_items
+                if isinstance(item, dict)
+                and item.get("type") == "sealed_provider_state"
+                and item.get("provider") == "deepseek"
+                and item.get("kind") == "reasoning_content"
+            ]
+            if not matching:
+                return {}
+            if len(matching) != 1 or self._replay_state_cipher is None:
+                raise ProviderReplayStateError(
+                    "DeepSeek reasoning replay state is unavailable"
+                )
+            return {
+                "reasoning_content": self._replay_state_cipher.open(
+                    matching[0],
+                    provider="deepseek",
+                    kind="reasoning_content",
+                )
+            }
+
+        try:
+            prepared_messages = prepare_openai_messages(
+                messages,
+                assistant_state_fields=replay_fields,
+            )
+        except ProviderReplayStateError as exc:
+            raise RuntimeError(
+                "DeepSeek reasoning replay could not be recovered safely"
+            ) from exc
         kwargs: dict[str, Any] = {
             "model": self._model_name,
-            "messages": prepare_openai_messages(messages),
+            "messages": prepared_messages,
             "temperature": temperature,
             "stream": True,
         }
@@ -179,6 +236,28 @@ class DeepSeekProvider(ProviderABC):
                 for partial in partials.values():
                     completed.append(CanonicalToolCall.model_validate(partial))
                 partials.clear()
+                provider_state = None
+                if reasoning_parts:
+                    if self._replay_state_cipher is None and tools:
+                        raise RuntimeError(
+                            "DeepSeek tool use in thinking mode requires durable "
+                            "reasoning replay state"
+                        )
+                    if self._replay_state_cipher is not None:
+                        try:
+                            provider_state = [
+                                self._replay_state_cipher.seal(
+                                    provider="deepseek",
+                                    kind="reasoning_content",
+                                    text="".join(reasoning_parts),
+                                )
+                            ]
+                        except ProviderReplayStateError as exc:
+                            raise RuntimeError(
+                                "DeepSeek reasoning replay could not be persisted safely"
+                            ) from exc
+            else:
+                provider_state = None
 
             yield StreamChunk(
                 content=content,
@@ -199,6 +278,7 @@ class DeepSeekProvider(ProviderABC):
                     if is_done and reasoning_parts
                     else None
                 ),
+                provider_state=provider_state,
             )
             completed.clear()
             if is_done:

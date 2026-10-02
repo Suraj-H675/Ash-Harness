@@ -1073,6 +1073,169 @@ async def test_openai_compatible_providers_preserve_streamed_reasoning(
 
 
 @pytest.mark.asyncio
+async def test_deepseek_seals_and_replays_reasoning_across_provider_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+
+    from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.replay_state import ProviderReplayStateCipher
+
+    reasoning = "exact private reasoning that must be replayed"
+    finish_tool = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content="", tool_calls=None),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=None,
+    )
+    first_client = _FakeOpenAIClient(
+        [
+            _openai_chunk(reasoning_content=reasoning),
+            _openai_tool_chunk("{}"),
+            finish_tool,
+        ]
+    )
+    state_dir = tmp_path / "provider-state"
+    first_cipher = ProviderReplayStateCipher(state_dir, trusted_root=tmp_path)
+    monkeypatch.setattr(
+        "ash.providers.deepseek.openai.AsyncOpenAI",
+        lambda **_: first_client,
+    )
+    first = DeepSeekProvider(
+        "deepseek-flash",
+        "key",
+        replay_state_cipher=first_cipher,
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    first_chunks = [
+        chunk
+        async for chunk in first.stream_chat(
+            [{"role": "user", "content": "read it"}],
+            tools=tools,
+        )
+    ]
+    terminal = first_chunks[-1]
+    assert terminal.provider_state is not None
+    assert reasoning not in json.dumps(terminal.provider_state)
+    assert terminal.native_tool_calls is not None
+
+    second_client = _FakeOpenAIClient(
+        [_openai_chunk(content="done", finish_reason="stop")]
+    )
+    monkeypatch.setattr(
+        "ash.providers.deepseek.openai.AsyncOpenAI",
+        lambda **_: second_client,
+    )
+    second = DeepSeekProvider(
+        "deepseek-flash",
+        "key",
+        replay_state_cipher=ProviderReplayStateCipher(
+            state_dir,
+            trusted_root=tmp_path,
+        ),
+    )
+    history = [
+        {"role": "user", "content": "read it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [call.to_wire() for call in terminal.native_tool_calls],
+            "provider_state": terminal.provider_state,
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "file contents",
+        },
+    ]
+
+    _ = [chunk async for chunk in second.stream_chat(history, tools=tools)]
+
+    replayed = second_client.completions.kwargs["messages"][1]
+    assert replayed["reasoning_content"] == reasoning
+    assert replayed["tool_calls"][0]["id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_deepseek_tool_reasoning_fails_closed_without_replay_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.deepseek import DeepSeekProvider
+
+    finish_tool = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content="", tool_calls=None),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=None,
+    )
+    client = _FakeOpenAIClient(
+        [
+            _openai_chunk(reasoning_content="must replay"),
+            _openai_tool_chunk("{}"),
+            finish_tool,
+        ]
+    )
+    monkeypatch.setattr(
+        "ash.providers.deepseek.openai.AsyncOpenAI",
+        lambda **_: client,
+    )
+    provider = DeepSeekProvider("deepseek-flash", "key")
+
+    with pytest.raises(RuntimeError, match="requires durable reasoning replay"):
+        _ = [
+            chunk
+            async for chunk in provider.stream_chat(
+                [{"role": "user", "content": "use a tool"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            )
+        ]
+
+
+def test_deepseek_current_model_capabilities_are_exact_and_unknown_is_conservative() -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.deepseek import DeepSeekProvider
+
+    assert DeepSeekProvider("deepseek-flash", "key").capabilities == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=384_000,
+    )
+    assert DeepSeekProvider("deepseek-v4-pro", "key").capabilities == ProviderCapabilities(
+        native_tools=True,
+        reasoning=True,
+        context_window=1_000_000,
+        max_output_tokens=384_000,
+    )
+    assert DeepSeekProvider("future-model", "key").capabilities == ProviderCapabilities()
+
+
+@pytest.mark.asyncio
 async def test_openai_compatible_reasoning_counts_toward_stream_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1130,7 +1293,7 @@ async def test_deepseek_preserves_provider_cache_read_usage(
     monkeypatch.setattr(
         "ash.providers.deepseek.openai.AsyncOpenAI", lambda **_: client
     )
-    provider = DeepSeekProvider("deepseek-reasoner", "key")
+    provider = DeepSeekProvider("deepseek-flash", "key")
 
     chunks = [chunk async for chunk in provider.stream_chat([])]
 

@@ -1038,16 +1038,6 @@ DEFAULT_MODEL_PRICING_USD_PER_MILLION: dict[str, dict[str, float]] = {
         "output": 2.0,
         "cache_read": 0.025,
     },
-    "deepseek/deepseek-v4-flash": {
-        "input": 0.28,
-        "output": 0.42,
-        "cache_read": 0.028,
-    },
-    "deepseek/deepseek-v4-pro": {
-        "input": 0.70,
-        "output": 2.10,
-        "cache_read": 0.07,
-    },
     "groq/llama-3.3-70b-versatile": {
         "input": 0.59,
         "output": 0.79,

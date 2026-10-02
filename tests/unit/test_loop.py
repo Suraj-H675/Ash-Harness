@@ -1887,6 +1887,62 @@ async def test_provider_replay_state_persists_and_returns_to_next_request(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_sealed_provider_replay_state_persists_exactly_without_plaintext(
+    tmp_path,
+) -> None:
+    from ash.providers.replay_state import ProviderReplayStateCipher
+
+    plaintext = "private reasoning OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz"
+    sealed = ProviderReplayStateCipher(
+        tmp_path / "provider-state",
+        trusted_root=tmp_path,
+    ).seal(
+        provider="deepseek",
+        kind="reasoning_content",
+        text=plaintext,
+    )
+
+    class SealedReplayProvider(ProviderABC):
+        model_name = "sealed-replay"
+
+        def count_tokens(self, text):
+            return len(str(text).split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            yield StreamChunk(
+                content="done",
+                is_done=True,
+                stop_reason="stop",
+                provider_state=[sealed],
+            )
+
+    store = SessionStore(tmp_path / "sealed-provider-state.db")
+    loop = AshLoop(
+        store,
+        SealedReplayProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+    session = await loop.start_session()
+
+    assert await loop.run_turn("persist sealed state") == "done"
+    persisted = store.load_session(session.session_id)
+    assistant = next(
+        message for message in persisted.messages if message.role == "assistant"
+    )
+    assert assistant.metadata["provider_state"] == [sealed]
+    with get_db_connection(store.db_path) as connection:
+        metadata_json = connection.execute(
+            "SELECT metadata_json FROM messages "
+            "WHERE session_id = ? AND role = 'assistant'",
+            (session.session_id,),
+        ).fetchone()["metadata_json"]
+    assert plaintext not in metadata_json
+
+
+@pytest.mark.asyncio
 async def test_runtime_tools_start_once_after_session_is_available(tmp_path):
     guard = SafetyGuard(tmp_path)
     tool = StartTool(guard)
@@ -6140,6 +6196,31 @@ def test_configured_provider_family_pricing_overrides_builtin_model_default(
     )
 
     assert loop._active_model_pricing() == {"input": 2.0, "output": 5.0}
+
+
+def test_deepseek_time_tiered_pricing_is_unknown_without_user_override(
+    tmp_path,
+) -> None:
+    class DeepSeekProvider(ProviderABC):
+        model_name = "deepseek-flash"
+        provider_family = "deepseek"
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="done", is_done=True)
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "deepseek-pricing.db"),
+        DeepSeekProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(model="deepseek/deepseek-flash"),
+    )
+
+    assert loop._active_model_pricing() == {}
 
 
 @pytest.mark.asyncio

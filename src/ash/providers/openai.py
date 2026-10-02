@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, AsyncGenerator
 import httpx
 import openai  # type: ignore[import-not-found]
@@ -78,6 +78,9 @@ def _owned_openai_http_client(*, anonymous: bool = False) -> Any:
 
 def prepare_openai_messages(
     messages: Sequence[MessageInput],
+    *,
+    assistant_state_fields: Callable[[Mapping[str, Any]], Mapping[str, Any]]
+    | None = None,
 ) -> list[dict[str, Any]]:
     """Translate Ash's canonical tool-call history to OpenAI chat messages."""
 
@@ -102,6 +105,8 @@ def prepare_openai_messages(
                 }
                 for call in canonical_calls
             ]
+        if message.get("role") == "assistant" and assistant_state_fields is not None:
+            item.update(assistant_state_fields(message))
         prepared.append(item)
     return prepared
 

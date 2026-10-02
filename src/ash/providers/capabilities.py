@@ -104,6 +104,30 @@ def _reasoning_by_name(model: str) -> ProviderCapabilities:
     )
 
 
+def deepseek_capabilities(model: str) -> ProviderCapabilities:
+    name = model.casefold()
+    if name in {
+        "deepseek-flash",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+    }:
+        return ProviderCapabilities(
+            native_tools=True,
+            vision=True,
+            reasoning=True,
+            context_window=1_000_000,
+            max_output_tokens=384_000,
+        )
+    if name == "deepseek-v4-pro":
+        return ProviderCapabilities(
+            native_tools=True,
+            reasoning=True,
+            context_window=1_000_000,
+            max_output_tokens=384_000,
+        )
+    return ProviderCapabilities()
+
+
 def _local_conservative(model: str) -> ProviderCapabilities:
     del model
     return ProviderCapabilities(native_tools=False, local=True)
@@ -113,7 +137,7 @@ def create_default_capability_registry() -> CapabilityRegistry:
     registry = CapabilityRegistry()
     registry.register("anthropic", _anthropic)
     registry.register("openai", _openai)
-    registry.register("deepseek", _reasoning_by_name)
+    registry.register("deepseek", deepseek_capabilities)
     registry.register("groq", _reasoning_by_name)
     registry.register("ollama", _local_conservative)
     registry.register("lmstudio", _local_conservative)

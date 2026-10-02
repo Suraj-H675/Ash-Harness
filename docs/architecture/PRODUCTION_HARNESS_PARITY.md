@@ -288,6 +288,53 @@ same-provider credential/account resilience, supported local-runtime lifecycle
 and real Ollama/LM Studio/vLLM conformance, and adapter-level
 cancellation/stream-cleanup verification.
 
+### P1 progress — DeepSeek current-agent compatibility slice 4
+
+DeepSeek's first-party API contract changed materially during 2026, so Ash no
+longer advertises the retired `deepseek-chat` / `deepseek-reasoner` model IDs.
+The built-in picker now exposes `deepseek-flash` and `deepseek-v4-pro`; still
+accepted V4 Flash compatibility aliases retain the same conservative mapping
+when entered manually. The exact current manifest used by both runtime and
+picker capability resolution records native tools and reasoning for both
+models, a 1M context window and 384K maximum output, with vision enabled only
+for Flash. Unknown DeepSeek IDs remain conservative instead of inheriting
+features from name substrings.
+
+DeepSeek thinking-mode tool use requires every prior assistant
+`reasoning_content` value to be replayed exactly on later requests that carry
+tools. Ash now captures that provider-required state on all DeepSeek reasoning
+completions when durable replay is available, seals the exact UTF-8 text with
+AES-GCM, and persists only a bounded opaque canonical `provider_state` envelope.
+The profile-scoped seal key is stored through Ash's existing descriptor-anchored
+private-store boundary. Restarted provider instances reopen the same key and
+restore the exact `reasoning_content` field before network I/O; missing,
+malformed, oversized, or tampered replay state fails closed rather than sending
+an invalid continuation. Generic persistence keeps sealed state byte-exact
+while continuing to redact provider-state variants that may contain plaintext
+summaries.
+
+DeepSeek Flash vision remains enabled because its current Chat Completions
+contract accepts the same user-only OpenAI `image_url` / base64 data-URL shape
+Ash already emits. Built-in DeepSeek dollar pricing was removed because current
+first-party prices vary by peak/off-peak window; absent an explicit user rate,
+Ash now reports pricing as unknown instead of applying a stale universal value.
+
+Evidence was rechecked against DeepSeek's first-party documentation on
+2026-10-02, including:
+`https://api-docs.deepseek.com/quick_start/pricing/`,
+`https://api-docs.deepseek.com/guides/thinking_mode/`,
+`https://api-docs.deepseek.com/guides/vision/`, and
+`https://api-docs.deepseek.com/guides/anthropic_api/`.
+
+The full affected provider/loop/CLI gate passes **461 tests**. Ruff, targeted
+Mypy, and `git diff --check` are green.
+
+P1 remains open. Explicitly remaining: provider-owned capability truth for
+other fast-changing hosted routes such as Groq, the P1A enterprise-route
+decision, P1B same-provider credential/account resilience, supported
+local-runtime lifecycle and real Ollama/LM Studio/vLLM conformance, and
+adapter-level cancellation/stream-cleanup verification.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product
