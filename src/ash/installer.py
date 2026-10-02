@@ -36,7 +36,9 @@ _GITHUB_API_VERSION = "2026-03-10"
 SUPPORTED_EXTRAS = (
     "a2a",
     "acp",
+    "aws",
     "browser",
+    "gcp",
     "local-embeddings",
     "observability",
     "server",
