@@ -100,11 +100,23 @@ def test_provider_catalog_is_secret_free_and_includes_local_and_gateway_routes()
     payload = provider_catalog_payload()
     provider_ids = {item["id"] for item in payload["providers"]}
 
-    assert {"google", "nvidia", "openrouter", "lmstudio", "vllm"} <= provider_ids
+    assert {
+        "google",
+        "nvidia",
+        "openrouter",
+        "lmstudio",
+        "vllm",
+        "vertex",
+        "bedrock",
+    } <= provider_ids
     assert all("API_KEY" not in json.dumps(item) or item["key_env"] for item in payload["providers"])
     google = next(item for item in payload["providers"] if item["id"] == "google")
     openai = next(item for item in payload["providers"] if item["id"] == "openai")
+    vertex = next(item for item in payload["providers"] if item["id"] == "vertex")
+    bedrock = next(item for item in payload["providers"] if item["id"] == "bedrock")
     assert openai["auth"] == "api-key-or-chatgpt"
+    assert vertex["auth"] == "google-adc"
+    assert bedrock["auth"] == "aws-sigv4"
     assert google["key_env"] == "GOOGLE_API_KEY"
     assert google["key_envs"] == ["GOOGLE_API_KEY", "GEMINI_API_KEY"]
     rendered = render_provider_catalog()
@@ -240,6 +252,126 @@ async def test_provider_catalog_verification_uses_api_key_readiness(
     assert probe_config.fallback_models == []
     assert probe_config.model == "openai/gpt-api"
     assert timeout == 3.0
+
+
+@pytest.mark.asyncio
+async def test_bedrock_catalog_verification_uses_native_aws_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import providers
+    from ash.config import AshConfig
+
+    config = AshConfig(
+        model="bedrock/us.anthropic.model",
+        bedrock_region="us-west-2",
+        bedrock_profile="engineering",
+    )
+    connection = ProviderConnection(
+        provider="bedrock",
+        model_name="us.anthropic.model",
+        base_url="https://bedrock-runtime.us-west-2.amazonaws.com/openai/v1",
+        catalog_endpoint="",
+        catalog_format="openai",
+        auth_mode="aws_sigv4",
+    )
+    seen: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        providers,
+        "resolve_provider_connection",
+        lambda _config: connection,
+    )
+    monkeypatch.setattr(
+        "ash.providers.bedrock.discover_bedrock_models",
+        lambda *, region, profile: (
+            seen.append((region, profile))
+            or ("us.anthropic.model", "global.amazon.model")
+        ),
+    )
+
+    result = await providers.verify_provider_catalog(config, timeout=2.0)
+
+    assert result.connection is connection
+    assert result.models == ("us.anthropic.model", "global.amazon.model")
+    assert result.selected_model_available is True
+    assert seen == [("us-west-2", "engineering")]
+
+
+@pytest.mark.asyncio
+async def test_vertex_catalog_verification_reports_manual_discovery_boundary() -> None:
+    from ash.commands import providers
+    from ash.config import AshConfig
+
+    config = AshConfig(
+        model="vertex/google/gemini-test",
+        vertex_project="project-123",
+        vertex_location="us-central1",
+    )
+
+    with pytest.raises(
+        providers.ProviderVerificationError,
+        match="does not expose a trustworthy.*live model catalog",
+    ):
+        await providers.verify_provider_catalog(config)
+
+
+def test_vertex_provider_test_runs_completion_without_fake_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import providers
+    from ash.config import AshConfig
+
+    provider = _ScriptedProbeProvider(
+        chunks=[
+            StreamChunk(content="OK"),
+            StreamChunk(is_done=True, stop_reason="stop"),
+        ]
+    )
+    _install_probe_provider(monkeypatch, provider)
+    config = AshConfig(
+        model="vertex/google/gemini-test",
+        vertex_project="project-123",
+        vertex_location="global",
+    )
+
+    result = providers.test_provider(config, timeout=1.0)
+
+    assert result.connection.provider == "vertex"
+    assert result.selected_model_available is False
+    assert result.catalog_authoritative is False
+    assert result.models == ("google/gemini-test",)
+    assert result.completion_attempted is True
+    assert result.completion_verified is True
+    assert result.ready_to_use is True
+
+
+def test_bedrock_provider_test_uses_completion_as_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands import providers
+    from ash.config import AshConfig
+
+    provider = _ScriptedProbeProvider(
+        chunks=[
+            StreamChunk(content="OK"),
+            StreamChunk(is_done=True, stop_reason="stop"),
+        ]
+    )
+    _install_probe_provider(monkeypatch, provider)
+    config = AshConfig(
+        model="bedrock/us.anthropic.model",
+        bedrock_region="us-west-2",
+    )
+
+    result = providers.test_provider(config, timeout=1.0)
+
+    assert result.connection.provider == "bedrock"
+    assert result.selected_model_available is False
+    assert result.catalog_authoritative is False
+    assert result.models == ("us.anthropic.model",)
+    assert result.completion_attempted is True
+    assert result.completion_verified is True
+    assert result.ready_to_use is True
 
 
 def test_provider_test_does_not_report_ready_when_completion_probe_fails(

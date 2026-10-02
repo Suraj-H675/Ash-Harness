@@ -127,6 +127,42 @@ def test_provider_runtime_environment_honors_custom_key_env(monkeypatch) -> None
     }
 
 
+def test_provider_runtime_environment_scopes_vertex_and_bedrock_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "/tmp/google-credentials.json",
+    )
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "project-123")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+    monkeypatch.setenv("GOOGLE_CLOUD_QUOTA_PROJECT", "quota-project")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session")
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    monkeypatch.setenv("AWS_PROFILE", "engineering")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross")
+
+    config = SimpleNamespace(
+        model="vertex/google/gemini-test",
+        fallback_models=["bedrock/us.anthropic.model"],
+        custom_providers={},
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "AWS_ACCESS_KEY_ID": "access",
+        "AWS_PROFILE": "engineering",
+        "AWS_REGION": "us-west-2",
+        "AWS_SECRET_ACCESS_KEY": "secret",
+        "AWS_SESSION_TOKEN": "session",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/google-credentials.json",
+        "GOOGLE_CLOUD_LOCATION": "us-central1",
+        "GOOGLE_CLOUD_PROJECT": "project-123",
+        "GOOGLE_CLOUD_QUOTA_PROJECT": "quota-project",
+    }
+
+
 def test_probe_model_catalog_metadata_preserves_openrouter_capability_fields(
     monkeypatch,
 ) -> None:
@@ -607,6 +643,70 @@ def test_together_connection_uses_native_catalog_shape(monkeypatch) -> None:
 
     assert connection.catalog_format == "together"
     assert connection.catalog_endpoint == "https://api.together.xyz/v1/models"
+
+
+def test_vertex_connection_requires_explicit_scope() -> None:
+    config = SimpleNamespace(
+        model="vertex/google/gemini-test",
+        vertex_project="project-123",
+        vertex_location="us-central1",
+        custom_providers={},
+    )
+
+    connection = readiness.resolve_provider_connection(config)
+
+    assert connection.base_url == (
+        "https://us-central1-aiplatform.googleapis.com/v1/projects/project-123/"
+        "locations/us-central1/endpoints/openapi"
+    )
+    assert connection.catalog_endpoint == ""
+    assert connection.auth_mode == "adc"
+    assert connection.headers == {}
+
+
+def test_vertex_connection_can_take_scope_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "env-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
+
+    connection = readiness.resolve_provider_connection(
+        _config("vertex/google/gemini-test")
+    )
+
+    assert connection.base_url == (
+        "https://aiplatform.googleapis.com/v1/projects/env-project/"
+        "locations/global/endpoints/openapi"
+    )
+    assert connection.auth_mode == "adc"
+
+
+def test_bedrock_connection_uses_partition_resolved_runtime_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ash.providers.bedrock.bedrock_runtime_base_url",
+        lambda *, region, profile: (
+            f"https://bedrock-runtime.{region}.example/openai/v1"
+            if profile == "engineering"
+            else "unexpected"
+        ),
+    )
+    config = SimpleNamespace(
+        model="bedrock/us.anthropic.model",
+        bedrock_region="us-west-2",
+        bedrock_profile="engineering",
+        custom_providers={},
+    )
+
+    connection = readiness.resolve_provider_connection(config)
+
+    assert connection.base_url == (
+        "https://bedrock-runtime.us-west-2.example/openai/v1"
+    )
+    assert connection.catalog_endpoint == ""
+    assert connection.auth_mode == "aws_sigv4"
+    assert connection.headers == {}
 
 
 @pytest.mark.parametrize(

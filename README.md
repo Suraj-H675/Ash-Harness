@@ -84,6 +84,9 @@ Supported built-in routes include:
 | --- | --- |
 | Anthropic | Claude models through the Anthropic Messages API |
 | OpenAI | GPT models through the OpenAI API using an API key or optional Sign in with ChatGPT plan auth |
+| Google Gemini API | Gemini models through Google AI Studio's OpenAI-compatible endpoint |
+| Google Vertex AI | Enterprise OpenAI-compatible inference through explicit project/location scope and Google Application Default Credentials (gcp extra) |
+| Amazon Bedrock | Bedrock Runtime OpenAI Chat Completions through the AWS credential chain and SigV4 (aws extra) |
 | OpenRouter | Multi-provider gateway routing |
 | Hugging Face | Inference Providers gateway to hundreds of hosted chat models |
 | Vercel AI Gateway | One API key for hundreds of routed models through an OpenAI-compatible gateway |
@@ -94,6 +97,7 @@ Supported built-in routes include:
 | Together AI | Hosted open models |
 | Fireworks AI | Hosted inference |
 | Cerebras | Fast hosted models |
+| NVIDIA API Catalog | Hosted NVIDIA and partner models through an OpenAI-compatible endpoint |
 | Ollama | Local models with no API key requirement |
 | LM Studio | Local OpenAI-compatible model server |
 | vLLM | Self-hosted OpenAI-compatible model server |
@@ -119,6 +123,14 @@ The provider layer also provides:
   reporting; and
 - provider usage normalization with explicit provider, estimated, or mixed
   accounting when a service does not return token usage.
+
+Enterprise cloud routes keep cloud identity outside Ash configuration. Vertex
+requires an explicit user-owned project and location and refreshes short-lived
+Application Default Credentials in memory. Bedrock uses the AWS default
+credential/profile chain through the official OpenAI Bedrock provider and the
+recommended bedrock-runtime endpoint. AWS native model/profile discovery is
+shown as candidate discovery only; ash providers test performs the bounded
+completion that actually verifies Runtime Chat Completions compatibility.
 
 OpenAI additionally supports optional **Sign in with ChatGPT** for eligible
 ChatGPT plans. Run `ash auth chatgpt login` to register/sign in, inspect saved

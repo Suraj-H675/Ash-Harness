@@ -41,7 +41,7 @@ CatalogFormat = Literal[
     "fireworks",
     "huggingface",
 ]
-AuthMode = Literal["bearer", "anthropic", "none", "chatgpt"]
+AuthMode = Literal["bearer", "anthropic", "none", "chatgpt", "adc", "aws_sigv4"]
 MAX_PROVIDER_CATALOG_BYTES = 2_000_000
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
 GOOGLE_API_CLIENT_HEADER = f"ash-harness-oai/{__version__}"
@@ -87,6 +87,10 @@ class ProviderConnection:
             return "no API key is required"
         if self.auth_mode == "chatgpt":
             return "ChatGPT plan sign-in is configured"
+        if self.auth_mode == "adc":
+            return "Google Application Default Credentials are configured"
+        if self.auth_mode == "aws_sigv4":
+            return "AWS credential-chain SigV4 authentication is configured"
         return "API key is configured"
 
 
@@ -105,6 +109,7 @@ class ProviderVerification:
     connection: ProviderConnection
     models: tuple[str, ...]
     selected_model_available: bool
+    catalog_authoritative: bool = True
     completion_attempted: bool = False
     completion_verified: bool = False
     completion_error: str | None = None
@@ -113,7 +118,10 @@ class ProviderVerification:
     def ready_to_use(self) -> bool:
         """Whether catalog discovery and an explicit completion probe both passed."""
 
-        return self.selected_model_available and self.completion_verified
+        catalog_ready = (
+            self.selected_model_available if self.catalog_authoritative else True
+        )
+        return catalog_ready and self.completion_verified
 
 
 @dataclass(frozen=True)
@@ -294,6 +302,37 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
     custom_providers = getattr(config, "custom_providers", {})
     for model in models:
         provider, _ = parse_model_string(model)
+        if provider == "vertex":
+            keys.update(
+                {
+                    "GOOGLE_APPLICATION_CREDENTIALS",
+                    "GOOGLE_CLOUD_PROJECT",
+                    "GOOGLE_CLOUD_LOCATION",
+                    "GOOGLE_CLOUD_QUOTA_PROJECT",
+                }
+            )
+        if provider == "bedrock":
+            keys.update(
+                {
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "AWS_PROFILE",
+                    "AWS_DEFAULT_PROFILE",
+                    "AWS_REGION",
+                    "AWS_DEFAULT_REGION",
+                    "AWS_SHARED_CREDENTIALS_FILE",
+                    "AWS_CONFIG_FILE",
+                    "AWS_WEB_IDENTITY_TOKEN_FILE",
+                    "AWS_ROLE_ARN",
+                    "AWS_ROLE_SESSION_NAME",
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                    "AWS_EC2_METADATA_DISABLED",
+                }
+            )
         if provider == "ollama":
             keys.add("OLLAMA_API_BASE")
         builtin = _BUILTIN_CONNECTIONS.get(provider)
@@ -395,6 +434,61 @@ def resolve_provider_connection(config: "AshConfig") -> ProviderConnection:
     """
 
     provider, model_name = parse_model_string(config.model)
+    if provider == "vertex":
+        from ash.providers.vertex import vertex_openai_base_url
+
+        project = (
+            str(getattr(config, "vertex_project", "") or "").strip()
+            or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+        )
+        location = (
+            str(getattr(config, "vertex_location", "") or "").strip()
+            or os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
+        )
+        try:
+            base_url = vertex_openai_base_url(project, location)
+        except ValueError as exc:
+            raise ProviderConfigurationError(str(exc)) from exc
+        return ProviderConnection(
+            provider="vertex",
+            model_name=model_name,
+            base_url=base_url,
+            catalog_endpoint="",
+            catalog_format="openai",
+            auth_mode="adc",
+            uses_default_base_url=True,
+        )
+    if provider == "bedrock":
+        from ash.providers.bedrock import (
+            BedrockBackendUnavailable,
+            bedrock_runtime_base_url,
+        )
+
+        region = (
+            str(getattr(config, "bedrock_region", "") or "").strip()
+            or os.environ.get("AWS_REGION", "").strip()
+            or os.environ.get("AWS_DEFAULT_REGION", "").strip()
+        )
+        profile = (
+            str(getattr(config, "bedrock_profile", "") or "").strip()
+            or os.environ.get("AWS_PROFILE", "").strip()
+        )
+        try:
+            base_url = bedrock_runtime_base_url(
+                region=region,
+                profile=profile,
+            )
+        except (ValueError, BedrockBackendUnavailable) as exc:
+            raise ProviderConfigurationError(str(exc)) from exc
+        return ProviderConnection(
+            provider="bedrock",
+            model_name=model_name,
+            base_url=base_url,
+            catalog_endpoint="",
+            catalog_format="openai",
+            auth_mode="aws_sigv4",
+            uses_default_base_url=True,
+        )
     if provider == "ollama":
         default = "http://localhost:11434"
         supplied = os.environ.get("OLLAMA_API_BASE")
@@ -808,6 +902,10 @@ def verify_provider_connection(
     """Resolve and verify the configured provider route and model catalog."""
 
     connection = resolve_provider_connection(config)
+    if not connection.catalog_endpoint:
+        raise ProviderVerificationError(
+            f"{connection.provider} does not expose a supported live model catalog"
+        )
     metadata = probe_model_catalog_metadata(
         connection.catalog_endpoint,
         headers=connection.headers,

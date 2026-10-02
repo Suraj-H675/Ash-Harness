@@ -152,17 +152,17 @@ cross-gate findings for later and close P1 first.
 P1 is split into bounded sub-gates so provider work cannot become an endless
 catalog-expansion exercise:
 
-1. **P1A — Provider and enterprise route coverage — OPEN.** Re-evaluate the
+1. **P1A — Provider and enterprise route coverage — CLOSED LOCALLY.** Re-evaluate the
    direct providers, gateways, and enterprise-hosted model routes that serious
    coding-harness users actually need. Ash already covers Anthropic, OpenAI,
    Google AI Studio, OpenRouter, Hugging Face Inference Providers, Vercel AI
    Gateway, DeepSeek, Groq, Mistral, xAI, Together, Fireworks, Cerebras,
    NVIDIA, Ollama, LM Studio, vLLM, and explicit custom OpenAI-compatible
-   endpoints. Current comparator evidence makes enterprise cloud routes such as
-   Amazon Bedrock and Google Vertex AI a real remaining question rather than a
-   provider-count target. Add only routes whose governance, billing, deployment,
-   or authentication value cannot already be met cleanly through Ash's existing
-   surfaces.
+   endpoints. Current comparator evidence established Amazon Bedrock and Google
+   Vertex AI as material enterprise routes whose governance and authentication
+   could not be represented cleanly by generic bearer endpoints; first-class
+   implementations now close that gap without turning provider count into the
+   target.
 2. **P1B — Authentication and credential resilience — OPEN.** Preserve the
    verified ChatGPT-plan multi-account path and cross-provider model fallback,
    then close any material same-provider credential/profile rotation,
@@ -283,10 +283,9 @@ and **130 automation tests**. Ruff, targeted Mypy, and `git diff --check` are
 green.
 
 P1 remains open. Explicitly remaining: provider-owned capability truth for
-fast-changing hosted models, the P1A enterprise-route decision, P1B
-same-provider credential/account resilience, supported local-runtime lifecycle
-and real Ollama/LM Studio/vLLM conformance, and adapter-level
-cancellation/stream-cleanup verification.
+fast-changing hosted models, P1B same-provider credential/account resilience,
+supported local-runtime lifecycle and real Ollama/LM Studio/vLLM conformance,
+and adapter-level cancellation/stream-cleanup verification.
 
 ### P1 progress — DeepSeek current-agent compatibility slice 4
 
@@ -378,10 +377,60 @@ including:
 The full affected provider/registry/readiness/CLI/loop gate passes **389
 tests**. Ruff, targeted Mypy, and `git diff --check` are green.
 
-P1 remains open. Explicitly remaining: the P1A enterprise-route decision, P1B
-same-provider credential/account resilience, supported local-runtime lifecycle
+P1 remains open. Explicitly remaining: P1B same-provider credential/account
+resilience, supported local-runtime lifecycle
 and real Ollama/LM Studio/vLLM conformance, and adapter-level
 cancellation/stream-cleanup verification.
+
+### P1 progress — enterprise cloud routes slice 6
+
+P1A is closed at the product/implementation level. Ash now has first-class
+enterprise-hosted routes where generic bearer custom endpoints were not an
+adequate substitute:
+
+- Google Vertex AI uses an explicit user-owned project and location plus
+  Google Application Default Credentials. The optional gcp extra installs
+  google-auth with its requests transport. Ash lazily loads ADC, serializes
+  refresh, passes an async rotating bearer credential into the shared
+  OpenAI-compatible adapter, and retains recent tokens only in memory for
+  provider-error redaction. No implicit global location is selected.
+- Amazon Bedrock uses the optional aws extra and the official OpenAI Bedrock
+  provider rather than an Ash-owned SigV4 implementation. The route targets
+  AWS's recommended bedrock-runtime endpoint, supports explicit Region/profile
+  scope, resolves partition-aware Runtime URLs through public botocore endpoint
+  data, and scopes AWS credential-chain variables into isolated provider
+  workers. Native foundation-model and inference-profile listings are exposed
+  only as candidates because AWS documents API compatibility separately per
+  model; a real Runtime Chat Completions request is the authoritative readiness
+  check.
+
+Both enterprise scopes are excluded from project-controlled configuration and
+neither route persists cloud credentials. Core Ash remains lightweight:
+OpenAI stays >=1.82,<4, while gcp and aws raise only their own optional
+requirements. The locked current environment uses OpenAI 3.23; real provider
+constructors were exercised with the installed extras, and wheel metadata was
+verified to publish the expected optional dependencies.
+
+The full affected provider/message/registry/readiness/CLI/loop/runtime/config/
+setup gate passes **704 tests**. The narrower enterprise lifecycle gate passes
+**388 tests**. Ruff, targeted Mypy, pinned uv lock validation, diff checks, and
+wheel/sdist build validation are green.
+
+P1A closure does not claim live AWS/GCP service conformance; credentialed cloud
+calls remain in P1E. Azure OpenAI/Foundry Entra or managed-identity support is
+tracked under P1B because the remaining gap is credential/profile selection and
+refresh rather than generic provider count.
+
+Evidence was rechecked against current first-party AWS and Google cloud
+documentation on 2026-10-02. AWS recommends bedrock-runtime for new
+applications, documents SigV4 on the OpenAI Chat Completions route, and states
+that native model/profile discovery must be combined with per-model API
+compatibility. Vertex's OpenAI-compatible endpoint uses explicit
+project/location scope plus short-lived Google Cloud OAuth/ADC credentials.
+Primary references:
+https://docs.aws.amazon.com/bedrock/latest/userguide/inference-chat-completions.html
+https://docs.aws.amazon.com/bedrock/latest/userguide/models-api-compatibility.html
+https://docs.cloud.google.com/vertex-ai/generative-ai/docs/samples/generativeaionvertexai-gemini-chat-completions-non-streaming
 
 ### M4 product decisions
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from threading import RLock
 from typing import TYPE_CHECKING, Callable
@@ -302,6 +303,47 @@ def _build_groq(config: "AshConfig", model_name: str) -> ProviderABC:
     return provider
 
 
+def _build_vertex(config: "AshConfig", model_name: str) -> ProviderABC:
+    from ash.providers.vertex import VertexProvider
+
+    project = (
+        str(getattr(config, "vertex_project", "") or "").strip()
+        or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+    )
+    location = (
+        str(getattr(config, "vertex_location", "") or "").strip()
+        or os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
+    )
+    provider = VertexProvider(
+        model_name=model_name,
+        project=project,
+        location=location,
+    )
+    provider.configure_max_tokens(config.max_completion_tokens)
+    return provider
+
+
+def _build_bedrock(config: "AshConfig", model_name: str) -> ProviderABC:
+    from ash.providers.bedrock import BedrockProvider
+
+    region = (
+        str(getattr(config, "bedrock_region", "") or "").strip()
+        or os.environ.get("AWS_REGION", "").strip()
+        or os.environ.get("AWS_DEFAULT_REGION", "").strip()
+    )
+    profile = (
+        str(getattr(config, "bedrock_profile", "") or "").strip()
+        or os.environ.get("AWS_PROFILE", "").strip()
+    )
+    provider = BedrockProvider(
+        model_name=model_name,
+        region=region,
+        profile=profile,
+    )
+    provider.configure_max_tokens(config.max_completion_tokens)
+    return provider
+
+
 def _custom_model_capabilities(
     config: "AshConfig",
     provider_name: str,
@@ -415,8 +457,11 @@ def create_default_provider_registry() -> ProviderRegistry:
     registry.register("ollama", _build_ollama)
     registry.register("deepseek", _build_deepseek)
     registry.register("groq", _build_groq)
+    registry.register("vertex", _build_vertex)
+    registry.register("bedrock", _build_bedrock)
     for provider_id in sorted(
-        BUILTIN_PROVIDER_IDS - {"anthropic", "openai", "deepseek", "groq", "ollama"}
+        BUILTIN_PROVIDER_IDS
+        - {"anthropic", "openai", "deepseek", "groq", "ollama", "vertex", "bedrock"}
     ):
         registry.register(provider_id, _build_openai_compatible)
     return registry

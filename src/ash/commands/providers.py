@@ -19,6 +19,7 @@ from ash.providers.readiness import (
     ProviderConfigurationError,
     ProviderVerification,
     ProviderVerificationError,
+    resolve_provider_connection,
     verify_provider_connection,
 )
 from ash.providers.openai_chatgpt_verification import verify_chatgpt_plan_connection
@@ -46,6 +47,35 @@ async def verify_provider_catalog(
     from ash.providers.identifiers import parse_model_string
 
     selected_provider, _selected_model = parse_model_string(probe_config.model)
+    if selected_provider == "bedrock":
+        from ash.providers.bedrock import discover_bedrock_models
+
+        connection = resolve_provider_connection(probe_config)
+        region = (
+            str(getattr(probe_config, "bedrock_region", "") or "").strip()
+            or os.environ.get("AWS_REGION", "").strip()
+            or os.environ.get("AWS_DEFAULT_REGION", "").strip()
+        )
+        profile = (
+            str(getattr(probe_config, "bedrock_profile", "") or "").strip()
+            or os.environ.get("AWS_PROFILE", "").strip()
+        )
+        models = await asyncio.to_thread(
+            discover_bedrock_models,
+            region=region,
+            profile=profile,
+        )
+        return ProviderVerification(
+            connection=connection,
+            models=models,
+            selected_model_available=connection.model_name in models,
+            catalog_authoritative=False,
+        )
+    if selected_provider == "vertex":
+        raise ProviderVerificationError(
+            "Vertex AI does not expose a trustworthy OpenAI-compatible live model "
+            "catalog for this route; enter the Vertex model ID explicitly."
+        )
     if (
         selected_provider == "openai"
         and getattr(probe_config, "openai_auth_mode", "api_key") == "chatgpt"
@@ -73,6 +103,10 @@ def provider_catalog_payload() -> dict[str, Any]:
                 "auth": (
                     "none"
                     if descriptor.local
+                    else "google-adc"
+                    if descriptor.id == "vertex"
+                    else "aws-sigv4"
+                    if descriptor.id == "bedrock"
                     else "api-key-or-chatgpt"
                     if descriptor.id == "openai"
                     else "api-key"
@@ -135,6 +169,7 @@ def provider_test_payload(verification: ProviderVerification) -> dict[str, Any]:
         "authentication": connection.credential_description,
         "discovered_model_count": len(verification.models),
         "discovered_models": list(verification.models),
+        "catalog_authoritative": verification.catalog_authoritative,
         "selected_model_available": verification.selected_model_available,
         "completion_attempted": verification.completion_attempted,
         "completion_verified": verification.completion_verified,
@@ -153,7 +188,6 @@ def render_provider_test(
     payload = provider_test_payload(verification)
     if json_output:
         return json.dumps(payload, indent=2, sort_keys=True)
-    selected = "available" if verification.selected_model_available else "not returned"
     connection = verification.connection
     if verification.completion_verified:
         completion = "verified"
@@ -174,13 +208,28 @@ def render_provider_test(
             + terminal_safe_text(
                 connection.credential_description, single_line=True
             ),
-            f"Catalog: {len(verification.models)} model(s); selected model {selected}",
+            (
+                f"Catalog: {len(verification.models)} model(s); selected model "
+                + (
+                    "available"
+                    if verification.selected_model_available
+                    else "not returned"
+                )
+                if verification.catalog_authoritative
+                else (
+                    f"Catalog: {len(verification.models)} candidate model(s); "
+                    "not authoritative for this route"
+                )
+            ),
             f"Completion: {completion}",
             (
                 "Result: ready to use"
                 if verification.ready_to_use
                 else "Result: endpoint is reachable, but the selected model is unavailable"
-                if not verification.selected_model_available
+                if (
+                    verification.catalog_authoritative
+                    and not verification.selected_model_available
+                )
                 else "Result: model is available, but a completion could not be verified"
             ),
         ]
@@ -354,8 +403,25 @@ def test_provider(
         if model
         else config.model_copy(update={"fallback_models": []})
     )
-    verification = asyncio.run(verify_provider_catalog(test_config, timeout=timeout))
-    if not verification.selected_model_available:
+    from ash.providers.identifiers import parse_model_string
+
+    provider_name, _model_name = parse_model_string(test_config.model)
+    if provider_name in {"vertex", "bedrock"}:
+        connection = resolve_provider_connection(test_config)
+        verification = ProviderVerification(
+            connection=connection,
+            models=(connection.model_name,),
+            selected_model_available=False,
+            catalog_authoritative=False,
+        )
+    else:
+        verification = asyncio.run(
+            verify_provider_catalog(test_config, timeout=timeout)
+        )
+    if (
+        verification.catalog_authoritative
+        and not verification.selected_model_available
+    ):
         return verification
     completion_verified, completion_error = asyncio.run(
         _probe_provider_completion(

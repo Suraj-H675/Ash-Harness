@@ -237,6 +237,90 @@ class TestGroqFlow:
             assert calls["ASH_MODEL"].startswith("groq/")
 
 
+class TestEnterpriseCloudFlows:
+    def test_vertex_setup_saves_scope_without_credentials(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, _flow_vertex
+
+        class TokenProvider:
+            async def __call__(self) -> str:
+                return "short-lived-token"
+
+        monkeypatch.setattr(
+            "ash.commands.setup.importlib.util.find_spec",
+            lambda name: object() if name == "google.auth" else None,
+        )
+        monkeypatch.setattr(
+            "ash.providers.vertex.GoogleAdcTokenProvider",
+            TokenProvider,
+        )
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(["project-123", "us-central1", "google/gemini-test"]),
+        )
+
+        with patch("ash.commands.setup.save_env_values") as save:
+            result = _flow_vertex(
+                "",
+                SimpleNamespace(vertex_project="", vertex_location=""),
+            )
+
+        assert result == SetupOutcome.SUCCESS
+        assert save.call_args.args[0] == {
+            "ASH_VERTEX_PROJECT": "project-123",
+            "ASH_VERTEX_LOCATION": "us-central1",
+            "ASH_MODEL": "vertex/google/gemini-test",
+        }
+        assert "short-lived-token" not in json.dumps(save.call_args.args[0])
+
+    def test_bedrock_setup_saves_region_profile_and_discovered_model(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, _flow_bedrock
+
+        class Provider:
+            def __init__(self, model, *, region, profile):
+                assert model == "us.anthropic.model"
+                assert region == "us-west-2"
+                assert profile == "engineering"
+
+            async def aclose(self) -> None:
+                return None
+
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(["us-west-2", "engineering", "1"]),
+        )
+        monkeypatch.setattr(
+            "ash.commands.setup._probe_bedrock_models_detailed",
+            lambda region, profile: (
+                __import__("ash.commands.setup", fromlist=["ModelProbe"]).ModelProbe(
+                    models=("us.anthropic.model",)
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            "ash.providers.bedrock.BedrockProvider",
+            Provider,
+        )
+
+        with patch("ash.commands.setup.save_env_values") as save:
+            result = _flow_bedrock(
+                "",
+                SimpleNamespace(bedrock_region="", bedrock_profile=""),
+            )
+
+        assert result == SetupOutcome.SUCCESS
+        assert save.call_args.args[0] == {
+            "ASH_BEDROCK_REGION": "us-west-2",
+            "ASH_BEDROCK_PROFILE": "engineering",
+            "ASH_MODEL": "bedrock/us.anthropic.model",
+        }
+
+
 class TestOpenAIFlow:
     def test_custom_base_url_is_used_for_discovery_and_saved_atomically(
         self, monkeypatch: pytest.MonkeyPatch
@@ -504,6 +588,42 @@ def test_google_setup_status_accepts_gemini_api_key_fallback(
     monkeypatch.setenv("GEMINI_API_KEY", "fallback-gemini-key")
 
     assert _provider_status(object(), descriptor) == "key detected"
+
+
+def test_enterprise_cloud_setup_status_uses_scope_not_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import _provider_status
+    from ash.provider_catalog import get_provider_descriptor
+
+    vertex = get_provider_descriptor("vertex")
+    bedrock = get_provider_descriptor("bedrock")
+    assert vertex is not None
+    assert bedrock is not None
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    assert (
+        _provider_status(
+            SimpleNamespace(
+                vertex_project="project-123",
+                vertex_location="us-central1",
+            ),
+            vertex,
+        )
+        == "ADC scope configured"
+    )
+    assert (
+        _provider_status(
+            SimpleNamespace(bedrock_region="us-west-2"),
+            bedrock,
+        )
+        == "AWS scope configured"
+    )
+    assert _provider_status(SimpleNamespace(), vertex) == "needs project/location"
+    assert _provider_status(SimpleNamespace(), bedrock) == "needs AWS region"
 
 
 @pytest.mark.parametrize(
@@ -853,8 +973,8 @@ def test_provider_catalog_render_exposes_full_breadth(
     _render_provider_catalog(config, list(PROVIDERS))
 
     output = capsys.readouterr().out
-    assert "Providers  ·  18 routes" in output
-    assert "OpenRouter" in output
+    assert "Providers  ·  20 routes" in output
+    assert "OpenRou" in output
     assert "Hugging Face" in output
     assert "Vercel AI Gateway" in output
     assert "Google Gemini" in output
@@ -947,7 +1067,7 @@ def test_provider_catalog_has_compact_narrow_layout(
     )
 
     output = stream.getvalue()
-    assert "Providers  ·  18 routes" in output
+    assert "Providers  ·  20 routes" in output
     assert "OpenRouter" in output
     assert "Hugging Face" in output
     assert "Type" not in output

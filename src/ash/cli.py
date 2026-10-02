@@ -500,6 +500,11 @@ def render_model_catalog_refresh(
             marker = " (current)" if model == current else ""
             display_model = terminal_safe_text(model, single_line=True)
             lines.append(f"  {display_model}{marker}")
+        if current.startswith("bedrock/"):
+            lines.append(
+                "  Bedrock entries are discovery candidates; use ash providers test "
+                "to verify Runtime Chat Completions compatibility."
+            )
     lines.extend(["", _render_model_list(config)])
     return "\n".join(lines)
 

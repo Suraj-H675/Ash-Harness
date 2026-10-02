@@ -135,6 +135,7 @@ def test_registry_builds_fallback_chain_through_same_factories() -> None:
 def test_default_registry_exposes_builtins_without_constructing_them() -> None:
     assert create_default_provider_registry().names() == (
         "anthropic",
+        "bedrock",
         "cerebras",
         "deepseek",
         "fireworks",
@@ -150,6 +151,7 @@ def test_default_registry_exposes_builtins_without_constructing_them() -> None:
         "openrouter",
         "together",
         "vercel",
+        "vertex",
         "vllm",
         "xai",
     )
@@ -200,6 +202,71 @@ def test_openai_compatible_catalog_providers_build_with_their_route(
         assert result.capabilities.vision is False
         assert callable(getattr(result, "detect_capabilities", None))
     assert result._base_url == base_url
+
+
+def test_vertex_registry_builds_explicit_scoped_route() -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.vertex import VertexProvider
+
+    result = create_default_provider_registry().build(
+        AshConfig(
+            model="vertex/google/gemini-test",
+            vertex_project="project-123",
+            vertex_location="us-central1",
+        )
+    )
+
+    assert isinstance(result, VertexProvider)
+    assert result.provider_family == "vertex"
+    assert result.model_name == "google/gemini-test"
+    assert result._base_url == (
+        "https://us-central1-aiplatform.googleapis.com/v1/projects/project-123/"
+        "locations/us-central1/endpoints/openapi"
+    )
+    assert result.capabilities == ProviderCapabilities()
+
+
+def test_bedrock_registry_passes_explicit_scope_to_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+
+    seen: list[dict[str, Any]] = []
+
+    class FakeBedrockProvider(RegistryProvider):
+        provider_family = "bedrock"
+
+        def __init__(self, model_name: str, **kwargs: Any) -> None:
+            super().__init__(model_name)
+            seen.append(kwargs)
+
+        def configure_max_tokens(self, max_tokens: int) -> None:
+            seen[-1]["max_tokens"] = max_tokens
+
+    monkeypatch.setattr(
+        "ash.providers.bedrock.BedrockProvider",
+        FakeBedrockProvider,
+    )
+
+    result = create_default_provider_registry().build(
+        AshConfig(
+            model="bedrock/us.anthropic.model",
+            bedrock_region="us-west-2",
+            bedrock_profile="engineering",
+            max_completion_tokens=321,
+        )
+    )
+
+    assert result.provider_family == "bedrock"
+    assert result.model_name == "us.anthropic.model"
+    assert seen == [
+        {
+            "region": "us-west-2",
+            "profile": "engineering",
+            "max_tokens": 321,
+        }
+    ]
+    assert result.capabilities == ProviderCapabilities()
 
 
 def test_google_runtime_client_identifies_ash_without_affecting_nvidia(
@@ -480,7 +547,14 @@ async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer
     assert provider.capabilities.native_tools is False
     assert provider.capabilities.vision is False
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    client = provider._resolve_client()._client
+    transport_module = type(client._transport).__module__.split(".", 1)[0]
+    if transport_module == "httpx2":
+        import httpx2 as transport_httpx  # type: ignore[import-not-found]
+    else:
+        transport_httpx = httpx
+
+    async def handler(request):
         assert request.url.path == "/v1/chat/completions"
         assert "Authorization" not in request.headers
         body = (
@@ -489,7 +563,7 @@ async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer
             b'"finish_reason":"stop"}]}\n\n'
             b"data: [DONE]\n\n"
         )
-        return httpx.Response(
+        return transport_httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
             content=body,
@@ -498,7 +572,7 @@ async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer
 
     # Keep the provider's real AsyncClient and request-hook path, replacing
     # only the network transport with a deterministic local response.
-    provider._resolve_client()._client._transport = httpx.MockTransport(handler)
+    client._transport = transport_httpx.MockTransport(handler)
     chunks = [
         chunk
         async for chunk in provider.stream_chat(

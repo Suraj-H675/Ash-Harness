@@ -904,6 +904,33 @@ class AshConfig(BaseSettings):
         default_factory=dict,
         description="Custom OpenAI-compatible providers with base URL, key env name, and models.",
     )
+    vertex_project: str = Field(
+        "",
+        max_length=128,
+        description=(
+            "User-owned Google Cloud project for the first-party Vertex AI route."
+        ),
+    )
+    vertex_location: str = Field(
+        "",
+        max_length=64,
+        description=(
+            "User-owned Vertex AI location. No implicit region is selected so "
+            "data-routing intent stays explicit."
+        ),
+    )
+    bedrock_region: str = Field(
+        "",
+        max_length=64,
+        description="User-owned AWS Region for the Amazon Bedrock route.",
+    )
+    bedrock_profile: str = Field(
+        "",
+        max_length=128,
+        description=(
+            "Optional user-owned AWS shared-config profile for Amazon Bedrock."
+        ),
+    )
     openai_auth_mode: str = Field(
         "api_key",
         description=(
@@ -1061,6 +1088,33 @@ class AshConfig(BaseSettings):
         normalized = value.strip().casefold()
         if normalized not in {"api_key", "chatgpt"}:
             raise ValueError("openai_auth_mode must be api_key or chatgpt")
+        return normalized
+
+    @field_validator(
+        "vertex_project",
+        "vertex_location",
+        "bedrock_region",
+    )
+    @classmethod
+    def validate_cloud_route_segment(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        if any(
+            character.isspace()
+            or ord(character) < 33
+            or character in {"/", "\\", "?", "#"}
+            for character in normalized
+        ):
+            raise ValueError("cloud route identifiers must be single safe segments")
+        return normalized
+
+    @field_validator("bedrock_profile")
+    @classmethod
+    def validate_bedrock_profile(cls, value: str) -> str:
+        normalized = value.strip()
+        if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+            raise ValueError("bedrock_profile contains control characters")
         return normalized
 
     @field_validator("prompt_cache_retention")

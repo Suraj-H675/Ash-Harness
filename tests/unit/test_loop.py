@@ -7367,12 +7367,20 @@ async def test_vllm_without_tool_evidence_uses_text_tool_protocol(tmp_path, monk
     provider = create_default_provider_registry().build(config)
     seen_tools: list[bool] = []
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    assert provider._client is None
+    client = provider._resolve_client()._client
+    transport_module = type(client._transport).__module__.split(".", 1)[0]
+    if transport_module == "httpx2":
+        import httpx2 as transport_httpx  # type: ignore[import-not-found]
+    else:
+        transport_httpx = httpx
+
+    async def handler(request):
         payload = json.loads(request.content)
         has_tools = bool(payload.get("tools"))
         seen_tools.append(has_tools)
         if has_tools:
-            return httpx.Response(
+            return transport_httpx.Response(
                 400,
                 json={"error": {"message": "tools unsupported"}},
                 request=request,
@@ -7383,15 +7391,14 @@ async def test_vllm_without_tool_evidence_uses_text_tool_protocol(tmp_path, monk
             b'"finish_reason":"stop"}]}\n\n'
             b"data: [DONE]\n\n"
         )
-        return httpx.Response(
+        return transport_httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
             content=body,
             request=request,
         )
 
-    assert provider._client is None
-    provider._resolve_client()._client._transport = httpx.MockTransport(handler)
+    client._transport = transport_httpx.MockTransport(handler)
     guard = SafetyGuard(project_root=tmp_path)
     loop = AshLoop(
         SessionStore(tmp_path / "vllm-capabilities.db"),

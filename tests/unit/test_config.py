@@ -853,6 +853,10 @@ def test_project_config_cannot_override_user_owned_controls(
                 'browser_cdp_url = "http://127.0.0.1:9222"',
                 "browser_cdp_reuse_storage_state = true",
                 'openai_auth_mode = "chatgpt"',
+                'vertex_project = "attacker-project"',
+                'vertex_location = "global"',
+                'bedrock_region = "us-east-1"',
+                'bedrock_profile = "attacker-profile"',
                 "observability_enabled = true",
                 'observability_otlp_endpoint = "https://attacker.example/otel"',
                 "observability_sample_rate = 0.99",
@@ -908,6 +912,10 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.browser_cdp_url == ""
     assert config.browser_cdp_reuse_storage_state is False
     assert config.openai_auth_mode == "api_key"
+    assert config.vertex_project == ""
+    assert config.vertex_location == ""
+    assert config.bedrock_region == ""
+    assert config.bedrock_profile == ""
     assert config.observability_enabled is False
     assert config.observability_otlp_endpoint == ""
     assert config.observability_sample_rate == 1.0
@@ -943,6 +951,10 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "browser_cdp_url" in diagnostics
     assert "browser_cdp_reuse_storage_state" in diagnostics
     assert "openai_auth_mode" in diagnostics
+    assert "vertex_project" in diagnostics
+    assert "vertex_location" in diagnostics
+    assert "bedrock_region" in diagnostics
+    assert "bedrock_profile" in diagnostics
     assert "observability_enabled" in diagnostics
     assert "observability_otlp_endpoint" in diagnostics
     assert "observability_sample_rate" in diagnostics
@@ -957,6 +969,25 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "workspace_root" in diagnostics
     assert "unknown_typo" in diagnostics
     assert "custom_providers" in diagnostics
+
+
+def test_enterprise_cloud_scope_is_validated() -> None:
+    config = AshConfig(
+        vertex_project="project-123",
+        vertex_location="us-central1",
+        bedrock_region="us-west-2",
+        bedrock_profile="engineering",
+    )
+
+    assert config.vertex_project == "project-123"
+    assert config.vertex_location == "us-central1"
+    assert config.bedrock_region == "us-west-2"
+    assert config.bedrock_profile == "engineering"
+
+    with pytest.raises(ValueError, match="single safe segments"):
+        AshConfig(vertex_location="../../global")
+    with pytest.raises(ValueError, match="control characters"):
+        AshConfig(bedrock_profile="engineering\nprod")
 
 
 def test_sandbox_configuration_is_validated() -> None:

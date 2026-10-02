@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, AsyncGenerator
 import httpx
 import openai  # type: ignore[import-not-found]
@@ -148,12 +148,14 @@ class OpenAIProvider(ProviderABC):
     def __init__(
         self,
         model_name: str = "gpt-4o",
-        api_key: str | None = None,
+        api_key: str | Callable[[], Awaitable[str]] | None = None,
         *,
         base_url: str | None = None,
         allow_anonymous: bool = False,
         token_counter: TokenCounterLike | None = None,
         default_headers: Mapping[str, str] | None = None,
+        error_secrets_supplier: Callable[[], Sequence[str]] | None = None,
+        include_stream_usage: bool | None = None,
         client: Any | None = None,
     ) -> None:
         if not api_key and not allow_anonymous:
@@ -171,11 +173,12 @@ class OpenAIProvider(ProviderABC):
         self._error_secrets = tuple(
             value
             for value in (
-                api_key or "",
+                api_key if isinstance(api_key, str) else "",
                 *(str(value) for value in (default_headers or {}).values()),
             )
             if value
         )
+        self._error_secrets_supplier = error_secrets_supplier
         self._token_counter = token_counter or OpenAITokenCounter(model_name)
         client_options: dict[str, Any] = {
             # A non-empty placeholder prevents the SDK from inheriting
@@ -188,6 +191,9 @@ class OpenAIProvider(ProviderABC):
             client_options["default_headers"] = dict(default_headers)
         self._client_options = client_options
         self._allow_anonymous = allow_anonymous
+        self._include_stream_usage = (
+            base_url is None if include_stream_usage is None else include_stream_usage
+        )
         self._client = client
         self._owns_client = client is None
         self._prompt_cache_enabled = False
@@ -241,7 +247,7 @@ class OpenAIProvider(ProviderABC):
             "temperature": temperature,
             "stream": True,
         }
-        if self._base_url is None:
+        if self._include_stream_usage:
             kwargs["stream_options"] = {"include_usage": True}
         if self._prompt_cache_enabled:
             if self._prompt_cache_key:
@@ -257,7 +263,17 @@ class OpenAIProvider(ProviderABC):
             client = self._resolve_client()
             stream = await client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            detail = redact_provider_error(str(exc), *self._error_secrets)
+            dynamic_secrets: Sequence[str] = ()
+            if self._error_secrets_supplier is not None:
+                try:
+                    dynamic_secrets = self._error_secrets_supplier()
+                except Exception:  # noqa: BLE001 - redaction must not mask provider error
+                    dynamic_secrets = ()
+            detail = redact_provider_error(
+                str(exc),
+                *self._error_secrets,
+                *dynamic_secrets,
+            )
             raise RuntimeError(f"OpenAI API error: {detail}") from exc
 
         # Buffer for accumulating streaming tool calls.

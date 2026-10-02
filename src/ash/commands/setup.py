@@ -187,6 +187,27 @@ def _provider_status(config, descriptor: ProviderDescriptor) -> str:
         return "manual setup"
     if descriptor.local:
         return "available to test"
+    if descriptor.id == "vertex":
+        project = (
+            str(getattr(config, "vertex_project", "") or "").strip()
+            or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+        )
+        location = (
+            str(getattr(config, "vertex_location", "") or "").strip()
+            or os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
+        )
+        return (
+            "ADC scope configured"
+            if project and location
+            else "needs project/location"
+        )
+    if descriptor.id == "bedrock":
+        region = (
+            str(getattr(config, "bedrock_region", "") or "").strip()
+            or os.environ.get("AWS_REGION", "").strip()
+            or os.environ.get("AWS_DEFAULT_REGION", "").strip()
+        )
+        return "AWS scope configured" if region else "needs AWS region"
     if descriptor.id == "openai" and getattr(config, "openai_auth_mode", "") == "chatgpt":
         from ash.providers.openai_chatgpt_auth import ChatGPTCredentialStore
 
@@ -813,6 +834,10 @@ def select_provider_and_model(config) -> SetupOutcome:
                 return _flow_deepseek(current)
             if provider_id == "groq":
                 return _flow_groq(current)
+            if provider_id == "vertex":
+                return _flow_vertex(current, config)
+            if provider_id == "bedrock":
+                return _flow_bedrock(current, config)
             if provider_id == "ollama":
                 return _flow_ollama(current)
             if provider_id == "openai-compatible":
@@ -1078,6 +1103,145 @@ def _flow_groq(current: str) -> SetupOutcome:
     return SetupOutcome.SUCCESS
 
 
+def _flow_vertex(current: str, config) -> SetupOutcome:
+    """Vertex setup: explicit project/location, ADC verification, manual model ID."""
+
+    _print_header("Google Vertex AI Configuration")
+    if importlib.util.find_spec("google.auth") is None:
+        from ash.install import pipx_install_command
+
+        print(
+            "  Vertex AI support is not installed. Install the GCP extra:\n"
+            f"\n    {pipx_install_command('gcp')}\n",
+            file=sys.stderr,
+        )
+        return SetupOutcome.ERROR
+
+    current_project = (
+        str(getattr(config, "vertex_project", "") or "").strip()
+        or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+    )
+    current_location = (
+        str(getattr(config, "vertex_location", "") or "").strip()
+        or os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
+    )
+    project = _prompt_setup_text(
+        f"  Google Cloud project{f' [{current_project}]' if current_project else ''}: ",
+        allow_empty=bool(current_project),
+    )
+    project = project or current_project
+    location = _prompt_setup_text(
+        f"  Vertex location{f' [{current_location}]' if current_location else ''}: ",
+        allow_empty=bool(current_location),
+    )
+    location = location or current_location
+
+    from ash.providers.vertex import (
+        GoogleAdcTokenProvider,
+        VertexBackendUnavailable,
+        VertexCredentialError,
+        vertex_openai_base_url,
+    )
+
+    try:
+        vertex_openai_base_url(project, location)
+        asyncio.run(GoogleAdcTokenProvider()())
+    except (ValueError, VertexBackendUnavailable, VertexCredentialError) as exc:
+        print(
+            "  Vertex ADC verification failed: "
+            + terminal_safe_text(str(exc), single_line=True)
+        )
+        return SetupOutcome.ERROR
+
+    prompt = "  Vertex model ID"
+    if current:
+        prompt += f" [{terminal_safe_text(current, single_line=True)}]"
+    model = _prompt_setup_text(prompt + ": ", allow_empty=bool(current)) or current
+    if not model:
+        print("  Vertex model ID is required.")
+        return SetupOutcome.ERROR
+
+    save_env_values(
+        {
+            "ASH_VERTEX_PROJECT": project,
+            "ASH_VERTEX_LOCATION": location,
+            "ASH_MODEL": f"vertex/{model}",
+        }
+    )
+    _print_info(
+        "Verified Google Application Default Credentials. "
+        "Run ash providers test to verify the selected model deployment."
+    )
+    return SetupOutcome.SUCCESS
+
+
+def _flow_bedrock(current: str, config) -> SetupOutcome:
+    """Bedrock setup: explicit region, AWS credential chain, native discovery."""
+
+    _print_header("Amazon Bedrock Configuration")
+    current_region = (
+        str(getattr(config, "bedrock_region", "") or "").strip()
+        or os.environ.get("AWS_REGION", "").strip()
+        or os.environ.get("AWS_DEFAULT_REGION", "").strip()
+    )
+    current_profile = (
+        str(getattr(config, "bedrock_profile", "") or "").strip()
+        or os.environ.get("AWS_PROFILE", "").strip()
+    )
+    region = _prompt_setup_text(
+        f"  AWS Region{f' [{current_region}]' if current_region else ''}: ",
+        allow_empty=bool(current_region),
+    )
+    region = region or current_region
+    profile = _prompt_setup_text(
+        f"  AWS profile (optional){f' [{current_profile}]' if current_profile else ''}: ",
+        allow_empty=True,
+    )
+    profile = profile or current_profile
+
+    models, verified = _discover_models(
+        "Amazon Bedrock candidate discovery",
+        lambda: _probe_bedrock_models_detailed(region, profile),
+        fallback=[current] if current else [],
+        guidance=(
+            "Install the Ash aws extra and configure an AWS IAM identity with "
+            "Bedrock discovery/inference permissions."
+        ),
+    )
+    model = _prompt_model_list(models, current)
+    _confirm_undiscovered_model(model, models, verified)
+
+    try:
+        from ash.providers.bedrock import BedrockProvider
+
+        provider = BedrockProvider(
+            model,
+            region=region,
+            profile=profile,
+        )
+        asyncio.run(provider.aclose())
+    except (ImportError, ValueError, RuntimeError) as exc:
+        print(
+            "  Bedrock Runtime provider is unavailable: "
+            + terminal_safe_text(str(exc), single_line=True)
+        )
+        return SetupOutcome.ERROR
+
+    settings = {
+        "ASH_BEDROCK_REGION": region,
+        "ASH_MODEL": f"bedrock/{model}",
+    }
+    if profile:
+        settings["ASH_BEDROCK_PROFILE"] = profile
+    save_env_values(settings)
+    _print_verification_status(verified)
+    _print_info(
+        "Bedrock discovery returns candidate IDs; run ash providers test to "
+        "verify that the selected ID supports Runtime Chat Completions."
+    )
+    return SetupOutcome.SUCCESS
+
+
 def _flow_ollama(current: str) -> SetupOutcome:
     """Ollama setup: base URL, local model selection via /api/tags."""
     _print_header("Ollama Configuration")
@@ -1312,6 +1476,20 @@ def _probe_ollama_models_detailed(base_url: str) -> ModelProbe:
 def _probe_ollama_models(base_url: str) -> list[str]:
     """Call Ollama /api/tags. Returns model names."""
     return list(_probe_ollama_models_detailed(base_url).models)
+
+
+def _probe_bedrock_models_detailed(region: str, profile: str = "") -> ModelProbe:
+    from ash.providers.bedrock import (
+        BedrockBackendUnavailable,
+        BedrockDiscoveryError,
+        discover_bedrock_models,
+    )
+
+    try:
+        models = discover_bedrock_models(region=region, profile=profile)
+    except (ValueError, BedrockBackendUnavailable, BedrockDiscoveryError) as exc:
+        return ModelProbe(error=str(exc))
+    return ModelProbe(models=models)
 
 
 # ---------------------------------------------------------------------------
@@ -1871,6 +2049,12 @@ def _compact_provider_status(status: str) -> str:
         return "ready"
     if "needs key" in normalized:
         return "key"
+    if "scope configured" in normalized:
+        return "scope"
+    if "project/location" in normalized:
+        return "scope"
+    if "aws region" in normalized:
+        return "region"
     if "available" in normalized or "local" in normalized:
         return "local"
     if "manual" in normalized:

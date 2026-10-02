@@ -53,11 +53,33 @@ defaults.
 ## Readiness Boundary
 
 For built-in and configured custom providers, Ash resolves a single connection
-description before runtime construction or `ash doctor --connect`. It includes
+description before runtime construction or ash doctor --connect. It includes
 the canonical provider/model identifier, exact base URL, authentication mode,
-and provider-specific model-catalog endpoint. This prevents diagnostics from
+and provider-specific model-catalog endpoint when that route has one. This prevents diagnostics from
 probing a vendor default while a turn sends credentials to an operator-selected
 gateway.
+
+First-class enterprise routes deliberately do not reuse generic bearer custom
+providers. The vertex route requires an explicit user-owned Google Cloud
+project and location, uses the optional gcp extra, and obtains short-lived
+bearer credentials from Google Application Default Credentials. The token
+callable refreshes ADC without persisting tokens in Ash config and retains only
+a bounded in-memory history for provider-error redaction. Vertex does not expose
+a trustworthy live OpenAI model catalog for Ash, so the model ID is explicit
+and ash providers test verifies it with a bounded completion.
+
+The bedrock route requires an explicit AWS Region and optionally a profile,
+uses the optional aws extra, and delegates AWS credential-chain refresh and
+SigV4 request signing to the official OpenAI Bedrock provider. Ash targets the
+AWS-recommended bedrock-runtime endpoint, not Mantle. Native
+ListFoundationModels and ListInferenceProfiles results are candidate IDs because
+AWS API compatibility is model-specific; only the completion probe establishes
+that the selected ID supports Runtime Chat Completions.
+
+Project configuration cannot set Vertex project/location or Bedrock
+region/profile. These are user-owned controls, and isolated provider workers
+receive only the Google/AWS credential-chain environment required by an active
+or fallback enterprise route.
 
 Custom OpenAI-compatible provider records use `auth_mode = "bearer"` or
 `auth_mode = "none"`. Bearer mode requires its declared key source to be
@@ -123,9 +145,13 @@ evidence. Exact model IDs take precedence; provider aliases are accepted only
 when they map to exactly one catalog entry. Missing, malformed, conflicting,
 ambiguous-alias, or different-model metadata keeps the conservative path.
 
-Connectivity diagnostics must receive a successful model catalog containing
-the selected model. A reachable endpoint with an empty catalog or a different
-model is reported as not ready; `ash setup` remains the remediation path.
+For routes with an authoritative model catalog, connectivity diagnostics must
+receive a successful catalog containing the selected model. A reachable catalog
+endpoint with an empty catalog or a different model is reported as not ready.
+Enterprise routes may have no authoritative OpenAI catalog: Vertex requires an
+explicit model ID, while Bedrock native discovery is candidate-only. For those
+routes, ash providers test treats a successful bounded completion as the
+authoritative readiness signal. ash setup remains the remediation path.
 
 Provider registration executes trusted Python code in the Ash host. It is an
 embedding API, not the future untrusted plugin ABI. Out-of-process plugins must

@@ -68,6 +68,20 @@ BUILTIN_PROVIDERS: tuple[ProviderDescriptor, ...] = (
         key_env_aliases=("GEMINI_API_KEY",),
     ),
     ProviderDescriptor(
+        "vertex",
+        "Google Vertex AI",
+        "Enterprise cloud",
+        "Vertex AI OpenAI-compatible inference with Application Default Credentials",
+        "https://aiplatform.googleapis.com",
+    ),
+    ProviderDescriptor(
+        "bedrock",
+        "Amazon Bedrock",
+        "Enterprise cloud",
+        "Bedrock Runtime with the AWS credential chain and SigV4",
+        "https://bedrock-runtime.amazonaws.com",
+    ),
+    ProviderDescriptor(
         "openrouter",
         "OpenRouter",
         "Gateway",
