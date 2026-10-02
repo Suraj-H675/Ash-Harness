@@ -293,7 +293,10 @@ second copy of their daemon/model managers. Setup therefore points users to
 the runtime's own lifecycle commands (`ollama serve` / `ollama pull`, `lms
 server start` / `lms load`, and `vllm serve`) while Ash owns endpoint safety,
 catalog/capability negotiation, streamed inference, cancellation, provider
-cleanup, and agent-loop semantics.
+cleanup, and agent-loop semantics. Fresh-process regression journeys cover a
+workspace-writing tool turn for all three routes: Ollama and LM Studio use
+provider-proven native tools, while vLLM deliberately stays on Ash's text/XML
+fallback unless the served model metadata proves native auto-tool support.
 
 For routes with an authoritative model catalog, connectivity diagnostics must
 receive a successful catalog containing the selected model. A reachable catalog

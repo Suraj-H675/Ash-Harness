@@ -103,14 +103,14 @@ The program is intentionally finite:
    recovery, observability, and production-core evidence remain the completed
    baseline. Reopen P0 only for new contradictory evidence or a regression that
    directly invalidates that baseline.
-1. **P1 — Provider/model parity — OPEN.** Close material gaps in provider
+1. **P1 — Provider/model parity — CLOSED.** Close material gaps in provider
    breadth and correctness, authentication/subscription paths, discovery and
    switching, capability metadata, tool/reasoning/multimodal semantics,
    streaming/cancellation, usage/cost normalization, failover/routing, local
    runtimes, onboarding, and real-provider/runtime conformance. Closure requires
    a current comparator pass plus enough real vendor/runtime evidence for every
    support claim that materially depends on external behavior.
-2. **P2 — Agent/workspace parity — NOT STARTED.** Evaluate and close material
+2. **P2 — Agent/workspace parity — OPEN.** Evaluate and close material
    gaps in subagent orchestration, durable/background work, worktree/workspace
    isolation, delegation, steering, recovery, remote execution where it solves
    real coding workflows, and multi-workspace ergonomics.
@@ -143,9 +143,10 @@ The program is intentionally finite:
    important unresolved user need remains may Ash claim whole-product
    leading-harness parity. Literal feature identity is never the criterion.
 
-**Active gate: P1 — Provider/model parity.** Do not start P2 merely because P1
-work is slow or because another interesting gap is discovered. Record
-cross-gate findings for later and close P1 first.
+**Active gate: P2 — Agent/workspace parity.** P1 is closed at its bounded
+provider/model finish condition. Do not reopen it for catalog churn or a new
+provider merely because one exists; reopen only for concrete evidence that an
+important supported provider/model user need or claim is wrong.
 
 ### P1 finite closure checklist
 
@@ -178,14 +179,14 @@ catalog-expansion exercise:
    switching remain provider-owned and fail conservatively when metadata is
    absent or contradictory. Fix concrete incorrect assumptions rather than
    hard-coding fast-changing model lists.
-4. **P1D — Local runtime parity — OPEN.** Close the material difference between
+4. **P1D — Local runtime parity — CLOSED.** Close the material difference between
    merely connecting to Ollama/LM Studio/vLLM and a strong local-model user
    journey. Decide with evidence whether Ash should manage runtime/model
    lifecycle itself or integrate cleanly with runtime-owned lifecycle commands;
    validate capability discovery, context sizing, tool calling, streaming,
    cancellation, health/readiness, and realistic coding turns on supported
    local runtimes.
-5. **P1E — Real service/runtime conformance and claims — OPEN.** Run the
+5. **P1E — Real service/runtime conformance and claims — CLOSED.** Run the
    smallest set of live provider/runtime journeys that materially changes
    confidence, keep unsupported claims qualified, and finish with a current
    comparator pass. P1 closes only when no important provider/model user need
@@ -203,16 +204,18 @@ not extend P1 with unrelated work once every flag is closed.
 - `P1A_PROVIDER_BREADTH = CLOSED`
 - `P1B_AUTH_RESILIENCE = CLOSED`
 - `P1C_MODEL_CAPABILITY_TRUTH = CLOSED`
-- `P1D_LOCAL_RUNTIME_PARITY = OPEN`
-- `P1E_LIVE_CONFORMANCE = OPEN`
-- `P1_PROVIDER_MODEL_PARITY = OPEN` until P1A-P1E are all closed.
+- `P1D_LOCAL_RUNTIME_PARITY = CLOSED`
+- `P1E_LIVE_CONFORMANCE = CLOSED`
+- `P1_PROVIDER_MODEL_PARITY = CLOSED`
 
 P1C's finish condition is satisfied: supported hosted-provider model discovery,
 capability/limit semantics, usage, prompt caching, and model switching now use
 provider-owned metadata or exact first-party declarations, while missing,
 ambiguous, conflicting, or deployment-opaque evidence fails conservative.
-The next unfinished checkpoint is P1D. P1E remains separate rather than a
-reason to reopen hosted-provider capability work without new concrete evidence.
+P1D's implementation-side finish condition is also satisfied. P1E now has a
+current live post-refactor OpenAI journey, the earlier independent OpenRouter
+service journey, and a current comparator/claims audit with unexercised routes
+still explicitly qualified. All five bounded P1 flags are closed; P2 is next.
 
 ### P1 progress — provider correctness slice 1
 
@@ -830,6 +833,84 @@ OpenClaw's current local-model guidance. P1D remains open for realistic local
 coding-turn conformance and any concrete readiness/capability defects those
 journeys expose; P1E remains the separate live-service claim gate.
 
+### P1 progress — local coding-turn closure slice 16
+
+The remaining P1D gap was the difference between protocol-unit coverage and a
+real Ash user journey. Fresh-process deterministic E2E now exercises every
+supported local route through discovery/capability negotiation, streamed
+inference, tool execution, continuation, and an actual workspace mutation:
+
+- **Ollama** probes `/api/show`, negotiates declared native tools/context, emits
+  a native `/api/chat` `write_file` call, receives the tool result on the next
+  request, and completes the turn.
+- **LM Studio** uses native `/api/v1/models` capability metadata to prove tool
+  training, sends the OpenAI-compatible native tool schema, performs the same
+  file edit, and completes after canonical tool-result replay.
+- **vLLM** exposes its served context through `/v1/models` but does not prove
+  auto-tool/parser configuration. The fresh-process request therefore contains
+  no native `tools` field; Ash's text/XML fallback performs the same file edit
+  and completes safely.
+
+These journeys complement the existing bounded catalog/readiness tests,
+Ollama streaming/usage/thinking tests, LM Studio loaded-context/capability
+parsing, vLLM conservative tool negotiation, and the cancellation/resource
+cleanup slice immediately above. Runtime installation, daemon/model lifecycle,
+and hardware fit remain intentionally runtime-owned.
+
+`P1D_LOCAL_RUNTIME_PARITY = CLOSED`. This is not a claim that real Ollama, LM
+Studio, and vLLM binaries were exercised on the current host: none are installed
+or listening here at this checkpoint. P1E closes below with that limitation
+preserved explicitly rather than promoting deterministic local-runtime evidence
+to a live-runtime claim.
+
+### P1 progress — live-conformance and provider/model closure slice 17
+
+P1E closes on scoped external evidence, not on the impossible standard that
+every supported vendor/model/runtime combination must be live-tested on one
+host. Claims that materially depend on live external behavior remain labeled by
+their actual evidence level.
+
+On 2026-10-03, Ash's existing user-owned ChatGPT-plan registration remained
+refreshable and plan-enabled after the P1 stream/cancellation refactors. Live
+model discovery returned the current selectable account catalog including
+`gpt-6-astra`. A bounded `ash providers test openai/gpt-6-astra` then verified
+authoritative model discovery, selected-model availability, and a real
+Responses completion. A separate isolated temporary-workspace turn exercised
+the current native-tool path end to end: GPT-6 Astra called `write_file`, Ash
+executed the edit, replayed the canonical tool result, received the exact final
+response, and recorded provider-authoritative token usage. The temporary trust
+entry/workspace was removed immediately after the run.
+
+That current OpenAI evidence complements the earlier bounded real OpenRouter
+service journey, which independently proved live catalog discovery,
+provider-reported usage, and a coding workflow that edited and externally
+tested a project using an ephemeral credential that Ash did not persist. No
+ambient API keys for the other cloud providers and no Ollama/LM Studio/vLLM
+binaries were available at this checkpoint, so Ash does **not** relabel those
+routes as live-verified. Their deterministic protocol/fresh-process evidence
+and the table's qualified `Partial` status remain the truthful boundary.
+
+The current comparator pass rechecked OpenClaw and Hermes provider/local-model
+surfaces. Both now offer managed llama.cpp-style local runtimes while also
+supporting externally managed local servers; OpenClaw explicitly keeps LM
+Studio and Ollama as separately managed options, and Hermes accepts existing
+llama-server/custom OpenAI-compatible endpoints. Ash's decision to leave
+Ollama, LM Studio, and vLLM lifecycle runtime-owned is therefore a deliberate
+product boundary, not an unnoticed provider/model parity defect. No current
+comparator evidence exposed a material provider/model user need that should
+keep this finite gate open.
+
+Current comparator references rechecked on 2026-10-03:
+`https://docs.openclaw.ai/gateway/local-models`,
+`https://docs.openclaw.ai/plugins/llama-cpp`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/local-models`, and
+`https://hermes-agent.nousresearch.com/docs/integrations/providers/`.
+
+`P1E_LIVE_CONFORMANCE = CLOSED` and `P1_PROVIDER_MODEL_PARITY = CLOSED`.
+Qualified provider/runtime rows remain evidence boundaries, not hidden claims
+that every external service/version has been exercised. The active finite
+roadmap advances to P2 agent/workspace parity.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product
@@ -969,9 +1050,9 @@ truthful evidence boundaries, not open mission blockers.
 | Dependency separation | Verified locally | Lean default runtime/provider install, standardized dev group, explicit server/local-embeddings/browser/ACP/A2A capability extras, actionable missing-extra errors, and lockfile/artifact checks |
 | First-run wizard | Verified locally | No-key detection, deterministic cancel/back, endpoint retry/save-unverified choices, non-billable model discovery, secret input, atomic related settings, non-TTY guidance, secret-free JSON status, and fresh-process API/local checks |
 | API-key providers | Partial | Every built-in cloud route now assembles from a fresh non-interactive process with its provider credential contract (including Google `GEMINI_API_KEY` fallback), while custom endpoints retain fresh-process coverage; deterministic fresh-process CLI loopback E2E proves real streamed completion across the previously covered built-in cloud catalog: Anthropic through the native Messages/SSE protocol with `x-api-key`, protocol-version, and provider-usage assertions, plus the OpenAI-wire routes for OpenAI, Google, OpenRouter, Vercel AI Gateway, DeepSeek, Groq, Mistral, xAI, Together, Fireworks, Cerebras, and NVIDIA with provider-specific bearer credentials, dynamic model-catalog probes where applicable, Together's list-shaped catalog, and Google's client-identification header. Current first-party OpenAI GPT-5.6/GPT-6 API-key models use the public Responses API so native-tool/reasoning semantics match the model contract; older verified OpenAI models retain Chat Completions, unknown IDs fail conservative, and an operator-overridden OpenAI base URL does not inherit first-party capabilities. Hugging Face Inference Providers is additionally wired as a first-class gateway with `HF_TOKEN`, official `/v1/models` discovery, model/provider routing aliases, and conservative capability-floor parsing across its live upstream providers; Vercel AI Gateway is wired as a first-class `AI_GATEWAY_API_KEY` route using its official OpenAI-compatible `https://ai-gateway.vercel.sh/v1` endpoint and `/v1/models` catalog, giving Ash another high-leverage gateway to hundreds of models without widening the transport surface. Both still need real service conformance before joining the live-verified subset. A bounded real OpenRouter service run additionally proved live catalog discovery, a no-tools completion with provider-reported usage, and a coding journey that edited and externally tested a project using an ephemeral credential that was not persisted by Ash; interactive generic onboarding consumes the same readiness-owned catalog shape used at runtime; custom OpenAI-compatible routes fail closed unless exact per-model metadata is explicitly declared; OpenRouter, Hugging Face, Vercel AI Gateway, Mistral, xAI, Together, Fireworks, and Cerebras start conservatively and recover only capabilities proven by bounded provider-owned metadata (including multi-source xAI metadata that fails closed on direct or follow-up alias disagreement about canonical model identity, and selected-model Fireworks management metadata); runtime provider/model switches own retired-provider closure through loop shutdown, surface cleanup failures, and preserve close-once semantics for successful resources across shutdown retries; real vendor cross-version/service interoperability remains broader than the exercised OpenRouter service plus deterministic protocol coverage |
-| OpenAI ChatGPT-plan auth | Verified live | Optional first-party `openai/*` auth mode uses OpenAI's open-source Sign in with ChatGPT flow with exact loopback state/nonce/PKCE and ID-token validation, private profile-scoped multi-account registration storage, stable host identity, rotating refresh serialization, revocation-aware logout, live model discovery, user-owned setup/CLI controls, project-config exclusion, and a dedicated stateless Responses adapter enforcing `store=false`, `stream=true`, full canonical history/tool replay, bounded encrypted reasoning replay, and success only on `response.completed`; deterministic auth/provider/runtime regressions pass, and a real 2026-10-01 account journey verified sign-in, catalog discovery, plan-backed completion, native function call, canonical tool-result continuation, and provider-reported usage |
+| OpenAI ChatGPT-plan auth | Verified live | Optional first-party `openai/*` auth mode uses OpenAI's open-source Sign in with ChatGPT flow with exact loopback state/nonce/PKCE and ID-token validation, private profile-scoped multi-account registration storage, stable host identity, rotating refresh serialization, revocation-aware logout, live model discovery, user-owned setup/CLI controls, project-config exclusion, and a dedicated stateless Responses adapter enforcing `store=false`, `stream=true`, full canonical history/tool replay, bounded encrypted reasoning replay, and success only on `response.completed`; deterministic auth/provider/runtime regressions pass. The original 2026-10-01 account journey verified sign-in, catalog discovery, plan-backed completion, native function call, canonical tool-result continuation, and provider-reported usage. A second bounded live journey on 2026-10-03, after the P1 stream/cancellation refactors, reconfirmed a refreshable plan registration, the current account model catalog, `ash providers test openai/gpt-6-astra`, and an isolated native `write_file` continuation with provider-authoritative usage. |
 | Provider route verification | Verified locally | `ash providers test` separates catalog/model discovery from a bounded no-tools model completion, requires a safe terminal response before declaring the route ready, redacts completion failures, and closes the probe provider; `ash doctor --connect` remains a non-billable catalog/model check |
-| Local models | Partial | Ollama URL validation, discovery, health detail, safe bounded pulls, and dynamic tool/context probing are wired; LM Studio and vLLM no longer inherit OpenAI capabilities from wire compatibility, LM Studio consumes its native per-model tool/vision/reasoning/loaded-context metadata, and vLLM preserves served context while generic `supported_parameters=tools` does not enable native auto-tool calling without explicit server capability evidence; deterministic fresh-process CLI loopback E2E now proves each route's native catalog endpoint, streamed completion, provider/model identity, and absence of bearer auth; `/capabilities --refresh` re-probes dynamic manifests, while real cross-version LM Studio/vLLM runtime conformance remains |
+| Local models | Partial | Ollama URL validation, discovery, health detail, safe bounded pulls, and dynamic tool/context probing are wired; LM Studio and vLLM no longer inherit OpenAI capabilities from wire compatibility, LM Studio consumes its native per-model tool/vision/reasoning/loaded-context metadata, and vLLM preserves served context while generic `supported_parameters=tools` does not enable native auto-tool calling without explicit server capability evidence. Deterministic fresh-process E2E now proves an actual workspace-writing coding turn for every supported local route: Ollama and LM Studio negotiate native tools, while vLLM deliberately uses Ash's text/XML fallback when the server does not prove auto-tool support; all three perform a real `write_file`, replay the tool result, and finish the turn without bearer auth. `/capabilities --refresh` re-probes dynamic manifests, provider streams are explicitly closed on success/retry/cancellation, and runtime lifecycle remains owned by `ollama`, `lms`/llmster, or `vllm serve`. Real cross-version runtime-binary conformance remains unclaimed because those binaries were not installed on the P1 closure host. |
 | Custom endpoints | Verified locally | Per-provider credentials are stored in mode-0600 env storage, not TOML |
 | Config precedence | Verified locally | CLI > process env > trusted hierarchical project TOML > user TOML > user dotenv > defaults, with exact masked provenance and project security restrictions |
 | Config migration | Verified locally | Complete legacy mapping, conflict preservation, strict destination parsing, verified private source/destination backups, exact-content migration records, and future-version refusal |
