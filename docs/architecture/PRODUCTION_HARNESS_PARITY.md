@@ -172,7 +172,7 @@ catalog-expansion exercise:
    ChatGPT-plan multi-account auth, ordered same-provider API-key profiles, and
    bounded user-owned dynamic credential helpers with forced auth refresh and
    static-profile fallback.
-3. **P1C — Model discovery and capability semantics — OPEN.** Verify that
+3. **P1C — Model discovery and capability semantics — CLOSED.** Verify that
    model catalogs, aliases, context/output limits, vision, reasoning, native
    tools, usage, prompt caching, streaming terminal semantics, and model
    switching remain provider-owned and fail conservatively when metadata is
@@ -749,10 +749,11 @@ context window, and 65,536 maximum output tokens; Gemini 3 requires prior
 function-call thought signatures to be returned or the provider rejects the
 request.
 
-P1C remains open for the remaining hosted-provider capability/usage/cache and
-model-switch semantics. Azure deployment IDs and Bedrock model/profile IDs stay
-conservative until provider-owned evidence can identify their runtime
-capabilities safely; P1D/P1E remain separate finish gates.
+At the slice-13 checkpoint, P1C still had the final hosted-provider
+capability/usage/cache audit open. Azure deployment IDs and Bedrock
+model/profile IDs remained conservative because provider-owned evidence could
+not identify their runtime capabilities safely; the following slice closes
+P1C without weakening that boundary.
 
 ### P1 progress — hosted capability closure and Azure usage slice 14
 
@@ -795,6 +796,39 @@ Cloud context-caching documentation on the same date.
 `P1C_MODEL_CAPABILITY_TRUTH = CLOSED`. The finite P1 roadmap now advances to
 P1D local-runtime parity; live credentialed/provider conformance remains P1E
 and does not block this hosted-model semantic closure.
+
+### P1 progress — local-runtime ownership and cancellation slice 15
+
+P1D starts from an explicit lifecycle decision rather than copying a competitor
+surface. Ollama, LM Studio/llmster, and vLLM already own installation, daemon,
+model-download/load, and serving lifecycle through their supported tools. Ash
+therefore treats those runtimes as separately managed services and owns the
+integration contract: safe loopback/default endpoints, model discovery,
+capability negotiation, readiness guidance, streaming, cancellation, agent
+tool semantics, and cleanup. This matches the useful comparator pattern where
+separately managed Ollama/LM Studio remain external while a harness-managed
+server is reserved for a backend the harness itself installs.
+
+The first implementation gap in that contract was cancellation/resource
+cleanup. LM Studio and vLLM use Ash's OpenAI-wire adapter, but an outer provider
+generator could be cancelled after yielding a chunk without deterministically
+closing the inner OpenAI SDK stream. Ash now has one bounded stream-lease helper
+that closes SDK streams on EOF, error, or cancellation while preserving the
+primary exception. OpenAI Chat Completions, current Responses, DeepSeek, and
+Groq use the same primitive. The core loop also owns each provider-stream lease
+explicitly and closes it before retry, successful finalization, or cancellation,
+so local server connections are not left to garbage-collection timing.
+
+Setup recovery is now runtime-specific: LM Studio points to `lms server start`
+plus `lms load <model>`/JIT loading, while vLLM points to `vllm serve <model>`
+and its `/v1/models` readiness boundary. Ollama already had its specific
+`ollama serve` / `ollama pull` path.
+
+Evidence was rechecked on 2026-10-02 against Ollama's CLI reference, LM Studio's
+`lms`/headless documentation, vLLM's OpenAI-compatible server/serve docs, and
+OpenClaw's current local-model guidance. P1D remains open for realistic local
+coding-turn conformance and any concrete readiness/capability defects those
+journeys expose; P1E remains the separate live-service claim gate.
 
 ### M4 product decisions
 

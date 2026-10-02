@@ -753,6 +753,7 @@ async def test_openai_provider_stream_chat_signature():
 class _AsyncChunkStream:
     def __init__(self, chunks: list[Any]) -> None:
         self._chunks = chunks
+        self.closed = 0
 
     def __aiter__(self):
         async def generate():
@@ -761,15 +762,20 @@ class _AsyncChunkStream:
 
         return generate()
 
+    async def aclose(self) -> None:
+        self.closed += 1
+
 
 class _FakeOpenAICompletions:
     def __init__(self, chunks: list[Any]) -> None:
         self._chunks = chunks
         self.kwargs: dict[str, Any] = {}
+        self.last_stream: _AsyncChunkStream | None = None
 
     async def create(self, **kwargs: Any) -> _AsyncChunkStream:
         self.kwargs = kwargs
-        return _AsyncChunkStream(self._chunks)
+        self.last_stream = _AsyncChunkStream(self._chunks)
+        return self.last_stream
 
 
 class _FakeOpenAIModels:
@@ -1051,9 +1057,61 @@ async def test_openai_prompt_cache_and_usage_only_chunk() -> None:
     assert client.completions.kwargs["stream_options"] == {"include_usage": True}
     assert client.completions.kwargs["prompt_cache_key"] == "ash-project-test"
     assert client.completions.kwargs["prompt_cache_retention"] == "24h"
+    assert client.completions.last_stream is not None
+    assert client.completions.last_stream.closed == 1
 
     await provider.aclose()
     assert client.closed is False
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_cancellation_closes_sdk_stream() -> None:
+    from ash.providers.openai import OpenAIProvider
+
+    class BlockingStream:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.closed = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.started.set()
+            await self.release.wait()
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.closed += 1
+            self.release.set()
+
+    class Completions:
+        def __init__(self, stream: BlockingStream) -> None:
+            self.stream = stream
+
+        async def create(self, **kwargs: Any) -> BlockingStream:
+            del kwargs
+            return self.stream
+
+    sdk_stream = BlockingStream()
+    provider = OpenAIProvider(
+        model_name="test",
+        api_key="test-key",
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=Completions(sdk_stream))
+        ),
+    )
+    provider_stream = provider.stream_chat([{"role": "user", "content": "hi"}])
+    task = asyncio.create_task(anext(provider_stream))
+    await asyncio.wait_for(sdk_stream.started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sdk_stream.closed == 1
+    await provider_stream.aclose()
 
 
 @pytest.mark.asyncio
@@ -1063,6 +1121,7 @@ async def test_openai_responses_provider_uses_native_tools_and_normalizes_cache_
     class Events:
         def __init__(self, events: list[Any]) -> None:
             self.events = iter(events)
+            self.closed = 0
 
         def __aiter__(self):
             return self
@@ -1073,14 +1132,19 @@ async def test_openai_responses_provider_uses_native_tools_and_normalizes_cache_
             except StopIteration as exc:
                 raise StopAsyncIteration from exc
 
+        async def aclose(self) -> None:
+            self.closed += 1
+
     class Responses:
         def __init__(self, events: list[Any]) -> None:
             self.events = events
             self.kwargs: dict[str, Any] = {}
+            self.last_stream: Events | None = None
 
         async def create(self, **kwargs: Any) -> Events:
             self.kwargs = kwargs
-            return Events(self.events)
+            self.last_stream = Events(self.events)
+            return self.last_stream
 
     class Client:
         def __init__(self, events: list[Any]) -> None:
@@ -1167,6 +1231,8 @@ async def test_openai_responses_provider_uses_native_tools_and_normalizes_cache_
     assert terminal.native_tool_calls is not None
     assert terminal.native_tool_calls[0].call_id == "call_1"
     assert terminal.provider_state is not None
+    assert client.responses.last_stream is not None
+    assert client.responses.last_stream.closed == 1
 
 
 @pytest.mark.asyncio

@@ -910,6 +910,119 @@ async def test_empty_provider_eof_retries_before_output(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_streams_close_before_retry_and_after_success(tmp_path) -> None:
+    class AttemptStream:
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+            self.closed = 0
+            self.done = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.attempt == 1:
+                raise TimeoutError("transient provider timeout")
+            if self.done:
+                raise StopAsyncIteration
+            self.done = True
+            return StreamChunk(content="recovered", is_done=True, stop_reason="stop")
+
+        async def aclose(self) -> None:
+            self.closed += 1
+
+    class ClosingProvider(ProviderABC):
+        model_name = "closing-provider"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.attempts = 0
+            self.streams: list[AttemptStream] = []
+
+        def count_tokens(self, text):
+            return len(str(text))
+
+        def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.attempts += 1
+            stream = AttemptStream(self.attempts)
+            self.streams.append(stream)
+            return stream
+
+    provider = ClosingProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "provider-stream-close.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="openai/test",
+            provider_max_attempts=2,
+            provider_retry_base_delay=0,
+            provider_retry_max_delay=0,
+        ),
+    )
+
+    outcome = await loop._stream_one_completion([])
+
+    assert outcome.text == "recovered"
+    assert provider.attempts == 2
+    assert [stream.closed for stream in provider.streams] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_closes_active_provider_stream(tmp_path) -> None:
+    class BlockingStream:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.closed = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.started.set()
+            await self.release.wait()
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.closed += 1
+            self.release.set()
+
+    class BlockingProvider(ProviderABC):
+        model_name = "blocking-provider"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.stream = BlockingStream()
+
+        def count_tokens(self, text):
+            return len(str(text))
+
+        def stream_chat(self, messages, temperature=0.0, tools=None):
+            return self.stream
+
+    provider = BlockingProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "cancelled-provider-stream.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(model="openai/test"),
+    )
+    task = asyncio.create_task(loop._stream_one_completion([]))
+    await asyncio.wait_for(provider.stream.started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert provider.stream.closed == 1
+
+
+@pytest.mark.asyncio
 async def test_exhausted_empty_provider_eof_records_circuit_failure(tmp_path) -> None:
     class EmptyEOFProvider(ProviderABC):
         model_name = "empty-eof"

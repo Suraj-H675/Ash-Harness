@@ -912,7 +912,7 @@ def _flow_openai_compatible_builtin(
         ),
         fallback=[current] if current else [],
         guidance=(
-            "Start the local runtime and load a model, then retry."
+            _local_runtime_guidance(descriptor.id)
             if descriptor.local
             else "Check the API key and endpoint, then retry."
         ),
@@ -928,6 +928,21 @@ def _flow_openai_compatible_builtin(
     save_env_values(settings)
     _print_verification_status(verified)
     return SetupOutcome.SUCCESS
+
+
+def _local_runtime_guidance(provider_id: str) -> str:
+    normalized = provider_id.strip().casefold()
+    if normalized == "lmstudio":
+        return (
+            "Start LM Studio or llmster, run 'lms server start', and load a "
+            "model with 'lms load <model>' (or enable JIT loading), then retry."
+        )
+    if normalized == "vllm":
+        return (
+            "Start the OpenAI-compatible server with 'vllm serve <model>' "
+            "and retry once the /v1/models endpoint is ready."
+        )
+    return "Start the local runtime and load a model, then retry."
 
 
 def _flow_anthropic(current: str) -> SetupOutcome:

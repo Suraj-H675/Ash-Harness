@@ -15,6 +15,7 @@ from ash.providers.base import (
     ProviderTerminalError,
     StreamChunk,
     TokenCounterLike,
+    managed_async_stream,
 )
 from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
 from ash.providers.openai import _owned_openai_http_client
@@ -206,71 +207,72 @@ async def stream_openai_responses(
     completed = False
     provider_state: list[dict[str, Any]] = []
     tool_calls: list[CanonicalToolCall] = []
-    async for event in stream:
-        event_type = str(getattr(event, "type", "") or "")
-        if event_type in {"response.output_text.delta", "response.refusal.delta"}:
-            delta = str(getattr(event, "delta", "") or "")
-            if delta:
-                yield StreamChunk(content=delta, model=model_name)
-            continue
-        if event_type == "response.output_item.done":
-            item = getattr(event, "item", None)
-            item_type = str(getattr(item, "type", "") or "")
-            if item_type == "reasoning":
-                if len(provider_state) >= MAX_OPENAI_RESPONSE_STATE_ITEMS:
-                    raise RuntimeError("OpenAI returned too many reasoning replay items")
-                provider_state.append(_reasoning_replay_item(item))
-            elif item_type == "function_call":
-                raw_arguments = str(getattr(item, "arguments", "") or "")
-                try:
-                    arguments = strict_json_loads(raw_arguments)
-                except (json.JSONDecodeError, ValueError, UnicodeError) as exc:
-                    raise RuntimeError(
-                        "OpenAI returned invalid function-call arguments"
-                    ) from exc
-                if not isinstance(arguments, dict):
-                    raise RuntimeError("OpenAI function-call arguments were not an object")
-                tool_calls.append(
-                    CanonicalToolCall(
-                        call_id=str(getattr(item, "call_id", "") or ""),
-                        name=str(getattr(item, "name", "") or ""),
-                        arguments=arguments,
+    async with managed_async_stream(stream, label='OpenAI Responses') as managed_stream:
+        async for event in managed_stream:
+            event_type = str(getattr(event, "type", "") or "")
+            if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+                delta = str(getattr(event, "delta", "") or "")
+                if delta:
+                    yield StreamChunk(content=delta, model=model_name)
+                continue
+            if event_type == "response.output_item.done":
+                item = getattr(event, "item", None)
+                item_type = str(getattr(item, "type", "") or "")
+                if item_type == "reasoning":
+                    if len(provider_state) >= MAX_OPENAI_RESPONSE_STATE_ITEMS:
+                        raise RuntimeError("OpenAI returned too many reasoning replay items")
+                    provider_state.append(_reasoning_replay_item(item))
+                elif item_type == "function_call":
+                    raw_arguments = str(getattr(item, "arguments", "") or "")
+                    try:
+                        arguments = strict_json_loads(raw_arguments)
+                    except (json.JSONDecodeError, ValueError, UnicodeError) as exc:
+                        raise RuntimeError(
+                            "OpenAI returned invalid function-call arguments"
+                        ) from exc
+                    if not isinstance(arguments, dict):
+                        raise RuntimeError("OpenAI function-call arguments were not an object")
+                    tool_calls.append(
+                        CanonicalToolCall(
+                            call_id=str(getattr(item, "call_id", "") or ""),
+                            name=str(getattr(item, "name", "") or ""),
+                            arguments=arguments,
+                        )
                     )
+                continue
+            if event_type == "response.failed":
+                error = getattr(getattr(event, "response", None), "error", None)
+                code = str(getattr(error, "code", "") or "error")
+                raise terminal_error_factory(code)
+            if event_type == "response.incomplete":
+                details = getattr(
+                    getattr(event, "response", None),
+                    "incomplete_details",
+                    None,
                 )
-            continue
-        if event_type == "response.failed":
-            error = getattr(getattr(event, "response", None), "error", None)
-            code = str(getattr(error, "code", "") or "error")
-            raise terminal_error_factory(code)
-        if event_type == "response.incomplete":
-            details = getattr(
-                getattr(event, "response", None),
-                "incomplete_details",
-                None,
-            )
-            reason = str(getattr(details, "reason", "") or "incomplete")
-            raise ProviderTerminalError(reason)
-        if event_type == "error":
-            code = str(getattr(event, "code", "") or "error")
-            raise terminal_error_factory(code)
-        if event_type == "response.completed":
-            response = getattr(event, "response", None)
-            usage = getattr(response, "usage", None)
-            input_details = getattr(usage, "input_tokens_details", None)
-            yield StreamChunk(
-                is_done=True,
-                model=model_name,
-                prompt_tokens=_usage_value(usage, "input_tokens"),
-                completion_tokens=_usage_value(usage, "output_tokens"),
-                cache_read_tokens=_usage_value(input_details, "cached_tokens"),
-                cache_write_tokens=_usage_value(input_details, "cache_write_tokens"),
-                usage_source="provider" if usage is not None else "unavailable",
-                stop_reason="completed",
-                native_tool_calls=tool_calls or None,
-                provider_state=provider_state or None,
-            )
-            completed = True
-            continue
+                reason = str(getattr(details, "reason", "") or "incomplete")
+                raise ProviderTerminalError(reason)
+            if event_type == "error":
+                code = str(getattr(event, "code", "") or "error")
+                raise terminal_error_factory(code)
+            if event_type == "response.completed":
+                response = getattr(event, "response", None)
+                usage = getattr(response, "usage", None)
+                input_details = getattr(usage, "input_tokens_details", None)
+                yield StreamChunk(
+                    is_done=True,
+                    model=model_name,
+                    prompt_tokens=_usage_value(usage, "input_tokens"),
+                    completion_tokens=_usage_value(usage, "output_tokens"),
+                    cache_read_tokens=_usage_value(input_details, "cached_tokens"),
+                    cache_write_tokens=_usage_value(input_details, "cache_write_tokens"),
+                    usage_source="provider" if usage is not None else "unavailable",
+                    stop_reason="completed",
+                    native_tool_calls=tool_calls or None,
+                    provider_state=provider_state or None,
+                )
+                completed = True
+                continue
     if not completed:
         raise ProviderIncompleteStreamError(
             "OpenAI Responses stream ended without response.completed"

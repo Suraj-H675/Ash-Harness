@@ -9,7 +9,12 @@ import httpx
 import openai  # type: ignore[import-not-found]
 
 from ash.context.tokens import OpenAITokenCounter
-from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.providers.base import (
+    ProviderABC,
+    StreamChunk,
+    TokenCounterLike,
+    managed_async_stream,
+)
 from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
 from ash.providers.readiness import (
     normalize_provider_base_url,
@@ -305,121 +310,122 @@ class OpenAIProvider(ProviderABC):
         stream_bytes = 0
         reasoning_parts: list[str] = []
 
-        async for chunk in stream:
-            choices = getattr(chunk, "choices", None) or []
-            usage = getattr(chunk, "usage", None)
-            if not choices:
-                if usage is not None:
+        async with managed_async_stream(stream, label='OpenAI') as managed_stream:
+            async for chunk in managed_stream:
+                    choices = getattr(chunk, "choices", None) or []
+                    usage = getattr(chunk, "usage", None)
+                    if not choices:
+                        if usage is not None:
+                            yield StreamChunk(
+                                is_done=True,
+                                model=self._model_name,
+                                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                                completion_tokens=(getattr(usage, "completion_tokens", 0) or 0),
+                                cache_read_tokens=openai_compatible_cache_read_tokens(usage),
+                                usage_source="provider",
+                            )
+                        continue
+
+                    choice = choices[0]
+                    delta = choice.delta
+                    content = delta.content or ""
+                    stream_bytes = account_openai_compatible_stream_bytes(
+                        stream_bytes, content, provider="OpenAI"
+                    )
+                    reasoning_delta = openai_compatible_reasoning_delta(
+                        delta, provider="OpenAI"
+                    )
+                    if reasoning_delta:
+                        stream_bytes = account_openai_compatible_stream_bytes(
+                            stream_bytes, reasoning_delta, provider="OpenAI"
+                        )
+                        reasoning_parts.append(reasoning_delta)
+                    is_done = choice.finish_reason is not None
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    cache_read_tokens = 0
+                    stop_reason = None
+
+                    # Process native tool_calls from the delta.
+                    if hasattr(delta, "tool_calls") and delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in partials:
+                                # New tool call — capture name immediately, buffer args.
+                                partials[idx] = _PartialToolCall(
+                                    id=tc.id or f"call_{idx}",
+                                    name=tc.function.name or "",
+                                )
+                                stream_bytes = account_openai_compatible_stream_bytes(
+                                    stream_bytes, partials[idx].id, provider="OpenAI"
+                                )
+                                stream_bytes = account_openai_compatible_stream_bytes(
+                                    stream_bytes, partials[idx].name, provider="OpenAI"
+                                )
+                            partial = partials[idx]
+                            for retained in self._capture_tool_call_provider_data(partial, tc):
+                                stream_bytes = account_openai_compatible_stream_bytes(
+                                    stream_bytes,
+                                    retained,
+                                    provider="OpenAI",
+                                )
+                            if tc.function.arguments:
+                                stream_bytes = account_openai_compatible_stream_bytes(
+                                    stream_bytes,
+                                    tc.function.arguments,
+                                    provider="OpenAI",
+                                )
+                                partial.arguments += tc.function.arguments
+
+                    # On terminal chunk, finalise every partial tool call.
+                    if is_done:
+                        if usage is not None:
+                            prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                            completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                            cache_read_tokens = openai_compatible_cache_read_tokens(usage)
+                        stop_reason = choice.finish_reason
+                        provider_state = self._provider_state_for_tool_calls(
+                            tuple(partials.values())
+                        )
+                        for partial in partials.values():
+                            completed.append(
+                                CanonicalToolCall.model_validate(
+                                    {
+                                        "call_id": partial.id,
+                                        "name": partial.name,
+                                        "arguments": partial.arguments,
+                                    }
+                                )
+                            )
+                        partials.clear()
+                    else:
+                        provider_state = None
+
                     yield StreamChunk(
-                        is_done=True,
+                        content=content,
+                        is_done=is_done,
                         model=self._model_name,
-                        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-                        completion_tokens=(getattr(usage, "completion_tokens", 0) or 0),
-                        cache_read_tokens=openai_compatible_cache_read_tokens(usage),
-                        usage_source="provider",
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                        usage_source="provider" if usage is not None else "unavailable",
+                        stop_reason=stop_reason,
+                        # Surface complete native tool calls so the loop can use their
+                        # real IDs instead of generating random UUIDs.
+                        # Yield a COPY so completed.clear() after yield doesn't affect
+                        # the StreamChunk's reference.
+                        native_tool_calls=list(completed) if completed else None,
+                        reasoning=(
+                            [{"type": "thinking", "thinking": "".join(reasoning_parts)}]
+                            if is_done and reasoning_parts
+                            else None
+                        ),
+                        provider_state=provider_state,
                     )
-                continue
-
-            choice = choices[0]
-            delta = choice.delta
-            content = delta.content or ""
-            stream_bytes = account_openai_compatible_stream_bytes(
-                stream_bytes, content, provider="OpenAI"
-            )
-            reasoning_delta = openai_compatible_reasoning_delta(
-                delta, provider="OpenAI"
-            )
-            if reasoning_delta:
-                stream_bytes = account_openai_compatible_stream_bytes(
-                    stream_bytes, reasoning_delta, provider="OpenAI"
-                )
-                reasoning_parts.append(reasoning_delta)
-            is_done = choice.finish_reason is not None
-            prompt_tokens = 0
-            completion_tokens = 0
-            cache_read_tokens = 0
-            stop_reason = None
-
-            # Process native tool_calls from the delta.
-            if hasattr(delta, "tool_calls") and delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in partials:
-                        # New tool call — capture name immediately, buffer args.
-                        partials[idx] = _PartialToolCall(
-                            id=tc.id or f"call_{idx}",
-                            name=tc.function.name or "",
-                        )
-                        stream_bytes = account_openai_compatible_stream_bytes(
-                            stream_bytes, partials[idx].id, provider="OpenAI"
-                        )
-                        stream_bytes = account_openai_compatible_stream_bytes(
-                            stream_bytes, partials[idx].name, provider="OpenAI"
-                        )
-                    partial = partials[idx]
-                    for retained in self._capture_tool_call_provider_data(partial, tc):
-                        stream_bytes = account_openai_compatible_stream_bytes(
-                            stream_bytes,
-                            retained,
-                            provider="OpenAI",
-                        )
-                    if tc.function.arguments:
-                        stream_bytes = account_openai_compatible_stream_bytes(
-                            stream_bytes,
-                            tc.function.arguments,
-                            provider="OpenAI",
-                        )
-                        partial.arguments += tc.function.arguments
-
-            # On terminal chunk, finalise every partial tool call.
-            if is_done:
-                if usage is not None:
-                    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-                    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
-                    cache_read_tokens = openai_compatible_cache_read_tokens(usage)
-                stop_reason = choice.finish_reason
-                provider_state = self._provider_state_for_tool_calls(
-                    tuple(partials.values())
-                )
-                for partial in partials.values():
-                    completed.append(
-                        CanonicalToolCall.model_validate(
-                            {
-                                "call_id": partial.id,
-                                "name": partial.name,
-                                "arguments": partial.arguments,
-                            }
-                        )
-                    )
-                partials.clear()
-            else:
-                provider_state = None
-
-            yield StreamChunk(
-                content=content,
-                is_done=is_done,
-                model=self._model_name,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                cache_read_tokens=cache_read_tokens,
-                usage_source="provider" if usage is not None else "unavailable",
-                stop_reason=stop_reason,
-                # Surface complete native tool calls so the loop can use their
-                # real IDs instead of generating random UUIDs.
-                # Yield a COPY so completed.clear() after yield doesn't affect
-                # the StreamChunk's reference.
-                native_tool_calls=list(completed) if completed else None,
-                reasoning=(
-                    [{"type": "thinking", "thinking": "".join(reasoning_parts)}]
-                    if is_done and reasoning_parts
-                    else None
-                ),
-                provider_state=provider_state,
-            )
-            # Clear emitted calls so they are not yielded again.
-            completed.clear()
-            if is_done:
-                reasoning_parts.clear()
+                    # Clear emitted calls so they are not yielded again.
+                    completed.clear()
+                    if is_done:
+                        reasoning_parts.clear()
 
     async def aclose(self) -> None:
         client = self._client

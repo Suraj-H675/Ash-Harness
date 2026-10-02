@@ -663,6 +663,22 @@ def test_openai_compatible_builtin_provider_onboarding(
     }
 
 
+@pytest.mark.parametrize(
+    ("provider_id", "expected"),
+    [
+        ("lmstudio", "lms server start"),
+        ("vllm", "vllm serve <model>"),
+    ],
+)
+def test_local_runtime_setup_guidance_is_runtime_specific(
+    provider_id: str,
+    expected: str,
+) -> None:
+    from ash.commands.setup import _local_runtime_guidance
+
+    assert expected in _local_runtime_guidance(provider_id)
+
+
 def test_google_onboarding_uses_documented_key_precedence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

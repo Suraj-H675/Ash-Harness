@@ -82,6 +82,7 @@ from ash.providers.base import (
     ProviderIncompleteStreamError,
     ProviderTerminalError,
     TokenCounterLike,
+    close_async_stream,
     completion_stop_category,
     stream_chunk_commits_provider,
 )
@@ -4346,6 +4347,8 @@ class AshLoop:
         )
         active_request_id: str | None = None
         active_request_attempt = 0
+        active_provider_stream: Any | None = None
+        stream_to_close: Any | None = None
         configured_model = (
             getattr(self._config, "model", None) if self._config is not None else None
         )
@@ -4378,10 +4381,11 @@ class AshLoop:
                     )
                     try:
                         deadline = asyncio.get_running_loop().time() + request_timeout
-                        stream = self.provider.stream_chat(
+                        active_provider_stream = self.provider.stream_chat(
                             canonical_messages,
                             tools=openai_tools,
                         )
+                        stream = active_provider_stream
                         while True:
                             remaining = deadline - asyncio.get_running_loop().time()
                             if remaining <= 0:
@@ -4625,6 +4629,13 @@ class AshLoop:
                                             f"finalize: {detail} (error)"
                                         )
                                     raise ProviderTerminalError(terminal_stop_reason)
+                        stream_to_close = active_provider_stream
+                        active_provider_stream = None
+                        if stream_to_close is not None:
+                            await close_async_stream(
+                                stream_to_close,
+                                label="provider",
+                            )
                         if not saw_terminal:
                             raise ProviderIncompleteStreamError(
                                 "provider stream ended before a terminal chunk"
@@ -4633,6 +4644,14 @@ class AshLoop:
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001
+                        stream_to_close = active_provider_stream
+                        active_provider_stream = None
+                        if stream_to_close is not None:
+                            await close_async_stream(
+                                stream_to_close,
+                                label="provider",
+                                primary_error=exc,
+                            )
                         failure = classify_provider_failure(exc)
                         self._emit_event(
                             {
@@ -4776,7 +4795,15 @@ class AshLoop:
                     }
                 )
                 active_request_id = None
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
+            stream_to_close = active_provider_stream
+            active_provider_stream = None
+            if stream_to_close is not None:
+                await close_async_stream(
+                    stream_to_close,
+                    label="provider",
+                    primary_error=cancellation,
+                )
             if active_request_id is not None:
                 self._emit_event(
                     {
@@ -4791,6 +4818,14 @@ class AshLoop:
                 active_request_id = None
             raise
         except Exception as exc:
+            stream_to_close = active_provider_stream
+            active_provider_stream = None
+            if stream_to_close is not None:
+                await close_async_stream(
+                    stream_to_close,
+                    label="provider",
+                    primary_error=exc,
+                )
             if active_request_id is not None:
                 failure = classify_provider_failure(exc)
                 self._emit_event(

@@ -287,6 +287,14 @@ evidence. Exact model IDs take precedence; provider aliases are accepted only
 when they map to exactly one catalog entry. Missing, malformed, conflicting,
 ambiguous-alias, or different-model metadata keeps the conservative path.
 
+Local runtime lifecycle remains runtime-owned. Ash connects to and verifies
+Ollama, LM Studio/llmster, and vLLM rather than installing or supervising a
+second copy of their daemon/model managers. Setup therefore points users to
+the runtime's own lifecycle commands (`ollama serve` / `ollama pull`, `lms
+server start` / `lms load`, and `vllm serve`) while Ash owns endpoint safety,
+catalog/capability negotiation, streamed inference, cancellation, provider
+cleanup, and agent-loop semantics.
+
 For routes with an authoritative model catalog, connectivity diagnostics must
 receive a successful catalog containing the selected model. A reachable catalog
 endpoint with an empty catalog or a different model is reported as not ready.

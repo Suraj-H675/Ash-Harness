@@ -12,7 +12,12 @@ from typing import Any, AsyncGenerator
 import openai  # type: ignore[import-not-found]
 
 from ash.context.tokens import AnthropicTokenCounter
-from ash.providers.base import ProviderABC, StreamChunk, TokenCounterLike
+from ash.providers.base import (
+    ProviderABC,
+    StreamChunk,
+    TokenCounterLike,
+    managed_async_stream,
+)
 from ash.providers.capabilities import ProviderCapabilities, groq_capabilities
 from ash.providers.messages import CanonicalToolCall, MessageInput
 from ash.providers.openai import (
@@ -143,99 +148,100 @@ class GroqProvider(ProviderABC):
         stream_bytes = 0
         reasoning_parts: list[str] = []
 
-        async for chunk in stream:
-            choices = getattr(chunk, "choices", None) or []
-            usage = getattr(chunk, "usage", None)
-            if not choices:
-                if usage is not None:
-                    yield StreamChunk(
-                        is_done=True,
-                        model=self._model_name,
-                        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-                        completion_tokens=(
-                            getattr(usage, "completion_tokens", 0) or 0
-                        ),
-                        cache_read_tokens=openai_compatible_cache_read_tokens(usage),
-                        usage_source="provider",
+        async with managed_async_stream(stream, label='Groq') as managed_stream:
+            async for chunk in managed_stream:
+                    choices = getattr(chunk, "choices", None) or []
+                    usage = getattr(chunk, "usage", None)
+                    if not choices:
+                        if usage is not None:
+                            yield StreamChunk(
+                                is_done=True,
+                                model=self._model_name,
+                                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                                completion_tokens=(
+                                    getattr(usage, "completion_tokens", 0) or 0
+                                ),
+                                cache_read_tokens=openai_compatible_cache_read_tokens(usage),
+                                usage_source="provider",
+                            )
+                        continue
+
+                    choice = choices[0]
+                    delta = choice.delta
+                    content = delta.content or ""
+                    stream_bytes = account_openai_compatible_stream_bytes(
+                        stream_bytes, content, provider="Groq"
                     )
-                continue
-
-            choice = choices[0]
-            delta = choice.delta
-            content = delta.content or ""
-            stream_bytes = account_openai_compatible_stream_bytes(
-                stream_bytes, content, provider="Groq"
-            )
-            reasoning_delta = openai_compatible_reasoning_delta(
-                delta, provider="Groq"
-            )
-            if reasoning_delta:
-                stream_bytes = account_openai_compatible_stream_bytes(
-                    stream_bytes, reasoning_delta, provider="Groq"
-                )
-                reasoning_parts.append(reasoning_delta)
-            is_done = choice.finish_reason is not None
-            prompt_tokens = 0
-            completion_tokens = 0
-            cache_read_tokens = 0
-            stop_reason = None
-
-            if hasattr(delta, "tool_calls") and delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in partials:
-                        partials[idx] = {
-                            "id": tc.id or f"call_{idx}",
-                            "name": tc.function.name or "",
-                            "arguments": "",
-                        }
+                    reasoning_delta = openai_compatible_reasoning_delta(
+                        delta, provider="Groq"
+                    )
+                    if reasoning_delta:
                         stream_bytes = account_openai_compatible_stream_bytes(
-                            stream_bytes, partials[idx]["id"], provider="Groq"
+                            stream_bytes, reasoning_delta, provider="Groq"
                         )
-                        stream_bytes = account_openai_compatible_stream_bytes(
-                            stream_bytes, partials[idx]["name"], provider="Groq"
-                        )
-                    if tc.function.arguments:
-                        stream_bytes = account_openai_compatible_stream_bytes(
-                            stream_bytes,
-                            tc.function.arguments,
-                            provider="Groq",
-                        )
-                        partials[idx]["arguments"] += tc.function.arguments
+                        reasoning_parts.append(reasoning_delta)
+                    is_done = choice.finish_reason is not None
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    cache_read_tokens = 0
+                    stop_reason = None
 
-            if is_done:
-                if usage is not None:
-                    prompt_tokens = usage.prompt_tokens or 0
-                    completion_tokens = usage.completion_tokens or 0
-                    cache_read_tokens = openai_compatible_cache_read_tokens(usage)
-                stop_reason = choice.finish_reason
-                for partial in partials.values():
-                    completed.append(CanonicalToolCall.model_validate(partial))
-                partials.clear()
+                    if hasattr(delta, "tool_calls") and delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in partials:
+                                partials[idx] = {
+                                    "id": tc.id or f"call_{idx}",
+                                    "name": tc.function.name or "",
+                                    "arguments": "",
+                                }
+                                stream_bytes = account_openai_compatible_stream_bytes(
+                                    stream_bytes, partials[idx]["id"], provider="Groq"
+                                )
+                                stream_bytes = account_openai_compatible_stream_bytes(
+                                    stream_bytes, partials[idx]["name"], provider="Groq"
+                                )
+                            if tc.function.arguments:
+                                stream_bytes = account_openai_compatible_stream_bytes(
+                                    stream_bytes,
+                                    tc.function.arguments,
+                                    provider="Groq",
+                                )
+                                partials[idx]["arguments"] += tc.function.arguments
 
-            yield StreamChunk(
-                content=content,
-                is_done=is_done,
-                model=self._model_name,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                cache_read_tokens=cache_read_tokens,
-                usage_source=(
-                    "provider"
-                    if is_done and usage is not None
-                    else "unavailable"
-                ),
-                stop_reason=stop_reason,
-                native_tool_calls=list(completed) if completed else None,
-                reasoning=(
-                    [{"type": "thinking", "thinking": "".join(reasoning_parts)}]
-                    if is_done and reasoning_parts
-                    else None
-                ),
-            )
-            completed.clear()
-            if is_done:
-                reasoning_parts.clear()
+                    if is_done:
+                        if usage is not None:
+                            prompt_tokens = usage.prompt_tokens or 0
+                            completion_tokens = usage.completion_tokens or 0
+                            cache_read_tokens = openai_compatible_cache_read_tokens(usage)
+                        stop_reason = choice.finish_reason
+                        for partial in partials.values():
+                            completed.append(CanonicalToolCall.model_validate(partial))
+                        partials.clear()
+
+                    yield StreamChunk(
+                        content=content,
+                        is_done=is_done,
+                        model=self._model_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                        usage_source=(
+                            "provider"
+                            if is_done and usage is not None
+                            else "unavailable"
+                        ),
+                        stop_reason=stop_reason,
+                        native_tool_calls=list(completed) if completed else None,
+                        reasoning=(
+                            [{"type": "thinking", "thinking": "".join(reasoning_parts)}]
+                            if is_done and reasoning_parts
+                            else None
+                        ),
+                    )
+                    completed.clear()
+                    if is_done:
+                        reasoning_parts.clear()
 
     async def aclose(self) -> None:
         client = self._client

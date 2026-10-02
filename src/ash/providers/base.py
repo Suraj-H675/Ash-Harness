@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from enum import StrEnum
+import inspect
 import json
 from typing import Any, AsyncGenerator, Literal, Protocol, runtime_checkable
 
@@ -19,6 +21,57 @@ MAX_PROVIDER_NATIVE_TOOL_CALLS_PER_CHUNK = 64
 MAX_PROVIDER_REASONING_BLOCKS_PER_CHUNK = 4096
 MAX_PROVIDER_CHUNK_TEXT_BYTES = 16 * 1024 * 1024
 MAX_PROVIDER_CHUNK_STRUCTURED_BYTES = 16 * 1024 * 1024
+
+
+async def close_async_stream(
+    stream: Any,
+    *,
+    label: str,
+    primary_error: BaseException | None = None,
+) -> None:
+    """Close an async provider/SDK stream without replacing a primary failure."""
+
+    close = getattr(stream, "aclose", None)
+    if not callable(close):
+        close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except BaseException as cleanup_error:
+        if primary_error is not None:
+            primary_error.add_note(
+                f"{label} stream cleanup also failed "
+                f"({type(cleanup_error).__name__})"
+            )
+            return
+        raise RuntimeError(
+            f"{label} stream cleanup failed ({type(cleanup_error).__name__})"
+        ) from cleanup_error
+
+
+@asynccontextmanager
+async def managed_async_stream(
+    stream: Any,
+    *,
+    label: str,
+) -> AsyncIterator[Any]:
+    """Keep one SDK stream deterministically closed on EOF, error, or cancellation."""
+
+    primary_error: BaseException | None = None
+    try:
+        yield stream
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        await close_async_stream(
+            stream,
+            label=label,
+            primary_error=primary_error,
+        )
 
 
 class StreamChunk(BaseModel):
