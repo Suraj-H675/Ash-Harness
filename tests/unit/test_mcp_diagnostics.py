@@ -55,6 +55,15 @@ def _install_fake_repl_frontend(
         def __init__(self, *args, **kwargs) -> None:
             pass
 
+        def __call__(self) -> str:
+            return ""
+
+        def header(self) -> str:
+            return ""
+
+        def footer(self) -> str:
+            return ""
+
     class FakeNotifier:
         def __init__(self, *args, **kwargs) -> None:
             pass

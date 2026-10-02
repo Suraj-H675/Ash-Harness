@@ -92,7 +92,10 @@ asyncio.run(main())
                 capture_output=True,
                 text=True,
             ).stdout
-            if pane_size == "40x10" and "smoke>" in resized_capture:
+            prompt_visible = any(
+                line.strip() == "smoke" for line in resized_capture.splitlines()
+            )
+            if pane_size == "40x10" and prompt_visible:
                 resized = True
                 break
             time.sleep(0.05)

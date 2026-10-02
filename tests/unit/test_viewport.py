@@ -161,6 +161,9 @@ def test_viewport_chrome_separates_identity_runtime_and_composer(
     assert _plain(viewport._composer_label()) == " ASK ASH "
     assert "sandbox docker" in _plain(viewport._status_text())
 
+    viewport._prompt = "smoke> "
+    assert _plain(viewport._composer_label()) == " smoke "
+
     viewport._prompt = "steer> "
     assert _plain(viewport._composer_label()) == " STEER "
     viewport.close()
