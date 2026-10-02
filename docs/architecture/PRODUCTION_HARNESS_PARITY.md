@@ -163,12 +163,15 @@ catalog-expansion exercise:
    could not be represented cleanly by generic bearer endpoints; first-class
    implementations now close that gap without turning provider count into the
    target.
-2. **P1B — Authentication and credential resilience — OPEN.** Preserve the
+2. **P1B — Authentication and credential resilience — CLOSED LOCALLY.** Preserve the
    verified ChatGPT-plan multi-account path and cross-provider model fallback,
    then close any material same-provider credential/profile rotation,
    subscription/OAuth, expiry, quota, or account-selection gap. Do not borrow
    another product's private credentials or unsupported OAuth flow merely to
-   increase auth-method count.
+   increase auth-method count. Ash now has first-class Azure Entra identity,
+   ChatGPT-plan multi-account auth, ordered same-provider API-key profiles, and
+   bounded user-owned dynamic credential helpers with forced auth refresh and
+   static-profile fallback.
 3. **P1C — Model discovery and capability semantics — OPEN.** Verify that
    model catalogs, aliases, context/output limits, vision, reasoning, native
    tools, usage, prompt caching, streaming terminal semantics, and model
@@ -250,9 +253,9 @@ Mypy, and `git diff --check` are green.
 P1 remains open. Explicitly remaining: provider-owned capability truth for
 fast-changing hosted models rather than stale name heuristics, correct
 representation of unknown model pricing instead of implying zero cost, the P1A
-enterprise-route decision, P1B same-provider credential/account resilience,
-supported local-runtime lifecycle and real Ollama/LM Studio/vLLM conformance,
-and adapter-level cancellation/stream-cleanup verification.
+enterprise-route decision, supported local-runtime lifecycle and real
+Ollama/LM Studio/vLLM conformance, and adapter-level
+cancellation/stream-cleanup verification.
 
 ### P1 progress — pricing provenance slice 3
 
@@ -283,9 +286,9 @@ and **130 automation tests**. Ruff, targeted Mypy, and `git diff --check` are
 green.
 
 P1 remains open. Explicitly remaining: provider-owned capability truth for
-fast-changing hosted models, P1B same-provider credential/account resilience,
-supported local-runtime lifecycle and real Ollama/LM Studio/vLLM conformance,
-and adapter-level cancellation/stream-cleanup verification.
+fast-changing hosted models, supported local-runtime lifecycle and real
+Ollama/LM Studio/vLLM conformance, and adapter-level
+cancellation/stream-cleanup verification.
 
 ### P1 progress — DeepSeek current-agent compatibility slice 4
 
@@ -330,9 +333,8 @@ Mypy, and `git diff --check` are green.
 
 P1 remains open. Explicitly remaining: provider-owned capability truth for
 other fast-changing hosted routes such as Groq, the P1A enterprise-route
-decision, P1B same-provider credential/account resilience, supported
-local-runtime lifecycle and real Ollama/LM Studio/vLLM conformance, and
-adapter-level cancellation/stream-cleanup verification.
+decision, supported local-runtime lifecycle and real Ollama/LM Studio/vLLM
+conformance, and adapter-level cancellation/stream-cleanup verification.
 
 ### P1 progress — Groq current-model truth slice 5
 
@@ -377,9 +379,8 @@ including:
 The full affected provider/registry/readiness/CLI/loop gate passes **389
 tests**. Ruff, targeted Mypy, and `git diff --check` are green.
 
-P1 remains open. Explicitly remaining: P1B same-provider credential/account
-resilience, supported local-runtime lifecycle
-and real Ollama/LM Studio/vLLM conformance, and adapter-level
+P1 remains open. Explicitly remaining: supported local-runtime lifecycle and
+real Ollama/LM Studio/vLLM conformance, and adapter-level
 cancellation/stream-cleanup verification.
 
 ### P1 progress — enterprise cloud routes slice 6
@@ -476,12 +477,12 @@ verification are green. The built wheel publishes the azure extra with
 azure-core[aio], azure-identity, and the compatible OpenAI range while keeping
 those dependencies out of the base install.
 
-P1B remains open here for the dynamic external-credential-helper portion of the
-gate. The following slice implements ordered user-owned API-key references,
-stickiness, bounded cooldowns, Retry-After-aware health, and classified
-pre-output rotation before cross-model failover. Existing ChatGPT multi-account
-auth remains intact and unsupported private subscription credentials will not
-be borrowed.
+At this checkpoint P1B still had the dynamic external-credential-helper portion
+open. The following slices add ordered user-owned API-key references,
+stickiness, bounded cooldowns, Retry-After-aware health, classified pre-output
+rotation, and finally the bounded helper path. Existing ChatGPT multi-account
+auth remains intact and unsupported private subscription credentials are not
+borrowed.
 
 Evidence was rechecked against Microsoft first-party Azure v1 documentation on
 2026-10-02:
@@ -536,19 +537,75 @@ Ruff and targeted Mypy. No
 dependency or config-schema migration is required for this additive user-owned
 field.
 
-P1B remains open for one deliberately separate capability: a bounded external
-credential helper for short-lived/vault/SSO-generated API keys. Current
-comparator evidence still shows this is materially useful: OpenClaw resolves
-named auth/secret references and rotates profiles before model fallback, while
-Claude Code supports apiKeyHelper for externally generated credentials. Ash
-will not fake this with arbitrary shell strings inside provider config; the
-helper needs an explicit execution, timeout, output, environment, caching and
-secret-redaction boundary before P1B can close.
+At this checkpoint P1B still had one deliberately separate capability open: a
+bounded external credential helper for short-lived/vault/SSO-generated API
+keys. Current comparator evidence showed this was materially useful: OpenClaw
+resolves named auth/secret references and rotates profiles before model
+fallback, while Claude Code supports apiKeyHelper for externally generated
+credentials. The following slice closes that gap without accepting arbitrary
+shell command strings.
 
 Current comparator references rechecked on 2026-10-02:
 https://docs.openclaw.ai/models
 https://docs.openclaw.ai/gateway/config-secrets-env
 https://code.claude.com/docs/en/settings
+
+### P1 progress — dynamic credential helper slice 9
+
+P1B is now closed locally. API-key routes can configure one user-owned dynamic
+credential helper ahead of ordered static env profiles through
+`provider_api_key_helpers`. The helper definition is excluded from
+project-controlled config, bounded and validated, and deliberately stores no
+credential value.
+
+The execution boundary is narrower than a generic shell hook:
+
+- helper commands are argv lists, never shell strings;
+- the executable must be a bare host command resolved outside the active
+  workspace or an explicit absolute executable outside the workspace;
+- execution cwd is user-owned Ash state, not repository content;
+- child environment starts from Ash's scrubbed baseline and adds only the
+  helper's explicit env allowlist;
+- helper authentication belongs in that env allowlist, not argv, because
+  process arguments may be visible to the host OS;
+- execution has bounded timeout/output and managed descendant cleanup;
+- stderr/helper output is never copied into failure messages;
+- stdout must be exactly one bounded non-whitespace UTF-8 credential line.
+
+Helper credentials are cached only in memory for a bounded TTL. Registry
+construction is lazy and never executes the helper. Normal capability refresh
+reuses a healthy credential; TTL expiry refreshes it naturally. A pre-output
+401/403 forces one helper refresh, after which a second auth failure advances
+to ordered static env backups inside the same model request attempt. Helper
+execution failures use the explicit `credential_source` classification and can
+also advance to static backups. Once text, tool output, reasoning, reasoning
+blocks or provider replay state has been retained, helper refresh/rotation is
+forbidden by the same shared commit predicate used by request retry and model
+failover.
+
+Provider construction remains extension-safe: helper-backed and static
+credential entries use the same Ash-owned credential factory and capability
+resolver, while replacing or unregistering a built-in provider factory revokes
+the private pool constructor rather than bypassing the extension. Isolated
+workers forward only the helper env allowlist and explicit static pool
+variables, not ambient default provider keys or unrelated cloud identity
+material.
+
+Secret lifetime and diagnostics are bounded. Successfully retired helper
+provider objects are released after close, wrapper shutdown clears the helper
+cache, `ash config explain` masks helper definitions, and runtime/OpenTelemetry
+surfaces expose only secret-free profile IDs such as `helper:openai`, pool size
+and failure category.
+
+The complete affected provider/runtime/config/setup/CLI/observability/subagent/
+automation gate passes **1,078 tests**. Focused helper, credential-pool,
+security and telemetry gates are green with Ruff and targeted Mypy.
+
+P1 remains open after P1B closure. The explicit remaining work is P1C/P1D/P1E:
+provider-owned model/capability semantics where still unresolved, supported
+local-runtime lifecycle plus real Ollama/LM Studio/vLLM conformance, and
+adapter-level cancellation/stream-cleanup plus the minimum live service/runtime
+evidence required to support final claims.
 
 ### M4 product decisions
 

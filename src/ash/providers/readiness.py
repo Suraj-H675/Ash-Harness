@@ -311,6 +311,7 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
     keys: set[str] = set()
     custom_providers = getattr(config, "custom_providers", {})
     provider_api_key_envs = getattr(config, "provider_api_key_envs", {})
+    provider_api_key_helpers = getattr(config, "provider_api_key_helpers", {})
     for model in models:
         provider, _ = parse_model_string(model)
         configured_pool_envs = (
@@ -322,6 +323,22 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
             keys.update(str(item) for item in configured_pool_envs)
         else:
             configured_pool_envs = ()
+        configured_helper = (
+            provider_api_key_helpers.get(provider)
+            if isinstance(provider_api_key_helpers, dict)
+            else None
+        )
+        helper_envs = (
+            configured_helper.get("env", ())
+            if isinstance(configured_helper, dict)
+            else ()
+        )
+        if isinstance(helper_envs, (list, tuple)):
+            keys.update(str(item) for item in helper_envs)
+        explicit_api_key_sources = bool(configured_pool_envs) or isinstance(
+            configured_helper,
+            dict,
+        )
         if provider == "vertex":
             keys.update(
                 {
@@ -359,7 +376,7 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
                 getattr(config, "azure_auth_mode", "entra") or "entra"
             ).strip().casefold()
             if azure_auth_mode == "api_key":
-                if not configured_pool_envs:
+                if not explicit_api_key_sources:
                     keys.add("AZURE_OPENAI_API_KEY")
             else:
                 keys.update(
@@ -388,7 +405,7 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
         if builtin is not None:
             keys.add(builtin[1])
         key_envs = _BUILTIN_KEY_ENVS.get(provider, ())
-        if provider != "azure" and not configured_pool_envs:
+        if provider != "azure" and not explicit_api_key_sources:
             keys.update(key_envs)
         custom = (
             custom_providers.get(provider)
@@ -397,7 +414,7 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
         )
         if isinstance(custom, dict):
             declared_key_env = str(custom.get("key_env") or "").strip()
-            if declared_key_env and not configured_pool_envs:
+            if declared_key_env and not explicit_api_key_sources:
                 keys.add(declared_key_env)
     return {key: os.environ[key] for key in sorted(keys) if key in os.environ}
 

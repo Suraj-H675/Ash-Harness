@@ -24,6 +24,7 @@ MAX_PROVIDER_CIRCUIT_STATES = 256
 class ProviderFailureCategory(str, Enum):
     AUTH = "auth"
     BILLING = "billing"
+    CREDENTIAL_SOURCE = "credential_source"
     RATE_LIMIT = "rate_limit"
     TRANSIENT = "transient"
     REQUEST = "request"
@@ -171,7 +172,20 @@ def classify_provider_failure(error: BaseException) -> ProviderFailure:
     )
     if explicit_retriable is not None:
         retriable = explicit_retriable
-    if status_code in {401, 403}:
+    explicit_category = next(
+        (
+            value
+            for item in chain
+            if isinstance(
+                (value := getattr(item, "provider_failure_category", None)),
+                ProviderFailureCategory,
+            )
+        ),
+        None,
+    )
+    if explicit_category is not None:
+        category = explicit_category
+    elif status_code in {401, 403}:
         category = ProviderFailureCategory.AUTH
     elif status_code == 402 or (
         status_code == 429

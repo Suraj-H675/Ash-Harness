@@ -1554,6 +1554,25 @@ def test_explain_config_shows_credential_env_references_not_secret_values() -> N
     }
 
 
+def test_explain_config_masks_credential_helper_definition() -> None:
+    from ash.commands import config as cli_config
+    from ash.config import AshConfig
+
+    config = AshConfig(
+        provider_api_key_helpers={
+            "openai": {
+                "command": ["op", "read", "op://private-vault/openai/key"],
+                "env": ["OP_SERVICE_ACCOUNT_TOKEN"],
+            }
+        }
+    )
+    entries = {entry.field: entry for entry in cli_config.explain_config(config)}
+    rendered = repr(entries["provider_api_key_helpers"].value)
+
+    assert "private-vault" not in rendered
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in rendered
+
+
 def test_render_config_explain_json_is_machine_readable() -> None:
     from ash.commands.config import ConfigExplanation, render_config_explain
 

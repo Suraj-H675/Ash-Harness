@@ -149,6 +149,32 @@ def test_provider_runtime_environment_uses_only_explicit_pool_keys(
     }
 
 
+def test_provider_runtime_environment_helper_suppresses_default_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "stale-default")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "helper-auth")
+    monkeypatch.setenv("OPENAI_BACKUP", "backup-secret")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross")
+    config = SimpleNamespace(
+        model="openai/gpt-test",
+        fallback_models=[],
+        custom_providers={},
+        provider_api_key_envs={"openai": ["OPENAI_BACKUP"]},
+        provider_api_key_helpers={
+            "openai": {
+                "command": ["op", "read", "secret"],
+                "env": ["OP_SERVICE_ACCOUNT_TOKEN"],
+            }
+        },
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "OPENAI_BACKUP": "backup-secret",
+        "OP_SERVICE_ACCOUNT_TOKEN": "helper-auth",
+    }
+
+
 def test_custom_pool_does_not_forward_declared_default_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -290,6 +316,36 @@ def test_provider_runtime_environment_azure_pool_excludes_stale_default_and_entr
         "AZURE_BACKUP": "backup-key",
         "AZURE_OPENAI_BASE_URL": "https://resource.openai.azure.com/openai/v1",
         "AZURE_PRIMARY": "primary-key",
+    }
+
+
+def test_provider_runtime_environment_azure_helper_excludes_default_and_entra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "AZURE_OPENAI_BASE_URL",
+        "https://resource.openai.azure.com/openai/v1",
+    )
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "stale-default")
+    monkeypatch.setenv("VAULT_TOKEN", "helper-auth")
+    monkeypatch.setenv("AZURE_CLIENT_ID", "must-not-cross")
+    monkeypatch.setenv("AZURE_CLIENT_SECRET", "must-not-cross")
+    config = SimpleNamespace(
+        model="azure/deployment-a",
+        fallback_models=[],
+        custom_providers={},
+        azure_auth_mode="api_key",
+        provider_api_key_helpers={
+            "azure": {
+                "command": ["vault", "read", "secret/azure"],
+                "env": ["VAULT_TOKEN"],
+            }
+        },
+    )
+
+    assert readiness.provider_runtime_environment(config) == {
+        "AZURE_OPENAI_BASE_URL": "https://resource.openai.azure.com/openai/v1",
+        "VAULT_TOKEN": "helper-auth",
     }
 
 

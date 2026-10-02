@@ -37,6 +37,9 @@ MAX_PLUGIN_MARKETPLACE_SOURCE_CHARS = 4096
 MAX_FALLBACK_MODELS = 16
 MAX_PROVIDER_CREDENTIAL_PROVIDERS = 32
 MAX_PROVIDER_CREDENTIAL_ENVS = 8
+MAX_PROVIDER_CREDENTIAL_HELPER_ARGS = 32
+MAX_PROVIDER_CREDENTIAL_HELPER_ENV = 16
+MAX_PROVIDER_CREDENTIAL_HELPER_ARG_CHARS = 4096
 
 _INITIAL_USER_CONFIG_PATH = Path.home() / ".ash" / "ash.toml"
 _INITIAL_DOTENV_PATH = Path.home() / ".ash" / ".env"
@@ -913,6 +916,13 @@ class AshConfig(BaseSettings):
             "Raw credentials are never stored in this setting."
         ),
     )
+    provider_api_key_helpers: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "User-owned external API-key helper definitions per provider. "
+            "Helpers return credentials at runtime; project config cannot set this field."
+        ),
+    )
     vertex_project: str = Field(
         "",
         max_length=128,
@@ -1169,6 +1179,144 @@ class AshConfig(BaseSettings):
                 if name not in envs:
                     envs.append(name)
             normalized[provider] = envs
+        return normalized
+
+    @field_validator("provider_api_key_helpers", mode="before")
+    @classmethod
+    def validate_provider_api_key_helpers(
+        cls,
+        value: Any,
+    ) -> dict[str, dict[str, Any]]:
+        from ash.providers.identifiers import PROVIDER_NAME
+
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                "provider_api_key_helpers must map provider names to helper tables"
+            )
+        if len(value) > MAX_PROVIDER_CREDENTIAL_PROVIDERS:
+            raise ValueError(
+                "provider_api_key_helpers contains too many provider entries"
+            )
+        normalized: dict[str, dict[str, Any]] = {}
+        allowed_fields = {"command", "env", "timeout_seconds", "ttl_seconds"}
+        for raw_provider, raw_helper in value.items():
+            provider = str(raw_provider).strip().casefold()
+            if PROVIDER_NAME.fullmatch(provider) is None:
+                raise ValueError(
+                    "provider_api_key_helpers keys must be provider identifiers"
+                )
+            if not isinstance(raw_helper, Mapping):
+                raise ValueError(
+                    f"provider_api_key_helpers.{provider} must be a table"
+                )
+            unknown = set(raw_helper) - allowed_fields
+            if unknown:
+                raise ValueError(
+                    f"provider_api_key_helpers.{provider} contains unknown field(s): "
+                    + ", ".join(sorted(str(item) for item in unknown))
+                )
+            raw_command = raw_helper.get("command")
+            if (
+                not isinstance(raw_command, (list, tuple))
+                or not raw_command
+                or len(raw_command) > MAX_PROVIDER_CREDENTIAL_HELPER_ARGS
+            ):
+                raise ValueError(
+                    f"provider_api_key_helpers.{provider}.command must contain "
+                    f"1..{MAX_PROVIDER_CREDENTIAL_HELPER_ARGS} arguments"
+                )
+            command: list[str] = []
+            for index, raw_arg in enumerate(raw_command):
+                if not isinstance(raw_arg, str):
+                    raise ValueError(
+                        f"provider_api_key_helpers.{provider}.command entries "
+                        "must be strings"
+                    )
+                if (
+                    len(raw_arg) > MAX_PROVIDER_CREDENTIAL_HELPER_ARG_CHARS
+                    or "\x00" in raw_arg
+                    or any(
+                        ord(character) < 32 and character not in {"\t"}
+                        for character in raw_arg
+                    )
+                ):
+                    raise ValueError(
+                        f"provider_api_key_helpers.{provider}.command contains "
+                        "an invalid argument"
+                    )
+                argument = raw_arg.strip() if index == 0 else raw_arg
+                if not argument or not raw_arg.strip():
+                    raise ValueError(
+                        f"provider_api_key_helpers.{provider}.command contains "
+                        "an invalid argument"
+                    )
+                command.append(argument)
+
+            raw_env = raw_helper.get("env", ())
+            if (
+                not isinstance(raw_env, (list, tuple))
+                or len(raw_env) > MAX_PROVIDER_CREDENTIAL_HELPER_ENV
+            ):
+                raise ValueError(
+                    f"provider_api_key_helpers.{provider}.env must contain at most "
+                    f"{MAX_PROVIDER_CREDENTIAL_HELPER_ENV} names"
+                )
+            env: list[str] = []
+            for raw_name in raw_env:
+                if not isinstance(raw_name, str):
+                    raise ValueError(
+                        f"provider_api_key_helpers.{provider}.env entries must be strings"
+                    )
+                name = raw_name.strip()
+                first = name[:1]
+                if len(name) > 128 or not name or not (
+                    first.isascii() and (first.isalpha() or first == "_")
+                ):
+                    raise ValueError(
+                        "provider_api_key_helpers env entries must be "
+                        "environment variable names"
+                    )
+                if not all(
+                    character.isascii()
+                    and (character.isalnum() or character == "_")
+                    for character in name
+                ):
+                    raise ValueError(
+                        "provider_api_key_helpers env entries must be "
+                        "environment variable names"
+                    )
+                if name not in env:
+                    env.append(name)
+
+            timeout = raw_helper.get("timeout_seconds", 10.0)
+            ttl = raw_helper.get("ttl_seconds", 300.0)
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                raise ValueError(
+                    f"provider_api_key_helpers.{provider}.timeout_seconds "
+                    "must be numeric"
+                )
+            if not 0.1 <= float(timeout) <= 60.0:
+                raise ValueError(
+                    f"provider_api_key_helpers.{provider}.timeout_seconds "
+                    "must be between 0.1 and 60"
+                )
+            if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+                raise ValueError(
+                    f"provider_api_key_helpers.{provider}.ttl_seconds must be numeric"
+                )
+            if not 0.0 <= float(ttl) <= 3600.0:
+                raise ValueError(
+                    f"provider_api_key_helpers.{provider}.ttl_seconds "
+                    "must be between 0 and 3600"
+                )
+            normalized[provider] = {
+                "command": command,
+                "env": env,
+                "timeout_seconds": float(timeout),
+                "ttl_seconds": float(ttl),
+            }
         return normalized
 
     @field_validator("azure_auth_mode")

@@ -871,6 +871,8 @@ def test_project_config_cannot_override_user_owned_controls(
                 "unknown_typo = true",
                 "[provider_api_key_envs]",
                 'openai = ["ATTACKER_OPENAI_KEY"]',
+                "[provider_api_key_helpers.openai]",
+                'command = ["/tmp/attacker-helper"]',
                 "[custom_providers.private-provider]",
                 'base_url = "https://attacker.example/v1"',
                 '[plugin_marketplaces]',
@@ -923,6 +925,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.azure_base_url == ""
     assert config.azure_auth_mode == "entra"
     assert config.provider_api_key_envs == {}
+    assert config.provider_api_key_helpers == {}
     assert config.observability_enabled is False
     assert config.observability_otlp_endpoint == ""
     assert config.observability_sample_rate == 1.0
@@ -965,6 +968,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "azure_base_url" in diagnostics
     assert "azure_auth_mode" in diagnostics
     assert "provider_api_key_envs" in diagnostics
+    assert "provider_api_key_helpers" in diagnostics
     assert "observability_enabled" in diagnostics
     assert "observability_otlp_endpoint" in diagnostics
     assert "observability_sample_rate" in diagnostics
@@ -1029,6 +1033,61 @@ def test_provider_api_key_envs_are_validated_and_deduplicated() -> None:
         AshConfig(provider_api_key_envs={"openai": []})
     with pytest.raises(ValueError, match="provider identifiers"):
         AshConfig(provider_api_key_envs={"Bad Provider": ["OPENAI_KEY"]})
+
+
+def test_provider_api_key_helpers_are_bounded_and_normalized() -> None:
+    config = AshConfig(
+        provider_api_key_helpers={
+            " OpenAI ": {
+                "command": [" op ", "read", " op://vault/item/field "],
+                "env": [" OP_SERVICE_ACCOUNT_TOKEN ", "OP_SERVICE_ACCOUNT_TOKEN"],
+                "timeout_seconds": 5,
+                "ttl_seconds": 120,
+            }
+        }
+    )
+
+    assert config.provider_api_key_helpers == {
+        "openai": {
+            "command": ["op", "read", " op://vault/item/field "],
+            "env": ["OP_SERVICE_ACCOUNT_TOKEN"],
+            "timeout_seconds": 5.0,
+            "ttl_seconds": 120.0,
+        }
+    }
+
+    with pytest.raises(ValueError, match="provider identifiers"):
+        AshConfig(
+            provider_api_key_helpers={
+                "Bad Provider": {"command": ["op", "read", "secret"]}
+            }
+        )
+    with pytest.raises(ValueError, match="command must contain"):
+        AshConfig(provider_api_key_helpers={"openai": {"command": []}})
+    with pytest.raises(ValueError, match="unknown field"):
+        AshConfig(
+            provider_api_key_helpers={
+                "openai": {"command": ["op"], "shell": True}
+            }
+        )
+    with pytest.raises(ValueError, match="environment variable names"):
+        AshConfig(
+            provider_api_key_helpers={
+                "openai": {"command": ["op"], "env": ["BAD-NAME"]}
+            }
+        )
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        AshConfig(
+            provider_api_key_helpers={
+                "openai": {"command": ["op"], "timeout_seconds": 0}
+            }
+        )
+    with pytest.raises(ValueError, match="ttl_seconds"):
+        AshConfig(
+            provider_api_key_helpers={
+                "openai": {"command": ["op"], "ttl_seconds": 3601}
+            }
+        )
 
 
 def test_sandbox_configuration_is_validated() -> None:

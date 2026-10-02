@@ -7,6 +7,7 @@ import pytest
 
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
+from ash.providers.credential_helper import CredentialHelperProvider
 from ash.providers.credential_pool import CredentialPoolProvider
 from ash.providers.failover import FailoverProvider
 from ash.providers.registry import (
@@ -380,6 +381,57 @@ def test_openai_api_key_pool_uses_ordered_user_envs(
     ]
 
 
+def test_openai_credential_helper_precedes_static_env_backups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_PRIMARY", "primary-key")
+    monkeypatch.setenv("OPENAI_BACKUP", "backup-key")
+
+    provider = create_default_provider_registry().build(
+        AshConfig(
+            model="openai/gpt-test",
+            provider_api_key_helpers={
+                "openai": {
+                    "command": ["op", "read", "op://vault/openai/key"],
+                    "env": ["OP_SERVICE_ACCOUNT_TOKEN"],
+                }
+            },
+            provider_api_key_envs={
+                "openai": ["OPENAI_PRIMARY", "OPENAI_BACKUP"],
+            },
+        )
+    )
+
+    assert isinstance(provider, CredentialPoolProvider)
+    assert provider.profile_ids == (
+        "helper:openai",
+        "OPENAI_PRIMARY",
+        "OPENAI_BACKUP",
+    )
+    assert isinstance(provider.providers[0], CredentialHelperProvider)
+    assert [item._api_key for item in provider.providers[1:]] == [
+        "primary-key",
+        "backup-key",
+    ]
+
+
+def test_credential_helper_only_build_is_lazy() -> None:
+    provider = create_default_provider_registry().build(
+        AshConfig(
+            model="openai/gpt-test",
+            provider_api_key_helpers={
+                "openai": {
+                    "command": ["/definitely/not/executed/during/build"],
+                }
+            },
+        )
+    )
+
+    assert isinstance(provider, CredentialPoolProvider)
+    assert provider.profile_ids == ("helper:openai",)
+    assert isinstance(provider.providers[0], CredentialHelperProvider)
+
+
 def test_credential_pool_is_nested_inside_model_failover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -434,8 +486,28 @@ def test_credential_pool_rejects_non_api_key_auth_modes() -> None:
     with pytest.raises(ValueError, match="does not support API-key credential pools"):
         create_default_provider_registry().build(
             AshConfig(
+                model="openai/gpt-test",
+                openai_auth_mode="chatgpt",
+                provider_api_key_helpers={
+                    "openai": {"command": ["op", "read", "secret"]}
+                },
+            )
+        )
+
+    with pytest.raises(ValueError, match="does not support API-key credential pools"):
+        create_default_provider_registry().build(
+            AshConfig(
                 model="ollama/qwen-test",
                 provider_api_key_envs={"ollama": ["OLLAMA_KEY"]},
+            )
+        )
+    with pytest.raises(ValueError, match="does not support API-key credential pools"):
+        create_default_provider_registry().build(
+            AshConfig(
+                model="ollama/qwen-test",
+                provider_api_key_helpers={
+                    "ollama": {"command": ["op", "read", "secret"]}
+                },
             )
         )
 
@@ -459,6 +531,28 @@ def test_replacing_builtin_factory_revokes_ash_credential_pool(
             AshConfig(
                 model="openai/gpt-test",
                 provider_api_key_envs={"openai": ["OPENAI_PRIMARY"]},
+            )
+        )
+
+
+def test_replacing_builtin_factory_revokes_ash_credential_helper() -> None:
+    registry = create_default_provider_registry()
+    registry.register(
+        "openai",
+        lambda config, model: RegistryProvider(model),
+        replace=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="active provider factory.*does not support.*credential pools",
+    ):
+        registry.build(
+            AshConfig(
+                model="openai/gpt-test",
+                provider_api_key_helpers={
+                    "openai": {"command": ["op", "read", "secret"]}
+                },
             )
         )
 
@@ -489,6 +583,28 @@ def test_custom_bearer_provider_supports_api_key_pool(
         "primary-key",
         "backup-key",
     ]
+
+
+def test_custom_bearer_provider_supports_credential_helper() -> None:
+    provider = create_default_provider_registry().build(
+        AshConfig(
+            model="private/model-a",
+            custom_providers={
+                "private": {
+                    "base_url": "https://gateway.example/v1",
+                    "auth_mode": "bearer",
+                }
+            },
+            provider_api_key_helpers={
+                "private": {"command": ["vault", "read", "secret/private"]}
+            },
+        )
+    )
+
+    assert isinstance(provider, CredentialPoolProvider)
+    assert provider.provider_family == "private"
+    assert provider.profile_ids == ("helper:private",)
+    assert isinstance(provider.providers[0], CredentialHelperProvider)
 
 
 def test_openai_gpt6_models_are_reasoning_capable() -> None:

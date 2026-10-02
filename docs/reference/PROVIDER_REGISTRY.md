@@ -143,9 +143,51 @@ failure category; key values never cross those diagnostic boundaries.
 Credential changes can invalidate provider-side cache/account/routing affinity.
 Ash therefore does not promise identical prompt-cache hit rates, latency, or
 billing behavior after rotation even though the selected provider/model route
-is unchanged. External process-backed dynamic credential helpers remain a
-separate P1B capability rather than being approximated by storing command
-strings in this first pool implementation.
+is unchanged.
+
+### Dynamic credential helpers
+
+One user-owned helper can precede the static env profiles for an API-key route:
+
+    [provider_api_key_helpers.openai]
+    command = ["op", "read", "op://Engineering/OpenAI/api-key"]
+    env = ["OP_SERVICE_ACCOUNT_TOKEN"]
+    timeout_seconds = 10
+    ttl_seconds = 300
+
+The helper table is excluded from project-controlled configuration. `command`
+is a bounded argv list, not a shell string. Ash accepts only a bare executable
+resolved outside the active workspace or an explicit absolute executable path
+outside the workspace. The process runs from user-owned Ash state rather than
+the repository, under Ash's managed process-tree cleanup, with a scrubbed
+environment plus only the explicitly declared helper env names. Helper argv
+must not contain credentials; operating systems may expose process arguments,
+so vault/SSO authentication belongs in the env allowlist instead.
+
+Execution defaults to a 10-second timeout and a 300-second in-memory credential
+TTL; both are bounded by config validation. Combined helper output is bounded,
+stderr is never copied into errors, and stdout must contain exactly one
+non-whitespace UTF-8 credential line. The credential and its cache are never
+persisted. Closing the helper-backed provider clears the cached credential and
+successfully retired provider objects are released so old key strings are not
+retained for the wrapper lifetime.
+
+The helper is represented as the first secret-free profile
+`helper:PROVIDER`. Its credential is resolved lazily, so registry construction
+never executes external helper code. Expired TTL causes a normal refresh; an
+explicit model-capability refresh does not rotate a healthy credential. A
+pre-output 401/403 forces exactly one helper refresh, after which the normal
+credential pool can advance to ordered static env backups. Helper execution
+failures use the provider-neutral `credential_source` failure category and can
+also fall through to static backups without pretending the error was an HTTP
+authentication failure.
+
+Helper-backed children use the same provider factory and capability resolver as
+static pool entries. Replacing or unregistering an Ash built-in provider factory
+revokes Ash's private credential-pool constructor, so extensions are never
+silently bypassed. Isolated workers forward only helper allowlisted env names
+and explicit static pool variables; ambient default API keys and unrelated
+cloud identity material remain excluded.
 
 Wire compatibility does not imply model capability. Custom routes therefore
 fail closed for native tools, vision, and reasoning unless the user declares

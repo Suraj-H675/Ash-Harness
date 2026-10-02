@@ -157,12 +157,37 @@ hints. Request-shape errors and transient network/server failures do not change
 credentials; they remain owned by Ash's normal request-retry path. Cross-model
 fallback happens only after the same-provider credential route cannot proceed.
 
-Credential-pool state is session-local and secret-free: ash config explain can
-show the configured environment references, and observability records only the
-active reference name/count and failure category. Credential values are never
-written to TOML, SQLite, runtime events, or telemetry. Switching provider
-accounts may also reset provider-side prompt-cache or routing affinity, so a
-rotation can change latency or cost even when the model ID stays the same.
+Short-lived credentials from a user-owned vault/SSO helper can be placed ahead
+of those static env profiles:
+
+    [provider_api_key_helpers.openai]
+    command = ["op", "read", "op://Engineering/OpenAI/api-key"]
+    env = ["OP_SERVICE_ACCOUNT_TOKEN"]
+    timeout_seconds = 10
+    ttl_seconds = 300
+
+Helpers are argv lists, never shell command strings. Ash resolves a bare host
+executable outside the workspace or an explicit absolute executable path
+outside the workspace, runs it from user-owned Ash state rather than the
+repository, forwards only the declared helper env names plus a scrubbed
+baseline, bounds runtime/output, and accepts exactly one credential line on
+stdout. Do not put credentials directly in helper argv because process
+arguments may be visible to the OS; use the helper env allowlist for helper
+authentication instead. Helper stdout/stderr is never copied into errors.
+
+The helper result is cached only in memory for the configured TTL. A pre-output
+401/403 forces one helper refresh before Ash advances to static env backups.
+Helper execution failures, billing/quota failures, and rate limits can also
+advance within the same credential pool under the same no-replay-after-output
+boundary. Successful profiles remain sticky.
+
+Credential-pool state is session-local and secret-free: `ash config explain`
+shows configured static environment references while helper definitions remain
+masked, and observability records only the active profile name/count and
+failure category. Credential values are never written to TOML, SQLite, runtime
+events, or telemetry. Switching provider accounts may also reset provider-side
+prompt-cache or routing affinity, so a rotation can change latency or cost even
+when the model ID stays the same.
 
 OpenAI additionally supports optional **Sign in with ChatGPT** for eligible
 ChatGPT plans. Run `ash auth chatgpt login` to register/sign in, inspect saved

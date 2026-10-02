@@ -29,6 +29,7 @@ from ash.providers.retry import (
 
 AUTH_COOLDOWN_SECONDS = 60.0
 BILLING_COOLDOWN_SECONDS = 300.0
+CREDENTIAL_SOURCE_COOLDOWN_SECONDS = 10.0
 RATE_LIMIT_COOLDOWN_SECONDS = 60.0
 MAX_CREDENTIAL_COOLDOWN_SECONDS = 3600.0
 
@@ -36,6 +37,7 @@ _ROTATABLE_FAILURES = frozenset(
     {
         ProviderFailureCategory.AUTH,
         ProviderFailureCategory.BILLING,
+        ProviderFailureCategory.CREDENTIAL_SOURCE,
         ProviderFailureCategory.RATE_LIMIT,
     }
 )
@@ -287,6 +289,8 @@ class CredentialPoolProvider(ProviderABC):
 
 
 def _credential_cooldown_seconds(failure: ProviderFailure) -> float:
+    if failure.category is ProviderFailureCategory.CREDENTIAL_SOURCE:
+        return CREDENTIAL_SOURCE_COOLDOWN_SECONDS
     if failure.category is ProviderFailureCategory.AUTH:
         return AUTH_COOLDOWN_SECONDS
     if failure.category is ProviderFailureCategory.BILLING:

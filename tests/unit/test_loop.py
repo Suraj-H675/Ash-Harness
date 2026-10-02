@@ -7348,6 +7348,118 @@ async def test_credential_rotation_is_one_model_attempt_with_profile_telemetry(
 
 
 @pytest.mark.asyncio
+async def test_helper_refresh_then_static_backup_is_one_model_attempt(
+    tmp_path,
+) -> None:
+    from ash.providers.credential_helper import (
+        CredentialHelperProvider,
+        CredentialHelperSource,
+    )
+    from ash.providers.credential_pool import CredentialPoolProvider
+
+    class APIError(RuntimeError):
+        status_code = 401
+
+    class CredentialProvider(ProviderABC):
+        provider_family = "openai"
+        model_name = "gpt-test"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self, credential: str, *, fail: bool) -> None:
+            self.credential = credential
+            self.fail = fail
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            self.calls += 1
+            if self.fail:
+                raise APIError("invalid key")
+            yield StreamChunk(content="static-backup")
+            yield StreamChunk(is_done=True, stop_reason="stop")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    counter = tmp_path / "helper-counter"
+    helper = tmp_path / "credential-helper.sh"
+    helper.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        f"n=0; [ ! -f '{counter}' ] || n=$(cat '{counter}')\n"
+        "n=$((n + 1))\n"
+        f"printf '%s' \"$n\" > '{counter}'\n"
+        "printf 'helper-key-%s\\n' \"$n\"\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o700)
+    source = CredentialHelperSource(
+        [str(helper)],
+        workspace_root=workspace,
+        state_directory=tmp_path / "helper-state",
+        ttl_seconds=300,
+    )
+    prototype = CredentialProvider("prototype", fail=True)
+    helper_children: list[CredentialProvider] = []
+
+    def helper_factory(credential: str) -> ProviderABC:
+        child = CredentialProvider(credential, fail=True)
+        helper_children.append(child)
+        return child
+
+    helper_provider = CredentialHelperProvider(
+        prototype,
+        helper_factory,
+        source,
+    )
+    static_backup = CredentialProvider("static-key", fail=False)
+    provider = CredentialPoolProvider(
+        [helper_provider, static_backup],
+        ["helper:openai", "OPENAI_BACKUP"],
+    )
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "helper-static-events.db"),
+        provider,
+        SafetyGuard(project_root=workspace),
+        ui,
+        workspace,
+        config=AshConfig(
+            model="openai/gpt-test",
+            workspace_root=workspace,
+            db_directory=tmp_path / "db",
+            provider_max_attempts=3,
+            provider_retry_base_delay=0,
+        ),
+    )
+
+    outcome = await loop._stream_one_completion([])
+
+    assert outcome.text == "static-backup"
+    assert [item.credential for item in helper_children] == [
+        "helper-key-1",
+        "helper-key-2",
+    ]
+    assert static_backup.calls == 1
+    assert counter.read_text(encoding="utf-8") == "2"
+    started = next(
+        event for event in ui.events if event["type"] == "model.request.started"
+    )
+    completed = next(
+        event for event in ui.events if event["type"] == "model.request.completed"
+    )
+    assert started["attempt"] == 1
+    assert started["credential_profile"] == "helper:openai"
+    assert started["credential_pool_size"] == 2
+    assert completed["attempt"] == 1
+    assert completed["credential_profile"] == "OPENAI_BACKUP"
+    assert completed["credential_pool_size"] == 2
+    assert not any(event["type"] == "provider.retrying" for event in ui.events)
+
+
+@pytest.mark.asyncio
 async def test_provider_circuit_fails_fast_then_allows_probe(tmp_path):
     now = 10.0
 

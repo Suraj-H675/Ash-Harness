@@ -6,7 +6,7 @@ import hashlib
 import os
 import re
 from threading import RLock
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from ash.providers.base import ProviderABC
 from ash.providers.capabilities import (
@@ -124,7 +124,8 @@ class ProviderRegistry:
             credential_factory = self._credential_factories.get(provider_name)
             resolver = self._owned_capability_resolvers.get(provider_name)
         credential_envs = _configured_api_key_envs(config, provider_name)
-        if credential_envs:
+        credential_helper = _configured_api_key_helper(config, provider_name)
+        if credential_envs or credential_helper is not None:
             if not _pool_auth_mode_allowed(config, provider_name):
                 raise ValueError(
                     f"provider {provider_name!r} does not support API-key credential pools"
@@ -153,6 +154,7 @@ class ProviderRegistry:
                 provider_name,
                 model_name,
                 credential_envs,
+                credential_helper=credential_helper,
                 credential_factory=credential_factory,
                 resolver=resolver,
             )
@@ -184,6 +186,17 @@ def _configured_api_key_envs(
     return tuple(str(item) for item in envs)
 
 
+def _configured_api_key_helper(
+    config: "AshConfig",
+    provider_name: str,
+) -> dict[str, Any] | None:
+    raw = getattr(config, "provider_api_key_helpers", {})
+    if not isinstance(raw, dict):
+        return None
+    helper = raw.get(provider_name)
+    return dict(helper) if isinstance(helper, dict) else None
+
+
 def _pool_auth_mode_allowed(
     config: "AshConfig",
     provider_name: str,
@@ -211,9 +224,14 @@ def _build_credential_pool(
     model_name: str,
     credential_envs: tuple[str, ...],
     *,
+    credential_helper: dict[str, Any] | None,
     credential_factory: CredentialProviderFactory,
     resolver: CapabilityResolver | None,
 ) -> ProviderABC:
+    from ash.providers.credential_helper import (
+        CredentialHelperProvider,
+        CredentialHelperSource,
+    )
     from ash.providers.credential_pool import CredentialPoolProvider
 
     resolved_keys: list[tuple[str, str]] = []
@@ -227,7 +245,9 @@ def _build_credential_pool(
         resolved_keys.append((env_name, api_key))
 
     providers: list[ProviderABC] = []
-    for env_name, api_key in resolved_keys:
+    profile_ids: list[str] = []
+
+    def build_credential_provider(api_key: str) -> ProviderABC:
         provider = credential_factory(config, model_name, api_key)
         if resolver is not None:
             capabilities = resolver(model_name)
@@ -236,8 +256,31 @@ def _build_credential_pool(
                     "capability resolver must return ProviderCapabilities"
                 )
             provider._ash_declared_capabilities = capabilities
-        providers.append(provider)
-    return CredentialPoolProvider(providers, list(credential_envs))
+        return provider
+
+    if credential_helper is not None:
+        prototype = build_credential_provider("ash-credential-helper-placeholder")
+        source = CredentialHelperSource(
+            credential_helper["command"],
+            env_names=credential_helper["env"],
+            timeout_seconds=credential_helper["timeout_seconds"],
+            ttl_seconds=credential_helper["ttl_seconds"],
+            workspace_root=config.workspace_root,
+            state_directory=config.db_directory.parent,
+        )
+        providers.append(
+            CredentialHelperProvider(
+                prototype,
+                build_credential_provider,
+                source,
+            )
+        )
+        profile_ids.append(f"helper:{provider_name}")
+
+    for env_name, api_key in resolved_keys:
+        providers.append(build_credential_provider(api_key))
+        profile_ids.append(env_name)
+    return CredentialPoolProvider(providers, profile_ids)
 
 
 def prompt_cache_key(config: "AshConfig") -> str:
