@@ -86,15 +86,88 @@ def _anthropic(model: str) -> ProviderCapabilities:
     return ProviderCapabilities(native_tools=True, vision=True)
 
 
-def _openai(model: str) -> ProviderCapabilities:
-    name = model.casefold()
-    return ProviderCapabilities(
+_OPENAI_RESPONSES_MODELS = frozenset(
+    {
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-6-luna",
+    }
+)
+
+_OPENAI_STATIC_CAPABILITIES: dict[str, ProviderCapabilities] = {
+    **{
+        model: ProviderCapabilities(
+            native_tools=True,
+            vision=True,
+            reasoning=True,
+            context_window=1_050_000,
+            max_output_tokens=128_000,
+        )
+        for model in _OPENAI_RESPONSES_MODELS
+    },
+    "gpt-5.2": ProviderCapabilities(
         native_tools=True,
         vision=True,
-        reasoning=any(
-            token in name for token in ("gpt-5", "gpt-6", "o1", "o3", "o4")
-        ),
-    )
+        reasoning=True,
+        context_window=400_000,
+        max_output_tokens=128_000,
+    ),
+    "gpt-5.2-2025-12-11": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=400_000,
+        max_output_tokens=128_000,
+    ),
+    "gpt-5.2-codex": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=400_000,
+        max_output_tokens=128_000,
+    ),
+    "gpt-5-mini": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=400_000,
+        max_output_tokens=128_000,
+    ),
+    "gpt-5-mini-2025-08-07": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=400_000,
+        max_output_tokens=128_000,
+    ),
+    "gpt-4.1": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        context_window=1_047_576,
+        max_output_tokens=32_768,
+    ),
+    "gpt-4.1-2025-04-14": ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        context_window=1_047_576,
+        max_output_tokens=32_768,
+    ),
+}
+
+
+def openai_uses_responses_api(model: str) -> bool:
+    """Return whether Ash's first-party API-key route uses Responses."""
+
+    return model.casefold() in _OPENAI_RESPONSES_MODELS
+
+
+def _openai(model: str) -> ProviderCapabilities:
+    return _OPENAI_STATIC_CAPABILITIES.get(model.casefold(), ProviderCapabilities())
 
 
 def deepseek_capabilities(model: str) -> ProviderCapabilities:

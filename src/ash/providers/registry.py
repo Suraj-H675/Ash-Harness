@@ -14,6 +14,7 @@ from ash.providers.capabilities import (
     CapabilityResolver,
     ProviderCapabilities,
     get_capability_registry,
+    openai_uses_responses_api,
 )
 from ash.providers.identifiers import PROVIDER_NAME, parse_model_string
 from ash.provider_catalog import BUILTIN_PROVIDER_IDS, get_provider_descriptor
@@ -338,18 +339,36 @@ def _build_openai(
         )
         return provider
 
-    from ash.providers.openai import OpenAIProvider
     from ash.providers.readiness import resolve_provider_connection
 
     connection = resolve_provider_connection(
         config,
         api_key_override=api_key_override,
     )
+    if connection.uses_default_base_url and openai_uses_responses_api(model_name):
+        from ash.providers.openai_responses import OpenAIResponsesProvider
+
+        provider = OpenAIResponsesProvider(
+            model_name=model_name,
+            api_key=connection.api_key,
+        )
+        provider.configure_max_tokens(config.max_completion_tokens)
+        provider.configure_prompt_cache(
+            enabled=config.prompt_cache_enabled,
+            cache_key=prompt_cache_key(config),
+            retention=config.prompt_cache_retention,
+        )
+        return provider
+
+    from ash.providers.openai import OpenAIProvider
+
     provider = OpenAIProvider(
         model_name=model_name,
         api_key=connection.api_key,
         base_url=None if connection.uses_default_base_url else connection.base_url,
     )
+    if not connection.uses_default_base_url and openai_uses_responses_api(model_name):
+        provider._ash_declared_capabilities = ProviderCapabilities()
     provider.configure_max_tokens(config.max_completion_tokens)
     provider.configure_prompt_cache(
         enabled=config.prompt_cache_enabled and connection.uses_default_base_url,

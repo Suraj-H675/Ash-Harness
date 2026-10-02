@@ -607,14 +607,81 @@ def test_custom_bearer_provider_supports_credential_helper() -> None:
     assert isinstance(provider.providers[0], CredentialHelperProvider)
 
 
-def test_openai_gpt6_models_are_reasoning_capable() -> None:
-    from ash.providers.capabilities import infer_capabilities
+def test_openai_current_responses_models_have_exact_capabilities() -> None:
+    from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
 
     capabilities = infer_capabilities("openai", "gpt-6.1-sol")
 
-    assert capabilities.native_tools is True
-    assert capabilities.vision is True
-    assert capabilities.reasoning is True
+    assert capabilities == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=1_050_000,
+        max_output_tokens=128_000,
+    )
+    assert infer_capabilities("openai", "gpt-5.2") == ProviderCapabilities(
+        native_tools=True,
+        vision=True,
+        reasoning=True,
+        context_window=400_000,
+        max_output_tokens=128_000,
+    )
+    assert infer_capabilities("openai", "gpt-3.5-turbo") == ProviderCapabilities()
+    assert infer_capabilities("openai", "unverified-future-model") == ProviderCapabilities()
+
+
+def test_openai_current_models_use_responses_for_api_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.openai_responses import OpenAIResponsesProvider
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    provider = create_default_provider_registry().build(
+        AshConfig(model="openai/gpt-6.1-sol")
+    )
+
+    assert isinstance(provider, OpenAIResponsesProvider)
+    assert provider.capabilities.native_tools is True
+
+
+def test_openai_current_models_keep_responses_inside_credential_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.openai_responses import OpenAIResponsesProvider
+
+    monkeypatch.setenv("OPENAI_PRIMARY", "primary-key")
+    monkeypatch.setenv("OPENAI_BACKUP", "backup-key")
+
+    provider = create_default_provider_registry().build(
+        AshConfig(
+            model="openai/gpt-6.1-sol",
+            provider_api_key_envs={
+                "openai": ["OPENAI_PRIMARY", "OPENAI_BACKUP"],
+            },
+        )
+    )
+
+    assert isinstance(provider, CredentialPoolProvider)
+    assert all(isinstance(item, OpenAIResponsesProvider) for item in provider.providers)
+    assert provider.capabilities.native_tools is True
+
+
+def test_openai_overridden_endpoint_does_not_inherit_first_party_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.openai import OpenAIProvider
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://gateway.example.test/v1")
+
+    provider = create_default_provider_registry().build(
+        AshConfig(model="openai/gpt-6.1-sol")
+    )
+
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.capabilities == ProviderCapabilities()
 
 
 def test_openrouter_capabilities_are_not_assumed_from_openai_wire_protocol(

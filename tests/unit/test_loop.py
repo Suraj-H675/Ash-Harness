@@ -6260,6 +6260,27 @@ def test_groq_gpt_oss_default_pricing_includes_cached_input_discount() -> None:
     }
 
 
+def test_current_openai_default_pricing_includes_cache_read_and_write_rates() -> None:
+    assert DEFAULT_MODEL_PRICING_USD_PER_MILLION["openai/gpt-6-astra"] == {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.0,
+        "cache_write": 12.5,
+    }
+    assert DEFAULT_MODEL_PRICING_USD_PER_MILLION["openai/gpt-6.1-sol"] == {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.10,
+        "cache_write": 2.50,
+    }
+    assert DEFAULT_MODEL_PRICING_USD_PER_MILLION["openai/gpt-6-luna"] == {
+        "input": 0.10,
+        "output": 0.50,
+        "cache_read": 0.01,
+        "cache_write": 0.125,
+    }
+
+
 @pytest.mark.asyncio
 async def test_default_pricing_applies_without_user_config(tmp_path):
     """Known model IDs get real costs without manual pricing config."""

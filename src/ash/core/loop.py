@@ -1093,6 +1093,24 @@ DEFAULT_MODEL_PRICING_USD_PER_MILLION: dict[str, dict[str, float]] = {
         "cache_read": 0.10,
         "cache_write": 1.25,
     },
+    "openai/gpt-6-astra": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.0,
+        "cache_write": 12.5,
+    },
+    "openai/gpt-6.1-sol": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.10,
+        "cache_write": 2.50,
+    },
+    "openai/gpt-6-luna": {
+        "input": 0.10,
+        "output": 0.50,
+        "cache_read": 0.01,
+        "cache_write": 0.125,
+    },
     "openai/gpt-5.2": {
         "input": 1.75,
         "output": 14.0,

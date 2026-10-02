@@ -195,6 +195,24 @@ Work P1A-P1E in evidence-driven slices; several may advance together when one
 implementation legitimately spans them, but do not declare P1 closed until all
 five are resolved.
 
+### P1 finish flags
+
+These are the bounded stop conditions for the provider/model parity phase. Do
+not extend P1 with unrelated work once every flag is closed.
+
+- `P1A_PROVIDER_BREADTH = CLOSED`
+- `P1B_AUTH_RESILIENCE = CLOSED`
+- `P1C_MODEL_CAPABILITY_TRUTH = OPEN`
+- `P1D_LOCAL_RUNTIME_PARITY = OPEN`
+- `P1E_LIVE_CONFORMANCE = OPEN`
+- `P1_PROVIDER_MODEL_PARITY = OPEN` until P1A-P1E are all closed.
+
+The next unfinished checkpoint is P1C. Its finish condition is that supported
+hosted-provider model discovery, capability/limit semantics, usage, prompt
+caching, and model switching are provider-owned or exact first-party
+declarations, with unknown/conflicting evidence failing conservative. P1D and
+P1E remain separate checkpoints rather than reasons to keep expanding P1C.
+
 ### P1 progress — provider correctness slice 1
 
 The first P1 implementation slice fixed confirmed correctness gaps in provider
@@ -607,6 +625,43 @@ local-runtime lifecycle plus real Ollama/LM Studio/vLLM conformance, and
 adapter-level cancellation/stream-cleanup plus the minimum live service/runtime
 evidence required to support final claims.
 
+### P1 progress — OpenAI current-model transport semantics slice 10
+
+The first P1C slice removed a transport/capability mismatch on first-party
+OpenAI models. Ash previously inferred tools, vision, and reasoning from broad
+OpenAI model-name substrings while the API-key route always used Chat
+Completions. Current GPT-6 contracts make that unsafe: GPT-6 Astra and GPT-6.1
+Sol require Responses for tool calling, and GPT-6 Sol/Luna restrict Chat
+Completions function calling to `reasoning_effort=none`.
+
+The first-party API-key route now selects the public Responses API for exact
+current GPT-5.6/GPT-6 model IDs, sharing Ash's already verified stateless
+Responses history/tool/reasoning replay semantics with ChatGPT-plan auth.
+Current OpenAI capability declarations are exact and bounded at the model IDs
+Ash has verified instead of using `gpt-*`/`o*` substring heuristics; unknown
+OpenAI IDs fail conservative. An operator-overridden `OPENAI_API_BASE` remains
+on the generic Chat Completions adapter and explicitly receives conservative
+capabilities rather than inheriting first-party OpenAI semantics.
+
+The Responses API-key path preserves `store=false`, streaming terminal
+validation, canonical native calls, encrypted reasoning replay, configured
+output limits, prompt-cache controls, and provider-reported cache read/write
+usage. Non-default sampling temperature and unsupported 24-hour cache retention
+fail clearly instead of being silently ignored. The offline picker now points
+at the current GPT-6 Astra / GPT-6.1 Sol / GPT-6 Luna frontier while live model
+discovery remains the provider-owned source of account-specific availability.
+
+Evidence was rechecked against OpenAI's first-party model, GPT-6 migration,
+reasoning, prompt-caching, and changelog documentation on 2026-10-02:
+`https://developers.openai.com/api/docs/models`,
+`https://developers.openai.com/api/docs/guides/latest-model`,
+`https://developers.openai.com/api/docs/guides/reasoning`,
+`https://developers.openai.com/api/docs/guides/prompt-caching`, and
+`https://developers.openai.com/api/docs/changelog`.
+
+P1C remains open for the remaining provider-owned discovery/capability
+semantics; this slice deliberately does not advance P1D or P1E claims.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product
@@ -624,8 +679,10 @@ decisions rather than an open-ended feature inventory:
   explicit status/login/logout/accounts/use/models CLI surfaces; setup wizard
   selection; and public Responses API requests with `store=false`,
   `stream=true`, full history replay, strict terminal handling, canonical
-  native function calls, and bounded opaque encrypted reasoning replay. The
-  existing API-key route remains unchanged. Deterministic local tests cover the
+  native function calls, and bounded opaque encrypted reasoning replay. At this
+  M4 checkpoint the API-key route remained unchanged; P1C slice 10 later moves
+  current first-party GPT-5.6/GPT-6 API-key models onto the same public
+  Responses semantics. Deterministic local tests cover the
   auth, replay, setup, routing, recovery, and stream contracts. On 2026-10-01,
   a real interactive OpenAI sign-in completed successfully, live model
   discovery returned the account's selectable catalog, `ash providers test
@@ -743,7 +800,7 @@ truthful evidence boundaries, not open mission blockers.
 | `python -m ash` | Verified locally | Keep as supported fallback |
 | Dependency separation | Verified locally | Lean default runtime/provider install, standardized dev group, explicit server/local-embeddings/browser/ACP/A2A capability extras, actionable missing-extra errors, and lockfile/artifact checks |
 | First-run wizard | Verified locally | No-key detection, deterministic cancel/back, endpoint retry/save-unverified choices, non-billable model discovery, secret input, atomic related settings, non-TTY guidance, secret-free JSON status, and fresh-process API/local checks |
-| API-key providers | Partial | Every built-in cloud route now assembles from a fresh non-interactive process with its provider credential contract (including Google `GEMINI_API_KEY` fallback), while custom endpoints retain fresh-process coverage; deterministic fresh-process CLI loopback E2E proves real streamed completion across the previously covered built-in cloud catalog: Anthropic through the native Messages/SSE protocol with `x-api-key`, protocol-version, and provider-usage assertions, plus the OpenAI-wire routes for OpenAI, Google, OpenRouter, Vercel AI Gateway, DeepSeek, Groq, Mistral, xAI, Together, Fireworks, Cerebras, and NVIDIA with provider-specific bearer credentials, dynamic model-catalog probes where applicable, Together's list-shaped catalog, and Google's client-identification header. Hugging Face Inference Providers is additionally wired as a first-class gateway with `HF_TOKEN`, official `/v1/models` discovery, model/provider routing aliases, and conservative capability-floor parsing across its live upstream providers; Vercel AI Gateway is wired as a first-class `AI_GATEWAY_API_KEY` route using its official OpenAI-compatible `https://ai-gateway.vercel.sh/v1` endpoint and `/v1/models` catalog, giving Ash another high-leverage gateway to hundreds of models without widening the transport surface. Both still need real service conformance before joining the live-verified subset. A bounded real OpenRouter service run additionally proved live catalog discovery, a no-tools completion with provider-reported usage, and a coding journey that edited and externally tested a project using an ephemeral credential that was not persisted by Ash; interactive generic onboarding consumes the same readiness-owned catalog shape used at runtime; custom OpenAI-compatible routes fail closed unless exact per-model metadata is explicitly declared; OpenRouter, Hugging Face, Vercel AI Gateway, Mistral, xAI, Together, Fireworks, and Cerebras start conservatively and recover only capabilities proven by bounded provider-owned metadata (including multi-source xAI metadata that fails closed on direct or follow-up alias disagreement about canonical model identity, and selected-model Fireworks management metadata); runtime provider/model switches own retired-provider closure through loop shutdown, surface cleanup failures, and preserve close-once semantics for successful resources across shutdown retries; real vendor cross-version/service interoperability remains broader than the exercised OpenRouter service plus deterministic protocol coverage |
+| API-key providers | Partial | Every built-in cloud route now assembles from a fresh non-interactive process with its provider credential contract (including Google `GEMINI_API_KEY` fallback), while custom endpoints retain fresh-process coverage; deterministic fresh-process CLI loopback E2E proves real streamed completion across the previously covered built-in cloud catalog: Anthropic through the native Messages/SSE protocol with `x-api-key`, protocol-version, and provider-usage assertions, plus the OpenAI-wire routes for OpenAI, Google, OpenRouter, Vercel AI Gateway, DeepSeek, Groq, Mistral, xAI, Together, Fireworks, Cerebras, and NVIDIA with provider-specific bearer credentials, dynamic model-catalog probes where applicable, Together's list-shaped catalog, and Google's client-identification header. Current first-party OpenAI GPT-5.6/GPT-6 API-key models use the public Responses API so native-tool/reasoning semantics match the model contract; older verified OpenAI models retain Chat Completions, unknown IDs fail conservative, and an operator-overridden OpenAI base URL does not inherit first-party capabilities. Hugging Face Inference Providers is additionally wired as a first-class gateway with `HF_TOKEN`, official `/v1/models` discovery, model/provider routing aliases, and conservative capability-floor parsing across its live upstream providers; Vercel AI Gateway is wired as a first-class `AI_GATEWAY_API_KEY` route using its official OpenAI-compatible `https://ai-gateway.vercel.sh/v1` endpoint and `/v1/models` catalog, giving Ash another high-leverage gateway to hundreds of models without widening the transport surface. Both still need real service conformance before joining the live-verified subset. A bounded real OpenRouter service run additionally proved live catalog discovery, a no-tools completion with provider-reported usage, and a coding journey that edited and externally tested a project using an ephemeral credential that was not persisted by Ash; interactive generic onboarding consumes the same readiness-owned catalog shape used at runtime; custom OpenAI-compatible routes fail closed unless exact per-model metadata is explicitly declared; OpenRouter, Hugging Face, Vercel AI Gateway, Mistral, xAI, Together, Fireworks, and Cerebras start conservatively and recover only capabilities proven by bounded provider-owned metadata (including multi-source xAI metadata that fails closed on direct or follow-up alias disagreement about canonical model identity, and selected-model Fireworks management metadata); runtime provider/model switches own retired-provider closure through loop shutdown, surface cleanup failures, and preserve close-once semantics for successful resources across shutdown retries; real vendor cross-version/service interoperability remains broader than the exercised OpenRouter service plus deterministic protocol coverage |
 | OpenAI ChatGPT-plan auth | Verified live | Optional first-party `openai/*` auth mode uses OpenAI's open-source Sign in with ChatGPT flow with exact loopback state/nonce/PKCE and ID-token validation, private profile-scoped multi-account registration storage, stable host identity, rotating refresh serialization, revocation-aware logout, live model discovery, user-owned setup/CLI controls, project-config exclusion, and a dedicated stateless Responses adapter enforcing `store=false`, `stream=true`, full canonical history/tool replay, bounded encrypted reasoning replay, and success only on `response.completed`; deterministic auth/provider/runtime regressions pass, and a real 2026-10-01 account journey verified sign-in, catalog discovery, plan-backed completion, native function call, canonical tool-result continuation, and provider-reported usage |
 | Provider route verification | Verified locally | `ash providers test` separates catalog/model discovery from a bounded no-tools model completion, requires a safe terminal response before declaring the route ready, redacts completion failures, and closes the probe provider; `ash doctor --connect` remains a non-billable catalog/model check |
 | Local models | Partial | Ollama URL validation, discovery, health detail, safe bounded pulls, and dynamic tool/context probing are wired; LM Studio and vLLM no longer inherit OpenAI capabilities from wire compatibility, LM Studio consumes its native per-model tool/vision/reasoning/loaded-context metadata, and vLLM preserves served context while generic `supported_parameters=tools` does not enable native auto-tool calling without explicit server capability evidence; deterministic fresh-process CLI loopback E2E now proves each route's native catalog endpoint, streamed completion, provider/model identity, and absence of bearer auth; `/capabilities --refresh` re-probes dynamic manifests, while real cross-version LM Studio/vLLM runtime conformance remains |

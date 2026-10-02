@@ -1038,6 +1038,137 @@ async def test_openai_prompt_cache_and_usage_only_chunk() -> None:
     assert client.closed is False
 
 
+@pytest.mark.asyncio
+async def test_openai_responses_provider_uses_native_tools_and_normalizes_cache_usage() -> None:
+    from ash.providers.openai_responses import OpenAIResponsesProvider
+
+    class Events:
+        def __init__(self, events: list[Any]) -> None:
+            self.events = iter(events)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.events)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+    class Responses:
+        def __init__(self, events: list[Any]) -> None:
+            self.events = events
+            self.kwargs: dict[str, Any] = {}
+
+        async def create(self, **kwargs: Any) -> Events:
+            self.kwargs = kwargs
+            return Events(self.events)
+
+    class Client:
+        def __init__(self, events: list[Any]) -> None:
+            self.responses = Responses(events)
+
+    reasoning = SimpleNamespace(
+        type="reasoning",
+        id="rs_1",
+        encrypted_content="opaque",
+        summary=[],
+        status="completed",
+    )
+    function_call = SimpleNamespace(
+        type="function_call",
+        call_id="call_1",
+        name="read_file",
+        arguments='{"file_path":"a.py"}',
+    )
+    usage = SimpleNamespace(
+        input_tokens=100,
+        output_tokens=20,
+        input_tokens_details=SimpleNamespace(
+            cached_tokens=40,
+            cache_write_tokens=30,
+        ),
+    )
+    client = Client(
+        [
+            SimpleNamespace(type="response.output_text.delta", delta="working"),
+            SimpleNamespace(type="response.output_item.done", item=reasoning),
+            SimpleNamespace(type="response.output_item.done", item=function_call),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(usage=usage),
+            ),
+        ]
+    )
+    provider = OpenAIResponsesProvider(
+        "gpt-6.1-sol",
+        "test-key",
+        client=client,
+    )
+    provider.configure_max_tokens(4096)
+    provider.configure_prompt_cache(
+        enabled=True,
+        cache_key="ash-project-test",
+        retention="memory",
+    )
+
+    chunks = [
+        chunk
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "inspect"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        )
+    ]
+
+    request = client.responses.kwargs
+    assert request["store"] is False
+    assert request["stream"] is True
+    assert request["max_output_tokens"] == 4096
+    assert request["prompt_cache_key"] == "ash-project-test"
+    assert request["prompt_cache_options"] == {"mode": "implicit", "ttl": "30m"}
+    assert "temperature" not in request
+    assert request["tools"][0]["name"] == "read_file"
+    terminal = chunks[-1]
+    assert terminal.is_done is True
+    assert terminal.prompt_tokens == 100
+    assert terminal.completion_tokens == 20
+    assert terminal.cache_read_tokens == 40
+    assert terminal.cache_write_tokens == 30
+    assert terminal.native_tool_calls is not None
+    assert terminal.native_tool_calls[0].call_id == "call_1"
+    assert terminal.provider_state is not None
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_provider_rejects_unsupported_sampling_controls() -> None:
+    from ash.providers.openai_responses import OpenAIResponsesProvider
+
+    provider = OpenAIResponsesProvider("gpt-6.1-sol", "test-key", client=SimpleNamespace())
+
+    with pytest.raises(ValueError, match="custom temperature"):
+        _ = [
+            chunk
+            async for chunk in provider.stream_chat(
+                [{"role": "user", "content": "hello"}],
+                temperature=0.2,
+            )
+        ]
+    with pytest.raises(ValueError, match="24h"):
+        provider.configure_prompt_cache(enabled=True, retention="extended")
+
+
 @pytest.mark.parametrize(
     ("provider_name", "reasoning_field"),
     [

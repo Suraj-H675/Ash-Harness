@@ -1194,6 +1194,16 @@ def test_model_catalog_advertises_current_deepseek_models_only() -> None:
     assert "deepseek/deepseek-reasoner" not in AVAILABLE_MODELS
 
 
+def test_model_catalog_advertises_current_openai_frontier_models() -> None:
+    from ash.cli import AVAILABLE_MODELS
+
+    assert "openai/gpt-6-astra" in AVAILABLE_MODELS
+    assert "openai/gpt-6.1-sol" in AVAILABLE_MODELS
+    assert "openai/gpt-6-luna" in AVAILABLE_MODELS
+    assert "openai/gpt-5.2-codex" not in AVAILABLE_MODELS
+    assert "openai/gpt-5-mini" not in AVAILABLE_MODELS
+
+
 def test_model_catalog_uses_current_groq_production_defaults() -> None:
     from ash.cli import AVAILABLE_MODELS
 

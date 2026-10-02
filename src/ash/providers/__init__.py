@@ -25,6 +25,7 @@ from ash.providers.messages import (
 )
 from ash.providers.anthropic import AnthropicProvider, ProviderBackendUnavailable
 from ash.providers.openai import OpenAIProvider
+from ash.providers.openai_responses import OpenAIResponsesProvider
 from ash.providers.ollama import OllamaProvider
 from ash.providers.deepseek import DeepSeekProvider
 from ash.providers.groq import GroqProvider
@@ -55,6 +56,7 @@ __all__ = [
     "TokenCounterLike",
     "AnthropicProvider",
     "OpenAIProvider",
+    "OpenAIResponsesProvider",
     "OllamaProvider",
     "DeepSeekProvider",
     "GroqProvider",

@@ -5,13 +5,18 @@ Normal CLI users configure built-in or OpenAI-compatible providers with
 Ash's CLI or runtime branches.
 
 The first-party `openai/*` route has two **user-owned** authentication modes:
-`api_key` (the default Chat Completions adapter) and `chatgpt` (OpenAI Sign
-in with ChatGPT plus the public Responses API). `openai_auth_mode` is excluded
-from project configuration so repository-controlled input cannot change the
-user's selected OpenAI authentication mode. The ChatGPT path keeps registrations
-profile-scoped, uses descriptor-anchored private storage, serializes rotating
-refresh-token updates across processes, and replays bounded opaque reasoning
-items required by `store=false` Responses conversations.
+`api_key` and `chatgpt`. API-key auth uses the public Responses API for the
+current GPT-5.6/GPT-6 model families where reasoning/tool semantics require or
+prefer it, while older supported OpenAI models retain the Chat Completions
+adapter. Operator-overridden `OPENAI_API_BASE` endpoints stay on the generic
+Chat Completions path and do not inherit first-party model capabilities from an
+OpenAI model name. ChatGPT auth uses OpenAI Sign in with ChatGPT plus the public
+Responses API. `openai_auth_mode` is excluded from project configuration so
+repository-controlled input cannot change the user's selected OpenAI
+authentication mode. The ChatGPT path keeps registrations profile-scoped, uses
+descriptor-anchored private storage, serializes rotating refresh-token updates
+across processes, and replays bounded opaque reasoning items required by
+`store=false` Responses conversations.
 
 ```python
 from ash.providers import (
