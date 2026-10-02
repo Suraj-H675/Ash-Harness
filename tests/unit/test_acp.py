@@ -1947,8 +1947,17 @@ async def test_acp_load_cancellation_closes_and_unregisters_client(
 
 
 class WireClient(FakeACPConnection):
+    def __init__(self) -> None:
+        super().__init__()
+        self.agent_message_received = asyncio.Event()
+
     def on_connect(self, conn: Any) -> None:
         self.connection = conn
+
+    async def session_update(self, session_id: str, update: Any) -> None:
+        await super().session_update(session_id, update)
+        if update.session_update == "agent_message_chunk":
+            self.agent_message_received.set()
 
 
 async def _loopback_stream_pair() -> tuple[
@@ -2018,6 +2027,7 @@ async def test_acp_official_sdk_wire_round_trip(tmp_path: Path) -> None:
         assert initialized.protocol_version == 1
         assert session.session_id == "wire-session"
         assert response.stop_reason == "end_turn"
+        await asyncio.wait_for(wire_client.agent_message_received.wait(), timeout=2)
         assert any(
             update.session_update == "agent_message_chunk"
             for _, update in wire_client.updates
