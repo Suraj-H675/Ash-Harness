@@ -1047,6 +1047,95 @@ Comparator references rechecked on 2026-10-03:
 All five bounded P2 finish flags are closed. The active roadmap advances to P3
 web/computer interaction parity.
 
+### P3 finish flags
+
+P3 is intentionally bounded around interaction workflows a coding harness can
+justify. It is not a requirement to absorb every remote-desktop or general
+assistant surface exposed by gateway products.
+
+- `P3A_WEB_RETRIEVAL = OPEN`
+- `P3B_BROWSER_INTERACTION = CLOSED`
+- `P3C_SIGNED_IN_BROWSER = OPEN`
+- `P3D_REMOTE_BROWSER_OPERATION = OPEN`
+- `P3E_DESKTOP_COMPUTER_USE = OPEN`
+- `P3F_INTERACTION_CONFORMANCE = OPEN`
+- `P3_WEB_COMPUTER_PARITY = OPEN` until P3A-P3F are all closed.
+
+P3 closes when public-web research/fetch is dependable and appropriately
+bounded; browser interaction can complete realistic modern web-app/test flows;
+authenticated browser state has an explicit safe user-consent story; local vs
+remote browser ownership is a deliberate product decision; general desktop
+computer use is either implemented for a concrete coding workflow or rejected
+for a defensible scope/security reason; and external-behavior claims have
+realistic conformance evidence plus a current comparator pass.
+
+### P3 progress — browser interaction audit slice 1
+
+Ash enters P3 with a substantial browser baseline rather than a blank computer
+tool: guarded public `web_search`/`web_fetch`; an isolated Playwright Chromium
+session; accessibility snapshots with stable per-tab refs; explicit tab
+open/focus/close; navigate/click/type/scroll/back; bounded screenshots;
+workspace-scoped upload/download; opt-in private persistent profiles; and
+loopback-only CDP attachment that creates an Ash-owned policy context instead
+of taking ownership of the source browser. Real Chromium E2E already covers
+snapshot/fill/click, popup tabs, uploads, network-policy enforcement, CDP
+attachment, storage-state reuse, runtime attach/disconnect, and source-browser
+survival.
+
+The current comparator pass nevertheless confirms a material action-surface
+gap. OpenClaw's current browser control includes keyboard press, hover, drag,
+select, richer waits/dialog handling, batching, and optional evaluation; Hermes'
+default Browser Use path lets the agent compose browser operations in code;
+OpenAI's current computer-use guidance likewise recommends persistent
+Playwright/code execution for complex browser interactions while retaining a
+structured action alternative. Ash does not need unrestricted page JavaScript
+to close the basic workflow gap, but modern forms, drag/drop UIs, keyboard-only
+controls, hover menus, select elements, and asynchronous app states require more
+than click/type/scroll.
+
+The first P3B slice therefore adds bounded structured operations: keyboard
+press, hover, select, drag, and explicit waits. The second slice adds explicit
+modal-state handling for action-triggered alert/confirm/prompt dialogs. A
+triggering browser action can now return the pending dialog instead of hanging;
+other browser actions fail closed while the modal is open; `browser_dialog`
+can accept, dismiss, or answer a prompt; chained dialogs remain explicit; and
+the blocked Playwright action resumes before Ash returns a fresh snapshot.
+`browser_dialog` remains side-effecting and approval-gated, and prompt text is
+treated as a sensitive tool argument.
+
+The final bounded frame-actionability slice closes the remaining material
+interaction gap without changing Ash's public ref grammar. Snapshots now
+traverse up to 32 visible frames, share the existing 150-element interaction
+budget across the page and frames, include bounded/redacted frame ARIA context,
+redact password values inside frames, and map each opaque snapshot-scoped ref
+internally to the exact Playwright page/frame that produced it. Hidden-frame
+controls are excluded and stale/detached frame refs fail closed. Nested-frame
+ancestry is handled internally instead of exposing brittle frame-index paths in
+the model-facing tool contract.
+
+P3B is CLOSED. The final closure gate passes 59/59 browser unit tests and
+10/10 complete real-Chromium browser E2E tests, with Ruff, targeted Mypy, and
+`git diff --check` clean. The E2E gate covers top-level form actions, bounded
+keyboard/hover/select/drag/wait primitives, explicit chained dialog handling,
+visible iframe discovery/action with hidden-frame exclusion and password
+redaction, popup/tab control, upload/download/network-policy behavior, CDP
+attachment/storage-state reuse, runtime attach/disconnect, and source-browser
+survival.
+
+Arbitrary page evaluation and batch execution are not P3B closure requirements.
+Current OpenClaw and Hermes expose those escape hatches, and OpenAI recommends
+code execution for some computer-use integrations, but Ash already has a strong
+structured interaction surface. Unrestricted evaluation would widen access to
+authenticated DOM/storage/network state, while batching would compress the
+existing per-action approval and fresh-ref boundaries. Keep both out of Ash core
+unless a concrete coding workflow later justifies a separately designed safety
+contract.
+
+Comparator references rechecked on 2026-10-03:
+`https://docs.openclaw.ai/tools/browser-control`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/features/browser/`, and
+`https://developers.openai.com/api/docs/guides/tools-computer-use`.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product

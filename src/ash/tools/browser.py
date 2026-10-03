@@ -11,12 +11,12 @@ import mimetypes
 import os
 import re
 import secrets
-from collections.abc import Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse, urlunparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ash.core.redaction import redact_text, redact_url
 from ash.safe_io import read_bounded_bytes, validate_unlinked_directory_path
@@ -34,6 +34,7 @@ MAX_INTERACTIVE_ELEMENTS = 150
 MAX_CDP_STORAGE_STATE_BYTES = 4 * 1024 * 1024
 MAX_CDP_SOURCE_TABS = 64
 MAX_BROWSER_TABS = 32
+MAX_BROWSER_FRAMES = 32
 TAB_ID_PATTERN = r"t[0-9a-f]{8}-[1-9][0-9]{0,8}"
 BROWSER_TOOL_NAMES = frozenset(
     {
@@ -45,6 +46,12 @@ BROWSER_TOOL_NAMES = frozenset(
         "browser_close_tab",
         "browser_click",
         "browser_type",
+        "browser_press",
+        "browser_hover",
+        "browser_select",
+        "browser_drag",
+        "browser_wait",
+        "browser_dialog",
         "browser_scroll",
         "browser_back",
         "browser_screenshot",
@@ -131,12 +138,18 @@ class BrowserSession:
         self._page: Any | None = None
         self._tab_pages: dict[str, Any] = {}
         self._snapshot_versions: dict[str, int] = {}
+        self._snapshot_ref_scopes: dict[str, Any] = {}
         self._snapshot_task: asyncio.Task[str] | None = None
         self._session_token = secrets.token_hex(4)
         self._next_tab_id = 1
         self._page_tasks: set[asyncio.Task[None]] = set()
         self._page_admission_dirty = False
         self._proxy: BrowserPolicyProxy | None = None
+        self._pending_dialog: Any | None = None
+        self._dialog_page: Any | None = None
+        self._dialog_action_task: asyncio.Task[Any] | None = None
+        self._dialog_queue: asyncio.Queue[Any] | None = None
+        self._dialog_handler: Callable[[Any], None] | None = None
 
     @property
     def is_started(self) -> bool:
@@ -368,10 +381,22 @@ class BrowserSession:
             _validate_browser_url, url, self.allowed_domains
         )
         page = await self.ensure_started()
-        await page.goto(validated, wait_until=wait_until, timeout=self.timeout_ms)
+        modal = await self._run_dialog_aware_action(
+            page,
+            lambda: page.goto(
+                validated,
+                wait_until=wait_until,
+                timeout=self.timeout_ms,
+            ),
+            label="navigate",
+        )
+        if modal is not None:
+            return modal
         return await self.snapshot()
 
     async def snapshot(self) -> str:
+        if self._pending_dialog is not None:
+            return self._render_dialog_state()
         task = self._snapshot_task
         if task is None or task.done():
             task = asyncio.create_task(
@@ -391,11 +416,30 @@ class BrowserSession:
         snapshot_version = self._snapshot_versions.get(tab_id, 0) + 1
         self._snapshot_versions[tab_id] = snapshot_version
         ref_prefix = f"{tab_id}:s{snapshot_version}"
+        for ref in tuple(self._snapshot_ref_scopes):
+            if ref.startswith(f"{tab_id}:"):
+                self._snapshot_ref_scopes.pop(ref, None)
         title = _redact_browser_text(_single_line(str(await page.title())))[:200]
-        elements = await page.eval_on_selector_all(
-            INTERACTIVE_SELECTOR,
-            """(nodes, options) => {
-              let refIndex = 0;
+        scopes: list[tuple[str | None, Any]] = [(None, page)]
+        page_frames = list(getattr(page, "frames", ()) or ())
+        child_frames = page_frames[1:MAX_BROWSER_FRAMES]
+        scopes.extend(
+            (f"f{index}", frame)
+            for index, frame in enumerate(child_frames, start=1)
+        )
+        frames_truncated = len(page_frames) > MAX_BROWSER_FRAMES
+        element_groups: list[tuple[str | None, str, list[dict[str, Any]]]] = []
+        aria_groups: list[tuple[str | None, str, str]] = []
+        ref_index = 0
+        for frame_label, scope in scopes:
+            if frame_label is not None and not await self._frame_is_visible(scope):
+                continue
+            try:
+                frame_url = _redact_browser_url(str(getattr(scope, "url", page.url)))
+                elements = await scope.eval_on_selector_all(
+                    INTERACTIVE_SELECTOR,
+                    """(nodes, options) => {
+              let refIndex = options.startIndex;
               return nodes.flatMap((node) => {
                 if (refIndex >= options.maxItems) return [];
                 const style = window.getComputedStyle(node);
@@ -413,14 +457,41 @@ class BrowserSession:
                     disabled: Boolean(node.disabled) || node.getAttribute('aria-disabled') === 'true'}];
               });
             }""",
-            {"maxItems": MAX_INTERACTIVE_ELEMENTS, "refPrefix": ref_prefix},
-        )
-        aria = await page.aria_snapshot(timeout=self.timeout_ms)
-        password_values = await page.eval_on_selector_all(
-            'input[type="password"]',
-            """nodes => nodes.slice(0, 100).map(node => String(node.value || '').slice(0, 10000)).filter(Boolean)""",
-        )
-        aria = _redact_browser_text(_redact_literals(aria, password_values))
+                    {
+                        "maxItems": MAX_INTERACTIVE_ELEMENTS,
+                        "refPrefix": ref_prefix,
+                        "startIndex": ref_index,
+                    },
+                )
+                ref_index += len(elements)
+                for item in elements:
+                    ref = str(item.get("ref", ""))
+                    if ref:
+                        self._snapshot_ref_scopes[ref] = scope
+                element_groups.append((frame_label, frame_url, elements))
+                password_values = await scope.eval_on_selector_all(
+                    'input[type="password"]',
+                    """nodes => nodes.slice(0, 100).map(node => String(node.value || '').slice(0, 10000)).filter(Boolean)""",
+                )
+                if frame_label is None:
+                    aria = await page.aria_snapshot(timeout=self.timeout_ms)
+                else:
+                    aria = await scope.locator("html").aria_snapshot(
+                        timeout=self.timeout_ms
+                    )
+                aria_groups.append(
+                    (
+                        frame_label,
+                        frame_url,
+                        _redact_browser_text(
+                            _redact_literals(str(aria), password_values)
+                        ),
+                    )
+                )
+            except Exception:
+                if frame_label is None:
+                    raise
+                continue
         lines = [
             f"Tab: {tab_id}",
             f"Page: {title}",
@@ -428,21 +499,51 @@ class BrowserSession:
             "",
             "Interactive elements:",
         ]
-        for item in elements:
-            label = _redact_browser_text(
-                _single_line(str(item.get("text", "")))
-            )[:200]
-            disabled = " disabled" if item.get("disabled") else ""
-            lines.append(
-                f"[{item.get('ref', '')}] {item.get('role', 'element')}{disabled} "
-                f"{label!r}"
-            )
-        if not elements:
+        rendered_elements = 0
+        for frame_label, frame_url, elements in element_groups:
+            if frame_label is not None:
+                lines.extend(("", f"Frame {frame_label}: {frame_url[:2048]}"))
+            for item in elements:
+                label = _redact_browser_text(
+                    _single_line(str(item.get("text", "")))
+                )[:200]
+                disabled = " disabled" if item.get("disabled") else ""
+                lines.append(
+                    f"[{item.get('ref', '')}] {item.get('role', 'element')}{disabled} "
+                    f"{label!r}"
+                )
+                rendered_elements += 1
+        if not rendered_elements:
             lines.append("(none)")
-        lines.extend(("", "ARIA snapshot:", aria))
+        if frames_truncated:
+            lines.extend(("", f"[frame list truncated at {MAX_BROWSER_FRAMES}]"))
+        for frame_label, frame_url, aria in aria_groups:
+            if frame_label is None:
+                lines.extend(("", "ARIA snapshot:", aria))
+            else:
+                lines.extend(
+                    (
+                        "",
+                        f"Frame {frame_label} ARIA snapshot: {frame_url[:2048]}",
+                        aria,
+                    )
+                )
         return _truncate_snapshot("\n".join(lines))
 
+    async def _frame_is_visible(self, frame: Any) -> bool:
+        current = frame
+        while getattr(current, "parent_frame", None) is not None:
+            try:
+                frame_element = await current.frame_element()
+                if not await frame_element.is_visible():
+                    return False
+            except Exception:
+                return False
+            current = current.parent_frame
+        return True
+
     async def screenshot(self, *, max_bytes: int) -> "BrowserScreenshot":
+        self._ensure_no_pending_dialog("take a screenshot")
         page = await self.ensure_started()
         payload = await page.screenshot(type="png", full_page=False)
         if len(payload) > max_bytes:
@@ -467,6 +568,7 @@ class BrowserSession:
         from ash.commands.attachments import _reject_sensitive
         from ash.safety.scoped_io import read_scoped_bytes
 
+        self._ensure_no_pending_dialog("upload a file")
         locator = await self._locator(ref)
         input_type = (await locator.get_attribute("type") or "").casefold()
         if input_type != "file":
@@ -513,6 +615,7 @@ class BrowserSession:
     ) -> str:
         """Save one bounded browser download into the trusted workspace."""
 
+        self._ensure_no_pending_dialog("download a file")
         target = await asyncio.to_thread(
             safety_guard.validate_mutation_path,
             file_path,
@@ -545,9 +648,16 @@ class BrowserSession:
         return f"Downloaded {len(payload)} bytes to {target}\n\n{snapshot}"
 
     async def click(self, ref: str) -> str:
+        self._ensure_no_pending_dialog("click another element")
         page = await self.ensure_started()
         locator = await self._locator(ref)
-        await locator.click(timeout=self.timeout_ms)
+        modal = await self._run_dialog_aware_action(
+            page,
+            lambda: locator.click(timeout=self.timeout_ms),
+            label="click",
+        )
+        if modal is not None:
+            return modal
         await self._settle(page)
         return await self.snapshot()
 
@@ -559,33 +669,313 @@ class BrowserSession:
         submit: bool,
         clear: bool,
     ) -> str:
+        self._ensure_no_pending_dialog("type into another element")
         page = await self.ensure_started()
         locator = await self._locator(ref)
         input_type = (await locator.get_attribute("type") or "").casefold()
         if input_type == "password":
             raise ValueError("browser_type refuses password fields")
-        if clear:
-            await locator.fill(text, timeout=self.timeout_ms)
-        else:
-            await locator.press_sequentially(text, timeout=self.timeout_ms)
+
+        async def type_action() -> None:
+            if clear:
+                await locator.fill(text, timeout=self.timeout_ms)
+            else:
+                await locator.press_sequentially(text, timeout=self.timeout_ms)
+            if submit:
+                await locator.press("Enter", timeout=self.timeout_ms)
+
+        modal = await self._run_dialog_aware_action(
+            page,
+            type_action,
+            label="type",
+        )
+        if modal is not None:
+            return modal
         if submit:
-            await locator.press("Enter", timeout=self.timeout_ms)
             await self._settle(page)
         return await self.snapshot()
 
+    async def press_key(self, key: str, *, ref: str | None = None) -> str:
+        self._ensure_no_pending_dialog("press another key")
+        page = await self.ensure_started()
+        if ref is None:
+            async def action() -> Any:
+                return await page.keyboard.press(key)
+        else:
+            locator = await self._locator(ref)
+
+            async def action() -> Any:
+                return await locator.press(key, timeout=self.timeout_ms)
+        modal = await self._run_dialog_aware_action(
+            page,
+            action,
+            label="press",
+        )
+        if modal is not None:
+            return modal
+        await self._settle(page)
+        return await self.snapshot()
+
+    async def hover(self, ref: str) -> str:
+        self._ensure_no_pending_dialog("hover another element")
+        page = await self.ensure_started()
+        locator = await self._locator(ref)
+        modal = await self._run_dialog_aware_action(
+            page,
+            lambda: locator.hover(timeout=self.timeout_ms),
+            label="hover",
+        )
+        if modal is not None:
+            return modal
+        await self._settle(page)
+        return await self.snapshot()
+
+    async def select(self, ref: str, values: list[str]) -> str:
+        self._ensure_no_pending_dialog("select another value")
+        page = await self.ensure_started()
+        locator = await self._locator(ref)
+        modal = await self._run_dialog_aware_action(
+            page,
+            lambda: locator.select_option(values, timeout=self.timeout_ms),
+            label="select",
+        )
+        if modal is not None:
+            return modal
+        await self._settle(page)
+        return await self.snapshot()
+
+    async def drag(self, source_ref: str, target_ref: str) -> str:
+        self._ensure_no_pending_dialog("drag another element")
+        page = await self.ensure_started()
+        source = await self._locator(source_ref)
+        target = await self._locator(target_ref)
+        modal = await self._run_dialog_aware_action(
+            page,
+            lambda: source.drag_to(target, timeout=self.timeout_ms),
+            label="drag",
+        )
+        if modal is not None:
+            return modal
+        await self._settle(page)
+        return await self.snapshot()
+
+    async def wait_for(
+        self,
+        *,
+        condition: str,
+        ref: str | None,
+        value: str | None,
+        load_state: str,
+        timeout_seconds: float,
+    ) -> str:
+        self._ensure_no_pending_dialog("wait for another page condition")
+        page = await self.ensure_started()
+        timeout_ms = min(self.timeout_ms, max(100, int(timeout_seconds * 1000)))
+        if condition == "ref_visible":
+            assert ref is not None
+            locator = await self._locator(ref)
+            await locator.wait_for(state="visible", timeout=timeout_ms)
+        elif condition == "text":
+            assert value is not None
+            await page.get_by_text(value, exact=False).first.wait_for(
+                state="visible",
+                timeout=timeout_ms,
+            )
+        elif condition == "url_contains":
+            assert value is not None
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout_ms / 1000
+            while value not in str(page.url):
+                if loop.time() >= deadline:
+                    raise ValueError(
+                        f"browser wait timed out before URL contained {value!r}"
+                    )
+                await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
+        elif condition == "load":
+            await page.wait_for_load_state(load_state, timeout=timeout_ms)
+        else:  # pragma: no cover - validated by WaitArgs
+            raise ValueError(f"unsupported browser wait condition: {condition}")
+        await self._settle(page)
+        return await self.snapshot()
+
     async def scroll(self, direction: str, amount: int) -> str:
+        self._ensure_no_pending_dialog("scroll the page")
         page = await self.ensure_started()
         delta = amount if direction == "down" else -amount
-        await page.mouse.wheel(0, delta)
-        await page.wait_for_timeout(150)
+        async def scroll_action() -> None:
+            await page.mouse.wheel(0, delta)
+            await page.wait_for_timeout(150)
+
+        modal = await self._run_dialog_aware_action(
+            page,
+            scroll_action,
+            label="scroll",
+        )
+        if modal is not None:
+            return modal
         return await self.snapshot()
 
     async def back(self) -> str:
+        self._ensure_no_pending_dialog("navigate back")
         page = await self.ensure_started()
-        await page.go_back(wait_until="domcontentloaded", timeout=self.timeout_ms)
+        modal = await self._run_dialog_aware_action(
+            page,
+            lambda: page.go_back(
+                wait_until="domcontentloaded",
+                timeout=self.timeout_ms,
+            ),
+            label="back",
+        )
+        if modal is not None:
+            return modal
         return await self.snapshot()
 
+    async def handle_dialog(self, *, accept: bool, prompt_text: str | None) -> str:
+        dialog = self._pending_dialog
+        page = self._dialog_page
+        action_task = self._dialog_action_task
+        queue = self._dialog_queue
+        if (
+            dialog is None
+            or page is None
+            or action_task is None
+            or queue is None
+        ):
+            raise ValueError("browser has no pending dialog")
+        dialog_type = str(getattr(dialog, "type", "dialog"))
+        if prompt_text is not None and dialog_type != "prompt":
+            raise ValueError("prompt_text is only valid for a prompt dialog")
+        try:
+            if accept:
+                if prompt_text is None:
+                    await dialog.accept()
+                else:
+                    await dialog.accept(prompt_text=prompt_text)
+            else:
+                await dialog.dismiss()
+        except Exception:
+            raise
+        self._pending_dialog = None
+        modal = await self._wait_for_action_or_dialog(
+            page,
+            action_task,
+            queue,
+        )
+        if modal is not None:
+            return modal
+        self._clear_dialog_action_state()
+        await self._settle(page)
+        return await self.snapshot()
+
+    def _ensure_no_pending_dialog(self, operation: str) -> None:
+        if self._pending_dialog is None:
+            return
+        raise ValueError(
+            f"browser has a pending dialog; use browser_dialog before you {operation}"
+        )
+
+    def _render_dialog_state(self) -> str:
+        dialog = self._pending_dialog
+        if dialog is None:
+            raise ValueError("browser has no pending dialog")
+        dialog_type = _single_line(str(getattr(dialog, "type", "dialog")))[:32]
+        message = _redact_browser_text(
+            _single_line(str(getattr(dialog, "message", "")))
+        )[:1_000]
+        return (
+            "Modal state:\n"
+            f"- {dialog_type} dialog with message {message!r}\n"
+            "- Use browser_dialog to accept or dismiss it before other browser actions."
+        )
+
+    async def _run_dialog_aware_action(
+        self,
+        page: Any,
+        action: Callable[[], Coroutine[Any, Any, Any]],
+        *,
+        label: str,
+    ) -> str | None:
+        self._ensure_no_pending_dialog(f"run browser action {label!r}")
+        on_event = getattr(page, "on", None)
+        remove_listener = getattr(page, "remove_listener", None)
+        if not callable(on_event) or not callable(remove_listener):
+            await action()
+            return None
+
+        queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
+
+        def capture_dialog(dialog: Any) -> None:
+            if queue.empty():
+                queue.put_nowait(dialog)
+
+        on_event("dialog", capture_dialog)
+        action_task: asyncio.Task[Any] = asyncio.create_task(
+            action(),
+            name=f"ash-browser-{label}-action",
+        )
+        try:
+            modal = await self._wait_for_action_or_dialog(
+                page,
+                action_task,
+                queue,
+            )
+        except BaseException:
+            remove_listener("dialog", capture_dialog)
+            if not action_task.done():
+                action_task.cancel()
+                await asyncio.gather(action_task, return_exceptions=True)
+            raise
+        if modal is None:
+            remove_listener("dialog", capture_dialog)
+            return None
+        self._dialog_page = page
+        self._dialog_action_task = action_task
+        self._dialog_queue = queue
+        self._dialog_handler = capture_dialog
+        return modal
+
+    async def _wait_for_action_or_dialog(
+        self,
+        page: Any,
+        action_task: asyncio.Task[Any],
+        queue: asyncio.Queue[Any],
+    ) -> str | None:
+        dialog_task = asyncio.create_task(
+            queue.get(),
+            name="ash-browser-dialog-wait",
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {action_task, dialog_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if action_task in done:
+                await action_task
+                return None
+            dialog = dialog_task.result()
+            self._pending_dialog = dialog
+            self._dialog_page = page
+            return self._render_dialog_state()
+        finally:
+            if not dialog_task.done():
+                dialog_task.cancel()
+                await asyncio.gather(dialog_task, return_exceptions=True)
+
+    def _clear_dialog_action_state(self) -> None:
+        page = self._dialog_page
+        handler = self._dialog_handler
+        if page is not None and handler is not None:
+            remove_listener = getattr(page, "remove_listener", None)
+            if callable(remove_listener):
+                remove_listener("dialog", handler)
+        self._pending_dialog = None
+        self._dialog_page = None
+        self._dialog_action_task = None
+        self._dialog_queue = None
+        self._dialog_handler = None
+
     async def list_tabs(self) -> str:
+        self._ensure_no_pending_dialog("list tabs")
         await self.ensure_started()
         await self._drain_page_tasks()
         async with self._tab_lock:
@@ -656,6 +1046,7 @@ class BrowserSession:
         return output
 
     async def open_tab(self, url: str, wait_until: str) -> str:
+        self._ensure_no_pending_dialog("open another tab")
         validated = await asyncio.to_thread(
             _validate_browser_url, url, self.allowed_domains
         )
@@ -688,13 +1079,21 @@ class BrowserSession:
                 await self._rollback_open_tab(page, previous)
                 raise asyncio.CancelledError
             try:
-                await page.goto(
-                    validated,
-                    wait_until=wait_until,
-                    timeout=self.timeout_ms,
+                modal = await self._run_dialog_aware_action(
+                    page,
+                    lambda: page.goto(
+                        validated,
+                        wait_until=wait_until,
+                        timeout=self.timeout_ms,
+                    ),
+                    label="open-tab-navigate",
                 )
+                if modal is not None:
+                    return modal
                 return await self.snapshot()
             except BaseException as primary:
+                if self._pending_dialog is not None and self._dialog_page is page:
+                    raise
                 cleanup_error, cleanup_interrupted = await self._rollback_open_tab(
                     page, previous
                 )
@@ -737,6 +1136,7 @@ class BrowserSession:
         return None, interrupted
 
     async def focus_tab(self, tab_id: str) -> str:
+        self._ensure_no_pending_dialog("focus another tab")
         await self.ensure_started()
         await self._drain_page_tasks()
         async with self._tab_lock:
@@ -746,6 +1146,7 @@ class BrowserSession:
             return await self.snapshot()
 
     async def close_tab(self, tab_id: str) -> str:
+        self._ensure_no_pending_dialog("close another tab")
         await self.ensure_started()
         await self._drain_page_tasks()
         async with self._tab_lock:
@@ -778,8 +1179,18 @@ class BrowserSession:
             raise ValueError(
                 f"browser element {ref!r} is stale; take a new snapshot"
             )
-        locator = page.locator(f'[data-ash-ref="{ref}"]')
-        count = await locator.count()
+        scope = self._snapshot_ref_scopes.get(ref)
+        if scope is None:
+            raise ValueError(
+                f"browser element {ref!r} is stale or missing; take a new snapshot"
+            )
+        locator = scope.locator(f'[data-ash-ref="{ref}"]')
+        try:
+            count = await locator.count()
+        except Exception as exc:
+            raise ValueError(
+                f"browser element {ref!r} is stale or missing; take a new snapshot"
+            ) from exc
         if count != 1:
             raise ValueError(
                 f"browser element {ref!r} is stale or missing; take a new snapshot"
@@ -967,6 +1378,22 @@ class BrowserSession:
             self._cleanup_failed = False
 
     async def _close_unlocked(self, *, cancel_snapshot: bool = True) -> None:
+        cleanup_failures: list[tuple[str, BaseException]] = []
+        pending_dialog = self._pending_dialog
+        if pending_dialog is not None:
+            try:
+                await pending_dialog.dismiss()
+            except BaseException as exc:
+                cleanup_failures.append(("browser dialog", exc))
+        dialog_action_task = self._dialog_action_task
+        self._clear_dialog_action_state()
+        if (
+            dialog_action_task is not None
+            and dialog_action_task is not asyncio.current_task()
+            and not dialog_action_task.done()
+        ):
+            dialog_action_task.cancel()
+            await asyncio.gather(dialog_action_task, return_exceptions=True)
         snapshot_task = self._snapshot_task
         current_task = asyncio.current_task()
         if (
@@ -987,7 +1414,6 @@ class BrowserSession:
             await asyncio.gather(*page_tasks, return_exceptions=True)
         self._page_tasks.clear()
         self._page_admission_dirty = False
-        cleanup_failures: list[tuple[str, BaseException]] = []
         context = self._context
         if context is not None:
             try:
@@ -1027,6 +1453,7 @@ class BrowserSession:
         self._page = None
         self._tab_pages.clear()
         self._snapshot_versions.clear()
+        self._snapshot_ref_scopes.clear()
         if cleanup_failures:
             label, primary = cleanup_failures[0]
             error = BrowserUnavailableError(
@@ -1229,6 +1656,127 @@ class TypeArgs(ElementArgs):
     clear: bool = True
 
 
+_KEY_MODIFIERS = frozenset({"Alt", "Control", "Meta", "Shift"})
+_NAMED_KEYS = frozenset(
+    {
+        "Enter",
+        "Tab",
+        "Escape",
+        "Space",
+        "Backspace",
+        "Delete",
+        "Insert",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        *(f"F{index}" for index in range(1, 13)),
+    }
+)
+
+
+class PressArgs(BaseModel):
+    key: str = Field(..., min_length=1, max_length=64)
+    ref: str | None = Field(None, min_length=17, max_length=40)
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        parts = value.split("+")
+        if not parts or any(not part for part in parts):
+            raise ValueError("browser key chord is invalid")
+        modifiers = parts[:-1]
+        final = parts[-1]
+        if len(set(modifiers)) != len(modifiers) or any(
+            modifier not in _KEY_MODIFIERS for modifier in modifiers
+        ):
+            raise ValueError("browser key chord has an invalid modifier")
+        if final not in _NAMED_KEYS and not (
+            len(final) == 1 and final.isascii() and final.isprintable()
+        ):
+            raise ValueError("browser key chord has an unsupported key")
+        return value
+
+    @field_validator("ref")
+    @classmethod
+    def validate_ref(cls, value: str | None) -> str | None:
+        if value is not None and not ELEMENT_REF.fullmatch(value):
+            raise ValueError("browser element ref must look like t1234abcd-1:s1:e1")
+        return value
+
+
+class SelectArgs(ElementArgs):
+    values: list[str] = Field(..., min_length=1, max_length=20)
+
+    @field_validator("values")
+    @classmethod
+    def validate_values(cls, values: list[str]) -> list[str]:
+        if any(len(value.encode("utf-8")) > 1_000 for value in values):
+            raise ValueError("browser select values must be at most 1000 UTF-8 bytes")
+        return values
+
+
+class DragArgs(BaseModel):
+    source_ref: str = Field(..., min_length=17, max_length=40)
+    target_ref: str = Field(..., min_length=17, max_length=40)
+
+    @field_validator("source_ref", "target_ref")
+    @classmethod
+    def validate_refs(cls, value: str) -> str:
+        if not ELEMENT_REF.fullmatch(value):
+            raise ValueError("browser element ref must look like t1234abcd-1:s1:e1")
+        return value
+
+
+class WaitArgs(BaseModel):
+    condition: Literal["ref_visible", "text", "url_contains", "load"]
+    ref: str | None = Field(None, min_length=17, max_length=40)
+    value: str | None = Field(None, max_length=2_048)
+    load_state: Literal["domcontentloaded", "load", "networkidle"] = "domcontentloaded"
+    timeout_seconds: float = Field(10.0, ge=0.1, le=30.0)
+
+    @field_validator("ref")
+    @classmethod
+    def validate_ref(cls, value: str | None) -> str | None:
+        if value is not None and not ELEMENT_REF.fullmatch(value):
+            raise ValueError("browser element ref must look like t1234abcd-1:s1:e1")
+        return value
+
+    @model_validator(mode="after")
+    def validate_condition_arguments(self) -> "WaitArgs":
+        if self.condition == "ref_visible":
+            if self.ref is None or self.value is not None:
+                raise ValueError("ref_visible wait requires ref and no value")
+        elif self.condition in {"text", "url_contains"}:
+            if self.ref is not None or self.value is None or not self.value.strip():
+                raise ValueError(f"{self.condition} wait requires a non-empty value")
+        elif self.ref is not None or self.value is not None:
+            raise ValueError("load wait does not accept ref or value")
+        return self
+
+
+class DialogArgs(BaseModel):
+    accept: bool
+    prompt_text: str | None = Field(None, max_length=10_000)
+
+    @field_validator("prompt_text")
+    @classmethod
+    def validate_prompt_text(cls, value: str | None) -> str | None:
+        if value is not None and len(value.encode("utf-8")) > 10_000:
+            raise ValueError("browser dialog prompt text exceeds 10000 UTF-8 bytes")
+        return value
+
+    @model_validator(mode="after")
+    def validate_action(self) -> "DialogArgs":
+        if not self.accept and self.prompt_text is not None:
+            raise ValueError("browser dialog prompt text requires accept=true")
+        return self
+
+
 class ScrollArgs(BaseModel):
     direction: Literal["up", "down"] = "down"
     amount: int = Field(600, ge=50, le=5000)
@@ -1403,6 +1951,98 @@ class BrowserTypeTool(_BrowserTool):
         )
 
 
+class BrowserPressTool(_BrowserTool):
+    name = "browser_press"
+    description = (
+        "Press one bounded keyboard key/chord on the current page or a referenced "
+        "element and return the updated snapshot."
+    )
+    args_schema = PressArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = PressArgs(**kwargs)
+        return await self._result(self.session.press_key(args.key, ref=args.ref))
+
+
+class BrowserHoverTool(_BrowserTool):
+    name = "browser_hover"
+    description = (
+        "Hover one element reference from the latest browser snapshot and return "
+        "the updated snapshot."
+    )
+    args_schema = ElementArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = ElementArgs(**kwargs)
+        return await self._result(self.session.hover(args.ref))
+
+
+class BrowserSelectTool(_BrowserTool):
+    name = "browser_select"
+    description = (
+        "Select one or more option values in a referenced select control and "
+        "return the updated snapshot."
+    )
+    args_schema = SelectArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = SelectArgs(**kwargs)
+        return await self._result(self.session.select(args.ref, args.values))
+
+
+class BrowserDragTool(_BrowserTool):
+    name = "browser_drag"
+    description = (
+        "Drag one referenced browser element onto another referenced element from "
+        "the same current snapshot and return the updated snapshot."
+    )
+    args_schema = DragArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = DragArgs(**kwargs)
+        return await self._result(self.session.drag(args.source_ref, args.target_ref))
+
+
+class BrowserWaitTool(_BrowserTool):
+    name = "browser_wait"
+    description = (
+        "Wait up to 30 seconds for a referenced element, visible text, URL "
+        "substring, or page load state, then return a fresh snapshot."
+    )
+    args_schema = WaitArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = WaitArgs(**kwargs)
+        return await self._result(
+            self.session.wait_for(
+                condition=args.condition,
+                ref=args.ref,
+                value=args.value,
+                load_state=args.load_state,
+                timeout_seconds=args.timeout_seconds,
+            )
+        )
+
+
+class BrowserDialogTool(_BrowserTool):
+    name = "browser_dialog"
+    description = (
+        "Handle the currently pending alert, confirm, or prompt dialog by accepting "
+        "or dismissing it; prompt text is allowed only when accepting a prompt."
+    )
+    args_schema = DialogArgs
+    sensitive_argument_fields = frozenset({"prompt_text"})
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = DialogArgs(**kwargs)
+        return await self._result(
+            self.session.handle_dialog(
+                accept=args.accept,
+                prompt_text=args.prompt_text,
+            )
+        )
+
+
 class BrowserScrollTool(_BrowserTool):
     name = "browser_scroll"
     description = (
@@ -1545,6 +2185,12 @@ def build_browser_tools(
         BrowserCloseTabTool(safety_guard, session),
         BrowserClickTool(safety_guard, session),
         BrowserTypeTool(safety_guard, session),
+        BrowserPressTool(safety_guard, session),
+        BrowserHoverTool(safety_guard, session),
+        BrowserSelectTool(safety_guard, session),
+        BrowserDragTool(safety_guard, session),
+        BrowserWaitTool(safety_guard, session),
+        BrowserDialogTool(safety_guard, session),
         BrowserScrollTool(safety_guard, session),
         BrowserBackTool(safety_guard, session),
         BrowserScreenshotTool(safety_guard, session),

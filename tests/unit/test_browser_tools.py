@@ -23,13 +23,19 @@ from ash.tools.browser import (
     BrowserDownloadTool,
     BrowserScreenshotTool,
     BrowserClickTool,
+    BrowserDialogTool,
+    BrowserDragTool,
     BrowserFocusTabTool,
+    BrowserHoverTool,
     BrowserNavigateTool,
     BrowserOpenTabTool,
+    BrowserPressTool,
     BrowserScrollTool,
+    BrowserSelectTool,
     BrowserSnapshotTool,
     BrowserTabsTool,
     BrowserTypeTool,
+    BrowserWaitTool,
     inspect_cdp_source,
     _redact_browser_url,
     _validate_browser_url,
@@ -82,6 +88,39 @@ class FakeBrowserSession:
     ) -> str:
         self.calls.append(("type", (ref, text, submit, clear)))
         return "type snapshot"
+
+    async def press_key(self, key: str, *, ref: str | None = None) -> str:
+        self.calls.append(("press", (key, ref)))
+        return "press snapshot"
+
+    async def hover(self, ref: str) -> str:
+        self.calls.append(("hover", ref))
+        return "hover snapshot"
+
+    async def select(self, ref: str, values: list[str]) -> str:
+        self.calls.append(("select", (ref, values)))
+        return "select snapshot"
+
+    async def drag(self, source_ref: str, target_ref: str) -> str:
+        self.calls.append(("drag", (source_ref, target_ref)))
+        return "drag snapshot"
+
+    async def wait_for(
+        self,
+        *,
+        condition: str,
+        ref: str | None,
+        value: str | None,
+        load_state: str,
+        timeout_seconds: float,
+    ) -> str:
+        self.calls.append(
+            (
+                "wait",
+                (condition, ref, value, load_state, timeout_seconds),
+            )
+        )
+        return "wait snapshot"
 
     async def scroll(self, direction: str, amount: int) -> str:
         self.calls.append(("scroll", (direction, amount)))
@@ -196,6 +235,11 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         BrowserCloseTabTool(guard, session),  # type: ignore[arg-type]
         BrowserClickTool(guard, session),  # type: ignore[arg-type]
         BrowserTypeTool(guard, session),  # type: ignore[arg-type]
+        BrowserPressTool(guard, session),  # type: ignore[arg-type]
+        BrowserHoverTool(guard, session),  # type: ignore[arg-type]
+        BrowserSelectTool(guard, session),  # type: ignore[arg-type]
+        BrowserDragTool(guard, session),  # type: ignore[arg-type]
+        BrowserWaitTool(guard, session),  # type: ignore[arg-type]
         BrowserScrollTool(guard, session),  # type: ignore[arg-type]
         BrowserBackTool(guard, session),  # type: ignore[arg-type]
         BrowserScreenshotTool(guard, session),  # type: ignore[arg-type]
@@ -217,15 +261,30 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
             submit=True,
             clear=False,
         ),
-        await tools[8].run(direction="up", amount=250),
-        await tools[9].run(),
-        await tools[10].run(max_bytes=1_000_000),
+        await tools[8].run(key="Control+a", ref="tdeadbeef-1:s1:e3"),
+        await tools[9].run(ref="tdeadbeef-1:s1:e2"),
+        await tools[10].run(
+            ref="tdeadbeef-1:s1:e4",
+            values=["one", "two"],
+        ),
         await tools[11].run(
+            source_ref="tdeadbeef-1:s1:e2",
+            target_ref="tdeadbeef-1:s1:e4",
+        ),
+        await tools[12].run(
+            condition="text",
+            value="Done",
+            timeout_seconds=2.5,
+        ),
+        await tools[13].run(direction="up", amount=250),
+        await tools[14].run(),
+        await tools[15].run(max_bytes=1_000_000),
+        await tools[16].run(
             ref="tdeadbeef-1:s1:e4",
             file_path="docs/report.pdf",
             max_bytes=2_000_000,
         ),
-        await tools[12].run(
+        await tools[17].run(
             ref="tdeadbeef-1:s1:e5",
             file_path="downloads/report.pdf",
             max_bytes=4_000_000,
@@ -243,6 +302,11 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         ("close_tab", "tdeadbeef-2"),
         ("click", "tdeadbeef-1:s1:e2"),
         ("type", ("tdeadbeef-1:s1:e3", "hello", True, False)),
+        ("press", ("Control+a", "tdeadbeef-1:s1:e3")),
+        ("hover", "tdeadbeef-1:s1:e2"),
+        ("select", ("tdeadbeef-1:s1:e4", ["one", "two"])),
+        ("drag", ("tdeadbeef-1:s1:e2", "tdeadbeef-1:s1:e4")),
+        ("wait", ("text", None, "Done", "domcontentloaded", 2.5)),
         ("scroll", ("up", 250)),
         ("back", None),
         ("screenshot", 1_000_000),
@@ -253,8 +317,212 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         ),
     ]
     assert session.closed == 1
-    assert results[10].images[0]["sha256"] == "a" * 64
-    assert results[10].image_blocks[0]["data"] == "cG5nLWRhdGE="
+    assert results[15].images[0]["sha256"] == "a" * 64
+    assert results[15].image_blocks[0]["data"] == "cG5nLWRhdGE="
+
+
+def test_structured_browser_action_arguments_reject_unsafe_or_ambiguous_inputs() -> None:
+    with pytest.raises(ValueError, match="invalid modifier"):
+        BrowserPressTool.args_schema(key="Control+Control+a")
+
+    with pytest.raises(ValueError, match="ref_visible wait requires ref"):
+        BrowserWaitTool.args_schema(condition="ref_visible")
+    with pytest.raises(ValueError, match="text wait requires a non-empty value"):
+        BrowserWaitTool.args_schema(condition="text", value="   ")
+    with pytest.raises(ValueError, match="load wait does not accept ref or value"):
+        BrowserWaitTool.args_schema(condition="load", value="unexpected")
+
+    with pytest.raises(ValueError, match="at most 1000 UTF-8 bytes"):
+        BrowserSelectTool.args_schema(
+            ref="tdeadbeef-1:s1:e1",
+            values=["é" * 501],
+        )
+    with pytest.raises(ValueError, match="requires accept=true"):
+        BrowserDialogTool.args_schema(accept=False, prompt_text="secret")
+
+
+@pytest.mark.asyncio
+async def test_browser_session_structured_interactions_are_bounded_and_ref_scoped() -> None:
+    calls: list[tuple[str, Any]] = []
+
+    class Locator:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def press(self, key: str, *, timeout: int) -> None:
+            calls.append(("press", (self.name, key, timeout)))
+
+        async def hover(self, *, timeout: int) -> None:
+            calls.append(("hover", (self.name, timeout)))
+
+        async def select_option(self, values: list[str], *, timeout: int) -> None:
+            calls.append(("select", (self.name, values, timeout)))
+
+        async def drag_to(self, target: "Locator", *, timeout: int) -> None:
+            calls.append(("drag", (self.name, target.name, timeout)))
+
+        async def wait_for(self, *, state: str, timeout: int) -> None:
+            calls.append(("wait_ref", (self.name, state, timeout)))
+
+    class TextQuery:
+        def __init__(self, locator: Locator) -> None:
+            self.first = locator
+
+    class Keyboard:
+        async def press(self, key: str) -> None:
+            calls.append(("page_press", key))
+
+    class Page:
+        url = "https://example.test/ready"
+        keyboard = Keyboard()
+
+        def get_by_text(self, text: str, *, exact: bool) -> TextQuery:
+            calls.append(("get_by_text", (text, exact)))
+            return TextQuery(Locator("text"))
+
+        async def wait_for_load_state(self, state: str, *, timeout: int) -> None:
+            calls.append(("wait_load", (state, timeout)))
+
+    page = Page()
+    session = BrowserSession(timeout_seconds=1)
+    session.ensure_started = AsyncMock(return_value=page)  # type: ignore[method-assign]
+    locators = {
+        f"tdeadbeef-1:s1:e{index}": Locator(f"e{index}")
+        for index in range(1, 7)
+    }
+    session._locator = AsyncMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: locators[ref]
+    )
+    session._settle = AsyncMock()  # type: ignore[method-assign]
+    session.snapshot = AsyncMock(return_value="snapshot")  # type: ignore[method-assign]
+
+    assert await session.press_key("Control+a", ref="tdeadbeef-1:s1:e1") == "snapshot"
+    assert await session.press_key("Tab") == "snapshot"
+    assert await session.hover("tdeadbeef-1:s1:e2") == "snapshot"
+    assert await session.select("tdeadbeef-1:s1:e3", ["a", "b"]) == "snapshot"
+    assert (
+        await session.drag("tdeadbeef-1:s1:e4", "tdeadbeef-1:s1:e5")
+        == "snapshot"
+    )
+    assert (
+        await session.wait_for(
+            condition="ref_visible",
+            ref="tdeadbeef-1:s1:e6",
+            value=None,
+            load_state="domcontentloaded",
+            timeout_seconds=0.5,
+        )
+        == "snapshot"
+    )
+    assert (
+        await session.wait_for(
+            condition="text",
+            ref=None,
+            value="Done",
+            load_state="domcontentloaded",
+            timeout_seconds=0.5,
+        )
+        == "snapshot"
+    )
+    assert (
+        await session.wait_for(
+            condition="url_contains",
+            ref=None,
+            value="/ready",
+            load_state="domcontentloaded",
+            timeout_seconds=0.5,
+        )
+        == "snapshot"
+    )
+    assert (
+        await session.wait_for(
+            condition="load",
+            ref=None,
+            value=None,
+            load_state="load",
+            timeout_seconds=0.5,
+        )
+        == "snapshot"
+    )
+
+    assert ("press", ("e1", "Control+a", 1000)) in calls
+    assert ("page_press", "Tab") in calls
+    assert ("hover", ("e2", 1000)) in calls
+    assert ("select", ("e3", ["a", "b"], 1000)) in calls
+    assert ("drag", ("e4", "e5", 1000)) in calls
+    assert ("wait_ref", ("e6", "visible", 500)) in calls
+    assert ("get_by_text", ("Done", False)) in calls
+    assert ("wait_ref", ("text", "visible", 500)) in calls
+    assert ("wait_load", ("load", 500)) in calls
+
+
+@pytest.mark.asyncio
+async def test_browser_dialog_state_blocks_other_actions_and_supports_chained_dialogs() -> None:
+    class Dialog:
+        def __init__(self, kind: str, message: str) -> None:
+            self.type = kind
+            self.message = message
+            self.resolved = asyncio.Event()
+            self.accepted_prompt: str | None = None
+
+        async def accept(self, *, prompt_text: str | None = None) -> None:
+            self.accepted_prompt = prompt_text
+            self.resolved.set()
+
+        async def dismiss(self) -> None:
+            self.resolved.set()
+
+    class Page:
+        def __init__(self) -> None:
+            self.handlers: list[Any] = []
+
+        def on(self, event: str, handler: Any) -> None:
+            assert event == "dialog"
+            self.handlers.append(handler)
+
+        def remove_listener(self, event: str, handler: Any) -> None:
+            assert event == "dialog"
+            self.handlers.remove(handler)
+
+    page = Page()
+    confirm = Dialog("confirm", "Proceed?")
+    prompt = Dialog("prompt", "Name?")
+
+    class Locator:
+        async def click(self, *, timeout: int) -> None:
+            assert timeout == 1_000
+            for dialog in (confirm, prompt):
+                for handler in list(page.handlers):
+                    handler(dialog)
+                await dialog.resolved.wait()
+
+    session = BrowserSession(timeout_seconds=1)
+    session.ensure_started = AsyncMock(return_value=page)  # type: ignore[method-assign]
+    session._locator = AsyncMock(return_value=Locator())  # type: ignore[method-assign]
+    session._settle = AsyncMock()  # type: ignore[method-assign]
+    session._snapshot_once = AsyncMock(return_value="snapshot")  # type: ignore[method-assign]
+
+    first_modal = await session.click("tdeadbeef-1:s1:e1")
+
+    assert "Modal state:" in first_modal
+    assert "confirm dialog" in first_modal
+    assert "Proceed?" in first_modal
+    assert await session.snapshot() == first_modal
+    with pytest.raises(ValueError, match="pending dialog"):
+        await session.press_key("Tab")
+    with pytest.raises(ValueError, match="only valid for a prompt"):
+        await session.handle_dialog(accept=True, prompt_text="wrong")
+
+    second_modal = await session.handle_dialog(accept=True, prompt_text=None)
+
+    assert "prompt dialog" in second_modal
+    assert "Name?" in second_modal
+    completed = await session.handle_dialog(accept=True, prompt_text="Ash")
+
+    assert completed == "snapshot"
+    assert confirm.accepted_prompt is None
+    assert prompt.accepted_prompt == "Ash"
+    assert page.handlers == []
 
 
 @pytest.mark.asyncio
@@ -935,6 +1203,7 @@ async def test_browser_element_refs_are_bound_to_their_tab() -> None:
     session._snapshot_versions[first_id] = 1
     session._snapshot_versions[second_id] = 1
     session._page = second
+    session._snapshot_ref_scopes[f"{second_id}:s1:e1"] = second
 
     with pytest.raises(ValueError, match="belongs to another tab"):
         await session._locator(f"{first_id}:s1:e1")
@@ -981,6 +1250,98 @@ async def test_browser_snapshot_redacts_page_title(
 
     assert "title-secret" not in snapshot
     assert "Page: Dashboard [REDACTED]" in snapshot
+
+
+@pytest.mark.asyncio
+async def test_browser_snapshot_maps_iframe_refs_and_redacts_frame_passwords() -> None:
+    class ElementLocator:
+        async def count(self) -> int:
+            return 1
+
+    class AriaLocator:
+        async def aria_snapshot(self, **_kwargs: Any) -> str:
+            return '- textbox "Frame name"\n- textbox: frame-secret'
+
+    class FrameElement:
+        async def is_visible(self) -> bool:
+            return True
+
+    class MainFrame:
+        parent_frame = None
+
+    class ChildFrame:
+        parent_frame = MainFrame()
+        url = "https://frame.example/"
+
+        async def frame_element(self) -> FrameElement:
+            return FrameElement()
+
+        async def eval_on_selector_all(
+            self, selector: str, _script: str, options: Any = None
+        ) -> list[Any]:
+            if selector.startswith('input[type="password"]'):
+                return ["frame-secret"]
+            return [
+                {
+                    "ref": f"{options['refPrefix']}:e{options['startIndex'] + 1}",
+                    "role": "input",
+                    "text": "Frame name",
+                    "disabled": False,
+                }
+            ]
+
+        def locator(self, selector: str) -> Any:
+            if selector == "html":
+                return AriaLocator()
+            return ElementLocator()
+
+    child = ChildFrame()
+
+    class Page:
+        url = "https://example.com/"
+        frames = [MainFrame(), child]
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def title(self) -> str:
+            return "Example"
+
+        async def eval_on_selector_all(
+            self, selector: str, _script: str, options: Any = None
+        ) -> list[Any]:
+            if selector.startswith('input[type="password"]'):
+                return []
+            return [
+                {
+                    "ref": f"{options['refPrefix']}:e{options['startIndex'] + 1}",
+                    "role": "button",
+                    "text": "Top",
+                    "disabled": False,
+                }
+            ]
+
+        async def aria_snapshot(self, **_kwargs: Any) -> str:
+            return '- button "Top"\n- iframe'
+
+        def locator(self, _selector: str) -> ElementLocator:
+            return ElementLocator()
+
+    page = Page()
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._context = type("Context", (), {"pages": [page]})()
+    session._page = page
+
+    snapshot = await session.snapshot()
+
+    assert "[tdeadbeef-1:s1:e1] button 'Top'" in snapshot
+    assert "Frame f1: https://frame.example/" in snapshot
+    assert "[tdeadbeef-1:s1:e2] input 'Frame name'" in snapshot
+    assert "frame-secret" not in snapshot
+    assert "[REDACTED]" in snapshot
+    locator = await session._locator("tdeadbeef-1:s1:e2")
+    assert isinstance(locator, ElementLocator)
 
 
 @pytest.mark.asyncio
@@ -1593,6 +1954,12 @@ def test_browser_tools_share_one_lazy_session_and_permissions(tmp_path) -> None:
     assert (
         PermissionPolicy("interactive").evaluate("browser_tabs", {}).action
         == PolicyAction.ALLOW
+    )
+    assert (
+        PermissionPolicy("interactive")
+        .evaluate("browser_dialog", {"accept": True})
+        .action
+        == PolicyAction.ASK
     )
     assert (
         PermissionPolicy("interactive")

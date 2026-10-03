@@ -52,6 +52,7 @@ READ_ONLY_TOOLS = frozenset(
         "update_goal",
         "browser_snapshot",
         "browser_tabs",
+        "browser_wait",
         "ask_user",
         "test_slow_read",
         "test_cancellable_read",

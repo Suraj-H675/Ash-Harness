@@ -92,6 +92,201 @@ async def test_real_chromium_snapshot_fill_click_and_private_fetch_block() -> No
 
 
 @pytest.mark.asyncio
+async def test_real_chromium_structured_interactions_cover_modern_ui_flow() -> None:
+    session = BrowserSession(timeout_seconds=15)
+    page = await session.ensure_started()
+    try:
+        await page.set_content(
+            """
+            <main>
+              <label>Flavor
+                <select aria-label="Flavor">
+                  <option value="one">One</option>
+                  <option value="two">Two</option>
+                </select>
+              </label>
+              <label>Command
+                <input aria-label="Command"
+                  onkeydown="if(event.key==='Enter') document.querySelector('#key').textContent='Key:Enter'">
+              </label>
+              <div role="button" aria-label="Hover target"
+                onmouseenter="document.querySelector('#hover').textContent='Hovered'">Hover</div>
+              <div role="button" aria-label="Drag source" draggable="true"
+                ondragstart="event.dataTransfer.setData('text/plain','ash')">Drag source</div>
+              <div role="button" aria-label="Drop target"
+                ondragover="event.preventDefault()"
+                ondrop="event.preventDefault(); document.querySelector('#drop').textContent='Dropped:' + event.dataTransfer.getData('text/plain')">Drop target</div>
+              <button onclick="setTimeout(() => document.querySelector('#async').textContent='Ready', 100)">Start async</button>
+              <output id="key"></output>
+              <output id="hover"></output>
+              <output id="drop"></output>
+              <output id="async"></output>
+            </main>
+            """
+        )
+
+        initial = await session.snapshot()
+        flavor = re.search(r"\[([^]]+)] select 'Flavor'", initial)
+        assert flavor is not None
+        selected = await session.select(flavor.group(1), ["two"])
+        assert await page.locator('select[aria-label="Flavor"]').input_value() == "two"
+
+        command = re.search(r"\[([^]]+)] input 'Command'", selected)
+        assert command is not None
+        typed = await session.type_text(
+            command.group(1),
+            "build",
+            submit=False,
+            clear=True,
+        )
+        command = re.search(r"\[([^]]+)] input 'Command'", typed)
+        assert command is not None
+        pressed = await session.press_key("Enter", ref=command.group(1))
+        assert "Key:Enter" in pressed
+
+        hover = re.search(r"\[([^]]+)] button 'Hover target'", pressed)
+        assert hover is not None
+        hovered = await session.hover(hover.group(1))
+        assert "Hovered" in hovered
+
+        source = re.search(r"\[([^]]+)] button 'Drag source'", hovered)
+        target = re.search(r"\[([^]]+)] button 'Drop target'", hovered)
+        assert source is not None
+        assert target is not None
+        dragged = await session.drag(source.group(1), target.group(1))
+        assert "Dropped:ash" in dragged
+
+        start = re.search(r"\[([^]]+)] button 'Start async'", dragged)
+        assert start is not None
+        await session.click(start.group(1))
+        waited = await session.wait_for(
+            condition="text",
+            ref=None,
+            value="Ready",
+            load_state="domcontentloaded",
+            timeout_seconds=2,
+        )
+        assert "Ready" in waited
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_real_chromium_dialogs_are_explicit_modal_state() -> None:
+    session = BrowserSession(timeout_seconds=15)
+    page = await session.ensure_started()
+    try:
+        await page.set_content(
+            """
+            <main>
+              <button onclick="
+                if (confirm('Proceed?')) {
+                  const name = prompt('Name?');
+                  document.querySelector('#result').textContent =
+                    name === null ? 'Prompt cancelled' : 'Hello ' + name;
+                } else {
+                  document.querySelector('#result').textContent = 'Confirm cancelled';
+                }
+              ">Dialog flow</button>
+              <output id="result"></output>
+            </main>
+            """
+        )
+
+        initial = await session.snapshot()
+        trigger = re.search(r"\[([^]]+)] button 'Dialog flow'", initial)
+        assert trigger is not None
+
+        confirm_modal = await session.click(trigger.group(1))
+
+        assert "Modal state:" in confirm_modal
+        assert "confirm dialog" in confirm_modal
+        assert "Proceed?" in confirm_modal
+        assert await session.snapshot() == confirm_modal
+        with pytest.raises(ValueError, match="pending dialog"):
+            await session.press_key("Tab")
+        with pytest.raises(ValueError, match="only valid for a prompt"):
+            await session.handle_dialog(accept=True, prompt_text="wrong")
+
+        prompt_modal = await session.handle_dialog(accept=True, prompt_text=None)
+
+        assert "prompt dialog" in prompt_modal
+        assert "Name?" in prompt_modal
+        completed = await session.handle_dialog(accept=True, prompt_text="Ash")
+        assert "Hello Ash" in completed
+
+        trigger = re.search(r"\[([^]]+)] button 'Dialog flow'", completed)
+        assert trigger is not None
+        await session.click(trigger.group(1))
+        dismissed = await session.handle_dialog(accept=False, prompt_text=None)
+        assert "Confirm cancelled" in dismissed
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_real_chromium_iframe_controls_are_snapshot_scoped_and_actionable() -> None:
+    session = BrowserSession(timeout_seconds=15)
+    page = await session.ensure_started()
+    try:
+        await page.set_content(
+            """
+            <main>
+              <button>Top button</button>
+              <iframe id="visible-frame"></iframe>
+              <iframe id="hidden-frame" style="display:none"></iframe>
+            </main>
+            """
+        )
+        await page.locator("#visible-frame").evaluate(
+            "(element, html) => { element.srcdoc = html; }",
+            """
+            <main>
+              <label>Frame name <input aria-label="Frame name"></label>
+              <button onclick="
+                document.querySelector('#result').textContent =
+                  'Hello ' + document.querySelector('input').value
+              ">Frame greet</button>
+              <input type="password" value="frame-secret">
+              <output id="result"></output>
+            </main>
+            """,
+        )
+        await page.locator("#hidden-frame").evaluate(
+            """element => {
+              element.srcdoc = '<button aria-label="Hidden frame button">Hidden</button>';
+            }"""
+        )
+        await page.wait_for_timeout(150)
+
+        initial = await session.snapshot()
+
+        assert "Frame f1:" in initial
+        assert "Hidden frame button" not in initial
+        assert "frame-secret" not in initial
+        frame_name = re.search(r"\[([^]]+)] input 'Frame name'", initial)
+        frame_greet = re.search(r"\[([^]]+)] button 'Frame greet'", initial)
+        assert frame_name is not None
+        assert frame_greet is not None
+
+        typed = await session.type_text(
+            frame_name.group(1),
+            "Ash",
+            submit=False,
+            clear=True,
+        )
+        fresh_greet = re.search(r"\[([^]]+)] button 'Frame greet'", typed)
+        assert fresh_greet is not None
+
+        clicked = await session.click(fresh_greet.group(1))
+
+        assert "Hello Ash" in clicked
+        assert "frame-secret" not in clicked
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_real_chromium_popup_tabs_are_explicitly_selectable() -> None:
     session = BrowserSession(timeout_seconds=15)
     page = await session.ensure_started()
