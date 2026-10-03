@@ -36,6 +36,7 @@ from ash.plugins.lifecycle import (
     recover_plugin_lifecycle,
     set_local_plugin_enabled,
     uninstall_local_plugin,
+    validate_plugin_source,
 )
 from ash.plugins.state import (
     ExtensionState,
@@ -65,6 +66,8 @@ ExtensionAction = Literal[
     "agents",
     "plugins",
     "hooks",
+    "inspect",
+    "validate",
     "search",
     "install",
     "update",
@@ -72,6 +75,141 @@ ExtensionAction = Literal[
     "disable",
     "uninstall",
 ]
+
+
+def _manifest_components(manifest: PluginManifest) -> dict[str, Any]:
+    return {
+        "skills": list(manifest.skills),
+        "commands": [
+            item for item in manifest.commands if isinstance(item, str)
+        ],
+        "agents": [item for item in manifest.agents if isinstance(item, str)],
+        "hooks": [item for item in manifest.hooks if isinstance(item, str)],
+        "mcp_servers": [
+            item for item in manifest.mcp_servers if isinstance(item, str)
+        ],
+        "tools": [tool.name for tool in manifest.tools],
+    }
+
+
+def validate_plugin_for_author(source: str) -> dict[str, Any]:
+    """Validate a local plugin tree using the same immutable checks as install."""
+
+    root = Path(source).expanduser().absolute()
+    manifest = validate_plugin_source(root)
+    return {
+        "valid": True,
+        "name": manifest.name,
+        "version": manifest.version,
+        "schema_version": manifest.schema_version,
+        "root": str(root),
+        "components": _manifest_components(manifest),
+        "warnings": (
+            [manifest.deprecation_notice] if manifest.deprecation_notice is not None else []
+        ),
+    }
+
+
+def inspect_plugin(
+    target: str,
+    *,
+    workspace: Path,
+) -> dict[str, Any]:
+    """Inspect a local plugin tree or one plugin visible in the current workspace."""
+
+    candidate = Path(target).expanduser()
+    source = "path"
+    enabled: bool | None = None
+    if candidate.exists() or candidate.is_symlink():
+        root = candidate.absolute()
+    else:
+        from ash.plugins.inventory import discover_extensions
+
+        inventory = discover_extensions(workspace)
+        matches = [plugin for plugin in inventory.plugins if plugin.name == target]
+        if not matches:
+            raise PluginLifecycleError(f"plugin is not visible: {target}")
+        plugin = matches[0]
+        root = Path(plugin.root)
+        source = plugin.source
+        enabled = plugin.enabled
+
+    manifest = validate_plugin_source(root)
+    record = None
+    user_root = user_plugin_root().expanduser().absolute()
+    if root.parent == user_root and root.name == manifest.name:
+        record = load_plugin_install_records().get(manifest.name)
+
+    provenance = (
+        {
+            "origin": record.origin,
+            "source": record.source,
+            "ref": record.ref,
+            "digest": record.digest,
+            "publisher": record.publisher,
+        }
+        if record is not None
+        else None
+    )
+    return {
+        "name": manifest.name,
+        "version": manifest.version,
+        "schema_version": manifest.schema_version,
+        "description": manifest.description,
+        "root": str(root),
+        "source": source,
+        "enabled": enabled,
+        "runtime_protocol": (
+            manifest.runtime.protocol_version if manifest.runtime is not None else None
+        ),
+        "components": _manifest_components(manifest),
+        "dependencies": list(manifest.dependencies),
+        "provenance": provenance,
+        "warnings": (
+            [manifest.deprecation_notice] if manifest.deprecation_notice is not None else []
+        ),
+    }
+
+
+def render_plugin_inspection(
+    payload: Mapping[str, Any],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps(payload, sort_keys=True)
+
+    lines = [
+        f"Plugin: {safe_plugin_diagnostic(payload['name'])} "
+        f"{safe_plugin_diagnostic(payload['version'])}",
+        f"Root: {safe_plugin_diagnostic(payload['root'])}",
+    ]
+    if "valid" in payload:
+        lines.append("Validation: valid")
+    else:
+        lines.append(f"Source: {safe_plugin_diagnostic(payload['source'])}")
+        enabled = payload.get("enabled")
+        if enabled is not None:
+            lines.append(f"State: {'enabled' if enabled else 'disabled'}")
+        provenance = payload.get("provenance")
+        if isinstance(provenance, Mapping):
+            lines.append(
+                "Provenance: "
+                f"{safe_plugin_diagnostic(provenance['origin'])} "
+                f"{safe_plugin_diagnostic(provenance['source'])} "
+                f"@ {safe_plugin_diagnostic(provenance['ref'])}"
+            )
+    components = payload.get("components")
+    if isinstance(components, Mapping):
+        component_counts = ", ".join(
+            f"{name}={len(items)}"
+            for name, items in components.items()
+            if isinstance(items, list) and items
+        )
+        lines.append(f"Components: {component_counts or 'none'}")
+    for warning in payload.get("warnings", []):
+        lines.append(f"Warning: {safe_plugin_diagnostic(warning)}")
+    return "\n".join(lines)
 
 
 def safe_plugin_diagnostic(
@@ -130,17 +268,40 @@ def render_extension_inventory(
             lines.append("  (none)")
     if kind in {"all", "plugins"}:
         lines.append("Plugins:")
-        lines.extend(
-            f"  {plugin.name} {plugin.version} [{plugin.source}; "
-            f"{'enabled' if plugin.enabled else 'disabled'}] - "
-            f"{plugin.description or '(no description)'}"
-            + (
-                f" (runtime v{plugin.runtime_protocol}: {', '.join(plugin.tools)})"
-                if plugin.runtime_protocol is not None
-                else ""
+        for plugin in inventory.plugins:
+            provenance = ""
+            if plugin.provenance is not None:
+                publisher = (
+                    f"; publisher=@{safe_plugin_diagnostic(plugin.provenance.publisher)}"
+                    if plugin.provenance.publisher is not None
+                    else ""
+                )
+                provenance = (
+                    f"; {safe_plugin_diagnostic(plugin.provenance.origin)} "
+                    f"ref={safe_plugin_diagnostic(plugin.provenance.ref)}{publisher}"
+                )
+            plugin_name = safe_plugin_diagnostic(plugin.name)
+            plugin_version = safe_plugin_diagnostic(plugin.version)
+            plugin_source = safe_plugin_diagnostic(plugin.source)
+            plugin_description = safe_plugin_diagnostic(
+                plugin.description or "(no description)"
             )
-            for plugin in inventory.plugins
-        )
+            lines.append(
+                f"  {plugin_name} {plugin_version} [{plugin_source}; "
+                f"{'enabled' if plugin.enabled else 'disabled'}{provenance}] - "
+                f"{plugin_description}"
+                + (
+                    " (runtime "
+                    f"v{plugin.runtime_protocol}: "
+                    f"{', '.join(safe_plugin_diagnostic(tool) for tool in plugin.tools)})"
+                    if plugin.runtime_protocol is not None
+                    else ""
+                )
+            )
+            lines.extend(
+                f"    Warning: {safe_plugin_diagnostic(warning)}"
+                for warning in plugin.warnings
+            )
         if not inventory.plugins:
             lines.append("  (none)")
     if kind in {"all", "hooks"}:

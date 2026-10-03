@@ -127,6 +127,54 @@ def test_extensions_cli_reports_invalid_hook_config(
     assert "pre_tool hooks must be a list" in payload["errors"][0]
 
 
+def test_extension_inventory_surfaces_managed_provenance_and_schema_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    _write_plugin(home / ".ash" / "plugins", "example")
+    manifest_path = home / ".ash" / "plugins" / "example" / "plugin.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schemaVersion"] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    records_path = home / ".ash" / "plugins" / ".ash-install-records.json"
+    records_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {
+                    "example": {
+                        "version": "1.0.0",
+                        "source": "https://plugins.example/example.git",
+                        "ref": "v1.0.0",
+                        "digest": "a" * 40,
+                        "publisher": "ash",
+                        "origin": "catalog",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = json.loads(
+        render_extension_inventory(
+            discover_extensions(workspace),
+            kind="plugins",
+            json_output=True,
+        )
+    )
+
+    plugin = payload["plugins"][0]
+    assert plugin["provenance"]["origin"] == "catalog"
+    assert plugin["provenance"]["publisher"] == "ash"
+    assert plugin["provenance"]["ref"] == "v1.0.0"
+    assert "schemaVersion 1 is deprecated" in plugin["warnings"][0]
+
+
 def test_extensions_inventory_rejects_duplicate_hook_config_fields(
     tmp_path: Path,
     monkeypatch,
@@ -231,6 +279,55 @@ def test_plugin_action_human_rendering_neutralizes_terminal_controls() -> None:
     assert json.loads(render_plugin_action(result, json_output=True))["root"] == result["root"]
 
 
+def test_extension_inventory_human_rendering_neutralizes_plugin_metadata() -> None:
+    from ash.plugins.inventory import (
+        ExtensionInventory,
+        PluginProvenanceSummary,
+        PluginSummary,
+    )
+
+    inventory = ExtensionInventory(
+        workspace="/tmp/repo",
+        project_trusted=True,
+        skills=(),
+        agents=(),
+        plugins=(
+            PluginSummary(
+                name="demo",
+                version="1.0.0",
+                description="clean\x1b[2J\u202ehidden\u202c\nforged",
+                source="user",
+                root="/tmp/demo",
+                skills=(),
+                commands=(),
+                hooks=(),
+                mcp_servers=(),
+                agents=(),
+                runtime_protocol=None,
+                tools=(),
+                enabled=True,
+                provenance=PluginProvenanceSummary(
+                    origin="catalog",
+                    source="https://plugins.example/demo.git",
+                    ref="v1.0.0\x1b[2J",
+                    digest="a" * 40,
+                    publisher="ash",
+                ),
+                warnings=(),
+            ),
+        ),
+        hooks=(),
+        errors=(),
+    )
+
+    rendered = render_extension_inventory(inventory, kind="plugins")
+
+    assert "\x1b[2J" not in rendered
+    assert "\u202e" not in rendered
+    assert "\nforged" not in rendered
+    assert "clean\\x1b[2J\\u202ehidden\\u202c\\x0aforged" in rendered
+
+
 def test_extensions_inventory_reports_invalid_lifecycle_state(
     tmp_path: Path,
     monkeypatch,
@@ -326,6 +423,104 @@ def test_extensions_cli_requires_management_target(capsys) -> None:
     assert "requires a target" in capsys.readouterr().err
 
 
+def test_extensions_cli_validates_plugin_source_without_installing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = tmp_path / "source"
+    _write_plugin(tmp_path, "source")
+    manifest_path = source / "plugin.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["schemaVersion"] = 2
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert main(["extensions", "validate", str(source), "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["valid"] is True
+    assert result["name"] == "source"
+    assert result["schema_version"] == 2
+    assert result["components"]["skills"] == ["skills/plugin-review/SKILL.md"]
+    assert result["warnings"] == []
+    assert not (home / ".ash" / "plugins").exists()
+
+
+def test_extensions_cli_validate_reports_component_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plugin.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 2,
+                "name": "source",
+                "version": "1.0.0",
+                "skills": ["missing/SKILL.md"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(workspace)
+
+    assert main(["extensions", "validate", str(source)]) == 2
+    assert "component path does not exist" in capsys.readouterr().err
+
+
+def test_extensions_cli_inspects_visible_local_plugin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = tmp_path / "source"
+    _write_plugin(tmp_path, "source")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert main(["extensions", "install", str(source), "--json"]) == 0
+    capsys.readouterr()
+    assert main(["extensions", "inspect", "source", "--json"]) == 0
+    inspected = json.loads(capsys.readouterr().out)
+
+    assert inspected["name"] == "source"
+    assert inspected["source"] == "user"
+    assert inspected["enabled"] is True
+    assert inspected["components"]["skills"] == ["skills/plugin-review/SKILL.md"]
+    assert inspected["provenance"] is None
+
+
+def test_extensions_cli_inspect_accepts_local_plugin_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    source = tmp_path / "source"
+    _write_plugin(tmp_path, "source")
+    monkeypatch.chdir(workspace)
+
+    assert main(["extensions", "inspect", str(source), "--json"]) == 0
+    inspected = json.loads(capsys.readouterr().out)
+
+    assert inspected["name"] == "source"
+    assert inspected["source"] == "path"
+    assert inspected["enabled"] is None
+
+
 def test_extensions_cli_installs_https_git_plugin(
     tmp_path: Path,
     monkeypatch,
@@ -394,6 +589,12 @@ def test_extensions_cli_installs_https_git_plugin(
     assert installed["enabled"] is True
     assert Path(installed["root"]).is_relative_to(home / ".ash" / "plugins")
     assert not (Path(installed["root"]) / ".git").exists()
+
+    assert main(["extensions", "inspect", "source", "--json"]) == 0
+    inspected = json.loads(capsys.readouterr().out)
+    assert inspected["provenance"]["origin"] == "git"
+    assert inspected["provenance"]["source"] == "https://plugins.example/source.git"
+    assert inspected["provenance"]["ref"] == "main"
 
 
 def test_extensions_cli_rejects_non_https_and_missing_git_ref(capsys) -> None:

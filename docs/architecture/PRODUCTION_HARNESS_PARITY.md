@@ -148,6 +148,61 @@ at their bounded finish conditions. Do not reopen them for feature-count churn;
 reopen only for concrete evidence that an important supported provider/model,
 agent/workspace, or web/computer-interaction user need or claim is wrong.
 
+### P4 finite closure checklist
+
+P4 is bounded around whether a real user or extension author can safely add,
+discover, inspect, update, and operate capabilities without editing Ash core.
+It is not a mandate to recreate every extension type or public marketplace that
+exists in a broader assistant product.
+
+1. **P4A — MCP ecosystem conformance — CLOSED.** The current upstream stable
+   protocol remains 2026-07-28; Ash's existing hosted official-SDK conformance
+   covers that modern revision plus the advertised legacy compatibility,
+   lifecycle, interactions, trust, and transport surface. Optional capabilities
+   that Ash does not implement remain explicitly unclaimed. Upstream reference:
+   [MCP v2 protocol versions](https://ts.sdk.modelcontextprotocol.io/v2/protocol-versions).
+2. **P4B — Plugin authoring and lifecycle — OPEN.** Make the existing plugin
+   contract practical to author and diagnose, not merely safe to execute.
+   Installation, validation, inspection, local development, update, reload,
+   dependency handling, and failure recovery must form one understandable
+   workflow without weakening Plugin API isolation.
+3. **P4C — Skills, commands, hooks, and agents — OPEN.** Verify that the
+   non-executable extension surfaces have intentional installation/discovery,
+   namespacing, trust, activation, authoring, and lifecycle ergonomics. Prefer
+   the standard Agent Skills model; do not promote the legacy in-process
+   executable-skill compatibility API into the default runtime.
+4. **P4D — Discovery, provenance, and marketplace trust — OPEN.** Close the
+   user journey from finding an extension through trusted acquisition and
+   later update/removal. A first-party hosted public marketplace is required
+   only if evidence shows it is necessary to solve an important Ash workflow;
+   ecosystem size by itself is not a parity criterion.
+5. **P4E — Integrated extensibility conformance — OPEN.** Exercise realistic
+   install/use/reload/update/uninstall and failure/trust journeys, run a current
+   comparator pass, and make the user-facing support claims match the verified
+   boundary.
+
+### P4 finish flags
+
+- `P4A_MCP_ECOSYSTEM_CONFORMANCE = CLOSED`
+- `P4B_PLUGIN_AUTHORING_LIFECYCLE = OPEN`
+- `P4C_DECLARATIVE_EXTENSION_ERGONOMICS = OPEN`
+- `P4D_DISCOVERY_PROVENANCE_MARKETPLACE = OPEN`
+- `P4E_INTEGRATED_EXTENSIBILITY_CONFORMANCE = OPEN`
+- `P4_EXTENSIBILITY_ECOSYSTEM_PARITY = OPEN`
+
+These flags are the stop conditions for P4. Once all five are closed with
+current evidence, advance to P5 rather than continuing to add extension types
+or marketplace features for feature-count parity.
+
+The first P4B authoring/diagnostics slice adds immutable no-install validation
+and inspection through `ash extensions validate TARGET` and
+`ash extensions inspect TARGET`. Installed inventory now exposes managed
+Git/catalog provenance when present and surfaces deprecated manifest-schema
+warnings, including in the interactive `/plugins` inventory. This closes the
+previous gap where Ash persisted trust/provenance but ordinary users could not
+inspect it. P4B remains open for the remaining local authoring/development
+workflow rather than being declared complete from diagnostics alone.
+
 ### P1 finite closure checklist
 
 P1 is split into bounded sub-gates so provider work cannot become an endless

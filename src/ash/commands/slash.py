@@ -66,8 +66,8 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("skills", "List available instruction skills", "/skills [query]"),
     SlashCommand(
         "plugins",
-        "List or manage local and HTTPS Git plugins",
-        "/plugins [install PATH|URL --ref REF|update NAME|update --all|enable NAME|disable NAME|uninstall NAME --yes]",
+        "List or manage local, Git, and catalog plugins",
+        "/plugins [install PATH|URL|@publisher/name [--ref REF]|update NAME|update --all|enable NAME|disable NAME|uninstall NAME --yes]",
     ),
     SlashCommand(
         "reload-plugins", "Reload active plugin components", "/reload-plugins"

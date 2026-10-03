@@ -11,7 +11,7 @@ An executable plugin declares a runtime and at least one tool in `plugin.json`:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "name": "text-utils",
   "version": "1.0.0",
   "description": "Deterministic text utilities",
@@ -34,6 +34,22 @@ An executable plugin declares a runtime and at least one tool in `plugin.json`:
   ]
 }
 ```
+
+Schema version 2 is the current plugin manifest format. Schema version 1 is
+accepted only as a deprecated compatibility format and should not be used for
+new plugins.
+
+Before installing or publishing a local plugin, validate the complete tree with:
+
+```bash
+ash extensions validate /path/to/plugin
+ash extensions inspect /path/to/plugin
+```
+
+`validate` applies the same bounded immutable manifest/component checks used by
+installation without activating or copying the plugin. `inspect` reports the
+manifest, contributed components, dependencies, runtime protocol, and managed
+provenance when the inspected plugin was installed from a tracked remote source.
 
 `command` is an argv array and is never interpreted by a shell. Commands should
 be portable within the selected sandbox; relative files resolve from the plugin

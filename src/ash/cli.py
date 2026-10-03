@@ -1467,7 +1467,6 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 )
                 from ash.plugins.errors import PluginLifecycleError
                 from ash.plugins.state import load_extension_state
-                from ash.plugins.registry import PluginCatalog
                 from ash.safety.trust import is_workspace_trusted
                 from ash.plugins.catalog import default_catalog_source
 
@@ -1569,25 +1568,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         _print_mcp_reload_errors(reload_result.mcp_errors)
                     continue
 
-                roots = [(Path.home() / ".ash" / "plugins", "user")]
-                if is_workspace_trusted(loop.project_root):
-                    roots.append((loop.project_root / ".ash" / "plugins", "project"))
-                plugin_catalog = PluginCatalog(
-                    tuple(roots),
-                    disabled_plugins=load_extension_state().disabled_plugins,
+                from ash.commands.extensions import render_extension_inventory
+                from ash.plugins.inventory import discover_extensions
+
+                print(
+                    render_extension_inventory(
+                        discover_extensions(loop.project_root),
+                        kind="plugins",
+                    ),
+                    flush=True,
                 )
-                discovered = plugin_catalog.discover(include_disabled=True)
-                if not discovered:
-                    print("No plugins discovered.")
-                for plugin in discovered:
-                    print(
-                        f"{plugin.manifest.name} {plugin.manifest.version} "
-                        f"[{plugin.source}; "
-                        f"{'enabled' if plugin.enabled else 'disabled'}] - "
-                        f"{plugin.manifest.description}"
-                    )
-                for path, error in plugin_catalog.errors.items():
-                    print(f"Invalid plugin {path}: {error}", file=sys.stderr)
                 continue
             if command.name == "reload-plugins":
                 if arguments:
@@ -2800,6 +2790,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
             "agents",
             "plugins",
             "hooks",
+            "inspect",
+            "validate",
             "search",
             "install",
             "update",
@@ -4443,13 +4435,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
     if args.command == "extensions":
         from ash.commands.extensions import (
+            inspect_plugin,
             render_catalog_search,
+            render_plugin_inspection,
             search_catalog_plugins,
             manage_local_plugin,
             render_plugin_update_all,
             safe_plugin_diagnostic,
             update_all_local_plugins,
             update_local_plugin,
+            validate_plugin_for_author,
             render_extension_inventory,
             render_plugin_action,
         )
@@ -4457,6 +4452,44 @@ def _main_impl(argv: list[str] | None = None) -> int:
         from ash.plugins.errors import PluginLifecycleError
 
         action = args.extensions_action
+        if action in {"inspect", "validate"}:
+            if not args.extensions_target:
+                print(
+                    f"Error: `ash extensions {action}` requires a target",
+                    file=sys.stderr,
+                )
+                return 2
+            if (
+                args.replace
+                or args.yes
+                or args.extensions_all
+                or args.ref
+                or args.catalog
+            ):
+                print(
+                    f"Error: `ash extensions {action}` accepts only TARGET and --json",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                if action == "validate":
+                    result = validate_plugin_for_author(args.extensions_target)
+                else:
+                    extension_config, exit_code = _load_config_or_report(
+                        json_output=args.json,
+                        **_config_overrides_from_args(args),
+                    )
+                    if extension_config is None:
+                        return exit_code
+                    result = inspect_plugin(
+                        args.extensions_target,
+                        workspace=extension_config.workspace_root,
+                    )
+                print(render_plugin_inspection(result, json_output=args.json))
+            except (OSError, PluginLifecycleError, ValueError) as exc:
+                print(f"Error: {safe_plugin_diagnostic(exc)}", file=sys.stderr)
+                return 2
+            return 0
         if action in {"search", "install", "update", "enable", "disable", "uninstall"}:
             if args.extensions_all and action != "update":
                 print("Error: --all is only valid with update", file=sys.stderr)

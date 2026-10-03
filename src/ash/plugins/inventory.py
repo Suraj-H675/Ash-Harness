@@ -12,6 +12,10 @@ from ash.json_utils import strict_json_loads
 from ash.mcp.server import load_mcp_servers
 from ash.plugins.agents import AgentCatalog, AgentSource
 from ash.plugins.errors import PluginLifecycleError
+from ash.plugins.install_records import (
+    PluginInstallRecord,
+    load_plugin_install_records,
+)
 from ash.plugins.lifecycle import recover_plugin_lifecycle
 from ash.plugins.state import load_extension_state
 from ash.plugins.manifest import namespaced_plugin_tool_name
@@ -36,6 +40,15 @@ class AgentSummary:
 
 
 @dataclass(frozen=True)
+class PluginProvenanceSummary:
+    origin: str
+    source: str
+    ref: str
+    digest: str
+    publisher: str | None
+
+
+@dataclass(frozen=True)
 class PluginSummary:
     name: str
     version: str
@@ -50,6 +63,8 @@ class PluginSummary:
     runtime_protocol: int | None
     tools: tuple[str, ...]
     enabled: bool
+    provenance: PluginProvenanceSummary | None
+    warnings: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -108,6 +123,11 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
         disabled_plugins = frozenset()
         extension_state_available = False
         state_errors.append(str(exc))
+    try:
+        install_records = load_plugin_install_records()
+    except PluginLifecycleError as exc:
+        install_records = {}
+        state_errors.append(f"Cannot load plugin provenance: {exc}")
     plugin_catalog = PluginCatalog(
         tuple(plugin_roots), disabled_plugins=disabled_plugins
     )
@@ -232,6 +252,16 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
                     for tool in plugin.manifest.tools
                 ),
                 enabled=plugin.enabled,
+                provenance=_plugin_provenance(
+                    install_records.get(plugin.manifest.name)
+                    if plugin.source == "user"
+                    else None
+                ),
+                warnings=(
+                    (plugin.manifest.deprecation_notice,)
+                    if plugin.manifest.deprecation_notice is not None
+                    else ()
+                ),
             )
             for plugin in sorted(
                 discovered_plugins, key=lambda item: item.manifest.name
@@ -240,6 +270,21 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
         hooks=tuple(hooks),
         errors=tuple(errors),
     )
+
+
+def _plugin_provenance(
+    record: PluginInstallRecord | None,
+) -> PluginProvenanceSummary | None:
+    if record is None:
+        return None
+    return PluginProvenanceSummary(
+        origin=record.origin,
+        source=record.source,
+        ref=record.ref,
+        digest=record.digest,
+        publisher=record.publisher,
+    )
+
 
 def _discover_hooks(
     paths: list[tuple[Path, str]],

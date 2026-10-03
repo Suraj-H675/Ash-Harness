@@ -614,6 +614,53 @@ def set_local_plugin_enabled(
         raise _lifecycle_error("plugin lifecycle", exc) from exc
 
 
+def validate_plugin_source(source: Path) -> PluginManifest:
+    """Validate one local plugin tree without installing or activating it."""
+
+    source_path = source.expanduser().absolute()
+    try:
+        source_metadata = source_path.lstat()
+    except OSError as exc:
+        raise PluginLifecycleError(
+            f"plugin source is not available: {source_path}"
+        ) from exc
+    if stat.S_ISLNK(source_metadata.st_mode):
+        raise PluginLifecycleError(f"plugin source cannot be a link: {source_path}")
+    if not stat.S_ISDIR(source_metadata.st_mode):
+        raise PluginLifecycleError(f"plugin source is not a directory: {source_path}")
+
+    try:
+        with AnchoredDirectory.open(
+            source_path,
+            create=False,
+            private=False,
+            expected=source_metadata,
+        ) as source_directory:
+            with PluginSnapshot.capture(
+                source_directory,
+                max_files=MAX_PLUGIN_FILES,
+                max_bytes=MAX_PLUGIN_BYTES,
+                max_entries=MAX_PLUGIN_TREE_ENTRIES,
+                max_depth=MAX_PLUGIN_TREE_DEPTH,
+            ) as snapshot:
+                manifest = _load_manifest_snapshot(snapshot)
+                _validate_manifest_snapshot(manifest, snapshot)
+                validate_plugin_contents_at(snapshot, manifest)
+                source_directory.validation_path()
+                return manifest
+    except PluginLifecycleError:
+        raise
+    except (
+        AnchoredFilesystemError,
+        PluginSnapshotError,
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        raise PluginLifecycleError(f"invalid plugin source: {exc}") from exc
+
+
 def install_local_plugin(
     source: Path,
     *,

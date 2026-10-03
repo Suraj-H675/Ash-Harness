@@ -531,6 +531,10 @@ Ash is extensible without changing the core runtime:
   record instead of exposing a broken enabled graph;
 - validation for traversal, links, malformed manifests, oversized components,
   missing dependencies, and unsafe replacements;
+- `ash extensions validate TARGET` validates a local plugin tree with the same
+  immutable bounded manifest/component checks used during installation, while
+  `ash extensions inspect TARGET` reports its components, runtime contract,
+  warnings, and managed Git/catalog provenance without activating it;
 - update, enable, disable, uninstall, inventory, search, and atomic live reload;
 - isolated versioned JSON-RPC stdio for executable plugins;
 - lazy plugin startup with no ambient secrets or network access;
@@ -545,6 +549,29 @@ Ash is extensible without changing the core runtime:
 Critical pre-tool hooks fail closed. Observer-hook failures cannot corrupt a
 completed turn. Custom Markdown commands support arguments, namespaces,
 completion, and trusted user or project sources.
+
+Marketplace registration deliberately starts from an operator-trusted signing
+key rather than trusting a catalog's self-declared key. Put the publisher's
+verified Ed25519 public key in `~/.ash/catalog-keys.json` (or point
+`ASH_CATALOG_KEYS` at another user-owned file) using:
+
+```json
+{
+  "version": 1,
+  "keys": [
+    {
+      "keyId": "publisher-key-id",
+      "algorithm": "ed25519",
+      "publicKey": "<base64url-encoded 32-byte public key>"
+    }
+  ]
+}
+```
+
+Then `ash marketplace add https://catalog.example/plugins.json` verifies the signed catalog
+before persisting its publisher/source and signer fingerprint. The trusted key
+must come from an independently authenticated publisher channel; copying a key
+from the same untrusted catalog would defeat the trust bootstrap.
 
 ### Subagents and delegation
 
