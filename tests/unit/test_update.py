@@ -9,7 +9,13 @@ import urllib.error
 
 import pytest
 
-from ash.commands.update import apply_update, check_for_update, render_update_status
+from ash.commands.update import (
+    apply_update,
+    check_for_update,
+    render_update_status,
+    repair_installation,
+    require_managed_release_invocation,
+)
 from ash.installer import InstallError, InstallResult
 
 
@@ -54,6 +60,49 @@ def opener(payload: dict):
         raise AssertionError(f"unexpected URL: {request.full_url}")
 
     return open_request
+
+
+def test_managed_release_mutation_rejects_editable_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Distribution:
+        def read_text(self, name: str) -> str | None:
+            assert name == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": "file:///workspace/Ash-Harness",
+                    "dir_info": {"editable": True},
+                }
+            )
+
+    monkeypatch.setattr(
+        "ash.commands.update.importlib.metadata.distribution",
+        lambda _name: Distribution(),
+    )
+
+    with pytest.raises(ValueError, match="editable/source checkout"):
+        require_managed_release_invocation()
+
+
+def test_managed_release_mutation_accepts_noneditable_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Distribution:
+        def read_text(self, name: str) -> str | None:
+            assert name == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": "file:///verified/ash_ai-0.2.0-py3-none-any.whl",
+                    "archive_info": {"hash": "sha256=abc"},
+                }
+            )
+
+    monkeypatch.setattr(
+        "ash.commands.update.importlib.metadata.distribution",
+        lambda _name: Distribution(),
+    )
+
+    require_managed_release_invocation()
 
 
 def test_update_check_normalizes_release_tag_and_reports_upgrade() -> None:
@@ -391,3 +440,53 @@ def test_apply_update_json_noop_stays_machine_readable(capsys) -> None:
     assert payload["updated"] is False
     assert payload["update_available"] is False
     assert payload["latest_version"] == "0.2.0"
+
+
+def test_repair_reinstalls_exact_current_release_and_preserves_user_state_claim(
+    capsys,
+) -> None:
+    calls: list[str | None] = []
+
+    def installer(*, ref: str | None = None):
+        calls.append(ref)
+        return InstallResult("pipx", "/isolated/bin/ash", "ash 0.2.0")
+
+    assert repair_installation(
+        current_version="0.2.0",
+        installer=installer,
+    ) == 0
+    assert calls == ["ash-v0.2.0"]
+    output = capsys.readouterr().out
+    assert "repaired successfully" in output
+    assert "configuration, profiles, sessions, and extensions were preserved" in output
+    assert "doctor --connect" in output
+
+
+def test_repair_json_is_machine_readable(capsys) -> None:
+    def installer(*, ref: str | None = None):
+        assert ref == "ash-v0.2.0"
+        return InstallResult("uv", "/isolated/bin/ash", "ash 0.2.0")
+
+    assert repair_installation(
+        current_version="0.2.0",
+        installer=installer,
+        json_output=True,
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "executable": "/isolated/bin/ash",
+        "manager": "uv",
+        "release_tag": "ash-v0.2.0",
+        "repaired": True,
+        "shell_restart_required": False,
+        "version": "0.2.0",
+    }
+
+
+@pytest.mark.parametrize("version", ["0.2.0.dev1", "0.2.0+local"])
+def test_repair_rejects_development_or_local_builds(version: str) -> None:
+    def installer(*, ref: str | None = None):
+        raise AssertionError(f"installer must not run for {ref}")
+
+    with pytest.raises(ValueError, match="published Ash releases"):
+        repair_installation(current_version=version, installer=installer)

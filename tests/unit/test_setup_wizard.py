@@ -1156,6 +1156,107 @@ def test_provider_picker_accepts_name_search(
     assert selected.id == "openrouter"
 
 
+def test_first_run_provider_scope_defaults_to_common_cloud_apis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import _prompt_first_run_provider_scope
+
+    monkeypatch.setattr("ash.commands.setup.get_env_value", lambda _name: None)
+    monkeypatch.setattr("builtins.input", _fake_input(["1"]))
+
+    selected = _prompt_first_run_provider_scope(
+        SimpleNamespace(model="", openai_auth_mode="api_key")
+    )
+
+    assert [descriptor.id for descriptor in selected] == [
+        "anthropic",
+        "openai",
+        "google",
+    ]
+
+
+def test_first_run_provider_scope_surfaces_detected_route_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import _prompt_first_run_provider_scope
+
+    monkeypatch.setattr(
+        "ash.commands.setup.get_env_value",
+        lambda name: "secret" if name == "OPENAI_API_KEY" else None,
+    )
+    monkeypatch.setattr("builtins.input", _fake_input(["1"]))
+
+    selected = _prompt_first_run_provider_scope(
+        SimpleNamespace(model="", openai_auth_mode="api_key")
+    )
+
+    assert [descriptor.id for descriptor in selected] == ["openai"]
+
+
+def test_scoped_provider_picker_rejects_hidden_global_number(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands.setup import PROVIDERS, _prompt_provider
+
+    gateways = [descriptor for descriptor in PROVIDERS if descriptor.category == "Gateway"]
+    monkeypatch.setattr("ash.commands.setup.get_env_value", lambda _name: None)
+    monkeypatch.setattr("builtins.input", _fake_input(["1", "7"]))
+
+    selected = _prompt_provider(
+        SimpleNamespace(model="", openai_auth_mode="api_key"),
+        initial_scope=gateways,
+    )
+
+    assert selected.id == "openrouter"
+    assert "Invalid choice." in capsys.readouterr().out
+
+
+def test_provider_catalog_marks_filtered_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands.setup import PROVIDERS, _render_provider_catalog
+
+    monkeypatch.setattr("ash.commands.setup.get_env_value", lambda _name: None)
+    common = [
+        descriptor
+        for descriptor in PROVIDERS
+        if descriptor.id in {"anthropic", "openai", "google"}
+    ]
+
+    _render_provider_catalog(
+        SimpleNamespace(model="", openai_auth_mode="api_key"),
+        common,
+    )
+
+    assert "3 shown / 21 routes" in capsys.readouterr().out
+
+
+def test_large_setup_choice_menu_renders_numbered_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands.setup import _prompt_choice
+
+    monkeypatch.setattr("builtins.input", _fake_input(["2"]))
+    options = [
+        "Common cloud APIs",
+        "Other cloud APIs",
+        "Gateways and routers",
+        "Enterprise cloud",
+        "Local runtimes",
+    ]
+
+    assert _prompt_choice("How do you want to connect Ash?", options, 0) == 1
+
+    output = capsys.readouterr().out
+    assert "How do you want to connect Ash?:" in output
+    assert "[1] Common cloud APIs (default)" in output
+    assert "[5] Local runtimes" in output
+    assert "'Common cloud APIs'/'Other cloud APIs'" not in output
+
+
 def test_model_picker_bounds_large_catalog_and_filters(
     monkeypatch: pytest.MonkeyPatch,
     capsys,
@@ -1570,6 +1671,8 @@ class TestCmdSetup:
         output = capsys.readouterr().out
         assert "Ash is configured for" in output
         assert "doctor --connect" in output
+        assert "providers test" in output
+        assert "does not make a billable model completion request" in output
 
     def test_status_json_is_secret_free_and_reports_capabilities(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
@@ -1767,7 +1870,11 @@ class TestBrowserSetup:
 class TestSetupNavigation:
     @pytest.mark.parametrize(
         ("section", "entrypoint"),
-        [("model", "setup_model_provider"), ("providers", "setup_providers")],
+        [
+            ("model", "setup_model_provider"),
+            ("fallbacks", "setup_providers"),
+            ("providers", "setup_providers"),
+        ],
     )
     def test_setup_sections_dispatch_to_their_distinct_entrypoints(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1818,6 +1925,7 @@ class TestSetupNavigation:
 
         assert result == SetupOutcome.SUCCESS
         output = capsys.readouterr().out
+        assert "Model Fallbacks" in output
         assert "Primary: openai/primary" in output
         assert "1. anthropic/backup" in output
         assert "2. ollama/local" in output
@@ -1971,6 +2079,7 @@ class TestSetupNavigation:
         output = capsys.readouterr().out
         assert "reused" in output.lower()
         assert "doctor --connect" in output
+        assert "providers test" in output
         assert "sk-quick-test" not in output
 
     def test_quick_partial_route_enters_provider_flow_once(
@@ -2005,6 +2114,10 @@ class TestSetupNavigation:
                 "ash.commands.setup.setup_model_provider",
                 return_value=SetupOutcome.SUCCESS,
             ),
+            patch(
+                "ash.commands.setup._has_provider_configured",
+                return_value=True,
+            ),
             patch("ash.commands.setup.setup_web_search") as web_setup,
             patch("ash.commands.setup._print_header"),
         ):
@@ -2014,6 +2127,8 @@ class TestSetupNavigation:
         web_setup.assert_not_called()
         output = capsys.readouterr().out
         assert "QuickStart skipped optional web search and browser setup." in output
+        assert "Setup saved." in output
+        assert "providers test" in output
 
     def test_cancelled_quick_setup_does_not_print_complete(
         self, monkeypatch: pytest.MonkeyPatch, capsys
@@ -2043,7 +2158,7 @@ class TestSetupNavigation:
     ) -> None:
         from ash.commands.setup import SetupOutcome, select_provider_and_model
 
-        monkeypatch.setattr("builtins.input", _fake_input(["invalid", "c"]))
+        monkeypatch.setattr("builtins.input", _fake_input(["1", "invalid", "c"]))
         with patch("ash.commands.setup._flow_openai") as flow:
             result = select_provider_and_model(SimpleNamespace(model=""))
 
@@ -2066,7 +2181,7 @@ class TestSetupNavigation:
         from ash.commands.setup import SetupOutcome, select_provider_and_model
 
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.setattr("builtins.input", _fake_input(["1", "c"]))
+        monkeypatch.setattr("builtins.input", _fake_input(["1", "1", "c"]))
         monkeypatch.setattr("ash.commands.setup.getpass.getpass", _FakeGetpass(""))
 
         assert select_provider_and_model(MagicMock(model="")) == SetupOutcome.CANCELLED

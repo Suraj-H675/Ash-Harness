@@ -28,6 +28,39 @@ PROJECT_METADATA_API = (
 MAX_RESPONSE_BYTES = 1_000_000
 
 
+def require_managed_release_invocation() -> None:
+    """Refuse install mutation from an editable/source checkout."""
+
+    try:
+        distribution = importlib.metadata.distribution("ash-ai")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise ValueError(
+            "Ash install ownership cannot be verified from this process. "
+            "Run the command from the managed pipx/uv Ash executable."
+        ) from exc
+    raw = distribution.read_text("direct_url.json")
+    if not raw:
+        return
+    try:
+        payload = strict_json_loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(
+            "Ash install origin metadata is invalid; reinstall through the "
+            "managed pipx/uv path before mutating the installation."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "Ash install origin metadata is invalid; reinstall through the "
+            "managed pipx/uv path before mutating the installation."
+        )
+    directory_info = payload.get("dir_info")
+    if isinstance(directory_info, dict) and directory_info.get("editable") is True:
+        raise ValueError(
+            "This Ash process is running from an editable/source checkout. "
+            "Run update or repair from the managed pipx/uv Ash executable instead."
+        )
+
+
 @dataclass(frozen=True)
 class UpdateStatus:
     current_version: str
@@ -248,6 +281,56 @@ def apply_update(
         f"Ash updated successfully ({result.version}) via {result.manager}. "
         "Run `ash doctor --connect` to verify provider connectivity."
     )
+    return 0
+
+
+def repair_installation(
+    *,
+    current_version: str | None = None,
+    installer: Callable[..., InstallResult] = install_ash,
+    json_output: bool = False,
+) -> int:
+    """Reinstall the exact currently installed immutable Ash release."""
+
+    current = current_version or _installed_version()
+    try:
+        parsed = Version(current)
+    except InvalidVersion as exc:
+        raise ValueError(f"Installed Ash version is invalid: {current!r}") from exc
+    if parsed.is_devrelease or parsed.local is not None:
+        raise ValueError(
+            "Repair is available only for published Ash releases; "
+            "development/local builds should be reinstalled from their development environment."
+        )
+    release_tag = f"ash-v{current}"
+    try:
+        result = installer(ref=release_tag)
+    except InstallError as exc:
+        raise ValueError(str(exc)) from exc
+    except OSError as exc:
+        raise ValueError(f"Ash installer could not start: {exc}") from exc
+    installed_version = _version_from_installer_result(result.version)
+    if installed_version != parsed:
+        raise ValueError(
+            "Ash repair completed but the installed version "
+            f"{installed_version} does not match expected {parsed}"
+        )
+    payload = {
+        "repaired": True,
+        "version": str(parsed),
+        "release_tag": release_tag,
+        "manager": result.manager,
+        "executable": result.executable,
+        "shell_restart_required": result.shell_restart_required,
+    }
+    if json_output:
+        print(json.dumps(payload, sort_keys=True))
+        return 0
+    print(
+        f"Ash {parsed} repaired successfully via {result.manager}. "
+        "User configuration, profiles, sessions, and extensions were preserved."
+    )
+    print("Run 'ash doctor --connect' to verify the repaired installation.")
     return 0
 
 

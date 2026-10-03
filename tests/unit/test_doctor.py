@@ -14,15 +14,21 @@ from ash.commands.doctor import (
     _check_credentials,
     _check_lsp,
     _check_observability,
+    _check_mcp,
     _check_storage,
     _check_connectivity,
+    _check_workspace,
     _check_web_search,
 )
 from ash.automation.schedules import build_schedule
 from ash.automation.store import AutomationStore
 from ash.config import AshConfig
 from ash.lsp.config import LSPServerConfig
-from ash.providers.readiness import ProviderConnection, ProviderVerification
+from ash.providers.readiness import (
+    ProviderConnection,
+    ProviderVerification,
+    ProviderVerificationError,
+)
 from .provider_test_helpers import patch_catalog_client
 
 
@@ -217,6 +223,29 @@ async def test_connectivity_fails_when_selected_model_is_not_advertised(
 
 
 @pytest.mark.asyncio
+async def test_connectivity_verification_failure_has_direct_remedy(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "ash.commands.doctor.verify_provider_connection",
+        lambda _config: (_ for _ in ()).throw(
+            ProviderVerificationError("catalog endpoint rejected the request")
+        ),
+    )
+
+    check = await _check_connectivity(
+        AshConfig(model="openai/test-model", workspace_root=tmp_path)
+    )
+
+    assert check.status == "fail"
+    assert "catalog endpoint rejected" in check.message
+    assert "ash providers test" in check.remedy
+    assert "ash setup model" in check.remedy
+
+
+@pytest.mark.asyncio
 async def test_connectivity_checks_anthropic_catalog_with_runtime_headers(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -298,6 +327,29 @@ def test_storage_check_reports_sqlite_open_failures(
     assert check.name == "storage"
     assert check.status == "fail"
     assert "unable to open database file" in check.message
+    assert "ash storage check" in check.remedy
+
+
+def test_workspace_check_failure_has_direct_remedy(tmp_path) -> None:
+    missing = tmp_path / "missing"
+
+    check = _check_workspace(AshConfig(workspace_root=missing))
+
+    assert check.status == "fail"
+    assert "Not a directory" in check.message
+    assert "ASH_WORKSPACE_ROOT" in check.remedy
+
+
+def test_mcp_check_failure_has_direct_remedy(tmp_path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / ".mcp.json").write_text("{not-json", encoding="utf-8")
+
+    check = _check_mcp(AshConfig(workspace_root=workspace))
+
+    assert check.status == "fail"
+    assert "Invalid .mcp.json" in check.message
+    assert "ash mcp status" in check.remedy
 
 
 def test_storage_check_preserves_pre_existing_doctor_database(tmp_path) -> None:

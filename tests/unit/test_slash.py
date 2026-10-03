@@ -43,6 +43,18 @@ def test_help_lists_core_session_commands() -> None:
         "/memory [status|index PATH|index-workspace [LIMIT]|search QUERY|export|clear]"
         in rendered
     )
+    assert max(len(line) for line in rendered.splitlines()) < 140
+
+
+def test_help_places_long_usage_description_on_next_line() -> None:
+    rendered = render_help("mcp")
+    lines = rendered.splitlines()
+
+    assert lines[0].startswith("/mcp [status")
+    assert any(
+        line.startswith("  Inspect, authorize, or reload live MCP servers")
+        for line in lines[1:]
+    )
 
 
 def test_help_filters_by_command_alias_and_description() -> None:

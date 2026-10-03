@@ -778,6 +778,34 @@ def test_untrusted_project_config_is_inert(
     assert config.config_diagnostics == ()
 
 
+def test_explicit_workspace_trust_override_controls_project_config_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ash.safety.trust import set_workspace_trusted
+
+    _use_temporary_trust_store(tmp_path, monkeypatch)
+    root = tmp_path / "repo"
+    _make_git_root(root)
+    (root / ".ash").mkdir()
+    project_config = root / ".ash" / "config.toml"
+    project_config.write_text(
+        'model = "ollama/project-model"\ntemperature = 0.7\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(root)
+    set_workspace_trusted(root, True)
+
+    trusted = AshConfig.load(_workspace_trust_override=True)
+    denied = AshConfig.load(_workspace_trust_override=False)
+
+    assert trusted.model == "ollama/project-model"
+    assert trusted.temperature == 0.7
+    assert trusted.config_source("model") == ("project", str(project_config))
+    assert denied.model == "anthropic/claude-sonnet-5-5"
+    assert denied.temperature == 0.0
+    assert denied.config_source("model")[0] == "default"
+
+
 def test_trusted_project_layers_have_precise_precedence_and_provenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

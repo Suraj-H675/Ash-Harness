@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shlex
+import textwrap
 from dataclasses import dataclass
 
 
@@ -19,7 +20,9 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("status", "Show session and runtime status", "/status"),
     SlashCommand("cancel", "Cancel the running turn", "/cancel"),
     SlashCommand(
-        "model", "Choose or switch the active model", "/model [provider/model]"
+        "model",
+        "Switch this session's model; ash setup model saves a default",
+        "/model [provider/model]",
     ),
     SlashCommand(
         "models",
@@ -30,6 +33,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("sessions", "List or search recent sessions", "/sessions [query]"),
     SlashCommand("resume", "Resume a session by ID or name", "/resume [session]"),
     SlashCommand("rename", "Rename the current session", "/rename <title>"),
+    SlashCommand(
+        "recovery",
+        "Inspect interrupted-turn recovery and items needing attention",
+        "/recovery",
+    ),
     SlashCommand(
         "fork",
         "Fork the session at a message boundary",
@@ -91,8 +99,8 @@ COMMANDS: tuple[SlashCommand, ...] = (
     ),
     SlashCommand(
         "permissions",
-        "Inspect/change mode or grants",
-        "/permissions [mode|allow TOOL|ask TOOL|deny TOOL|revoke TOOL|remove RULE_ID]",
+        "Inspect modes/rules or change this session's mode",
+        "/permissions [modes|MODE|allow TOOL|ask TOOL|deny TOOL|revoke TOOL|remove RULE_ID]",
     ),
     SlashCommand("sandbox", "Show active sandbox capabilities", "/sandbox"),
     SlashCommand(
@@ -153,12 +161,24 @@ def render_help(query: str | None = None) -> str:
     commands = matching_commands(query)
     if not commands:
         return f"No slash commands match {query!r}."
-    width = max(len(command.usage) for command in commands)
-    return "\n".join(
-        f"{command.usage:<{width}}  {command.description}"
-        f"{_render_aliases(command.aliases)}"
-        for command in commands
-    )
+    width = min(max(len(command.usage) for command in commands), 48)
+    lines: list[str] = []
+    for command in commands:
+        suffix = command.description + _render_aliases(command.aliases)
+        if len(command.usage) > width:
+            lines.extend(
+                textwrap.wrap(
+                    command.usage,
+                    width=96,
+                    subsequent_indent="  ",
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                )
+            )
+            lines.append(f"  {suffix}")
+        else:
+            lines.append(f"{command.usage:<{width}}  {suffix}")
+    return "\n".join(lines)
 
 
 def _command_matches(command: SlashCommand, query: str) -> bool:

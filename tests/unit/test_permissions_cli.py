@@ -6,9 +6,53 @@ from pathlib import Path
 import pytest
 
 from ash.cli import main
-from ash.commands.permissions import build_argument_matchers, render_permission_grants
+from ash.commands.permissions import (
+    build_argument_matchers,
+    render_permission_grants,
+    render_permission_modes,
+)
 from ash.safety.grants import MatchOperator, load_permission_rules, load_tool_grants, set_tool_grant
 from ash.safety.policy import PermissionPolicy, PolicyAction
+
+
+def test_permission_mode_guide_is_plain_language_and_machine_readable() -> None:
+    human = render_permission_modes("interactive")
+    assert "interactive (current)" in human
+    assert "Read-only tools run automatically" in human
+    assert "auto_approve" in human
+    assert "aggregate sandbox resource containment" in human
+    assert "dry_run" in human
+
+    payload = json.loads(render_permission_modes("plan", json_output=True))
+    assert payload["current_mode"] == "plan"
+    assert [item["mode"] for item in payload["modes"]] == [
+        "interactive",
+        "auto_edit",
+        "plan",
+        "auto_approve",
+        "dry_run",
+    ]
+    assert next(item for item in payload["modes"] if item["mode"] == "plan")[
+        "current"
+    ] is True
+
+
+def test_permissions_cli_explains_modes_without_mutating_rules(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert main(["permissions", "modes", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["current_mode"] == "interactive"
+    assert len(payload["modes"]) == 5
+    assert load_permission_rules(workspace) == []
 
 
 def test_permission_grant_renderer_emits_json(tmp_path: Path) -> None:

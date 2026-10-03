@@ -271,7 +271,11 @@ def _check_storage(config: AshConfig) -> DoctorCheck:
         result = DoctorCheck("storage", "pass", str(pinned.path.parent))
     except (OSError, sqlite3.Error, ValueError, SQLitePathError) as exc:
         result = DoctorCheck(
-            "storage", "fail", f"Database directory is not writable: {exc}"
+            "storage",
+            "fail",
+            f"Database directory is not writable: {exc}",
+            "Run ash storage check; repair the directory permissions or choose "
+            "a writable ASH_DB_DIRECTORY before retrying.",
         )
 
     cleanup_errors: list[str] = []
@@ -306,6 +310,8 @@ def _check_storage(config: AshConfig) -> DoctorCheck:
             "storage",
             "fail",
             f"{result.message}; cleanup failed: {'; '.join(cleanup_errors)}",
+            "Run ash storage check; inspect the database directory before "
+            "retrying Ash.",
         )
     return result
 
@@ -429,9 +435,21 @@ def _check_automation(config: AshConfig) -> DoctorCheck:
 def _check_workspace(config: AshConfig) -> DoctorCheck:
     root = config.workspace_root.expanduser().resolve()
     if not root.is_dir():
-        return DoctorCheck("workspace", "fail", f"Not a directory: {root}")
+        return DoctorCheck(
+            "workspace",
+            "fail",
+            f"Not a directory: {root}",
+            "Start Ash from an existing project directory or set "
+            "ASH_WORKSPACE_ROOT to one.",
+        )
     if not os.access(root, os.R_OK | os.W_OK):
-        return DoctorCheck("workspace", "fail", f"Not readable and writable: {root}")
+        return DoctorCheck(
+            "workspace",
+            "fail",
+            f"Not readable and writable: {root}",
+            "Fix the project directory permissions or choose a readable and "
+            "writable ASH_WORKSPACE_ROOT.",
+        )
     return DoctorCheck("workspace", "pass", str(root))
 
 
@@ -442,7 +460,13 @@ def _check_mcp(config: AshConfig) -> DoctorCheck:
     try:
         servers = load_mcp_servers(path)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-        return DoctorCheck("mcp", "fail", f"Invalid {path.name}: {exc}")
+        return DoctorCheck(
+            "mcp",
+            "fail",
+            f"Invalid {path.name}: {exc}",
+            "Repair or remove the invalid .mcp.json, then run ash mcp status "
+            "and ash doctor again.",
+        )
     return DoctorCheck("mcp", "pass", f"{len(servers)} server(s) configured")
 
 
@@ -496,7 +520,7 @@ def _check_a2a(config: AshConfig) -> DoctorCheck:
         {
             agent.token_env
             for agent in agents.values()
-            if not os.environ.get(agent.token_env)
+            if agent.token_env and not os.environ.get(agent.token_env)
         }
     )
     if missing:
@@ -569,7 +593,13 @@ async def _check_connectivity(config: AshConfig) -> DoctorCheck:
     except (ProviderConfigurationError, ValueError) as exc:
         return DoctorCheck("connectivity", "fail", str(exc), "Run ash setup.")
     except ProviderVerificationError as exc:
-        return DoctorCheck("connectivity", "fail", str(exc))
+        return DoctorCheck(
+            "connectivity",
+            "fail",
+            str(exc),
+            "Run ash providers test for bounded completion diagnostics, or "
+            "ash setup model to select or repair the route.",
+        )
 
     connection = verification.connection
 

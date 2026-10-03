@@ -24,6 +24,7 @@ canonical `ash.*` namespace under `src/ash`.
 - [Extension authoring](guides/EXTENSIONS.md)
 - [Permissions and managed policy](guides/PERMISSIONS.md)
 - [Remote access](guides/REMOTE_ACCESS.md)
+- [Maintenance and recovery](guides/MAINTENANCE.md)
 - [Releasing Ash](guides/RELEASING.md)
 
 ## Reference

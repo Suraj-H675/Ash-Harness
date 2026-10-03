@@ -114,6 +114,7 @@ WEB_SEARCH_PROVIDERS = (
 _PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 BROWSER_INSTALL_TIMEOUT_SECONDS = 300
 SETUP_MODEL_PREVIEW_LIMIT = 18
+FIRST_RUN_COMMON_PROVIDER_IDS = frozenset({"anthropic", "openai", "google"})
 
 
 @dataclass(frozen=True)
@@ -450,7 +451,7 @@ def run_setup_wizard(args) -> SetupOutcome:
                 "Ash is configured for "
                 f"{terminal_safe_text(str(config.model), single_line=True)}."
             )
-            print("Run 'ash doctor --connect' to verify endpoint connectivity.")
+            _print_inference_verification_guidance()
             return SetupOutcome.SUCCESS
         print("Error: ash setup requires an interactive terminal.", file=sys.stderr)
         print(
@@ -470,7 +471,7 @@ def run_setup_wizard(args) -> SetupOutcome:
     setup_result = SetupOutcome.SUCCESS
     if section == "model":
         setup_result = setup_model_provider(config, quick=quick)
-    elif section == "providers":
+    elif section in {"fallbacks", "providers"}:
         setup_result = setup_providers(config, quick=quick)
     elif section == "all":
         keep_existing = False
@@ -512,7 +513,9 @@ def run_setup_wizard(args) -> SetupOutcome:
         # summary failure must not turn a successful setup into a false error.
         pass
     _render_setup_status(config, title="Setup complete")
-    _print_info("Setup complete!")
+    _print_info("Setup saved.")
+    if section in {"model", "all"} and _has_provider_configured(config):
+        _print_inference_verification_guidance()
     return SetupOutcome.SUCCESS
 
 
@@ -521,9 +524,20 @@ def setup_model_provider(config, *, quick: bool = False) -> SetupOutcome:
     if quick and _has_provider_configured(config):
         model = str(getattr(config, "model", "") or "current model")
         _print_info(f"QuickStart reused {model}.")
-        print("Run 'ash doctor --connect' to verify endpoint connectivity.")
+        _print_inference_verification_guidance()
         return SetupOutcome.SUCCESS
     return select_provider_and_model(config)
+
+
+def _print_inference_verification_guidance() -> None:
+    print(
+        "Route configuration is saved; setup does not make a billable model "
+        "completion request."
+    )
+    print(
+        "Run 'ash doctor --connect' for a non-billable connectivity/catalog check, "
+        "or 'ash providers test' for one bounded real completion."
+    )
 
 
 def _choose_provider_management_action() -> ProviderManagementAction:
@@ -566,11 +580,11 @@ def _handle_add_fallback(config) -> SetupOutcome:
 
 
 def setup_providers(config, *, quick: bool = False) -> SetupOutcome:
-    """Manage configured provider fallbacks."""
+    """Manage the configured model fallback chain."""
     del quick
     fallbacks = list(getattr(config, "fallback_models", []) or [])
     while True:
-        _print_header("Provider Fallbacks")
+        _print_header("Model Fallbacks")
         print(
             "Primary: "
             f"{terminal_safe_text(str(config.model), single_line=True)}"
@@ -835,13 +849,18 @@ def select_provider_and_model(config) -> SetupOutcome:
     """Show provider list, route to provider flow, verify model."""
     while True:
         _print_header("Select your inference provider")
-        print(
-            "Ash supports the routes below directly. "
-            "Choose by number, provider name, or provider ID.\n"
-        )
 
         try:
-            descriptor = _prompt_provider(config)
+            initial_scope = (
+                _prompt_first_run_provider_scope(config)
+                if not _has_provider_configured(config)
+                else list(PROVIDERS)
+            )
+            print(
+                "Choose by number, provider name, or provider ID. "
+                "Type all from a filtered view to show every route.\n"
+            )
+            descriptor = _prompt_provider(config, initial_scope=initial_scope)
             provider_id = descriptor.id
             current = _get_current_model_for_provider(config, provider_id)
             if provider_id == "anthropic":
@@ -867,6 +886,94 @@ def select_provider_and_model(config) -> SetupOutcome:
             print("  Returning to provider selection.")
         except SetupCancelled:
             return SetupOutcome.CANCELLED
+
+
+def _prompt_first_run_provider_scope(config) -> list[ProviderDescriptor]:
+    detected = [
+        descriptor
+        for descriptor in PROVIDERS
+        if _provider_is_detected_or_configured(config, descriptor)
+    ]
+    choices: list[tuple[str, list[ProviderDescriptor]]] = []
+    if detected:
+        choices.append(("Detected or configured routes", detected))
+    choices.extend(
+        [
+            (
+                "Common cloud APIs",
+                [
+                    descriptor
+                    for descriptor in PROVIDERS
+                    if descriptor.id in FIRST_RUN_COMMON_PROVIDER_IDS
+                ],
+            ),
+            (
+                "Other cloud APIs",
+                [
+                    descriptor
+                    for descriptor in PROVIDERS
+                    if descriptor.category == "Cloud API"
+                    and descriptor.id not in FIRST_RUN_COMMON_PROVIDER_IDS
+                ],
+            ),
+            (
+                "Gateways and routers",
+                [
+                    descriptor
+                    for descriptor in PROVIDERS
+                    if descriptor.category == "Gateway"
+                ],
+            ),
+            (
+                "Enterprise cloud",
+                [
+                    descriptor
+                    for descriptor in PROVIDERS
+                    if descriptor.category == "Enterprise cloud"
+                ],
+            ),
+            (
+                "Local runtimes",
+                [
+                    descriptor
+                    for descriptor in PROVIDERS
+                    if descriptor.category == "Local runtime"
+                ],
+            ),
+            (
+                "Custom endpoint",
+                [
+                    descriptor
+                    for descriptor in PROVIDERS
+                    if descriptor.category == "Custom route"
+                ],
+            ),
+            ("Browse all providers", list(PROVIDERS)),
+        ]
+    )
+    selected = _prompt_choice(
+        "How do you want to connect Ash?",
+        [label for label, _ in choices],
+        default=0,
+    )
+    return choices[selected][1]
+
+
+def _provider_is_detected_or_configured(
+    config,
+    descriptor: ProviderDescriptor,
+) -> bool:
+    if descriptor.local or descriptor.id == "openai-compatible":
+        return False
+    status = _provider_status(config, descriptor).casefold()
+    return any(
+        marker in status
+        for marker in (
+            "key detected",
+            "signed in",
+            "scope configured",
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2139,8 +2246,13 @@ def _render_provider_catalog(
 ) -> None:
     console = _setup_console()
     width = console.width
+    title = (
+        f"Providers  ·  {len(PROVIDERS)} routes"
+        if len(descriptors) == len(PROVIDERS)
+        else f"Providers  ·  {len(descriptors)} shown / {len(PROVIDERS)} routes"
+    )
     table = Table(
-        title=f"Providers  ·  {len(PROVIDERS)} routes",
+        title=title,
         box=box.ROUNDED if width >= 52 else box.SIMPLE,
         border_style="bright_black",
         header_style="bold",
@@ -2208,8 +2320,13 @@ def _compact_provider_status(status: str) -> str:
     return status
 
 
-def _prompt_provider(config) -> ProviderDescriptor:
-    visible = list(PROVIDERS)
+def _prompt_provider(
+    config,
+    *,
+    initial_scope: list[ProviderDescriptor] | tuple[ProviderDescriptor, ...] | None = None,
+) -> ProviderDescriptor:
+    scope = list(initial_scope) if initial_scope is not None else list(PROVIDERS)
+    visible = list(scope)
     current_provider = str(getattr(config, "model", "") or "").partition("/")[0]
     default = next(
         (
@@ -2228,6 +2345,7 @@ def _prompt_provider(config) -> ProviderDescriptor:
         if value.casefold() in {"c", "cancel", "q", "quit"}:
             raise SetupCancelled
         if value.casefold() in {"all", "*"}:
+            scope = list(PROVIDERS)
             visible = list(PROVIDERS)
             continue
         if value.startswith("/"):
@@ -2237,7 +2355,7 @@ def _prompt_provider(config) -> ProviderDescriptor:
                 continue
             visible = [
                 descriptor
-                for descriptor in PROVIDERS
+                for descriptor in scope
                 if query
                 in " ".join(
                     (
@@ -2250,7 +2368,7 @@ def _prompt_provider(config) -> ProviderDescriptor:
             ]
             if not visible:
                 print(f"  No providers match {value[1:].strip()!r}.")
-                visible = list(PROVIDERS)
+                visible = list(scope)
             continue
         if value.isdigit():
             try:
@@ -2258,21 +2376,21 @@ def _prompt_provider(config) -> ProviderDescriptor:
             except ValueError:
                 print("  Invalid choice.")
                 continue
-            if 0 <= index < len(PROVIDERS):
+            if 0 <= index < len(PROVIDERS) and PROVIDERS[index] in scope:
                 return PROVIDERS[index]
             print("  Invalid choice.")
             continue
         query = value.casefold()
         exact = [
             descriptor
-            for descriptor in PROVIDERS
+            for descriptor in scope
             if query in {descriptor.id.casefold(), descriptor.name.casefold()}
         ]
         if len(exact) == 1:
             return exact[0]
         matches = [
             descriptor
-            for descriptor in PROVIDERS
+            for descriptor in scope
             if query in descriptor.id.casefold()
             or query in descriptor.name.casefold()
         ]
@@ -2287,11 +2405,25 @@ def _prompt_provider(config) -> ProviderDescriptor:
 
 def _prompt_choice(prompt: str, options: list[str], default: int) -> int:
     """Ask for a numbered option, raising when the user cancels."""
-    options_str = "/".join(f"'{o}'" for o in options)
-    while True:
-        val = input(
+    multiline = len(options) > 4 or sum(len(option) for option in options) > 72
+    if multiline:
+        print(f"\n  {prompt}:")
+        for index, option in enumerate(options, 1):
+            suffix = " (default)" if index == default + 1 else ""
+            print(
+                f"    [{index}] "
+                f"{terminal_safe_text(option, single_line=True)}{suffix}"
+            )
+        prompt_text = f"\n  Choice [{default + 1}], 'c' to cancel: "
+    else:
+        options_str = "/".join(
+            f"'{terminal_safe_text(option, single_line=True)}'" for option in options
+        )
+        prompt_text = (
             f"\n  {prompt} ({options_str}) [{default + 1}], 'c' to cancel: "
-        ).strip()
+        )
+    while True:
+        val = input(prompt_text).strip()
         if not val:
             return default
         if val.casefold() in ("c", "q", "cancel", "quit"):

@@ -6,6 +6,7 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from ash.core.redaction import redact_text
 from ash.core.session import SessionLineage, SessionStore, SessionSummary
 from ash.ui.safe_text import terminal_safe_text
 
@@ -156,4 +157,90 @@ def render_session_tree(
             single_line=True,
         )
         lines.append(f"{'  ' * node.depth}{session_id}  {label}")
+    return "\n".join(lines)
+
+
+def render_recovery_reports(
+    reports: list[dict[str, object]],
+    *,
+    json_output: bool = False,
+) -> str:
+    """Render persisted interrupted-turn recovery decisions for one session."""
+
+    if json_output:
+        return json.dumps({"reports": reports}, sort_keys=True)
+    if not reports:
+        return "No interrupted-turn recovery reports for this session."
+
+    lines: list[str] = []
+    for index, report in enumerate(reports, 1):
+        turn_id = terminal_safe_text(
+            str(report.get("turn_id", "unknown")),
+            single_line=True,
+        )
+        status = terminal_safe_text(
+            str(report.get("status", "interrupted")),
+            single_line=True,
+        )
+        if index > 1:
+            lines.append("")
+        lines.append(f"Recovery {index}: turn {turn_id} — {status}")
+
+        compensated = report.get("compensated_calls")
+        if isinstance(compensated, list) and compensated:
+            lines.append(f"  Compensated tool calls: {len(compensated)}")
+
+        unknown = report.get("unknown_calls")
+        if isinstance(unknown, list) and unknown:
+            lines.append("  Unknown external outcomes:")
+            for item in unknown:
+                if not isinstance(item, dict):
+                    continue
+                tool = terminal_safe_text(
+                    str(item.get("tool", "tool")),
+                    single_line=True,
+                )
+                call_id = terminal_safe_text(
+                    str(item.get("call_id", "")),
+                    single_line=True,
+                )
+                lines.append(
+                    f"    - {tool} ({call_id}): inspect the external system "
+                    "before retrying."
+                )
+
+        unresolved = report.get("unresolved_files")
+        if isinstance(unresolved, list) and unresolved:
+            lines.append("  Files needing inspection:")
+            for path in unresolved:
+                lines.append(
+                    "    - "
+                    + terminal_safe_text(str(path), single_line=True)
+                )
+
+        recovered = report.get("recovered_calls")
+        if isinstance(recovered, list) and recovered:
+            lines.append("  Recovered tool decisions:")
+            for item in recovered:
+                if not isinstance(item, dict):
+                    continue
+                tool = terminal_safe_text(
+                    str(item.get("tool", "tool")),
+                    single_line=True,
+                )
+                ambiguous = bool(item.get("ambiguous"))
+                outcome = "ambiguous" if ambiguous else "recorded"
+                error = redact_text(str(item.get("error", "") or ""))
+                suffix = (
+                    ": " + terminal_safe_text(error, single_line=True)
+                    if error
+                    else ""
+                )
+                lines.append(f"    - {tool}: {outcome}{suffix}")
+
+        if status == "needs_attention":
+            lines.append(
+                "  Next: inspect the items above before manually retrying any "
+                "side effect."
+            )
     return "\n".join(lines)

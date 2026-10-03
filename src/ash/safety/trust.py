@@ -6,12 +6,14 @@ import json
 import os
 import stat
 from pathlib import Path
+from typing import Literal
 
 from ash.json_utils import strict_json_loads
 from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 
 
 MAX_TRUST_STORE_BYTES = 1_000_000
+WorkspaceTrustState = Literal["trusted", "untrusted", "unknown"]
 
 
 def trust_store_path() -> Path:
@@ -23,6 +25,16 @@ def canonical_workspace(path: str | Path) -> str:
 
 
 def load_trusted_workspaces() -> set[str]:
+    """Return workspaces with an explicit trusted decision."""
+
+    return {
+        workspace
+        for workspace, trusted in _load_workspace_trust_decisions().items()
+        if trusted
+    }
+
+
+def _load_workspace_trust_decisions() -> dict[str, bool]:
     path = trust_store_path()
     try:
         with AnchoredDirectory.open(
@@ -40,26 +52,49 @@ def load_trusted_workspaces() -> set[str]:
         json.JSONDecodeError,
         AnchoredFilesystemError,
     ):
-        return set()
+        return {}
 
 
-def _load_from_directory(directory: AnchoredDirectory, name: str) -> set[str]:
+def _load_from_directory(directory: AnchoredDirectory, name: str) -> dict[str, bool]:
     raw = directory.read_file(name, max_bytes=MAX_TRUST_STORE_BYTES)
     if raw is None:
-        return set()
+        return {}
     payload = strict_json_loads(raw)
-    if not isinstance(payload, dict) or payload.get("version") != 1:
-        return set()
+    if not isinstance(payload, dict):
+        return {}
+    version = payload.get("version")
+    if type(version) is not int:
+        return {}
     entries = payload.get("workspaces")
-    if not isinstance(entries, list) or any(
-        not isinstance(entry, str) for entry in entries
-    ):
-        return set()
-    return set(entries)
+    if version == 1:
+        if not isinstance(entries, list) or any(
+            not isinstance(entry, str) for entry in entries
+        ):
+            return {}
+        return {entry: True for entry in entries}
+    if version == 2:
+        if not isinstance(entries, dict) or any(
+            not isinstance(entry, str) or not isinstance(trusted, bool)
+            for entry, trusted in entries.items()
+        ):
+            return {}
+        return dict(entries)
+    return {}
 
 
 def is_workspace_trusted(path: str | Path) -> bool:
-    return canonical_workspace(path) in load_trusted_workspaces()
+    return workspace_trust_state(path) == "trusted"
+
+
+def workspace_trust_state(path: str | Path) -> WorkspaceTrustState:
+    """Return whether a workspace was trusted, denied, or never decided."""
+
+    decision = _load_workspace_trust_decisions().get(canonical_workspace(path))
+    if decision is True:
+        return "trusted"
+    if decision is False:
+        return "untrusted"
+    return "unknown"
 
 
 def set_workspace_trusted(path: str | Path, trusted: bool) -> bool:
@@ -76,11 +111,8 @@ def set_workspace_trusted(path: str | Path, trusted: bool) -> bool:
                 directory.chmod(0o700)
             with directory.lock(f".{state_path.name}.lock"):
                 entries = _load_from_directory(directory, state_path.name)
-                changed = canonical not in entries if trusted else canonical in entries
-                if trusted:
-                    entries.add(canonical)
-                else:
-                    entries.discard(canonical)
+                changed = entries.get(canonical) is not trusted
+                entries[canonical] = trusted
                 _save(directory, state_path.name, entries)
                 return changed
     except AnchoredFilesystemError as exc:
@@ -94,11 +126,17 @@ def set_workspace_trusted(path: str | Path, trusted: bool) -> bool:
 def _save(
     directory: AnchoredDirectory,
     name: str,
-    entries: set[str],
+    entries: dict[str, bool],
 ) -> None:
     payload = (
         json.dumps(
-            {"version": 1, "workspaces": sorted(entries)},
+            {
+                "version": 2,
+                "workspaces": {
+                    workspace: entries[workspace]
+                    for workspace in sorted(entries)
+                },
+            },
             indent=2,
         )
         + "\n"

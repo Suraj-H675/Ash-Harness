@@ -12,7 +12,11 @@ from ash.context.instructions import (
     render_instructions,
     InstructionFile,
 )
-from ash.safety.trust import is_workspace_trusted, set_workspace_trusted
+from ash.safety.trust import (
+    is_workspace_trusted,
+    set_workspace_trusted,
+    workspace_trust_state,
+)
 from ash.safety.trust import MAX_TRUST_STORE_BYTES, trust_store_path
 
 
@@ -21,10 +25,44 @@ def test_trust_round_trip_uses_canonical_workspace(tmp_path, monkeypatch) -> Non
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     assert is_workspace_trusted(workspace) is False
+    assert workspace_trust_state(workspace) == "unknown"
     assert set_workspace_trusted(workspace / ".", True) is True
     assert is_workspace_trusted(workspace) is True
+    assert workspace_trust_state(workspace) == "trusted"
     assert set_workspace_trusted(workspace, False) is True
     assert is_workspace_trusted(workspace) is False
+    assert workspace_trust_state(workspace) == "untrusted"
+
+
+def test_version_one_trust_store_migrates_on_explicit_deny(
+    tmp_path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    other = tmp_path / "other"
+    (home / ".ash").mkdir(parents=True)
+    workspace.mkdir()
+    other.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    path = trust_store_path()
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workspaces": [str(workspace.resolve()), str(other.resolve())],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert workspace_trust_state(workspace) == "trusted"
+    assert set_workspace_trusted(workspace, False) is True
+    assert workspace_trust_state(workspace) == "untrusted"
+    assert workspace_trust_state(other) == "trusted"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["version"] == 2
+    assert payload["workspaces"][str(workspace.resolve())] is False
+    assert payload["workspaces"][str(other.resolve())] is True
 
 
 def test_concurrent_trust_updates_do_not_restore_revoked_workspace(
@@ -354,12 +392,16 @@ def test_malformed_or_unsupported_trust_store_fails_closed(
 
     for payload in (
         {"version": 999, "workspaces": [canonical]},
+        {"version": True, "workspaces": [canonical]},
+        {"version": 1.0, "workspaces": [canonical]},
+        {"version": 2.0, "workspaces": {canonical: True}},
         {"version": 1, "workspaces": canonical},
         {"version": 1, "workspaces": [canonical, 1]},
         {"workspaces": [canonical]},
     ):
         path.write_text(json.dumps(payload), encoding="utf-8")
         assert is_workspace_trusted(workspace) is False
+        assert workspace_trust_state(workspace) == "unknown"
 
 
 def test_duplicate_trust_store_keys_fail_closed(tmp_path, monkeypatch) -> None:

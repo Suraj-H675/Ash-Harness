@@ -11,11 +11,14 @@ from ash.cli import main
 from ash.commands.sessions import (
     list_session_summaries,
     parse_session_retention_days,
+    render_recovery_reports,
     render_session_summaries,
     render_session_tree,
     select_startup_session,
 )
-from ash.core.session import Message, SessionStore
+from ash.core.checkpoints import recover_interrupted_turns
+from ash.core.session import Message, SessionStore, ToolCallRecord
+from ash.safety.guard import SafetyGuard
 
 
 def test_session_summary_renderer_emits_json(tmp_path: Path) -> None:
@@ -67,6 +70,40 @@ def test_session_human_renderers_neutralize_persisted_terminal_controls(
     stored = next(item for item in payload["sessions"] if item["session_id"] == session.session_id)
     assert stored["title"] == "title\x1b[2J forged"
     assert stored["model"] == "openai/model\x1b]0;owned\x07"
+
+
+def test_recovery_renderer_explains_attention_items() -> None:
+    reports = [
+        {
+            "turn_id": "turn-1",
+            "status": "needs_attention",
+            "compensated_calls": ["call-edit"],
+            "unknown_calls": [
+                {"call_id": "call-command", "tool": "run_command"},
+            ],
+            "unresolved_files": ["src/app.py"],
+            "recovered_calls": [
+                {
+                    "call_id": "call-command",
+                    "tool": "run_command",
+                    "error": "Tool outcome is ambiguous; inspect before retrying.",
+                    "dispatched": True,
+                    "ambiguous": True,
+                }
+            ],
+        }
+    ]
+
+    rendered = render_recovery_reports(reports)
+
+    assert "needs_attention" in rendered
+    assert "Compensated tool calls: 1" in rendered
+    assert "inspect the external system before retrying" in rendered
+    assert "src/app.py" in rendered
+    assert "inspect the items above before manually retrying" in rendered
+
+    payload = json.loads(render_recovery_reports(reports, json_output=True))
+    assert payload["reports"][0]["turn_id"] == "turn-1"
 
 
 def test_sessions_cli_lists_current_project_sessions(
@@ -164,6 +201,60 @@ def test_sessions_cli_renders_branch_tree_by_title(
     assert "alternative" in render_session_tree(store.session_tree(root.session_id))
 
 
+def test_sessions_cli_renders_persisted_recovery_report(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    store = SessionStore(db_dir / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.rename_session(session.session_id, "recovery target")
+    turn_id = "turn-interrupted"
+    store.start_turn(session.session_id, turn_id, "run command")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id="call-command",
+            tool_name="run_command",
+            arguments={"command_line": "build"},
+            approved=True,
+            executed=False,
+            dispatched=True,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.interrupt_turn(turn_id)
+    summary = recover_interrupted_turns(
+        store,
+        SafetyGuard(tmp_path),
+        session.session_id,
+    )
+    assert summary.needs_attention is True
+    monkeypatch.chdir(tmp_path)
+
+    status = main(
+        [
+            "--db-directory",
+            str(db_dir),
+            "sessions",
+            "recovery",
+            "--session",
+            "RECOVERY TARGET",
+            "--json",
+        ]
+    )
+
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reports"][0]["turn_id"] == turn_id
+    assert payload["reports"][0]["status"] == "needs_attention"
+    assert payload["reports"][0]["unknown_calls"] == [
+        {"call_id": "call-command", "tool": "run_command"}
+    ]
+
+
 def test_sessions_cli_rejects_invalid_limit(tmp_path: Path, capsys) -> None:
     db_dir = tmp_path / "db"
     SessionStore(db_dir / "sessions.db")
@@ -211,7 +302,7 @@ def test_sessions_cli_rejects_tree_only_session_option(tmp_path: Path, capsys) -
     )
 
     assert status == 2
-    assert "requires 'sessions tree'" in capsys.readouterr().err
+    assert "requires 'sessions tree' or 'sessions recovery'" in capsys.readouterr().err
 
 
 def test_startup_continue_selects_latest_project_session(tmp_path: Path) -> None:

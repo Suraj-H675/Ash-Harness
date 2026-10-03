@@ -20,6 +20,62 @@ from ash.safety.grants import (
     remove_permission_rules_for_tool,
 )
 from ash.safety.trust import canonical_workspace
+from ash.safety.policy import PermissionMode
+
+
+PERMISSION_MODE_DESCRIPTIONS: dict[PermissionMode, str] = {
+    PermissionMode.INTERACTIVE: (
+        "Read-only tools run automatically; side effects ask unless an explicit "
+        "permission rule decides otherwise."
+    ),
+    PermissionMode.AUTO_EDIT: (
+        "Direct file-edit tools run without the default prompt; other side effects "
+        "still ask unless an explicit permission rule decides otherwise."
+    ),
+    PermissionMode.PLAN: (
+        "Planning and read-only inspection only; side-effecting tools are denied."
+    ),
+    PermissionMode.AUTO_APPROVE: (
+        "Side effects run without the default prompt, while explicit ASK/DENY "
+        "rules still apply. Safe use requires aggregate sandbox resource containment "
+        "unless the explicit unsafe override is configured."
+    ),
+    PermissionMode.DRY_RUN: (
+        "All tool execution is denied so the model can reason without running tools."
+    ),
+}
+
+
+def render_permission_modes(
+    current_mode: str | PermissionMode,
+    *,
+    json_output: bool = False,
+) -> str:
+    current = PermissionMode(current_mode)
+    payload = {
+        "current_mode": current.value,
+        "modes": [
+            {
+                "mode": mode.value,
+                "current": mode is current,
+                "description": PERMISSION_MODE_DESCRIPTIONS[mode],
+            }
+            for mode in PermissionMode
+        ],
+    }
+    if json_output:
+        return json.dumps(payload, sort_keys=True)
+    lines = ["Permission modes:"]
+    for mode in PermissionMode:
+        marker = " (current)" if mode is current else ""
+        lines.append(
+            f"  {mode.value}{marker}: {PERMISSION_MODE_DESCRIPTIONS[mode]}"
+        )
+    return "\n".join(lines)
+
+
+def permission_mode_description(mode: str | PermissionMode) -> str:
+    return PERMISSION_MODE_DESCRIPTIONS[PermissionMode(mode)]
 
 
 def permission_rules_payload(

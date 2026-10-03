@@ -73,6 +73,38 @@ Development setup and release-maintainer instructions are intentionally
 separate; see [Contributing](CONTRIBUTING.md) and
 [Releasing Ash](docs/guides/RELEASING.md).
 
+### First run
+
+Start Ash from the project you want it to work in:
+
+    cd /path/to/project
+    ash
+
+On a workspace Ash has never seen before, it first asks whether to trust
+**project-controlled Ash configuration**. Trust enables project .ash
+extensions, hooks, instructions, and managed executable configuration; it is
+separate from tool-call approvals. Choosing **No** keeps those project-owned
+surfaces disabled and Ash remembers that safe choice. You can change it later
+with ash trust add or ash trust remove.
+
+If no inference route is configured, first-run setup narrows the provider
+catalog by connection type instead of requiring you to scan every supported
+route. Existing credentials and configured enterprise scopes are surfaced
+first; common cloud APIs, gateways, enterprise cloud, local runtimes, custom
+endpoints, and the complete catalog remain explicit choices.
+
+Setup saves configuration but deliberately does **not** make a hidden billable
+model request. After setup:
+
+    ash doctor --connect   # non-billable route/catalog connectivity check
+    ash providers test     # one bounded real model completion
+    ash                    # start the interactive coding session
+
+Inside a session, /model changes only that running session. Use
+ash setup model to save a new default model and ash setup fallbacks to
+manage the ordered fallback chain (ash setup providers remains a compatibility
+alias).
+
 ## Capability overview
 
 ### Provider and model layer
@@ -660,9 +692,10 @@ The operational surface includes:
   `~/.ash/logs/ash.jsonl`, with secret redaction and session/turn/tool
   correlation while normal human logs remain on stderr;
 - explicit update/version checks with no background telemetry;
-- selective reset of configuration, sessions, cache, or all local state;
-- idempotent installation and repair behavior that preserves selected optional
-  capability packs; and
+- selective reset of default-profile configuration, sessions, and cache;
+  the combined reset retains named profiles and installed extensions;
+- first-class same-release repair through the verified immutable installer,
+  plus package-manager-owned uninstall guidance that preserves user data; and
 - lazy loading so lightweight version/help/status paths do not initialize the
   full provider, browser, server, repository, or TUI stack.
 
@@ -680,6 +713,7 @@ ACP, and A2A dependencies separate from the lean core. The repository contains:
 
 The [documentation index](docs/README.md) links to the maintained guides,
 including [permissions and managed policy](docs/guides/PERMISSIONS.md),
+[maintenance and recovery](docs/guides/MAINTENANCE.md),
 [durable session branching](docs/guides/SESSION_BRANCHING.md),
 [durable automation](docs/guides/DURABLE_AUTOMATION.md), and the
 [production parity checklist](docs/architecture/PRODUCTION_HARNESS_PARITY.md).
@@ -703,8 +737,8 @@ they are complete:
 - a broad messaging-channel gateway is not currently part of Ash.
 
 Ash has a real immutable production distribution, but the final whole-product
-mission gate remains open while the finite parity program is still working
-through interfaces/anywhere-access and later cross-cutting closure gates.
+mission gate remains open while the finite parity program is working through
+user-experience and later adversarial whole-product closure gates.
 Production observability is available as an explicit opt-in OpenTelemetry/OTLP
 trace-and-metrics path; qualified boundaries above remain truthful support
 limits rather than claims of feature identity with every comparator.

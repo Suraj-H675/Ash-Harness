@@ -126,12 +126,12 @@ The program is intentionally finite:
    whether remote access, web UI, messaging surfaces, companion clients, or
    other access modalities solve important Ash workflows; implement justified
    gaps and explicitly reject unrelated product categories.
-6. **P6 — User-experience parity — OPEN.** Benchmark the complete
+6. **P6 — User-experience parity — CLOSED.** Benchmark the complete
    journey from installation and onboarding through model selection, coding,
    approvals, sessions, debugging, interruption/recovery, updates, and
    troubleshooting. Close material friction even when the underlying backend
    capability already exists.
-7. **P7 — Final adversarial comparator pass — NOT STARTED.** Re-run current
+7. **P7 — Final adversarial comparator pass — OPEN.** Re-run current
    evidence against the strongest relevant harnesses, including OpenClaw,
    Hermes, Claude Code, Codex CLI, Gemini CLI, OpenCode, Aider, and any newer
    serious comparator. Confirm no material user-value gap was missed or hidden
@@ -143,11 +143,79 @@ The program is intentionally finite:
    important unresolved user need remains may Ash claim whole-product
    leading-harness parity. Literal feature identity is never the criterion.
 
-**Active gate: P6 — User-experience parity.** P1 through P5 are
+**Active gate: P7 — Final adversarial comparator pass.** P1 through P6 are
 closed at their bounded finish conditions. Do not reopen them for feature-count
 churn; reopen only for concrete evidence that an important supported
-provider/model, agent/workspace, web/computer-interaction, extensibility, or
-interface/access user need or claim is wrong.
+provider/model, agent/workspace, web/computer-interaction, extensibility,
+interface/access, or user-experience need or claim is wrong.
+
+### P6 finite closure checklist
+
+P6 is bounded around whether a developer can discover, understand, recover, and
+maintain Ash's already-supported capabilities without memorizing internal
+commands or reading architecture documentation. It is not a mandate for
+decorative UI churn, consumer-product onboarding, or duplicating backend
+features that already have a clear operator path.
+
+1. **P6A — First-run and setup clarity — CLOSED.** A fresh user now sees an
+   understandable project-trust decision, can choose an inference route without
+   first parsing the complete provider catalog, gets detected existing
+   credentials/routes surfaced first, and sees a deliberate distinction between
+   saved configuration, the non-billable Doctor connectivity/catalog probe, and
+   an explicit bounded real completion through ash providers test. Workspace
+   trust is tri-state and remembers a safe decline. Runtime startup snapshots
+   that decision into config loading so a concurrent trust-store transition
+   cannot retain project-controlled config or executable surfaces from an older
+   trust state; v1 trust state remains compatible while malformed schema
+   versions fail closed.
+2. **P6B — Daily interactive discoverability — CLOSED.** Common in-session
+   actions are discoverable from the interactive help surface. Model switching
+   now states that it is session-only and points to ash setup model for the
+   persisted default; ash setup fallbacks is the canonical fallback-chain path
+   while the old providers spelling remains a compatibility alias. Permissions
+   explains all five modes and their session scope, including the containment
+   requirement for safe auto-approve. Long slash-command usages wrap instead of
+   forcing descriptions off-screen.
+3. **P6C — Interruption, session, and recovery UX — CLOSED.** Ordinary
+   cancellation, process interruption, failed turns, session resume/fork,
+   file-change undo/rewind, and recoverable session states preserve user work
+   and lead to explicit next actions. /recovery and ash sessions recovery render
+   the persisted recovery journal, including compensated calls, unresolved files,
+   and ambiguous external outcomes with an inspect-before-retry instruction.
+   Cancellation/startup point there when attention is required. Fresh-runtime
+   recovery tests prove unknown dispatched side effects are not replayed.
+4. **P6D — Maintenance and troubleshooting lifecycle — CLOSED.** Doctor,
+   config, setup-status, and provider diagnostics now lead directly to safe
+   remediation for the material failure paths. Update and same-release repair
+   reuse the verified immutable installer, while mutating install commands refuse
+   editable/source-checkout invocation. Storage backup/restore remains explicit;
+   reset --all truthfully means the default-profile config/session/cache
+   categories and states that named profiles/extensions are retained. Package
+   removal remains package-manager-owned, with pipx/uv uninstall and user-data
+   retention documented rather than duplicated inside Ash.
+5. **P6E — Integrated UX conformance — CLOSED.** Representative fresh setup,
+   configured daily-use/help, permission-mode, interruption/recovery,
+   broken-config diagnosis, and maintenance journeys were exercised through real
+   CLI/PTY paths plus focused runtime tests. The final P6 suite passed **440
+   tests**, with separate fresh-loop restart/cancellation recovery tests,
+   Ruff/MyPy checks, and git diff --check clean at the checkpoint. A 2026-10-03
+   official-doc recheck covered OpenClaw onboarding/Doctor/update, Gemini CLI
+   session resume/rewind discoverability, and Hermes update/uninstall ownership.
+   Ash deliberately keeps real completion verification explicit rather than
+   hiding a potentially billable request in setup, and keeps uninstall owned by
+   the package manager.
+
+### P6 finish flags
+
+- `P6A_FIRST_RUN_SETUP_CLARITY = CLOSED`
+- `P6B_DAILY_INTERACTIVE_DISCOVERABILITY = CLOSED`
+- `P6C_INTERRUPTION_SESSION_RECOVERY_UX = CLOSED`
+- `P6D_MAINTENANCE_TROUBLESHOOTING_UX = CLOSED`
+- `P6E_INTEGRATED_UX_CONFORMANCE = CLOSED`
+- `P6_USER_EXPERIENCE_PARITY = CLOSED`
+
+These flags are the stop conditions for P6. P6 is closed; advance to P7 rather
+than continuing visual or wording changes without a demonstrated user problem.
 
 ### P5 finite closure checklist
 

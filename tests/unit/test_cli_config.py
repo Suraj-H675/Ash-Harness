@@ -1182,7 +1182,10 @@ def test_model_catalog_rendering_and_shared_input_picker() -> None:
 
     assert selected == [AVAILABLE_MODELS[1]]
     assert config.model == AVAILABLE_MODELS[1]
-    assert output[-1] == f"Switched to {AVAILABLE_MODELS[1]}"
+    assert output[-1] == (
+        f"Switched to {AVAILABLE_MODELS[1]} for this session only. "
+        "Run 'ash setup model' to save a default model."
+    )
 
 
 def test_model_catalog_advertises_current_deepseek_models_only() -> None:
@@ -1891,6 +1894,183 @@ def test_ci_reset_never_prompts_for_confirmation(
 
     assert main(["--ci", "reset", "--cache"]) == 2
     assert "Reset cancelled." in capsys.readouterr().err
+
+
+def test_reset_all_confirmation_explains_retained_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.cli import main
+
+    class TtyInput(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    prompts: list[str] = []
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(sys, "stdin", TtyInput())
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": prompts.append(prompt) or "n",
+    )
+
+    assert main(["reset", "--all"]) == 2
+    assert len(prompts) == 1
+    assert "named profiles and installed extensions will be retained" in prompts[0]
+    assert "Reset cancelled." in capsys.readouterr().err
+
+
+def test_repair_cli_delegates_to_release_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.cli import main
+
+    observed: dict[str, object] = {}
+
+    def fake_repair(*, current_version=None, json_output=False) -> int:
+        observed["current_version"] = current_version
+        observed["json_output"] = json_output
+        return 0
+
+    monkeypatch.setattr(
+        "ash.commands.update.require_managed_release_invocation",
+        lambda: None,
+    )
+    monkeypatch.setattr("ash.commands.update.repair_installation", fake_repair)
+
+    assert main(["repair", "--json"]) == 0
+    assert observed["json_output"] is True
+    assert isinstance(observed["current_version"], str)
+
+
+def test_update_apply_refuses_editable_invocation_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.cli import main
+
+    monkeypatch.setattr(
+        "ash.commands.update.require_managed_release_invocation",
+        lambda: (_ for _ in ()).throw(
+            ValueError("This Ash process is running from an editable/source checkout.")
+        ),
+    )
+    monkeypatch.setattr(
+        "ash.commands.update.check_for_update",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("network update check must not run")
+        ),
+    )
+
+    assert main(["update", "--apply"]) == 1
+    assert "editable/source checkout" in capsys.readouterr().err
+
+
+def test_startup_denial_uses_one_untrusted_snapshot_even_if_persistence_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.cli import main
+    from ash.config import AshConfig
+
+    class TtyStream(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stale = AshConfig(
+        model="ollama/project-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    safe = stale.model_copy(update={"model": "ollama/safe-user-model"})
+    load_calls: list[bool | None] = []
+    runtime_observed: dict[str, object] = {}
+
+    def fake_load_config_or_report(**kwargs):
+        trust_override = kwargs.get("_workspace_trust_override")
+        load_calls.append(trust_override)
+        return (safe if trust_override is False else stale), 0
+
+    def fail_persist(_path, _trusted):
+        raise OSError("state directory unavailable")
+
+    def fake_build_runtime(config, _ui, **kwargs):
+        runtime_observed["model"] = config.model
+        runtime_observed["workspace_trusted"] = kwargs["workspace_trusted"]
+        raise ValueError("stop after trust boundary")
+
+    monkeypatch.setattr("ash.cli._load_config_or_report", fake_load_config_or_report)
+    monkeypatch.setattr(
+        "ash.safety.trust.workspace_trust_state",
+        lambda _path: "unknown",
+    )
+    monkeypatch.setattr("ash.safety.trust.set_workspace_trusted", fail_persist)
+    monkeypatch.setattr(
+        "ash.commands.setup._has_provider_configured",
+        lambda _config: True,
+    )
+    monkeypatch.setattr("ash.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ash.ui.terminal.TerminalUI", lambda **_kwargs: object())
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+    monkeypatch.setattr(sys, "stdin", TtyStream())
+    monkeypatch.setattr(sys, "stdout", TtyStream())
+    monkeypatch.setattr(sys, "stderr", TtyStream())
+
+    assert main([]) != 0
+    assert load_calls == [None, False, False]
+    assert runtime_observed == {
+        "model": "ollama/safe-user-model",
+        "workspace_trusted": False,
+    }
+
+
+def test_startup_revocation_discards_initially_loaded_project_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.cli import main
+    from ash.config import AshConfig
+
+    stale = AshConfig(
+        model="ollama/project-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    safe = stale.model_copy(update={"model": "ollama/safe-user-model"})
+    load_calls: list[bool | None] = []
+    runtime_observed: dict[str, object] = {}
+
+    def fake_load_config_or_report(**kwargs):
+        trust_override = kwargs.get("_workspace_trust_override")
+        load_calls.append(trust_override)
+        return (safe if trust_override is False else stale), 0
+
+    def fake_build_runtime(config, _ui, **kwargs):
+        runtime_observed["model"] = config.model
+        runtime_observed["workspace_trusted"] = kwargs["workspace_trusted"]
+        raise ValueError("stop after trust boundary")
+
+    monkeypatch.setattr("ash.cli._load_config_or_report", fake_load_config_or_report)
+    monkeypatch.setattr(
+        "ash.safety.trust.workspace_trust_state",
+        lambda _path: "untrusted",
+    )
+    monkeypatch.setattr(
+        "ash.commands.setup._has_provider_configured",
+        lambda _config: True,
+    )
+    monkeypatch.setattr("ash.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ash.ui.terminal.TerminalUI", lambda **_kwargs: object())
+
+    assert main([]) != 0
+    assert load_calls == [None, False]
+    assert runtime_observed == {
+        "model": "ollama/safe-user-model",
+        "workspace_trusted": False,
+    }
 
 
 def test_ci_forces_setup_non_interactive(

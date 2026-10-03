@@ -1826,6 +1826,7 @@ class AshConfig(BaseSettings):
         *,
         _override_source: str = "override",
         _override_detail: str = "AshConfig.load()",
+        _workspace_trust_override: bool | None = None,
         **overrides: Any,
     ) -> "AshConfig":
         """Resolve all supported layers and retain exact field provenance.
@@ -1883,7 +1884,12 @@ class AshConfig(BaseSettings):
         project_layers: list[tuple[Path, dict[str, Any]]] = []
         from ash.safety.trust import is_workspace_trusted
 
-        if is_workspace_trusted(workspace_root):
+        workspace_trusted = (
+            is_workspace_trusted(workspace_root)
+            if _workspace_trust_override is None
+            else _workspace_trust_override
+        )
+        if workspace_trusted:
             for path in project_config_paths(workspace_root):
                 if not path.is_file():
                     continue

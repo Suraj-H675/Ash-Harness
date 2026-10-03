@@ -548,7 +548,10 @@ async def _interactive_model_picker(
         loop.switch_model(model_str)
         config.model = model_str
         write_output(
-            "Switched to " + terminal_safe_text(model_str, single_line=True)
+            "Switched to "
+            + terminal_safe_text(model_str, single_line=True)
+            + " for this session only. "
+            "Run 'ash setup model' to save a default model."
         )
     except Exception as exc:
         write_output(f"Error: {exc}", file=sys.stderr)
@@ -1112,6 +1115,18 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     ),
                     flush=True,
                 )
+                continue
+            if command.name == "recovery":
+                from ash.commands.sessions import render_recovery_reports
+
+                session = loop.current_session
+                if session is None:
+                    print("No active session.")
+                    continue
+                reports = loop.session_store.interrupted_recovery_reports(
+                    session.session_id
+                )
+                print(render_recovery_reports(reports), flush=True)
                 continue
             if command.name == "cancel":
                 print("No turn is currently running.", flush=True)
@@ -1734,7 +1749,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 user_input = build_review_prompt(label, changes)
                 parsed_command = None
             if command.name == "permissions":
-                from ash.commands.permissions import render_permission_rules
+                from ash.commands.permissions import (
+                    permission_mode_description,
+                    render_permission_modes,
+                    render_permission_rules,
+                )
                 from ash.safety.grants import (
                     PermissionRule,
                     RuleEffect,
@@ -1748,11 +1767,18 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 if not arguments:
                     print(f"Permission mode: {loop.permission_policy.mode.value}")
                     print(
+                        permission_mode_description(loop.permission_policy.mode)
+                    )
+                    print("Use /permissions modes to compare all modes.")
+                    print(
                         render_permission_rules(
                             loop.project_root,
                             loop.permission_policy.persistent_rules,
                         )
                     )
+                    continue
+                if len(arguments) == 1 and arguments[0] in {"modes", "help"}:
+                    print(render_permission_modes(loop.permission_policy.mode))
                     continue
                 if len(arguments) == 2 and arguments[0] in {
                     "allow",
@@ -1854,6 +1880,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         result="SUCCESS",
                     )
                 print(f"Permission mode: {mode.value}")
+                print(permission_mode_description(mode))
+                print(
+                    "This mode change applies to the current Ash session only."
+                )
                 continue
             if command.name == "sandbox":
                 manager = sandbox_manager
@@ -2233,7 +2263,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 config.model = model_str
                 print(
                     "Switched to "
-                    + terminal_safe_text(model_str, single_line=True),
+                    + terminal_safe_text(model_str, single_line=True)
+                    + " for this session only. "
+                    "Run 'ash setup model' to save a default model.",
                     flush=True,
                 )
             except Exception as exc:
@@ -2337,8 +2369,19 @@ def _main_impl(argv: list[str] | None = None) -> int:
     setup_parser.add_argument(
         "section",
         nargs="?",
-        choices=["model", "providers", "web", "browser", "status", "all"],
-        help="Which section to configure",
+        choices=[
+            "model",
+            "fallbacks",
+            "providers",
+            "web",
+            "browser",
+            "status",
+            "all",
+        ],
+        help=(
+            "Section to configure; use fallbacks for the model fallback chain "
+            "(providers is a compatibility alias)"
+        ),
     )
     setup_parser.add_argument(
         "--quick",
@@ -2510,10 +2553,29 @@ def _main_impl(argv: list[str] | None = None) -> int:
     reset_parser = subparsers.add_parser(
         "reset", help="Selectively remove Ash local configuration or data"
     )
-    reset_parser.add_argument("--config", action="store_true")
-    reset_parser.add_argument("--sessions", action="store_true")
-    reset_parser.add_argument("--cache", action="store_true")
-    reset_parser.add_argument("--all", action="store_true")
+    reset_parser.add_argument(
+        "--config",
+        action="store_true",
+        help="Remove default-profile config, trust decisions, and permission grants",
+    )
+    reset_parser.add_argument(
+        "--sessions",
+        action="store_true",
+        help="Remove the default-profile session/database directory",
+    )
+    reset_parser.add_argument(
+        "--cache",
+        action="store_true",
+        help="Remove default-profile caches, history, and local memory indexes",
+    )
+    reset_parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Select config, sessions, and cache together; named profiles and "
+            "installed extensions are retained"
+        ),
+    )
     reset_parser.add_argument("--yes", action="store_true")
     update_parser = subparsers.add_parser(
         "update", help="Check GitHub for a newer Ash release"
@@ -2524,6 +2586,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Install the latest published Ash release through the managed installer",
     )
+    repair_parser = subparsers.add_parser(
+        "repair",
+        help="Reinstall the exact current immutable Ash release",
+    )
+    repair_parser.add_argument("--json", action="store_true")
     storage_parser = subparsers.add_parser(
         "storage", help="Check, back up, or restore the session database"
     )
@@ -2562,11 +2629,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
     sessions_parser.add_argument(
         "sessions_action",
         nargs="?",
-        choices=["list", "tree"],
+        choices=["list", "tree", "recovery"],
         default="list",
     )
     sessions_parser.add_argument(
-        "--session", help="Session ID or exact title for tree inspection"
+        "--session",
+        help="Session ID or exact title for tree/recovery inspection",
     )
     sessions_parser.add_argument("--query", default="")
     sessions_parser.add_argument("--limit", type=int, default=20)
@@ -2704,6 +2772,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
     )
     permissions_status = permissions_subparsers.add_parser("status")
     permissions_status.add_argument("--json", action="store_true")
+    permissions_modes = permissions_subparsers.add_parser(
+        "modes",
+        help="Explain permission modes without changing policy",
+    )
+    permissions_modes.add_argument("--json", action="store_true")
     for effect in ("allow", "ask", "deny"):
         permissions_rule = permissions_subparsers.add_parser(effect)
         permissions_rule.add_argument("tool_name")
@@ -3700,8 +3773,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
             return 2
         confirmed = args.yes
         if not confirmed and not args.ci and sys.stdin.isatty():
+            scope = (
+                "default-profile config, sessions, and cache; named profiles and "
+                "installed extensions will be retained"
+                if args.all
+                else "the selected default-profile Ash state"
+            )
             confirmed = input(
-                "Remove selected Ash local state? [y/N] "
+                f"Remove {scope}? [y/N] "
             ).strip().casefold() in {"y", "yes"}
         if not confirmed:
             print("Reset cancelled.", file=sys.stderr)
@@ -3719,10 +3798,33 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print(f"Removed {len(removed)} path(s).")
         return 0
 
-    if args.command == "update":
-        from ash.commands.update import apply_update, check_for_update, render_update_status
+    if args.command == "repair":
+        from ash.commands.update import (
+            repair_installation,
+            require_managed_release_invocation,
+        )
 
         try:
+            require_managed_release_invocation()
+            return repair_installation(
+                current_version=version,
+                json_output=args.json,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+
+    if args.command == "update":
+        from ash.commands.update import (
+            apply_update,
+            check_for_update,
+            render_update_status,
+            require_managed_release_invocation,
+        )
+
+        try:
+            if args.apply:
+                require_managed_release_invocation()
             update_status = check_for_update(current_version=version)
             if args.apply:
                 return apply_update(update_status, json_output=args.json)
@@ -4127,6 +4229,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         from ash.core.session import SessionResolutionError
         from ash.commands.sessions import (
             list_session_summaries,
+            render_recovery_reports,
             render_session_summaries,
             render_session_tree,
         )
@@ -4155,8 +4258,30 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     return 2
                 print(render_session_tree(tree, json_output=args.json))
                 return 0
+            if args.sessions_action == "recovery":
+                try:
+                    selected_summary = (
+                        store.resolve_session(
+                            args.session, str(sessions_config.workspace_root)
+                        )
+                        if args.session
+                        else store.latest_session(str(sessions_config.workspace_root))
+                    )
+                    if selected_summary is None:
+                        raise SessionResolutionError("no sessions found in this project")
+                    reports = store.interrupted_recovery_reports(
+                        selected_summary.session_id
+                    )
+                except (KeyError, SessionResolutionError) as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 2
+                print(render_recovery_reports(reports, json_output=args.json))
+                return 0
             if args.session:
-                print("Error: --session requires 'sessions tree'", file=sys.stderr)
+                print(
+                    "Error: --session requires 'sessions tree' or 'sessions recovery'",
+                    file=sys.stderr,
+                )
                 return 2
             if args.limit < 1:
                 print("Error: limit must be positive", file=sys.stderr)
@@ -4240,6 +4365,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
             add_cli_permission_rule,
             clear_permission_grants,
             remove_cli_permission_rule,
+            render_permission_modes,
             render_permission_rules,
             revoke_permission_grant,
         )
@@ -4254,6 +4380,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
         workspace = permissions_config.workspace_root
         action = args.permissions_action or "status"
         try:
+            if action == "modes":
+                print(
+                    render_permission_modes(
+                        permissions_config.safety_tier,
+                        json_output=getattr(args, "json", False),
+                    )
+                )
+                return 0
             if action == "status":
                 from ash.safety.grants import load_managed_permission_rules
 
@@ -5007,19 +5141,38 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return config_exit_code
     config = loaded_config
 
-    from ash.safety.trust import is_workspace_trusted, set_workspace_trusted
+    from ash.safety.trust import (
+        set_workspace_trusted,
+        workspace_trust_state,
+    )
 
-    workspace_trusted = is_workspace_trusted(config.workspace_root)
+    trust_state = workspace_trust_state(config.workspace_root)
+    workspace_trusted = trust_state == "trusted"
+    loaded_config, config_exit_code = _load_config_or_report(
+        event_output=runtime_event_output,
+        _workspace_trust_override=workspace_trusted,
+        **runtime_overrides,
+    )
+    if loaded_config is None:
+        return config_exit_code
+    config = loaded_config
     if (
-        not workspace_trusted
+        trust_state == "unknown"
         and args.prompt is None
         and not args.ci
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     ):
+        print(
+            "Project-controlled extensions are disabled until you trust this workspace. "
+            "Trust enables project .ash extensions, hooks, instructions, and managed "
+            "executable configuration.",
+            flush=True,
+        )
         answer = (
             input(
-                f"Trust project extensions in {config.workspace_root.resolve()}? [y/N] "
+                f"Trust project-controlled Ash configuration in "
+                f"{config.workspace_root.resolve()}? [y/N] "
             )
             .strip()
             .casefold()
@@ -5029,7 +5182,26 @@ def _main_impl(argv: list[str] | None = None) -> int:
             workspace_trusted = True
             loaded_config, config_exit_code = _load_config_or_report(
                 event_output=runtime_event_output,
-                **runtime_overrides
+                _workspace_trust_override=True,
+                **runtime_overrides,
+            )
+            if loaded_config is None:
+                return config_exit_code
+            config = loaded_config
+        else:
+            workspace_trusted = False
+            try:
+                set_workspace_trusted(config.workspace_root, False)
+            except (OSError, ValueError) as exc:
+                print(
+                    "Warning: could not remember the untrusted workspace decision: "
+                    f"{exc}",
+                    file=sys.stderr,
+                )
+            loaded_config, config_exit_code = _load_config_or_report(
+                event_output=runtime_event_output,
+                _workspace_trust_override=False,
+                **runtime_overrides,
             )
             if loaded_config is None:
                 return config_exit_code
@@ -5229,6 +5401,13 @@ async def _bootstrap_and_repl(
                 file=sys.stderr if summary.needs_attention else sys.stdout,
                 flush=True,
             )
+            if summary.needs_attention:
+                print(
+                    "Run /recovery to inspect unresolved files and ambiguous "
+                    "external outcomes before retrying side effects.",
+                    file=sys.stderr,
+                    flush=True,
+                )
         return await _repl(loop, config, sandbox_manager)
     except asyncio.CancelledError as exc:
         primary_error = exc

@@ -4,6 +4,16 @@ Date checked: 2026-08-27 (Asia/Kolkata)
 
 Scope: first-run setup, provider/model selection, API-key onboarding, local or custom OpenAI-compatible endpoints, profiles/configuration, MCP, and extensions for six terminal-oriented AI coding harnesses. Sources are official product documentation or official repositories only.
 
+> **Historical benchmark snapshot.** The comparator observations remain useful
+> evidence for the date above, but the Ash current-state audit and implementation
+> plan in this file are **superseded** and are not an open backlog. As of
+> 2026-10-03, Ash has a 21-route searchable/categorized provider catalog,
+> detected-route-first progressive onboarding, API-key plus supported
+> subscription/cloud-identity routes, named profiles, provider tests, setup
+> status cards, fallback-chain management, richer custom endpoints, and explicit
+> QuickStart behavior. Current UX work and stop conditions live in
+> [Production Harness Parity — P6](../architecture/PRODUCTION_HARNESS_PARITY.md#p6-finite-closure-checklist).
+
 ## Executive comparison
 
 | Harness | First-run UX | Provider/model and local endpoint handling | Profiles/configuration | MCP/extensions |
@@ -35,12 +45,11 @@ Hermes then exposes a broad [tool and toolset registry](https://hermes-agent.nou
 
 **Ash lesson:** offer opinionated “connection packs” that configure provider plus optional hosted capabilities in one path, while preserving granular commands for advanced users. Model selection should be only one part of an agent profile: tools, memory, delegation, sandbox, and delivery behavior belong beside it.
 
-## Ash current-state audit
+## Historical Ash current-state audit (superseded)
 
-> Implementation update: the provider catalog, fallback manager, setup status
-> screen, and `ash providers list/test` landed after this baseline audit. The
-> original rows below describe the pre-implementation gaps; use the target
-> blueprint and the live commands to assess the remaining work.
+> The rows below intentionally preserve the 2026-08-27 baseline for historical
+> comparison. They do **not** describe current Ash and must not be used to
+> prioritize new work without rechecking the live repository.
 
 Ash is not limited to four providers today; the setup catalogue has six entries: Anthropic, OpenAI, DeepSeek, Groq, Ollama, and one generic OpenAI-compatible route ([setup.py](../../src/ash/commands/setup.py#L55)). The problem is that they appear as six flat choices and all but Ollama follow almost the same API-key/base-URL/model-probe flow. That makes the product feel smaller than its runtime already is.
 
@@ -187,7 +196,12 @@ Provider setup should unlock a second layer rather than ending the wizard. Propo
 
 Hermes and OpenClaw show why these capabilities should be visible in the product model, while their optionality keeps Ash's core setup approachable.
 
-## Prioritized implementation plan
+## Historical prioritized implementation plan (superseded)
+
+The plan below records what this benchmark recommended on 2026-08-27. Many
+items subsequently shipped or were intentionally rejected. Use the active P6
+checklist instead of treating these bullets as current requirements.
+
 
 ### P0 — make the existing setup feel complete
 

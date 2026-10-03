@@ -530,4 +530,24 @@ class InteractiveTurnController:
         if not turn.done():
             turn.cancel()
         await asyncio.gather(turn, return_exceptions=True)
-        self.write_status("Turn cancelled.")
+        self.write_status(_cancellation_recovery_status(self.loop))
+
+
+def _cancellation_recovery_status(loop: AshLoop) -> str:
+    summary = loop.recovery_summary
+    if summary is None or not summary.interrupted_turns:
+        return "Turn cancelled."
+    if summary.needs_attention:
+        return (
+            "Turn cancelled. Recovery needs attention: "
+            f"{len(summary.unknown_calls)} unknown tool outcome(s), "
+            f"{len(summary.unresolved_files)} unresolved file(s). "
+            "Run /recovery before retrying side effects."
+        )
+    if summary.compensated_calls:
+        return (
+            "Turn cancelled. Ash compensated "
+            f"{summary.compensated_calls} interrupted tool call(s). "
+            "Run /recovery for details."
+        )
+    return "Turn cancelled."

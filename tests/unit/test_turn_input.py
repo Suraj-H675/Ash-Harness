@@ -8,6 +8,7 @@ from rich.console import Console
 
 from ash.agents.shared_state import SharedState
 from ash.config import AshConfig
+from ash.core.checkpoints import RecoverySummary
 from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
@@ -20,7 +21,10 @@ from ash.tools.browser import BrowserTypeTool
 from ash.tools.filesystem import WriteFileTool
 from ash.ui.terminal import TerminalUI
 from ash.ui.notifications import NotificationEvent
-from ash.ui.turn_input import InteractiveTurnController
+from ash.ui.turn_input import (
+    InteractiveTurnController,
+    _cancellation_recovery_status,
+)
 
 
 class RoutedPrompt:
@@ -43,6 +47,37 @@ class RecordingNotifier:
     def notify(self, event: str | NotificationEvent, message: str) -> bool:
         self.calls.append((NotificationEvent(event), message))
         return True
+
+
+def test_cancellation_status_surfaces_recovery_attention() -> None:
+    loop = SimpleNamespace(
+        recovery_summary=RecoverySummary(
+            interrupted_turns=1,
+            unknown_calls=("run_command (call-1)",),
+            unresolved_files=(Path("src/app.py"),),
+        )
+    )
+
+    rendered = _cancellation_recovery_status(loop)
+
+    assert "Recovery needs attention" in rendered
+    assert "1 unknown tool outcome(s)" in rendered
+    assert "1 unresolved file(s)" in rendered
+    assert "Run /recovery" in rendered
+
+
+def test_cancellation_status_surfaces_safe_compensation() -> None:
+    loop = SimpleNamespace(
+        recovery_summary=RecoverySummary(
+            interrupted_turns=1,
+            compensated_calls=2,
+        )
+    )
+
+    rendered = _cancellation_recovery_status(loop)
+
+    assert "compensated 2 interrupted tool call(s)" in rendered
+    assert "Run /recovery for details" in rendered
 
 
 class BlockingProvider(ProviderABC):
