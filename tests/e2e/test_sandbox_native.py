@@ -167,7 +167,10 @@ finally:
         )
 
         assert result.success is True, result.error
-        assert f"backend={manager.backend_name}" in result.output
+        if sys.platform.startswith("linux"):
+            assert f"backend={manager.backend_name}" in result.output
+        else:
+            assert "[sandbox tier=" not in result.output
         assert "tty=True,True,True" in result.output
         assert "foreground=True" in result.output
         if sys.platform.startswith("linux"):
