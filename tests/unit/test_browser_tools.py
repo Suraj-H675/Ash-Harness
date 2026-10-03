@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import threading
@@ -22,6 +23,7 @@ from ash.tools.browser import (
     BrowserUploadTool,
     BrowserDownloadTool,
     BrowserScreenshotTool,
+    BrowserClickAtTool,
     BrowserClickTool,
     BrowserDialogTool,
     BrowserDragTool,
@@ -36,6 +38,7 @@ from ash.tools.browser import (
     BrowserTabsTool,
     BrowserTypeTool,
     BrowserWaitTool,
+    CoordinateClickArgs,
     inspect_cdp_source,
     _redact_browser_url,
     _validate_browser_url,
@@ -77,6 +80,16 @@ class FakeBrowserSession:
     async def click(self, ref: str) -> str:
         self.calls.append(("click", ref))
         return "click snapshot"
+
+    async def click_at(
+        self,
+        x: int,
+        y: int,
+        *,
+        screenshot_sha256: str,
+    ) -> str:
+        self.calls.append(("click_at", (x, y, screenshot_sha256)))
+        return "coordinate click snapshot"
 
     async def type_text(
         self,
@@ -234,6 +247,7 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         BrowserFocusTabTool(guard, session),  # type: ignore[arg-type]
         BrowserCloseTabTool(guard, session),  # type: ignore[arg-type]
         BrowserClickTool(guard, session),  # type: ignore[arg-type]
+        BrowserClickAtTool(guard, session),  # type: ignore[arg-type]
         BrowserTypeTool(guard, session),  # type: ignore[arg-type]
         BrowserPressTool(guard, session),  # type: ignore[arg-type]
         BrowserHoverTool(guard, session),  # type: ignore[arg-type]
@@ -255,36 +269,37 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         await tools[4].run(tab_id="tdeadbeef-2"),
         await tools[5].run(tab_id="tdeadbeef-2"),
         await tools[6].run(ref="tdeadbeef-1:s1:e2"),
-        await tools[7].run(
+        await tools[7].run(x=320, y=240, screenshot_sha256="a" * 64),
+        await tools[8].run(
             ref="tdeadbeef-1:s1:e3",
             text="hello",
             submit=True,
             clear=False,
         ),
-        await tools[8].run(key="Control+a", ref="tdeadbeef-1:s1:e3"),
-        await tools[9].run(ref="tdeadbeef-1:s1:e2"),
-        await tools[10].run(
+        await tools[9].run(key="Control+a", ref="tdeadbeef-1:s1:e3"),
+        await tools[10].run(ref="tdeadbeef-1:s1:e2"),
+        await tools[11].run(
             ref="tdeadbeef-1:s1:e4",
             values=["one", "two"],
         ),
-        await tools[11].run(
+        await tools[12].run(
             source_ref="tdeadbeef-1:s1:e2",
             target_ref="tdeadbeef-1:s1:e4",
         ),
-        await tools[12].run(
+        await tools[13].run(
             condition="text",
             value="Done",
             timeout_seconds=2.5,
         ),
-        await tools[13].run(direction="up", amount=250),
-        await tools[14].run(),
-        await tools[15].run(max_bytes=1_000_000),
-        await tools[16].run(
+        await tools[14].run(direction="up", amount=250),
+        await tools[15].run(),
+        await tools[16].run(max_bytes=1_000_000),
+        await tools[17].run(
             ref="tdeadbeef-1:s1:e4",
             file_path="docs/report.pdf",
             max_bytes=2_000_000,
         ),
-        await tools[17].run(
+        await tools[18].run(
             ref="tdeadbeef-1:s1:e5",
             file_path="downloads/report.pdf",
             max_bytes=4_000_000,
@@ -301,6 +316,7 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         ("focus_tab", "tdeadbeef-2"),
         ("close_tab", "tdeadbeef-2"),
         ("click", "tdeadbeef-1:s1:e2"),
+        ("click_at", (320, 240, "a" * 64)),
         ("type", ("tdeadbeef-1:s1:e3", "hello", True, False)),
         ("press", ("Control+a", "tdeadbeef-1:s1:e3")),
         ("hover", "tdeadbeef-1:s1:e2"),
@@ -317,11 +333,14 @@ async def test_browser_tools_dispatch_validated_actions_and_close(tmp_path) -> N
         ),
     ]
     assert session.closed == 1
-    assert results[15].images[0]["sha256"] == "a" * 64
-    assert results[15].image_blocks[0]["data"] == "cG5nLWRhdGE="
+    assert results[16].images[0]["sha256"] == "a" * 64
+    assert results[16].image_blocks[0]["data"] == "cG5nLWRhdGE="
 
 
 def test_structured_browser_action_arguments_reject_unsafe_or_ambiguous_inputs() -> None:
+    with pytest.raises(ValueError, match="64 hexadecimal"):
+        CoordinateClickArgs(x=10, y=20, screenshot_sha256="g" * 64)
+
     with pytest.raises(ValueError, match="invalid modifier"):
         BrowserPressTool.args_schema(key="Control+Control+a")
 
@@ -454,6 +473,42 @@ async def test_browser_session_structured_interactions_are_bounded_and_ref_scope
     assert ("get_by_text", ("Done", False)) in calls
     assert ("wait_ref", ("text", "visible", 500)) in calls
     assert ("wait_load", ("load", 500)) in calls
+
+
+@pytest.mark.asyncio
+async def test_browser_coordinate_click_requires_fresh_matching_screenshot() -> None:
+    calls: list[tuple[int, int]] = []
+
+    class Mouse:
+        async def click(self, x: int, y: int) -> None:
+            calls.append((x, y))
+
+    class Page:
+        viewport_size = {"width": 800, "height": 600}
+        mouse = Mouse()
+
+        async def screenshot(self, *, type: str, full_page: bool) -> bytes:
+            assert type == "png"
+            assert full_page is False
+            return b"current-screenshot"
+
+    page = Page()
+    session = BrowserSession(timeout_seconds=1)
+    session.ensure_started = AsyncMock(return_value=page)  # type: ignore[method-assign]
+    session._settle = AsyncMock()  # type: ignore[method-assign]
+    session.snapshot = AsyncMock(return_value="snapshot")  # type: ignore[method-assign]
+    screenshot_sha256 = hashlib.sha256(b"current-screenshot").hexdigest()
+
+    with pytest.raises(ValueError, match="outside viewport"):
+        await session.click_at(800, 20, screenshot_sha256=screenshot_sha256)
+    with pytest.raises(ValueError, match="screenshot is stale"):
+        await session.click_at(20, 30, screenshot_sha256="0" * 64)
+
+    assert (
+        await session.click_at(20, 30, screenshot_sha256=screenshot_sha256)
+        == "snapshot"
+    )
+    assert calls == [(20, 30)]
 
 
 @pytest.mark.asyncio
@@ -1964,6 +2019,15 @@ def test_browser_tools_share_one_lazy_session_and_permissions(tmp_path) -> None:
     assert (
         PermissionPolicy("interactive")
         .evaluate("browser_navigate", {"url": "https://example.com"})
+        .action
+        == PolicyAction.ASK
+    )
+    assert (
+        PermissionPolicy("interactive")
+        .evaluate(
+            "browser_click_at",
+            {"x": 20, "y": 30, "screenshot_sha256": "a" * 64},
+        )
         .action
         == PolicyAction.ASK
     )

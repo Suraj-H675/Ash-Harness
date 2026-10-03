@@ -114,11 +114,11 @@ The program is intentionally finite:
    gaps in subagent orchestration, durable/background work, worktree/workspace
    isolation, delegation, steering, recovery, remote execution where it solves
    real coding workflows, and multi-workspace ergonomics.
-3. **P3 — Web/computer interaction parity — OPEN.** Evaluate browser
+3. **P3 — Web/computer interaction parity — CLOSED.** Evaluate browser
    control breadth, signed-in browser workflows, web research/fetch ergonomics,
    browser attachment/remote operation, and whether general computer use is a
    justified Ash capability rather than copying broader assistant products.
-4. **P4 — Extensibility/ecosystem parity — NOT STARTED.** Evaluate plugins,
+4. **P4 — Extensibility/ecosystem parity — OPEN.** Evaluate plugins,
    skills, MCP, hooks, custom commands, discovery, installation, updating,
    provenance/trust, and marketplace/ecosystem experience. Hosted ecosystem
    breadth is work only when it materially improves real Ash usage.
@@ -143,10 +143,10 @@ The program is intentionally finite:
    important unresolved user need remains may Ash claim whole-product
    leading-harness parity. Literal feature identity is never the criterion.
 
-**Active gate: P3 — Web/computer interaction parity.** P1 and P2 are closed at
-their bounded finish conditions. Do not reopen either for feature-count churn;
-reopen only for concrete evidence that an important supported provider/model or
-agent/workspace user need or claim is wrong.
+**Active gate: P4 — Extensibility/ecosystem parity.** P1, P2, and P3 are closed
+at their bounded finish conditions. Do not reopen them for feature-count churn;
+reopen only for concrete evidence that an important supported provider/model,
+agent/workspace, or web/computer-interaction user need or claim is wrong.
 
 ### P1 finite closure checklist
 
@@ -1058,8 +1058,8 @@ assistant surface exposed by gateway products.
 - `P3C_SIGNED_IN_BROWSER = CLOSED`
 - `P3D_REMOTE_BROWSER_OPERATION = CLOSED`
 - `P3E_DESKTOP_COMPUTER_USE = CLOSED`
-- `P3F_INTERACTION_CONFORMANCE = OPEN`
-- `P3_WEB_COMPUTER_PARITY = OPEN` until P3A-P3F are all closed.
+- `P3F_INTERACTION_CONFORMANCE = CLOSED`
+- `P3_WEB_COMPUTER_PARITY = CLOSED`
 
 P3 closes when public-web research/fetch is dependable and appropriately
 bounded; browser interaction can complete realistic modern web-app/test flows;
@@ -1360,6 +1360,68 @@ Comparator references rechecked on 2026-10-03:
 `https://hermes-agent.nousresearch.com/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-computer-use`,
 and `https://developers.openai.com/api/docs/guides/tools-computer-use`.
 
+### P3F closure — integrated interaction conformance
+
+P3F and the parent P3 phase are CLOSED. The final comparator pass did not reopen
+the deliberately rejected remote-browser or general-desktop surfaces, but it
+did identify one material browser-level gap that the earlier ref-oriented audit
+had missed: visual-only web controls such as canvas content can have no
+actionable accessibility/DOM ref. Current OpenClaw retains `click-coords` for
+exactly that fallback, Hermes' browser execution can use Playwright mouse
+coordinates, and OpenAI's computer-use action model includes coordinate clicks.
+
+Ash now exposes a narrowly bounded `browser_click_at` fallback rather than a
+general page-evaluation escape hatch. The tool requires viewport coordinates
+plus the SHA-256 emitted by a specific `browser_screenshot`. Immediately before
+acting, Ash re-captures the current viewport and compares its SHA-256 with the
+caller-supplied value; any changed pixels make the screenshot stale and the
+action fails closed. Coordinates must also fall inside the current Ash-owned
+viewport. The click then runs through the existing dialog-aware action path,
+normal permission policy, page-settle behavior, and fresh bounded snapshot.
+Ref-based `browser_click` remains the preferred operation whenever an
+actionable ref exists.
+
+This preserves the earlier safety/product decisions. Ash still does not expose
+unrestricted page evaluation or browser action batching merely for parity; it
+does not attach directly to remote CDP endpoints; authenticated state remains
+Ash-owned or explicitly domain-scoped; and a general desktop-control subsystem
+remains outside core. The current OpenAI guidance explicitly permits
+application-defined function/MCP UI tools and emphasizes isolated environments,
+site/action allowlists, confirmation for consequential actions, bounded
+execution, and verification. Ash's structured tools, network policy,
+side-effect approval classification, fresh-ref/screenshot boundaries, bounded
+timeouts/output, and post-action snapshots fit that contract without importing
+the broader computer-use surface.
+
+Final deterministic conformance on this checkout passes 105/105 focused
+browser/web unit tests, six browser config/runtime/SDK ownership checks, and
+12/12 complete real-Chromium E2E tests. The Chromium suite covers accessible
+form interaction, keyboard/hover/select/drag/waits, dialogs, visible iframes,
+popup/tab ownership, upload, network/redirect/subresource blocking, Ash-owned
+persistent auth and reset, domain-scoped CDP state import/source-browser
+survival, and the new screenshot-bound visual-only canvas click.
+
+The final live public-network probe on 2026-10-03 also succeeded through Ash's
+actual guarded paths: `web_fetch` retrieved `https://example.com/` with its
+sanitized citation; Chromium navigated to the same public site, produced a
+bounded PNG screenshot, followed its `Learn more` link to IANA, and navigated
+back. A first run intentionally authorized `iana.org` but not its redirect
+subdomain and failed closed at the redirect; adding `*.iana.org` allowed the
+journey to complete. This is direct evidence that the browser policy remains in
+force on a real external navigation rather than only local fixture pages.
+
+Neither `BRAVE_SEARCH_API_KEY` nor `TAVILY_API_KEY` is present on this host,
+so this P3F checkpoint does **not** upgrade the P3A search-provider claim to a
+live credentialed-service test. Brave/Tavily behavior remains covered by the
+validated provider contracts, deterministic transport/normalization tests, and
+the current first-party API references recorded in P3A.
+
+Comparator references rechecked on 2026-10-03:
+`https://docs.openclaw.ai/tools/browser-control`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/features/browser/`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/features/computer-use`,
+and `https://developers.openai.com/api/docs/guides/tools-computer-use`.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product
@@ -1627,7 +1689,7 @@ truthful evidence boundaries, not open mission blockers.
 | Git commit | Verified locally | Explicit commits require a path scope and refuse any pre-existing staged index state before staging; staged additions are secret-scanned and Git hook/stdout/stderr failures are surfaced. Automatic per-turn commits are stricter: candidates come only from successful Ash file mutations, `auto_commit_paths` acts only as an allowlist, paths dirty at turn start are skipped, post-edit SHA-256 ownership is rechecked before and after staging, and real dirty-repo journeys preserve same-file user edits instead of absorbing them. Explicit approved commits remain full-path scoped rather than hunk-owned. |
 | Tests/build/lint diagnostics | Verified locally | `run_command` parses bounded compiler/lint/pytest diagnostics into model-visible path, line, symbol, code, and message fields and aggregates pytest/MyPy/Ruff summary counts |
 | Web fetch/search | Verified locally | Guarded HTTP(S) fetch plus Brave/Tavily live search with credential auto-detection, auto fallback, fixed endpoints, freshness, bounded normalized sources, provider provenance, shared domain filtering, and durable citation objects are wired |
-| Browser automation | Strong partial | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets, blocked service workers/password fills, bounded ARIA snapshots and visible-frame refs, structured modern interactions, explicit dialog state, bounded vision screenshots, safe workspace uploads and atomic bounded workspace downloads, setup/doctor support, deterministic cleanup, opt-in private Ash-owned persistent profiles, and loopback-only CDP attachment through a separate Ash-owned policy context. Existing-browser auth reuse is explicit and requires user-owned `allowed_web_domains`; only matching cookies/localStorage are copied, unrelated/future credential categories are dropped, and the source browser remains untouched. `/browser inspect` reads only bounded/redacted tab inventory; `/browser status`, `/browser connect`, `/browser disconnect`, and `/browser reset-profile` provide inspectable attach, detach, scope, and revocation controls. Real Chromium E2E proves persistent auth/reset, scoped state reuse, hot-swap, interaction breadth, and source-browser survival. Browser-specific remote relays/remote CDP are intentionally out of core: remote deployments run Ash beside the browser and use ACP/SDK/HTTP/A2A according to their approval and trust model |
+| Browser automation | Verified locally + live public probe | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets, blocked service workers/password fills, bounded ARIA snapshots and visible-frame refs, structured modern interactions, explicit dialog state, bounded screenshots, screenshot-hash-bound coordinate fallback for visual-only controls, safe workspace uploads and atomic bounded workspace downloads, setup/doctor support, deterministic cleanup, opt-in private Ash-owned persistent profiles, and loopback-only CDP attachment through a separate Ash-owned policy context. Existing-browser auth reuse is explicit and requires user-owned `allowed_web_domains`; only matching cookies/localStorage are copied, unrelated/future credential categories are dropped, and the source browser remains untouched. `/browser inspect` reads only bounded/redacted tab inventory; `/browser status`, `/browser connect`, `/browser disconnect`, and `/browser reset-profile` provide inspectable attach, detach, scope, and revocation controls. Complete real Chromium E2E covers interaction/state/security breadth, and a live public-network navigate/screenshot/click/back journey verifies the guarded external path. Browser-specific remote relays/remote CDP are intentionally out of core: remote deployments run Ash beside the browser and use ACP/SDK/HTTP/A2A according to their approval and trust model |
 | General desktop computer use | Scope-closed | Not a core Ash capability at this phase. Coding workflows use files/shell/Git/LSP/browser first; command subprocesses do not inherit desktop-session authority by default, and only explicit user-owned environment forwarding can expose it. A future native-GUI provider/plugin requires a concrete engineering workflow plus its own screen/accessibility/input/permission contract rather than piggybacking on shell or browser authority |
 | Ask-user tool | Verified locally | Typed blocking question with bounded options and explicit empty-answer failure |
 | Todo/plan tracking | Verified locally | Persisted sprint checklists are inspectable and updatable from the top-level CLI; active plan state is injected into every runtime model request with bounded context accounting |

@@ -49,6 +49,7 @@ BROWSER_TOOL_NAMES = frozenset(
         "browser_focus_tab",
         "browser_close_tab",
         "browser_click",
+        "browser_click_at",
         "browser_type",
         "browser_press",
         "browser_hover",
@@ -668,6 +669,45 @@ class BrowserSession:
             page,
             lambda: locator.click(timeout=self.timeout_ms),
             label="click",
+        )
+        if modal is not None:
+            return modal
+        await self._settle(page)
+        return await self.snapshot()
+
+    async def click_at(
+        self,
+        x: int,
+        y: int,
+        *,
+        screenshot_sha256: str,
+    ) -> str:
+        self._ensure_no_pending_dialog("click another coordinate")
+        page = await self.ensure_started()
+        viewport = getattr(page, "viewport_size", None)
+        if (
+            not isinstance(viewport, dict)
+            or not isinstance(viewport.get("width"), int)
+            or not isinstance(viewport.get("height"), int)
+        ):
+            raise ValueError("browser coordinate click requires a known viewport")
+        width = int(viewport["width"])
+        height = int(viewport["height"])
+        if not 0 <= x < width or not 0 <= y < height:
+            raise ValueError(
+                f"browser coordinate ({x}, {y}) is outside viewport {width}x{height}"
+            )
+        current = await page.screenshot(type="png", full_page=False)
+        current_sha256 = hashlib.sha256(current).hexdigest()
+        if not secrets.compare_digest(current_sha256, screenshot_sha256):
+            raise ValueError(
+                "browser screenshot is stale; take a fresh browser_screenshot "
+                "before using browser_click_at"
+            )
+        modal = await self._run_dialog_aware_action(
+            page,
+            lambda: page.mouse.click(x, y),
+            label="coordinate-click",
         )
         if modal is not None:
             return modal
@@ -1750,6 +1790,20 @@ class ElementArgs(BaseModel):
         return value
 
 
+class CoordinateClickArgs(BaseModel):
+    x: int = Field(..., ge=0, le=100_000)
+    y: int = Field(..., ge=0, le=100_000)
+    screenshot_sha256: str = Field(..., min_length=64, max_length=64)
+
+    @field_validator("screenshot_sha256")
+    @classmethod
+    def validate_screenshot_sha256(cls, value: str) -> str:
+        normalized = value.casefold()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            raise ValueError("browser screenshot sha256 must be 64 hexadecimal characters")
+        return normalized
+
+
 class TypeArgs(ElementArgs):
     text: str = Field(..., max_length=10_000)
     submit: bool = False
@@ -2033,6 +2087,27 @@ class BrowserClickTool(_BrowserTool):
         return await self._result(self.session.click(args.ref))
 
 
+class BrowserClickAtTool(_BrowserTool):
+    name = "browser_click_at"
+    description = (
+        "Fallback for visual-only browser controls: click viewport coordinates from "
+        "a specific browser_screenshot. The viewport is re-captured first and the "
+        "action fails if the screenshot SHA-256 is stale. Prefer browser_click refs "
+        "whenever an actionable ref exists."
+    )
+    args_schema = CoordinateClickArgs
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = CoordinateClickArgs(**kwargs)
+        return await self._result(
+            self.session.click_at(
+                args.x,
+                args.y,
+                screenshot_sha256=args.screenshot_sha256,
+            )
+        )
+
+
 class BrowserTypeTool(_BrowserTool):
     name = "browser_type"
     description = "Fill or type into a referenced non-password browser control, optionally submit, and return the updated snapshot."
@@ -2284,6 +2359,7 @@ def build_browser_tools(
         BrowserFocusTabTool(safety_guard, session),
         BrowserCloseTabTool(safety_guard, session),
         BrowserClickTool(safety_guard, session),
+        BrowserClickAtTool(safety_guard, session),
         BrowserTypeTool(safety_guard, session),
         BrowserPressTool(safety_guard, session),
         BrowserHoverTool(safety_guard, session),

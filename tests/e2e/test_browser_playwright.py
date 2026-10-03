@@ -172,6 +172,49 @@ async def test_real_chromium_structured_interactions_cover_modern_ui_flow() -> N
 
 
 @pytest.mark.asyncio
+async def test_real_chromium_coordinate_click_covers_visual_only_canvas() -> None:
+    session = BrowserSession(timeout_seconds=15)
+    page = await session.ensure_started()
+    try:
+        await page.set_content(
+            """
+            <main>
+              <canvas id="target" width="240" height="120"
+                style="display:block;border:1px solid black"></canvas>
+              <output id="result"></output>
+              <script>
+                const canvas = document.querySelector('#target');
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = '#ddd';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#111';
+                ctx.font = '20px sans-serif';
+                ctx.fillText('Visual target', 55, 65);
+                canvas.addEventListener('click', () => {
+                  document.querySelector('#result').textContent = 'Canvas clicked';
+                });
+              </script>
+            </main>
+            """
+        )
+        snapshot = await session.snapshot()
+        assert "] canvas " not in snapshot
+        screenshot = await session.screenshot(max_bytes=1_000_000)
+        bounds = await page.locator("#target").bounding_box()
+        assert bounds is not None
+
+        clicked = await session.click_at(
+            int(bounds["x"] + bounds["width"] / 2),
+            int(bounds["y"] + bounds["height"] / 2),
+            screenshot_sha256=screenshot.sha256,
+        )
+
+        assert "Canvas clicked" in clicked
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_real_chromium_dialogs_are_explicit_modal_state() -> None:
     session = BrowserSession(timeout_seconds=15)
     page = await session.ensure_started()
