@@ -67,6 +67,70 @@ async def test_background_process_start_poll_and_close(tmp_path) -> None:
     await tool.aclose()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_background_process_pty_is_interactive_controlling_terminal(
+    tmp_path: Path,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    script = (
+        "import os,sys; "
+        "print('tty=' + str(os.isatty(0)) + ':' + "
+        "str(os.tcgetpgrp(0) == os.getpgrp()), flush=True); "
+        "value=sys.stdin.readline().strip(); "
+        "print('got=' + value, flush=True)"
+    )
+    started = await tool.run(
+        action="start",
+        command=_python_shell_command(script),
+        pty=True,
+    )
+    assert started.success is True
+    job_id = started.output.split()[1]
+    try:
+        observed = ""
+        for _ in range(100):
+            polled = await tool.run(action="poll", job_id=job_id)
+            observed += polled.output
+            if "tty=True:True" in observed:
+                break
+            await asyncio.sleep(0.01)
+        assert "tty=True:True" in observed
+
+        written = await tool.run(action="write", job_id=job_id, input="hello\n")
+        assert written.success is True
+        for _ in range(100):
+            polled = await tool.run(action="poll", job_id=job_id)
+            observed += polled.output
+            if "got=hello" in observed:
+                break
+            await asyncio.sleep(0.01)
+        assert "got=hello" in observed
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_background_process_pty_preflight_fails_before_fd_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.process as process_module
+
+    monkeypatch.setenv("ASH_INTERNAL_INHERIT_PROCESS_GROUP", "1")
+    open_pty = Mock(side_effect=AssertionError("openpty must not be reached"))
+    monkeypatch.setattr(process_module, "open_process_pty", open_pty)
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+
+    result = await tool.run(action="start", command="printf hi", pty=True)
+
+    assert result.success is False
+    assert "independently owned POSIX process session" in (result.error or "")
+    open_pty.assert_not_called()
+    await tool.aclose()
+
+
 @pytest.mark.asyncio
 async def test_background_process_close_does_not_reterminate_completed_job(
     tmp_path: Path,
@@ -282,6 +346,42 @@ async def test_background_process_stream_redacts_secret_split_across_polls(
     await tool.aclose()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_background_process_pty_redacts_secret_split_across_polls(
+    tmp_path: Path,
+) -> None:
+    first_fragment = "xai-" + "a" * 10
+    second_fragment = "a" * 70
+    script = (
+        "import sys,time; "
+        f"sys.stdout.write({first_fragment!r}); sys.stdout.flush(); "
+        "time.sleep(0.3); "
+        f"sys.stdout.write({second_fragment!r} + '\\n'); sys.stdout.flush()"
+    )
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+
+    started = await tool.run(
+        action="start",
+        command=_python_shell_command(script),
+        pty=True,
+    )
+    job_id = started.output.split()[1]
+    await asyncio.sleep(0.1)
+    first = await tool.run(action="poll", job_id=job_id)
+    await tool.jobs[job_id].process.wait()
+    await asyncio.gather(*tool.jobs[job_id].readers)
+    second = await tool.run(action="poll", job_id=job_id)
+
+    first_payload = first.output.split("\n", 1)[1] if "\n" in first.output else ""
+    second_payload = second.output.split("\n", 1)[1] if "\n" in second.output else ""
+    combined = first_payload + second_payload
+    assert first_fragment not in combined
+    assert second_fragment not in combined
+    assert "[REDACTED]" in combined
+    await tool.aclose()
+
+
 @pytest.mark.asyncio
 async def test_background_process_stream_redacts_split_private_key(tmp_path) -> None:
     marker = "SYNTHETIC_BACKGROUND_PRIVATE_KEY_BODY"
@@ -485,6 +585,7 @@ async def test_background_process_uses_sandbox_manager(tmp_path) -> None:
         ["/bin/sh", "-c", "printf ignored"],
         cwd=tmp_path,
         passthrough_env_names=(),
+        pty=False,
     )
     await tool.aclose()
 

@@ -604,6 +604,7 @@ class SandboxManager:
         *,
         cwd: Path | None = None,
         passthrough_env_names: Sequence[str] = (),
+        pty: bool = False,
     ) -> Iterator[SandboxInvocation]:
         """Prepare one spawn while holding any backend security anchors open."""
 
@@ -612,6 +613,7 @@ class SandboxManager:
                 command,
                 cwd=cwd,
                 passthrough_env_names=passthrough_env_names,
+                pty=pty,
             )
             return
 
@@ -654,6 +656,7 @@ class SandboxManager:
                     workspace_fd=workspace_fd,
                     read_only_fds=tuple(read_only_fds),
                     docker_workspace_volume=None,
+                    pty=pty,
                 )
                 if invocation.backend_name != "bubblewrap":
                     yield invocation
@@ -683,6 +686,7 @@ class SandboxManager:
         *,
         cwd: Path | None = None,
         passthrough_env_names: Sequence[str] = (),
+        pty: bool = False,
     ) -> SandboxInvocation:
         """Prepare argv without retaining launch-time security anchors.
 
@@ -698,6 +702,7 @@ class SandboxManager:
             workspace_fd=None,
             read_only_fds=None,
             docker_workspace_volume=None,
+            pty=pty,
         )
 
     @contextmanager
@@ -707,6 +712,7 @@ class SandboxManager:
         *,
         workspace_volume: str,
         passthrough_env_names: Sequence[str] = (),
+        pty: bool = False,
     ) -> Iterator[SandboxInvocation]:
         """Prepare a Docker launch backed only by a daemon-managed volume."""
 
@@ -719,6 +725,7 @@ class SandboxManager:
             workspace_fd=None,
             read_only_fds=None,
             docker_workspace_volume=workspace_volume,
+            pty=pty,
         )
         if invocation.backend_name != "docker":
             raise SandboxBackendUnavailable(
@@ -800,11 +807,21 @@ class SandboxManager:
         workspace_fd: int | None,
         read_only_fds: tuple[tuple[int, Path], ...] | None,
         docker_workspace_volume: str | None,
+        pty: bool,
     ) -> SandboxInvocation:
         """Prepare argv, optionally binding Bubblewrap to a held workspace FD."""
 
         if not command:
             raise ValueError("command must be a non-empty sequence")
+        if pty and (
+            self.backend_preference == "docker"
+            or self._selected_backend == "docker"
+            or self.require_resource_containment
+        ):
+            raise SandboxBackendUnavailable(
+                "PTY execution is unavailable with the Docker sandbox because "
+                "Ash cannot guarantee container cleanup after terminal detach"
+            )
         if self._selection_error is not None:
             if not self.allow_scoped_fallback:
                 raise SandboxBackendUnavailable(self._selection_error)
@@ -817,6 +834,17 @@ class SandboxManager:
             )
         try:
             backend = self._build_backend(self._tier)
+        except SandboxBackendUnavailable:
+            if not self.allow_scoped_fallback:
+                raise
+            return SandboxInvocation(
+                tuple(command),
+                cwd,
+                SANDBOX_TIER_SCOPED,
+                "scoped",
+                fallback_used=True,
+            )
+        try:
             if isinstance(backend, BubblewrapSandbox):
                 wrapped = backend.wrap(
                     command,
@@ -824,6 +852,7 @@ class SandboxManager:
                     passthrough_env_names=passthrough_env_names,
                     workspace_fd=workspace_fd,
                     read_only_fds=read_only_fds,
+                    pty=pty,
                 )
             elif isinstance(backend, DockerSandbox):
                 wrapped = backend.wrap(

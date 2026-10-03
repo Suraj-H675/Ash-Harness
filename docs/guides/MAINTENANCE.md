@@ -71,8 +71,10 @@ with a name such as:
 
     sessions.db.before-v18-migration.<timestamp>.backup
 
-For the 0.2.0 upgrade, that backup is the compatible v17 state needed by
-0.1.0. If you must return to 0.1.0 after 0.2.0 has opened the database:
+For the 0.2.0 upgrade, a database created by the published 0.1.0 release starts
+at schema v16; 0.2.0 migrates it through v17 to v18. The automatic
+`before-v18-migration` backup therefore preserves the compatible v16 state
+needed by 0.1.0. If you must return to 0.1.0 after 0.2.0 has opened the database:
 
 1. Stop all Ash processes using that profile/database.
 2. Identify and inspect the `before-v18-migration` backup created by the 0.2.0

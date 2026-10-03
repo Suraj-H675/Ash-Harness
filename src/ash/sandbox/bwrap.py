@@ -69,7 +69,6 @@ _BWRAP_BASE_FLAGS: tuple[str, ...] = (
     "--disable-userns",  # child cannot create nested user namespaces
     "--assert-userns-disabled",  # fail closed if the lock-down was ineffective
     "--die-with-parent",  # kill the sandbox if the parent dies
-    "--new-session",  # new session
 )
 
 
@@ -130,6 +129,7 @@ class BubblewrapSandbox(SandboxBackend):
         passthrough_env_names: Sequence[str] = (),
         workspace_fd: int | None = None,
         read_only_fds: Sequence[tuple[int, Path]] | None = None,
+        pty: bool = False,
     ) -> list[str]:
         """Build a full ``bwrap … -- command`` argv list."""
 
@@ -142,6 +142,12 @@ class BubblewrapSandbox(SandboxBackend):
 
         args: list[str] = [self.bwrap_path or "bwrap"]
         args.extend(_BWRAP_BASE_FLAGS)
+        if not pty:
+            # Ordinary sandboxed commands get a fresh session so they cannot
+            # interact with the caller's controlling terminal. PTY commands
+            # already run in an Ash-owned new session with a dedicated PTY;
+            # creating another session here would discard that controlling TTY.
+            args.append("--new-session")
 
         # Mount a fresh /tmp so the sandbox cannot tamper with host temp.
         args.extend(["--tmpfs", "/tmp"])

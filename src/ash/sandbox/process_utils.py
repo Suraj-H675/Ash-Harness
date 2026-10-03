@@ -7,10 +7,11 @@ import errno
 import os
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,14 +28,31 @@ ProcessStreamCallback = Callable[[str, str], None]
 INHERIT_PROCESS_GROUP_ENV = "ASH_INTERNAL_INHERIT_PROCESS_GROUP"
 WINDOWS_TASKKILL_TIMEOUT_SECONDS = 5.0
 OUTPUT_LIMIT_NATURAL_EXIT_GRACE_SECONDS = 0.05
+PTY_DEFAULT_ROWS = 40
+PTY_DEFAULT_COLUMNS = 120
+PTY_WRITE_TIMEOUT_SECONDS = 5.0
 _KILLPG = getattr(os, "killpg", None)
 _SIGKILL = getattr(signal, "SIGKILL", None)
+_POSIX_FCNTL: Any = None
+_POSIX_TERMIOS: Any = None
+if os.name == "posix":
+    import fcntl as _fcntl
+    import termios as _termios
+
+    _POSIX_FCNTL = _fcntl
+    _POSIX_TERMIOS = _termios
 _FCHDIR_EXEC = (
     "import os,sys;"
     "fd=int(sys.argv[1]);"
     "argv=sys.argv[2:];"
     "os.fchdir(fd);"
     "os.close(fd);"
+    "os.execvpe(argv[0],argv,os.environ)"
+)
+_PTY_EXEC = (
+    "import fcntl,os,sys,termios;"
+    "argv=sys.argv[1:];"
+    "fcntl.ioctl(0,termios.TIOCSCTTY,0);"
     "os.execvpe(argv[0],argv,os.environ)"
 )
 _WINDOWS_CWD_EXEC = """\
@@ -73,6 +91,196 @@ class ProcessTreeError(RuntimeError):
 
 class ProcessTreeUnavailable(ProcessTreeError):
     """A managed process cannot be launched safely on this host."""
+
+
+def open_process_pty(
+    *,
+    rows: int = PTY_DEFAULT_ROWS,
+    columns: int = PTY_DEFAULT_COLUMNS,
+) -> tuple[int, int]:
+    """Allocate a bounded POSIX pseudo-terminal pair for a managed process."""
+
+    if sys.platform not in {"linux", "darwin"}:
+        raise ProcessTreeUnavailable("PTY execution is supported only on Linux/macOS")
+    try:
+        master_fd, slave_fd = os.openpty()
+        try:
+            _POSIX_FCNTL.ioctl(
+                slave_fd,
+                _POSIX_TERMIOS.TIOCSWINSZ,
+                struct.pack("HHHH", rows, columns, 0, 0),
+            )
+            os.set_blocking(master_fd, False)
+        except BaseException:
+            os.close(master_fd)
+            os.close(slave_fd)
+            raise
+    except (ImportError, OSError) as exc:
+        raise ProcessTreeUnavailable(f"PTY allocation failed: {exc}") from exc
+    return master_fd, slave_fd
+
+
+def pty_process_spawn_options(plan: "ProcessTreePlan") -> dict[str, Any]:
+    """Return process-group options compatible with PTY ownership."""
+
+    if sys.platform not in {"linux", "darwin"}:
+        raise ProcessTreeUnavailable("PTY execution is supported only on Linux/macOS")
+    if plan.spawn_options.get("start_new_session") is not True:
+        raise ProcessTreeUnavailable(
+            "PTY execution requires an independently owned POSIX process session"
+        )
+    return dict(plan.spawn_options)
+
+
+def prepare_pty_process_argv(
+    command: Sequence[str],
+    *,
+    plan: "ProcessTreePlan",
+    search_path: str | None,
+) -> tuple[str, ...]:
+    """Wrap a command in a trusted post-exec controlling-terminal trampoline."""
+
+    if not command:
+        raise ValueError("PTY command must not be empty")
+    pty_process_spawn_options(plan)
+    launcher = _resolve_trusted_python_launcher(
+        plan.workspace_root,
+        search_path=search_path,
+    )
+    if launcher is None:
+        raise ProcessTreeUnavailable(
+            "PTY execution requires a trusted host Python launcher"
+        )
+    return (launcher, "-I", "-S", "-c", _PTY_EXEC, *command)
+
+
+def close_pty_fd(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+async def iter_pty_output(master_fd: int) -> AsyncIterator[bytes]:
+    """Yield PTY output until the slave side closes."""
+
+    while True:
+        try:
+            chunk = os.read(master_fd, 4096)
+        except BlockingIOError:
+            await _wait_fd_ready(master_fd, writable=False)
+            continue
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            if exc.errno in {errno.EIO, errno.EBADF}:
+                return
+            raise
+        if not chunk:
+            return
+        yield chunk
+
+
+async def _wait_fd_ready(fd: int, *, writable: bool) -> None:
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+
+    def mark_ready() -> None:
+        if not ready.done():
+            ready.set_result(None)
+
+    add = loop.add_writer if writable else loop.add_reader
+    remove = loop.remove_writer if writable else loop.remove_reader
+    add(fd, mark_ready)
+    try:
+        await ready
+    finally:
+        remove(fd)
+
+
+async def write_pty_input(
+    master_fd: int,
+    data: bytes,
+    *,
+    lock: asyncio.Lock | None = None,
+    timeout_seconds: float = PTY_WRITE_TIMEOUT_SECONDS,
+) -> None:
+    """Write a bounded PTY input payload without blocking the event loop."""
+
+    async def write_all() -> None:
+        view = memoryview(data)
+        while view:
+            try:
+                written = os.write(master_fd, view)
+            except BlockingIOError:
+                await _wait_fd_ready(master_fd, writable=True)
+                continue
+            except InterruptedError:
+                continue
+            if written <= 0:
+                raise OSError(errno.EIO, "PTY input closed")
+            view = view[written:]
+
+    async def bounded_write() -> None:
+        await asyncio.wait_for(write_all(), timeout=timeout_seconds)
+
+    if lock is None:
+        await bounded_write()
+        return
+    async with lock:
+        await bounded_write()
+
+
+async def communicate_pty_process(
+    process: asyncio.subprocess.Process,
+    master_fd: int,
+    *,
+    stream_callback: ProcessStreamCallback | None = None,
+    max_output_bytes: int | None = None,
+    process_tree_plan: "ProcessTreePlan" | None = None,
+    capture_output: bool = True,
+) -> bytes:
+    """Drain one PTY stream with the same bounded cleanup contract as pipes."""
+
+    if max_output_bytes is not None and max_output_bytes < 1:
+        raise ValueError("max_output_bytes must be positive")
+    captured = bytearray()
+    read_total = 0
+    output_limit_exceeded = False
+    cleanup_error: ProcessTreeError | None = None
+    async for chunk in iter_pty_output(master_fd):
+        read_total += len(chunk)
+        if capture_output and (
+            max_output_bytes is None or len(captured) < max_output_bytes
+        ):
+            remaining = (
+                len(chunk)
+                if max_output_bytes is None
+                else max_output_bytes - len(captured)
+            )
+            captured.extend(chunk[:remaining])
+        if stream_callback is not None:
+            try:
+                stream_callback("stdout", chunk.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+        if max_output_bytes is not None and read_total > max_output_bytes:
+            output_limit_exceeded = True
+            try:
+                await terminate_process_tree(process, plan=process_tree_plan)
+            except ProcessTreeError as exc:
+                cleanup_error = exc
+            break
+    if output_limit_exceeded:
+        raise ProcessOutputLimitExceeded(
+            f"subprocess output exceeded {max_output_bytes} bytes",
+            stdout=bytes(captured),
+            cleanup_error=cleanup_error,
+        )
+    await process.wait()
+    return bytes(captured)
 
 
 class ProcessTreeTerminationError(ProcessTreeError):

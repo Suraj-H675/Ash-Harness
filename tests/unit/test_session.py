@@ -223,8 +223,8 @@ def test_v17_migration_marks_historical_usage_pricing_unknown(tmp_path: Path) ->
         ).fetchone()[0] == CURRENT_SCHEMA_VERSION
 
 
-def test_v18_migration_backup_remains_v17_rollback_state(tmp_path: Path) -> None:
-    db_path = tmp_path / "v17.db"
+def test_v18_migration_backup_remains_v16_rollback_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "v16.db"
     store = SessionStore(db_path)
     session = store.create_session(str(tmp_path))
     store.save_message(
@@ -244,7 +244,8 @@ def test_v18_migration_backup_remains_v17_rollback_state(tmp_path: Path) -> None
             DROP TRIGGER messages_fts_delete;
             DROP TRIGGER messages_fts_update;
             DROP TABLE messages_fts;
-            DELETE FROM schema_migrations WHERE version >= 18;
+            ALTER TABLE sessions DROP COLUMN pricing_unknown_turns;
+            DELETE FROM schema_migrations WHERE version >= 17;
             """
         )
         conn.commit()
@@ -253,12 +254,15 @@ def test_v18_migration_backup_remains_v17_rollback_state(tmp_path: Path) -> None
 
     SessionStore(db_path)
 
-    backups = list(tmp_path.glob("v17.db.before-v18-migration.*.backup"))
+    backups = list(tmp_path.glob("v16.db.before-v18-migration.*.backup"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as backup_conn:
         assert backup_conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 17
+        ).fetchone()[0] == 16
+        assert "pricing_unknown_turns" not in {
+            row[1] for row in backup_conn.execute("PRAGMA table_info(sessions)")
+        }
         assert backup_conn.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type = 'table' AND name = 'messages_fts'"
@@ -267,6 +271,9 @@ def test_v18_migration_backup_remains_v17_rollback_state(tmp_path: Path) -> None
         assert migrated_conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
         ).fetchone()[0] == 18
+        assert "pricing_unknown_turns" in {
+            row[1] for row in migrated_conn.execute("PRAGMA table_info(sessions)")
+        }
         assert migrated_conn.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type = 'table' AND name = 'messages_fts'"

@@ -23,9 +23,15 @@ from ash.sandbox.process_utils import (
     ProcessTreeError,
     ProcessTreePlan,
     ProcessTreeUnavailable,
+    close_pty_fd,
+    communicate_pty_process,
+    open_process_pty,
+    prepare_pty_process_argv,
     prepare_process_tree,
     prepare_scoped_process_launch,
+    pty_process_spawn_options,
     terminate_process_tree,
+    write_pty_input,
 )
 from ash.sandbox import (
     SANDBOX_TIER_SCOPED,
@@ -133,6 +139,8 @@ class Job:
     sandbox_backend: str = "scoped"
     stdout_redactor: StreamingRedactor = field(default_factory=StreamingRedactor)
     stderr_redactor: StreamingRedactor = field(default_factory=StreamingRedactor)
+    pty_master_fd: int | None = None
+    pty_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class BackgroundProcessArgs(BaseModel):
@@ -141,6 +149,13 @@ class BackgroundProcessArgs(BaseModel):
     job_id: str = Field("", max_length=MAX_BACKGROUND_JOB_ID_CHARS)
     input: str = Field("", max_length=MAX_BACKGROUND_INPUT_CHARS)
     cwd: str | None = Field(None, max_length=MAX_BACKGROUND_CWD_CHARS)
+    pty: bool = Field(
+        False,
+        description=(
+            "Allocate a POSIX pseudo-terminal for a started process. PTY output "
+            "merges stdout/stderr and write sends input to the terminal."
+        ),
+    )
 
 
 class BackgroundProcessTool(BaseTool):
@@ -183,12 +198,32 @@ class BackgroundProcessTool(BaseTool):
                 truncated=job.output_truncated,
             )
         if args.action == "write":
-            if job.process.stdin is None or job.process.returncode is not None:
+            if job.process.returncode is not None:
                 return ToolResult(
                     success=False, output="", error="Job stdin is unavailable"
                 )
-            job.process.stdin.write(args.input.encode())
-            await job.process.stdin.drain()
+            if job.pty_master_fd is not None:
+                try:
+                    async with job.pty_write_lock:
+                        if job.pty_master_fd is None:
+                            raise OSError("PTY input closed")
+                        await write_pty_input(
+                            job.pty_master_fd,
+                            args.input.encode(),
+                        )
+                except (OSError, asyncio.TimeoutError):
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error="Job PTY input is unavailable",
+                    )
+            else:
+                if job.process.stdin is None:
+                    return ToolResult(
+                        success=False, output="", error="Job stdin is unavailable"
+                    )
+                job.process.stdin.write(args.input.encode())
+                await job.process.stdin.drain()
             return self._result(f"Wrote {len(args.input)} bytes to {job.job_id}.")
         _, cleanup_error, cancelled = await _settle_cleanup(
             terminate_process_tree(job.process, plan=job.process_tree_plan)
@@ -285,6 +320,7 @@ class BackgroundProcessTool(BaseTool):
                     argv,
                     cwd=Path(cwd),
                     passthrough_env_names=self.environment_allowlist,
+                    pty=args.pty,
                 )
             with invocation_context as invocation:
                 backend_name = invocation.backend_name
@@ -299,17 +335,35 @@ class BackgroundProcessTool(BaseTool):
                         dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
                     )
                     spawn_options = dict(process_tree_plan.spawn_options)
+                    master_fd: int | None = None
+                    slave_fd: int | None = None
+                    if args.pty:
+                        spawn_options = pty_process_spawn_options(process_tree_plan)
+                        launch_argv = prepare_pty_process_argv(
+                            launch.argv,
+                            plan=process_tree_plan,
+                            search_path=environment.get("PATH"),
+                        )
+                        master_fd, slave_fd = open_process_pty()
+                    else:
+                        launch_argv = launch.argv
                     if inherited_fds:
                         spawn_options["pass_fds"] = inherited_fds
-                    process = await asyncio.create_subprocess_exec(
-                        *launch.argv,
-                        cwd=launch.cwd,
-                        env=environment,
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        **spawn_options,
-                    )
+                    try:
+                        process = await asyncio.create_subprocess_exec(
+                            *launch_argv,
+                            cwd=launch.cwd,
+                            env=environment,
+                            stdin=(slave_fd if args.pty else asyncio.subprocess.PIPE),
+                            stdout=(slave_fd if args.pty else asyncio.subprocess.PIPE),
+                            stderr=(slave_fd if args.pty else asyncio.subprocess.PIPE),
+                            **spawn_options,
+                        )
+                    except BaseException:
+                        close_pty_fd(master_fd)
+                        close_pty_fd(slave_fd)
+                        raise
+                    close_pty_fd(slave_fd)
         except SandboxBackendUnavailable as exc:
             return ToolResult(
                 success=False,
@@ -328,23 +382,53 @@ class BackgroundProcessTool(BaseTool):
             process,
             process_tree_plan,
             sandbox_backend=backend_name,
+            pty_master_fd=master_fd if args.pty else None,
         )
-        assert process.stdout is not None and process.stderr is not None
-        job.readers = [
-            asyncio.create_task(
-                self._read(process.stdout, job, "", job.stdout_redactor)
-            ),
-            asyncio.create_task(
-                self._read(
-                    process.stderr,
-                    job,
-                    "[stderr] ",
-                    job.stderr_redactor,
-                )
-            ),
-        ]
+        if args.pty:
+            assert job.pty_master_fd is not None
+            job.readers = [asyncio.create_task(self._read_pty(job))]
+        else:
+            assert process.stdout is not None and process.stderr is not None
+            job.readers = [
+                asyncio.create_task(
+                    self._read(process.stdout, job, "", job.stdout_redactor)
+                ),
+                asyncio.create_task(
+                    self._read(
+                        process.stderr,
+                        job,
+                        "[stderr] ",
+                        job.stderr_redactor,
+                    )
+                ),
+            ]
         self.jobs[job.job_id] = job
         return self._result(f"Started {job.job_id} (pid {process.pid}).")
+
+    async def _read_pty(self, job: Job) -> None:
+        assert job.pty_master_fd is not None
+
+        def receive(_stream: str, text: str) -> None:
+            delta = job.stdout_redactor.feed(text)
+            if delta:
+                self._append_redacted_output(job, delta)
+
+        try:
+            await communicate_pty_process(
+                job.process,
+                job.pty_master_fd,
+                stream_callback=receive,
+                process_tree_plan=job.process_tree_plan,
+                capture_output=False,
+            )
+        finally:
+            async with job.pty_write_lock:
+                master_fd = job.pty_master_fd
+                job.pty_master_fd = None
+                close_pty_fd(master_fd)
+            delta = job.stdout_redactor.finish()
+            if delta:
+                self._append_redacted_output(job, delta)
 
     def _prune_terminal_history(self) -> None:
         """Bound retained terminal-job history without consuming live capacity."""
@@ -406,7 +490,8 @@ class BackgroundProcessTool(BaseTool):
             else f"exited({job.process.returncode})"
         )
         return (
-            f"{job.job_id} {state} [{job.sandbox_backend}]: "
+            f"{job.job_id} {state} [{job.sandbox_backend}"
+            f"{'/pty' if job.pty_master_fd is not None else ''}]: "
             f"{redact_text(job.command)}"
         )
 

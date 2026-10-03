@@ -661,6 +661,11 @@ def test_manager_explicit_unavailable_backend_fails_closed(
     assert fallback.backend_name == "scoped"
     assert fallback.fallback_used is True
     assert docker_fallback.status()["backend"] == "scoped"
+    with pytest.raises(
+        SandboxBackendUnavailable,
+        match="PTY execution is unavailable with the Docker sandbox",
+    ):
+        docker_fallback.prepare(["echo", "hi"], pty=True)
     bwrap.assert_called_once_with(tmp_path)
     assert docker.call_count == 2
     docker.assert_called_with(DEFAULT_IMAGE, workspace_root=tmp_path)
@@ -693,6 +698,23 @@ def test_manager_explicit_docker_uses_configured_image(tmp_path: Path) -> None:
     docker.assert_called_with(
         "company/ash-sandbox:v2", workspace_root=tmp_path
     )
+    with (
+        patch.object(manager, "_build_backend", return_value=backend),
+        pytest.raises(
+            SandboxBackendUnavailable,
+            match="PTY execution is unavailable with the Docker sandbox",
+        ),
+    ):
+        manager.prepare(["echo", "hi"], pty=True)
+    manager.allow_scoped_fallback = True
+    with (
+        patch.object(manager, "_build_backend", return_value=backend),
+        pytest.raises(
+            SandboxBackendUnavailable,
+            match="PTY execution is unavailable with the Docker sandbox",
+        ),
+    ):
+        manager.prepare(["echo", "hi"], pty=True)
 
 
 def test_manager_can_disable_docker_cpu_and_memory_limits(tmp_path: Path) -> None:
@@ -870,6 +892,7 @@ def test_bubblewrap_wrap_includes_namespace_flags(tmp_path: Path) -> None:
     assert "--disable-userns" in argv
     assert "--assert-userns-disabled" in argv
     assert "--die-with-parent" in argv
+    assert "--new-session" in argv
     assert "--proc" in argv
     assert argv[argv.index("--proc") + 1] == "/proc"
     assert "--dev" in argv
@@ -882,6 +905,9 @@ def test_bubblewrap_wrap_includes_namespace_flags(tmp_path: Path) -> None:
     # Command separator and the actual command are at the tail.
     assert "--" in argv
     assert argv[-2:] == ["echo", "hi"]
+
+    pty_argv = backend.wrap(["echo", "hi"], pty=True)
+    assert "--new-session" not in pty_argv
 
 
 def test_bubblewrap_does_not_mount_entire_host_etc(tmp_path: Path) -> None:

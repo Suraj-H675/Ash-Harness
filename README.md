@@ -268,7 +268,7 @@ Ash includes a broad coding-tool surface:
 | Text and structure | Directory listing, bounded globbing, descriptor-scoped bounded text/regex search, symbol lookup, and reference lookup |
 | Code intelligence | Incremental Tree-sitter repository maps for Python, JavaScript/JSX, TypeScript/TSX, Go, Rust, Java, C, C++, and C# |
 | Git | Status, bounded diffs, log inspection, explicit-scope commits, secret scanning, Git-hook error reporting, and worktree-aware review |
-| Processes | Foreground commands, managed background jobs, live bounded stdout/stderr, stdin, polling, stopping, and cleanup; TTY-only programs may still require an external terminal or extension |
+| Processes | Foreground commands, managed background jobs, live bounded stdout/stderr, stdin, polling, stopping, cleanup, and opt-in native/scoped POSIX PTY execution for TTY-required CLIs; Docker-sandbox PTY currently fails closed |
 | Interaction | Typed ask-user questions, persisted plans, and model-visible compiler, linter, test, MyPy, and Ruff diagnostics |
 
 File operations are workspace-scoped and protect against symlinks, junctions,
@@ -746,10 +746,11 @@ they are complete:
   executed directly; and
 - a broad messaging-channel gateway is not currently part of Ash.
 
-Ash has a real immutable production distribution, and the finite P0-P8 parity
-program is closed at the documented product and evidence boundaries. This does
-not claim literal feature identity with desktop/mobile/gateway products or turn
-qualified provider/protocol rows into broader support claims.
+Ash has a real immutable production distribution. The strict post-0.2.0 parity
+re-audit currently keeps P0, P5, P7, and P8 open while corrected release claims
+and strengthened hosted PTY/browser evidence are verified; P1-P4 and P6 remain
+closed. This does not claim literal feature identity with desktop/mobile/gateway
+products or turn qualified provider/protocol rows into broader support claims.
 Production observability is available as an explicit opt-in OpenTelemetry/OTLP
 trace-and-metrics path; qualified boundaries above remain truthful support
 limits rather than claims of feature identity with every comparator.

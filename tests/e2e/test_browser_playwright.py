@@ -35,6 +35,76 @@ class _BrowserE2EProvider(ProviderABC):
 
 
 @pytest.mark.asyncio
+async def test_real_chromium_allows_exact_configured_loopback_origin_only() -> None:
+    app_requests: list[bytes] = []
+    neighbor_requests: list[bytes] = []
+
+    async def app_handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            header = await reader.readuntil(b"\r\n\r\n")
+            app_requests.append(header)
+            body = (
+                b"<main><button onclick=\"document.querySelector('output').textContent="
+                b"'local-ok'\">Run local app</button><output></output></main>"
+            )
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                + b"Content-Type: text/html\r\nConnection: close\r\n\r\n"
+                + body
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def neighbor_handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        neighbor_requests.append(await reader.read(64 * 1024))
+        writer.close()
+        await writer.wait_closed()
+
+    app = await asyncio.start_server(app_handler, "127.0.0.1", 0)
+    neighbor = await asyncio.start_server(neighbor_handler, "127.0.0.1", 0)
+    app_port = int(app.sockets[0].getsockname()[1])
+    neighbor_port = int(neighbor.sockets[0].getsockname()[1])
+    session = BrowserSession(
+        timeout_seconds=10,
+        allowed_local_origins=(f"http://127.0.0.1:{app_port}",),
+    )
+    try:
+        snapshot = await session.navigate(
+            f"http://127.0.0.1:{app_port}/",
+            "domcontentloaded",
+        )
+        action = re.search(r"\[([^]]+)] button 'Run local app'", snapshot)
+        assert action is not None
+
+        clicked = await session.click(action.group(1))
+
+        assert "local-ok" in clicked
+        with pytest.raises(ValueError):
+            await session.navigate(
+                f"http://127.0.0.1:{neighbor_port}/",
+                "domcontentloaded",
+            )
+    finally:
+        await session.close()
+        app.close()
+        neighbor.close()
+        await app.wait_closed()
+        await neighbor.wait_closed()
+
+    assert app_requests
+    assert neighbor_requests == []
+
+
+@pytest.mark.asyncio
 async def test_real_chromium_snapshot_fill_click_and_private_fetch_block() -> None:
     session = BrowserSession(timeout_seconds=15)
     page = await session.ensure_started()

@@ -77,7 +77,9 @@ reopening already-verified areas mechanically.
    benchmark no longer identifies a material core-harness weakness that should
    be fixed before calling Ash first-class and production-worthy.
 
-Current production-foundation gate state: **M1-M5 are closed/current.** They
+Current production-foundation gate state: **M1 is reopened by the strict audit;
+M2-M5 remain closed/current.** M1 is waiting on publication of the corrected
+immutable release claims described in P0. The remaining foundation milestones
 establish that Ash is production-worthy within its documented terminal
 coding-harness scope; they do **not** establish literal whole-product parity
 with every leading harness. Partial capability rows below remain deliberately
@@ -100,11 +102,12 @@ evidence where warranted, and truthful user-facing claims must support closure.
 
 The program is intentionally finite:
 
-0. **P0 — Production foundation — CLOSED.** M1-M5, immutable release
-   ash-v0.1.0, supported-host CI, packaging/install/repair, safety,
-   recovery, observability, and production-core evidence remain the completed
-   baseline. Reopen P0 only for new contradictory evidence or a regression that
-   directly invalidates that baseline.
+0. **P0 — Production foundation — REOPENED (strict audit).** The production
+   behavior remains healthy, including a real published 0.1.0 → 0.2.0 → 0.1.0
+   package/data rollback journey, but the latest immutable 0.2.0 release docs
+   incorrectly describe the published 0.1.0 session schema as v17 instead of
+   v16. Source docs and regression coverage are repaired locally; P0/M1 stays
+   open until a corrected immutable release publishes those claims.
 1. **P1 — Provider/model parity — CLOSED.** Close material gaps in provider
    breadth and correctness, authentication/subscription paths, discovery and
    switching, capability metadata, tool/reasoning/multimodal semantics,
@@ -124,7 +127,7 @@ The program is intentionally finite:
    skills, MCP, hooks, custom commands, discovery, installation, updating,
    provenance/trust, and marketplace/ecosystem experience. Hosted ecosystem
    breadth is work only when it materially improves real Ash usage.
-5. **P5 — Interfaces and anywhere-access parity — CLOSED.** Determine
+5. **P5 — Interfaces and anywhere-access parity — REOPENED (strict audit).** Determine
    whether remote access, web UI, messaging surfaces, companion clients, or
    other access modalities solve important Ash workflows; implement justified
    gaps and explicitly reject unrelated product categories.
@@ -133,24 +136,26 @@ The program is intentionally finite:
    approvals, sessions, debugging, interruption/recovery, updates, and
    troubleshooting. Close material friction even when the underlying backend
    capability already exists.
-7. **P7 — Final adversarial comparator pass — CLOSED.** Re-run current
+7. **P7 — Final adversarial comparator pass — REOPENED (strict audit).** Re-run current
    evidence against the strongest relevant harnesses, including OpenClaw,
    Hermes, Claude Code, Codex CLI, Gemini CLI, OpenCode, Aider, and any newer
    serious comparator. Confirm no material user-value gap was missed or hidden
    by Ash's existing architecture or docs.
-8. **P8 — Whole-product parity decision gate — CLOSED.** Every remaining
+8. **P8 — Whole-product parity decision gate — REOPENED (strict audit).** Every remaining
    material comparator advantage must be classified with evidence as
    matched/exceeded, solved differently to comparable quality, explicitly
    out-of-scope for a defensible product reason, or still open. Only when no
    important unresolved user need remains may Ash claim whole-product
    leading-harness parity. Literal feature identity is never the criterion.
 
-**Active gate: none — the finite P0-P8 parity program is closed.** Reopen a gate
-only for concrete contradictory evidence, a production regression, or a newly
-established user need that materially weakens Ash inside its documented coding-
-harness mission. Do not reopen the program for feature-count churn.
+**Active gate: strict P0/P5/P7/P8 re-audit closure.** P1-P4 and P6 remain
+closed. P0 is waiting on a corrected immutable release; P5 is waiting on hosted
+Chromium confirmation of the strengthened real-SDK durable-session UI journey;
+P7/P8 are waiting on supported-host confirmation of the newly justified PTY
+workflow plus the positive local-app browser journey. Do not re-close these
+gates from local evidence alone.
 
-### P8 whole-product decision gate — closed 2026-10-03
+### P8 whole-product decision gate — reopened by strict audit 2026-10-03
 
 P8 classifies the material differences left after the final adversarial pass.
 Closure does not mean literal feature identity; it means no important user need
@@ -166,18 +171,26 @@ remains both unresolved and inside Ash's defensible product boundary.
   WebSocket origins, enforces the same rule in request interception and the
   outbound proxy, and rejects LAN/private or mixed-DNS answers. This solves the
   local-app workflow without adopting a broad private-network SSRF escape hatch.
+  A real Chromium journey now starts a loopback app, navigates through Ash's
+  actual browser session/proxy, clicks a local control, observes the resulting
+  DOM state, and proves a neighboring unlisted loopback port is not contacted.
 - **Matched after P7 — specialist agent model routing.** Custom agents may select
   a canonical provider/model route. That worker clears inherited fallbacks,
   subprocess specifications carry the same resolved child config, nested
   unconfigured children inherit the orchestrator's resolved model, and opaque
   injected provider factories fail closed rather than silently ignoring the
   override.
-- **Solved differently — long-running command interaction.** Ash has bounded
-  foreground execution plus managed background processes with stdin, polling,
-  output streaming/redaction, stopping, sandboxing, and process-tree cleanup.
-  Core PTY emulation is not required for the normal coding workflow; TTY-only
-  programs remain an external-terminal/extension concern unless concrete usage
-  proves otherwise.
+- **Matched after strict re-audit — TTY-required command interaction.** Current
+  comparator evidence shows PTY execution is a real coding-agent workflow, not
+  generic desktop scope: Hermes documents PTY use for delegated terminal agents
+  such as Codex CLI, and OpenClaw exposes PTY for TTY-required exec workflows.
+  Ash now has opt-in PTY execution for foreground commands and managed
+  background processes, interactive writes, a real controlling terminal rather
+  than only `isatty()` descriptors, bounded/redacted output, existing
+  permission/sandbox/process-tree cleanup, and explicit Docker-sandbox refusal
+  until container ownership can remain provable across terminal detach.
+  Local direct/scoped regressions are green; supported-host/native-sandbox CI is
+  the remaining closure evidence.
 - **Intentional safety boundary — dirty lead worktrees.** Coder/tester auto
   isolation uses managed Git worktrees and requires a clean lead tree. Ash does
   not silently downgrade a dirty tree to shared mutation; the user can
@@ -207,19 +220,18 @@ remains both unresolved and inside Ash's defensible product boundary.
   ecosystem, and product-scope decisions: https://block.github.io/goose/ and
   https://github.com/aaif-goose/goose/releases.
 
-P8 is therefore closed: every material difference surfaced by the 2026-10-03
-adversarial pass is implemented, solved differently to comparable coding value,
-explicitly outside Ash's product boundary for a concrete reason, or unsupported
-as a valid third-party integration path. Partial rows elsewhere in this document
-remain evidence qualifications and are not silently promoted by this decision.
+P8 was closed by the earlier pass, but the strict re-audit found the PTY
+classification too weak and reopened the gate. Reclosure requires supported-host
+CI for the new PTY contract and the strengthened browser/interface journeys; no
+other material unclassified comparator need has been confirmed so far.
 
 ### P8 finish flags
 
-- P8_MATERIAL_ADVANTAGES_CLASSIFIED = CLOSED
-- P8_NO_UNRESOLVED_CORE_USER_NEED = CLOSED
-- P8_WHOLE_PRODUCT_DECISION_GATE = CLOSED
+- P8_MATERIAL_ADVANTAGES_CLASSIFIED = OPEN
+- P8_NO_UNRESOLVED_CORE_USER_NEED = OPEN
+- P8_WHOLE_PRODUCT_DECISION_GATE = OPEN
 
-### P7 final adversarial comparator pass — closed 2026-10-03
+### P7 final adversarial comparator pass — reopened by strict audit 2026-10-03
 
 P7 re-audited Ash from both directions: repository truth against public claims,
 and implementation-first user workflows against current OpenClaw, Hermes,
@@ -235,9 +247,14 @@ claim drift around provider authentication breadth, route-vs-model conformance,
 JSON-RPC's HTTP transport, browser help, LSP advisory operations, coding-tool
 wording, and the actual deterministic compaction algorithm.
 
-The remaining candidates were classified rather than copied mechanically: core
-PTY emulation is optional rather than required by the evidenced terminal coding
-workflow; dirty-tree worktree isolation remains intentionally fail-closed;
+The strict re-audit overturned one earlier classification: PTY support is a
+material terminal coding workflow and is now implemented locally rather than
+left to external terminals/extensions. Current first-party comparator evidence
+includes Hermes' Codex CLI guidance requiring `pty=true`
+(https://hermes-agent.nousresearch.com/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex)
+and OpenClaw's exec contract for TTY-only CLIs/coding agents
+(https://docs.openclaw.ai/tools/exec). Dirty-tree worktree isolation remains
+intentionally fail-closed;
 Gemini CLI OAuth reuse is explicitly disallowed for third-party tools by Google;
 and desktop/mobile/messaging/voice/multi-user hosted breadth remains outside the
 terminal coding-harness boundary. Current Goose did not add an unclassified core
@@ -246,9 +263,9 @@ need.
 ### P7 finish flags
 
 - P7_CURRENT_COMPARATOR_PASS = CLOSED
-- P7_REPOSITORY_CLAIMS_AUDIT = CLOSED
-- P7_MATERIAL_GAPS_CLOSED_OR_CLASSIFIED = CLOSED
-- P7_FINAL_ADVERSARIAL_PASS = CLOSED
+- P7_REPOSITORY_CLAIMS_AUDIT = OPEN
+- P7_MATERIAL_GAPS_CLOSED_OR_CLASSIFIED = OPEN
+- P7_FINAL_ADVERSARIAL_PASS = OPEN
 
 ### P6 finite closure checklist
 
@@ -293,7 +310,12 @@ features that already have a clear operator path.
    reset --all truthfully means the default-profile config/session/cache
    categories and states that named profiles/extensions are retained. Package
    removal remains package-manager-owned, with pipx/uv uninstall and user-data
-   retention documented rather than duplicated inside Ash.
+   retention documented rather than duplicated inside Ash. The strict audit
+   additionally exercised the real published lifecycle in an isolated managed
+   pipx environment: `ash-v0.1.0` with the `observability` extra upgraded via
+   `ash update --apply` to the latest immutable release, preserved the optional
+   capability, then `ash repair` successfully reinstalled the same release and
+   preserved the capability again. The temporary environment was deleted.
 5. **P6E — Integrated UX conformance — CLOSED.** Representative fresh setup,
    configured daily-use/help, permission-mode, interruption/recovery,
    broken-config diagnosis, and maintenance journeys were exercised through real
@@ -352,14 +374,16 @@ native desktop/mobile applications merely because broader products ship them.
    core: they create different consumer/team service boundaries without a
    demonstrated coding-harness need. A future concrete workflow can reopen
    that decision.
-5. **P5E — Integrated interface conformance — CLOSED.** Focused local coverage
+5. **P5E — Integrated interface conformance — REOPENED pending hosted proof.** Focused local coverage
    spans HTTP/SSE, remote CLI, JSON-RPC, SDK session binding, server lifecycle,
-   A2A, and ACP; a real Playwright journey drives the actual loopback FastAPI
-   app and packaged UI routes through authentication, durable-session restore,
-   live approval, streamed turn, and steering. Installed-wheel smoke now
-   requires all three browser assets. Remote security review found no remaining
-   Critical/High issue; its Medium findings (session race and approval-poll
-   rate exhaustion) and Low hardening findings were fixed before closure.
+   A2A, and ACP. The original real-Playwright/FastAPI journey proves
+   authentication, live approval, streaming, and steering. A second Playwright
+   journey now uses a real `AshClient`, real SQLite session store, and scripted
+   provider to prove durable session switching/transcript restore and that a
+   browser-started streamed turn persists only into the selected session.
+   Installed-wheel smoke requires all three browser assets, and both UI journeys
+   are now part of the hosted Chromium CI lane. Reclosure waits for that hosted
+   lane to pass.
 
 ### P5 finish flags
 
@@ -367,12 +391,12 @@ native desktop/mobile applications merely because broader products ship them.
 - `P5B_HOST_PROTOCOL_INTEGRATION = CLOSED`
 - `P5C_SECURE_REMOTE_OPERATOR = CLOSED`
 - `P5D_BROWSER_MOBILE_CHANNEL_SCOPE = CLOSED`
-- `P5E_INTEGRATED_INTERFACE_CONFORMANCE = CLOSED`
-- `P5_INTERFACES_ANYWHERE_ACCESS_PARITY = CLOSED`
+- `P5E_INTEGRATED_INTERFACE_CONFORMANCE = OPEN`
+- `P5_INTERFACES_ANYWHERE_ACCESS_PARITY = OPEN`
 
-These flags are the stop conditions for P5. P5 is closed; the roadmap advances
-to P6 rather than adding more frontends, channels, or companion clients for
-feature-count parity.
+These flags are the stop conditions for P5. The strict re-audit keeps P5 open
+only until the strengthened hosted Chromium evidence passes; no additional
+frontend/channel work is implied.
 
 ### P5E closure — current interface evidence
 
@@ -1842,9 +1866,16 @@ scope-qualified with stronger evidence:
   `install-ash.py`, installed `ash-v0.1.0` into an isolated pipx environment
   with the `observability` capability pack, verified `ash 0.1.0`, simulated
   a missing app link, and proved same-ref repair restored the executable while
-  preserving the capability pack. A true cross-version upgrade/rollback cannot
-  be exercised until a second immutable release exists; the installer lifecycle
-  remains covered by deterministic stateful upgrade/repair/rollback tests.
+  preserving the capability pack. After `ash-v0.2.0` shipped, a separate
+  isolated published-artifact journey installed `ash-v0.1.0` with the
+  `observability` capability pack, created a real schema-v16 session database,
+  upgraded that same managed pipx environment to `ash-v0.2.0`, verified the
+  capability pack survived and the database migrated to v18 with its original
+  message intact, verified the automatic `before-v18-migration` backup remained
+  schema v16, restored that backup through `ash storage restore`, rolled the
+  managed package back to `ash-v0.1.0`, and proved the old release reopened the
+  restored database with the original message and capability pack intact. The
+  isolated environment was removed after verification.
 - **Production observability gap — addressed locally.** Ash now has an opt-in,
   user-owned OpenTelemetry/OTLP HTTP trace-and-metrics plane with locally owned
   SDK providers, parented turn/model/tool spans, retry/circuit/context/token
@@ -1899,7 +1930,7 @@ Evidence that remains valid from the previous audit:
   current verdict, while older research/audit files are explicitly labeled as
   dated evidence rather than competing product truth.
 
-**M5 is closed.** The supported-host CI matrix is green, the production release
+**M5 remains closed.** The supported-host CI matrix is green, the production release
 path is real and immutable, packaging/install/repair evidence is live rather
 than simulated, observability and maintenance gaps are addressed, and the final
 comparator pass does not identify a material terminal coding-harness-core
@@ -2152,7 +2183,8 @@ truthful evidence boundaries, not open mission blockers.
 ## Overall parity verdict
 
 Ash is now a **production-worthy, first-class local-first terminal coding
-harness within its documented scope**. M1-M5 are closed/current.
+harness within its documented scope**. M2-M5 remain closed/current; M1 is
+temporarily reopened until corrected release claims are published and verified.
 
 Current comparators also cover materially different product categories:
 

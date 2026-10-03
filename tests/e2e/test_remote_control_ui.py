@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
@@ -11,7 +12,9 @@ import pytest
 import uvicorn
 from playwright.async_api import async_playwright
 
-from ash.sdk import AshEvent
+from ash.config import AshConfig
+from ash.providers.base import ProviderABC, StreamChunk
+from ash.sdk import AshClient, AshEvent
 from ash.server.http import HTTPApprovalBroker, create_app
 
 
@@ -22,6 +25,53 @@ pytestmark = pytest.mark.skipif(
         "optional dependencies plus Chromium"
     ),
 )
+
+
+@asynccontextmanager
+async def _serve_app(app: Any) -> AsyncIterator[str]:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(128)
+    port = int(listener.getsockname()[1])
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            log_level="critical",
+            access_log=False,
+            lifespan="on",
+        )
+    )
+    server_task = asyncio.create_task(
+        server.serve(sockets=[listener]),
+        name="ash-remote-ui-e2e-server",
+    )
+    for _ in range(200):
+        if server.started:
+            break
+        if server_task.done():
+            await server_task
+        await asyncio.sleep(0.01)
+    assert server.started
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        try:
+            await asyncio.wait_for(server_task, timeout=5)
+        finally:
+            listener.close()
+
+
+class _DurableRemoteUIProvider(ProviderABC):
+    model_name = "remote-ui-e2e"
+
+    def count_tokens(self, text: str) -> int:
+        return len(text.split())
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        del messages, temperature, tools
+        yield StreamChunk(content="<response>durable reply</response>", is_done=True)
 
 
 class _SessionSummary:
@@ -160,37 +210,12 @@ async def test_remote_control_ui_uses_real_app_for_sessions_stream_steer_and_app
         approval_broker=approval_broker,
     )
 
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(128)
-    port = int(listener.getsockname()[1])
-    server = uvicorn.Server(
-        uvicorn.Config(
-            app,
-            log_level="critical",
-            access_log=False,
-            lifespan="on",
-        )
-    )
-    server_task = asyncio.create_task(
-        server.serve(sockets=[listener]),
-        name="ash-remote-ui-e2e-server",
-    )
-    for _ in range(200):
-        if server.started:
-            break
-        if server_task.done():
-            await server_task
-        await asyncio.sleep(0.01)
-    assert server.started
-
     browser = None
     try:
-        async with async_playwright() as playwright:
+        async with _serve_app(app) as base_url, async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
             page = await browser.new_page(viewport={"width": 1100, "height": 760})
-            await page.goto(f"http://127.0.0.1:{port}/ui")
+            await page.goto(f"{base_url}/ui")
             assert await page.title() == "Ash Remote"
 
             await page.locator("#token").fill("0123456789abcdef")
@@ -231,15 +256,94 @@ async def test_remote_control_ui_uses_real_app_for_sessions_stream_steer_and_app
 
             assert client.stream_session_id == "session-2"
             assert client.steering == "focus on tests"
+            await browser.close()
+            browser = None
+            await approval_broker.close()
     finally:
         if browser is not None:
             await browser.close()
-        server.should_exit = True
-        try:
-            await asyncio.wait_for(server_task, timeout=5)
-        finally:
-            listener.close()
+        await approval_broker.close()
+        if not approval_task.done():
+            approval_task.cancel()
+            await asyncio.gather(approval_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_remote_control_ui_restores_real_durable_sessions_and_streams_sdk_turn(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    client = await AshClient.create(
+        config=AshConfig(
+            model="ollama/remote-ui-e2e",
+            workspace_root=workspace,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+            repo_map_enabled=False,
+        ),
+        provider=_DurableRemoteUIProvider(),
+        workspace_trusted=True,
+        run_maintenance=False,
+    )
+    assert client.loop.current_session is not None
+    main_session = client.loop.current_session.session_id
+    await client.prompt("durable main history")
+    client.loop.session_store.rename_session(main_session, "Main durable")
+
+    review_session = await client.new_session()
+    await client.prompt("durable review history")
+    client.loop.session_store.rename_session(review_session, "Review durable")
+
+    approval_broker = HTTPApprovalBroker(timeout_seconds=10)
+    app = create_app(
+        client,
+        bearer_token="0123456789abcdef",
+        requests_per_minute=120,
+        approval_broker=approval_broker,
+    )
+    browser = None
+    try:
+        async with _serve_app(app) as base_url, async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1100, "height": 760})
+            await page.goto(f"{base_url}/ui")
+            await page.locator("#token").fill("0123456789abcdef")
+            await page.locator("#connect").click()
+            await page.wait_for_function(
+                "() => document.querySelector('#connection-state').textContent === 'Connected'"
+            )
+
+            await page.locator("#sessions").select_option(main_session)
+            await page.wait_for_function(
+                "() => document.querySelector('#transcript').textContent.includes('durable main history')"
+            )
+            transcript = await page.locator("#transcript").inner_text()
+            assert "durable review history" not in transcript
+
+            await page.locator("#prompt").fill("browser durable prompt")
+            await page.locator("#send").click()
+            await page.wait_for_function(
+                "() => document.querySelector('#send').textContent === 'Send'"
+            )
+            await page.wait_for_function(
+                "() => document.querySelector('#transcript').textContent.includes('browser durable prompt')"
+            )
+
+            main_messages = client.session_messages(main_session)
+            review_messages = client.session_messages(review_session)
+            assert [item["content"] for item in main_messages[-2:]] == [
+                "browser durable prompt",
+                "durable reply",
+            ]
+            assert all(
+                item["content"] != "browser durable prompt" for item in review_messages
+            )
+            await browser.close()
+            browser = None
             await approval_broker.close()
-            if not approval_task.done():
-                approval_task.cancel()
-                await asyncio.gather(approval_task, return_exceptions=True)
+    finally:
+        if browser is not None:
+            await browser.close()
+        await approval_broker.close()
+        await client.close()

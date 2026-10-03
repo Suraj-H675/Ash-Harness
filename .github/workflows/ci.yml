@@ -133,12 +133,16 @@ jobs:
           version: "0.12.17"
           enable-cache: true
           python-version: "3.12"
-      - run: uv sync --locked --group dev --extra browser
+      - run: uv sync --locked --group dev --extra browser --extra server
       - run: uv run --locked playwright install --with-deps chromium
       - name: Real Chromium integration
         env:
           ASH_RUN_BROWSER_TESTS: "1"
-        run: uv run --locked pytest -q tests/e2e/test_browser_playwright.py --timeout=120 --timeout-method=thread
+        run: >-
+          uv run --locked pytest -q
+          tests/e2e/test_browser_playwright.py
+          tests/e2e/test_remote_control_ui.py
+          --timeout=120 --timeout-method=thread
 
   docker-sandbox-e2e:
     runs-on: ubuntu-latest

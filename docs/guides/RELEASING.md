@@ -69,10 +69,11 @@ repair, and package rollback.
 
 Package rollback does not reverse user-data schema migrations. A release that
 advances the durable session schema must document its automatic pre-migration
-backup and the compatible restore procedure. For 0.2.0 specifically, opening
-the session store migrates schema v17 to v18 after creating a validated
-`before-v18-migration` backup; returning to 0.1.0 after that migration requires
-restoring the v17 backup as well as installing the older package. See
+backup and the compatible restore procedure. For 0.2.0 specifically, the
+published 0.1.0 release creates schema v16 databases; opening one with 0.2.0
+migrates it through v17 to v18 after creating a validated
+`before-v18-migration` backup. Returning to 0.1.0 after that migration requires
+restoring the v16 backup as well as installing the older package. See
 [Maintenance and recovery](MAINTENANCE.md#roll-back-across-a-session-schema-migration).
 
 ## Verify a published release

@@ -18,6 +18,7 @@ from ash.sandbox.process_utils import (
     ProcessTreePlan,
     ProcessTreeTerminationError,
     ProcessTreeUnavailable,
+    communicate_pty_process,
     communicate_process,
     _descendant_pids,
     _prepare_windows_cwd_launch,
@@ -25,6 +26,7 @@ from ash.sandbox.process_utils import (
     prepare_process_tree,
     prepare_scoped_process_launch,
     process_group_options,
+    pty_process_spawn_options,
     terminate_process_tree,
     terminate_process_tree_sync,
 )
@@ -59,6 +61,81 @@ def test_process_group_options_can_inherit_automation_group(
 ) -> None:
     monkeypatch.setenv(INHERIT_PROCESS_GROUP_ENV, "1")
     assert process_group_options() == {}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+def test_pty_rejects_inherited_automation_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv(INHERIT_PROCESS_GROUP_ENV, "1")
+    plan = prepare_process_tree(workspace_root=tmp_path)
+
+    with pytest.raises(
+        ProcessTreeUnavailable,
+        match="requires an independently owned POSIX process session",
+    ):
+        pty_process_spawn_options(plan)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+def test_pty_spawn_options_never_use_preexec_fn(tmp_path: Path) -> None:
+    plan = prepare_process_tree(workspace_root=tmp_path)
+
+    options = pty_process_spawn_options(plan)
+
+    assert options.get("start_new_session") is True
+    assert "preexec_fn" not in options
+
+
+def test_pty_refuses_unsupported_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.sandbox.process_utils as process_utils
+
+    monkeypatch.setattr(process_utils.sys, "platform", "win32")
+
+    with pytest.raises(
+        ProcessTreeUnavailable,
+        match="supported only on Linux/macOS",
+    ):
+        process_utils.open_process_pty()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_pty_output_limit_cleanup_failure_returns_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import ash.sandbox.process_utils as process_utils
+
+    process = Mock(returncode=None)
+    plan = prepare_process_tree(workspace_root=tmp_path)
+
+    async def output():
+        yield b"x" * 128
+        await asyncio.sleep(60)
+
+    async def fail_cleanup(*args, **kwargs):
+        del args, kwargs
+        raise ProcessTreeTerminationError("synthetic cleanup failure")
+
+    monkeypatch.setattr(process_utils, "iter_pty_output", lambda _fd: output())
+    monkeypatch.setattr(process_utils, "terminate_process_tree", fail_cleanup)
+
+    with pytest.raises(ProcessOutputLimitExceeded) as caught:
+        await asyncio.wait_for(
+            communicate_pty_process(
+                process,
+                123,
+                max_output_bytes=16,
+                process_tree_plan=plan,
+            ),
+            timeout=0.5,
+        )
+
+    assert isinstance(caught.value.cleanup_error, ProcessTreeTerminationError)
 
 
 def test_prepare_windows_cwd_launch_wraps_command_with_expected_identity(

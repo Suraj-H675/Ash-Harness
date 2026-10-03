@@ -242,6 +242,96 @@ async def test_run_command_extracts_bounded_structured_diagnostics(
     )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_run_command_pty_has_real_controlling_terminal(
+    guard: SafetyGuard,
+) -> None:
+    script = (
+        "import os; "
+        "print('tty=' + ','.join(str(os.isatty(fd)) for fd in (0,1,2))); "
+        "print('foreground=' + str(os.tcgetpgrp(0) == os.getpgrp()))"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    result = await RunCommandTool(guard).run(command_line=command, pty=True)
+
+    assert result.success is True
+    assert "tty=True,True,True" in result.output
+    assert "foreground=True" in result.output
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_run_command_pty_enforces_timeout(guard: SafetyGuard) -> None:
+    command = (
+        f"{shlex.quote(sys.executable)} -c "
+        f"{shlex.quote('import time; print(\"ready\", flush=True); time.sleep(30)')}"
+    )
+
+    result = await RunCommandTool(guard).run(
+        command_line=command,
+        timeout_seconds=1,
+        pty=True,
+    )
+
+    assert result.success is False
+    assert result.error == "Error: Command timed out after 1 seconds."
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_run_command_pty_enforces_output_capture_limit(
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.command as command_module
+
+    monkeypatch.setattr(command_module, "MAX_COMMAND_OUTPUT_CHARS", 64)
+    command = (
+        f"{shlex.quote(sys.executable)} -c "
+        f"{shlex.quote('import sys; sys.stdout.write(\"x\" * 4096); sys.stdout.flush()')}"
+    )
+
+    result = await RunCommandTool(guard).run(command_line=command, pty=True)
+
+    assert result.truncated is True
+    assert len(result.output) < 256
+    assert "Process output capture limit reached" in result.output
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_run_command_pty_concurrent_spawns_complete(
+    guard: SafetyGuard,
+) -> None:
+    script = "import os; print(os.isatty(0) and os.tcgetpgrp(0) == os.getpgrp())"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    results = await asyncio.gather(
+        *(RunCommandTool(guard).run(command_line=command, pty=True) for _ in range(8))
+    )
+
+    assert all(result.success for result in results)
+    assert all("True" in result.output for result in results)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_run_command_pty_redacts_provider_key(
+    guard: SafetyGuard,
+) -> None:
+    provider_key = "xai-" + "a" * 80
+    script = f"print({provider_key!r}, flush=True)"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    result = await RunCommandTool(guard).run(command_line=command, pty=True)
+
+    assert result.success is True
+    assert provider_key not in result.output
+    assert "[REDACTED]" in result.output
+
+
 @pytest.mark.asyncio
 async def test_run_command_bounds_diagnostic_count(
     project_root: Path,

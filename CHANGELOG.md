@@ -6,17 +6,33 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Added
+- Added opt-in POSIX PTY execution for foreground commands and managed
+  background jobs, including interactive input, existing native/scoped
+  sandbox/process-tree controls, bounded output, and controlling-TTY
+  verification for TTY-required coding CLIs. Docker-sandbox PTY requests fail
+  closed until Ash can own container cleanup across terminal detach.
+
+### Changed
+- Strengthened browser/interface conformance evidence with a real Chromium
+  localhost-app journey and a real `AshClient` + SQLite remote-control UI
+  journey; both are included in hosted browser CI.
+
+### Fixed
+- Corrected the 0.2.0 upgrade/rollback documentation: the published 0.1.0
+  release creates schema-v16 session databases, which 0.2.0 migrates through
+  v17 to v18 after preserving a schema-v16 pre-migration backup.
 
 ## [0.2.0] - 2026-10-03
 
 ### Upgrade notes
-- The durable session database advances from schema v17 to v18 to add the
+- The published `0.1.0` session database uses schema v16. Opening it with
+  `0.2.0` advances it through v17 to v18 to add pricing provenance and the
   maintained FTS5 transcript index. Ash creates a validated
   `before-v18-migration` backup beside the database before migrating. Rolling
   the package back to `0.1.0` after `0.2.0` has opened that database also
-  requires restoring the compatible pre-v18 backup; package rollback alone
-  does not downgrade user data.
+  requires restoring that compatible v16 backup; package rollback alone does
+  not downgrade user data.
 
 ### Added
 - Added enterprise provider routes and identity flows for Azure OpenAI, Amazon

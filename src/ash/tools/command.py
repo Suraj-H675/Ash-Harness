@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -13,15 +14,26 @@ from pydantic import BaseModel, Field
 from ash.core.redaction import StreamingRedactor
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
-from ash.sandbox._base import SANDBOX_TIER_BWRAP, SandboxBackendUnavailable
-from ash.sandbox.manager import SandboxManager, SandboxResult
+from ash.sandbox import (
+    SANDBOX_TIER_BWRAP,
+    SANDBOX_TIER_SCOPED,
+    SandboxBackendUnavailable,
+    SandboxInvocation,
+    SandboxManager,
+    SandboxResult,
+)
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     ProcessTreeError,
     ProcessTreeUnavailable,
+    close_pty_fd,
+    communicate_pty_process,
     communicate_process,
+    open_process_pty,
+    prepare_pty_process_argv,
     prepare_process_tree,
     prepare_scoped_process_launch,
+    pty_process_spawn_options,
     settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
@@ -62,6 +74,13 @@ class RunCommandArgs(BaseModel):
         ge=1,
         le=MAX_COMMAND_TIMEOUT_SECONDS,
         description="Hard timeout for subprocess execution.",
+    )
+    pty: bool = Field(
+        False,
+        description=(
+            "Run the command in a POSIX pseudo-terminal. Use this only for "
+            "TTY-required CLIs; stdout and stderr are merged as terminal output."
+        ),
     )
 
 
@@ -228,6 +247,18 @@ class RunCommandTool(BaseTool):
 
         streamer = _CommandEventStreamer(self.emit_event)
         try:
+            if args.pty:
+                return await self._run_pty(
+                    ["/bin/sh", "-c", args.command_line],
+                    args.timeout_seconds,
+                    cwd,
+                    env=build_scrubbed_command_env(
+                        self.project_root, self.environment_allowlist
+                    ),
+                    passthrough_env_names=self.environment_allowlist,
+                    stream_callback=streamer,
+                    expected_cwd_identity=expected_cwd_identity,
+                )
             if sandboxed:
                 assert self.sandbox_manager is not None
                 argv = ["/bin/sh", "-c", args.command_line]
@@ -255,6 +286,188 @@ class RunCommandTool(BaseTool):
             )
         finally:
             streamer.finish()
+
+    async def _run_pty(
+        self,
+        argv: list[str],
+        timeout_seconds: int,
+        cwd: str | None,
+        *,
+        env: dict[str, str],
+        passthrough_env_names: tuple[str, ...],
+        stream_callback: "_CommandEventStreamer",
+        expected_cwd_identity: tuple[int, int] | None,
+    ) -> ToolResult:
+        if os.name != "posix":
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: PTY execution is supported only on Linux/macOS hosts",
+            )
+        workspace = self.project_root or (Path(cwd) if cwd is not None else Path.cwd())
+        cwd_path = Path(cwd) if cwd is not None else workspace
+        try:
+            process_tree_plan = prepare_process_tree(workspace_root=workspace)
+        except ProcessTreeUnavailable as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Error: command was not started: {exc}",
+            )
+
+        invocation_context: AbstractContextManager[SandboxInvocation]
+        if self.sandbox_manager is None:
+            invocation_context = nullcontext(
+                SandboxInvocation(
+                    tuple(argv),
+                    cwd_path,
+                    SANDBOX_TIER_SCOPED,
+                    "scoped",
+                )
+            )
+        else:
+            invocation_context = self.sandbox_manager.prepare_launch(
+                argv,
+                cwd=cwd_path,
+                passthrough_env_names=passthrough_env_names,
+                pty=True,
+            )
+
+        master_fd: int | None = None
+        slave_fd: int | None = None
+        try:
+            with invocation_context as invocation:
+                with prepare_scoped_process_launch(
+                    invocation.argv,
+                    cwd=invocation.cwd,
+                    guard=self.safety_guard,
+                    search_path=env.get("PATH"),
+                    expected_cwd_identity=expected_cwd_identity,
+                ) as launch:
+                    master_fd, slave_fd = open_process_pty()
+                    inherited_fds = tuple(
+                        dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
+                    )
+                    spawn_options = pty_process_spawn_options(process_tree_plan)
+                    pty_argv = prepare_pty_process_argv(
+                        launch.argv,
+                        plan=process_tree_plan,
+                        search_path=env.get("PATH"),
+                    )
+                    if inherited_fds:
+                        spawn_options["pass_fds"] = inherited_fds
+                    process = await asyncio.create_subprocess_exec(
+                        *pty_argv,
+                        cwd=launch.cwd,
+                        env=env,
+                        stdin=slave_fd,
+                        stdout=slave_fd,
+                        stderr=slave_fd,
+                        **spawn_options,
+                    )
+                    close_pty_fd(slave_fd)
+                    slave_fd = None
+                captured = await asyncio.wait_for(
+                    communicate_pty_process(
+                        process,
+                        master_fd,
+                        stream_callback=stream_callback,
+                        max_output_bytes=MAX_COMMAND_OUTPUT_CHARS,
+                        process_tree_plan=process_tree_plan,
+                    ),
+                    timeout=timeout_seconds,
+                )
+        except asyncio.TimeoutError:
+            if "process" in locals():
+                try:
+                    await terminate_process_tree(process, plan=process_tree_plan)
+                except ProcessTreeError as exc:
+                    cleanup = f" Process-tree cleanup failed: {exc}."
+                else:
+                    cleanup = ""
+            else:
+                cleanup = ""
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Error: Command timed out after {timeout_seconds} seconds."
+                    f"{cleanup}"
+                ),
+            )
+        except asyncio.CancelledError as cancellation:
+            if "process" in locals():
+                cleanup_error, cleanup_cancelled = (
+                    await settle_process_tree_after_cancellation(
+                        process, plan=process_tree_plan
+                    )
+                )
+                if cleanup_error is not None:
+                    cancellation.add_note(
+                        f"Process-tree cleanup failed: {cleanup_error}"
+                    )
+                if cleanup_cancelled:
+                    cancellation.add_note("Process-tree cleanup was cancelled")
+            raise
+        except ProcessOutputLimitExceeded as exc:
+            output = _redact_captured_output(decode_stream(exc.stdout))
+            output, _ = _truncate_command_output(
+                output,
+                force=True,
+                notice=OUTPUT_CAPTURE_LIMIT_NOTICE,
+            )
+            error = (
+                f"Process-tree cleanup failed: {exc.cleanup_error}"
+                if exc.cleanup_error is not None
+                else None
+            )
+            return ToolResult(
+                success=process.returncode == 0 and exc.cleanup_error is None,
+                output=output,
+                error=error,
+                token_count=count_output_tokens(output),
+                truncated=True,
+                diagnostics=extract_diagnostics("", output),
+                diagnostic_summary=extract_diagnostic_summary(output, ""),
+            )
+        except (SandboxBackendUnavailable, ProcessTreeUnavailable) as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Error: command was not started: {exc}",
+            )
+        except Exception as primary_error:
+            if "process" in locals():
+                cleanup_error, cleanup_cancelled = (
+                    await settle_process_tree_after_cancellation(
+                        process, plan=process_tree_plan
+                    )
+                )
+                if cleanup_error is not None:
+                    primary_error.add_note(
+                        f"Process-tree cleanup failed: {cleanup_error}"
+                    )
+                if cleanup_cancelled:
+                    raise asyncio.CancelledError from primary_error
+            raise
+        finally:
+            close_pty_fd(slave_fd)
+            close_pty_fd(master_fd)
+
+        terminal_output = _redact_captured_output(decode_stream(captured))
+        output, truncated = _truncate_command_output(terminal_output)
+        if not invocation.fallback_used and invocation.tier >= SANDBOX_TIER_BWRAP:
+            annotation = f"[sandbox tier={invocation.tier} backend={invocation.backend_name}]"
+            output = f"{annotation}\n{output}" if output else annotation
+        return ToolResult(
+            success=process.returncode == 0,
+            output=output,
+            error=None,
+            token_count=count_output_tokens(output),
+            truncated=truncated,
+            diagnostics=extract_diagnostics("", terminal_output),
+            diagnostic_summary=extract_diagnostic_summary(terminal_output, ""),
+        )
 
     async def _run_sandboxed(
         self,
