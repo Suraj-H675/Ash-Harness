@@ -44,6 +44,7 @@ AGENT_ROLES: tuple[str, ...] = (
     "tester",
     "reviewer",
     "general",
+    "orchestrator",
 )
 _CUSTOM_ROLE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
@@ -241,7 +242,12 @@ class SubprocessAgent:
             self.publish_report(report)
         return report
 
-    def publish_report(self, report: AgentReport) -> None:
+    def publish_report(
+        self,
+        report: AgentReport,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
         """Publish a finalized in-process report to status and IPC state."""
 
         status = "completed" if report.success else "failed"
@@ -250,11 +256,11 @@ class SubprocessAgent:
             status,
             current_task=report.summary[:200],
         )
-        self.shared_state.send_message(
+        return self.shared_state.send_message(
             sender_id=self.agent_id,
             recipient_id="lead",
             message_type="agent_report",
-            content=_report_to_payload(report),
+            content=_report_to_payload(report, metadata=metadata),
         )
 
     # --- subprocess execution -----------------------------------------
@@ -345,8 +351,12 @@ def _coerce_report(result: AgentReport | str, agent: SubprocessAgent) -> AgentRe
     )
 
 
-def _report_to_payload(report: AgentReport) -> dict[str, Any]:
-    return {
+def _report_to_payload(
+    report: AgentReport,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
         "agent_id": report.agent_id,
         "role": report.role,
         "task": report.task,
@@ -356,6 +366,9 @@ def _report_to_payload(report: AgentReport) -> dict[str, Any]:
         "started_at": report.started_at.isoformat(),
         "finished_at": report.finished_at.isoformat(),
     }
+    if metadata:
+        payload["metadata"] = redact_value(metadata)
+    return payload
 
 
 def payload_to_report(payload: dict[str, Any]) -> AgentReport:

@@ -91,7 +91,54 @@ async def test_spawn_agent_uses_provider_and_persists_report(tmp_path) -> None:
         "agent.task.succeeded",
     ]
     assert all(event["task_id"] == durable[0].task_id for event in emitted)
+    reports = state.fetch_messages(
+        "lead",
+        undelivered_only=False,
+        message_type="agent_report",
+    )
+    assert len(reports) == 1
+    assert reports[0].delivered is True
+    assert reports[0].content["metadata"]["background"] is False
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_report_stays_pending_until_parent_acknowledges(tmp_path) -> None:
+    state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider)
+    try:
+        started = await tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="background-reviewer",
+            background=True,
+        )
+        assert started.success is True
+        durable = state.tasks.list_tasks()[0]
+        terminal = await asyncio.wait_for(
+            tool.wait_for_tasks([durable.task_id]),
+            timeout=2,
+        )
+        assert terminal[0].state == "succeeded"
+
+        pending = tool.pending_background_reports()
+        assert len(pending) == 1
+        assert pending[0]["agent_id"] == "background-reviewer"
+        assert pending[0]["summary"] == "evidence: tests pass"
+        assert pending[0]["durable_task_id"] == durable.task_id
+        message_id = pending[0]["message_id"]
+
+        assert tool.acknowledge_background_reports([message_id]) == 1
+        assert tool.pending_background_reports() == []
+        stored = state.fetch_messages(
+            "lead",
+            undelivered_only=False,
+            message_type="agent_report",
+        )
+        assert stored[-1].message_id == message_id
+        assert stored[-1].delivered is True
+    finally:
+        await tool.aclose()
 
 
 @pytest.mark.asyncio
@@ -2875,6 +2922,336 @@ async def test_agent_capacity_is_enforced_across_durable_leases(tmp_path) -> Non
         } == {"first": "cancelled", "second": "cancelled"}
     finally:
         reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_can_delegate_one_bounded_nested_graph(tmp_path) -> None:
+    class OrchestratorProvider(ProviderABC):
+        model_name = "orchestrator-provider"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del temperature
+            self.calls += 1
+            assert tools is not None
+            tool_names = [tool["function"]["name"] for tool in tools]
+            assert "delegate_agents" in tool_names, tool_names
+            assert "spawn_agent" not in tool_names, tool_names
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "nested-delegate",
+                            "name": "delegate_agents",
+                            "arguments": {
+                                "goal": "inspect the focused change",
+                                "tasks": [
+                                    {
+                                        "key": "review",
+                                        "role": "reviewer",
+                                        "task": "inspect nested evidence",
+                                    }
+                                ],
+                                "background": False,
+                            },
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                assert any(
+                    message.get("role") == "tool"
+                    and "leaf evidence" in str(message.get("content"))
+                    for message in messages
+                ), messages
+                yield StreamChunk(content="synthesized nested evidence", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+    class LeafProvider(ProviderABC):
+        model_name = "leaf-provider"
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del temperature, tools
+            assert messages[-1]["content"] == "inspect nested evidence"
+            yield StreamChunk(content="leaf evidence", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+    providers = [OrchestratorProvider(), LeafProvider()]
+
+    def provider_factory() -> ProviderABC:
+        assert providers
+        return providers.pop(0)
+
+    state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        agent_max_spawn_depth=2,
+        max_concurrent_agents=2,
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        provider_factory,
+        config=config,
+    )
+    approvals: list[tuple[str, str]] = []
+
+    async def approve_nested_delegation(
+        agent_id: str,
+        tool_name: str,
+        arguments: dict,
+    ) -> bool:
+        del arguments
+        approvals.append((agent_id, tool_name))
+        return True
+
+    tool.set_foreground_approval_broker(approve_nested_delegation)
+    try:
+        result = await tool.run(
+            role="orchestrator",
+            task="coordinate a nested review",
+            agent_id="orchestrator-1",
+        )
+
+        assert result.success is True, (result.error, approvals)
+        assert result.output == "synthesized nested evidence"
+        assert approvals == [("orchestrator-1", "delegate_agents")]
+        assert providers == []
+        tasks = sorted(state.tasks.list_tasks(), key=lambda task: task.created_at)
+        assert len(tasks) == 2
+        root, child = tasks
+        assert root.role == "orchestrator"
+        assert root.parent_task_id is None
+        assert root.metadata["spawn_depth"] == 1
+        assert child.role == "reviewer"
+        assert child.parent_task_id == root.task_id
+        assert child.metadata["spawn_depth"] == 2
+        assert child.state == "succeeded"
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_is_flat_by_default(tmp_path) -> None:
+    factory_called = False
+
+    def provider_factory() -> ProviderABC:
+        nonlocal factory_called
+        factory_called = True
+        return FakeProvider()
+
+    state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        provider_factory,
+        config=AshConfig(workspace_root=tmp_path, agent_max_spawn_depth=1),
+    )
+    try:
+        result = await tool.run(
+            role="orchestrator",
+            task="try to recurse",
+            agent_id="flat-orchestrator",
+        )
+        assert result.success is False
+        assert "no remaining delegation depth" in (result.error or "")
+        assert factory_called is False
+        assert state.tasks.list_tasks() == []
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_nested_graph_runs_inside_subprocess(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_: object) -> None:
+            return
+
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            payload = json.loads(self.rfile.read(length) if length else b"{}")
+            requests.append(payload)
+            call_number = len(requests)
+            tool_names = [
+                item["function"]["name"] for item in payload.get("tools", [])
+            ]
+            if call_number == 1:
+                assert "delegate_agents" in tool_names
+                assert "spawn_agent" not in tool_names
+                arguments = json.dumps(
+                    {
+                        "goal": "inspect nested subprocess evidence",
+                        "tasks": [
+                            {
+                                "key": "review",
+                                "role": "reviewer",
+                                "task": "inspect nested subprocess evidence",
+                            }
+                        ],
+                        "background": False,
+                    },
+                    separators=(",", ":"),
+                )
+                chunks = [
+                    {
+                        "id": "nested-orchestrator",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "nested-delegate",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "delegate_agents",
+                                                "arguments": arguments,
+                                            },
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    },
+                    {
+                        "id": "nested-orchestrator",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "tool_calls",
+                            }
+                        ],
+                    },
+                ]
+            elif call_number == 2:
+                assert "delegate_agents" not in tool_names
+                assert payload["messages"][-1]["content"] == (
+                    "inspect nested subprocess evidence"
+                )
+                chunks = [
+                    {
+                        "id": "nested-leaf",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "subprocess leaf evidence"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ]
+            else:
+                assert call_number == 3
+                assert "delegate_agents" in tool_names
+                assert any(
+                    message.get("role") == "tool"
+                    and "subprocess leaf evidence" in str(message.get("content"))
+                    for message in payload["messages"]
+                )
+                chunks = [
+                    {
+                        "id": "nested-final",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "subprocess nested synthesis"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ]
+            body = "".join(
+                "data: " + json.dumps(chunk, separators=(",", ":")) + "\n\n"
+                for chunk in chunks
+            ) + "data: [DONE]\n\n"
+            encoded = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    def parent_factory() -> ProviderABC:
+        raise AssertionError("nested subprocess must rebuild providers in the child")
+
+    state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="nested/nested-subprocess-model",
+        custom_providers={
+            "nested": {
+                "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                "auth_mode": "none",
+                "model_capabilities": {
+                    "nested-subprocess-model": {"native_tools": True}
+                },
+            }
+        },
+        agent_execution_mode="subprocess",
+        agent_max_spawn_depth=2,
+        max_concurrent_agents=2,
+        provider_max_attempts=1,
+        memory_backend="off",
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        parent_factory,
+        config=config,
+        provider_config_backed=True,
+    )
+
+    async def approve_nested_delegation(
+        agent_id: str,
+        tool_name: str,
+        arguments: dict,
+    ) -> bool:
+        del arguments
+        assert agent_id == "subprocess-orchestrator"
+        assert tool_name == "delegate_agents"
+        return True
+
+    tool.set_foreground_approval_broker(approve_nested_delegation)
+    try:
+        result = await tool.run(
+            role="orchestrator",
+            task="coordinate nested subprocess review",
+            agent_id="subprocess-orchestrator",
+        )
+
+        assert result.success is True, result.error
+        assert result.output == "subprocess nested synthesis"
+        assert len(requests) == 3
+        tasks = sorted(state.tasks.list_tasks(), key=lambda task: task.created_at)
+        assert len(tasks) == 2
+        assert tasks[1].parent_task_id == tasks[0].task_id
+        assert [task.metadata["spawn_depth"] for task in tasks] == [1, 2]
+    finally:
+        await tool.aclose()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
 
 
 @pytest.mark.asyncio

@@ -195,6 +195,62 @@ def _tools(tmp_path: Path, *, max_concurrency: int = 2):
 
 
 @pytest.mark.asyncio
+async def test_nested_delegate_enforces_child_limit_and_disallows_background(
+    tmp_path: Path,
+) -> None:
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        agent_max_spawn_depth=2,
+        agent_max_children_per_task=1,
+        memory_backend="off",
+    )
+    state = SharedState(config.db_directory / "agents.db", workspace=tmp_path)
+    parent = state.tasks.create_task(
+        "coordinate",
+        role="orchestrator",
+        task_id="parent-orchestrator",
+        metadata={"workspace": str(tmp_path.resolve()), "spawn_depth": 1},
+    )
+    spawn = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        RecordingProvider,
+        config=config,
+        spawn_depth=1,
+        parent_task_id=parent.task_id,
+    )
+    delegate = DelegateAgentsTool(
+        SafetyGuard(tmp_path),
+        state,
+        spawn,
+        config,
+        allow_background=False,
+    )
+    try:
+        background = await delegate.run(
+            goal="background nested",
+            tasks=[{"key": "one", "role": "reviewer", "task": "one"}],
+            background=True,
+        )
+        assert background.success is False
+        assert "must wait" in (background.error or "")
+
+        too_many = await delegate.run(
+            goal="too many",
+            tasks=[
+                {"key": "one", "role": "reviewer", "task": "one"},
+                {"key": "two", "role": "reviewer", "task": "two"},
+            ],
+        )
+        assert too_many.success is False
+        assert "child-task limit" in (too_many.error or "")
+        assert [task.task_id for task in state.tasks.list_tasks()] == [parent.task_id]
+    finally:
+        await spawn.aclose()
+
+
+@pytest.mark.asyncio
 async def test_delegate_agents_runs_provider_in_subprocess(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

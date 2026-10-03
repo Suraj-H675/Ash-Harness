@@ -303,8 +303,12 @@ class SpawnAgentTool(BaseTool):
         max_turn_iterations: int = 12,
         custom_agents: dict[str, "AgentDefinition"] | None = None,
         provider_config_backed: bool = False,
+        spawn_depth: int = 0,
+        parent_task_id: str | None = None,
     ) -> None:
         super().__init__(safety_guard)
+        if type(spawn_depth) is not int or spawn_depth < 0:
+            raise ValueError("spawn_depth must be a non-negative integer")
         self._shared_state = shared_state
         self._provider_factory = provider_factory
         self._max_return_chars = max_return_chars
@@ -315,6 +319,10 @@ class SpawnAgentTool(BaseTool):
         self._task_token_budget = config.agent_token_budget if config else 4000
         self._task_time_budget = config.agent_time_budget_seconds if config else 900.0
         self._task_lease_seconds = config.agent_lease_seconds if config else 30.0
+        self._max_spawn_depth = config.agent_max_spawn_depth if config else 1
+        self._max_children_per_task = config.agent_max_children_per_task if config else 8
+        self._spawn_depth = spawn_depth
+        self._parent_task_id = parent_task_id
         self._custom_agents = dict(custom_agents or {})
         self._permission_policy_provider: Callable[[], PermissionPolicy] | None = None
         self._foreground_approval_broker: SubagentApprovalBroker | None = None
@@ -390,7 +398,7 @@ class SpawnAgentTool(BaseTool):
             return policy
         if has_explicit_ask:
             return None
-        if execution_role in {"researcher", "reviewer", "general"}:
+        if execution_role in {"researcher", "reviewer", "general", "orchestrator"}:
             return policy
         if policy.mode.value in {"auto_approve", "plan", "dry_run"}:
             return policy
@@ -972,6 +980,40 @@ class SpawnAgentTool(BaseTool):
     def supports_role(self, role: str) -> bool:
         return role in AGENT_ROLES or role in self._custom_agents
 
+    @property
+    def spawn_depth(self) -> int:
+        return self._spawn_depth
+
+    @property
+    def parent_task_id(self) -> str | None:
+        return self._parent_task_id
+
+    @property
+    def child_spawn_depth(self) -> int:
+        return self._spawn_depth + 1
+
+    def spawn_role_error(self, role: str, *, child_depth: int | None = None) -> str | None:
+        """Return why this coordinator cannot create the requested child role."""
+
+        if not self.supports_role(role):
+            return f"Unknown delegated agent role: {role!r}."
+        depth = self.child_spawn_depth if child_depth is None else child_depth
+        if type(depth) is not int or depth < 1:
+            return "Subagent spawn depth is invalid."
+        if depth > self._max_spawn_depth:
+            return (
+                f"Subagent depth {depth} exceeds configured agent_max_spawn_depth "
+                f"{self._max_spawn_depth}."
+            )
+        definition = self._custom_agents.get(role)
+        execution_role = definition.base_role if definition is not None else role
+        if execution_role == "orchestrator" and depth >= self._max_spawn_depth:
+            return (
+                f"Orchestrator role at depth {depth} has no remaining delegation "
+                f"depth; raise agent_max_spawn_depth above {depth} or use a leaf role."
+            )
+        return None
+
     def _update_description(self) -> None:
         roles = ", ".join((*AGENT_ROLES, *sorted(self._custom_agents)))
         self.description = f"Run a bounded worker on a focused subtask. Roles: {roles}."
@@ -1138,13 +1180,24 @@ class SpawnAgentTool(BaseTool):
             return f"Task {task.task_id!r} belongs to another workspace."
         if task.role not in AGENT_ROLES and task.role not in self._custom_agents:
             return f"Task {task.task_id!r} has unknown role {task.role!r}."
+        raw_depth = metadata.get("spawn_depth", 1)
+        if type(raw_depth) is not int or raw_depth < 1:
+            return f"Task {task.task_id!r} has invalid spawn depth."
+        depth_error = self.spawn_role_error(task.role, child_depth=raw_depth)
+        if depth_error is not None:
+            return f"Task {task.task_id!r} cannot be dispatched: {depth_error}"
+        definition = self._custom_agents.get(task.role)
+        execution_role = definition.base_role if definition is not None else task.role
+        isolation = str(metadata.get("isolation") or "auto")
+        if execution_role == "orchestrator" and isolation not in {"auto", "shared"}:
+            return f"Task {task.task_id!r} has invalid orchestrator isolation."
         try:
             SpawnAgentArgs(
                 role=task.role,
                 task=task.description,
                 agent_id=metadata.get("agent_id"),
                 background=True,
-                isolation=str(metadata.get("isolation") or "auto"),
+                isolation=isolation,
                 parent_task_id=task.parent_task_id,
             )
         except ValueError as exc:
@@ -1257,6 +1310,19 @@ class SpawnAgentTool(BaseTool):
         if approval_mode not in {"auto", "live", "durable"}:
             raise ValueError(f"unsupported subagent approval mode: {approval_mode}")
         created_here = durable_task is None
+        task_spawn_depth = self.child_spawn_depth
+        if durable_task is not None:
+            raw_depth = durable_task.metadata.get("spawn_depth", 1)
+            if type(raw_depth) is not int or raw_depth < 1:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Task {durable_task.task_id!r} has invalid spawn depth.",
+                )
+            task_spawn_depth = raw_depth
+        depth_error = self.spawn_role_error(args.role, child_depth=task_spawn_depth)
+        if depth_error is not None:
+            return ToolResult(success=False, output="", error=depth_error)
         agent_definition = self._custom_agents.get(args.role)
         if agent_definition is not None:
             try:
@@ -1273,20 +1339,49 @@ class SpawnAgentTool(BaseTool):
         execution_role = (
             agent_definition.base_role if agent_definition is not None else args.role
         )
+        if execution_role == "orchestrator" and args.isolation not in {"auto", "shared"}:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Orchestrator subagents require shared isolation.",
+            )
 
         if durable_task is None:
+            parent_task_id = args.parent_task_id
+            if self._parent_task_id is not None:
+                if parent_task_id not in {None, self._parent_task_id}:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error="Nested subagents cannot override their orchestrator lineage.",
+                    )
+                parent_task_id = self._parent_task_id
+                existing_children = self._shared_state.tasks.count_children(
+                    parent_task_id,
+                    workspace=self.safety_guard.project_root,
+                )
+                if existing_children >= self._max_children_per_task:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=(
+                            "Orchestrator child-task limit reached: "
+                            f"{existing_children}/{self._max_children_per_task}."
+                        ),
+                    )
             try:
                 durable_task = self._shared_state.tasks.create_task(
                     args.task,
                     role=args.role,
                     task_id=f"agent-task-{uuid.uuid4()}",
-                    parent_task_id=args.parent_task_id,
+                    parent_task_id=parent_task_id,
                     token_budget=self._task_token_budget,
                     time_budget_seconds=self._task_time_budget,
                     metadata={
                         "agent_id": agent_id,
                         "background": args.background,
                         "isolation": args.isolation,
+                        "spawn_depth": task_spawn_depth,
                         "workspace": str(
                             Path(self.safety_guard.project_root).resolve()
                         ),
@@ -1593,6 +1688,7 @@ class SpawnAgentTool(BaseTool):
                     approval_broker=foreground_approval_broker,
                     durable_approval=durable_approval,
                     durable_attempt=durable_lease.task.attempt,
+                    spawn_depth=task_spawn_depth,
                     attempt_state=attempt_state,
                 )
                 artifacts["completion_tokens"] = completion_tokens
@@ -1680,6 +1776,12 @@ class SpawnAgentTool(BaseTool):
                 "workspace": str(worker_workspace),
                 "base_role": execution_role,
                 "durable_task_id": durable_task.task_id,
+                "background": durable_task.metadata.get("background") is True,
+                **(
+                    {"graph_id": durable_task.metadata["graph_id"]}
+                    if isinstance(durable_task.metadata.get("graph_id"), str)
+                    else {}
+                ),
                 **({"branch": lease.branch} if lease is not None else {}),
             },
             workspace_root=worker_workspace,
@@ -1736,7 +1838,20 @@ class SpawnAgentTool(BaseTool):
                         owner_agent_id=agent_id,
                         reason=report.summary,
                     )
-                agent.publish_report(report)
+                report_message_id = agent.publish_report(
+                    report,
+                    metadata={
+                        "durable_task_id": durable_task.task_id,
+                        "background": durable_task.metadata.get("background") is True,
+                        **(
+                            {"graph_id": durable_task.metadata["graph_id"]}
+                            if isinstance(durable_task.metadata.get("graph_id"), str)
+                            else {}
+                        ),
+                    },
+                )
+                if durable_task.metadata.get("background") is not True:
+                    self._shared_state.mark_delivered((report_message_id,))
                 branch = report.artifacts.get("branch")
                 commit = report.artifacts.get("commit")
                 if isinstance(branch, str) and isinstance(commit, str):
@@ -1939,6 +2054,7 @@ class SpawnAgentTool(BaseTool):
         approval_broker: SubagentApprovalBroker | None,
         durable_approval: bool,
         durable_attempt: int,
+        spawn_depth: int,
         attempt_state: dict[str, bool],
     ) -> tuple[str, int, float]:
         guard = SafetyGuard(
@@ -1978,6 +2094,41 @@ class SpawnAgentTool(BaseTool):
             ),
         )
         tools = _worker_tools(execution_role, guard, sandbox)
+        if execution_role == "orchestrator":
+            if self._config is None:
+                raise RuntimeError("orchestrator subagents require runtime configuration")
+            if spawn_depth >= self._config.agent_max_spawn_depth:
+                raise RuntimeError(
+                    "orchestrator subagent reached the configured delegation depth"
+                )
+            from ash.tools.delegate import DelegateAgentsTool
+
+            nested_state = SharedState.open_existing(
+                Path(self._shared_state.db_path),
+                workspace=self._shared_state.workspace,
+            )
+            nested_spawn = SpawnAgentTool(
+                guard,
+                nested_state,
+                self._provider_factory,
+                max_return_chars=self._max_return_chars,
+                config=self._config,
+                max_turn_iterations=self._max_turn_iterations,
+                custom_agents=self._custom_agents,
+                provider_config_backed=self._provider_config_backed,
+                spawn_depth=spawn_depth,
+                parent_task_id=durable_task_id,
+            )
+            nested_spawn.set_permission_policy_provider(lambda: worker_policy)
+            nested_delegate = DelegateAgentsTool(
+                guard,
+                nested_state,
+                nested_spawn,
+                self._config,
+                allow_background=False,
+                owns_spawn_tool=True,
+            )
+            tools[nested_delegate.name] = nested_delegate
         if agent_definition is not None and agent_definition.allowed_tools:
             unknown_tools = sorted(set(agent_definition.allowed_tools) - tools.keys())
             if unknown_tools:
@@ -2010,10 +2161,19 @@ class SpawnAgentTool(BaseTool):
             if self._config is not None
             else None
         )
+        if execution_role == "orchestrator" and "delegate_agents" in tools:
+            delegation_guidance = (
+                "You may use delegate_agents to create bounded child task DAGs when "
+                "that materially helps. Wait for each delegated graph to finish and "
+                "synthesize its evidence before returning. Do not create background "
+                "child graphs."
+            )
+        else:
+            delegation_guidance = "Do not spawn or delegate to other agents."
         instructions = (
             f"You are Ash subagent {agent_id}, acting only as {role}. "
             f"Your workspace is {workspace}. Use the available tools to inspect and "
-            "complete the focused task. Do not spawn other agents. Return concise "
+            f"complete the focused task. {delegation_guidance} Return concise "
             "findings with file paths, commands, and test evidence."
         )
         if agent_definition is not None:
@@ -2565,6 +2725,49 @@ class SpawnAgentTool(BaseTool):
                 "failed",
                 current_task=failure[:200],
             )
+
+    def pending_background_reports(self, *, limit: int = 32) -> list[dict[str, Any]]:
+        """Return durable background reports awaiting parent-session delivery."""
+
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("background report limit must be between 1 and 100")
+        reports: list[dict[str, Any]] = []
+        for message in self._shared_state.fetch_messages(
+            "lead",
+            undelivered_only=True,
+            limit=1000,
+            message_type="agent_report",
+        ):
+            metadata = message.content.get("metadata")
+            if not isinstance(metadata, dict) or metadata.get("background") is not True:
+                continue
+            reports.append(
+                {
+                    "message_id": message.message_id,
+                    "agent_id": message.sender_id,
+                    "role": message.content.get("role", "general"),
+                    "task": message.content.get("task", ""),
+                    "success": message.content.get("success") is True,
+                    "summary": str(message.content.get("summary", "")),
+                    "artifacts": message.content.get("artifacts", {}),
+                    "durable_task_id": metadata.get("durable_task_id"),
+                    "graph_id": metadata.get("graph_id"),
+                }
+            )
+            if len(reports) >= limit:
+                break
+        return reports
+
+    def acknowledge_background_reports(self, message_ids: list[int]) -> int:
+        """Acknowledge reports only after the parent session persisted delivery."""
+
+        if not message_ids:
+            return 0
+        if len(message_ids) > 100 or any(
+            type(message_id) is not int or message_id <= 0 for message_id in message_ids
+        ):
+            raise ValueError("background report message ids are invalid")
+        return self._shared_state.mark_delivered(message_ids)
 
     async def _stop_subprocess_monitor(
         self,

@@ -966,6 +966,11 @@ class AgentTaskStore:
                     FROM agent_task_dependencies AS dependency
                     JOIN descendants
                       ON dependency.depends_on_task_id = descendants.task_id
+                    UNION
+                    SELECT child.task_id
+                    FROM agent_tasks AS child
+                    JOIN descendants
+                      ON child.parent_task_id = descendants.task_id
                 )
                 SELECT task_id FROM descendants
                 """,
@@ -1015,11 +1020,17 @@ class AgentTaskStore:
                       ON dependency.depends_on_task_id = descendants.task_id
                     JOIN agent_tasks AS child ON child.task_id = dependency.task_id
                     WHERE 1 = 1{recursive_scope}
+                    UNION
+                    SELECT child.task_id
+                    FROM agent_tasks AS child
+                    JOIN descendants
+                      ON child.parent_task_id = descendants.task_id
+                    WHERE 1 = 1{recursive_scope}
                 )
                 SELECT task_id FROM descendants
                 """,
                 (
-                    (identifier, workspace_value)
+                    (identifier, workspace_value, workspace_value)
                     if workspace_value is not None
                     else (identifier,)
                 ),
@@ -1057,7 +1068,7 @@ class AgentTaskStore:
             )
             params: tuple[Any, ...] = (identifier,)
             if workspace_value is not None:
-                params += (workspace_value, workspace_value)
+                params += (workspace_value, workspace_value, workspace_value)
             rows = self._conn.execute(
                 f"""
                 WITH RECURSIVE descendants(task_id) AS (
@@ -1070,6 +1081,12 @@ class AgentTaskStore:
                     JOIN descendants
                       ON dependency.depends_on_task_id = descendants.task_id
                     JOIN agent_tasks AS child ON child.task_id = dependency.task_id
+                    WHERE 1 = 1{recursive_scope}
+                    UNION
+                    SELECT child.task_id
+                    FROM agent_tasks AS child
+                    JOIN descendants
+                      ON child.parent_task_id = descendants.task_id
                     WHERE 1 = 1{recursive_scope}
                 )
                 SELECT task_id FROM descendants
@@ -1091,6 +1108,25 @@ class AgentTaskStore:
         now = time.time()
         with self._transaction():
             return self._recover_expired_locked(now)
+
+    def count_children(
+        self,
+        parent_task_id: str,
+        *,
+        workspace: str | Path | None = None,
+    ) -> int:
+        """Count direct durable descendants owned by one parent task."""
+
+        identifier = _identifier(parent_task_id, "parent task id")
+        workspace_value = _workspace_scope(workspace)
+        query = "SELECT COUNT(*) FROM agent_tasks WHERE parent_task_id = ?"
+        params: tuple[Any, ...] = (identifier,)
+        if workspace_value is not None:
+            query += " AND json_extract(metadata_json, '$.workspace') = ?"
+            params += (workspace_value,)
+        with self._lock, closing(self._conn.cursor()) as cur:
+            row = cur.execute(query, params).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def get_task(
         self,

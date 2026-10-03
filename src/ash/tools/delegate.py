@@ -75,21 +75,32 @@ class DelegateAgentsTool(BaseTool):
         shared_state: SharedState,
         spawn_tool: SpawnAgentTool,
         config: AshConfig,
+        *,
+        allow_background: bool = True,
+        owns_spawn_tool: bool = False,
     ) -> None:
         super().__init__(safety_guard)
         self._shared_state = shared_state
         self._spawn_tool = spawn_tool
         self._config = config
+        self._allow_background = allow_background
+        self._owns_spawn_tool = owns_spawn_tool
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = DelegateAgentsArgs(**kwargs)
+        if args.background and not self._allow_background:
+            return _error(
+                "Nested orchestrators must wait for their delegated graph; "
+                "background nested graphs are not supported."
+            )
         keys = [spec.key for spec in args.tasks]
         if len(set(keys)) != len(keys):
             return _error("Task keys must be unique within a delegated graph.")
         known_keys = set(keys)
         for spec in args.tasks:
-            if not self._spawn_tool.supports_role(spec.role):
-                return _error(f"Unknown delegated agent role: {spec.role!r}.")
+            role_error = self._spawn_tool.spawn_role_error(spec.role)
+            if role_error is not None:
+                return _error(role_error)
             unknown = sorted(set(spec.depends_on) - known_keys)
             if unknown:
                 return _error(
@@ -114,6 +125,19 @@ class DelegateAgentsTool(BaseTool):
                     f"of {self._config.agent_time_budget_seconds:g}s."
                 )
 
+        parent_task_id = self._spawn_tool.parent_task_id
+        if parent_task_id is not None:
+            existing_children = self._shared_state.tasks.count_children(
+                parent_task_id,
+                workspace=self.safety_guard.project_root,
+            )
+            if existing_children + len(args.tasks) > self._config.agent_max_children_per_task:
+                return _error(
+                    "Orchestrator child-task limit would be exceeded: "
+                    f"{existing_children}+{len(args.tasks)} > "
+                    f"{self._config.agent_max_children_per_task}."
+                )
+
         graph_id = f"graph-{uuid.uuid4().hex[:12]}"
         task_ids = {key: f"{graph_id}-{key}" for key in keys}
         workspace = str(Path(self.safety_guard.project_root).resolve())
@@ -122,6 +146,7 @@ class DelegateAgentsTool(BaseTool):
                 description=spec.task,
                 role=spec.role,
                 task_id=task_ids[spec.key],
+                parent_task_id=parent_task_id,
                 dependencies=tuple(task_ids[key] for key in spec.depends_on),
                 max_attempts=spec.max_attempts,
                 token_budget=spec.token_budget or self._config.agent_token_budget,
@@ -130,11 +155,13 @@ class DelegateAgentsTool(BaseTool):
                 ),
                 metadata={
                     "agent_id": f"worker-{graph_id[6:]}-{spec.key}",
+                    "background": args.background,
                     "accept_git_artifacts": spec.accept_git_artifacts,
                     "dispatchable": True,
                     "graph_id": graph_id,
                     "goal": redact_text(args.goal),
                     "isolation": spec.isolation,
+                    "spawn_depth": self._spawn_tool.child_spawn_depth,
                     "task_key": spec.key,
                     "workspace": workspace,
                 },
@@ -156,11 +183,23 @@ class DelegateAgentsTool(BaseTool):
             }
         )
         self._spawn_tool.ensure_dispatcher()
-        terminal = (
-            await self._spawn_tool.wait_for_tasks([task.task_id for task in created])
-            if not args.background
-            else []
-        )
+        try:
+            terminal = (
+                await self._spawn_tool.wait_for_tasks([task.task_id for task in created])
+                if not args.background
+                else []
+            )
+        except BaseException:
+            if not args.background:
+                try:
+                    self._shared_state.tasks.cancel_graph(
+                        graph_id,
+                        reason="delegated graph cancelled with its owning turn",
+                        workspace=self.safety_guard.project_root,
+                    )
+                except AgentTaskError:
+                    pass
+            raise
         terminal_by_id = {task.task_id: task for task in terminal}
         graph_budget = (
             self._shared_state.tasks.get_graph_budget(graph_id)
@@ -254,7 +293,10 @@ class DelegateAgentsTool(BaseTool):
         )
 
     async def aclose(self) -> None:
-        self._shared_state.close()
+        if self._owns_spawn_tool:
+            await self._spawn_tool.aclose()
+        else:
+            self._shared_state.close()
 
 
 def _error(message: str) -> ToolResult:

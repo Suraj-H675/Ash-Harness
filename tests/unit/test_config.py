@@ -306,6 +306,8 @@ def test_config_rejects_negative_model_pricing() -> None:
         "provider_retry_base_delay",
         "max_concurrent_agents",
         "agent_token_budget",
+        "agent_max_spawn_depth",
+        "agent_max_children_per_task",
         "web_search_timeout_seconds",
         "browser_timeout_seconds",
         "session_retention_days",
@@ -837,6 +839,8 @@ def test_project_config_cannot_override_user_owned_controls(
                 "agent_token_budget = 999999",
                 "agent_time_budget_seconds = 86400",
                 "agent_lease_seconds = 3600",
+                "agent_max_spawn_depth = 5",
+                "agent_max_children_per_task = 32",
                 'agent_execution_mode = "subprocess"',
                 "allow_unsafe_auto_approve = true",
                 "allow_unsafe_plugin_runtime = true",
@@ -902,6 +906,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.agent_token_budget == 4000
     assert config.agent_time_budget_seconds == 900
     assert config.agent_lease_seconds == 30
+    assert config.agent_max_spawn_depth == 1
+    assert config.agent_max_children_per_task == 8
     assert config.agent_execution_mode == "in_process"
     assert config.allow_unsafe_auto_approve is False
     assert config.allow_unsafe_plugin_runtime is False
@@ -945,6 +951,8 @@ def test_project_config_cannot_override_user_owned_controls(
     assert "agent_token_budget" in diagnostics
     assert "agent_time_budget_seconds" in diagnostics
     assert "agent_lease_seconds" in diagnostics
+    assert "agent_max_spawn_depth" in diagnostics
+    assert "agent_max_children_per_task" in diagnostics
     assert "agent_execution_mode" in diagnostics
     assert "allow_unsafe_auto_approve" in diagnostics
     assert "allow_unsafe_plugin_runtime" in diagnostics

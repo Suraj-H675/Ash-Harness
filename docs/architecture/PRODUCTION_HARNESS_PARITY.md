@@ -110,11 +110,11 @@ The program is intentionally finite:
    runtimes, onboarding, and real-provider/runtime conformance. Closure requires
    a current comparator pass plus enough real vendor/runtime evidence for every
    support claim that materially depends on external behavior.
-2. **P2 — Agent/workspace parity — OPEN.** Evaluate and close material
+2. **P2 — Agent/workspace parity — CLOSED.** Evaluate and close material
    gaps in subagent orchestration, durable/background work, worktree/workspace
    isolation, delegation, steering, recovery, remote execution where it solves
    real coding workflows, and multi-workspace ergonomics.
-3. **P3 — Web/computer interaction parity — NOT STARTED.** Evaluate browser
+3. **P3 — Web/computer interaction parity — OPEN.** Evaluate browser
    control breadth, signed-in browser workflows, web research/fetch ergonomics,
    browser attachment/remote operation, and whether general computer use is a
    justified Ash capability rather than copying broader assistant products.
@@ -143,10 +143,10 @@ The program is intentionally finite:
    important unresolved user need remains may Ash claim whole-product
    leading-harness parity. Literal feature identity is never the criterion.
 
-**Active gate: P2 — Agent/workspace parity.** P1 is closed at its bounded
-provider/model finish condition. Do not reopen it for catalog churn or a new
-provider merely because one exists; reopen only for concrete evidence that an
-important supported provider/model user need or claim is wrong.
+**Active gate: P3 — Web/computer interaction parity.** P1 and P2 are closed at
+their bounded finish conditions. Do not reopen either for feature-count churn;
+reopen only for concrete evidence that an important supported provider/model or
+agent/workspace user need or claim is wrong.
 
 ### P1 finite closure checklist
 
@@ -911,6 +911,142 @@ Qualified provider/runtime rows remain evidence boundaries, not hidden claims
 that every external service/version has been exercised. The active finite
 roadmap advances to P2 agent/workspace parity.
 
+### P2 finish flags
+
+These are the bounded stop conditions for agent/workspace parity. Do not turn
+P2 into an open-ended inventory of every multi-agent pattern another harness
+can express.
+
+- `P2A_DELEGATION_DELIVERY = CLOSED`
+- `P2B_DURABLE_BACKGROUND_RECOVERY = CLOSED`
+- `P2C_WORKTREE_WORKSPACE_ISOLATION = CLOSED`
+- `P2D_ADAPTIVE_ORCHESTRATION = CLOSED`
+- `P2E_REMOTE_MULTIWORKSPACE_CONFORMANCE = CLOSED`
+- `P2_AGENT_WORKSPACE_PARITY = CLOSED`
+
+P2 closes when focused child work can be delegated with bounded context/tools,
+foreground and background results return to the owning workflow safely, durable
+work has honest recovery/steering/stop semantics, parallel edits are isolated
+and reviewable, adaptive decomposition is either supported or deliberately
+replaced by a stronger bounded orchestration contract, and remote/multi-workspace
+claims are backed by current evidence. Presentation features alone do not keep
+the gate open when the underlying workflow is already accessible through CLI,
+SDK, ACP/A2A, or persisted status/event surfaces.
+
+### P2 progress — durable background completion delivery slice 1
+
+Ash already persisted subagent reports to a workspace-scoped SQLite lead inbox,
+but background completion stopped one layer too early: the active parent session
+did not consume those reports automatically. A user or host had to inspect
+`/agents`, the top-level agent CLI, or SDK state manually before the parent model
+could act on completed background work. Current OpenClaw and Hermes background
+delegation both return completions to the requester, so this was a material
+workflow gap rather than cosmetic monitoring.
+
+Background reports now carry explicit durable delivery metadata, including the
+originating task and graph identity. Foreground reports are acknowledged as soon
+as their ordinary `spawn_agent`/delegation tool result returns, preventing
+already-consumed reports from accumulating in the lead inbox. Background
+reports remain pending until the parent loop reaches a safe model boundary. The
+loop then persists a bounded completion notice into session history **before**
+acknowledging the IPC row, giving the handoff at-least-once failure semantics
+instead of losing a completion on a crash between coordination and history
+stores.
+
+Worker-controlled task/summary text is redacted, size-bounded, JSON-quoted, and
+wrapped as explicitly untrusted evidence in a user-role history message. It is
+not promoted to system instructions. No extra model turn is started merely
+because a worker finishes: completions join the next already-running model
+iteration or the next user turn, avoiding surprise cost and runaway background
+chaining. The in-memory session recognizes a persisted IPC message ID so an
+acknowledgement failure cannot duplicate the report repeatedly within the same
+turn.
+
+Current comparator evidence rechecked on 2026-10-03: OpenClaw subagents run as
+tracked background tasks and announce results back to their requester; Hermes
+background delegation similarly returns handles immediately and routes final
+results back to the owning session. OpenAI's current managed multi-agent harness
+also exposes explicit spawn/message/wait/interrupt/list semantics for a live
+agent tree. The parent-context delivery path, ordinary delegation DAGs, and
+persisted agent CLI/API surfaces pass together, so
+`P2A_DELEGATION_DELIVERY = CLOSED`.
+
+### P2 progress — recovery, isolation, and adaptive orchestration closure slice 2
+
+P2B and P2C were revalidated as production behaviors rather than inferred from
+their implementations. Focused recovery tests prove renewable leases,
+side-effect replay fencing, restart dispatch, attempt-scoped durable approvals,
+live steering, persisted stop, active graph cancellation, and single-winner
+approval resolution. Focused worktree tests prove clean-lead admission, managed
+branch/commit identity, dependency-artifact handoff, conflict-safe application,
+deterministic cleanup, stop cleanup, explicit discard, and the requirement to
+apply isolated work before report-based continuation. These gates close
+`P2B_DURABLE_BACKGROUND_RECOVERY` and
+`P2C_WORKTREE_WORKSPACE_ISOLATION`.
+
+The remaining comparator difference was adaptive hierarchy. Ash's root-owned
+atomic DAG was safer than unconstrained recursive spawning but could not expand
+work when a long-running child discovered a new bounded subproblem. Current
+OpenClaw exposes depth-capped nested subagents; Hermes keeps delegation flat by
+default but supports opt-in orchestrator children; OpenAI's current multi-agent
+runtime likewise models live agent trees. Ash now adopts the useful capability
+without adopting unrestricted recursion:
+
+- direct children remain leaves by default (`agent_max_spawn_depth = 1`);
+- nesting is an explicit user-owned opt-in with a maximum depth of five and a
+  separate direct-child limit;
+- only the dedicated `orchestrator` role receives `delegate_agents`; leaf
+  workers never receive recursive `spawn_agent`;
+- orchestrators are shared-workspace coordinators, not isolated editors, and
+  nested graphs must complete synchronously before the orchestrator returns;
+- descendant tasks carry durable `parent_task_id` lineage plus explicit spawn
+  depth, use the same global concurrency/token/time/cost and permission
+  boundaries, and cannot override their owning lineage;
+- cancellation traverses both dependency edges and parent-child lineage, so a
+  stopped owner cannot leave descendant work running;
+- the same contract passes through Ash's real subprocess worker boundary,
+  including explicit approval brokerage and provider reconstruction.
+
+The new depth/child limits stay user-owned: repository project configuration
+cannot raise them. A custom OpenAI-compatible subprocess regression enables
+native tools only through Ash's existing exact per-model capability declaration;
+an earlier loopback attempt using an overridden OpenAI endpoint correctly stayed
+conservative and was not weakened for the test. With in-process and subprocess
+nested journeys, depth/child admission, and lineage cancellation green,
+`P2D_ADAPTIVE_ORCHESTRATION = CLOSED`.
+
+### P2 progress — remote and multi-workspace closure slice 3
+
+P2E keeps Ash's coding-workspace boundary explicit instead of copying a gateway
+persona model. One Ash runtime/client owns one immutable workspace root;
+concurrent independent roots use independent clients/processes, same-repository
+parallel edits use managed Git worktrees, and independent remote agents use the
+official A2A path. Current OpenClaw can multiplex long-lived personas with
+separate workspaces and channel bindings inside one gateway, while Hermes
+primarily scopes a session to its launch directory or remote terminal backend.
+For Ash's terminal-first coding mission, channel/persona routing is an
+interfaces/anywhere-access question for P5, not an agent/workspace blocker.
+
+Focused P2E conformance proves the official A2A client stream/resume journey,
+durable remote-context restart recovery and endpoint-rebinding refusal, remote
+cancellation of an active Ash turn, workspace-scoped A2A task state, SDK agent
+state isolation, cross-workspace session-resume refusal, workspace-namespaced
+agent identity/IPC/sprints, and cross-workspace approval refusal. Therefore
+`P2E_REMOTE_MULTIWORKSPACE_CONFORMANCE = CLOSED` and
+`P2_AGENT_WORKSPACE_PARITY = CLOSED`.
+
+Comparator references rechecked on 2026-10-03:
+`https://docs.openclaw.ai/tools/subagents/nesting`,
+`https://docs.openclaw.ai/tools/subagents/operations`,
+`https://docs.openclaw.ai/concepts/multi-agent/index.html`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/features/delegation`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/configuration`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/git-worktrees`, and
+`https://developers.openai.com/api/docs/guides/responses-multi-agent`.
+
+All five bounded P2 finish flags are closed. The active roadmap advances to P3
+web/computer interaction parity.
+
 ### M4 product decisions
 
 The remaining comparator differences have now been reduced to explicit product
@@ -1225,14 +1361,14 @@ truthful evidence boundaries, not open mission blockers.
 
 | Capability | Ash status | Required production behavior |
 |---|---|---|
-| Spawn subagent tool | Verified locally | Real bounded provider-backed Ash loop, persisted reports, role-scoped tool manifests, background execution, cancellation, no recursive spawning, and start-time inheritance of the parent permission mode plus managed/session/persistent rules; the default remains in-process, while optional config-backed subprocess execution serializes the durable task/config/policy plus only selected provider environment into a scrubbed child that rebuilds the provider there, with source-tree regressions and installed-wheel smoke proving the parent provider factory is not used; direct foreground child `ASK` decisions broker through the active TUI or explicit runtime approval callback, including the subprocess approval channel, while autonomous workers persist attempt-scoped approval requests for later operator resolution and direct foreground headless workers still fail closed when no broker exists |
-| Parallel agents | Verified locally | Atomic DAG submission, dependency-ready dispatch, bounded retries, foreground/background operation, restart recovery, independent child sessions/workspaces, durable graph-wide token and USD ceilings, safe foreground approval brokerage, and a durable asynchronous approval inbox for background/queued DAG workers. Approval responses are single-resolution, task/attempt/owner/digest correlated, cancellation-aware, and stale requests are retired before retried attempts can run |
-| Agent status/output | Verified locally | Live basic and full slash status with durable task identity, token budgets, and USD cost usage; top-level persisted status/report/message inspection |
-| Agent messaging | Verified locally | Typed SQLite IPC is persisted and inspectable; running workers consume steer/stop messages, acknowledge delivery, enforce pending-message backpressure, and use correlated `approval_request`/`approval_response` messages for asynchronous child permissions |
-| Role tool policies | Verified locally | Read/search baseline, coder-only scoped edits, sandbox-required tester commands, and no recursive spawn tool |
+| Spawn subagent tool | Verified locally | Real bounded provider-backed Ash loop, persisted reports, background execution, cancellation, and start-time inheritance of the parent permission mode plus managed/session/persistent rules. Direct children remain leaves by default; an explicit user-owned depth increase enables the dedicated orchestrator role, which receives bounded `delegate_agents` but never unrestricted recursive `spawn_agent`. The default execution boundary remains in-process, while optional config-backed subprocess execution serializes durable task/config/policy plus only selected provider environment into a scrubbed child that rebuilds the provider there; both ordinary and nested subprocess regressions prove the parent provider factory is not reused. Direct foreground child `ASK` decisions broker through the active TUI or explicit runtime approval callback, including the subprocess approval channel, while autonomous workers persist attempt-scoped approval requests for later operator resolution and direct foreground headless workers still fail closed when no broker exists. |
+| Parallel agents | Verified locally | Atomic DAG submission, dependency-ready dispatch, bounded retries, foreground/background operation, restart recovery, independent child sessions/workspaces, durable graph-wide token and USD ceilings, safe foreground approval brokerage, and a durable asynchronous approval inbox for background/queued DAG workers. Opt-in orchestrators can synchronously expand one bounded child DAG with durable parent lineage; depth, direct-child count, global concurrency, budgets, and cascade cancellation remain enforced. Approval responses are single-resolution, task/attempt/owner/digest correlated, cancellation-aware, and stale requests are retired before retried attempts can run. |
+| Agent status/output | Verified locally | Live basic and full slash status with durable task identity, token budgets, and USD cost usage; top-level persisted status/report/message inspection; completed background reports are also persisted into the owning parent session at the next safe model boundary without starting a surprise model turn. |
+| Agent messaging | Verified locally | Typed SQLite IPC is persisted and inspectable; running workers consume steer/stop messages, acknowledge delivery, enforce pending-message backpressure, and use correlated `approval_request`/`approval_response` messages for asynchronous child permissions. Background completion handoff persists bounded, JSON-quoted, explicitly untrusted worker evidence into parent history before acknowledging IPC, preserving at-least-once delivery across coordination/history-store failures. |
+| Role tool policies | Verified locally | Read/search baseline, coder-only scoped edits, sandbox-required tester commands, leaf workers without delegation, and a dedicated orchestrator role whose only agent-creation surface is bounded synchronous `delegate_agents`; nesting remains flat by default and repository config cannot raise the user-owned depth/child limits. |
 | Worktree isolation | Verified locally | Clean-lead precondition, locked `ash-agent/*` branches, exact branch/commit verification, conflict-safe dependent merges, bounded commits, deterministic cleanup, explicit full-branch squash/discard, and Ash-owned storage-root/worktree inode pinning carried into the worker `SafetyGuard` and sandbox. If a concurrently hostile same-account host process redirects the destination pathname during external `git worktree add`, Ash revalidates after Git returns and refuses the lease before any worker execution; Git may already have written to the redirected host path because the Git CLI exposes only a pathname destination, so that host-side race is not claimed as a strict same-principal namespace guarantee. |
 | Result consolidation | Verified locally | Foreground DAG calls return typed terminal results and errors plus evidence-linked synthesis, bounded summaries, workspace-relative path evidence, cross-agent claim-conflict detection, and durable graph-consolidation artifacts |
-| Agent steering/stop | Verified locally | In-process stop, persisted stop, atomic graph cancellation with active-turn revocation, live steering at safe iteration boundaries, delivery state, and report-based resume; isolated changes must be applied before continuation |
+| Agent steering/stop | Verified locally | In-process stop, persisted stop, atomic graph cancellation with active-turn revocation, parent-lineage cascade cancellation for nested work, live steering at safe iteration boundaries, delivery state, and report-based resume; isolated changes must be applied before continuation. |
 
 ## 11. Automation And Integration
 

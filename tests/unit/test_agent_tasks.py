@@ -924,6 +924,38 @@ def test_task_dependency_fan_in_is_bounded(
         )
 
 
+def test_parent_lineage_cascades_task_cancellation(state: SharedState) -> None:
+    root = state.tasks.create_task("root", task_id="root")
+    child = state.tasks.create_task(
+        "child",
+        task_id="child",
+        parent_task_id=root.task_id,
+    )
+    grandchild = state.tasks.create_task(
+        "grandchild",
+        task_id="grandchild",
+        parent_task_id=child.task_id,
+    )
+    lease = state.tasks.claim_task("root-worker", task_id=root.task_id)
+    assert lease is not None
+    state.tasks.start_task(root.task_id, lease.token)
+
+    cancelled = state.tasks.cancel_owned_task(
+        root.task_id,
+        lease.token,
+        reason="parent stopped",
+    )
+
+    assert set(cancelled) == {root.task_id, child.task_id, grandchild.task_id}
+    assert {
+        task.task_id: task.state for task in state.tasks.list_tasks()
+    } == {
+        root.task_id: "cancelled",
+        child.task_id: "cancelled",
+        grandchild.task_id: "cancelled",
+    }
+
+
 def test_task_artifact_count_is_bounded_and_legacy_overflow_fails_closed(
     state: SharedState,
     monkeypatch: pytest.MonkeyPatch,

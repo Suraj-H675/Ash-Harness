@@ -709,6 +709,21 @@ class AshConfig(BaseSettings):
         le=3600.0,
         description="Renewable durable ownership lease for a live subagent task.",
     )
+    agent_max_spawn_depth: int = Field(
+        1,
+        ge=1,
+        le=5,
+        description=(
+            "Maximum subagent tree depth. Depth 1 keeps direct children as leaves; "
+            "raise this to opt into nested orchestrator delegation."
+        ),
+    )
+    agent_max_children_per_task: int = Field(
+        8,
+        ge=1,
+        le=32,
+        description="Maximum direct descendant tasks owned by one orchestrator task.",
+    )
     agent_execution_mode: str = Field(
         "in_process",
         description=(
