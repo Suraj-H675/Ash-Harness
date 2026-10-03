@@ -824,6 +824,13 @@ class AshConfig(BaseSettings):
             "directory. Disabled always starts a clean ephemeral profile."
         ),
     )
+    browser_allowed_local_origins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Explicit loopback browser origins for local app testing, such as "
+            "http://localhost:3000. Does not permit LAN or other private networks."
+        ),
+    )
     browser_cdp_url: str = Field(
         "",
         description=(
@@ -1567,6 +1574,13 @@ class AshConfig(BaseSettings):
                 )
             normalized.append(item)
         return sorted(set(normalized))
+
+    @field_validator("browser_allowed_local_origins")
+    @classmethod
+    def validate_browser_allowed_local_origins(cls, value: list[str]) -> list[str]:
+        from ash.safety.network import normalize_loopback_origins
+
+        return list(normalize_loopback_origins(value))
 
     @field_validator("plugin_marketplaces", mode="before")
     @classmethod

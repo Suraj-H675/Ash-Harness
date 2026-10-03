@@ -39,38 +39,30 @@ For a standard `128,000` token context limit:
 
 ## 2. Context Compaction Algorithms
 
-When historical messages exceed the active history budget (e.g. 40,000 tokens), Ash executes a two-layer compaction routine: **Layered Truncation** followed by **Anchored Iterative Summarization**.
+When historical messages exceed the active history budget, Ash compacts only
+the provider-visible history. The durable transcript remains intact in SQLite.
+Compaction is deterministic and extractive: it does not make a helper-model
+request, incur another inference charge, or invent a synthesized state object.
 
 ### 2.1 Layered Compaction
-Instead of summarising the entire history from scratch (which loses specific code details), Ash applies structured truncation rules to historical turns:
-1.  **Masking tool outputs**: Keep the tool name and argument JSON, but strip tool response content if the turn is older than 5 cycles.
-2.  **Truncate lines**: If raw file reads or massive compiler error logs exist in older turns, strip the middle lines and preserve only the start/end lines along with a summary statement.
-3.  **JSON extraction**: Extract tool usage records as structured JSON schemas to save space.
+Before removing conversation turns, Ash bounds stale tool-result payloads and
+preserves valid assistant-tool/result protocol groups atomically. The current
+user request and its active tool chain are protected; if that protected state
+alone cannot fit, Ash fails with a context-budget error rather than silently
+dropping it.
 
-### 2.2 Anchored Iterative Summarization
-To update the persistent history summary without rebuilding it, Ash sends the old summary, the latest active turns, and the current task to a helper LLM instance using the following schema:
+### 2.2 Anchored Extractive Summary
+Removed turns are represented by a bounded text summary built from observable
+state: recent user requests, referenced paths, tool names/arguments, assistant
+outcomes, and bounded event text. A prior durable summary is carried forward
+with both ends preserved, then merged with newly removed state. The persisted
+summary may be larger than the provider-visible copy; Ash separately fits the
+visible summary to the remaining input budget without shrinking durable state.
 
-```python
-class HistorySummary(BaseModel):
-    core_sprint_goal: str = Field(..., description="The main problem being solved.")
-    key_decisions_made: list[str] = Field(..., description="Architectural choices or code patterns established.")
-    completed_checkpoints: list[str] = Field(..., description="Files written, tests passed, or bugs fixed.")
-    remaining_blockers: list[str] = Field(..., description="Outstanding tasks or bugs to address.")
-    active_state_variables: dict[str, str] = Field(..., description="Key variables, functions, or file paths currently under modification.")
-
-def anchor_summarization(
-    previous_summary: HistorySummary,
-    new_turns: list[dict],
-    provider: ProviderABC
-) -> HistorySummary:
-    """
-    Sends the previous structured summary and the new turns to the provider
-    to get an updated HistorySummary object without losing historical state anchor points.
-    """
-    # LLM instruction asks to MERGE the new turns into the existing structure
-    # and enforces output matching the HistorySummary JSON schema.
-    ...
-```
+Repeated compaction therefore retains earlier anchors while adding newer
+decisions and blockers. The algorithm intentionally trades abstractive polish
+for reproducibility, zero extra model calls, and a lower risk of fabricated
+history.
 
 ---
 

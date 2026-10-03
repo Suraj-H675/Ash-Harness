@@ -1873,6 +1873,33 @@ def test_browser_url_policy_blocks_private_non_http_and_disallowed_hosts(
         _validate_browser_url("https://blocked.example/page", ("docs.example",))
 
 
+def test_browser_url_policy_allows_only_explicit_loopback_origin() -> None:
+    allowed = ("http://localhost:3000",)
+
+    assert (
+        _validate_browser_url(
+            "http://localhost:3000/dashboard",
+            (),
+            allowed,
+        )
+        == "http://localhost:3000/dashboard"
+    )
+    assert (
+        _validate_browser_url(
+            "ws://localhost:3000/socket",
+            (),
+            allowed,
+        )
+        == "ws://localhost:3000/socket"
+    )
+    with pytest.raises(ValueError):
+        _validate_browser_url("http://localhost:3001/", (), allowed)
+    with pytest.raises(ValueError):
+        _validate_browser_url("https://localhost:3000/", (), allowed)
+    with pytest.raises(ValueError, match="non-public"):
+        _validate_browser_url("http://192.168.1.10:3000/", (), allowed)
+
+
 def test_browser_url_output_redacts_oauth_query_and_fragment_credentials() -> None:
     redacted = _redact_browser_url(
         "https://login.example/callback?"

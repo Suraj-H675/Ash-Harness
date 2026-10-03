@@ -1153,6 +1153,23 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     )
                     print(f"Deleted {deleted} expired session(s).")
                     continue
+                if arguments[:1] == ["search"]:
+                    query = " ".join(arguments[1:]).strip()
+                    if not query:
+                        print("Usage: /sessions search QUERY", file=sys.stderr)
+                        continue
+                    from ash.commands.sessions import render_session_search_hits
+
+                    try:
+                        hits = loop.session_store.search_session_messages(
+                            project_path=loop.project_root,
+                            query=query,
+                        )
+                    except ValueError as exc:
+                        print(f"Error: {exc}", file=sys.stderr)
+                        continue
+                    print(render_session_search_hits(hits), flush=True)
+                    continue
                 query = " ".join(arguments)
                 sessions = loop.session_store.list_sessions(
                     project_path=str(loop.project_root),
@@ -2629,7 +2646,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     sessions_parser.add_argument(
         "sessions_action",
         nargs="?",
-        choices=["list", "tree", "recovery"],
+        choices=["list", "tree", "recovery", "search"],
         default="list",
     )
     sessions_parser.add_argument(
@@ -4230,6 +4247,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         from ash.commands.sessions import (
             list_session_summaries,
             render_recovery_reports,
+            render_session_search_hits,
             render_session_summaries,
             render_session_tree,
         )
@@ -4276,6 +4294,26 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     print(f"Error: {exc}", file=sys.stderr)
                     return 2
                 print(render_recovery_reports(reports, json_output=args.json))
+                return 0
+            if args.sessions_action == "search":
+                if args.all_projects:
+                    print(
+                        "Error: transcript search is scoped to the current project",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if not args.query.strip():
+                    print(
+                        "Error: sessions search requires --query TEXT",
+                        file=sys.stderr,
+                    )
+                    return 2
+                hits = store.search_session_messages(
+                    project_path=sessions_config.workspace_root,
+                    query=args.query,
+                    limit=args.limit,
+                )
+                print(render_session_search_hits(hits, json_output=args.json))
                 return 0
             if args.session:
                 print(

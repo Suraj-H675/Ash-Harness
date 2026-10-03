@@ -21,6 +21,7 @@ class AgentDefinition:
     instructions: str
     path: Path
     base_role: str = "general"
+    model: str = ""
     allowed_tools: tuple[str, ...] = ()
     source_identity: tuple[int, int] | None = None
 
@@ -165,6 +166,12 @@ def parse_agent_definition_bytes(
     base_role = metadata.get("base-role", metadata.get("role", "general"))
     if base_role not in AGENT_ROLES:
         raise ValueError(f"agent base-role must be one of {AGENT_ROLES}")
+    model = metadata.get("model", "")
+    if model:
+        from ash.providers.identifiers import parse_model_string
+
+        provider, model_name = parse_model_string(model)
+        model = f"{provider}/{model_name}"
     instructions = body.strip()
     if not instructions:
         raise ValueError("agent instructions are empty")
@@ -184,6 +191,7 @@ def parse_agent_definition_bytes(
         instructions=instructions,
         path=path,
         base_role=base_role,
+        model=model,
         allowed_tools=tools,
         source_identity=source_identity,
     )

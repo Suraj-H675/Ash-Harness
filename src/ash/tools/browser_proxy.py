@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 from ash.tools.web import _host_allowed, _resolve_public_addresses
+from ash.safety.network import loopback_target_allowed
 
 
 MAX_PROXY_HEADER_BYTES = 64 * 1024
@@ -63,16 +64,20 @@ class BrowserPolicyProxy:
         self,
         allowed_domains: tuple[str, ...],
         *,
+        allowed_local_origins: tuple[str, ...] = (),
         timeout_seconds: float,
         resolver: Resolver | None = None,
+        local_resolver: Resolver | None = None,
         connector: Connector | None = None,
         max_connections: int = MAX_BROWSER_PROXY_CONNECTIONS,
     ) -> None:
         if not 1 <= max_connections <= 4096:
             raise ValueError("browser proxy connection limit must be between 1 and 4096")
         self.allowed_domains = allowed_domains
+        self.allowed_local_origins = allowed_local_origins
         self.timeout_seconds = timeout_seconds
         self._resolver = resolver or _resolve_public_addresses
+        self._local_resolver = local_resolver or _resolve_loopback_addresses
         self._connector = connector or self._connect_numeric
         self._max_connections = max_connections
         self._server: asyncio.AbstractServer | None = None
@@ -296,13 +301,22 @@ class BrowserPolicyProxy:
         self,
         target: _ProxyTarget,
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        local_allowed = loopback_target_allowed(
+            target.hostname,
+            target.port,
+            self.allowed_local_origins,
+            scheme=target.scheme,
+        )
         if self.allowed_domains and not _host_allowed(
             target.hostname, self.allowed_domains
-        ):
+        ) and not local_allowed:
             raise _RejectedProxyTarget
         try:
             addresses = tuple(
-                await asyncio.to_thread(self._resolver, target.hostname)
+                await asyncio.to_thread(
+                    self._local_resolver if local_allowed else self._resolver,
+                    target.hostname,
+                )
             )
         except (OSError, ValueError, TypeError):
             raise _RejectedProxyTarget from None
@@ -313,7 +327,10 @@ class BrowserPolicyProxy:
                 address = ipaddress.ip_address(raw_address)
             except ValueError:
                 raise _RejectedProxyTarget from None
-            if not address.is_global:
+            if local_allowed:
+                if not address.is_loopback:
+                    raise _RejectedProxyTarget
+            elif not address.is_global:
                 raise _RejectedProxyTarget
 
         for raw_address in addresses:
@@ -325,7 +342,6 @@ class BrowserPolicyProxy:
             except (OSError, asyncio.TimeoutError, ConnectionError):
                 continue
         raise _UpstreamConnectionError
-
     async def _connect_numeric(
         self,
         address: str,
@@ -355,6 +371,28 @@ class BrowserPolicyProxy:
         )
         with contextlib.suppress(OSError, RuntimeError):
             await writer.drain()
+
+
+def _resolve_loopback_addresses(hostname: str) -> tuple[str, ...]:
+    """Resolve localhost/literal loopback targets and reject mixed answers."""
+
+    if hostname.casefold().rstrip(".") == "localhost":
+        records = socket.getaddrinfo(
+            hostname,
+            None,
+            type=socket.SOCK_STREAM,
+        )
+        addresses = tuple(dict.fromkeys(str(record[4][0]) for record in records))
+    else:
+        try:
+            addresses = (str(ipaddress.ip_address(hostname)),)
+        except ValueError as exc:
+            raise ValueError("local browser target must be loopback") from exc
+    if not addresses or any(
+        not ipaddress.ip_address(address).is_loopback for address in addresses
+    ):
+        raise ValueError("local browser target must resolve only to loopback")
+    return addresses
 
 
 def _parse_request_header(

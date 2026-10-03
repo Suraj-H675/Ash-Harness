@@ -26,6 +26,7 @@ from ash.safe_io import (
 )
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
+from ash.safety.network import loopback_url_allowed, normalize_loopback_origins
 from ash.safety.scoped_io import atomic_write_scoped_bytes
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.browser_proxy import BrowserPolicyProxy
@@ -109,6 +110,7 @@ class BrowserSession:
         headless: bool = True,
         timeout_seconds: float = 30.0,
         allowed_domains: list[str] | tuple[str, ...] | None = None,
+        allowed_local_origins: list[str] | tuple[str, ...] | None = None,
         profile_path: Path | None = None,
         cdp_url: str | None = None,
         cdp_reuse_storage_state: bool = False,
@@ -119,6 +121,9 @@ class BrowserSession:
         self._timeout_seconds = timeout_seconds
         self.timeout_ms = int(timeout_seconds * 1000)
         self.allowed_domains = _normalize_allowed_domains(allowed_domains or ())
+        self.allowed_local_origins = normalize_loopback_origins(
+            allowed_local_origins or ()
+        )
         normalized_cdp = _validate_cdp_url(cdp_url) if cdp_url else ""
         if normalized_cdp and profile_path is not None:
             raise ValueError("browser CDP attachment cannot use an Ash persistent profile")
@@ -221,6 +226,7 @@ class BrowserSession:
                     )
                 self._proxy = BrowserPolicyProxy(
                     self.allowed_domains,
+                    allowed_local_origins=self.allowed_local_origins,
                     timeout_seconds=self._timeout_seconds,
                 )
                 await self._proxy.start()
@@ -373,7 +379,10 @@ class BrowserSession:
     async def _route_request(self, route: Any, request: Any) -> None:
         try:
             await asyncio.to_thread(
-                _validate_browser_url, request.url, self.allowed_domains
+                _validate_browser_url,
+                request.url,
+                self.allowed_domains,
+                self.allowed_local_origins,
             )
         except ValueError:
             await route.abort("blockedbyclient")
@@ -383,7 +392,10 @@ class BrowserSession:
     async def _route_websocket(self, websocket: Any) -> None:
         try:
             await asyncio.to_thread(
-                _validate_browser_url, websocket.url, self.allowed_domains
+                _validate_browser_url,
+                websocket.url,
+                self.allowed_domains,
+                self.allowed_local_origins,
             )
         except ValueError:
             await websocket.close(code=1008, reason="Blocked by Ash network policy")
@@ -392,7 +404,10 @@ class BrowserSession:
 
     async def navigate(self, url: str, wait_until: str) -> str:
         validated = await asyncio.to_thread(
-            _validate_browser_url, url, self.allowed_domains
+            _validate_browser_url,
+            url,
+            self.allowed_domains,
+            self.allowed_local_origins,
         )
         page = await self.ensure_started()
         modal = await self._run_dialog_aware_action(
@@ -1698,10 +1713,16 @@ def _filter_cdp_storage_state(
     }
 
 
-def _validate_browser_url(url: str, allowed_domains: tuple[str, ...]) -> str:
+def _validate_browser_url(
+    url: str,
+    allowed_domains: tuple[str, ...],
+    allowed_local_origins: tuple[str, ...] = (),
+) -> str:
     parsed = urlparse(url)
     if parsed.username or parsed.password:
         raise ValueError("Browser URLs cannot contain embedded credentials")
+    if loopback_url_allowed(url, allowed_local_origins):
+        return url
     if parsed.scheme in {"ws", "wss"}:
         equivalent = parsed._replace(
             scheme="https" if parsed.scheme == "wss" else "http"
@@ -2339,6 +2360,7 @@ def build_browser_tools(
     headless: bool = True,
     timeout_seconds: float = 30.0,
     allowed_domains: list[str] | tuple[str, ...] | None = None,
+    allowed_local_origins: list[str] | tuple[str, ...] | None = None,
     profile_path: Path | None = None,
     cdp_url: str | None = None,
     cdp_reuse_storage_state: bool = False,
@@ -2347,6 +2369,7 @@ def build_browser_tools(
         headless=headless,
         timeout_seconds=timeout_seconds,
         allowed_domains=allowed_domains,
+        allowed_local_origins=allowed_local_origins,
         profile_path=profile_path,
         cdp_url=cdp_url,
         cdp_reuse_storage_state=cdp_reuse_storage_state,

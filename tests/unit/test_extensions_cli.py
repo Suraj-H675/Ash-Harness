@@ -2041,7 +2041,8 @@ def test_extensions_inventory_lists_namespaced_plugin_agents(
     agent = plugin / "agents" / "reviewer.md"
     agent.parent.mkdir(parents=True)
     agent.write_text(
-        "---\ndescription: Review changes\nbase-role: reviewer\n---\n"
+        "---\ndescription: Review changes\x1b[2J\nbase-role: reviewer\n"
+        "model: openai/gpt-5-mini\n---\n"
         "Review correctness.\n",
         encoding="utf-8",
     )
@@ -2054,3 +2055,8 @@ def test_extensions_inventory_lists_namespaced_plugin_agents(
 
     assert inventory.agents[0].name == "example:reviewer"
     assert inventory.agents[0].base_role == "reviewer"
+    assert inventory.agents[0].model == "openai/gpt-5-mini"
+    rendered = render_extension_inventory(inventory, kind="agents")
+    assert "\x1b" not in rendered
+    assert "Review changes\\x1b[2J" in rendered
+    assert "model=openai/gpt-5-mini" in rendered

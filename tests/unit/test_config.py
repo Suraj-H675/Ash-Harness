@@ -586,6 +586,7 @@ def test_browser_configuration_is_user_owned_and_bounded() -> None:
         browser_headless=False,
         browser_timeout_seconds=45,
         allowed_web_domains=["example.com"],
+        browser_allowed_local_origins=["http://LOCALHOST:3000/"],
         browser_cdp_url="http://127.0.0.1:9222",
         browser_cdp_reuse_storage_state=True,
     )
@@ -594,6 +595,7 @@ def test_browser_configuration_is_user_owned_and_bounded() -> None:
     assert config.browser_timeout_seconds == 45
     assert config.browser_cdp_url == "http://127.0.0.1:9222"
     assert config.browser_cdp_reuse_storage_state is True
+    assert config.browser_allowed_local_origins == ["http://localhost:3000"]
     with pytest.raises(ValueError, match="less than or equal to 120"):
         AshConfig(browser_timeout_seconds=121)
     with pytest.raises(ValueError, match="requires browser_cdp_url"):
@@ -610,6 +612,10 @@ def test_browser_configuration_is_user_owned_and_bounded() -> None:
         )
     with pytest.raises(ValueError, match="must target loopback"):
         AshConfig(browser_cdp_url="https://browser.example.com:9222")
+    with pytest.raises(ValueError, match=r"exact HTTP\(S\) loopback origins"):
+        AshConfig(browser_allowed_local_origins=["http://192.168.1.10:3000"])
+    with pytest.raises(ValueError, match=r"exact HTTP\(S\) loopback origins"):
+        AshConfig(browser_allowed_local_origins=["http://localhost:3000/path"])
 
 
 def test_sprint_planning_can_be_enabled_from_config() -> None:

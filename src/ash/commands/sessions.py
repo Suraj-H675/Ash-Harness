@@ -7,7 +7,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from ash.core.redaction import redact_text
-from ash.core.session import SessionLineage, SessionStore, SessionSummary
+from ash.core.session import (
+    SessionLineage,
+    SessionSearchHit,
+    SessionStore,
+    SessionSummary,
+)
 from ash.ui.safe_text import terminal_safe_text
 
 
@@ -133,6 +138,29 @@ def render_session_summaries(
         lines.append(
             f"{session_id}  {title}  {session.message_count} messages  "
             f"{model}  {session.updated_at.isoformat()}  {project_path}"
+        )
+    return "\n".join(lines)
+
+
+def render_session_search_hits(
+    hits: list[SessionSearchHit],
+    *,
+    json_output: bool = False,
+) -> str:
+    if json_output:
+        return json.dumps(
+            {"matches": [hit.model_dump(mode="json") for hit in hits]},
+            sort_keys=True,
+        )
+    if not hits:
+        return "No matching session messages."
+    lines: list[str] = []
+    for hit in hits:
+        title = terminal_safe_text(hit.title or "(untitled)", single_line=True)
+        excerpt = terminal_safe_text(redact_text(hit.excerpt), single_line=True)
+        lines.append(
+            f"{hit.session_id}  {title}  {hit.role}  "
+            f"{hit.timestamp.isoformat()}  {excerpt}"
         )
     return "\n".join(lines)
 

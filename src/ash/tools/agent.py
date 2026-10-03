@@ -429,6 +429,7 @@ class SpawnAgentTool(BaseTool):
             "instructions": definition.instructions,
             "path": str(definition.path),
             "base_role": definition.base_role,
+            "model": definition.model,
             "allowed_tools": list(definition.allowed_tools),
         }
 
@@ -445,9 +446,19 @@ class SpawnAgentTool(BaseTool):
         from ash.providers.identifiers import parse_model_string
         from ash.providers.readiness import provider_runtime_environment
 
+        selected_model = (
+            agent_definition.model
+            if agent_definition is not None and agent_definition.model
+            else self._config.model
+        )
+        selected_fallbacks = (
+            []
+            if agent_definition is not None and agent_definition.model
+            else list(self._config.fallback_models)
+        )
         selected_providers = {
             parse_model_string(model)[0]
-            for model in (self._config.model, *self._config.fallback_models)
+            for model in (selected_model, *selected_fallbacks)
         }
         child_custom_providers = {
             name: value
@@ -456,6 +467,8 @@ class SpawnAgentTool(BaseTool):
         }
         child_config = self._config.model_copy(
             update={
+                "model": selected_model,
+                "fallback_models": selected_fallbacks,
                 "agent_execution_mode": "in_process",
                 "custom_providers": child_custom_providers,
             }
@@ -470,7 +483,7 @@ class SpawnAgentTool(BaseTool):
                 mode="json",
                 exclude={"openai_api_key"},
             ),
-            "provider_env": provider_runtime_environment(self._config),
+            "provider_env": provider_runtime_environment(child_config),
             "permission_policy": self._permission_policy_payload(policy),
             "custom_agent": self._custom_agent_payload(agent_definition),
             "max_return_chars": self._max_return_chars,
@@ -1329,6 +1342,23 @@ class SpawnAgentTool(BaseTool):
                 agent_definition.ensure_current()
             except ValueError as exc:
                 return ToolResult(success=False, output="", error=str(exc))
+            if (
+                agent_definition.model
+                and (
+                    self._config is None
+                    or self._config.model != agent_definition.model
+                )
+                and not self._provider_config_backed
+            ):
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        f"custom agent {args.role!r} selects model "
+                        f"{agent_definition.model!r}, but this runtime uses an opaque "
+                        "provider factory that cannot honor model overrides"
+                    ),
+                )
         if args.role not in AGENT_ROLES and agent_definition is None:
             expected = (*AGENT_ROLES, *sorted(self._custom_agents))
             return ToolResult(
@@ -2062,6 +2092,31 @@ class SpawnAgentTool(BaseTool):
             expected_project_root_identity=workspace_identity,
         )
         worker_policy = self._worker_permission_policy()
+        worker_safety_tier = worker_policy.mode.value
+        worker_config = (
+            self._config.model_copy(
+                update={
+                    **(
+                        {
+                            "model": agent_definition.model,
+                            "fallback_models": [],
+                        }
+                        if agent_definition is not None and agent_definition.model
+                        else {}
+                    ),
+                    "workspace_root": workspace,
+                    "safety_tier": worker_safety_tier,
+                    "max_completion_tokens": min(
+                        self._config.max_completion_tokens,
+                        token_budget,
+                    ),
+                    "enable_sprint_planning": False,
+                    "memory_backend": "off",
+                }
+            )
+            if self._config is not None
+            else None
+        )
         sandbox = SandboxManager(
             workspace_root=workspace,
             expected_workspace_identity=workspace_identity,
@@ -2107,12 +2162,19 @@ class SpawnAgentTool(BaseTool):
                 Path(self._shared_state.db_path),
                 workspace=self._shared_state.workspace,
             )
+            nested_provider_factory = self._provider_factory
+            if self._provider_config_backed:
+                assert worker_config is not None
+                from ash.providers.registry import get_provider_registry
+
+                def nested_provider_factory() -> ProviderABC:
+                    return get_provider_registry().build(worker_config)
             nested_spawn = SpawnAgentTool(
                 guard,
                 nested_state,
-                self._provider_factory,
+                nested_provider_factory,
                 max_return_chars=self._max_return_chars,
-                config=self._config,
+                config=worker_config,
                 max_turn_iterations=self._max_turn_iterations,
                 custom_agents=self._custom_agents,
                 provider_config_backed=self._provider_config_backed,
@@ -2143,23 +2205,6 @@ class SpawnAgentTool(BaseTool):
             }
         worker_store = SessionStore(
             Path(self._shared_state.db_path).with_name("agent-sessions.db")
-        )
-        worker_safety_tier = worker_policy.mode.value
-        worker_config = (
-            self._config.model_copy(
-                update={
-                    "workspace_root": workspace,
-                    "safety_tier": worker_safety_tier,
-                    "max_completion_tokens": min(
-                        self._config.max_completion_tokens,
-                        token_budget,
-                    ),
-                    "enable_sprint_planning": False,
-                    "memory_backend": "off",
-                }
-            )
-            if self._config is not None
-            else None
         )
         if execution_role == "orchestrator" and "delegate_agents" in tools:
             delegation_guidance = (
@@ -2203,7 +2248,17 @@ class SpawnAgentTool(BaseTool):
                 attempt_state["side_effect_dispatched"] = True
 
         worker_ui.subscribe(observe_worker_event)
-        provider = self._provider_factory()
+        if (
+            agent_definition is not None
+            and agent_definition.model
+            and self._provider_config_backed
+        ):
+            assert worker_config is not None
+            from ash.providers.registry import get_provider_registry
+
+            provider = get_provider_registry().build(worker_config)
+        else:
+            provider = self._provider_factory()
         try:
             loop = AshLoop(
                 session_store=worker_store,

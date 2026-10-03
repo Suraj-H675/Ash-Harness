@@ -3,9 +3,11 @@
 **Scope:** native Linux and macOS coding harness. Windows users run Ash inside
 WSL2 through the supported Linux runtime path; native Windows is intentionally
 outside the supported/tested host matrix.
-Authentication is limited to API keys, custom OpenAI-compatible endpoints,
-local model runtimes, and optional service-verified OpenAI ChatGPT-plan
-sign-in. MCP OAuth is part of the remote MCP transport boundary.
+Authentication includes API keys, custom OpenAI-compatible endpoints, local
+model runtimes, optional service-verified OpenAI ChatGPT-plan sign-in, Google
+ADC for Vertex AI, the AWS credential chain/SigV4 for Bedrock, and Microsoft
+Entra/managed identity for Azure OpenAI. MCP OAuth is part of the remote MCP
+transport boundary.
 
 This is the authoritative product checklist. Older roadmap files describe
 historical intent and do not prove that a feature works.
@@ -131,23 +133,122 @@ The program is intentionally finite:
    approvals, sessions, debugging, interruption/recovery, updates, and
    troubleshooting. Close material friction even when the underlying backend
    capability already exists.
-7. **P7 — Final adversarial comparator pass — OPEN.** Re-run current
+7. **P7 — Final adversarial comparator pass — CLOSED.** Re-run current
    evidence against the strongest relevant harnesses, including OpenClaw,
    Hermes, Claude Code, Codex CLI, Gemini CLI, OpenCode, Aider, and any newer
    serious comparator. Confirm no material user-value gap was missed or hidden
    by Ash's existing architecture or docs.
-8. **P8 — Whole-product parity decision gate — NOT STARTED.** Every remaining
+8. **P8 — Whole-product parity decision gate — CLOSED.** Every remaining
    material comparator advantage must be classified with evidence as
    matched/exceeded, solved differently to comparable quality, explicitly
    out-of-scope for a defensible product reason, or still open. Only when no
    important unresolved user need remains may Ash claim whole-product
    leading-harness parity. Literal feature identity is never the criterion.
 
-**Active gate: P7 — Final adversarial comparator pass.** P1 through P6 are
-closed at their bounded finish conditions. Do not reopen them for feature-count
-churn; reopen only for concrete evidence that an important supported
-provider/model, agent/workspace, web/computer-interaction, extensibility,
-interface/access, or user-experience need or claim is wrong.
+**Active gate: none — the finite P0-P8 parity program is closed.** Reopen a gate
+only for concrete contradictory evidence, a production regression, or a newly
+established user need that materially weakens Ash inside its documented coding-
+harness mission. Do not reopen the program for feature-count churn.
+
+### P8 whole-product decision gate — closed 2026-10-03
+
+P8 classifies the material differences left after the final adversarial pass.
+Closure does not mean literal feature identity; it means no important user need
+remains both unresolved and inside Ash's defensible product boundary.
+
+- **Matched after P7 — cross-session work retrieval.** Durable session storage
+  now has a transactional schema-v18 FTS5 index with migration backup/rebuild,
+  current-project scoping, user/assistant-only results, bounded redacted
+  excerpts, explicit CLI/session search, and a read-only model tool. Tool/system
+  output and other projects are excluded.
+- **Matched after P7 — local development browser testing.** Browser automation
+  now accepts user-owned exact HTTP(S) localhost/loopback origins, maps matching
+  WebSocket origins, enforces the same rule in request interception and the
+  outbound proxy, and rejects LAN/private or mixed-DNS answers. This solves the
+  local-app workflow without adopting a broad private-network SSRF escape hatch.
+- **Matched after P7 — specialist agent model routing.** Custom agents may select
+  a canonical provider/model route. That worker clears inherited fallbacks,
+  subprocess specifications carry the same resolved child config, nested
+  unconfigured children inherit the orchestrator's resolved model, and opaque
+  injected provider factories fail closed rather than silently ignoring the
+  override.
+- **Solved differently — long-running command interaction.** Ash has bounded
+  foreground execution plus managed background processes with stdin, polling,
+  output streaming/redaction, stopping, sandboxing, and process-tree cleanup.
+  Core PTY emulation is not required for the normal coding workflow; TTY-only
+  programs remain an external-terminal/extension concern unless concrete usage
+  proves otherwise.
+- **Intentional safety boundary — dirty lead worktrees.** Coder/tester auto
+  isolation uses managed Git worktrees and requires a clean lead tree. Ash does
+  not silently downgrade a dirty tree to shared mutation; the user can
+  explicitly choose shared isolation when that trade-off is wanted.
+- **Unsupported by provider policy — Gemini CLI Google-account OAuth reuse.**
+  Google's current Gemini CLI terms/FAQ explicitly state that third-party tools
+  must not piggyback Gemini CLI/Code Assist OAuth and direct third-party coding
+  agents to Vertex AI or Google AI Studio API keys instead. Ash therefore keeps
+  its supported Gemini API-key and Vertex identity routes rather than copying an
+  unauthorized subscription-auth path:
+  https://github.com/google-gemini/gemini-cli/blob/main/docs/resources/tos-privacy.md
+  and https://github.com/google-gemini/gemini-cli/blob/main/docs/resources/faq.md.
+- **Intentional product boundaries — presentation/ecosystem categories.** Native
+  desktop/mobile clients, broad messaging gateways, voice/media, direct remote
+  desktop/browser takeover, multi-user hosted service administration, and a
+  first-party public extension marketplace remain separate product categories.
+  ACP/A2A/HTTP/SDK, user-owned catalogs, and the terminal/browser surfaces cover
+  the coding-harness outcomes Ash has chosen to own.
+- **Verified rather than reopened — context durability.** Repeated deterministic
+  extractive compaction preserves prior durable anchors while newer decisions
+  stay in the protected recent window and are absorbed when they age out. The
+  architecture specification now matches that zero-extra-model-call behavior.
+- **Newer comparator sanity check.** Current Goose evidence adds a native
+  desktop app, recipes, MCP Apps, broad MCP extension breadth, ACP provider use,
+  and general-assistant workflows, but did not expose another unresolved core
+  terminal coding need. Those differences map to already documented interface,
+  ecosystem, and product-scope decisions: https://block.github.io/goose/ and
+  https://github.com/aaif-goose/goose/releases.
+
+P8 is therefore closed: every material difference surfaced by the 2026-10-03
+adversarial pass is implemented, solved differently to comparable coding value,
+explicitly outside Ash's product boundary for a concrete reason, or unsupported
+as a valid third-party integration path. Partial rows elsewhere in this document
+remain evidence qualifications and are not silently promoted by this decision.
+
+### P8 finish flags
+
+- P8_MATERIAL_ADVANTAGES_CLASSIFIED = CLOSED
+- P8_NO_UNRESOLVED_CORE_USER_NEED = CLOSED
+- P8_WHOLE_PRODUCT_DECISION_GATE = CLOSED
+
+### P7 final adversarial comparator pass — closed 2026-10-03
+
+P7 re-audited Ash from both directions: repository truth against public claims,
+and implementation-first user workflows against current OpenClaw, Hermes,
+Claude Code, Codex CLI, Gemini CLI, OpenCode, Aider, and newer Goose evidence.
+Two independent read-only Luna audits were used only as adversarial inputs; all
+decisions were rechecked directly against repository/runtime evidence and, where
+needed, current first-party comparator documentation.
+
+The pass found three material implementation gaps and closed all three: full-
+text project-session retrieval, explicit loopback browser access for local app
+testing, and per-custom-agent model routing. It also found and corrected public
+claim drift around provider authentication breadth, route-vs-model conformance,
+JSON-RPC's HTTP transport, browser help, LSP advisory operations, coding-tool
+wording, and the actual deterministic compaction algorithm.
+
+The remaining candidates were classified rather than copied mechanically: core
+PTY emulation is optional rather than required by the evidenced terminal coding
+workflow; dirty-tree worktree isolation remains intentionally fail-closed;
+Gemini CLI OAuth reuse is explicitly disallowed for third-party tools by Google;
+and desktop/mobile/messaging/voice/multi-user hosted breadth remains outside the
+terminal coding-harness boundary. Current Goose did not add an unclassified core
+need.
+
+### P7 finish flags
+
+- P7_CURRENT_COMPARATOR_PASS = CLOSED
+- P7_REPOSITORY_CLAIMS_AUDIT = CLOSED
+- P7_MATERIAL_GAPS_CLOSED_OR_CLASSIFIED = CLOSED
+- P7_FINAL_ADVERSARIAL_PASS = CLOSED
 
 ### P6 finite closure checklist
 
@@ -1942,7 +2043,7 @@ truthful evidence boundaries, not open mission blockers.
 | Git commit | Verified locally | Explicit commits require a path scope and refuse any pre-existing staged index state before staging; staged additions are secret-scanned and Git hook/stdout/stderr failures are surfaced. Automatic per-turn commits are stricter: candidates come only from successful Ash file mutations, `auto_commit_paths` acts only as an allowlist, paths dirty at turn start are skipped, post-edit SHA-256 ownership is rechecked before and after staging, and real dirty-repo journeys preserve same-file user edits instead of absorbing them. Explicit approved commits remain full-path scoped rather than hunk-owned. |
 | Tests/build/lint diagnostics | Verified locally | `run_command` parses bounded compiler/lint/pytest diagnostics into model-visible path, line, symbol, code, and message fields and aggregates pytest/MyPy/Ruff summary counts |
 | Web fetch/search | Verified locally | Guarded HTTP(S) fetch plus Brave/Tavily live search with credential auto-detection, auto fallback, fixed endpoints, freshness, bounded normalized sources, provider provenance, shared domain filtering, and durable citation objects are wired |
-| Browser automation | Verified locally + live public probe | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets, blocked service workers/password fills, bounded ARIA snapshots and visible-frame refs, structured modern interactions, explicit dialog state, bounded screenshots, screenshot-hash-bound coordinate fallback for visual-only controls, safe workspace uploads and atomic bounded workspace downloads, setup/doctor support, deterministic cleanup, opt-in private Ash-owned persistent profiles, and loopback-only CDP attachment through a separate Ash-owned policy context. Existing-browser auth reuse is explicit and requires user-owned `allowed_web_domains`; only matching cookies/localStorage are copied, unrelated/future credential categories are dropped, and the source browser remains untouched. `/browser inspect` reads only bounded/redacted tab inventory; `/browser status`, `/browser connect`, `/browser disconnect`, and `/browser reset-profile` provide inspectable attach, detach, scope, and revocation controls. Complete real Chromium E2E covers interaction/state/security breadth, and a live public-network navigate/screenshot/click/back journey verifies the guarded external path. Browser-specific remote relays/remote CDP are intentionally out of core: remote deployments run Ash beside the browser and use ACP/SDK/HTTP/A2A according to their approval and trust model |
+| Browser automation | Verified locally + live public probe | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets plus user-owned exact loopback origins for local development apps, blocked service workers/password fills, bounded ARIA snapshots and visible-frame refs, structured modern interactions, explicit dialog state, bounded screenshots, screenshot-hash-bound coordinate fallback for visual-only controls, safe workspace uploads and atomic bounded workspace downloads, setup/doctor support, deterministic cleanup, opt-in private Ash-owned persistent profiles, and loopback-only CDP attachment through a separate Ash-owned policy context. `browser_allowed_local_origins` accepts only exact HTTP(S) localhost/loopback origins and does not authorize LAN/private-network targets. Existing-browser auth reuse is explicit and requires user-owned `allowed_web_domains`; only matching cookies/localStorage are copied, unrelated/future credential categories are dropped, and the source browser remains untouched. `/browser inspect` reads only bounded/redacted tab inventory; `/browser status`, `/browser connect`, `/browser disconnect`, and `/browser reset-profile` provide inspectable attach, detach, scope, and revocation controls. Complete real Chromium E2E covers interaction/state/security breadth, and a live public-network navigate/screenshot/click/back journey verifies the guarded external path. Browser-specific remote relays/remote CDP are intentionally out of core: remote deployments run Ash beside the browser and use ACP/SDK/HTTP/A2A according to their approval and trust model |
 | General desktop computer use | Scope-closed | Not a core Ash capability at this phase. Coding workflows use files/shell/Git/LSP/browser first; command subprocesses do not inherit desktop-session authority by default, and only explicit user-owned environment forwarding can expose it. A future native-GUI provider/plugin requires a concrete engineering workflow plus its own screen/accessibility/input/permission contract rather than piggybacking on shell or browser authority |
 | Ask-user tool | Verified locally | Typed blocking question with bounded options and explicit empty-answer failure |
 | Todo/plan tracking | Verified locally | Persisted sprint checklists are inspectable and updatable from the top-level CLI; active plan state is injected into every runtime model request with bounded context accounting |

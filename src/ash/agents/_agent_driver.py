@@ -84,9 +84,12 @@ def _custom_agents_from_spec(raw: Any) -> dict[str, Any]:
     instructions = _required_text(raw, "instructions")
     path = _required_text(raw, "path")
     base_role = _required_text(raw, "base_role")
+    model = raw.get("model", "")
     allowed_tools = raw.get("allowed_tools", [])
     if not isinstance(description, str):
         raise ValueError("subagent custom agent description must be text")
+    if not isinstance(model, str):
+        raise ValueError("subagent custom agent model must be text")
     if not isinstance(allowed_tools, list) or not all(
         isinstance(item, str) and item for item in allowed_tools
     ):
@@ -97,6 +100,7 @@ def _custom_agents_from_spec(raw: Any) -> dict[str, Any]:
         instructions=instructions,
         path=Path(path),
         base_role=base_role,
+        model=model,
         allowed_tools=tuple(allowed_tools),
     )
     return {name: definition}

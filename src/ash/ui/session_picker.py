@@ -159,6 +159,7 @@ class SessionPicker:
                 session.title,
                 session.model,
                 session.project_path,
+                session.context_summary,
             )
         ).casefold()
 

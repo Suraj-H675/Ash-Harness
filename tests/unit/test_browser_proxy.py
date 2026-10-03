@@ -126,6 +126,102 @@ async def test_browser_proxy_rejects_mixed_public_and_non_global_dns_results() -
 
 
 @pytest.mark.asyncio
+async def test_browser_proxy_allows_exact_loopback_origin_only() -> None:
+    requests: list[bytes] = []
+
+    async def origin_handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            requests.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 2\r\n"
+                b"Connection: close\r\n\r\n"
+                b"ok"
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    origin = await asyncio.start_server(origin_handler, "127.0.0.1", 0)
+    origin_port = _port(origin)
+
+    def resolve_local(hostname: str) -> tuple[str, ...]:
+        assert hostname == "localhost"
+        return ("127.0.0.1",)
+
+    proxy = BrowserPolicyProxy(
+        (),
+        allowed_local_origins=(f"http://localhost:{origin_port}",),
+        timeout_seconds=1,
+        local_resolver=resolve_local,
+    )
+    await proxy.start()
+    try:
+        allowed = await _proxy_request(
+            proxy,
+            (
+                f"GET http://localhost:{origin_port}/app HTTP/1.1\r\n"
+                f"Host: localhost:{origin_port}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii"),
+        )
+        blocked = await _proxy_request(
+            proxy,
+            (
+                f"GET http://localhost:{origin_port + 1}/app HTTP/1.1\r\n"
+                f"Host: localhost:{origin_port + 1}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii"),
+        )
+    finally:
+        await proxy.close()
+        origin.close()
+        await origin.wait_closed()
+
+    assert b"200 OK" in allowed
+    assert b"403 Forbidden" in blocked
+    assert requests
+
+
+@pytest.mark.asyncio
+async def test_browser_proxy_rejects_non_loopback_answer_for_allowed_local_origin() -> None:
+    connector_called = False
+
+    def resolve_local(_hostname: str) -> tuple[str, ...]:
+        return ("127.0.0.1", "10.0.0.8")
+
+    async def connect(_address: str, _port: int):
+        nonlocal connector_called
+        connector_called = True
+        raise AssertionError("mixed local DNS result must be rejected before connect")
+
+    proxy = BrowserPolicyProxy(
+        (),
+        allowed_local_origins=("http://localhost:3000",),
+        timeout_seconds=1,
+        local_resolver=resolve_local,
+        connector=connect,
+    )
+    await proxy.start()
+    try:
+        response = await _proxy_request(
+            proxy,
+            b"GET http://localhost:3000/app HTTP/1.1\r\n"
+            b"Host: localhost:3000\r\n"
+            b"\r\n",
+        )
+    finally:
+        await proxy.close()
+
+    assert b"403 Forbidden" in response
+    assert connector_called is False
+
+
+@pytest.mark.asyncio
 async def test_browser_proxy_tunnels_connect_without_tls_termination() -> None:
     received = asyncio.Event()
 

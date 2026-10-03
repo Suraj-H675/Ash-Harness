@@ -7,6 +7,7 @@ import pytest
 
 from ash.agents.shared_state import SharedState
 from ash.cli import _build_tools
+from ash.config import AshConfig
 from ash.plugins.agents import (
     AgentCatalog,
     AgentDefinition,
@@ -39,6 +40,29 @@ def test_agent_catalog_namespaces_declared_plugin_agents(tmp_path: Path) -> None
     assert [definition.name for definition in definitions] == ["example:reviewer"]
     assert definitions[0].base_role == "reviewer"
     assert definitions[0].allowed_tools == ("read_file", "search_text")
+
+
+def test_agent_definition_normalizes_optional_model(tmp_path: Path) -> None:
+    path = tmp_path / "reviewer.md"
+    path.write_text(
+        "---\nmodel: OpenAI/gpt-5-mini\n---\nReview the task.\n",
+        encoding="utf-8",
+    )
+
+    definition = parse_agent_definition(path)
+
+    assert definition.model == "openai/gpt-5-mini"
+
+
+def test_agent_definition_rejects_invalid_model(tmp_path: Path) -> None:
+    path = tmp_path / "reviewer.md"
+    path.write_text(
+        "---\nmodel: missing-provider-prefix\n---\nReview the task.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="provider/model"):
+        parse_agent_definition(path)
 
 
 def test_agent_catalog_isolates_invalid_definitions(tmp_path: Path) -> None:
@@ -183,6 +207,153 @@ async def test_spawn_agent_runs_custom_definition_with_restricted_tools(
     report = state.fetch_messages("lead", undelivered_only=False)[-1]
     assert report.content["role"] == definition.name
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_custom_agent_model_override_rejects_opaque_provider_factory(
+    tmp_path: Path,
+) -> None:
+    definition = AgentDefinition(
+        name="specialist",
+        description="Specialist",
+        instructions="Inspect the task.",
+        path=tmp_path / "specialist.md",
+        base_role="reviewer",
+        model="openai/child-model",
+        allowed_tools=("read_file",),
+    )
+    state = SharedState(tmp_path / "state" / "agents.db")
+    provider_calls = 0
+
+    def provider_factory() -> ProviderABC:
+        nonlocal provider_calls
+        provider_calls += 1
+        return CustomAgentProvider()
+
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        provider_factory,
+        config=AshConfig(model="openai/parent-model", workspace_root=tmp_path),
+        custom_agents={definition.name: definition},
+        provider_config_backed=False,
+    )
+
+    result = await tool.run(role=definition.name, task="inspect changes")
+
+    assert result.success is False
+    assert "opaque provider factory" in (result.error or "")
+    assert provider_calls == 0
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_custom_agent_model_override_builds_config_backed_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = AgentDefinition(
+        name="specialist",
+        description="Specialist",
+        instructions="Inspect the task.",
+        path=tmp_path / "specialist.md",
+        base_role="reviewer",
+        model="openai/child-model",
+        allowed_tools=("read_file",),
+    )
+    state = SharedState(tmp_path / "state" / "agents.db")
+    observed: list[tuple[str, tuple[str, ...]]] = []
+
+    class ModelOverrideProvider(ProviderABC):
+        model_name = "child-model"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature
+            assert tools is not None
+            assert {tool["function"]["name"] for tool in tools} == {"read_file"}
+            yield StreamChunk(content="model override complete", is_done=True)
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+    class Registry:
+        def build(self, config: AshConfig) -> ProviderABC:
+            observed.append((config.model, tuple(config.fallback_models)))
+            return ModelOverrideProvider()
+
+    monkeypatch.setattr(
+        "ash.providers.registry.get_provider_registry",
+        lambda: Registry(),
+    )
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        lambda: (_ for _ in ()).throw(
+            AssertionError("parent provider factory should not be used")
+        ),
+        config=AshConfig(
+            model="openai/parent-model",
+            fallback_models=["anthropic/fallback-model"],
+            workspace_root=tmp_path,
+        ),
+        custom_agents={definition.name: definition},
+        provider_config_backed=True,
+    )
+
+    result = await tool.run(role=definition.name, task="inspect changes")
+
+    assert result.success is True
+    assert observed == [("openai/child-model", ())]
+    await tool.aclose()
+
+
+def test_custom_agent_model_override_is_serialized_for_subprocess_worker(
+    tmp_path: Path,
+) -> None:
+    definition = AgentDefinition(
+        name="specialist",
+        description="Specialist",
+        instructions="Inspect the task.",
+        path=tmp_path / "specialist.md",
+        base_role="reviewer",
+        model="openai/child-model",
+    )
+    state = SharedState(tmp_path / "state" / "agents.db")
+    tool = SpawnAgentTool(
+        SafetyGuard(tmp_path),
+        state,
+        CustomAgentProvider,
+        config=AshConfig(
+            model="openai/parent-model",
+            fallback_models=["anthropic/fallback-model"],
+            workspace_root=tmp_path,
+            agent_execution_mode="subprocess",
+        ),
+        custom_agents={definition.name: definition},
+        provider_config_backed=True,
+    )
+    task = state.tasks.create_task(
+        "inspect changes",
+        role=definition.name,
+        task_id="agent-task-model-override",
+        token_budget=1000,
+        time_budget_seconds=30,
+        metadata={"agent_id": "specialist-1", "spawn_depth": 1},
+    )
+
+    payload = json.loads(
+        tool._subprocess_spec(
+            durable_task=task,
+            policy=tool._worker_permission_policy(),
+            agent_definition=definition,
+            require_dispatchable=False,
+        )
+    )
+
+    assert payload["config"]["model"] == "openai/child-model"
+    assert payload["config"]["fallback_models"] == []
+    assert payload["custom_agent"]["model"] == "openai/child-model"
 
 
 @pytest.mark.asyncio

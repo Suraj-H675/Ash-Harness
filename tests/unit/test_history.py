@@ -283,6 +283,99 @@ def test_compaction_preserves_task_paths_actions_and_prior_summary_ends() -> Non
     assert "Assistant outcome: I will keep the public API stable" in result.summary
 
 
+def test_repeated_compaction_preserves_prior_goal_and_newer_decisions() -> None:
+    compactor = HistoryCompactor(
+        max_context_tokens=10_000,
+        completion_reserve=100,
+        recent_messages=2,
+        summary_char_limit=2400,
+    )
+    first = compactor.compact(
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "ORIGINAL GOAL: keep API compatibility"},
+            {
+                "role": "assistant",
+                "content": "FIRST DECISION: preserve the public adapter",
+            },
+            {"role": "user", "content": "current request"},
+        ],
+        count_tokens=count_words,
+        force=True,
+    )
+
+    second = compactor.compact(
+        [
+            {"role": "system", "content": "system"},
+            {
+                "role": "assistant",
+                "content": "FIRST DECISION: preserve the public adapter",
+            },
+            {"role": "user", "content": "current request"},
+            {
+                "role": "user",
+                "content": "NEW BLOCKER: migration must tolerate legacy rows",
+            },
+            {
+                "role": "assistant",
+                "content": "LATEST DECISION: migrate transactionally with backup",
+                "tool_calls": [
+                    {
+                        "call_id": "migration-check",
+                        "name": "read_file",
+                        "arguments": {"file_path": "src/ash/core/session.py"},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "checked", "tool_call_id": "migration-check"},
+            {"role": "user", "content": "next request"},
+        ],
+        count_tokens=count_words,
+        previous_summary=first.summary,
+        force=True,
+    )
+
+    assert "ORIGINAL GOAL: keep API compatibility" in second.summary
+    assert "FIRST DECISION: preserve the public adapter" in second.summary
+    assert "NEW BLOCKER: migration must tolerate legacy rows" in second.summary
+    assert any(
+        "LATEST DECISION: migrate transactionally with backup"
+        in str(message.get("content", ""))
+        for message in second.messages
+    )
+
+    third = compactor.compact(
+        [
+            {"role": "system", "content": "system"},
+            {
+                "role": "assistant",
+                "content": "LATEST DECISION: migrate transactionally with backup",
+                "tool_calls": [
+                    {
+                        "call_id": "migration-check",
+                        "name": "read_file",
+                        "arguments": {"file_path": "src/ash/core/session.py"},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "checked", "tool_call_id": "migration-check"},
+            {"role": "user", "content": "next request"},
+            {"role": "assistant", "content": "migration verification passed"},
+            {"role": "user", "content": "final request"},
+        ],
+        count_tokens=count_words,
+        previous_summary=second.summary,
+        force=True,
+    )
+
+    assert "ORIGINAL GOAL: keep API compatibility" in third.summary
+    assert "FIRST DECISION: preserve the public adapter" in third.summary
+    assert "NEW BLOCKER: migration must tolerate legacy rows" in third.summary
+    assert "LATEST DECISION: migrate transactionally with backup" in third.summary
+    assert "Referenced path: src/ash/core/session.py" in third.summary
+    assert "Tool action: read_file" in third.summary
+
+
 def test_windowed_history_keeps_previous_summary_visible_below_compaction_limit() -> None:
     previous = "Earlier durable context"
     messages = [

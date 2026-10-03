@@ -23,7 +23,7 @@ def test_unknown_command_has_helpful_error() -> None:
 
 def test_help_lists_core_session_commands() -> None:
     rendered = render_help()
-    assert "/sessions [query]" in rendered
+    assert "/sessions [search QUERY|prune DAYS]" in rendered
     assert "/rewind <message-count> [--files]" in rendered
     assert "/resume [session]" in rendered
     assert "/status" in rendered
@@ -77,5 +77,8 @@ def test_help_lists_mcp_authorization_actions() -> None:
 def test_help_lists_browser_runtime_actions() -> None:
     rendered = render_help("browser")
 
-    assert "/browser [status|connect [URL] [--reuse-storage-state]|disconnect]" in rendered
+    assert (
+        "/browser [status|inspect [URL]|connect [URL] [--reuse-storage-state]|"
+        "disconnect|reset-profile]" in rendered
+    )
     assert "Attach or return browser tools at runtime" in rendered

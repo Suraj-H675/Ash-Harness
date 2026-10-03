@@ -272,7 +272,11 @@ def render_extension_inventory(
     if kind in {"all", "agents"}:
         lines.append("Agents:")
         lines.extend(
-            f"  {agent.name} [{agent.base_role}]: {agent.description} ({agent.path})"
+            f"  {safe_plugin_diagnostic(agent.name)} "
+            f"[{safe_plugin_diagnostic(agent.base_role)}"
+            f"{'; model=' + safe_plugin_diagnostic(agent.model) if agent.model else ''}]"
+            f": {safe_plugin_diagnostic(agent.description)} "
+            f"({safe_plugin_diagnostic(agent.path)})"
             for agent in inventory.agents
         )
         if not inventory.agents:

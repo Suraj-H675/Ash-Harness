@@ -136,6 +136,11 @@ Supported built-in routes include:
 | vLLM | Self-hosted OpenAI-compatible model server |
 | Custom routes | User-defined OpenAI-compatible providers with explicit auth mode |
 
+This table describes implemented route families, not blanket conformance for
+every model/version exposed by each catalog. `ash providers test` verifies one
+selected route with a bounded real completion; richer tool, vision, reasoning,
+and provider-version behavior remains capability- and model-specific.
+
 The provider layer also provides:
 
 - model strings in `provider/model` form;
@@ -255,7 +260,7 @@ as evidence and cannot override user instructions or runtime policy.
 
 ### Coding workspace tools
 
-Ash includes a complete coding-tool surface:
+Ash includes a broad coding-tool surface:
 
 | Area | Capabilities |
 | --- | --- |
@@ -263,7 +268,7 @@ Ash includes a complete coding-tool surface:
 | Text and structure | Directory listing, bounded globbing, descriptor-scoped bounded text/regex search, symbol lookup, and reference lookup |
 | Code intelligence | Incremental Tree-sitter repository maps for Python, JavaScript/JSX, TypeScript/TSX, Go, Rust, Java, C, C++, and C# |
 | Git | Status, bounded diffs, log inspection, explicit-scope commits, secret scanning, Git-hook error reporting, and worktree-aware review |
-| Processes | Foreground commands, managed background jobs, live bounded stdout/stderr, stdin, polling, stopping, and cleanup |
+| Processes | Foreground commands, managed background jobs, live bounded stdout/stderr, stdin, polling, stopping, and cleanup; TTY-only programs may still require an external terminal or extension |
 | Interaction | Typed ask-user questions, persisted plans, and model-visible compiler, linter, test, MyPy, and Ruff diagnostics |
 
 File operations are workspace-scoped and protect against symlinks, junctions,
@@ -311,7 +316,7 @@ digests rather than base64 payloads.
 Every project can have durable, inspectable conversation state backed by
 versioned SQLite storage. Ash supports:
 
-- new, continue, resume, list, search, rename, and project-scoped session
+- new, continue, resume, list, full-text transcript search, rename, and project-scoped session
   picking;
 - exact session IDs and human-readable session names;
 - parent/root lineage, forks, conversation trees, and branch summaries;
@@ -455,6 +460,9 @@ provides:
 - bounded atomic workspace downloads with no-overwrite-by-default behavior;
 - public-host and allowed-domain policy for navigation, subresources, and
   WebSockets;
+- explicit browser_allowed_local_origins entries for developer-owned loopback
+  web apps such as http://localhost:3000, without allowing LAN/private-network
+  targets;
 - disabled service workers and blocked password-field filling;
 - ephemeral contexts by default;
 - optional Ash-owned persistent browser profiles; and
@@ -636,8 +644,8 @@ Ash exposes or consumes the following integration surfaces:
 | ACP v1 | Stdio editor/agent host integration with new/load/list/close plus durable fork/resume session lifecycle, prompts, cancellation, tool progress, usage, text, bounded inline images, resource links, and stdio/HTTP/SSE MCP support |
 | A2A 1.0 | Public discovery Agent Card plus authenticated JSON-RPC/HTTP+JSON task routes, bounded concurrent task execution, task polling, streaming, cancellation, context continuation, inspection, and outbound delegation |
 | HTTP API | Authenticated bounded-concurrency turns, live SSE events, steering, live approval decisions, durable session controls, and a responsive first-party browser/remote-terminal control surface |
-| JSON-RPC | Structured runtime and session integration for external hosts |
-| LSP 3.18 | Managed lazy language servers for diagnostics, hover, definitions, references, implementations, symbols, and call hierarchy |
+| JSON-RPC over HTTP | Structured runtime and session integration for external hosts through the authenticated /rpc endpoint |
+| LSP 3.18 | Managed lazy language servers for diagnostics, hover, definitions, references, implementations, symbols, advisory rename/code actions, formatting, and call hierarchy |
 | Python SDK | Async client access to turns, durable Goals, sessions, steering, events, usage, automation, and agent delegation |
 
 ### Remote control
@@ -659,9 +667,10 @@ Managed LSP detects host-installed basedpyright/pyright,
 typescript-language-server, gopls, rust-analyzer, clangd, and
 lua-language-server processes. Trusted project configuration can explicitly
 select a workspace-local server, but project executables are not implicitly
-auto-detected. It never downloads a server, rejects
-out-of-workspace semantic results, and does not expose rename or code-action
-operations yet.
+auto-detected. It never downloads a server, rejects out-of-workspace semantic
+results, and returns rename/code-action/formatting edits or commands only as
+advisory data; Ash does not execute those LSP-proposed edits or commands
+directly.
 
 ### Durable automation
 
@@ -733,12 +742,14 @@ they are complete:
   until their full behavior is implemented;
 - A2A push notifications, file/data modalities, extended cards, gRPC, and
   signed-card trust policy are not currently advertised;
-- LSP rename and code actions are not exposed; and
+- LSP rename/code-action/formatting results are advisory only and are not
+  executed directly; and
 - a broad messaging-channel gateway is not currently part of Ash.
 
-Ash has a real immutable production distribution, but the final whole-product
-mission gate remains open while the finite parity program is working through
-user-experience and later adversarial whole-product closure gates.
+Ash has a real immutable production distribution, and the finite P0-P8 parity
+program is closed at the documented product and evidence boundaries. This does
+not claim literal feature identity with desktop/mobile/gateway products or turn
+qualified provider/protocol rows into broader support claims.
 Production observability is available as an explicit opt-in OpenTelemetry/OTLP
 trace-and-metrics path; qualified boundaries above remain truthful support
 limits rather than claims of feature identity with every comparator.

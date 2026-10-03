@@ -30,7 +30,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "/models [--refresh]",
     ),
     SlashCommand("new", "Start a new session", "/new", aliases=("clear",)),
-    SlashCommand("sessions", "List or search recent sessions", "/sessions [query]"),
+    SlashCommand(
+        "sessions",
+        "List sessions or search prior conversation text",
+        "/sessions [search QUERY|prune DAYS]",
+    ),
     SlashCommand("resume", "Resume a session by ID or name", "/resume [session]"),
     SlashCommand("rename", "Rename the current session", "/rename <title>"),
     SlashCommand(
@@ -106,7 +110,7 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand(
         "browser",
         "Attach or return browser tools at runtime",
-        "/browser [status|connect [URL] [--reuse-storage-state]|disconnect]",
+        "/browser [status|inspect [URL]|connect [URL] [--reuse-storage-state]|disconnect|reset-profile]",
     ),
     SlashCommand("doctor", "Run local diagnostics", "/doctor"),
     SlashCommand(

@@ -37,6 +37,7 @@ class AgentSummary:
     name: str
     description: str
     base_role: str
+    model: str
     path: str
 
 
@@ -256,6 +257,7 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
                 name=agent.name,
                 description=agent.description,
                 base_role=agent.base_role,
+                model=agent.model,
                 path=str(agent.path),
             )
             for agent in sorted(discovered_agents, key=lambda item: item.name)

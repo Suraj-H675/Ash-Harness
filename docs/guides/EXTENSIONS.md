@@ -115,13 +115,16 @@ Custom agents are Markdown instruction files:
 ---
 description: Review correctness and tests
 base-role: reviewer
+model: openai/gpt-5-mini
 tools: read_file, search_text
 ---
 Review the requested work and report concrete defects with evidence.
 ```
 
 Plugin agents are namespaced by plugin name. Standalone user agents live under
-`~/.ash/agents/`; trusted project agents live under `.ash/agents/`.
+`~/.ash/agents/`; trusted project agents live under `.ash/agents/`. The optional
+`model` field selects that worker's `provider/model` route and clears the
+parent's fallback chain, so a specialist's cost/quality choice is explicit.
 
 ### Hooks
 

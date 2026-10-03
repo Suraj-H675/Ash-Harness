@@ -41,6 +41,7 @@ READ_ONLY_TOOLS = frozenset(
         "list_skills",
         "activate_skill",
         "search_tools",
+        "search_sessions",
         "list_remote_agents",
         "list_remote_agent_tasks",
         "recover_remote_agent_task",

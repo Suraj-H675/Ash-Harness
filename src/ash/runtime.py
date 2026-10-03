@@ -101,6 +101,7 @@ def build_tools(
     safety_guard: SafetyGuard,
     project_root: Path | None = None,
     *,
+    session_store: SessionStore | None = None,
     sandbox_manager: Any | None = None,
     allow_project_extensions: bool = False,
     provider_factory: Any | None = None,
@@ -147,6 +148,7 @@ def build_tools(
     from ash.tools.patch import ApplyPatchTool
     from ash.tools.process import BackgroundProcessTool
     from ash.tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
+    from ash.tools.sessions import SearchSessionsTool
     from ash.tools.symbols import FindReferencesTool, FindSymbolTool
     from ash.tools.tool_search import SearchToolsTool
     from ash.tools.web import WebFetchTool
@@ -226,6 +228,8 @@ def build_tools(
         ActivateSkillTool(safety_guard, catalog),
         ReadSkillResourceTool(safety_guard, catalog),
     ]
+    if session_store is not None:
+        tools.append(SearchSessionsTool(safety_guard, session_store, root))
     if runtime_config is not None and runtime_config.automation_enabled:
         automation_store_path = runtime_config.db_directory / "automation.db"
         tools.extend(
@@ -244,6 +248,11 @@ def build_tools(
                 runtime_config.browser_timeout_seconds if runtime_config else 30.0
             ),
             allowed_domains=effective_allowed_web_domains,
+            allowed_local_origins=(
+                runtime_config.browser_allowed_local_origins
+                if runtime_config is not None
+                else ()
+            ),
             profile_path=(
                 runtime_config.db_directory / "browser-profile"
                 if runtime_config is not None
@@ -620,6 +629,7 @@ def build_runtime(
     tools = build_tools(
         guard,
         config.workspace_root,
+        session_store=store,
         sandbox_manager=sandbox,
         allow_project_extensions=trusted,
         provider_factory=(

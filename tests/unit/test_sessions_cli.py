@@ -167,6 +167,83 @@ def test_sessions_cli_filters_query_and_all_projects(
     ]
 
 
+def test_sessions_cli_searches_current_project_transcript_content(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    project = tmp_path / "project"
+    other = tmp_path / "other"
+    project.mkdir()
+    other.mkdir()
+    store = SessionStore(db_dir / "sessions.db")
+    current = store.create_session(str(project))
+    external = store.create_session(str(other))
+    timestamp = datetime.now(timezone.utc)
+    store.save_message(
+        current.session_id,
+        Message(
+            role="user",
+            content="diagnose websocket reconnect regression",
+            timestamp=timestamp,
+        ),
+    )
+    store.save_message(
+        external.session_id,
+        Message(
+            role="user",
+            content="websocket reconnect from another project",
+            timestamp=timestamp,
+        ),
+    )
+    monkeypatch.chdir(project)
+
+    status = main(
+        [
+            "--db-directory",
+            str(db_dir),
+            "sessions",
+            "search",
+            "--query",
+            "websocket reconnect",
+            "--json",
+        ]
+    )
+
+    assert status == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["session_id"] for item in payload["matches"]] == [
+        current.session_id
+    ]
+
+
+def test_sessions_cli_search_rejects_cross_project_scope(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    SessionStore(db_dir / "sessions.db")
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        main(
+            [
+                "--db-directory",
+                str(db_dir),
+                "sessions",
+                "search",
+                "--query",
+                "needle",
+                "--all-projects",
+            ]
+        )
+        == 2
+    )
+    assert "scoped to the current project" in capsys.readouterr().err
+
+
 def test_sessions_cli_renders_branch_tree_by_title(
     tmp_path: Path,
     monkeypatch,

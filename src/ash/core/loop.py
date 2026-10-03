@@ -2378,6 +2378,7 @@ class AshLoop:
                 headless=config.browser_headless,
                 timeout_seconds=config.browser_timeout_seconds,
                 allowed_domains=config.allowed_web_domains,
+                allowed_local_origins=config.browser_allowed_local_origins,
                 profile_path=profile_path,
                 cdp_url=cdp_url,
                 cdp_reuse_storage_state=reuse_storage_state,

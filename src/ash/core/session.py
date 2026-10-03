@@ -57,7 +57,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 17
+CURRENT_SCHEMA_VERSION = 18
 SQLITE_INTEGER_MAX = 2**63 - 1
 SQLITE_REAL_MAX = sys.float_info.max
 MAX_SESSION_IMPORT_BYTES = 64 * 1024 * 1024
@@ -70,6 +70,10 @@ MAX_RECENT_SESSION_CONTEXT_SESSIONS = 20
 MAX_RECENT_SESSION_CONTEXT_MESSAGES = 32
 MAX_RECENT_SESSION_CONTEXT_CHARS = 2000
 MAX_SESSION_LIST_LIMIT = 1000
+MAX_SESSION_SEARCH_LIMIT = 100
+MAX_SESSION_SEARCH_QUERY_CHARS = 500
+MAX_SESSION_SEARCH_TERMS = 20
+MAX_SESSION_SEARCH_EXCERPT_CHARS = 1200
 MAX_SESSION_TREE_NODES = 4096
 MAX_AUDIT_VERIFICATION_ERRORS = 1000
 MAX_RECOVERY_TOOL_OUTPUT_PREVIEW_BYTES = 2 * 1024 * 1024
@@ -610,6 +614,15 @@ class SessionSummary(BaseModel):
     branch_name: str = ""
     depth: int = 0
     context_summary: str = ""
+
+
+class SessionSearchHit(BaseModel):
+    session_id: str
+    title: str = ""
+    message_id: int
+    role: Literal["user", "assistant"]
+    timestamp: datetime
+    excerpt: str
 
 
 class SessionLineage(BaseModel):
@@ -1206,6 +1219,8 @@ class SessionStore:
                 self._migrate_v16(conn)
             if from_version < 17:
                 self._migrate_v17(conn)
+            if from_version < 18:
+                self._migrate_v18(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -1698,6 +1713,46 @@ class SessionStore:
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
             "VALUES (?, ?)",
             (17, _serialize_datetime(_utc_now())),
+        )
+
+    def _migrate_v18(self, conn: sqlite3.Connection) -> None:
+        """Add a maintained full-text index for durable session messages."""
+
+        conn.executescript(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content,
+                content='messages',
+                content_rowid='message_id',
+                tokenize='unicode61'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_insert
+            AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content)
+                VALUES (new.message_id, new.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_delete
+            AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content)
+                VALUES ('delete', old.message_id, old.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_update
+            AFTER UPDATE OF content ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content)
+                VALUES ('delete', old.message_id, old.content);
+                INSERT INTO messages_fts(rowid, content)
+                VALUES (new.message_id, new.content);
+            END;
+            """
+        )
+        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (18, _serialize_datetime(_utc_now())),
         )
 
     def backup(
@@ -2374,6 +2429,72 @@ class SessionStore:
                     branch_name=row["branch_name"] or "",
                     depth=int(row["depth"] or 0),
                     context_summary=row["context_summary"] or "",
+                )
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
+
+    def search_session_messages(
+        self,
+        *,
+        project_path: str | Path,
+        query: str,
+        limit: int = 20,
+    ) -> list[SessionSearchHit]:
+        """Search user/assistant text in durable sessions for one project."""
+
+        normalized = " ".join(query.split())
+        if not normalized:
+            raise ValueError("session search query cannot be blank")
+        if len(normalized) > MAX_SESSION_SEARCH_QUERY_CHARS:
+            raise ValueError(
+                "session search query exceeds "
+                f"{MAX_SESSION_SEARCH_QUERY_CHARS} characters"
+            )
+        if not 1 <= limit <= MAX_SESSION_SEARCH_LIMIT:
+            raise ValueError(
+                f"session search limit must be between 1 and {MAX_SESSION_SEARCH_LIMIT}"
+            )
+        terms = normalized.split()
+        if len(terms) > MAX_SESSION_SEARCH_TERMS:
+            raise ValueError(
+                "session search query exceeds "
+                f"{MAX_SESSION_SEARCH_TERMS} terms"
+            )
+        match_query = " AND ".join(
+            '"' + term.replace('"', '""') + '"' for term in terms
+        )
+        project_key = normalize_project_path(project_path)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT m.message_id, m.session_id, s.title, m.role, m.timestamp,
+                       snippet(messages_fts, 0, '', '', ' … ', 24) AS excerpt
+                FROM messages_fts
+                JOIN messages m ON m.message_id = messages_fts.rowid
+                JOIN sessions s ON s.session_id = m.session_id
+                WHERE messages_fts MATCH ?
+                  AND s.project_key = ?
+                  AND m.role IN ('user', 'assistant')
+                ORDER BY bm25(messages_fts), m.timestamp DESC, m.message_id DESC
+                LIMIT ?
+                """,
+                (match_query, project_key, limit),
+            ).fetchall()
+        from ash.core.redaction import redact_text
+
+        try:
+            return [
+                SessionSearchHit(
+                    session_id=str(row["session_id"]),
+                    title=str(row["title"] or ""),
+                    message_id=int(row["message_id"]),
+                    role=row["role"],
+                    timestamp=_deserialize_datetime(str(row["timestamp"])),
+                    excerpt=redact_text(str(row["excerpt"] or ""))[
+                        :MAX_SESSION_SEARCH_EXCERPT_CHARS
+                    ],
                 )
                 for row in rows
             ]
