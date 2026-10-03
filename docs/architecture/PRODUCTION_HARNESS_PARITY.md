@@ -1057,7 +1057,7 @@ assistant surface exposed by gateway products.
 - `P3B_BROWSER_INTERACTION = CLOSED`
 - `P3C_SIGNED_IN_BROWSER = CLOSED`
 - `P3D_REMOTE_BROWSER_OPERATION = CLOSED`
-- `P3E_DESKTOP_COMPUTER_USE = OPEN`
+- `P3E_DESKTOP_COMPUTER_USE = CLOSED`
 - `P3F_INTERACTION_CONFORMANCE = OPEN`
 - `P3_WEB_COMPUTER_PARITY = OPEN` until P3A-P3F are all closed.
 
@@ -1300,6 +1300,65 @@ Comparator references rechecked on 2026-10-03:
 `https://docs.openclaw.ai/gateway/security/browser-control`,
 `https://hermes-agent.nousresearch.com/docs/user-guide/features/browser/`, and
 `https://developers.openai.com/api/docs/guides/tools-computer-use`.
+
+### P3E closure — general desktop control stays out of Ash core
+
+P3E is CLOSED by an explicit coding-harness scope/security decision. Ash does
+not add a first-class general desktop `computer` tool to core at this phase.
+The concrete coding workflows that justify first-party interaction are already
+covered by stronger, more inspectable primitives: workspace files and patches,
+shell/process execution, Git, LSP, browser automation, screenshots for browser
+state, and remote Ash runtimes. Native GUI-only automation remains a possible
+future plugin/provider capability when a specific engineering workflow proves
+that those primitives are insufficient; it is not accepted merely for generic
+assistant feature parity.
+
+Current comparator behavior supports that distinction rather than contradicting
+it. OpenClaw now has substantial desktop Computer Use, including screenshots,
+pointer/keyboard actions, accessibility-aware window/element operations, paired
+machines, and managed desktops. However its documented **coding** tool profile
+excludes `computer` unless the operator explicitly adds it. OpenClaw's Linux
+computer-control path also remains experimental in its current release.
+Hermes similarly provides a cross-platform `computer_use` driver, but its own
+guidance says to reserve that surface for native applications, browser chrome,
+permission prompts, and other non-DOM UI; for web-only tasks it recommends the
+separate browser toolset because it avoids desktop/accessibility/input-driver
+overhead. OpenAI's current computer-use guidance requires the application to
+provide and secure the desktop/browser environment, explicitly allows existing
+function/MCP UI tools to remain in place, and recommends isolated environments,
+allowlists, consequential-action confirmation, bounded execution, and result
+verification.
+
+Those requirements would make a production desktop subsystem materially larger
+than “add click/type”: Ash would need supported display/session discovery,
+screen capture, accessibility trees, coordinate/frame freshness, input
+injection, application/window identity, cancellation, user takeover, sensitive
+input rules, OS permission/readiness diagnostics, headed/headless ownership,
+and consistent Linux/macOS behavior. Introducing that trust surface without a
+specific coding workflow would conflict with Ash's minimal-complexity and
+least-authority goals.
+
+Ash also fails closed against accidental shell-based desktop authority. The
+default command environment does not forward `DISPLAY`, `WAYLAND_DISPLAY`,
+`XAUTHORITY`, or `DBUS_SESSION_BUS_ADDRESS`; foreground and managed
+background commands share that scrubbed environment path. A user can
+deliberately forward such variables through the existing user-owned
+`command_env_allowlist`, but project configuration cannot enable that field.
+That remains an explicit shell escape hatch under the normal command
+permission/sandbox model, not an Ash-managed desktop-control capability.
+
+P3E closure evidence: 25/25 targeted command/background-process/config tests
+pass, including a new real-subprocess regression proving desktop-session
+authority is absent by default and appears only after explicit environment
+opt-in, plus the project-config ownership check proving repositories cannot set
+`command_env_allowlist`. Ruff and `git diff --check` are clean.
+
+Comparator references rechecked on 2026-10-03:
+`https://docs.openclaw.ai/nodes/computer-use`,
+`https://docs.openclaw.ai/releases/2026.8.1/browser-and-computer-use`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/features/computer-use`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-computer-use`,
+and `https://developers.openai.com/api/docs/guides/tools-computer-use`.
 
 ### M4 product decisions
 
@@ -1568,7 +1627,8 @@ truthful evidence boundaries, not open mission blockers.
 | Git commit | Verified locally | Explicit commits require a path scope and refuse any pre-existing staged index state before staging; staged additions are secret-scanned and Git hook/stdout/stderr failures are surfaced. Automatic per-turn commits are stricter: candidates come only from successful Ash file mutations, `auto_commit_paths` acts only as an allowlist, paths dirty at turn start are skipped, post-edit SHA-256 ownership is rechecked before and after staging, and real dirty-repo journeys preserve same-file user edits instead of absorbing them. Explicit approved commits remain full-path scoped rather than hunk-owned. |
 | Tests/build/lint diagnostics | Verified locally | `run_command` parses bounded compiler/lint/pytest diagnostics into model-visible path, line, symbol, code, and message fields and aggregates pytest/MyPy/Ruff summary counts |
 | Web fetch/search | Verified locally | Guarded HTTP(S) fetch plus Brave/Tavily live search with credential auto-detection, auto fallback, fixed endpoints, freshness, bounded normalized sources, provider provenance, shared domain filtering, and durable citation objects are wired |
-| Browser automation | Strong partial | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets, blocked service workers/password fills, bounded ARIA snapshots and visible-frame refs, structured modern interactions, explicit dialog state, bounded vision screenshots, safe workspace uploads and atomic bounded workspace downloads, setup/doctor support, deterministic cleanup, opt-in private Ash-owned persistent profiles, and loopback-only CDP attachment through a separate Ash-owned policy context. Existing-browser auth reuse is explicit and requires user-owned `allowed_web_domains`; only matching cookies/localStorage are copied, unrelated/future credential categories are dropped, and the source browser remains untouched. `/browser inspect` reads only bounded/redacted tab inventory; `/browser status`, `/browser connect`, `/browser disconnect`, and `/browser reset-profile` provide inspectable attach, detach, scope, and revocation controls. Real Chromium E2E proves persistent auth/reset, scoped state reuse, hot-swap, interaction breadth, and source-browser survival. Browser-specific remote relays/remote CDP are intentionally out of core: remote deployments run Ash beside the browser and use ACP/SDK/HTTP/A2A according to their approval and trust model. General desktop computer use remains a P3 follow-up decision |
+| Browser automation | Strong partial | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets, blocked service workers/password fills, bounded ARIA snapshots and visible-frame refs, structured modern interactions, explicit dialog state, bounded vision screenshots, safe workspace uploads and atomic bounded workspace downloads, setup/doctor support, deterministic cleanup, opt-in private Ash-owned persistent profiles, and loopback-only CDP attachment through a separate Ash-owned policy context. Existing-browser auth reuse is explicit and requires user-owned `allowed_web_domains`; only matching cookies/localStorage are copied, unrelated/future credential categories are dropped, and the source browser remains untouched. `/browser inspect` reads only bounded/redacted tab inventory; `/browser status`, `/browser connect`, `/browser disconnect`, and `/browser reset-profile` provide inspectable attach, detach, scope, and revocation controls. Real Chromium E2E proves persistent auth/reset, scoped state reuse, hot-swap, interaction breadth, and source-browser survival. Browser-specific remote relays/remote CDP are intentionally out of core: remote deployments run Ash beside the browser and use ACP/SDK/HTTP/A2A according to their approval and trust model |
+| General desktop computer use | Scope-closed | Not a core Ash capability at this phase. Coding workflows use files/shell/Git/LSP/browser first; command subprocesses do not inherit desktop-session authority by default, and only explicit user-owned environment forwarding can expose it. A future native-GUI provider/plugin requires a concrete engineering workflow plus its own screen/accessibility/input/permission contract rather than piggybacking on shell or browser authority |
 | Ask-user tool | Verified locally | Typed blocking question with bounded options and explicit empty-answer failure |
 | Todo/plan tracking | Verified locally | Persisted sprint checklists are inspectable and updatable from the top-level CLI; active plan state is injected into every runtime model request with bounded context accounting |
 

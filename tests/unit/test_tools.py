@@ -926,6 +926,41 @@ async def test_run_command_forwards_only_explicitly_allowlisted_environment(
     assert result.output.splitlines() == ["nightly", "missing"]
 
 
+@pytest.mark.asyncio
+async def test_run_command_strips_desktop_session_authority_by_default(
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    desktop_env = {
+        "DISPLAY": ":77",
+        "WAYLAND_DISPLAY": "wayland-9",
+        "XAUTHORITY": "/tmp/xauthority",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/session-bus",
+    }
+    for name, value in desktop_env.items():
+        monkeypatch.setenv(name, value)
+    script = (
+        "import os; "
+        "names=('DISPLAY','WAYLAND_DISPLAY','XAUTHORITY','DBUS_SESSION_BUS_ADDRESS'); "
+        "print('|'.join(os.getenv(name, 'missing') for name in names))"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    default_result = await RunCommandTool(guard).run(command_line=command)
+    opted_in_result = await RunCommandTool(
+        guard,
+        environment_allowlist=desktop_env,
+    ).run(command_line=command)
+
+    assert default_result.success is True
+    assert default_result.output.strip() == "missing|missing|missing|missing"
+    assert opted_in_result.success is True
+    assert (
+        opted_in_result.output.strip()
+        == ":77|wayland-9|/tmp/xauthority|unix:path=/tmp/session-bus"
+    )
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX executable PATH semantics")
 @pytest.mark.asyncio
 async def test_run_command_workspace_path_requires_explicit_opt_in(
