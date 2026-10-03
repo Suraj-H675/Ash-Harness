@@ -39,7 +39,9 @@ async def test_web_fetch_returns_bounded_html_text(monkeypatch, guard) -> None:
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["user-agent"].startswith("ash-web-fetch")
+        assert request.headers["user-agent"].startswith("Mozilla/5.0")
+        assert request.headers["user-agent"].endswith("Ash-WebFetch/0.1")
+        assert request.headers["accept-language"] == "en-US,en;q=0.9"
         return httpx.Response(
             200,
             headers={"content-type": "text/html"},
@@ -61,6 +63,77 @@ async def test_web_fetch_returns_bounded_html_text(monkeypatch, guard) -> None:
             "content_type": "text/html",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_prefers_readable_main_content_over_site_chrome(
+    monkeypatch,
+    guard,
+) -> None:
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text=(
+                "<html><head><title>Site title</title></head><body>"
+                "<nav>Docs Products Pricing Login</nav>"
+                "<main><h1>Install Ash</h1><p>Run the installer.</p>"
+                "<article><p>Then verify the CLI.</p></article></main>"
+                "<aside>Related marketing links</aside>"
+                "<footer>Copyright and legal links</footer>"
+                "</body></html>"
+            ),
+        )
+
+    result = await WebFetchTool(
+        guard,
+        transport=httpx.MockTransport(handler),
+    ).run(url="https://example.com/docs")
+
+    assert result.success is True
+    assert "Install Ash" in result.output
+    assert "Run the installer." in result.output
+    assert "Then verify the CLI." in result.output
+    assert "Docs Products Pricing Login" not in result.output
+    assert "Related marketing links" not in result.output
+    assert "Copyright and legal links" not in result.output
+    assert "Site title" not in result.output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_length", ["invalid", "-1"])
+async def test_web_fetch_rejects_invalid_content_length(
+    monkeypatch,
+    guard,
+    content_length: str,
+) -> None:
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/plain",
+                "content-length": content_length,
+            },
+            content=b"ok",
+        )
+
+    result = await WebFetchTool(
+        guard,
+        transport=httpx.MockTransport(handler),
+    ).run(url="https://example.com/page")
+
+    assert result.success is False
+    assert "invalid Content-Length" in (result.error or "")
 
 
 @pytest.mark.asyncio

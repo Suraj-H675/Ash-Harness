@@ -24,6 +24,7 @@ async def test_brave_search_is_bounded_filtered_and_emits_provenance(
         assert request.url.params["count"] == "3"
         assert request.url.params["freshness"] == "pw"
         assert request.url.params["safesearch"] == "moderate"
+        assert request.url.params["text_decorations"] == "false"
         assert request.headers["x-subscription-token"] == "brave-test-key"
         return httpx.Response(
             200,
@@ -145,6 +146,91 @@ async def test_auto_search_falls_back_to_tavily_after_brave_rate_limit(
     assert payload["provider"] == "tavily"
     assert requests == ["api.search.brave.com", "api.tavily.com"]
     assert "contains-secret-details" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_web_search_provider_uses_public_dns_pinned_transport(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from ash.tools import web_search
+
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-test-key")
+    observed: dict[str, object] = {}
+
+    async def resolved(
+        hostname: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, ...]:
+        observed["hostname"] = hostname
+        observed["timeout"] = timeout_seconds
+        return ("93.184.216.34",)
+
+    def pinned_transport(*, pinned_addresses: tuple[str, ...]):
+        observed["addresses"] = pinned_addresses
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.host == "api.search.brave.com"
+            assert request.headers["x-subscription-token"] == "brave-test-key"
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={"web": {"results": []}},
+                request=request,
+            )
+
+        return httpx.MockTransport(handler)
+
+    monkeypatch.setattr(
+        web_search,
+        "_resolve_public_addresses_with_timeout",
+        resolved,
+    )
+    monkeypatch.setattr(web_search, "_PinnedPublicTransport", pinned_transport)
+
+    result = await WebSearchTool(
+        SafetyGuard(tmp_path),
+        provider="brave",
+        timeout=12,
+    ).run(query="anything")
+
+    assert result.success is True
+    assert observed == {
+        "hostname": "api.search.brave.com",
+        "timeout": 5.0,
+        "addresses": ("93.184.216.34",),
+    }
+
+
+@pytest.mark.asyncio
+async def test_web_search_provider_dns_policy_fails_closed_before_dispatch(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-test-key")
+
+    async def rejected(
+        hostname: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, ...]:
+        del timeout_seconds
+        raise ValueError(f"Refusing non-public provider endpoint {hostname}")
+
+    monkeypatch.setattr(
+        "ash.tools.web_search._resolve_public_addresses_with_timeout",
+        rejected,
+    )
+
+    result = await WebSearchTool(
+        SafetyGuard(tmp_path),
+        provider="brave",
+    ).run(query="anything")
+
+    assert result.success is False
+    assert "public-network validation" in (result.error or "")
+    assert "brave-test-key" not in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -394,6 +480,42 @@ async def test_web_search_bounds_provider_result_fields(tmp_path, monkeypatch) -
     assert len(hit["title"]) == 500
     assert len(hit["snippet"]) == 4000
     assert len(hit["published_at"]) == 128
+
+
+@pytest.mark.asyncio
+async def test_web_search_normalizes_nullable_provider_fields(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-test-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "web": {
+                    "results": [
+                        {
+                            "title": "Result",
+                            "url": "https://example.com/result",
+                            "description": None,
+                            "page_age": None,
+                        }
+                    ]
+                }
+            },
+        )
+
+    result = await WebSearchTool(
+        SafetyGuard(tmp_path),
+        provider="brave",
+        transport=httpx.MockTransport(handler),
+    ).run(query="anything")
+    payload = json.loads(result.output)
+
+    assert result.success is True
+    assert payload["results"][0]["snippet"] == ""
+    assert payload["results"][0]["published_at"] == ""
 
 
 @pytest.mark.asyncio

@@ -1053,7 +1053,7 @@ P3 is intentionally bounded around interaction workflows a coding harness can
 justify. It is not a requirement to absorb every remote-desktop or general
 assistant surface exposed by gateway products.
 
-- `P3A_WEB_RETRIEVAL = OPEN`
+- `P3A_WEB_RETRIEVAL = CLOSED`
 - `P3B_BROWSER_INTERACTION = CLOSED`
 - `P3C_SIGNED_IN_BROWSER = OPEN`
 - `P3D_REMOTE_BROWSER_OPERATION = OPEN`
@@ -1068,6 +1068,59 @@ remote browser ownership is a deliberate product decision; general desktop
 computer use is either implemented for a concrete coding workflow or rejected
 for a defensible scope/security reason; and external-behavior claims have
 realistic conformance evidence plus a current comparator pass.
+
+### P3A closure — guarded public web retrieval
+
+P3A is CLOSED. Ash keeps the public-web surface intentionally small:
+`web_search` provides normalized live search and `web_fetch` retrieves one
+public HTTP(S) resource. Search supports explicit/auto Brave and Tavily
+selection, bounded results and fields, freshness filters, allowed-domain
+filtering, provider provenance/citations, credential redaction, provider
+fallback on backend failures, and user-owned setup/doctor/config controls.
+Fetch remains keyless and enforces scheme/credential checks, public-host DNS
+validation, DNS-result pinning against rebinding, redirect revalidation,
+allowed domains, response-size/content-type bounds, bounded model output, and
+sanitized citation URLs.
+
+The closure audit fixed two material production gaps. Search-provider API calls
+now use the same public-address DNS validation/pinning boundary as fetch and
+ignore ambient HTTP proxy configuration by default, so provider credentials are
+not sent through a weaker network path. Direct fetch likewise ignores ambient
+proxy configuration and now uses a browser-like User-Agent plus
+`Accept-Language`. HTML extraction no longer behaves as a raw tag stripper:
+it suppresses document head/script/style/template/SVG and common site chrome,
+prefers visible `main`/`article` content when present, and falls back to
+bounded body text for pages without semantic main content. Invalid or negative
+`Content-Length` values fail closed. Search also normalizes nullable provider
+fields and disables Brave display-text decorations.
+
+The current Brave Web Search contract still uses
+`/res/v1/web/search`, `X-Subscription-Token`, `pd/pw/pm/py` freshness,
+and the optional `text_decorations` flag. Tavily still uses
+`POST https://api.tavily.com/search`, Bearer authentication,
+`max_results`, and `time_range`. Ash retains its own conservative
+500-character query limit even though Brave currently accepts a larger web
+query; Tavily's current reference does not require Ash to lower that bound.
+
+OpenClaw and Hermes expose many additional search backends, including
+unofficial/key-free DuckDuckGo paths and self-hosted SearXNG. That provider
+breadth is useful but is not a P3A closure requirement for Ash core: adding an
+unofficial scraper would create a brittle production dependency, while
+self-hosting/search-plugin breadth can be added later through a deliberate
+provider/plugin contract. Ash's core contract is configured live search plus a
+keyless guarded fetch path, with the browser available for JS-heavy or
+authenticated pages.
+
+P3A closure evidence: 38/38 focused `web_fetch`/`web_search` tests, 6/6
+setup/doctor/config/runtime/permission wiring tests, Ruff clean, targeted Mypy
+clean, and `git diff --check` clean.
+
+Comparator/provider references rechecked on 2026-10-03:
+`https://docs.openclaw.ai/tools/web`,
+`https://docs.openclaw.ai/tools/web-fetch`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/features/web-search/`,
+`https://api-dashboard.search.brave.com/api-reference/web/search/get`, and
+`https://docs.tavily.com/documentation/api-reference/endpoint/search`.
 
 ### P3 progress — browser interaction audit slice 1
 

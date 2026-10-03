@@ -19,7 +19,13 @@ from ash.core.redaction import redact_known_secrets, redact_text, redact_url
 from ash.safe_io import strict_json_loads
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
-from ash.tools.web import _host_allowed, _normalize_allowed_domains
+from ash.tools.web import (
+    DNS_TIMEOUT_SECONDS,
+    _PinnedPublicTransport,
+    _host_allowed,
+    _normalize_allowed_domains,
+    _resolve_public_addresses_with_timeout,
+)
 
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
@@ -43,6 +49,11 @@ class WebSearchHit:
 
 class WebSearchBackendError(RuntimeError):
     """A safe provider failure suitable for returning to the model."""
+
+
+def _result_text(item: dict[str, Any], key: str) -> str:
+    value = item.get(key)
+    return "" if value is None else str(value)
 
 
 def _redact_provider_result_url(value: str, secret: str) -> str:
@@ -99,6 +110,7 @@ class BraveWebSearchProvider(WebSearchProvider):
             "q": query,
             "count": limit,
             "safesearch": "moderate",
+            "text_decorations": False,
         }
         if freshness != "any":
             params["freshness"] = {
@@ -125,13 +137,13 @@ class BraveWebSearchProvider(WebSearchProvider):
             raise WebSearchBackendError("brave returned an invalid result list")
         return [
             WebSearchHit(
-                title=redact_known_secrets(str(item.get("title", "")), api_key),
-                url=_redact_provider_result_url(str(item.get("url", "")), api_key),
+                title=redact_known_secrets(_result_text(item, "title"), api_key),
+                url=_redact_provider_result_url(_result_text(item, "url"), api_key),
                 snippet=redact_known_secrets(
-                    str(item.get("description", "")), api_key
+                    _result_text(item, "description"), api_key
                 ),
                 published_at=redact_known_secrets(
-                    str(item.get("page_age", "")), api_key
+                    _result_text(item, "page_age"), api_key
                 ),
             )
             for item in raw_results[:limit]
@@ -183,11 +195,11 @@ class TavilyWebSearchProvider(WebSearchProvider):
             raise WebSearchBackendError("tavily returned an invalid result list")
         return [
             WebSearchHit(
-                title=redact_known_secrets(str(item.get("title", "")), api_key),
-                url=_redact_provider_result_url(str(item.get("url", "")), api_key),
-                snippet=redact_known_secrets(str(item.get("content", "")), api_key),
+                title=redact_known_secrets(_result_text(item, "title"), api_key),
+                url=_redact_provider_result_url(_result_text(item, "url"), api_key),
+                snippet=redact_known_secrets(_result_text(item, "content"), api_key),
                 published_at=redact_known_secrets(
-                    str(item.get("published_date", "")), api_key
+                    _result_text(item, "published_date"), api_key
                 ),
             )
             for item in raw_results[:limit]
@@ -204,8 +216,29 @@ async def _request_json(
     transport: httpx.AsyncBaseTransport | None,
     **kwargs: Any,
 ) -> dict[str, Any]:
+    effective_transport = transport
+    if effective_transport is None:
+        hostname = urlparse(url).hostname
+        if not hostname:
+            raise WebSearchBackendError(f"{provider} has an invalid endpoint")
+        try:
+            addresses = await _resolve_public_addresses_with_timeout(
+                hostname,
+                timeout_seconds=min(timeout, DNS_TIMEOUT_SECONDS),
+            )
+            effective_transport = _PinnedPublicTransport(
+                pinned_addresses=addresses
+            )
+        except ValueError as exc:
+            raise WebSearchBackendError(
+                f"{provider} endpoint failed public-network validation"
+            ) from exc
     try:
-        async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            transport=effective_transport,
+            trust_env=False,
+        ) as client:
             async with client.stream(method, url, **kwargs) as response:
                 if response.status_code == 401:
                     raise WebSearchBackendError(

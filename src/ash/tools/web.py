@@ -117,7 +117,11 @@ async def _fetch_public_text(
 ) -> tuple[str, int, str, str]:
     url = _validate_public_url_syntax(raw_url, allowed_domains=allowed_domains)
     headers = {
-        "User-Agent": "ash-web-fetch/0.1",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/140.0 Safari/537.36 Ash-WebFetch/0.1"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/*,application/json,application/xml;q=0.9,*/*;q=0.1",
     }
     for _ in range(MAX_REDIRECTS + 1):
@@ -134,6 +138,7 @@ async def _fetch_public_text(
             timeout=10.0,
             transport=effective_transport,
             headers=headers,
+            trust_env=False,
         ) as client:
             async with client.stream("GET", url) as response:
                 if response.is_redirect:
@@ -158,8 +163,15 @@ async def _fetch_public_text(
                 if content_type and not content_type.startswith(TEXT_CONTENT_TYPES):
                     raise ValueError(f"Unsupported content type: {content_type}")
                 content_length = response.headers.get("content-length")
-                if content_length and int(content_length) > MAX_FETCH_BYTES:
-                    raise ValueError("Response is larger than 1 MB")
+                if content_length:
+                    try:
+                        declared_length = int(content_length)
+                    except ValueError as exc:
+                        raise ValueError("Response has an invalid Content-Length") from exc
+                    if declared_length < 0:
+                        raise ValueError("Response has an invalid Content-Length")
+                    if declared_length > MAX_FETCH_BYTES:
+                        raise ValueError("Response is larger than 1 MB")
                 chunks: list[bytes] = []
                 total = 0
                 async for chunk in response.aiter_bytes():
@@ -378,31 +390,105 @@ def _ensure_public_host(hostname: str) -> None:
 
 
 class _HTMLTextExtractor(HTMLParser):
+    _SKIP_TAGS = frozenset({"head", "script", "style", "noscript", "template", "svg"})
+    _CHROME_TAGS = frozenset({"nav", "aside", "footer"})
+    _PRIMARY_TAGS = frozenset({"main", "article"})
+    _BLOCK_TAGS = frozenset(
+        {
+            "address",
+            "blockquote",
+            "br",
+            "dd",
+            "div",
+            "dl",
+            "dt",
+            "figcaption",
+            "figure",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "hr",
+            "li",
+            "ol",
+            "p",
+            "pre",
+            "section",
+            "table",
+            "tbody",
+            "td",
+            "th",
+            "thead",
+            "tr",
+            "ul",
+        }
+    )
+
     def __init__(self) -> None:
         super().__init__()
         self.parts: list[str] = []
+        self.primary_parts: list[str] = []
         self._skip_depth = 0
+        self._chrome_depth = 0
+        self._primary_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"script", "style", "noscript"}:
+        del attrs
+        tag = tag.casefold()
+        if tag in self._SKIP_TAGS:
             self._skip_depth += 1
-        if tag in {"p", "br", "div", "section", "article", "li", "h1", "h2", "h3"}:
-            self.parts.append("\n")
+            return
+        if self._skip_depth:
+            return
+        if tag in self._CHROME_TAGS:
+            self._chrome_depth += 1
+            return
+        if self._chrome_depth:
+            return
+        if tag in self._PRIMARY_TAGS:
+            self._primary_depth += 1
+        if tag in self._BLOCK_TAGS:
+            self._append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style", "noscript"} and self._skip_depth:
+        tag = tag.casefold()
+        if tag in self._SKIP_TAGS and self._skip_depth:
             self._skip_depth -= 1
-        if tag in {"p", "div", "section", "article", "li"}:
-            self.parts.append("\n")
+            return
+        if self._skip_depth:
+            return
+        if tag in self._CHROME_TAGS and self._chrome_depth:
+            self._chrome_depth -= 1
+            return
+        if self._chrome_depth:
+            return
+        if tag in self._BLOCK_TAGS:
+            self._append("\n")
+        if tag in self._PRIMARY_TAGS and self._primary_depth:
+            self._primary_depth -= 1
 
     def handle_data(self, data: str) -> None:
-        if self._skip_depth == 0:
+        if self._skip_depth == 0 and self._chrome_depth == 0:
             stripped = " ".join(data.split())
             if stripped:
-                self.parts.append(stripped + " ")
+                self._append(stripped + " ")
 
     def text(self) -> str:
-        lines = [" ".join(line.split()) for line in "".join(self.parts).splitlines()]
+        primary = self._normalize(self.primary_parts)
+        if primary:
+            return primary
+        return self._normalize(self.parts)
+
+    def _append(self, value: str) -> None:
+        self.parts.append(value)
+        if self._primary_depth:
+            self.primary_parts.append(value)
+
+    @staticmethod
+    def _normalize(parts: list[str]) -> str:
+        lines = [" ".join(line.split()) for line in "".join(parts).splitlines()]
         return "\n".join(line for line in lines if line)
 
 
