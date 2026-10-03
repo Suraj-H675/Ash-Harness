@@ -443,7 +443,7 @@ async def test_real_chromium_cannot_bypass_proxy_for_loopback_or_link_local(
     monkeypatch.setattr(
         browser_module,
         "_validate_browser_url",
-        lambda url, _allowed_domains: url,
+        lambda url, _allowed_domains, _allowed_local_origins=(): url,
     )
     session = BrowserSession(timeout_seconds=10)
     try:
@@ -542,6 +542,7 @@ async def test_real_chromium_proxy_blocks_redirect_and_subresource_targets(
             self,
             allowed_domains: tuple[str, ...],
             *,
+            allowed_local_origins: tuple[str, ...] = (),
             timeout_seconds: float,
         ) -> None:
             def resolve(hostname: str) -> tuple[str, ...]:
@@ -555,6 +556,7 @@ async def test_real_chromium_proxy_blocks_redirect_and_subresource_targets(
 
             super().__init__(
                 allowed_domains,
+                allowed_local_origins=allowed_local_origins,
                 timeout_seconds=timeout_seconds,
                 resolver=resolve,
                 connector=connect,
@@ -564,7 +566,7 @@ async def test_real_chromium_proxy_blocks_redirect_and_subresource_targets(
     monkeypatch.setattr(
         browser_module,
         "_validate_browser_url",
-        lambda url, _allowed_domains: url,
+        lambda url, _allowed_domains, _allowed_local_origins=(): url,
     )
     session = BrowserSession(timeout_seconds=10)
     try:
