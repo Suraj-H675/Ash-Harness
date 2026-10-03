@@ -8,10 +8,11 @@ All notable changes to Ash are documented here. The format follows
 
 ### Added
 - Added opt-in POSIX PTY execution for foreground commands and managed
-  background jobs, including interactive input, existing native/scoped
+  background jobs, including interactive input, Bubblewrap/scoped
   sandbox/process-tree controls, bounded output, and controlling-TTY
-  verification for TTY-required coding CLIs. Docker-sandbox PTY requests fail
-  closed until Ash can own container cleanup across terminal detach.
+  verification for TTY-required coding CLIs. Docker-sandbox and macOS
+  `sandbox-exec` PTY requests fail closed where Ash cannot preserve the required
+  process/terminal ownership guarantees.
 
 ### Changed
 - Strengthened browser/interface conformance evidence with a real Chromium

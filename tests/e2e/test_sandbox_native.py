@@ -107,6 +107,21 @@ def test_native_sandbox_preserves_real_pty_for_tty_required_cli(tmp_path: Path) 
         assert manager.backend_name == "bubblewrap"
     elif sys.platform == "darwin":
         assert manager.backend_name == "sandbox-exec"
+        refused = asyncio.run(
+            RunCommandTool(
+                SafetyGuard(workspace),
+                project_root=workspace,
+                sandbox_manager=manager,
+            ).run(command_line="printf should-not-run", pty=True)
+        )
+        assert refused.success is False
+        assert "sandbox-exec backend" in (refused.error or "")
+        manager = SandboxManager(
+            workspace_root=workspace,
+            backend_preference="direct",
+            network=False,
+        )
+        assert manager.backend_name == "scoped"
     else:
         pytest.skip(f"unsupported native sandbox host: {sys.platform}")
     script = f"""
@@ -155,12 +170,18 @@ finally:
         assert f"backend={manager.backend_name}" in result.output
         assert "tty=True,True,True" in result.output
         assert "foreground=True" in result.output
-        assert "OUTSIDE_WRITE=blocked" in result.output
-        assert "NETWORK=blocked" in result.output
-        assert (workspace / "pty-inside.txt").read_text(encoding="utf-8") == "inside"
-        assert not outside_write.exists()
         if sys.platform.startswith("linux"):
+            assert "OUTSIDE_WRITE=blocked" in result.output
+            assert "NETWORK=blocked" in result.output
+        else:
+            assert "OUTSIDE_WRITE=allowed" in result.output
+            assert "NETWORK=allowed" in result.output
+        assert (workspace / "pty-inside.txt").read_text(encoding="utf-8") == "inside"
+        if sys.platform.startswith("linux"):
+            assert not outside_write.exists()
             assert "HOST_READ=blocked" in result.output
+        else:
+            assert outside_write.exists()
     finally:
         listener.close()
         outside_write.unlink(missing_ok=True)

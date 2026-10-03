@@ -268,7 +268,7 @@ Ash includes a broad coding-tool surface:
 | Text and structure | Directory listing, bounded globbing, descriptor-scoped bounded text/regex search, symbol lookup, and reference lookup |
 | Code intelligence | Incremental Tree-sitter repository maps for Python, JavaScript/JSX, TypeScript/TSX, Go, Rust, Java, C, C++, and C# |
 | Git | Status, bounded diffs, log inspection, explicit-scope commits, secret scanning, Git-hook error reporting, and worktree-aware review |
-| Processes | Foreground commands, managed background jobs, live bounded stdout/stderr, stdin, polling, stopping, cleanup, and opt-in native/scoped POSIX PTY execution for TTY-required CLIs; Docker-sandbox PTY currently fails closed |
+| Processes | Foreground commands, managed background jobs, live bounded stdout/stderr, stdin, polling, stopping, cleanup, and opt-in Bubblewrap/scoped POSIX PTY execution for TTY-required CLIs; Docker-sandbox and macOS `sandbox-exec` PTY fail closed |
 | Interaction | Typed ask-user questions, persisted plans, and model-visible compiler, linter, test, MyPy, and Ruff diagnostics |
 
 File operations are workspace-scoped and protect against symlinks, junctions,

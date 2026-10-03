@@ -349,14 +349,10 @@ class RunCommandTool(BaseTool):
                         dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
                     )
                     spawn_options = pty_process_spawn_options(process_tree_plan)
-                    pty_argv = (
-                        tuple(launch.argv)
-                        if invocation.pty_claimed_in_backend
-                        else prepare_pty_process_argv(
-                            launch.argv,
-                            plan=process_tree_plan,
-                            search_path=env.get("PATH"),
-                        )
+                    pty_argv = prepare_pty_process_argv(
+                        launch.argv,
+                        plan=process_tree_plan,
+                        search_path=env.get("PATH"),
                     )
                     if inherited_fds:
                         spawn_options["pass_fds"] = inherited_fds
