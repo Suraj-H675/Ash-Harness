@@ -522,6 +522,38 @@ def test_manager_uses_sandbox_exec_on_macos(tmp_path: Path) -> None:
     assert auto_approve_safety_error(mgr, allow_unsafe=False)
 
 
+def test_manager_wraps_macos_pty_inside_sandbox_exec(tmp_path: Path) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "darwin"),
+        patch("ash.sandbox.manager.has_sandbox_exec", return_value=True),
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+        patch(
+            "ash.sandbox.manager.resolve_host_executable",
+            return_value="/usr/bin/sandbox-exec",
+        ),
+        patch(
+            "ash.sandbox.manager.prepare_pty_command_argv",
+            return_value=("/trusted/python", "pty-wrapper", "echo", "hi"),
+        ) as pty_wrapper,
+    ):
+        manager = SandboxManager(workspace_root=tmp_path)
+        invocation = manager.prepare(["echo", "hi"], cwd=tmp_path, pty=True)
+
+    assert invocation.backend_name == "sandbox-exec"
+    assert invocation.pty_claimed_in_backend is True
+    assert invocation.argv[-4:] == (
+        "/trusted/python",
+        "pty-wrapper",
+        "echo",
+        "hi",
+    )
+    pty_wrapper.assert_called_once_with(
+        ["echo", "hi"],
+        workspace_root=tmp_path,
+        search_path=None,
+    )
+
+
 def test_manager_reports_sandbox_exec_as_partial_isolation(tmp_path: Path) -> None:
     with (
         patch("ash.sandbox.manager.sys.platform", "darwin"),

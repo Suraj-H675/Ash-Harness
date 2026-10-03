@@ -49,6 +49,7 @@ from ash.sandbox.process_utils import (
     ProcessTreePlan,
     ProcessTreeUnavailable,
     communicate_process,
+    prepare_pty_command_argv,
     prepare_process_tree,
     prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
@@ -132,6 +133,7 @@ class SandboxInvocation:
     backend_name: str
     fallback_used: bool = False
     pass_fds: tuple[int, ...] = ()
+    pty_claimed_in_backend: bool = False
 
 
 class SandboxStatus(TypedDict):
@@ -672,6 +674,7 @@ class SandboxManager:
                             (workspace_fd, *(fd for fd, _ in read_only_fds))
                         )
                     ),
+                    invocation.pty_claimed_in_backend,
                 )
         except SandboxBackendUnavailable:
             raise
@@ -862,8 +865,19 @@ class SandboxManager:
                     workspace_volume=docker_workspace_volume,
                 )
             else:
+                backend_command: Sequence[str] = command
+                if isinstance(backend, _SandboxExecBackend) and pty:
+                    if self.workspace_root is None:
+                        raise SandboxBackendUnavailable(
+                            "sandbox-exec PTY requires a workspace root"
+                        )
+                    backend_command = prepare_pty_command_argv(
+                        command,
+                        workspace_root=self.workspace_root,
+                        search_path=None,
+                    )
                 wrapped = backend.wrap(
-                    command,
+                    backend_command,
                     cwd=cwd,
                     passthrough_env_names=passthrough_env_names,
                 )
@@ -882,6 +896,9 @@ class SandboxManager:
             cwd,
             backend.tier,
             backend_name=backend.name,
+            pty_claimed_in_backend=(
+                pty and isinstance(backend, _SandboxExecBackend)
+            ),
         )
 
     # --- tier detection --------------------------------------------------

@@ -140,11 +140,26 @@ def prepare_pty_process_argv(
 ) -> tuple[str, ...]:
     """Wrap a command in a trusted post-exec controlling-terminal trampoline."""
 
+    pty_process_spawn_options(plan)
+    return prepare_pty_command_argv(
+        command,
+        workspace_root=plan.workspace_root,
+        search_path=search_path,
+    )
+
+
+def prepare_pty_command_argv(
+    command: Sequence[str],
+    *,
+    workspace_root: Path,
+    search_path: str | None,
+) -> tuple[str, ...]:
+    """Wrap a command so it claims fd 0 as the controlling terminal after exec."""
+
     if not command:
         raise ValueError("PTY command must not be empty")
-    pty_process_spawn_options(plan)
     launcher = _resolve_trusted_python_launcher(
-        plan.workspace_root,
+        workspace_root,
         search_path=search_path,
     )
     if launcher is None:

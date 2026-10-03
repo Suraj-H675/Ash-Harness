@@ -339,10 +339,14 @@ class BackgroundProcessTool(BaseTool):
                     slave_fd: int | None = None
                     if args.pty:
                         spawn_options = pty_process_spawn_options(process_tree_plan)
-                        launch_argv = prepare_pty_process_argv(
-                            launch.argv,
-                            plan=process_tree_plan,
-                            search_path=environment.get("PATH"),
+                        launch_argv = (
+                            tuple(launch.argv)
+                            if invocation.pty_claimed_in_backend
+                            else prepare_pty_process_argv(
+                                launch.argv,
+                                plan=process_tree_plan,
+                                search_path=environment.get("PATH"),
+                            )
                         )
                         master_fd, slave_fd = open_process_pty()
                     else:
