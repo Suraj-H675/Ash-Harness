@@ -1056,7 +1056,7 @@ assistant surface exposed by gateway products.
 - `P3A_WEB_RETRIEVAL = CLOSED`
 - `P3B_BROWSER_INTERACTION = CLOSED`
 - `P3C_SIGNED_IN_BROWSER = CLOSED`
-- `P3D_REMOTE_BROWSER_OPERATION = OPEN`
+- `P3D_REMOTE_BROWSER_OPERATION = CLOSED`
 - `P3E_DESKTOP_COMPUTER_USE = OPEN`
 - `P3F_INTERACTION_CONFORMANCE = OPEN`
 - `P3_WEB_COMPUTER_PARITY = OPEN` until P3A-P3F are all closed.
@@ -1244,6 +1244,62 @@ Comparator references rechecked on 2026-10-03:
 `https://docs.openclaw.ai/gateway/security/browser-control`,
 `https://hermes-agent.nousresearch.com/docs/user-guide/features/browser/`, and
 `https://playwright.dev/docs/auth`.
+
+### P3D closure — remote ownership stays at the Ash runtime boundary
+
+P3D is CLOSED by an explicit product/security decision: Ash does not add a
+browser-specific cross-machine relay, remote-CDP exception, or third-party cloud
+browser backend to core. When a browser must run on another machine or VM, run
+the Ash runtime on that host and reach Ash through its existing integration
+surfaces. The browser remains local to that Ash runtime, so the same
+loopback-CDP, domain/network, signed-in-state, permission, cleanup, and audit
+boundaries apply instead of being reimplemented in a second control plane.
+
+This is a deliberate difference from gateway-oriented systems. Current OpenClaw
+can proxy browser actions to a paired node host and can attach directly to
+remote CDP endpoints; its own security guidance says remote browser control is
+effectively operator access to everything the selected profile can reach and
+recommends keeping those control paths on trusted private networks. Hermes can
+route browser tools to Browser Use, Browserbase, Firecrawl, or a hosted Nous
+gateway, which is useful for managed anti-bot/cloud execution but introduces a
+separate provider, credential, billing, data-boundary, and lifecycle surface.
+OpenAI's computer-use guidance instead treats the browser/desktop as an
+environment supplied by the application (or by OpenAI's separate hosted
+environment) and explicitly allows applications to keep their own UI-tool
+integration.
+
+Ash's remote-runtime choices already cover the coding-harness use case:
+
+- ACP runs a canonical Ash runtime on the browser host and carries explicit
+  editor permission requests back to the connected client.
+- The Python SDK constructs that same canonical runtime and lets an embedding
+  supply an approval callback.
+- Authenticated HTTP/SSE and A2A expose remote Ash turns with bounded admission,
+  authentication, and TLS requirements for non-loopback serving. They remain
+  general headless/agent transports rather than privileged browser-control APIs;
+  browser actions receive no special approval bypass through those transports.
+
+Direct remote CDP stays rejected even when the URL uses HTTPS/WSS: Ash accepts
+only loopback CDP endpoints. That is intentional. It prevents a browser-control
+credential/session boundary from silently becoming a network-access boundary
+and avoids duplicating TLS/authentication, profile routing, reconnection,
+multi-tenant isolation, and consequential-action approval semantics that the
+existing remote Ash protocols already own. A deployment that needs a cloud
+browser can place Ash beside that browser in the same trusted runtime/VM, or a
+future provider/plugin can add a narrowly scoped backend when a concrete coding
+workflow justifies the additional trust boundary.
+
+P3D closure evidence: 11/11 targeted tests covering loopback-only CDP, HTTP and
+A2A remote opt-in/TLS/token boundaries, ACP permission mediation, and canonical
+SDK browser-policy propagation. No browser implementation change was required;
+the only regression addition asserts that SDK-built runtimes propagate the
+configured browser domain policy alongside web-fetch policy.
+
+Comparator references rechecked on 2026-10-03:
+`https://docs.openclaw.ai/tools/browser/remote`,
+`https://docs.openclaw.ai/gateway/security/browser-control`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/features/browser/`, and
+`https://developers.openai.com/api/docs/guides/tools-computer-use`.
 
 ### M4 product decisions
 
@@ -1512,7 +1568,7 @@ truthful evidence boundaries, not open mission blockers.
 | Git commit | Verified locally | Explicit commits require a path scope and refuse any pre-existing staged index state before staging; staged additions are secret-scanned and Git hook/stdout/stderr failures are surfaced. Automatic per-turn commits are stricter: candidates come only from successful Ash file mutations, `auto_commit_paths` acts only as an allowlist, paths dirty at turn start are skipped, post-edit SHA-256 ownership is rechecked before and after staging, and real dirty-repo journeys preserve same-file user edits instead of absorbing them. Explicit approved commits remain full-path scoped rather than hunk-owned. |
 | Tests/build/lint diagnostics | Verified locally | `run_command` parses bounded compiler/lint/pytest diagnostics into model-visible path, line, symbol, code, and message fields and aggregates pytest/MyPy/Ruff summary counts |
 | Web fetch/search | Verified locally | Guarded HTTP(S) fetch plus Brave/Tavily live search with credential auto-detection, auto fallback, fixed endpoints, freshness, bounded normalized sources, provider provenance, shared domain filtering, and durable citation objects are wired |
-| Browser automation | Strong partial | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets, blocked service workers/password fills, bounded ARIA snapshots and visible-frame refs, structured modern interactions, explicit dialog state, bounded vision screenshots, safe workspace uploads and atomic bounded workspace downloads, setup/doctor support, deterministic cleanup, opt-in private Ash-owned persistent profiles, and loopback-only CDP attachment through a separate Ash-owned policy context. Existing-browser auth reuse is explicit and requires user-owned `allowed_web_domains`; only matching cookies/localStorage are copied, unrelated/future credential categories are dropped, and the source browser remains untouched. `/browser inspect` reads only bounded/redacted tab inventory; `/browser status`, `/browser connect`, `/browser disconnect`, and `/browser reset-profile` provide inspectable attach, detach, scope, and revocation controls. Real Chromium E2E proves persistent auth/reset, scoped state reuse, hot-swap, interaction breadth, and source-browser survival. Remote browser operation and general desktop computer use remain P3 follow-up decisions |
+| Browser automation | Strong partial | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets, blocked service workers/password fills, bounded ARIA snapshots and visible-frame refs, structured modern interactions, explicit dialog state, bounded vision screenshots, safe workspace uploads and atomic bounded workspace downloads, setup/doctor support, deterministic cleanup, opt-in private Ash-owned persistent profiles, and loopback-only CDP attachment through a separate Ash-owned policy context. Existing-browser auth reuse is explicit and requires user-owned `allowed_web_domains`; only matching cookies/localStorage are copied, unrelated/future credential categories are dropped, and the source browser remains untouched. `/browser inspect` reads only bounded/redacted tab inventory; `/browser status`, `/browser connect`, `/browser disconnect`, and `/browser reset-profile` provide inspectable attach, detach, scope, and revocation controls. Real Chromium E2E proves persistent auth/reset, scoped state reuse, hot-swap, interaction breadth, and source-browser survival. Browser-specific remote relays/remote CDP are intentionally out of core: remote deployments run Ash beside the browser and use ACP/SDK/HTTP/A2A according to their approval and trust model. General desktop computer use remains a P3 follow-up decision |
 | Ask-user tool | Verified locally | Typed blocking question with bounded options and explicit empty-answer failure |
 | Todo/plan tracking | Verified locally | Persisted sprint checklists are inspectable and updatable from the top-level CLI; active plan state is injected into every runtime model request with bounded context accounting |
 

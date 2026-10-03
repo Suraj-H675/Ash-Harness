@@ -840,6 +840,7 @@ async def test_async_sdk_applies_trusted_project_extensions(
     ) as client:
         listed = await client.loop.tools["list_skills"].run()
         web_tool = client.loop.tools["web_fetch"]
+        browser_tool = client.loop.tools["browser_navigate"]
 
         assert "PROJECT_RUNTIME_INSTRUCTION" in client.loop.system_prompt
         assert f"{workspace}|{workspace}" in client.loop.system_prompt
@@ -847,6 +848,7 @@ async def test_async_sdk_applies_trusted_project_extensions(
         assert client.loop.hooks is not None
         assert len(client.loop.hooks._pre_tool) == 1
         assert web_tool._allowed_domains == ("docs.example.com",)
+        assert browser_tool.session.allowed_domains == ("docs.example.com",)
 
 
 @pytest.mark.asyncio
