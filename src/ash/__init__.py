@@ -7,7 +7,7 @@ from typing import Any
 try:
     __version__ = version("ash-ai")
 except PackageNotFoundError:
-    __version__ = "0.1.0"
+    __version__ = "0+unknown"
 
 
 _SDK_EXPORTS = frozenset(

@@ -223,6 +223,56 @@ def test_v17_migration_marks_historical_usage_pricing_unknown(tmp_path: Path) ->
         ).fetchone()[0] == CURRENT_SCHEMA_VERSION
 
 
+def test_v18_migration_backup_remains_v17_rollback_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "v17.db"
+    store = SessionStore(db_path)
+    session = store.create_session(str(tmp_path))
+    store.save_message(
+        session.session_id,
+        Message(
+            role="user",
+            content="rollback compatibility probe",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+
+    conn = get_db_connection(db_path)
+    try:
+        conn.executescript(
+            """
+            DROP TRIGGER messages_fts_insert;
+            DROP TRIGGER messages_fts_delete;
+            DROP TRIGGER messages_fts_update;
+            DROP TABLE messages_fts;
+            DELETE FROM schema_migrations WHERE version >= 18;
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    SessionStore(db_path)
+
+    backups = list(tmp_path.glob("v17.db.before-v18-migration.*.backup"))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as backup_conn:
+        assert backup_conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 17
+        assert backup_conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'messages_fts'"
+        ).fetchone() is None
+    with get_db_connection(db_path) as migrated_conn:
+        assert migrated_conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 18
+        assert migrated_conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'messages_fts'"
+        ).fetchone() is not None
+
+
 def test_goal_lifecycle_is_durable_bounded_and_redacted(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "goals.db")
     session = store.create_session(str(tmp_path))

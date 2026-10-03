@@ -62,6 +62,31 @@ Restore only after inspecting the backup and explicitly confirming:
 Backups cover the session database. They are not a replacement for backing up
 all of ~/.ash when you need a complete user-state archive.
 
+### Roll back across a session-schema migration
+
+Installing an older immutable Ash release rolls back the **package**, not a
+database schema that a newer release has already migrated. Before every session
+schema migration, Ash creates a validated backup beside the session database
+with a name such as:
+
+    sessions.db.before-v18-migration.<timestamp>.backup
+
+For the 0.2.0 upgrade, that backup is the compatible v17 state needed by
+0.1.0. If you must return to 0.1.0 after 0.2.0 has opened the database:
+
+1. Stop all Ash processes using that profile/database.
+2. Identify and inspect the `before-v18-migration` backup created by the 0.2.0
+   migration.
+3. Restore that backup with `ash storage restore /path/to/backup --yes` while
+   still using a version that can read both schemas.
+4. Immediately install the older immutable release. Do not start the newer Ash
+   again between restoring the older database and rolling the package back, or
+   it will migrate the database forward again.
+
+If no compatible pre-migration backup exists, do not force an older binary to
+open the newer schema. Keep the newer release installed or recover from another
+known-good backup instead.
+
 ## Reset selected default-profile state
 
 Ash reset is deliberately selective:

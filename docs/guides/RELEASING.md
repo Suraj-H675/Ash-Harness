@@ -35,12 +35,16 @@ this preflight.
 4. Let `.github/workflows/release.yml` build and publish the release. Do not
    hand-replace release assets or move a release tag.
 
-The workflow checks that the tag matches the package version, validates the
-lockfile and dependencies, runs lint/type/tests, builds the sdist and then the
-wheel from that fresh sdist, smoke-tests the wheel, tests the standalone
-installer on Python 3.10, emits `SHA256SUMS`, creates artifact provenance, and
-publishes the assets through a draft release before verifying that the final
-release is immutable.
+The release workflow first calls the complete reusable supported-host CI
+workflow and cannot enter the publishing job until every required Linux/macOS,
+Python-version, packaging, browser, sandbox, LSP, and MCP lane succeeds. The
+publishing job then checks that the tag matches the package version, validates
+the lockfile and dependencies again, runs its Ubuntu/Python 3.12 lint/type/test
+gate, builds the sdist and then the wheel from that fresh sdist, installs the
+wheel and requires its exact `ash --version` output to match the release tag,
+smoke-tests the wheel, tests the standalone installer on Python 3.10, emits
+`SHA256SUMS`, creates artifact provenance, and publishes the assets through a
+draft release before verifying that the final release is immutable.
 
 The standalone `install-ash.py` asset is copied from `src/ash/installer.py`.
 The public bootstrap selects exactly that uploaded asset from the GitHub
@@ -59,9 +63,17 @@ match the requested `ash-v<version>` release tag.
 
 Re-running the same verified immutable ref repairs the managed environment.
 Installing a newer immutable ref upgrades it. Installing an older verified
-immutable ref is the supported explicit rollback path. Supported capability
-extras already present in the managed installation are preserved across
-upgrade, repair, and rollback.
+immutable ref rolls back the managed **package**. Supported capability extras
+already present in the managed installation are preserved across upgrade,
+repair, and package rollback.
+
+Package rollback does not reverse user-data schema migrations. A release that
+advances the durable session schema must document its automatic pre-migration
+backup and the compatible restore procedure. For 0.2.0 specifically, opening
+the session store migrates schema v17 to v18 after creating a validated
+`before-v18-migration` backup; returning to 0.1.0 after that migration requires
+restoring the v17 backup as well as installing the older package. See
+[Maintenance and recovery](MAINTENANCE.md#roll-back-across-a-session-schema-migration).
 
 ## Verify a published release
 

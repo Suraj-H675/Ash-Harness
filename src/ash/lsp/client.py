@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ash import __version__
 from ash.lsp.config import LSPServerConfig, resolve_lsp_command
 from ash.core.redaction import redact_text
 from ash.safety.environment import build_scrubbed_environment
@@ -150,7 +151,7 @@ class LSPClient:
                 "initialize",
                 {
                     "processId": os.getpid(),
-                    "clientInfo": {"name": "ash", "version": "0.1.0"},
+                    "clientInfo": {"name": "ash", "version": __version__},
                     "locale": "en",
                     "rootUri": self.root.as_uri(),
                     "workspaceFolders": [

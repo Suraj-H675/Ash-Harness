@@ -1599,7 +1599,7 @@ def main(
     if not args.ref or _RELEASE_REF_PATTERN.fullmatch(args.ref) is None:
         print(
             "Ash installation could not continue: --ref must name a canonical "
-            "Ash release tag such as ash-v0.1.0. Use the verified release "
+            "Ash release tag in ash-v<version> form. Use the verified release "
             "bootstrap rather than installing a moving branch.",
             file=errors,
         )

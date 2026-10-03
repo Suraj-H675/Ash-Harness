@@ -12,7 +12,11 @@ permissions:
   artifact-metadata: write
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   release:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -63,6 +67,12 @@ jobs:
         run: |
           uv venv .release-smoke --python 3.12
           uv pip install --python .release-smoke dist/*.whl
+          expected="${GITHUB_REF_NAME#ash-v}"
+          actual="$(.release-smoke/bin/ash --version)"
+          if [ "$actual" != "ash $expected" ]; then
+            echo >&2 "Installed wheel reported $actual; expected ash $expected"
+            exit 1
+          fi
           .release-smoke/bin/python tests/packaging/smoke_minimal_install.py
           uv run --python 3.10 --no-project python -I tests/packaging/smoke_standalone_installer_py310.py
           sha256sum --check dist/SHA256SUMS

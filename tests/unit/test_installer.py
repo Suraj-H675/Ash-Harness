@@ -1717,7 +1717,7 @@ def test_public_installer_refuses_missing_or_nonrelease_ref() -> None:
         )
         rendered = stderr.getvalue()
         assert "--ref must name a canonical Ash release tag" in rendered
-        assert "ash-v0.1.0" in rendered
+        assert "ash-v<version>" in rendered
 
     assert calls == 0
 

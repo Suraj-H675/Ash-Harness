@@ -4,6 +4,7 @@ import math
 
 import pytest
 
+from ash import __version__
 from ash.sdk import AshEvent, AshEventRecord, AshResult
 from ash.core.session import SessionLineage
 from ash.server.jsonrpc import JSONRPCServer
@@ -96,6 +97,7 @@ async def test_jsonrpc_initialize_advertises_versioned_contracts() -> None:
     )
 
     assert response["result"]["protocol_version"] == 1
+    assert response["result"]["server"] == {"name": "ash", "version": __version__}
     assert response["result"]["capabilities"]["event_schema_version"] == 1
     assert response["result"]["capabilities"]["event_replay"] is True
     assert response["result"]["capabilities"]["session_tree"] is True

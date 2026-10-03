@@ -8,13 +8,13 @@ import json
 import base64
 import math
 from collections.abc import AsyncIterator
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from typing import Any, Awaitable, Callable
 
 import httpx
 
+from ash import __version__
 from ash.core.redaction import redact_known_secrets
 from ash.safe_io import strict_json_loads
 from ash.mcp.server import MCPServerConfig, resolve_mcp_stdio_launch
@@ -4085,7 +4085,4 @@ def _validate_jsonrpc_message(message: dict[str, Any]) -> None:
 
 
 def _client_version() -> str:
-    try:
-        return version("ash-ai")
-    except PackageNotFoundError:
-        return "0.1.0"
+    return __version__

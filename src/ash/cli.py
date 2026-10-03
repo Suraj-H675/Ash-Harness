@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
-import importlib.metadata
 import json
 import math
 import os
@@ -1161,14 +1160,14 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     from ash.commands.sessions import render_session_search_hits
 
                     try:
-                        hits = loop.session_store.search_session_messages(
+                        session_hits = loop.session_store.search_session_messages(
                             project_path=loop.project_root,
                             query=query,
                         )
                     except ValueError as exc:
                         print(f"Error: {exc}", file=sys.stderr)
                         continue
-                    print(render_session_search_hits(hits), flush=True)
+                    print(render_session_search_hits(session_hits), flush=True)
                     continue
                 query = " ".join(arguments)
                 sessions = loop.session_store.list_sessions(
@@ -2368,10 +2367,9 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main_impl(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ash", description="Ash coding harness REPL")
-    try:
-        version = importlib.metadata.version("ash-ai")
-    except importlib.metadata.PackageNotFoundError:
-        version = "0.1.0"
+    from ash import __version__
+
+    version = __version__
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser.add_argument("--version", action="version", version=f"ash {version}")
     parser.add_argument(

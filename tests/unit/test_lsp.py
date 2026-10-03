@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from ash import __version__
 import ash.cli as ash_cli
 import ash.commands.lsp as cli_lsp
 import ash.lsp.manager as manager_module
@@ -625,6 +626,11 @@ async def test_manager_uses_real_lsp_subprocess(tmp_path: Path) -> None:
         "shutdown",
         "exit",
     } <= methods
+    initialize = next(event for event in events if event.get("method") == "initialize")
+    assert initialize["params"]["clientInfo"] == {
+        "name": "ash",
+        "version": __version__,
+    }
 
 
 @pytest.mark.asyncio

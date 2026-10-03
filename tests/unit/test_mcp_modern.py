@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
+from ash import __version__
 from ash.mcp import client as mcp_client_module
 from ash.mcp.client import (
     MCPClient,
@@ -24,6 +25,12 @@ from ash.mcp.server import (
     MCPServerConfig,
 )
 from ash.safety.guard import SafetyGuard
+
+
+def test_mcp_client_version_matches_package_identity() -> None:
+    from ash.mcp.client import _client_version
+
+    assert _client_version() == __version__
 
 
 @pytest.mark.asyncio

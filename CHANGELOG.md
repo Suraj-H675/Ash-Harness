@@ -6,6 +6,79 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.2.0] - 2026-10-03
+
+### Upgrade notes
+- The durable session database advances from schema v17 to v18 to add the
+  maintained FTS5 transcript index. Ash creates a validated
+  `before-v18-migration` backup beside the database before migrating. Rolling
+  the package back to `0.1.0` after `0.2.0` has opened that database also
+  requires restoring the compatible pre-v18 backup; package rollback alone
+  does not downgrade user data.
+
+### Added
+- Added enterprise provider routes and identity flows for Azure OpenAI, Amazon
+  Bedrock, and Vertex AI, plus stronger live model discovery, capability truth,
+  same-provider credential rotation, and current OpenAI/Anthropic/Gemini model
+  semantics.
+- Added production-grade multi-agent/workspace ergonomics, including stronger
+  isolated worktree execution, durable/background orchestration boundaries, and
+  optional per-custom-agent `provider/model` routing with consistent in-process,
+  subprocess, and nested-agent behavior.
+- Added the complete browser/web parity layer: guarded interactive browser
+  control, signed-in browser state reuse, public web retrieval, remote/browser
+  control surfaces, and explicit exact-loopback origins for testing local web
+  applications without opening LAN/private-network access.
+- Added stronger extension authoring and lifecycle UX with validate/inspect,
+  provenance and deprecation reporting, command/agent inventory, signed catalog
+  metadata, and a documented local development workflow.
+- Added first-party remote operator access through `ash remote` and a same-origin
+  browser control UI, with session selection/transcript restore, streamed turns,
+  steering, and explicit live approvals on the authenticated HTTP/SSE boundary.
+- Added full-text durable session transcript search scoped to the current
+  project, backed by a schema-v18 FTS5 migration with bounded redacted excerpts
+  for both operator and read-only model retrieval.
+- Added user-experience hardening across first-run setup, progressive provider
+  selection, tri-state project trust, session-only model/mode explanations,
+  permission-mode help, interrupted-turn recovery inspection, same-release
+  repair, and clearer Doctor/reset maintenance guidance.
+
+### Changed
+- Release publication now depends on the complete reusable supported-host CI
+  workflow, and the release smoke requires the installed wheel's exact Ash
+  version to match the immutable release tag before publication.
+- Closed the finite provider, agent/workspace, web/computer interaction,
+  extensibility, interface/access, UX, and final adversarial parity programs at
+  explicit product boundaries rather than feature-count equivalence.
+- Tightened provider/model capability and pricing truth so unknown or
+  unverified metadata stays conservative instead of inheriting optimistic
+  defaults.
+- Clarified context compaction as deterministic extractive summarization with
+  no hidden helper-model call, preserving durable anchors across repeated
+  compaction cycles while retaining the recent live window.
+- Unified runtime package identity so CLI, JSON-RPC, MCP, and LSP advertise the
+  installed Ash package version instead of release-specific literals.
+
+### Fixed
+- Hardened local-runtime stream cancellation, provider failover and credential
+  rotation, macOS process-group cleanup, ACP notification ordering, and several
+  provider-specific compatibility paths discovered during parity verification.
+- Fixed stale public claims and help text around provider authentication scope,
+  JSON-RPC transport, browser runtime actions, LSP advisory operations, process
+  capabilities, and whole-product parity boundaries.
+
+### Security
+- Kept local browser access fail-closed through user-owned exact loopback
+  origins, request interception, proxy enforcement, and loopback-only DNS
+  validation; LAN/private-network and mixed-address resolutions remain blocked.
+- Preserved fail-closed trust and remote-control boundaries across project
+  configuration, approvals, A2A/HTTP access, extension provenance, and agent
+  isolation while expanding the supported UX around them.
+
+## [0.1.0] - 2026-10-02
+
 ### Added
 - Added live interactive `/mcp status` reporting with text and JSON output,
   transport/auth state, discovered-tool counts, and bounded redacted errors.
@@ -212,3 +285,7 @@ All notable changes to Ash are documented here. The format follows
 - Added package license metadata, project links, classifiers, and a changelog.
 - Fixed duplicate `project.urls` tables so the distribution builds with modern
   `setuptools`; expanded CI across Python 3.11 and 3.12.
+
+[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.2.0...HEAD
+[0.2.0]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.1.0...ash-v0.2.0
+[0.1.0]: https://github.com/Suraj-H675/Ash-Harness/releases/tag/ash-v0.1.0

@@ -6,6 +6,7 @@ import asyncio
 import math
 from typing import Any, Awaitable, Callable
 
+from ash import __version__
 from ash.sdk import AshClient
 from ash.core.events import EVENT_SCHEMA_VERSION
 from ash.core.redaction import redact_text
@@ -199,7 +200,7 @@ class JSONRPCServer:
     async def _initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         return {
             "protocol_version": 1,
-            "server": {"name": "ash", "version": "0.1.0"},
+            "server": {"name": "ash", "version": __version__},
             "capabilities": {
                 "turns": True,
                 "sessions": True,
