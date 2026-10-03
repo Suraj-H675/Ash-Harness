@@ -546,6 +546,9 @@ Ash is extensible without changing the core runtime:
 - bounded lifecycle hooks for sessions, turns, models, tools, errors, and
   policy gates.
 
+For component formats and the local development/publishing workflow, see
+[Extension authoring](docs/guides/EXTENSIONS.md).
+
 Critical pre-tool hooks fail closed. Observer-hook failures cannot corrupt a
 completed turn. Custom Markdown commands support arguments, namespaces,
 completion, and trusted user or project sources.

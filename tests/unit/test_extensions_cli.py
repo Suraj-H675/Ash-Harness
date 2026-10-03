@@ -79,6 +79,7 @@ def test_extension_inventory_discovers_user_extensions(
         "review",
     }
     assert payload["plugins"][0]["name"] == "example"
+    assert payload["commands"] == []
     assert payload["hooks"][0]["session_start"] == 1
     assert payload["hooks"][0]["turn_end"] == 1
     assert payload["errors"] == []
@@ -240,6 +241,57 @@ def test_extensions_cli_reports_invalid_skill_without_hiding_valid_skills(
     assert "Invalid skill" in payload["errors"][0]
 
 
+def test_extensions_inventory_lists_namespaced_plugin_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    plugin = home / ".ash" / "plugins" / "example"
+    command = plugin / "commands" / "review.md"
+    command.parent.mkdir(parents=True)
+    command.write_text(
+        "---\ndescription: Review a path\n---\nReview $ARGUMENTS",
+        encoding="utf-8",
+    )
+    (plugin / "plugin.json").write_text(
+        json.dumps({"name": "example", "version": "1.0.0"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    inventory = discover_extensions(workspace)
+
+    assert inventory.commands[0].name == "example:review"
+    assert inventory.commands[0].description == "Review a path"
+    assert inventory.commands[0].source == "plugin:example"
+
+
+def test_extensions_cli_commands_respects_project_trust(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    command = workspace / ".ash" / "commands" / "review.md"
+    command.parent.mkdir(parents=True)
+    command.write_text("Review $ARGUMENTS", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+
+    assert main(["extensions", "commands", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["commands"] == []
+
+    set_workspace_trusted(workspace, True)
+    assert main(["extensions", "commands", "--json"]) == 0
+    commands = json.loads(capsys.readouterr().out)["commands"]
+    assert commands[0]["name"] == "review"
+    assert commands[0]["source"] == "project"
+
+
 def test_extensions_inventory_keeps_disabled_plugin_but_removes_its_skills(
     tmp_path: Path,
     monkeypatch,
@@ -290,6 +342,7 @@ def test_extension_inventory_human_rendering_neutralizes_plugin_metadata() -> No
         workspace="/tmp/repo",
         project_trusted=True,
         skills=(),
+        commands=(),
         agents=(),
         plugins=(
             PluginSummary(
@@ -1113,23 +1166,25 @@ def _write_publisher_catalog(
     sequence: int = 1,
     version: str = "1.0.0",
     ref: str = "v1.0.0",
+    description: str = "",
 ) -> Path:
     encoded_private = (
         base64.urlsafe_b64encode(private_key.private_bytes_raw()).rstrip(b"=").decode()
     )
+    entry = {
+        "name": name,
+        "version": version,
+        "source": source,
+        "ref": ref,
+        "digest": digest,
+    }
+    if description:
+        entry["description"] = description
     catalog_payload = {
         "version": 2,
         "publisher": publisher,
         "sequence": sequence,
-        "entries": [
-            {
-                "name": name,
-                "version": version,
-                "source": source,
-                "ref": ref,
-                "digest": digest,
-            }
-        ],
+        "entries": [entry],
     }
     path = root / filename
     path.write_text(
@@ -1355,7 +1410,11 @@ def test_multi_catalog_search_and_publisher_qualified_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ash.commands.extensions import catalog_entry_for_name, search_catalog_plugins
+    from ash.commands.extensions import (
+        catalog_entry_for_name,
+        render_catalog_search,
+        search_catalog_plugins,
+    )
     from ash.plugins.lifecycle import PluginLifecycleError
 
     private_key = Ed25519PrivateKey.generate()
@@ -1379,6 +1438,7 @@ def test_multi_catalog_search_and_publisher_qualified_selection(
         digest="b" * 64,
         private_key=private_key,
         sequence=9,
+        description="Beta review helpers",
     )
     monkeypatch.setenv("ASH_CATALOG_KEYS", str(keys))
 
@@ -1397,6 +1457,16 @@ def test_multi_catalog_search_and_publisher_qualified_selection(
     selected = catalog_entry_for_name("@beta/demo", catalog=[alpha, beta])
     assert selected.publisher == "beta"
     assert selected.source == "https://plugins.example/beta-demo.git"
+    assert selected.description == "Beta review helpers"
+    _, description_matches = search_catalog_plugins(
+        "review helpers",
+        catalog=[alpha, beta],
+    )
+    assert [(entry.publisher, entry.name) for entry in description_matches] == [
+        ("beta", "demo")
+    ]
+    rendered = render_catalog_search(catalogs, entries)
+    assert "Beta review helpers" in rendered
     with pytest.raises(PluginLifecycleError, match="@publisher/name"):
         catalog_entry_for_name("@beta/demo/extra", catalog=[alpha, beta])
 

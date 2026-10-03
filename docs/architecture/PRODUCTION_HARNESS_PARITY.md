@@ -118,11 +118,11 @@ The program is intentionally finite:
    control breadth, signed-in browser workflows, web research/fetch ergonomics,
    browser attachment/remote operation, and whether general computer use is a
    justified Ash capability rather than copying broader assistant products.
-4. **P4 — Extensibility/ecosystem parity — OPEN.** Evaluate plugins,
+4. **P4 — Extensibility/ecosystem parity — CLOSED.** Evaluate plugins,
    skills, MCP, hooks, custom commands, discovery, installation, updating,
    provenance/trust, and marketplace/ecosystem experience. Hosted ecosystem
    breadth is work only when it materially improves real Ash usage.
-5. **P5 — Interfaces and anywhere-access parity — NOT STARTED.** Determine
+5. **P5 — Interfaces and anywhere-access parity — OPEN.** Determine
    whether remote access, web UI, messaging surfaces, companion clients, or
    other access modalities solve important Ash workflows; implement justified
    gaps and explicitly reject unrelated product categories.
@@ -143,10 +143,11 @@ The program is intentionally finite:
    important unresolved user need remains may Ash claim whole-product
    leading-harness parity. Literal feature identity is never the criterion.
 
-**Active gate: P4 — Extensibility/ecosystem parity.** P1, P2, and P3 are closed
-at their bounded finish conditions. Do not reopen them for feature-count churn;
-reopen only for concrete evidence that an important supported provider/model,
-agent/workspace, or web/computer-interaction user need or claim is wrong.
+**Active gate: P5 — Interfaces and anywhere-access parity.** P1 through P4 are
+closed at their bounded finish conditions. Do not reopen them for feature-count
+churn; reopen only for concrete evidence that an important supported
+provider/model, agent/workspace, web/computer-interaction, or extensibility user
+need or claim is wrong.
 
 ### P4 finite closure checklist
 
@@ -161,22 +162,33 @@ exists in a broader assistant product.
    lifecycle, interactions, trust, and transport surface. Optional capabilities
    that Ash does not implement remain explicitly unclaimed. Upstream reference:
    [MCP v2 protocol versions](https://ts.sdk.modelcontextprotocol.io/v2/protocol-versions).
-2. **P4B — Plugin authoring and lifecycle — OPEN.** Make the existing plugin
-   contract practical to author and diagnose, not merely safe to execute.
-   Installation, validation, inspection, local development, update, reload,
-   dependency handling, and failure recovery must form one understandable
-   workflow without weakening Plugin API isolation.
-3. **P4C — Skills, commands, hooks, and agents — OPEN.** Verify that the
+2. **P4B — Plugin authoring and lifecycle — CLOSED.** The plugin contract is
+   now documented as one end-to-end workflow: conventional/default component
+   layout, schema-v2 manifests, immutable no-install validation, inspection,
+   trusted project-local edit/reload, user-level copy/install/replace, tracked
+   Git/catalog updates, dependencies, publishing, and crash recovery. Ash does
+   not add a symlink-style development install because linked plugin trees
+   conflict with its snapshot/identity trust boundary; project-local plugins
+   already provide the fast iterative path.
+3. **P4C — Skills, commands, hooks, and agents — CLOSED.** Verify that the
    non-executable extension surfaces have intentional installation/discovery,
    namespacing, trust, activation, authoring, and lifecycle ergonomics. Prefer
    the standard Agent Skills model; do not promote the legacy in-process
-   executable-skill compatibility API into the default runtime.
-4. **P4D — Discovery, provenance, and marketplace trust — OPEN.** Close the
-   user journey from finding an extension through trusted acquisition and
-   later update/removal. A first-party hosted public marketplace is required
-   only if evidence shows it is necessary to solve an important Ash workflow;
-   ecosystem size by itself is not a parity criterion.
-5. **P4E — Integrated extensibility conformance — OPEN.** Exercise realistic
+   executable-skill compatibility API into the default runtime. Direct
+   user/project components intentionally remain local configuration; reusable
+   install/update/provenance semantics come from packaging them as one plugin
+   rather than maintaining parallel package managers for every component type.
+4. **P4D — Discovery, provenance, and marketplace trust — CLOSED.** Signed
+   catalog v2 provides publisher identity, pinned signer material, sequence
+   rollback protection, exact source/ref/digest binding, multi-publisher search,
+   registered catalog sources, qualified selection, and tracked update
+   provenance. Search entries can additionally carry a bounded signed
+   human-facing description, and installed inventory/inspection exposes
+   recorded managed provenance. Ash deliberately stops at user-owned signed
+   catalogs instead of operating a first-party hosted marketplace until real
+   adoption demonstrates that hosting/curation solves a material Ash need;
+   comparator ecosystem size alone is not a core-harness requirement.
+5. **P4E — Integrated extensibility conformance — CLOSED.** Exercise realistic
    install/use/reload/update/uninstall and failure/trust journeys, run a current
    comparator pass, and make the user-facing support claims match the verified
    boundary.
@@ -184,24 +196,66 @@ exists in a broader assistant product.
 ### P4 finish flags
 
 - `P4A_MCP_ECOSYSTEM_CONFORMANCE = CLOSED`
-- `P4B_PLUGIN_AUTHORING_LIFECYCLE = OPEN`
-- `P4C_DECLARATIVE_EXTENSION_ERGONOMICS = OPEN`
-- `P4D_DISCOVERY_PROVENANCE_MARKETPLACE = OPEN`
-- `P4E_INTEGRATED_EXTENSIBILITY_CONFORMANCE = OPEN`
-- `P4_EXTENSIBILITY_ECOSYSTEM_PARITY = OPEN`
+- `P4B_PLUGIN_AUTHORING_LIFECYCLE = CLOSED`
+- `P4C_DECLARATIVE_EXTENSION_ERGONOMICS = CLOSED`
+- `P4D_DISCOVERY_PROVENANCE_MARKETPLACE = CLOSED`
+- `P4E_INTEGRATED_EXTENSIBILITY_CONFORMANCE = CLOSED`
+- `P4_EXTENSIBILITY_ECOSYSTEM_PARITY = CLOSED`
 
 These flags are the stop conditions for P4. Once all five are closed with
 current evidence, advance to P5 rather than continuing to add extension types
 or marketplace features for feature-count parity.
 
-The first P4B authoring/diagnostics slice adds immutable no-install validation
-and inspection through `ash extensions validate TARGET` and
-`ash extensions inspect TARGET`. Installed inventory now exposes managed
-Git/catalog provenance when present and surfaces deprecated manifest-schema
-warnings, including in the interactive `/plugins` inventory. This closes the
-previous gap where Ash persisted trust/provenance but ordinary users could not
-inspect it. P4B remains open for the remaining local authoring/development
-workflow rather than being declared complete from diagnostics alone.
+The P4B/P4C/P4D closure slice adds immutable no-install validation and
+inspection through `ash extensions validate TARGET` and
+`ash extensions inspect TARGET`, exposes managed Git/catalog provenance and
+deprecated schema warnings in inventory, documents the complete local
+authoring/reload/publishing workflow, and makes signed catalog search useful for
+humans with an optional bounded description field. The declarative component
+boundary stays intentionally simple: author directly for local user/project
+configuration, package as a plugin when the component needs distribution,
+namespacing, update, or provenance. Shared extension inventory also covers
+custom commands, including project-trust gating and plugin namespacing, rather
+than leaving commands visible only through the interactive `/commands` path.
+
+### P4E closure — integrated extensibility conformance
+
+P4E closes after a current implementation and comparator pass rather than by
+matching ecosystem size. The focused extensibility gate passes **452 tests**
+across plugin lifecycle/recovery, install records, updates, executable runtime,
+signed catalogs/marketplaces, instruction skills, hooks, commands, custom
+agents, manifest/registry/snapshot behavior, CLI inventory, and slash-command
+surfaces. Ruff, targeted Mypy, and diff checks are also clean.
+
+The 2026-10-03 comparator refresh rechecked current first-party extension
+workflows:
+
+- OpenClaw provides plugin init/build/validate/pack scaffolds:
+  <https://docs.openclaw.ai/cli/plugins/authoring>.
+- Gemini CLI provides templates, a gallery, local extension linking, validation,
+  and update management:
+  <https://geminicli.com/docs/extensions/reference/>.
+- Hermes provides first-party plugin and skill-hub workflows:
+  <https://hermes-agent.nousresearch.com/docs/guides/work-with-skills/>.
+- OpenCode demonstrates that a strong extension model can use ordinary package
+  distribution and local project/user plugins rather than requiring a dedicated
+  hosted marketplace:
+  <https://opencode.ai/v2/docs/plugins>.
+
+Ash keeps the comparator features that solve the same coding-harness needs and
+rejects the ones that weaken its boundary or add infrastructure without current
+user value. Project-local plugins provide the fast edit/reload loop, so a
+symlink-style development install is unnecessary and would conflict with
+descriptor/snapshot identity guarantees. A generator/scaffold remains optional
+convenience because Ash's declarative plugin layout is already small,
+documented, and directly validated. Signed user-owned catalogs remain the
+distribution boundary until real adoption justifies operating a hosted
+curation service.
+
+No material P4 user need remains unresolved under that product boundary.
+`P4E_INTEGRATED_EXTENSIBILITY_CONFORMANCE = CLOSED` and
+`P4_EXTENSIBILITY_ECOSYSTEM_PARITY = CLOSED`. The roadmap advances to P5
+interfaces and anywhere-access parity.
 
 ### P1 finite closure checklist
 

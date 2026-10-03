@@ -50,7 +50,7 @@ from ash.plugins.validation import validate_plugin_contents, validate_plugin_con
 from ash.plugins.manifest import PluginManifest
 from ash.ui.safe_text import terminal_safe_text
 
-ExtensionKind = Literal["all", "skills", "agents", "plugins", "hooks"]
+ExtensionKind = Literal["all", "skills", "commands", "agents", "plugins", "hooks"]
 PluginAction = Literal["install", "enable", "disable", "uninstall"]
 MAX_PLUGIN_DIAGNOSTIC_CHARS = 512
 CatalogSource = Path | str
@@ -63,6 +63,7 @@ CatalogSelection = (
 ExtensionAction = Literal[
     "all",
     "skills",
+    "commands",
     "agents",
     "plugins",
     "hooks",
@@ -257,6 +258,16 @@ def render_extension_inventory(
             for skill in inventory.skills
         )
         if not inventory.skills:
+            lines.append("  (none)")
+    if kind in {"all", "commands"}:
+        lines.append("Commands:")
+        lines.extend(
+            f"  /{safe_plugin_diagnostic(command.name)} [{safe_plugin_diagnostic(command.source)}]"
+            f": {safe_plugin_diagnostic(command.description)} "
+            f"({safe_plugin_diagnostic(command.path)})"
+            for command in inventory.commands
+        )
+        if not inventory.commands:
             lines.append("  (none)")
     if kind in {"all", "agents"}:
         lines.append("Agents:")
@@ -504,6 +515,7 @@ def search_catalog_plugins(
                     f"@{entry.publisher}/{entry.name}" if entry.publisher else entry.name,
                     entry.name,
                     entry.version,
+                    entry.description,
                     entry.source,
                     entry.ref,
                 )
@@ -523,6 +535,7 @@ def render_catalog_search(
             **({"publisher": entry.publisher} if entry.publisher is not None else {}),
             "name": entry.name,
             "version": entry.version,
+            **({"description": entry.description} if entry.description else {}),
             "source": entry.source,
             "ref": entry.ref,
             "digest": entry.digest,
@@ -570,11 +583,15 @@ def render_catalog_search(
         version = terminal_safe_text(entry.version, single_line=True)
         source = terminal_safe_text(entry.source, single_line=True)
         ref = terminal_safe_text(entry.ref, single_line=True)
-        lines.append(
+        description = terminal_safe_text(entry.description, single_line=True)
+        line = (
             f"  @{publisher}/{name} {version} [{source}@{ref}]"
             if publisher is not None
             else f"  {name} {version} [{source}@{ref}]"
         )
+        if description:
+            line += f" - {description}"
+        lines.append(line)
     if not entries:
         lines.append("  (none)")
     return "\n".join(lines)

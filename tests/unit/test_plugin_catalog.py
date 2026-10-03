@@ -168,6 +168,107 @@ def test_signed_catalog_v2_binds_publisher_identity(tmp_path: Path) -> None:
     assert verified.entries["demo"].publisher == "acme-labs"
 
 
+def test_signed_catalog_entry_accepts_bounded_description(tmp_path: Path) -> None:
+    private_key, public_key, key_id = generate_catalog_signing_key()
+    keys = tmp_path / "keys.json"
+    keys.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": key_id,
+                        "algorithm": "ed25519",
+                        "publicKey": public_key,
+                    }
+                ],
+            }
+        )
+    )
+    catalog = {
+        "version": 2,
+        "publisher": "acme-labs",
+        "sequence": 1,
+        "entries": [
+            {
+                "name": "demo",
+                "version": "1.2.3",
+                "description": "Review and release helpers",
+                "source": "https://plugins.example/demo.git",
+                "ref": "v1.2.3",
+                "digest": "0" * 64,
+            }
+        ],
+    }
+    path = tmp_path / "catalog.json"
+    path.write_text(
+        json.dumps(
+            {
+                "catalog": catalog,
+                "keyId": key_id,
+                "algorithm": "ed25519",
+                "signature": sign_catalog(catalog, private_key),
+            }
+        )
+    )
+
+    verified = parse_and_verify_catalog(path, trusted_keys_path=keys)
+
+    assert verified.entries["demo"].description == "Review and release helpers"
+
+
+@pytest.mark.parametrize("description", ["bad\nline", "\x1b[2J", "x" * 1025])
+def test_signed_catalog_entry_rejects_invalid_description(
+    tmp_path: Path,
+    description: str,
+) -> None:
+    private_key, public_key, key_id = generate_catalog_signing_key()
+    keys = tmp_path / "keys.json"
+    keys.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "keys": [
+                    {
+                        "keyId": key_id,
+                        "algorithm": "ed25519",
+                        "publicKey": public_key,
+                    }
+                ],
+            }
+        )
+    )
+    catalog = {
+        "version": 2,
+        "publisher": "acme-labs",
+        "sequence": 1,
+        "entries": [
+            {
+                "name": "demo",
+                "version": "1.2.3",
+                "description": description,
+                "source": "https://plugins.example/demo.git",
+                "ref": "v1.2.3",
+                "digest": "0" * 64,
+            }
+        ],
+    }
+    path = tmp_path / "catalog.json"
+    path.write_text(
+        json.dumps(
+            {
+                "catalog": catalog,
+                "keyId": key_id,
+                "algorithm": "ed25519",
+                "signature": sign_catalog(catalog, private_key),
+            }
+        )
+    )
+
+    with pytest.raises(PluginCatalogError, match="description"):
+        parse_and_verify_catalog(path, trusted_keys_path=keys)
+
+
 def test_signed_catalog_v2_rejects_publisher_changed_after_signing(tmp_path: Path) -> None:
     private_key, public_key, key_id = generate_catalog_signing_key()
     keys = tmp_path / "keys.json"

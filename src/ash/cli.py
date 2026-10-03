@@ -2779,7 +2779,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     permissions_clear.add_argument("--yes", action="store_true")
     permissions_clear.add_argument("--json", action="store_true")
     extensions_parser = subparsers.add_parser(
-        "extensions", help="Inspect and manage skills, plugins, and hooks"
+        "extensions", help="Inspect and manage Ash extension components"
     )
     extensions_parser.add_argument(
         "extensions_action",
@@ -2787,6 +2787,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         choices=[
             "all",
             "skills",
+            "commands",
             "agents",
             "plugins",
             "hooks",

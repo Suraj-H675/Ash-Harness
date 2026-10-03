@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from ash.commands.custom_commands import CommandSource, CustomCommandCatalog
 from ash.hooks.config import MAX_HOOK_CONFIG_BYTES, load_command_hooks
 from ash.json_utils import strict_json_loads
 from ash.mcp.server import load_mcp_servers
@@ -37,6 +38,14 @@ class AgentSummary:
     description: str
     base_role: str
     path: str
+
+
+@dataclass(frozen=True)
+class CommandSummary:
+    name: str
+    description: str
+    path: str
+    source: str
 
 
 @dataclass(frozen=True)
@@ -88,6 +97,7 @@ class ExtensionInventory:
     workspace: str
     project_trusted: bool
     skills: tuple[SkillSummary, ...]
+    commands: tuple[CommandSummary, ...]
     agents: tuple[AgentSummary, ...]
     plugins: tuple[PluginSummary, ...]
     hooks: tuple[HookConfigSummary, ...]
@@ -98,6 +108,7 @@ class ExtensionInventory:
             "workspace": self.workspace,
             "project_trusted": self.project_trusted,
             "skills": [asdict(item) for item in self.skills],
+            "commands": [asdict(item) for item in self.commands],
             "agents": [asdict(item) for item in self.agents],
             "plugins": [asdict(item) for item in self.plugins],
             "hooks": [asdict(item) for item in self.hooks],
@@ -158,6 +169,22 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
     )
     skill_catalog = SkillCatalog(tuple(skill_roots))
     discovered_skills = skill_catalog.discover()
+    command_sources: list[tuple[Path, str] | CommandSource] = [
+        (Path.home() / ".ash" / "commands", "user")
+    ]
+    if trusted:
+        command_sources.append((workspace / ".ash" / "commands", "project"))
+    command_sources.extend(
+        CommandSource(
+            paths=plugin.command_paths(),
+            source=f"plugin:{plugin.manifest.name}",
+            namespace=plugin.manifest.name,
+        )
+        for plugin in discovered_plugins
+        if plugin.enabled
+    )
+    command_catalog = CustomCommandCatalog(tuple(command_sources))
+    discovered_commands = command_catalog.discover()
     agent_sources: list[Path | AgentSource] = [Path.home() / ".ash" / "agents"]
     if trusted:
         agent_sources.append(workspace / ".ash" / "agents")
@@ -179,6 +206,10 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
     errors.extend(
         f"Invalid skill {path}: {error}"
         for path, error in sorted(skill_catalog.errors.items())
+    )
+    errors.extend(
+        f"Invalid command {path}: {error}"
+        for path, error in sorted(command_catalog.errors.items())
     )
     errors.extend(
         f"Invalid agent {path}: {error}"
@@ -210,6 +241,15 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
                 path=str(skill.path),
             )
             for skill in sorted(discovered_skills, key=lambda item: item.name)
+        ),
+        commands=tuple(
+            CommandSummary(
+                name=command.name,
+                description=command.description,
+                path=str(command.path),
+                source=command.source,
+            )
+            for command in sorted(discovered_commands, key=lambda item: item.name)
         ),
         agents=tuple(
             AgentSummary(

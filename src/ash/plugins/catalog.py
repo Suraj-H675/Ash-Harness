@@ -262,6 +262,7 @@ class CatalogEntry:
     ref: str
     digest: str
     publisher: str | None = None
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -459,19 +460,20 @@ def _validate_catalog(
 
 
 def _validate_entry(item: Any, *, publisher: str | None = None) -> CatalogEntry:
-    if not isinstance(item, dict) or set(item) != {
-        "name",
-        "version",
-        "source",
-        "ref",
-        "digest",
-    }:
+    required_fields = {"name", "version", "source", "ref", "digest"}
+    allowed_fields = {*required_fields, "description"}
+    if (
+        not isinstance(item, dict)
+        or not required_fields.issubset(item)
+        or not set(item).issubset(allowed_fields)
+    ):
         raise PluginCatalogError("invalid plugin catalog entry")
     name = item["name"]
     version = item["version"]
     source = item["source"]
     ref = item["ref"]
     digest = item["digest"]
+    description = item.get("description", "")
     if not isinstance(name, str) or not _PLUGIN_NAME.fullmatch(name):
         raise PluginCatalogError("invalid plugin catalog entry name")
     if not isinstance(version, str) or not version or len(version) > 128:
@@ -497,6 +499,12 @@ def _validate_entry(item: Any, *, publisher: str | None = None) -> CatalogEntry:
         raise PluginCatalogError("invalid plugin catalog entry ref")
     if not isinstance(digest, str) or not GIT_DIGEST_PATTERN.fullmatch(digest):
         raise PluginCatalogError("invalid plugin catalog entry digest")
+    if (
+        not isinstance(description, str)
+        or len(description) > 1024
+        or any(ord(character) < 32 or ord(character) == 127 for character in description)
+    ):
+        raise PluginCatalogError("invalid plugin catalog entry description")
     return CatalogEntry(
         name=name,
         version=version,
@@ -504,6 +512,7 @@ def _validate_entry(item: Any, *, publisher: str | None = None) -> CatalogEntry:
         ref=ref,
         digest=digest,
         publisher=publisher,
+        description=description.strip(),
     )
 
 
