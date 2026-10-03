@@ -585,6 +585,7 @@ def test_browser_configuration_is_user_owned_and_bounded() -> None:
     config = AshConfig(
         browser_headless=False,
         browser_timeout_seconds=45,
+        allowed_web_domains=["example.com"],
         browser_cdp_url="http://127.0.0.1:9222",
         browser_cdp_reuse_storage_state=True,
     )
@@ -597,6 +598,11 @@ def test_browser_configuration_is_user_owned_and_bounded() -> None:
         AshConfig(browser_timeout_seconds=121)
     with pytest.raises(ValueError, match="requires browser_cdp_url"):
         AshConfig(browser_cdp_reuse_storage_state=True)
+    with pytest.raises(ValueError, match="requires non-empty allowed_web_domains"):
+        AshConfig(
+            browser_cdp_url="http://127.0.0.1:9222",
+            browser_cdp_reuse_storage_state=True,
+        )
     with pytest.raises(ValueError, match="cannot be combined"):
         AshConfig(
             browser_cdp_url="http://127.0.0.1:9222",

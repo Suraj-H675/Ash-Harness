@@ -1550,6 +1550,7 @@ def test_runtime_passes_user_owned_cdp_settings_to_browser_tools(tmp_path, monke
         db_directory=tmp_path / "db",
         memory_backend="off",
         automation_enabled=False,
+        allowed_web_domains=["example.com"],
         browser_cdp_url="http://127.0.0.1:9222",
         browser_cdp_reuse_storage_state=True,
     )
@@ -1563,6 +1564,7 @@ def test_runtime_passes_user_owned_cdp_settings_to_browser_tools(tmp_path, monke
 
     assert captured["cdp_url"] == "http://127.0.0.1:9222"
     assert captured["cdp_reuse_storage_state"] is True
+    assert captured["allowed_domains"] == ["example.com"]
     assert captured["profile_path"] is None
 
 

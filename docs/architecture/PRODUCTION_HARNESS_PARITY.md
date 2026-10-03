@@ -1055,7 +1055,7 @@ assistant surface exposed by gateway products.
 
 - `P3A_WEB_RETRIEVAL = CLOSED`
 - `P3B_BROWSER_INTERACTION = CLOSED`
-- `P3C_SIGNED_IN_BROWSER = OPEN`
+- `P3C_SIGNED_IN_BROWSER = CLOSED`
 - `P3D_REMOTE_BROWSER_OPERATION = OPEN`
 - `P3E_DESKTOP_COMPUTER_USE = OPEN`
 - `P3F_INTERACTION_CONFORMANCE = OPEN`
@@ -1188,6 +1188,62 @@ Comparator references rechecked on 2026-10-03:
 `https://docs.openclaw.ai/tools/browser-control`,
 `https://hermes-agent.nousresearch.com/docs/user-guide/features/browser/`, and
 `https://developers.openai.com/api/docs/guides/tools-computer-use`.
+
+### P3C closure — explicit signed-in browser consent
+
+P3C is CLOSED. Ash now has two deliberate authenticated-browser paths, both
+off by default and both user-owned rather than project-configurable:
+
+- **Ash-owned persistent profile.** `browser_persistent_profile=true` uses a
+  private Chromium user-data directory under Ash's local state. The default
+  remains ephemeral. Users who need to sign in manually can combine the
+  persistent profile with headed mode and complete login themselves in the
+  visible browser; model-facing `browser_type` still refuses password fields.
+  Real Chromium E2E proves a persistent auth cookie survives an Ash browser
+  restart.
+- **Existing-browser state import.** Loopback-only CDP attachment still never
+  takes direct ownership of the source browser's tabs. Read-only
+  `/browser inspect` inventories bounded/redacted tab metadata without reading
+  storage. Auth-state reuse requires the explicit `--reuse-storage-state`
+  action or equivalent user-owned config **and** a non-empty user-owned
+  `allowed_web_domains` allowlist. Ash filters the source state before creating
+  its isolated context: only cookies whose cookie domain matches that allowlist
+  and localStorage for matching HTTP(S) origins cross the boundary. Unrelated
+  cookies/origins are dropped, and extra storage categories such as IndexedDB
+  or passkey/private-key credential state are not copied. The same domain
+  allowlist also governs Ash browser network access, keeping credential scope
+  aligned with navigation scope.
+
+Consent is reversible. `/browser reset-profile` safely closes an active
+Ash-owned persistent browser if necessary and deletes only Ash's anchored
+`browser-profile` directory; subsequent browser use starts fresh. It does not
+modify the source browser used for CDP state import. Real Chromium E2E proves
+profile persistence and reset, scoped source-cookie import, source-browser
+survival, and runtime attach/disconnect. The CLI reports whether storage-state
+reuse is enabled and the exact configured domain scope.
+
+This is intentionally narrower than OpenClaw's direct existing-session/extension
+control and Hermes' whole-profile snapshot option. Current OpenClaw guidance
+explicitly treats signed-in profiles as sensitive state and prefers a dedicated
+agent profile by default; its manual-login guidance recommends that the user,
+not the model, perform login in that profile. Hermes likewise labels real-profile
+browsing a consent-gated convenience rather than an isolation boundary.
+Playwright warns that stored authentication state can contain impersonation-
+capable cookies/tokens. Ash therefore keeps direct personal-tab takeover and
+whole-profile copying out of the P3C contract: existing login reuse crosses into
+an Ash-owned policy context only through an explicit, domain-scoped state-copy
+boundary.
+
+P3C closure evidence: 70/70 focused signed-in browser/config/runtime/CLI unit
+tests, 11/11 complete real-Chromium browser E2E tests, Ruff clean, targeted
+Mypy clean, and `git diff --check` clean.
+
+Comparator references rechecked on 2026-10-03:
+`https://docs.openclaw.ai/tools/browser/profiles`,
+`https://docs.openclaw.ai/tools/browser-login`,
+`https://docs.openclaw.ai/gateway/security/browser-control`,
+`https://hermes-agent.nousresearch.com/docs/user-guide/features/browser/`, and
+`https://playwright.dev/docs/auth`.
 
 ### M4 product decisions
 
@@ -1456,7 +1512,7 @@ truthful evidence boundaries, not open mission blockers.
 | Git commit | Verified locally | Explicit commits require a path scope and refuse any pre-existing staged index state before staging; staged additions are secret-scanned and Git hook/stdout/stderr failures are surfaced. Automatic per-turn commits are stricter: candidates come only from successful Ash file mutations, `auto_commit_paths` acts only as an allowlist, paths dirty at turn start are skipped, post-edit SHA-256 ownership is rechecked before and after staging, and real dirty-repo journeys preserve same-file user edits instead of absorbing them. Explicit approved commits remain full-path scoped rather than hunk-owned. |
 | Tests/build/lint diagnostics | Verified locally | `run_command` parses bounded compiler/lint/pytest diagnostics into model-visible path, line, symbol, code, and message fields and aggregates pytest/MyPy/Ruff summary counts |
 | Web fetch/search | Verified locally | Guarded HTTP(S) fetch plus Brave/Tavily live search with credential auto-detection, auto fallback, fixed endpoints, freshness, bounded normalized sources, provider provenance, shared domain filtering, and durable citation objects are wired |
-| Browser automation | Strong partial | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets, blocked service workers/password fills, bounded ARIA snapshots, stable refs, navigation/click/type/scroll/history actions, bounded vision screenshots, safe workspace uploads and atomic bounded workspace downloads, setup/doctor support, deterministic cleanup, opt-in private Ash-owned profiles, and loopback-only CDP attachment to an existing Chromium browser through a separate Ash-owned policy context with optional bounded storage-state reuse. `/browser inspect` performs bounded read-only source-browser inventory (context/tab counts, terminal-safe titles, redacted URLs) without reading storage or page content; `/browser status`, `/browser connect`, and `/browser disconnect` hot-swap the browser family after candidate preflight without persisting config or taking ownership of the source browser. Real Chromium E2E proves inspection, isolated state reuse, hot-swap, and source-browser survival; remote CDP and direct ownership of pre-existing tabs remain intentionally unsupported |
+| Browser automation | Strong partial | Optional Playwright pack owns an isolated Chromium context with public-host/domain routing for requests and WebSockets, blocked service workers/password fills, bounded ARIA snapshots and visible-frame refs, structured modern interactions, explicit dialog state, bounded vision screenshots, safe workspace uploads and atomic bounded workspace downloads, setup/doctor support, deterministic cleanup, opt-in private Ash-owned persistent profiles, and loopback-only CDP attachment through a separate Ash-owned policy context. Existing-browser auth reuse is explicit and requires user-owned `allowed_web_domains`; only matching cookies/localStorage are copied, unrelated/future credential categories are dropped, and the source browser remains untouched. `/browser inspect` reads only bounded/redacted tab inventory; `/browser status`, `/browser connect`, `/browser disconnect`, and `/browser reset-profile` provide inspectable attach, detach, scope, and revocation controls. Real Chromium E2E proves persistent auth/reset, scoped state reuse, hot-swap, interaction breadth, and source-browser survival. Remote browser operation and general desktop computer use remain P3 follow-up decisions |
 | Ask-user tool | Verified locally | Typed blocking question with bounded options and explicit empty-answer failure |
 | Todo/plan tracking | Verified locally | Persisted sprint checklists are inspectable and updatable from the top-level CLI; active plan state is injected into every runtime model request with bounded context accounting |
 

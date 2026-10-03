@@ -556,6 +556,59 @@ async def test_real_chromium_proxy_blocks_redirect_and_subresource_targets(
 
 
 @pytest.mark.asyncio
+async def test_real_chromium_ash_owned_profile_persists_auth_state(tmp_path) -> None:
+    profile = tmp_path / "ash-browser-profile"
+    first = BrowserSession(
+        timeout_seconds=15,
+        profile_path=profile,
+    )
+    try:
+        await first.ensure_started()
+        assert first._context is not None
+        await first._context.add_cookies(
+            [
+                {
+                    "name": "ash_persistent_login",
+                    "value": "present",
+                    "url": "https://example.com/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "Lax",
+                    "expires": 2_000_000_000,
+                }
+            ]
+        )
+    finally:
+        await first.close()
+
+    second = BrowserSession(
+        timeout_seconds=15,
+        profile_path=profile,
+    )
+    try:
+        await second.ensure_started()
+        assert second._context is not None
+        copied = await second._context.cookies("https://example.com/")
+        assert [(item["name"], item["value"]) for item in copied] == [
+            ("ash_persistent_login", "present")
+        ]
+        assert await second.reset_persistent_profile() is True
+    finally:
+        await second.close()
+
+    third = BrowserSession(
+        timeout_seconds=15,
+        profile_path=profile,
+    )
+    try:
+        await third.ensure_started()
+        assert third._context is not None
+        assert await third._context.cookies("https://example.com/") == []
+    finally:
+        await third.close()
+
+
+@pytest.mark.asyncio
 async def test_real_chromium_cdp_attach_uses_isolated_context_and_preserves_owner(tmp_path) -> None:
     import socket
     from playwright.async_api import async_playwright
@@ -580,14 +633,24 @@ async def test_real_chromium_cdp_attach_uses_isolated_context_and_preserves_owne
         )
         await owner_page.set_content("<title>owner-alive</title><main>owner</main>")
         await owner_context.add_cookies(
-            [{
-                "name": "ash_login_probe",
-                "value": "present",
-                "url": "https://example.com/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "Lax",
-            }]
+            [
+                {
+                    "name": "ash_login_probe",
+                    "value": "present",
+                    "url": "https://example.com/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "Lax",
+                },
+                {
+                    "name": "unrelated_login_probe",
+                    "value": "must-not-copy",
+                    "url": "https://other.example/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "Lax",
+                },
+            ]
         )
 
         inventory = await inspect_cdp_source(
@@ -599,6 +662,7 @@ async def test_real_chromium_cdp_attach_uses_isolated_context_and_preserves_owne
 
         session = BrowserSession(
             timeout_seconds=15,
+            allowed_domains=["example.com"],
             cdp_url=f"http://127.0.0.1:{port}",
             cdp_reuse_storage_state=True,
         )
@@ -609,6 +673,8 @@ async def test_real_chromium_cdp_attach_uses_isolated_context_and_preserves_owne
         assert [(item["name"], item["value"]) for item in copied] == [
             ("ash_login_probe", "present")
         ]
+        unrelated = await session._context.cookies("https://other.example/")
+        assert unrelated == []
 
         await session.close()
         session = None
@@ -664,6 +730,7 @@ async def test_runtime_browser_switch_attaches_and_disconnects_without_owning_so
             db_directory=tmp_path / "db",
             memory_backend="off",
             browser_timeout_seconds=15,
+            allowed_web_domains=["example.com"],
         )
         browser_tools = {
             tool.name: tool
@@ -691,6 +758,7 @@ async def test_runtime_browser_switch_attaches_and_disconnects_without_owning_so
 
         assert connected["backend"] == "cdp"
         assert connected["reuse_storage_state"] is True
+        assert connected["storage_state_domains"] == ["example.com"]
         assert [(item["name"], item["value"]) for item in copied] == [
             ("ash_runtime_probe", "present")
         ]

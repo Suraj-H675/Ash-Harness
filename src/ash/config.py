@@ -792,8 +792,9 @@ class AshConfig(BaseSettings):
     allowed_web_domains: list[str] = Field(
         default_factory=list,
         description=(
-            "Optional web fetch/search allowlist. Entries are hostnames or wildcard "
-            "subdomains like *.example.com. Empty allows any public host."
+            "Optional web fetch/search/browser allowlist. Entries are hostnames or "
+            "wildcard subdomains like *.example.com. Empty allows any public host, "
+            "but CDP authentication-state reuse requires a non-empty allowlist."
         ),
     )
     web_search_provider: str = Field(
@@ -834,7 +835,8 @@ class AshConfig(BaseSettings):
         False,
         description=(
             "When browser_cdp_url is configured, copy bounded cookies/local storage "
-            "from the existing default context into Ash's isolated context."
+            "only for allowed_web_domains from the existing default context into "
+            "Ash's isolated context."
         ),
     )
     plugin_marketplaces: dict[str, str] = Field(
@@ -1754,6 +1756,11 @@ class AshConfig(BaseSettings):
     def validate_browser_cdp_configuration(self) -> "AshConfig":
         if self.browser_cdp_reuse_storage_state and not self.browser_cdp_url:
             raise ValueError("browser_cdp_reuse_storage_state requires browser_cdp_url")
+        if self.browser_cdp_reuse_storage_state and not self.allowed_web_domains:
+            raise ValueError(
+                "browser_cdp_reuse_storage_state requires non-empty "
+                "allowed_web_domains"
+            )
         if self.browser_cdp_url and self.browser_persistent_profile:
             raise ValueError(
                 "browser_cdp_url cannot be combined with browser_persistent_profile"

@@ -2284,6 +2284,7 @@ class AshLoop:
                 "backend": "unavailable",
                 "cdp_url": "",
                 "reuse_storage_state": False,
+                "storage_state_domains": [],
                 "profile": "unavailable",
                 "started": False,
             }
@@ -2291,6 +2292,11 @@ class AshLoop:
             "backend": "cdp" if session.cdp_url else "managed",
             "cdp_url": session.cdp_url,
             "reuse_storage_state": session.cdp_reuse_storage_state,
+            "storage_state_domains": (
+                list(session.allowed_domains)
+                if session.cdp_reuse_storage_state
+                else []
+            ),
             "profile": (
                 "isolated"
                 if session.cdp_url
@@ -2300,6 +2306,40 @@ class AshLoop:
             ),
             "started": session.is_started,
         }
+
+    async def reset_browser_profile(self) -> dict[str, Any]:
+        """Clear only the Ash-owned persistent browser profile."""
+
+        from ash.safe_io import remove_anchored_path
+        from ash.tools.browser import browser_session_from_tools
+
+        config = self._config
+        if config is None:
+            raise RuntimeError("browser profile reset requires AshConfig")
+        async with self._browser_reload_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("cannot reset browser profile after loop shutdown")
+            if self._turn_running:
+                raise RuntimeError("cannot reset browser profile while a turn is running")
+
+            session = browser_session_from_tools(self.tools)
+            profile_path = config.db_directory / "browser-profile"
+            if (
+                session is not None
+                and not session.cdp_url
+                and session.profile_path is not None
+            ):
+                cleared = await session.reset_persistent_profile()
+            else:
+                cleared = await asyncio.to_thread(
+                    remove_anchored_path,
+                    profile_path,
+                    trusted_root=config.db_directory,
+                    label="Ash browser profile",
+                )
+            status = self.browser_runtime_status()
+            status["profile_reset"] = cleared
+            return status
 
     async def configure_browser_runtime(
         self,

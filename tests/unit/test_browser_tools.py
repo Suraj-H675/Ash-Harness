@@ -2048,6 +2048,11 @@ def test_browser_cdp_rejects_persistent_profile_and_orphaned_storage_reuse(
         )
     with pytest.raises(ValueError, match="requires browser_cdp_url"):
         BrowserSession(cdp_reuse_storage_state=True)
+    with pytest.raises(ValueError, match="requires non-empty allowed_web_domains"):
+        BrowserSession(
+            cdp_url="http://127.0.0.1:9222",
+            cdp_reuse_storage_state=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -2100,8 +2105,22 @@ async def test_browser_cdp_uses_isolated_policy_context_and_optional_storage() -
     source_context = MagicMock()
     source_context.storage_state = AsyncMock(
         return_value={
-            "cookies": [{"name": "session", "value": "ok", "domain": ".example.com", "path": "/", "expires": -1, "httpOnly": True, "secure": True, "sameSite": "Lax"}],
-            "origins": [],
+            "cookies": [
+                {"name": "session", "value": "ok", "domain": ".example.com", "path": "/", "expires": -1, "httpOnly": True, "secure": True, "sameSite": "Lax"},
+                {"name": "other", "value": "drop", "domain": ".other.example", "path": "/", "expires": -1, "httpOnly": True, "secure": True, "sameSite": "Lax"},
+            ],
+            "origins": [
+                {
+                    "origin": "https://example.com",
+                    "localStorage": [{"name": "session", "value": "local-ok"}],
+                    "indexedDB": [{"name": "must-not-copy"}],
+                },
+                {
+                    "origin": "https://other.example",
+                    "localStorage": [{"name": "other", "value": "drop"}],
+                },
+            ],
+            "credentials": [{"privateKey": "must-not-copy"}],
         }
     )
     isolated = FakeContext()
@@ -2116,6 +2135,7 @@ async def test_browser_cdp_uses_isolated_policy_context_and_optional_storage() -
     factory = MagicMock()
     factory.start = AsyncMock(return_value=playwright)
     session = BrowserSession(
+        allowed_domains=["example.com"],
         cdp_url="http://127.0.0.1:9222",
         cdp_reuse_storage_state=True,
     )
@@ -2131,7 +2151,16 @@ async def test_browser_cdp_uses_isolated_policy_context_and_optional_storage() -
     context_kwargs = attached.new_context.await_args.kwargs
     assert context_kwargs["service_workers"] == "block"
     assert context_kwargs["accept_downloads"] is True
-    assert context_kwargs["storage_state"]["cookies"][0]["name"] == "session"
+    assert [item["name"] for item in context_kwargs["storage_state"]["cookies"]] == [
+        "session"
+    ]
+    assert context_kwargs["storage_state"]["origins"] == [
+        {
+            "origin": "https://example.com",
+            "localStorage": [{"name": "session", "value": "local-ok"}],
+        }
+    ]
+    assert "credentials" not in context_kwargs["storage_state"]
     assert context_kwargs["proxy"]["bypass"] == "<-loopback>"
     assert context_kwargs["proxy"]["server"].startswith("http://127.0.0.1:")
     attached.close.assert_awaited_once()
@@ -2179,6 +2208,7 @@ async def test_browser_cdp_rejects_non_object_storage_state() -> None:
     factory = MagicMock()
     factory.start = AsyncMock(return_value=playwright)
     session = BrowserSession(
+        allowed_domains=["example.com"],
         cdp_url="http://127.0.0.1:9222",
         cdp_reuse_storage_state=True,
     )
@@ -2212,6 +2242,7 @@ async def test_browser_cdp_storage_import_timeout_is_bounded(
     factory.start = AsyncMock(return_value=playwright)
     session = BrowserSession(
         timeout_seconds=1,
+        allowed_domains=["example.com"],
         cdp_url="http://127.0.0.1:9222",
         cdp_reuse_storage_state=True,
     )
@@ -2241,6 +2272,7 @@ async def test_browser_cdp_storage_import_is_bounded(
     factory.start = AsyncMock(return_value=playwright)
     monkeypatch.setattr("ash.tools.browser.MAX_CDP_STORAGE_STATE_BYTES", 32)
     session = BrowserSession(
+        allowed_domains=["example.com"],
         cdp_url="http://127.0.0.1:9222",
         cdp_reuse_storage_state=True,
     )

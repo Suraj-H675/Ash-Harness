@@ -56,7 +56,7 @@ MAX_CRON_PROMPT_BYTES = 64 * 1024
 DEFAULT_BROWSER_CDP_URL = "http://127.0.0.1:9222"
 BROWSER_COMMAND_USAGE = (
     "Usage: /browser [status|inspect [URL]|connect [URL] "
-    "[--reuse-storage-state]|disconnect]"
+    "[--reuse-storage-state]|disconnect|reset-profile]"
 )
 
 
@@ -563,11 +563,20 @@ def _render_browser_runtime_status(status: dict[str, Any]) -> str:
             single_line=True,
         )
         reuse = "enabled" if bool(status.get("reuse_storage_state")) else "disabled"
+        storage_domains = [
+            terminal_safe_text(str(item), single_line=True)
+            for item in status.get("storage_state_domains", [])
+        ]
         return "\n".join(
             (
                 "Browser backend: attached via CDP",
                 f"Endpoint: {endpoint}",
                 f"Storage-state reuse: {reuse}",
+                (
+                    "Storage-state domains: " + ", ".join(storage_domains)
+                    if storage_domains
+                    else "Storage-state domains: none"
+                ),
                 "Context: Ash-owned isolated context",
                 f"Session: {started}",
                 "Control policy: loopback-only CDP; page traffic uses Ash network policy",
@@ -604,6 +613,16 @@ async def _handle_browser_command(
             raise ValueError(BROWSER_COMMAND_USAGE)
         status = await loop.configure_browser_runtime(cdp_url=None)
         return _render_browser_runtime_status(status)
+    if action == "reset-profile":
+        if len(arguments) != 1:
+            raise ValueError(BROWSER_COMMAND_USAGE)
+        status = await loop.reset_browser_profile()
+        result = (
+            "Ash browser profile cleared."
+            if bool(status.get("profile_reset"))
+            else "Ash browser profile was already empty."
+        )
+        return result + "\n" + _render_browser_runtime_status(status)
     if action == "inspect":
         if len(arguments) > 2:
             raise ValueError(BROWSER_COMMAND_USAGE)
@@ -640,7 +659,8 @@ async def _handle_browser_command(
             lines.append("… additional contexts omitted")
         lines.append(
             "Ash will not control these tabs directly; --reuse-storage-state "
-            "copies bounded state into an isolated Ash context."
+            "copies bounded state only for user-owned allowed_web_domains into "
+            "an isolated Ash context."
         )
         return "\n".join(lines)
     if action != "connect":
@@ -660,6 +680,11 @@ async def _handle_browser_command(
         cdp_url = argument
         index += 1
     target = cdp_url or config.browser_cdp_url or DEFAULT_BROWSER_CDP_URL
+    if reuse_storage_state and not getattr(config, "allowed_web_domains", []):
+        raise ValueError(
+            "--reuse-storage-state requires non-empty user-owned "
+            "allowed_web_domains so authentication state has an explicit scope"
+        )
     status = await loop.configure_browser_runtime(
         cdp_url=target,
         reuse_storage_state=reuse_storage_state,

@@ -19,13 +19,17 @@ from urllib.parse import urlparse, urlunparse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ash.core.redaction import redact_text, redact_url
-from ash.safe_io import read_bounded_bytes, validate_unlinked_directory_path
+from ash.safe_io import (
+    read_bounded_bytes,
+    remove_anchored_path,
+    validate_unlinked_directory_path,
+)
 from ash.safety.environment import build_scrubbed_environment
 from ash.safety.guard import SafetyGuard
 from ash.safety.scoped_io import atomic_write_scoped_bytes
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.browser_proxy import BrowserPolicyProxy
-from ash.tools.web import _normalize_allowed_domains, _validate_public_url
+from ash.tools.web import _host_allowed, _normalize_allowed_domains, _validate_public_url
 from ash.ui.safe_text import terminal_safe_text
 
 
@@ -119,6 +123,11 @@ class BrowserSession:
             raise ValueError("browser CDP attachment cannot use an Ash persistent profile")
         if cdp_reuse_storage_state and not normalized_cdp:
             raise ValueError("browser_cdp_reuse_storage_state requires browser_cdp_url")
+        if cdp_reuse_storage_state and not self.allowed_domains:
+            raise ValueError(
+                "browser_cdp_reuse_storage_state requires non-empty "
+                "allowed_web_domains to scope imported authentication state"
+            )
         self.cdp_url = normalized_cdp
         self.cdp_reuse_storage_state = bool(cdp_reuse_storage_state)
         self.profile_path = (
@@ -264,7 +273,11 @@ class BrowserSession:
                             raise BrowserUnavailableError(
                                 "CDP browser returned invalid storage state"
                             )
-                        storage_state = raw_storage_state
+                        _validate_cdp_storage_state(raw_storage_state)
+                        storage_state = _filter_cdp_storage_state(
+                            raw_storage_state,
+                            self.allowed_domains,
+                        )
                         _validate_cdp_storage_state(storage_state)
                     context_kwargs: dict[str, Any] = {
                         "accept_downloads": True,
@@ -1377,6 +1390,36 @@ class BrowserSession:
                 raise cleanup_error
             self._cleanup_failed = False
 
+    async def reset_persistent_profile(self) -> bool:
+        if self.profile_path is None:
+            raise ValueError("browser session does not use an Ash persistent profile")
+        async with self._lock:
+            if self._closed:
+                raise BrowserUnavailableError("browser session is closed")
+            cleanup_task = asyncio.create_task(
+                self._close_unlocked(),
+                name="ash-browser-profile-reset-close",
+            )
+            cleanup_error, interrupted = await _settle_browser_cleanup_task(
+                cleanup_task
+            )
+            if interrupted:
+                cancellation = asyncio.CancelledError()
+                if cleanup_error is not None:
+                    cancellation.add_note(
+                        "browser cleanup failed while profile reset was cancelled: "
+                        + _redact_browser_text(str(cleanup_error))[:500]
+                    )
+                raise cancellation from cleanup_error
+            if cleanup_error is not None:
+                raise cleanup_error
+            return await asyncio.to_thread(
+                remove_anchored_path,
+                self.profile_path,
+                trusted_root=self.profile_path.parent,
+                label="Ash browser profile",
+            )
+
     async def _close_unlocked(self, *, cancel_snapshot: bool = True) -> None:
         cleanup_failures: list[tuple[str, BaseException]] = []
         pending_dialog = self._pending_dialog
@@ -1556,6 +1599,63 @@ def _validate_cdp_storage_state(state: dict[str, Any]) -> None:
         raise BrowserUnavailableError(
             f"CDP storage state exceeded {MAX_CDP_STORAGE_STATE_BYTES} bytes"
         )
+
+
+def _filter_cdp_storage_state(
+    state: dict[str, Any],
+    allowed_domains: tuple[str, ...],
+) -> dict[str, Any]:
+    cookies = state.get("cookies", [])
+    origins = state.get("origins", [])
+    if not isinstance(cookies, list) or not isinstance(origins, list):
+        raise BrowserUnavailableError("CDP browser returned invalid storage state")
+
+    filtered_cookies: list[dict[str, Any]] = []
+    for item in cookies:
+        if not isinstance(item, dict):
+            raise BrowserUnavailableError("CDP browser returned invalid storage state")
+        domain = item.get("domain")
+        if not isinstance(domain, str) or not domain.strip():
+            raise BrowserUnavailableError("CDP browser returned invalid storage state")
+        cookie_host = domain.strip().casefold().lstrip(".").rstrip(".")
+        if cookie_host and _host_allowed(cookie_host, allowed_domains):
+            filtered_cookies.append(dict(item))
+
+    filtered_origins: list[dict[str, Any]] = []
+    for item in origins:
+        if not isinstance(item, dict):
+            raise BrowserUnavailableError("CDP browser returned invalid storage state")
+        origin = item.get("origin")
+        local_storage = item.get("localStorage", [])
+        if not isinstance(origin, str) or not isinstance(local_storage, list):
+            raise BrowserUnavailableError("CDP browser returned invalid storage state")
+        parsed = urlparse(origin)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or not _host_allowed(parsed.hostname, allowed_domains)
+        ):
+            continue
+        normalized_local_storage: list[dict[str, str]] = []
+        for entry in local_storage:
+            if not isinstance(entry, dict):
+                raise BrowserUnavailableError("CDP browser returned invalid storage state")
+            name = entry.get("name")
+            value = entry.get("value")
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise BrowserUnavailableError("CDP browser returned invalid storage state")
+            normalized_local_storage.append({"name": name, "value": value})
+        filtered_origins.append(
+            {
+                "origin": origin,
+                "localStorage": normalized_local_storage,
+            }
+        )
+
+    return {
+        "cookies": filtered_cookies,
+        "origins": filtered_origins,
+    }
 
 
 def _validate_browser_url(url: str, allowed_domains: tuple[str, ...]) -> str:

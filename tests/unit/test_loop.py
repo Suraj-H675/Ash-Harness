@@ -283,6 +283,7 @@ async def test_browser_runtime_connect_disconnect_swaps_shared_session_once(
         db_directory=tmp_path / "db",
         memory_backend="off",
         browser_persistent_profile=True,
+        allowed_web_domains=["example.com"],
     )
     tools = _browser_tool_map(
         guard,
@@ -325,6 +326,7 @@ async def test_browser_runtime_connect_disconnect_swaps_shared_session_once(
     )
     assert connected["backend"] == "cdp"
     assert connected["profile"] == "isolated"
+    assert connected["storage_state_domains"] == ["example.com"]
     assert closed == [initial_session]
 
     disconnected = await loop.configure_browser_runtime(cdp_url=None)
@@ -338,6 +340,41 @@ async def test_browser_runtime_connect_disconnect_swaps_shared_session_once(
     assert closed == [initial_session, attached_session]
     assert config.browser_cdp_url == ""
     assert config.browser_persistent_profile is True
+
+
+@pytest.mark.asyncio
+async def test_browser_profile_reset_clears_only_active_ash_profile(tmp_path) -> None:
+    guard = SafetyGuard(tmp_path)
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        browser_persistent_profile=True,
+    )
+    profile = config.db_directory / "browser-profile"
+    tools = _browser_tool_map(guard, profile_path=profile)
+    loop = AshLoop(
+        SessionStore(tmp_path / "browser-reset.db"),
+        MockProvider(),
+        guard,
+        object(),
+        tmp_path,
+        tools=tools,
+        config=config,
+    )
+    profile.mkdir(parents=True)
+    marker = profile / "auth-state"
+    marker.write_text("sensitive", encoding="utf-8")
+
+    status = await loop.reset_browser_profile()
+
+    assert status["profile_reset"] is True
+    assert status["backend"] == "managed"
+    assert status["profile"] == "persistent"
+    assert status["started"] is False
+    assert not profile.exists()
+    assert not marker.exists()
+    await loop.aclose()
 
 
 @pytest.mark.asyncio

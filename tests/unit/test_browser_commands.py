@@ -10,10 +10,12 @@ from ash.cli import _handle_browser_command
 class _FakeBrowserLoop:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.profile_resets = 0
         self.status = {
             "backend": "managed",
             "cdp_url": "",
             "reuse_storage_state": False,
+            "storage_state_domains": [],
             "profile": "ephemeral",
             "started": False,
         }
@@ -37,9 +39,16 @@ class _FakeBrowserLoop:
             "backend": "cdp" if cdp_url else "managed",
             "cdp_url": cdp_url or "",
             "reuse_storage_state": reuse_storage_state,
+            "storage_state_domains": ["example.com"] if reuse_storage_state else [],
             "profile": "ephemeral",
             "started": True,
         }
+        return dict(self.status)
+
+    async def reset_browser_profile(self) -> dict[str, object]:
+        self.profile_resets += 1
+        self.status["profile_reset"] = True
+        self.status["started"] = False
         return dict(self.status)
 
 
@@ -72,6 +81,7 @@ async def test_browser_command_connect_reuse_is_explicit_and_disconnects_to_mana
         browser_cdp_url="http://127.0.0.1:9333",
         browser_cdp_reuse_storage_state=True,
         browser_timeout_seconds=30,
+        allowed_web_domains=["example.com"],
     )
 
     connected = await _handle_browser_command(
@@ -89,9 +99,30 @@ async def test_browser_command_connect_reuse_is_explicit_and_disconnects_to_mana
         {"cdp_url": None, "reuse_storage_state": False},
     ]
     assert "Storage-state reuse: enabled" in connected
+    assert "Storage-state domains: example.com" in connected
     assert "Browser backend: managed Chromium" in disconnected
     assert config.browser_cdp_url == "http://127.0.0.1:9333"
     assert config.browser_cdp_reuse_storage_state is True
+
+
+@pytest.mark.asyncio
+async def test_browser_command_reuse_requires_explicit_allowed_domains() -> None:
+    loop = _FakeBrowserLoop()
+    config = SimpleNamespace(
+        browser_cdp_url="http://127.0.0.1:9333",
+        browser_cdp_reuse_storage_state=False,
+        browser_timeout_seconds=30,
+        allowed_web_domains=[],
+    )
+
+    with pytest.raises(ValueError, match="requires non-empty user-owned"):
+        await _handle_browser_command(
+            loop,
+            config,
+            ["connect", "--reuse-storage-state"],
+        )
+
+    assert loop.calls == []
 
 
 @pytest.mark.asyncio
@@ -107,6 +138,22 @@ async def test_browser_command_rejects_unknown_actions_and_extra_disconnect_args
         await _handle_browser_command(loop, config, ["wat"])
     with pytest.raises(ValueError, match="Usage: /browser"):
         await _handle_browser_command(loop, config, ["disconnect", "extra"])
+
+
+@pytest.mark.asyncio
+async def test_browser_command_reset_profile_is_explicit_operator_action() -> None:
+    loop = _FakeBrowserLoop()
+    config = SimpleNamespace(
+        browser_cdp_url="",
+        browser_cdp_reuse_storage_state=False,
+        browser_timeout_seconds=30,
+    )
+
+    rendered = await _handle_browser_command(loop, config, ["reset-profile"])
+
+    assert loop.profile_resets == 1
+    assert rendered.startswith("Ash browser profile cleared.")
+    assert "Session: not started" in rendered
 
 
 @pytest.mark.asyncio

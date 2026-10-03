@@ -115,6 +115,10 @@ def build_tools(
 ) -> dict[str, Any]:
     """Build the standard tool set and its trusted declarative extensions."""
 
+    effective_allowed_web_domains = allowed_web_domains
+    if effective_allowed_web_domains is None and runtime_config is not None:
+        effective_allowed_web_domains = runtime_config.allowed_web_domains
+
     from ash.agents.shared_state import SharedState
     from ash.plugins.agents import AgentCatalog, AgentSource
     from ash.plugins.skills import (
@@ -209,14 +213,14 @@ def build_tools(
         ListDirectoryTool(safety_guard),
         GlobFilesTool(safety_guard),
         SearchTextTool(safety_guard),
-        WebFetchTool(safety_guard, allowed_domains=allowed_web_domains),
+        WebFetchTool(safety_guard, allowed_domains=effective_allowed_web_domains),
         WebSearchTool(
             safety_guard,
             provider=(runtime_config.web_search_provider if runtime_config else "auto"),
             timeout=(
                 runtime_config.web_search_timeout_seconds if runtime_config else 20.0
             ),
-            allowed_domains=allowed_web_domains,
+            allowed_domains=effective_allowed_web_domains,
         ),
         ListSkillsTool(safety_guard, catalog),
         ActivateSkillTool(safety_guard, catalog),
@@ -239,7 +243,7 @@ def build_tools(
             timeout_seconds=(
                 runtime_config.browser_timeout_seconds if runtime_config else 30.0
             ),
-            allowed_domains=allowed_web_domains,
+            allowed_domains=effective_allowed_web_domains,
             profile_path=(
                 runtime_config.db_directory / "browser-profile"
                 if runtime_config is not None
