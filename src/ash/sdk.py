@@ -285,13 +285,22 @@ class AshClient:
         self._started = True
         return session.session_id
 
+    async def _select_session_unlocked(self, session_id: str) -> str:
+        self._require_runtime_open()
+        session = await self.loop.start_session(session_id)
+        self._started = True
+        return session.session_id
+
     async def prompt(
         self,
         text: str,
         *,
         user_metadata: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> AshResult:
         async with self._turn_lock:
+            if session_id is not None:
+                await self._select_session_unlocked(session_id)
             return await self._prompt_unlocked(text, user_metadata=user_metadata)
 
     async def run_goal(
@@ -391,6 +400,7 @@ class AshClient:
         text: str,
         *,
         user_metadata: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[AshEvent]:
         """Yield real runtime deltas and one terminal completion/error event."""
 
@@ -398,6 +408,8 @@ class AshClient:
         if not _prompt_has_content(text, user_metadata):
             raise ValueError("prompt cannot be empty")
         async with self._turn_lock:
+            if session_id is not None:
+                await self._select_session_unlocked(session_id)
             ui = self.loop.ui
             if not isinstance(ui, HeadlessUI):
                 raise RuntimeError("stream_prompt requires Ash's headless event UI")
@@ -515,6 +527,30 @@ class AshClient:
         return self.loop.session_store.list_sessions(
             project_path=str(self.loop.project_root), query=query, limit=limit
         )
+
+    def session_messages(
+        self,
+        session_id: str,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded durable transcript for one workspace-owned session."""
+
+        if not 1 <= limit <= 500:
+            raise ValueError("session message limit must be between 1 and 500")
+        self.loop.session_store.require_session_project(
+            session_id,
+            self.loop.project_root,
+        )
+        session = self.loop.session_store.load_session(session_id)
+        return [
+            {
+                "role": message.role,
+                "content": message.content,
+                "timestamp": message.timestamp.isoformat(),
+            }
+            for message in session.messages[-limit:]
+        ]
 
     def session_tree(self, session_id: str | None = None) -> list[SessionLineage]:
         """Return the complete lineage tree containing a session."""
@@ -849,9 +885,7 @@ class AshClient:
     async def resume(self, session_id: str) -> str:
         self._require_runtime_open()
         async with self._turn_lock:
-            session = await self.loop.start_session(session_id)
-            self._started = True
-            return session.session_id
+            return await self._select_session_unlocked(session_id)
 
     async def new_session(self) -> str:
         self._require_runtime_open()

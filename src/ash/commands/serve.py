@@ -21,13 +21,21 @@ uvicorn: Any = _uvicorn
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+HTTP_SERVER_LIMIT_CONCURRENCY = 128
+HTTP_SERVER_BACKLOG = 128
+HTTP_SERVER_KEEP_ALIVE_SECONDS = 5
 
 
 async def serve_http(args) -> int:
     token = os.environ.get(args.token_env, "")
-    if len(token) < 16:
+    if (
+        len(token) < 16
+        or not token.isascii()
+        or any(character.isspace() for character in token)
+    ):
         raise ValueError(
-            f"Set {args.token_env} to a bearer token containing at least 16 characters"
+            f"Set {args.token_env} to a bearer token containing at least 16 "
+            "non-whitespace ASCII characters"
         )
     remote = args.host not in LOOPBACK_HOSTS
     if remote and not args.allow_remote:
@@ -44,21 +52,27 @@ async def serve_http(args) -> int:
         raise ValueError("Port must be between 1 and 65535")
     if args.rate_limit < 1:
         raise ValueError("Rate limit must be positive")
+    approval_timeout = float(getattr(args, "approval_timeout", 300.0))
+    if not 1 <= approval_timeout <= 3600:
+        raise ValueError("Approval timeout must be between 1 and 3600 seconds")
     if uvicorn is None:
         raise _server_dependency_error()
     try:
-        from ash.server.http import create_app
+        from ash.server.http import HTTPApprovalBroker, create_app
     except ModuleNotFoundError as exc:
         if exc.name is None or not exc.name.startswith("fastapi"):
             raise
         raise _server_dependency_error() from exc
-    client = await AshClient.create()
+    approval_broker = HTTPApprovalBroker(timeout_seconds=approval_timeout)
+    client = await AshClient.create(approval_callback=approval_broker.request)
+    approval_broker.set_tool_provider(lambda name: client.loop.tools.get(name))
     primary_error: BaseException | None = None
     try:
         app = create_app(
             client,
             bearer_token=token,
             requests_per_minute=args.rate_limit,
+            approval_broker=approval_broker,
         )
         server = uvicorn.Server(
             uvicorn.Config(
@@ -68,6 +82,9 @@ async def serve_http(args) -> int:
                 log_level=args.log_level,
                 ssl_certfile=ssl_certfile,
                 ssl_keyfile=ssl_keyfile,
+                limit_concurrency=HTTP_SERVER_LIMIT_CONCURRENCY,
+                backlog=HTTP_SERVER_BACKLOG,
+                timeout_keep_alive=HTTP_SERVER_KEEP_ALIVE_SECONDS,
             )
         )
         await server.serve()
@@ -76,6 +93,7 @@ async def serve_http(args) -> int:
         primary_error = exc
         raise
     finally:
+        await approval_broker.close()
         try:
             await client.close()
         except BaseException as cleanup_error:

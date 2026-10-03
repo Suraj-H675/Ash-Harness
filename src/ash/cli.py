@@ -2890,12 +2890,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
     agents_discard.add_argument("branch")
     agents_discard.add_argument("--yes", action="store_true")
     serve_parser = subparsers.add_parser(
-        "serve", help="Run the authenticated local Ash HTTP API"
+        "serve",
+        help="Run the authenticated Ash HTTP API (loopback by default; remote requires opt-in and TLS)",
     )
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8765)
     serve_parser.add_argument("--token-env", default="ASH_SERVER_TOKEN")
     serve_parser.add_argument("--rate-limit", type=int, default=60)
+    serve_parser.add_argument("--approval-timeout", type=float, default=300.0)
     serve_parser.add_argument("--allow-remote", action="store_true")
     serve_parser.add_argument("--ssl-certfile")
     serve_parser.add_argument("--ssl-keyfile")
@@ -2904,6 +2906,86 @@ def _main_impl(argv: list[str] | None = None) -> int:
         choices=["critical", "error", "warning", "info", "debug"],
         default="info",
     )
+    remote_parser = subparsers.add_parser(
+        "remote",
+        help="Control an authenticated Ash HTTP server from another terminal or machine",
+    )
+    remote_subparsers = remote_parser.add_subparsers(
+        dest="remote_action",
+        required=True,
+    )
+    remote_common = argparse.ArgumentParser(add_help=False)
+    remote_common.add_argument("url", help="Ash server origin, for example https://host:8765")
+    remote_common.add_argument("--token-env", default="ASH_SERVER_TOKEN")
+    remote_common.add_argument("--timeout", type=float, default=300.0)
+
+    remote_status = remote_subparsers.add_parser(
+        "status",
+        parents=[remote_common],
+        help="Show remote runtime/session status",
+    )
+    remote_status.add_argument("--json", action="store_true")
+    remote_sessions = remote_subparsers.add_parser(
+        "sessions",
+        parents=[remote_common],
+        help="List durable sessions on the remote Ash host",
+    )
+    remote_sessions.add_argument("--query", default="")
+    remote_sessions.add_argument("--limit", type=int, default=20)
+    remote_sessions.add_argument("--json", action="store_true")
+    remote_new = remote_subparsers.add_parser(
+        "new",
+        parents=[remote_common],
+        help="Create and select a new remote session",
+    )
+    remote_new.add_argument("--json", action="store_true")
+    remote_resume = remote_subparsers.add_parser(
+        "resume",
+        parents=[remote_common],
+        help="Select an existing durable remote session",
+    )
+    remote_resume.add_argument("session_id")
+    remote_resume.add_argument("--json", action="store_true")
+    remote_prompt = remote_subparsers.add_parser(
+        "prompt",
+        parents=[remote_common],
+        help="Run one streamed remote turn",
+    )
+    remote_prompt.add_argument("prompt")
+    remote_chat = remote_subparsers.add_parser(
+        "chat",
+        parents=[remote_common],
+        help="Attach an interactive terminal to the remote Ash runtime",
+    )
+    remote_chat.add_argument("--session-id")
+    remote_chat.set_defaults(json=False)
+    remote_steer = remote_subparsers.add_parser(
+        "steer",
+        parents=[remote_common],
+        help="Queue guidance for the currently running remote turn",
+    )
+    remote_steer.add_argument("text")
+    remote_steer.add_argument("--json", action="store_true")
+    remote_approvals = remote_subparsers.add_parser(
+        "approvals",
+        parents=[remote_common],
+        help="List pending remote tool approvals",
+    )
+    remote_approvals.add_argument("--json", action="store_true")
+    remote_approve = remote_subparsers.add_parser(
+        "approve",
+        parents=[remote_common],
+        help="Approve one pending remote tool call",
+    )
+    remote_approve.add_argument("request_id")
+    remote_approve.add_argument("--json", action="store_true")
+    remote_deny = remote_subparsers.add_parser(
+        "deny",
+        parents=[remote_common],
+        help="Deny one pending remote tool call",
+    )
+    remote_deny.add_argument("request_id")
+    remote_deny.add_argument("--json", action="store_true")
     acp_parser = subparsers.add_parser(
         "acp", help="Run Ash as an Agent Client Protocol v1 stdio agent"
     )
@@ -4684,6 +4766,22 @@ def _main_impl(argv: list[str] | None = None) -> int:
             error = classify_exception(exc)
             print(format_error(error), file=sys.stderr)
             return error.exit_code
+
+    if args.command == "remote":
+        from ash.commands.remote import RemoteClientError, run_remote
+        from ash.core.redaction import redact_urls_in_text
+
+        try:
+            return asyncio.run(run_remote(args))
+        except KeyboardInterrupt:
+            return 130
+        except (OSError, RemoteClientError, RuntimeError, ValueError) as exc:
+            print(
+                "Error: remote Ash operation failed: "
+                + redact_urls_in_text(str(exc)),
+                file=sys.stderr,
+            )
+            return 2
 
     if args.command == "mcp":
         from ash.commands.mcp import (

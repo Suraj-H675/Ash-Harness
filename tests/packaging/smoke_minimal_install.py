@@ -109,8 +109,14 @@ def assert_distribution_metadata() -> None:
         "ash/lsp/middleware.py",
         "ash/mcp/schema_worker.py",
         "ash/sandbox/Dockerfile",
+        "ash/server/static/control.html",
+        "ash/server/static/control.css",
+        "ash/server/static/control.js",
         "ash/tools/lsp.py",
     } <= packaged
+    assert "Ash Remote" in files("ash.server").joinpath("static", "control.html").read_text(
+        encoding="utf-8"
+    )
     assert {
         "ash/memory/fts5.py",
         "ash/memory/markdown_store.py",

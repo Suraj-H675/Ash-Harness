@@ -38,6 +38,9 @@ from ash.server.a2a import create_a2a_app
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+A2A_SERVER_LIMIT_CONCURRENCY = 128
+A2A_SERVER_BACKLOG = 128
+A2A_SERVER_KEEP_ALIVE_SECONDS = 5
 MAX_A2A_CLIENT_INPUT_BYTES = 1_000_000
 MAX_A2A_CLIENT_EVENTS = 10_000
 MAX_A2A_CLIENT_OUTPUT_BYTES = 1_000_000
@@ -52,9 +55,14 @@ TERMINAL_STATES = {
 
 async def serve_a2a(args) -> int:
     token = os.environ.get(args.token_env, "")
-    if len(token) < 16:
+    if (
+        len(token) < 16
+        or not token.isascii()
+        or any(character.isspace() for character in token)
+    ):
         raise ValueError(
-            f"Set {args.token_env} to a bearer token containing at least 16 characters"
+            f"Set {args.token_env} to a bearer token containing at least 16 "
+            "non-whitespace ASCII characters"
         )
     if not 1 <= args.port <= 65535:
         raise ValueError("Port must be between 1 and 65535")
@@ -96,6 +104,9 @@ async def serve_a2a(args) -> int:
             log_level=args.log_level,
             ssl_certfile=ssl_certfile,
             ssl_keyfile=ssl_keyfile,
+            limit_concurrency=A2A_SERVER_LIMIT_CONCURRENCY,
+            backlog=A2A_SERVER_BACKLOG,
+            timeout_keep_alive=A2A_SERVER_KEEP_ALIVE_SECONDS,
         )
     )
     await server.serve()

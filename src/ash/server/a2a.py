@@ -67,6 +67,7 @@ MAX_A2A_CONTEXT_ID_BYTES = 512
 MAX_A2A_SESSION_MAPPINGS = 100_000
 MAX_A2A_RATE_LIMIT_KEYS = 10_000
 MAX_A2A_IN_FLIGHT_TASKS = 16
+MAX_A2A_PREAUTH_REQUESTS_PER_MINUTE = 240
 
 
 class _TokenUser(User):
@@ -135,10 +136,19 @@ class A2AAuthMiddleware:
         bearer_token: str,
         requests_per_minute: int,
     ) -> None:
-        if len(bearer_token) < 16:
-            raise ValueError("A2A bearer token must contain at least 16 characters")
+        if (
+            len(bearer_token) < 16
+            or not bearer_token.isascii()
+            or any(character.isspace() for character in bearer_token)
+        ):
+            raise ValueError(
+                "A2A bearer token must contain at least 16 non-whitespace ASCII characters"
+            )
         self.app = app
-        self._token = bearer_token.encode("utf-8")
+        self._token = bearer_token.encode("ascii")
+        self._preauth_limiter = _SlidingWindowLimiter(
+            max(MAX_A2A_PREAUTH_REQUESTS_PER_MINUTE, requests_per_minute * 4)
+        )
         self._limiter = _SlidingWindowLimiter(requests_per_minute)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -147,6 +157,16 @@ class A2AAuthMiddleware:
             "/.well-known/agent-card.json",
         }:
             await self.app(scope, receive, send)
+            return
+        client = scope.get("client")
+        key = str(client[0]) if client else "unknown"
+        if not await self._preauth_limiter.allow(key):
+            response = JSONResponse(
+                {"detail": "Too many authentication attempts"},
+                status_code=429,
+                headers={"Retry-After": "60"},
+            )
+            await response(scope, receive, send)
             return
         authorization_values = [
             value
@@ -168,8 +188,6 @@ class A2AAuthMiddleware:
             )
             await response(scope, receive, send)
             return
-        client = scope.get("client")
-        key = str(client[0]) if client else "unknown"
         if not await self._limiter.allow(key):
             response = JSONResponse(
                 {"detail": "Rate limit exceeded"},

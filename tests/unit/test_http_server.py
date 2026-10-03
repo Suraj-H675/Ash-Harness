@@ -7,11 +7,13 @@ import pytest
 from ash.sdk import AshEvent, AshEventRecord, AshResult
 from ash.core.session import SessionLineage
 from ash.server.http import (
+    HTTPApprovalBroker,
     MAX_HTTP_BODY_BYTES,
     MAX_HTTP_IN_FLIGHT_TURNS,
     MAX_HTTP_RATE_LIMIT_KEYS,
     SlidingWindowLimiter,
     TurnRequest,
+    _HTTPBoundaryMiddleware,
     _sse,
     create_app,
 )
@@ -20,6 +22,157 @@ from ash.server.http import (
 def test_sse_rejects_non_finite_json_payload() -> None:
     with pytest.raises(ValueError, match="Out of range float values"):
         _sse("metric", {"value": float("nan")})
+
+
+@pytest.mark.asyncio
+async def test_http_approval_broker_redacts_resolves_and_bounds_capacity() -> None:
+    broker = HTTPApprovalBroker(timeout_seconds=5, max_pending=1)
+    first = asyncio.create_task(
+        broker.request(
+            "run_command",
+            {"command": ["echo", "ok"], "token": "top-secret"},
+        )
+    )
+    await asyncio.sleep(0)
+
+    pending = await broker.list_pending()
+    assert len(pending) == 1
+    assert pending[0]["tool"] == "run_command"
+    assert "top-secret" not in str(pending[0]["arguments"])
+
+    assert await broker.request("write_file", {"path": "x"}) is False
+    assert await broker.resolve(pending[0]["id"], approved=True) is True
+    assert await first is True
+    assert await broker.list_pending() == []
+
+
+@pytest.mark.asyncio
+async def test_http_approval_broker_redacts_tool_declared_sensitive_fields() -> None:
+    class TypeTool:
+        sensitive_argument_fields = frozenset({"text"})
+
+    class DialogTool:
+        sensitive_argument_fields = frozenset({"prompt_text"})
+
+    tools = {
+        "browser_type": TypeTool(),
+        "browser_dialog": DialogTool(),
+    }
+    broker = HTTPApprovalBroker(timeout_seconds=5, max_pending=2)
+    broker.set_tool_provider(tools.get)
+    typed = asyncio.create_task(
+        broker.request(
+            "browser_type",
+            {"ref": "e1", "text": "typed-secret"},
+        )
+    )
+    dialog = asyncio.create_task(
+        broker.request(
+            "browser_dialog",
+            {"accept": True, "prompt_text": "dialog-secret"},
+        )
+    )
+    await asyncio.sleep(0)
+
+    pending = await broker.list_pending()
+    assert "typed-secret" not in str(pending)
+    assert "dialog-secret" not in str(pending)
+    assert all("[REDACTED]" in str(item["arguments"]) for item in pending)
+    for item in pending:
+        assert await broker.resolve(item["id"], approved=False) is True
+    assert await typed is False
+    assert await dialog is False
+
+
+@pytest.mark.asyncio
+async def test_http_approval_endpoints_require_auth_and_resolve_pending_request() -> None:
+    broker = HTTPApprovalBroker(timeout_seconds=5)
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        approval_broker=broker,
+    )
+    pending_task = asyncio.create_task(
+        broker.request("write_file", {"path": "README.md", "content": "hello"})
+    )
+    await asyncio.sleep(0)
+    transport = httpx.ASGITransport(app=app)
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as http:
+        assert (await http.get("/v1/approvals")).status_code == 401
+        listed = await http.get("/v1/approvals", headers=headers)
+        approval = listed.json()["approvals"][0]
+        resolved = await http.post(
+            f"/v1/approvals/{approval['id']}",
+            json={"approved": False},
+            headers=headers,
+        )
+
+    assert listed.status_code == 200
+    assert listed.json()["enabled"] is True
+    assert resolved.status_code == 200
+    assert resolved.json() == {"resolved": True, "approved": False}
+    assert await pending_task is False
+
+
+@pytest.mark.asyncio
+async def test_http_approval_long_poll_wakes_when_request_arrives() -> None:
+    broker = HTTPApprovalBroker(timeout_seconds=5)
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        approval_broker=broker,
+    )
+    transport = httpx.ASGITransport(app=app)
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as http:
+        waiting = asyncio.create_task(
+            http.get(
+                "/v1/approvals",
+                params={"wait_seconds": 2},
+                headers=headers,
+            )
+        )
+        await asyncio.sleep(0)
+        pending_task = asyncio.create_task(
+            broker.request("write_file", {"path": "README.md"})
+        )
+        response = await asyncio.wait_for(waiting, timeout=1)
+        approval = response.json()["approvals"][0]
+        await broker.resolve(approval["id"], approved=True)
+
+    assert response.status_code == 200
+    assert approval["tool"] == "write_file"
+    assert await pending_task is True
+
+
+@pytest.mark.asyncio
+async def test_http_approval_broker_timeout_fails_closed() -> None:
+    broker = HTTPApprovalBroker(timeout_seconds=1)
+    broker.timeout_seconds = 0.01
+
+    assert await broker.request("write_file", {"path": "README.md"}) is False
+    assert await broker.list_pending() == []
+
+
+@pytest.mark.asyncio
+async def test_http_approval_broker_shutdown_fails_pending_closed() -> None:
+    broker = HTTPApprovalBroker(timeout_seconds=5)
+    pending = asyncio.create_task(
+        broker.request("write_file", {"path": "README.md"})
+    )
+    await asyncio.sleep(0)
+
+    await broker.close()
+
+    assert await pending is False
+    assert await broker.list_pending() == []
 
 
 class FakeClient:
@@ -50,6 +203,21 @@ class FakeClient:
                     {"response": "done", "session_id": session_id},
                 ),
             )
+        ]
+
+    def session_messages(self, session_id, *, limit=200):
+        assert 1 <= limit <= 500
+        return [
+            {
+                "role": "user",
+                "content": f"prompt for {session_id}",
+                "timestamp": "2026-10-03T00:00:00+00:00",
+            },
+            {
+                "role": "assistant",
+                "content": "done",
+                "timestamp": "2026-10-03T00:00:01+00:00",
+            },
         ]
 
     async def new_session(self):
@@ -128,6 +296,36 @@ async def test_http_server_requires_auth_and_runs_turn() -> None:
     assert response.status_code == 200
     assert response.json()["response"] == "HELLO"
     assert response.json()["usage"]["cache_read_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_http_control_ui_is_public_but_api_remains_authenticated() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as http:
+        page = await http.get("/ui")
+        script = await http.get("/ui/control.js")
+        style = await http.get("/ui/control.css")
+        protected = await http.get("/v1/sessions")
+
+    assert page.status_code == 200
+    assert '<script src="/ui/control.js" defer></script>' in page.text
+    assert "default-src 'none'" in page.headers["content-security-policy"]
+    assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
+    assert page.headers["cache-control"] == "no-store"
+    assert page.headers["x-frame-options"] == "DENY"
+    assert script.status_code == 200
+    assert "localStorage" not in script.text
+    assert "sessionStorage" not in script.text
+    assert "document.cookie" not in script.text
+    assert style.status_code == 200
+    assert protected.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -444,11 +642,12 @@ async def test_http_rate_limit_precedes_rest_body_reading() -> None:
 
 
 @pytest.mark.asyncio
-async def test_http_public_framework_routes_remain_public() -> None:
+async def test_http_framework_and_unknown_routes_default_to_authenticated() -> None:
     app = create_app(
         FakeClient(),  # type: ignore[arg-type]
         bearer_token="0123456789abcdef",
     )
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
         transport=transport, base_url="http://testserver"
@@ -456,10 +655,83 @@ async def test_http_public_framework_routes_remain_public() -> None:
         docs = await http.get("/docs")
         schema = await http.get("/openapi.json")
         missing = await http.get("/not-an-ash-route")
+        authenticated_docs = await http.get("/docs", headers=headers)
+        authenticated_schema = await http.get("/openapi.json", headers=headers)
+        authenticated_missing = await http.get("/not-an-ash-route", headers=headers)
 
-    assert docs.status_code == 200
-    assert schema.status_code == 200
-    assert missing.status_code == 404
+    assert docs.status_code == 401
+    assert schema.status_code == 401
+    assert missing.status_code == 401
+    assert authenticated_docs.status_code == 404
+    assert authenticated_schema.status_code == 404
+    assert authenticated_missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_http_auth_rejects_non_ascii_bearer_token_as_unauthorized() -> None:
+    app_called = False
+
+    async def app(scope, receive, send) -> None:
+        del scope, receive, send
+        nonlocal app_called
+        app_called = True
+
+    middleware = _HTTPBoundaryMiddleware(
+        app,
+        bearer_token="0123456789abcdef",
+        requests_per_minute=100,
+        max_bytes=MAX_HTTP_BODY_BYTES,
+    )
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    await middleware(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/turn",
+            "headers": [(b"authorization", b"Bearer \xff")],
+            "client": ("127.0.0.1", 12345),
+        },
+        receive,
+        send,
+    )
+
+    assert app_called is False
+    assert sent[0]["status"] == 401
+
+
+@pytest.mark.asyncio
+async def test_http_pre_authentication_attempts_are_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ash.server.http.MAX_HTTP_PREAUTH_REQUESTS_PER_MINUTE", 2)
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        requests_per_minute=1,
+    )
+    transport = httpx.ASGITransport(app=app, client=("198.51.100.10", 12345))
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as http:
+        responses = [
+            await http.get(
+                "/v1/sessions",
+                headers={"Authorization": "Bearer wrong-token-value"},
+            )
+            for _ in range(5)
+        ]
+
+    assert [response.status_code for response in responses[:4]] == [401] * 4
+    assert responses[4].status_code == 429
+    assert responses[4].json()["detail"] == "Too many authentication attempts"
 
 
 @pytest.mark.asyncio
@@ -967,6 +1239,33 @@ async def test_http_server_replays_events_with_cursor() -> None:
     assert response.json()["schema_version"] == 1
     assert response.json()["events"][0]["sequence"] == 5
     assert response.json()["next_sequence"] == 5
+
+
+@pytest.mark.asyncio
+async def test_http_server_returns_bounded_session_transcript() -> None:
+    app = create_app(
+        FakeClient(),  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+    )
+    transport = httpx.ASGITransport(app=app)
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as http:
+        response = await http.get(
+            "/v1/sessions/session-1/messages",
+            params={"limit": 50},
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["messages"][0] == {
+        "role": "user",
+        "content": "prompt for session-1",
+        "timestamp": "2026-10-03T00:00:00+00:00",
+    }
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>Ash Remote</title>
+    <link rel="stylesheet" href="/ui/control.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <strong>Ash Remote</strong>
+        <span id="connection-state" class="state">Disconnected</span>
+      </div>
+      <div id="runtime-summary" class="runtime-summary"></div>
+    </header>
+
+    <section id="connect-panel" class="connect-panel" aria-label="Connection">
+      <label for="token">Bearer token</label>
+      <input
+        id="token"
+        type="password"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="ASH_SERVER_TOKEN"
+      >
+      <button id="connect" type="button">Connect</button>
+      <span class="hint">Kept in this page's memory only.</span>
+    </section>
+
+    <main class="workspace" aria-label="Ash remote workspace">
+      <section class="conversation" aria-label="Conversation">
+        <div id="transcript" class="transcript" aria-live="polite"></div>
+        <div class="composer">
+          <label class="sr-only" for="prompt">Message</label>
+          <textarea
+            id="prompt"
+            rows="3"
+            placeholder="Connect to Ash to start."
+            disabled
+          ></textarea>
+          <div class="composer-actions">
+            <button id="send" type="button" disabled>Send</button>
+            <button id="stop" type="button" disabled>Stop</button>
+          </div>
+        </div>
+      </section>
+
+      <aside class="sidebar">
+        <section>
+          <div class="section-heading">
+            <h2>Session</h2>
+            <button id="new-session" type="button" disabled>New</button>
+          </div>
+          <label class="sr-only" for="sessions">Session</label>
+          <select id="sessions" disabled></select>
+          <button id="refresh-sessions" type="button" disabled>Refresh sessions</button>
+        </section>
+
+        <section>
+          <h2>Approvals</h2>
+          <div id="approvals" class="approvals">
+            <p class="empty">No pending approvals.</p>
+          </div>
+        </section>
+
+        <section>
+          <h2>Connection</h2>
+          <dl id="connection-details" class="details"></dl>
+        </section>
+      </aside>
+    </main>
+
+    <div id="notice" class="notice" role="status" aria-live="polite"></div>
+    <script src="/ui/control.js" defer></script>
+  </body>
+</html>

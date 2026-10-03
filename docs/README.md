@@ -23,6 +23,7 @@ canonical `ash.*` namespace under `src/ash`.
 - [Durable session branching](guides/SESSION_BRANCHING.md)
 - [Extension authoring](guides/EXTENSIONS.md)
 - [Permissions and managed policy](guides/PERMISSIONS.md)
+- [Remote access](guides/REMOTE_ACCESS.md)
 - [Releasing Ash](guides/RELEASING.md)
 
 ## Reference

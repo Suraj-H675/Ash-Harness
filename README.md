@@ -602,11 +602,26 @@ Ash exposes or consumes the following integration surfaces:
 | Surface | Capability |
 | --- | --- |
 | ACP v1 | Stdio editor/agent host integration with new/load/list/close plus durable fork/resume session lifecycle, prompts, cancellation, tool progress, usage, text, bounded inline images, resource links, and stdio/HTTP/SSE MCP support |
-| A2A 1.0 | Authenticated Agent Card, JSON-RPC, HTTP+JSON routes, bounded concurrent task execution, task polling, streaming, cancellation, context continuation, inspection, and outbound delegation |
-| HTTP API | Authenticated bounded-concurrency synchronous turns, live SSE turn events, steering, session fork, and session tree endpoints |
+| A2A 1.0 | Public discovery Agent Card plus authenticated JSON-RPC/HTTP+JSON task routes, bounded concurrent task execution, task polling, streaming, cancellation, context continuation, inspection, and outbound delegation |
+| HTTP API | Authenticated bounded-concurrency turns, live SSE events, steering, live approval decisions, durable session controls, and a responsive first-party browser/remote-terminal control surface |
 | JSON-RPC | Structured runtime and session integration for external hosts |
 | LSP 3.18 | Managed lazy language servers for diagnostics, hover, definitions, references, implementations, symbols, and call hierarchy |
-| Python SDK | Async client access to turns, durable Goals, sessions, plans, steering, events, usage, storage, automation, and agent delegation |
+| Python SDK | Async client access to turns, durable Goals, sessions, steering, events, usage, automation, and agent delegation |
+
+### Remote control
+
+`ash serve` runs a dedicated headless Ash runtime on loopback by default.
+`ash remote chat http://127.0.0.1:8765` attaches a first-party terminal client,
+and `http://127.0.0.1:8765/ui` provides the responsive browser control surface.
+Both can work with durable sessions, stream turns, steer running work, and
+resolve policy approvals.
+
+Non-loopback serving requires explicit `--allow-remote` plus TLS. For
+Internet-crossing access, keep Ash on loopback behind an SSH tunnel or private
+VPN rather than exposing the built-in listener directly. One bearer token is
+one trusted controller; the server is not a multi-user service. See
+[Remote access](docs/guides/REMOTE_ACCESS.md) for the complete trust and
+deployment boundary.
 
 Managed LSP detects host-installed basedpyright/pyright,
 typescript-language-server, gopls, rust-analyzer, clangd, and
@@ -687,11 +702,10 @@ they are complete:
 - LSP rename and code actions are not exposed; and
 - a broad messaging-channel gateway is not currently part of Ash.
 
-Ash is not yet justified as fully production-ready under the project Charter.
-The current implementation is strong, but the post-closure Charter audit
-reopened the final mission gate because the documented production release does
-not yet exist and whole-product parity still has material gaps. Production
-observability is now available as an explicit opt-in OpenTelemetry/OTLP
+Ash has a real immutable production distribution, but the final whole-product
+mission gate remains open while the finite parity program is still working
+through interfaces/anywhere-access and later cross-cutting closure gates.
+Production observability is available as an explicit opt-in OpenTelemetry/OTLP
 trace-and-metrics path; qualified boundaries above remain truthful support
 limits rather than claims of feature identity with every comparator.
 

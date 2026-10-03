@@ -8,7 +8,11 @@ import json
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from dataclasses import dataclass
+from functools import lru_cache
+from importlib import resources
+from typing import Any, AsyncIterator, Callable
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -19,10 +23,12 @@ from ash.sdk import AshClient
 from ash.core.events import EVENT_SCHEMA_VERSION
 from ash.core.redaction import redact_text, redact_value
 from ash.server.jsonrpc import JSONRPCServer
+from ash.tools.base import redact_tool_arguments
 
 
 class TurnRequest(BaseModel):
     input: str = Field(..., min_length=1, max_length=1_000_000)
+    session_id: str | None = Field(default=None, min_length=1, max_length=512)
 
 
 class ResumeRequest(BaseModel):
@@ -39,7 +45,129 @@ class ForkSessionRequest(BaseModel):
     branch_summary: str = Field(default="", max_length=12_000)
 
 
+class ApprovalDecisionRequest(BaseModel):
+    approved: bool
+
+
 MAX_HTTP_RATE_LIMIT_KEYS = 10_000
+MAX_PENDING_HTTP_APPROVALS = 64
+MAX_HTTP_APPROVAL_TIMEOUT_SECONDS = 3600.0
+DEFAULT_HTTP_APPROVAL_TIMEOUT_SECONDS = 300.0
+
+
+@dataclass
+class _PendingHTTPApproval:
+    request_id: str
+    tool: str
+    arguments: dict[str, Any]
+    future: asyncio.Future[bool]
+
+
+class HTTPApprovalBroker:
+    """Bounded live approval broker for authenticated remote operators."""
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_HTTP_APPROVAL_TIMEOUT_SECONDS,
+        max_pending: int = MAX_PENDING_HTTP_APPROVALS,
+    ) -> None:
+        if not 1 <= timeout_seconds <= MAX_HTTP_APPROVAL_TIMEOUT_SECONDS:
+            raise ValueError(
+                "HTTP approval timeout must be between 1 and "
+                f"{int(MAX_HTTP_APPROVAL_TIMEOUT_SECONDS)} seconds"
+            )
+        if max_pending < 1:
+            raise ValueError("HTTP approval capacity must be positive")
+        self.timeout_seconds = float(timeout_seconds)
+        self.max_pending = max_pending
+        self._pending: dict[str, _PendingHTTPApproval] = {}
+        self._lock = asyncio.Lock()
+        self._changed = asyncio.Event()
+        self._closed = False
+        self._tool_provider: Callable[[str], Any] | None = None
+
+    def set_tool_provider(self, provider: Callable[[str], Any]) -> None:
+        self._tool_provider = provider
+
+    async def request(self, tool_name: str, arguments: dict[str, Any]) -> bool:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        request_id = uuid4().hex
+        tool = self._tool_provider(tool_name) if self._tool_provider is not None else None
+        display_arguments = redact_tool_arguments(tool, arguments)
+        pending = _PendingHTTPApproval(
+            request_id=request_id,
+            tool=redact_text(tool_name),
+            arguments=display_arguments,
+            future=future,
+        )
+        async with self._lock:
+            if self._closed or len(self._pending) >= self.max_pending:
+                return False
+            self._pending[request_id] = pending
+            self._changed.set()
+        try:
+            return await asyncio.wait_for(future, timeout=self.timeout_seconds)
+        except TimeoutError:
+            return False
+        finally:
+            async with self._lock:
+                if self._pending.get(request_id) is pending:
+                    self._pending.pop(request_id, None)
+
+    async def list_pending(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            return self._pending_payload_locked()
+
+    async def wait_pending(self, timeout_seconds: float) -> list[dict[str, Any]]:
+        if not 0 <= timeout_seconds <= 30:
+            raise ValueError("approval wait must be between 0 and 30 seconds")
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            async with self._lock:
+                if self._pending or self._closed or timeout_seconds == 0:
+                    return self._pending_payload_locked()
+                self._changed.clear()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return []
+            try:
+                await asyncio.wait_for(self._changed.wait(), timeout=remaining)
+            except TimeoutError:
+                return []
+
+    async def resolve(self, request_id: str, *, approved: bool) -> bool:
+        async with self._lock:
+            pending = self._pending.pop(request_id, None)
+        if pending is None:
+            return False
+        self._changed.set()
+        if not pending.future.done():
+            pending.future.set_result(bool(approved))
+        return True
+
+    async def close(self) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            pending = tuple(self._pending.values())
+            self._pending.clear()
+            self._changed.set()
+        for item in pending:
+            if not item.future.done():
+                item.future.set_result(False)
+
+    def _pending_payload_locked(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": item.request_id,
+                "tool": item.tool,
+                "arguments": item.arguments,
+            }
+            for item in self._pending.values()
+        ]
 
 
 class SlidingWindowLimiter:
@@ -80,6 +208,22 @@ MAX_JSONRPC_BATCH_REQUESTS = 32
 MAX_EVENT_LIST_LIMIT = 10_000
 MAX_HTTP_BODY_BYTES = 16 * 1024 * 1024
 MAX_HTTP_IN_FLIGHT_TURNS = 16
+MAX_HTTP_PREAUTH_REQUESTS_PER_MINUTE = 240
+PUBLIC_HTTP_PATHS = frozenset(
+    {"/health", "/ui", "/ui/control.css", "/ui/control.js"}
+)
+CONTROL_UI_ASSETS = frozenset({"control.html", "control.css", "control.js"})
+CONTROL_UI_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; "
+        "form-action 'none'; frame-ancestors 'none'"
+    ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
 
 
 class _HTTPBoundaryMiddleware:
@@ -93,28 +237,50 @@ class _HTTPBoundaryMiddleware:
         requests_per_minute: int,
         max_bytes: int,
     ) -> None:
+        if (
+            len(bearer_token) < 16
+            or not bearer_token.isascii()
+            or any(character.isspace() for character in bearer_token)
+        ):
+            raise ValueError(
+                "HTTP bearer token must contain at least 16 non-whitespace ASCII characters"
+            )
         self.app = app
-        self._token = bearer_token
+        self._token = bearer_token.encode("ascii")
+        self._preauth_limiter = SlidingWindowLimiter(
+            max(MAX_HTTP_PREAUTH_REQUESTS_PER_MINUTE, requests_per_minute * 4)
+        )
         self._limiter = SlidingWindowLimiter(requests_per_minute)
         self.max_bytes = max_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = str(scope.get("path", ""))
-        if scope["type"] != "http" or not (path == "/rpc" or path.startswith("/v1/")):
+        if scope["type"] != "http" or path in PUBLIC_HTTP_PATHS:
             await self.app(scope, receive, send)
             return
 
+        client = scope.get("client")
+        key = str(client[0]) if client else "unknown"
+        if not await self._preauth_limiter.allow(key):
+            response = JSONResponse(
+                status_code=429,
+                content={"detail": "Too many authentication attempts"},
+                headers={"Retry-After": "60"},
+            )
+            await response(scope, receive, send)
+            return
+
         authorization_values = [
-            value.decode("latin-1")
+            value
             for key, value in scope.get("headers", [])
             if key.lower() == b"authorization"
         ]
         scheme, _, supplied = (
-            authorization_values[0] if len(authorization_values) == 1 else ""
-        ).partition(" ")
+            authorization_values[0] if len(authorization_values) == 1 else b""
+        ).partition(b" ")
         if (
             len(authorization_values) != 1
-            or scheme.casefold() != "bearer"
+            or scheme.lower() != b"bearer"
             or not hmac.compare_digest(supplied, self._token)
         ):
             response = JSONResponse(
@@ -125,8 +291,6 @@ class _HTTPBoundaryMiddleware:
             await response(scope, receive, send)
             return
 
-        client = scope.get("client")
-        key = str(client[0]) if client else "unknown"
         if not await self._limiter.allow(key):
             response = JSONResponse(
                 status_code=429,
@@ -199,9 +363,16 @@ def create_app(
     requests_per_minute: int = 60,
     close_client_on_shutdown: bool = False,
     max_in_flight_turns: int = MAX_HTTP_IN_FLIGHT_TURNS,
+    approval_broker: HTTPApprovalBroker | None = None,
 ) -> FastAPI:
-    if len(bearer_token) < 16:
-        raise ValueError("HTTP bearer token must contain at least 16 characters")
+    if (
+        len(bearer_token) < 16
+        or not bearer_token.isascii()
+        or any(character.isspace() for character in bearer_token)
+    ):
+        raise ValueError(
+            "HTTP bearer token must contain at least 16 non-whitespace ASCII characters"
+        )
     if max_in_flight_turns < 1:
         raise ValueError("HTTP in-flight turn limit must be positive")
     rpc = JSONRPCServer(client)
@@ -263,14 +434,46 @@ def create_app(
                     "HTTP JSON-RPC shutdown cleanup failed: "
                     + redact_text(str(cleanup_error))
                 )
+            if approval_broker is not None:
+                try:
+                    await approval_broker.close()
+                except BaseException as cleanup_error:
+                    if primary_error is None:
+                        raise
+                    primary_error.add_note(
+                        "HTTP approval broker shutdown failed: "
+                        + redact_text(str(cleanup_error))
+                    )
 
-    app = FastAPI(title="Ash API", version="1", lifespan=lifespan)
+    app = FastAPI(
+        title="Ash API",
+        version="1",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.add_middleware(
         _HTTPBoundaryMiddleware,
         bearer_token=bearer_token,
         requests_per_minute=requests_per_minute,
         max_bytes=MAX_HTTP_BODY_BYTES,
     )
+
+    @app.get("/ui")
+    async def control_ui() -> Response:
+        return _control_ui_asset("control.html", "text/html; charset=utf-8")
+
+    @app.get("/ui/control.css")
+    async def control_ui_css() -> Response:
+        return _control_ui_asset("control.css", "text/css; charset=utf-8")
+
+    @app.get("/ui/control.js")
+    async def control_ui_js() -> Response:
+        return _control_ui_asset(
+            "control.js",
+            "text/javascript; charset=utf-8",
+        )
 
     @app.get("/health")
     async def health() -> dict[str, str | int]:
@@ -345,7 +548,11 @@ def create_app(
     async def run_turn(payload: TurnRequest) -> dict:
         require_turn_slot()
         try:
-            result = await client.prompt(payload.input)
+            result = (
+                await client.prompt(payload.input, session_id=payload.session_id)
+                if payload.session_id is not None
+                else await client.prompt(payload.input)
+            )
             return {
                 "response": result.response,
                 "session_id": result.session_id,
@@ -359,7 +566,12 @@ def create_app(
     @app.post("/v1/turn/stream")
     async def stream_turn(payload: TurnRequest) -> StreamingResponse:
         async def events() -> AsyncIterator[str]:
-            async for event in client.stream_prompt(payload.input):
+            stream = (
+                client.stream_prompt(payload.input, session_id=payload.session_id)
+                if payload.session_id is not None
+                else client.stream_prompt(payload.input)
+            )
+            async for event in stream:
                 yield _sse(
                     event.type,
                     redact_value(event.to_wire(include_type=False)),
@@ -377,6 +589,40 @@ def create_app(
             raise HTTPException(status_code=429, detail=redact_text(str(exc))) from exc
         return {"pending": pending}
 
+    @app.get("/v1/approvals")
+    async def approvals(wait_seconds: float = 0) -> dict[str, Any]:
+        if not 0 <= wait_seconds <= 30:
+            raise HTTPException(
+                status_code=422,
+                detail="wait_seconds must be between 0 and 30",
+            )
+        return {
+            "enabled": approval_broker is not None,
+            "approvals": (
+                await approval_broker.wait_pending(wait_seconds)
+                if approval_broker is not None
+                else []
+            ),
+        }
+
+    @app.post("/v1/approvals/{request_id}")
+    async def resolve_approval(
+        request_id: str,
+        payload: ApprovalDecisionRequest,
+    ) -> dict[str, bool]:
+        if approval_broker is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Remote approvals are unavailable",
+            )
+        resolved = await approval_broker.resolve(
+            request_id,
+            approved=payload.approved,
+        )
+        if not resolved:
+            raise HTTPException(status_code=404, detail="Approval request not found")
+        return {"resolved": True, "approved": payload.approved}
+
     @app.get("/v1/sessions")
     async def sessions(query: str = "", limit: int = 20) -> dict:
         if not 1 <= limit <= 100:
@@ -387,6 +633,18 @@ def create_app(
                 for item in client.sessions(query=query, limit=limit)
             ]
         }
+
+    @app.get("/v1/sessions/{session_id}/messages")
+    async def session_messages(session_id: str, limit: int = 200) -> dict:
+        if not 1 <= limit <= 500:
+            raise HTTPException(status_code=422, detail="limit must be 1..500")
+        try:
+            messages = client.session_messages(session_id, limit=limit)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=redact_text(str(exc))) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=redact_text(str(exc))) from exc
+        return {"messages": messages}
 
     @app.get("/v1/sessions/{session_id}/events")
     async def session_events(
@@ -493,3 +751,18 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _reject_json_constant(raw: str) -> None:
     raise ValueError(f"invalid JSON constant: {raw}")
+
+
+@lru_cache(maxsize=len(CONTROL_UI_ASSETS))
+def _control_ui_bytes(name: str) -> bytes:
+    if name not in CONTROL_UI_ASSETS:
+        raise ValueError("unknown Ash control UI asset")
+    return resources.files("ash.server").joinpath("static", name).read_bytes()
+
+
+def _control_ui_asset(name: str, media_type: str) -> Response:
+    return Response(
+        content=_control_ui_bytes(name),
+        media_type=media_type,
+        headers=CONTROL_UI_HEADERS,
+    )

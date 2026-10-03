@@ -218,8 +218,19 @@ class JSONRPCServer:
             raise ValueError(
                 f"input must not exceed {MAX_JSONRPC_TEXT_BYTES} bytes"
             )
+        session_id = params.get("session_id")
+        if session_id is not None and (
+            not isinstance(session_id, str)
+            or not session_id
+            or len(session_id.encode("utf-8")) > 512
+        ):
+            raise ValueError("session_id must be a non-empty string of at most 512 bytes")
         async with self._turn_lock:
-            result = await self.client.prompt(text)
+            result = (
+                await self.client.prompt(text, session_id=session_id)
+                if session_id is not None
+                else await self.client.prompt(text)
+            )
         return {
             "response": result.response,
             "session_id": result.session_id,

@@ -7,7 +7,7 @@ import httpx
 import pytest
 from a2a.utils.errors import InternalError
 
-from ash.commands.a2a import _local_public_url, _remote_url
+from ash.commands.a2a import _local_public_url, _remote_url, serve_a2a
 
 from ash.cli import main
 
@@ -51,6 +51,40 @@ def test_a2a_serve_requires_tls_cert_and_key_together(monkeypatch, capsys) -> No
 
     assert main(["a2a", "serve", "--ssl-certfile", "cert.pem"]) == 2
     assert "both --ssl-certfile and --ssl-keyfile" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_a2a_serve_bounds_uvicorn_admission(monkeypatch) -> None:
+    monkeypatch.setenv("ASH_A2A_TOKEN", "0123456789abcdef")
+    observed_config = None
+
+    class Server:
+        def __init__(self, config) -> None:
+            nonlocal observed_config
+            observed_config = config
+
+        async def serve(self) -> None:
+            return None
+
+    monkeypatch.setattr("ash.commands.a2a.AshConfig.load", lambda: object())
+    monkeypatch.setattr("ash.commands.a2a.create_a2a_app", lambda *args, **kwargs: object())
+    monkeypatch.setattr("ash.commands.a2a.uvicorn.Server", Server)
+    args = SimpleNamespace(
+        token_env="ASH_A2A_TOKEN",
+        host="127.0.0.1",
+        port=8766,
+        rate_limit=60,
+        allow_remote=False,
+        ssl_certfile=None,
+        ssl_keyfile=None,
+        public_url=None,
+        log_level="info",
+    )
+
+    assert await serve_a2a(args) == 0
+    assert observed_config.limit_concurrency == 128
+    assert observed_config.backlog == 128
+    assert observed_config.timeout_keep_alive == 5
 
 
 def test_a2a_client_network_failure_has_stable_cli_error(monkeypatch, capsys) -> None:

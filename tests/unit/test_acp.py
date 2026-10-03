@@ -2145,6 +2145,7 @@ async def test_production_acp_entrypoint_exposes_fork_resume_and_close(
             timeout=45,
         )
         assert prompted.stop_reason == "end_turn"
+        await asyncio.wait_for(wire_client.agent_message_received.wait(), timeout=2)
         assert any(
             update.session_update == "agent_message_chunk"
             and update.content.text == "acp-real-ok"

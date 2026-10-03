@@ -1616,13 +1616,23 @@ async def test_remote_task_tools_return_protocol_errors_as_tool_failures(
         "ash.agents.a2a_remote.cancel_remote_agent_task",
         missing_task,
     )
+    store = RemoteTaskStore(tmp_path / "remote-tasks.db", tmp_path)
+    store.save(
+        agent="local",
+        endpoint=config.url,
+        task_id="missing-task",
+        context_id="context-1",
+        state="TASK_STATE_WORKING",
+    )
     status_tool = RemoteAgentTaskStatusTool(
         SafetyGuard(tmp_path),
         {"local": config},
+        store,
     )
     cancel_tool = RemoteAgentTaskCancelTool(
         SafetyGuard(tmp_path),
         {"local": config},
+        store,
     )
 
     status = await status_tool.run(agent="local", task_id="missing-task")
@@ -1634,6 +1644,7 @@ async def test_remote_task_tools_return_protocol_errors_as_tool_failures(
     assert cancelled.success is False
     assert cancelled.output == ""
     assert cancelled.error == "remote task not found"
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -1652,9 +1663,18 @@ async def test_remote_task_tool_redacts_signed_url_from_protocol_error(
         )
 
     monkeypatch.setattr("ash.agents.a2a_remote.get_remote_agent_task", signed_error)
+    store = RemoteTaskStore(tmp_path / "remote-tasks.db", tmp_path)
+    store.save(
+        agent="local",
+        endpoint=config.url,
+        task_id="task-1",
+        context_id="context-1",
+        state="TASK_STATE_WORKING",
+    )
     tool = RemoteAgentTaskStatusTool(
         SafetyGuard(tmp_path),
         {"local": config},
+        store,
     )
 
     result = await tool.run(agent="local", task_id="task-1")
@@ -1662,6 +1682,7 @@ async def test_remote_task_tool_redacts_signed_url_from_protocol_error(
     assert result.success is False
     assert marker not in (result.error or "")
     assert "X-Amz-Signature=[REDACTED]" in (result.error or "")
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -1682,9 +1703,18 @@ async def test_remote_task_tool_redacts_exact_configured_bearer_token(
         raise RuntimeError(f"remote echoed bearer credential {token}")
 
     monkeypatch.setattr("ash.agents.a2a_remote.get_remote_agent_task", echoed_token)
+    store = RemoteTaskStore(tmp_path / "remote-tasks.db", tmp_path)
+    store.save(
+        agent="local",
+        endpoint=config.url,
+        task_id="task-1",
+        context_id="context-1",
+        state="TASK_STATE_WORKING",
+    )
     tool = RemoteAgentTaskStatusTool(
         SafetyGuard(tmp_path),
         {"local": config},
+        store,
     )
 
     result = await tool.run(agent="local", task_id="task-1")
@@ -1692,6 +1722,37 @@ async def test_remote_task_tool_redacts_exact_configured_bearer_token(
     assert result.success is False
     assert token not in (result.error or "")
     assert "[REDACTED]" in (result.error or "")
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_task_status_rejects_unknown_handle_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = RemoteAgentConfig(name="local", url="https://agent.example.com")
+    store = RemoteTaskStore(tmp_path / "remote-tasks.db", tmp_path)
+    network_calls = 0
+
+    async def forbidden(*args: Any, **kwargs: Any) -> Any:
+        nonlocal network_calls
+        del args, kwargs
+        network_calls += 1
+        raise AssertionError("unknown task must fail before network")
+
+    monkeypatch.setattr("ash.agents.a2a_remote.get_remote_agent_task", forbidden)
+    tool = RemoteAgentTaskStatusTool(
+        SafetyGuard(tmp_path),
+        {"local": config},
+        store,
+    )
+
+    result = await tool.run(agent="local", task_id="attacker-chosen")
+
+    assert result.success is False
+    assert "unknown remote task" in (result.error or "")
+    assert network_calls == 0
+    store.close()
 
 
 @pytest.mark.asyncio
@@ -1856,6 +1917,58 @@ def test_a2a_remote_config_respects_trust_and_rejects_duplicates(
         )
 
 
+def test_project_a2a_config_cannot_select_host_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    project_config = workspace / ".ash" / "a2a.json"
+    home.mkdir()
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(
+        '{"agents":{"review":{"url":"https://review.example.com",'
+        '"token_env":"OPENAI_API_KEY"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ValueError, match="cannot declare token_env"):
+        load_remote_agent_configs(workspace, include_project=True)
+
+
+@pytest.mark.asyncio
+async def test_project_a2a_peer_never_inherits_default_bearer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    project_config = workspace / ".ash" / "a2a.json"
+    home.mkdir()
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(
+        '{"agents":{"review":{"url":"https://review.example.com"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("ASH_A2A_TOKEN", "host-secret-must-not-leave")
+    config = load_remote_agent_configs(workspace, include_project=True)["review"]
+    observed: dict[str, Any] = {}
+
+    def stop_before_network(**kwargs: Any) -> Any:
+        observed.update(kwargs)
+        raise RuntimeError("stop before network")
+
+    monkeypatch.setattr("ash.agents.a2a_remote.httpx.AsyncClient", stop_before_network)
+
+    with pytest.raises(RuntimeError, match="stop before network"):
+        await send_remote_agent(config, "review this")
+
+    assert config.token_env is None
+    assert observed["headers"] == {}
+
+
 def test_a2a_remote_config_rejects_duplicate_json_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1997,6 +2110,49 @@ async def test_a2a_rate_limits_authenticated_operations(tmp_path: Path) -> None:
     assert first.status_code == 200
     assert second.status_code == 429
     assert second.headers["Retry-After"] == "60"
+
+
+@pytest.mark.asyncio
+async def test_a2a_rate_limits_pre_authentication_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ash.server.a2a.MAX_A2A_PREAUTH_REQUESTS_PER_MINUTE", 2)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    app = create_a2a_app(
+        config,
+        public_url="http://testserver",
+        bearer_token="0123456789abcdef",
+        requests_per_minute=1,
+        task_store=InMemoryTaskStore(),
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=app,
+                client=("198.51.100.10", 12345),
+            ),
+            base_url="http://testserver",
+        ) as client:
+            responses = [
+                await client.post(
+                    "/a2a",
+                    json={},
+                    headers={"Authorization": "Bearer wrong-token-value"},
+                )
+                for _ in range(5)
+            ]
+
+    assert [response.status_code for response in responses[:4]] == [401] * 4
+    assert responses[4].status_code == 429
+    assert responses[4].json()["detail"] == "Too many authentication attempts"
 
 
 @pytest.mark.asyncio

@@ -41,7 +41,9 @@ class FakeClient:
         self.config = FakeConfig()
         self._started = True
 
-    async def prompt(self, text: str) -> AshResult:
+    async def prompt(self, text: str, *, session_id: str | None = None) -> AshResult:
+        if session_id is not None:
+            self.last_prompt_session_id = session_id
         return AshResult(text.upper(), "session-1", "fake/model", 3)
 
     def sessions(self, query="", limit=20):
@@ -97,6 +99,24 @@ async def test_jsonrpc_initialize_advertises_versioned_contracts() -> None:
     assert response["result"]["capabilities"]["event_schema_version"] == 1
     assert response["result"]["capabilities"]["event_replay"] is True
     assert response["result"]["capabilities"]["session_tree"] is True
+
+
+@pytest.mark.asyncio
+async def test_jsonrpc_turn_can_bind_to_explicit_session() -> None:
+    client = FakeClient()
+    server = JSONRPCServer(client)  # type: ignore[arg-type]
+
+    response = await server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "turn/run",
+            "params": {"input": "hello", "session_id": "session-review"},
+        }
+    )
+
+    assert response["result"]["response"] == "HELLO"
+    assert client.last_prompt_session_id == "session-review"
 
 
 @pytest.mark.asyncio

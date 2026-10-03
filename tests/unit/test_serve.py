@@ -13,6 +13,7 @@ def args(**overrides):
         "host": "127.0.0.1",
         "port": 8765,
         "rate_limit": 60,
+        "approval_timeout": 300.0,
         "allow_remote": False,
         "ssl_certfile": None,
         "ssl_keyfile": None,
@@ -64,6 +65,8 @@ async def test_serve_validates_arguments_before_creating_client(monkeypatch) -> 
         await serve_http(args(port=0))
     with pytest.raises(ValueError, match="Rate limit"):
         await serve_http(args(rate_limit=0))
+    with pytest.raises(ValueError, match="Approval timeout"):
+        await serve_http(args(approval_timeout=0))
 
 
 @pytest.mark.asyncio
@@ -100,7 +103,11 @@ async def test_serve_closes_client_when_server_stops(monkeypatch) -> None:
         async def serve(self) -> None:
             return None
 
-    async def create_client():
+    approval_callback = None
+
+    async def create_client(**kwargs):
+        nonlocal approval_callback
+        approval_callback = kwargs.get("approval_callback")
         return Client()
 
     monkeypatch.setattr("ash.commands.serve.AshClient.create", create_client)
@@ -110,8 +117,12 @@ async def test_serve_closes_client_when_server_stops(monkeypatch) -> None:
         args(ssl_certfile="cert.pem", ssl_keyfile="key.pem")
     ) == 0
     assert closed is True
+    assert callable(approval_callback)
     assert observed_config.ssl_certfile == "cert.pem"
     assert observed_config.ssl_keyfile == "key.pem"
+    assert observed_config.limit_concurrency == 128
+    assert observed_config.backlog == 128
+    assert observed_config.timeout_keep_alive == 5
 
 
 @pytest.mark.asyncio
@@ -131,7 +142,7 @@ async def test_serve_preserves_server_failure_when_client_close_fails(
         async def serve(self) -> None:
             raise RuntimeError("server failure")
 
-    async def create_client():
+    async def create_client(**_kwargs):
         return Client()
 
     monkeypatch.setattr("ash.commands.serve.AshClient.create", create_client)

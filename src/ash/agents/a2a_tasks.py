@@ -438,6 +438,27 @@ class RemoteTaskStore:
             str(row["endpoint"]), "stored remote agent endpoint", 4096
         )
 
+    def endpoint_for_task(self, *, agent: str, task_id: str) -> str | None:
+        """Return the exact durable endpoint bound to one agent/task handle."""
+
+        self._require_open()
+        normalized_agent = self._bounded(agent, "remote agent name", 64)
+        normalized_task = self._bounded(task_id, "remote task ID", 512)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT endpoint FROM remote_agent_tasks
+                WHERE workspace = ? AND agent = ? AND task_id = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (self.workspace, normalized_agent, normalized_task),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._bounded(
+            str(row["endpoint"]), "stored remote agent endpoint", 4096
+        )
+
     def _row(self, row: sqlite3.Row) -> RemoteTaskHandle:
         return RemoteTaskHandle(
             agent=self._bounded(str(row["agent"]), "stored remote agent name", 64),

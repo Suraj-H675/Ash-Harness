@@ -122,11 +122,11 @@ The program is intentionally finite:
    skills, MCP, hooks, custom commands, discovery, installation, updating,
    provenance/trust, and marketplace/ecosystem experience. Hosted ecosystem
    breadth is work only when it materially improves real Ash usage.
-5. **P5 — Interfaces and anywhere-access parity — OPEN.** Determine
+5. **P5 — Interfaces and anywhere-access parity — CLOSED.** Determine
    whether remote access, web UI, messaging surfaces, companion clients, or
    other access modalities solve important Ash workflows; implement justified
    gaps and explicitly reject unrelated product categories.
-6. **P6 — User-experience parity — NOT STARTED.** Benchmark the complete
+6. **P6 — User-experience parity — OPEN.** Benchmark the complete
    journey from installation and onboarding through model selection, coding,
    approvals, sessions, debugging, interruption/recovery, updates, and
    troubleshooting. Close material friction even when the underlying backend
@@ -143,11 +143,87 @@ The program is intentionally finite:
    important unresolved user need remains may Ash claim whole-product
    leading-harness parity. Literal feature identity is never the criterion.
 
-**Active gate: P5 — Interfaces and anywhere-access parity.** P1 through P4 are
+**Active gate: P6 — User-experience parity.** P1 through P5 are
 closed at their bounded finish conditions. Do not reopen them for feature-count
 churn; reopen only for concrete evidence that an important supported
-provider/model, agent/workspace, web/computer-interaction, or extensibility user
-need or claim is wrong.
+provider/model, agent/workspace, web/computer-interaction, extensibility, or
+interface/access user need or claim is wrong.
+
+### P5 finite closure checklist
+
+P5 is bounded around whether a developer can use the same Ash runtime safely
+from the terminal, an editor/host, automation, or another machine. It is not a
+mandate to turn Ash into a general consumer messaging assistant or to build
+native desktop/mobile applications merely because broader products ship them.
+
+1. **P5A — Local operator and headless interfaces — CLOSED.** Ash already has
+   the responsive interactive CLI/TUI, non-interactive text/JSON/stream-JSON
+   modes, durable session resume/fork/tree workflows, accessibility behavior,
+   and explicit automation surfaces required for local operation.
+2. **P5B — Host and protocol integration — CLOSED.** The Python SDK,
+   authenticated HTTP/SSE, JSON-RPC, ACP v1, and A2A 1.0 surfaces already expose
+   the supported runtime/session capabilities with bounded admission,
+   cancellation, replay, and lifecycle ownership. Optional protocol features
+   remain unadvertised where Ash does not implement them.
+3. **P5C — Secure remote operator access — CLOSED.** `ash serve` now has a
+   first-party `ash remote` terminal client plus authenticated browser control
+   surface for session inspection/selection, bounded transcript restore,
+   streamed turns, steering, and explicit live approvals. Remote turns bind
+   their expected session atomically under the SDK turn lock. The server stays
+   loopback-first; non-loopback serving requires explicit opt-in and TLS, while
+   the documented Internet-crossing path is SSH/private VPN rather than direct
+   exposure. Auth attempts, authenticated requests, connection admission,
+   bodies, streams, pending approvals, and approval waits are bounded and
+   fail closed.
+4. **P5D — Browser/mobile/messaging scope — CLOSED.** A thin same-origin browser
+   control UI materially improves access to an already-running coding host and
+   is now shipped with the server package. Broad
+   Telegram/WhatsApp/Discord/etc. gateways, voice assistants, native
+   desktop/mobile clients, device nodes, and a hosted Ash relay remain outside
+   core: they create different consumer/team service boundaries without a
+   demonstrated coding-harness need. A future concrete workflow can reopen
+   that decision.
+5. **P5E — Integrated interface conformance — CLOSED.** Focused local coverage
+   spans HTTP/SSE, remote CLI, JSON-RPC, SDK session binding, server lifecycle,
+   A2A, and ACP; a real Playwright journey drives the actual loopback FastAPI
+   app and packaged UI routes through authentication, durable-session restore,
+   live approval, streamed turn, and steering. Installed-wheel smoke now
+   requires all three browser assets. Remote security review found no remaining
+   Critical/High issue; its Medium findings (session race and approval-poll
+   rate exhaustion) and Low hardening findings were fixed before closure.
+
+### P5 finish flags
+
+- `P5A_LOCAL_OPERATOR_HEADLESS = CLOSED`
+- `P5B_HOST_PROTOCOL_INTEGRATION = CLOSED`
+- `P5C_SECURE_REMOTE_OPERATOR = CLOSED`
+- `P5D_BROWSER_MOBILE_CHANNEL_SCOPE = CLOSED`
+- `P5E_INTEGRATED_INTERFACE_CONFORMANCE = CLOSED`
+- `P5_INTERFACES_ANYWHERE_ACCESS_PARITY = CLOSED`
+
+These flags are the stop conditions for P5. P5 is closed; the roadmap advances
+to P6 rather than adding more frontends, channels, or companion clients for
+feature-count parity.
+
+### P5E closure — current interface evidence
+
+The 2026-10-03 comparator refresh confirms that the important coding-harness
+pattern is attachable long-running service access, not literal surface count:
+
+- OpenClaw serves a same-gateway Control UI:
+  <https://docs.openclaw.ai/web/control-ui>.
+- Hermes serves a local dashboard that can be bound for authenticated remote
+  Desktop access, while its messaging gateway is a separate process/surface:
+  <https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard>.
+- OpenCode supports a long-running service and clients that attach through
+  `--server`:
+  <https://opencode.ai/v2/docs/cli/web>.
+
+Ash therefore closes the same coding need with one headless runtime, a guarded
+HTTP/SSE + JSON-RPC boundary, `ash remote`, the small same-origin browser UI,
+ACP for editor hosts, and A2A for agent interoperability. It does not need a
+hosted relay, consumer messaging gateway, or native companion application to
+claim this bounded interface/access phase complete.
 
 ### P4 finite closure checklist
 
@@ -1865,7 +1941,7 @@ truthful evidence boundaries, not open mission blockers.
 | Stdin prompts | Verified locally | Piped stdin and `-p -` enter machine-clean one-shot mode |
 | CI mode | Verified locally | `--ci` disables interactive prompts/ANSI and defaults one-shot output to stream-json |
 | SDK/library API | Verified locally | Async create/prompt/steer/session/lifecycle/delegation API with explicit subagent provider injection and normalized usage independent of the TUI |
-| JSON-RPC server | Verified locally | Validated stdio and authenticated HTTP methods share one SDK adapter; remote `/rpc` supports JSON-RPC 2.0 requests, notifications, bounded batches, strict JSON parsing, bearer auth, rate limits, payload limits, a 64-request in-flight ownership budget, duplicate in-flight request-ID rejection, and cancellation. Direct `/v1/turn` and SSE turn routes have a separate default 16-turn admission budget while steering remains available at capacity. |
+| JSON-RPC server | Verified locally | Authenticated HTTP `/rpc` exposes the SDK-backed JSON-RPC 2.0 adapter with requests, notifications, bounded batches, strict JSON parsing, bearer auth, rate limits, payload limits, a 64-request in-flight ownership budget, duplicate in-flight request-ID rejection, and cancellation. Ash does not advertise a standalone JSON-RPC stdio server; ACP owns the supported stdio host-integration contract. Direct `/v1/turn` and SSE turn routes have a separate default 16-turn admission budget while steering remains available at capacity. |
 | HTTP server | Verified locally | Bearer auth, rate limits, lifecycle, session/turn/steering routes, live SSE events, cancellation, safe CLI binding, and mandatory TLS for non-loopback bearer-token transport |
 | IDE/ACP integration | Verified locally | Official ACP Python SDK v1 over bounded JSONL stdio; initialize/new/load/list/close/prompt/cancel plus durable fork/resume lifecycle, durable message and redacted tool replay, permission requests, text/resource links, ordered bounded inline image prompts, tool/usage streaming, editor-supplied stdio/HTTP/SSE MCP, isolated runtimes, and official-client plus shipped-process wire tests. Fork (an ACP unstable capability) creates a durable independent child while preserving the parent runtime, rejects unfinished source turns and prompt/fork races, reserves session capacity and exact IDs before publication, confines source/resume ownership to the requested workspace, and rolls back only provably untouched unpublished children; resume attaches an existing durable session without replaying prior transcript updates. ACP images are validated through Ash's canonical PNG/JPEG/GIF/WebP contract, limited to 5 MiB each / 10 MiB per prompt, passed as native provider image blocks in protocol order, rejected before provider I/O when the negotiated model lacks vision, and stripped of raw bytes before session persistence. Audio/embedded context, session delete, extra directories, modes, terminal/filesystem callbacks, and registry publication remain unadvertised. |
 | Remote-agent/A2A integration | Verified locally | Official A2A SDK/spec 1.0 Agent Card, JSON-RPC and HTTP+JSON routes, bearer auth, rate limits, a default 16-task in-flight executor budget, durable SQLite tasks and project-scoped context/session mapping, text artifact streaming, polling/get/list/cancel, CLI inspect/send, trusted configured delegation tools, bounded I/O, origin pinning, mandatory TLS for non-loopback serving, and official-client end-to-end tests. Push notifications, files/data, extended cards, gRPC, signed-card verification, and OAuth/mTLS remain unadvertised. |

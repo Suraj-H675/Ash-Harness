@@ -123,7 +123,7 @@ class RemoteAgentConfig:
     name: str
     url: str
     description: str = ""
-    token_env: str = "ASH_A2A_TOKEN"
+    token_env: str | None = "ASH_A2A_TOKEN"
     timeout_seconds: float = 300.0
 
 
@@ -140,7 +140,7 @@ def _redact_remote_agent_error(config: RemoteAgentConfig, exc: BaseException) ->
 
 
 def _redact_remote_agent_text(config: RemoteAgentConfig, value: str) -> str:
-    token = os.environ.get(config.token_env, "")
+    token = _remote_agent_token(config)
     return redact_known_secrets(value, token)
 
 
@@ -190,17 +190,22 @@ class _RemoteTaskStoreTool(BaseTool):
 
     async def _check_binding(self, config: RemoteAgentConfig, task_id: str) -> None:
         if self.task_store is None:
-            return
+            raise ValueError(
+                f"unknown remote task for agent {config.name}: {task_id}"
+            )
         try:
-            conflict = await asyncio.to_thread(
-                self.task_store.conflicting_endpoint,
+            endpoint = await asyncio.to_thread(
+                self.task_store.endpoint_for_task,
                 agent=config.name,
-                endpoint=config.url,
                 task_id=task_id,
             )
         except Exception as exc:
             raise RuntimeError("could not read durable A2A remote task state") from exc
-        if conflict is not None:
+        if endpoint is None:
+            raise ValueError(
+                f"unknown remote task for agent {config.name}: {task_id}"
+            )
+        if endpoint != config.url:
             raise ValueError(
                 f"remote task {task_id!r} for agent {config.name!r} is bound to "
                 "a different configured endpoint"
@@ -313,7 +318,7 @@ class ListRemoteAgentsTool(BaseTool):
                 {
                     "name": agent.name,
                     "description": agent.description,
-                    "credential_configured": bool(os.environ.get(agent.token_env)),
+                    "credential_configured": bool(_remote_agent_token(agent)),
                 }
                 for agent in sorted(values, key=lambda item: item.name)
             ]
@@ -777,7 +782,12 @@ def load_remote_agent_configs(
                 raise ValueError(f"invalid A2A agent name in {path}: {name!r}")
             if name in agents:
                 raise ValueError(f"duplicate A2A agent name: {name}")
-            agents[name] = _parse_agent_config(name, raw, path)
+            agents[name] = _parse_agent_config(
+                name,
+                raw,
+                path,
+                allow_credentials=trusted_root is None,
+            )
     return agents
 
 
@@ -808,7 +818,7 @@ async def send_remote_agent(
         raise ValueError("remote-agent context ID exceeds 512 bytes")
     generated_context = not context_id and request_observer is not None
     resolved_context = str(uuid4()) if generated_context else context_id
-    token = os.environ.get(config.token_env, "")
+    token = _remote_agent_token(config)
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     http = httpx.AsyncClient(
         headers=headers,
@@ -1048,7 +1058,7 @@ async def _open_remote_agent_client(
     from a2a.utils.constants import TransportProtocol
 
     _validate_remote_url(config.url)
-    token = os.environ.get(config.token_env, "")
+    token = _remote_agent_token(config)
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     http = httpx.AsyncClient(
         headers=headers,
@@ -1104,20 +1114,33 @@ def _validate_remote_context_id(context_id: str) -> None:
         )
 
 
-def _parse_agent_config(name: str, raw: Any, path: Path) -> RemoteAgentConfig:
+def _parse_agent_config(
+    name: str,
+    raw: Any,
+    path: Path,
+    *,
+    allow_credentials: bool,
+) -> RemoteAgentConfig:
     allowed = {"url", "description", "token_env", "timeout_seconds"}
     if not isinstance(raw, dict) or not set(raw) <= allowed:
         raise ValueError(f"invalid A2A agent {name!r} in {path}")
     url = raw.get("url")
     description = raw.get("description", "")
-    token_env = raw.get("token_env", "ASH_A2A_TOKEN")
+    if not allow_credentials and "token_env" in raw:
+        raise ValueError(
+            f"project A2A agent {name!r} cannot declare token_env; "
+            "configure authenticated peers in ~/.ash/a2a.json"
+        )
+    token_env = raw.get("token_env", "ASH_A2A_TOKEN") if allow_credentials else None
     timeout = raw.get("timeout_seconds", 300.0)
     if not isinstance(url, str):
         raise ValueError(f"A2A agent {name!r} requires a URL")
     _validate_remote_url(url)
     if not isinstance(description, str) or len(description) > 512:
         raise ValueError(f"A2A agent {name!r} description is invalid")
-    if not isinstance(token_env, str) or not A2A_ENV_NAME.fullmatch(token_env):
+    if token_env is not None and (
+        not isinstance(token_env, str) or not A2A_ENV_NAME.fullmatch(token_env)
+    ):
         raise ValueError(f"A2A agent {name!r} token_env is invalid")
     if (
         isinstance(timeout, bool)
@@ -1128,6 +1151,12 @@ def _parse_agent_config(name: str, raw: Any, path: Path) -> RemoteAgentConfig:
     return RemoteAgentConfig(
         name, url.rstrip("/"), description, token_env, float(timeout)
     )
+
+
+def _remote_agent_token(config: RemoteAgentConfig) -> str:
+    if config.token_env is None:
+        return ""
+    return os.environ.get(config.token_env, "")
 
 
 def _validate_remote_url(value: str) -> None:

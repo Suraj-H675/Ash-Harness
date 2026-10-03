@@ -1166,6 +1166,35 @@ async def test_async_sdk_serializes_prompts_on_one_session(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_sdk_binds_concurrent_prompts_to_explicit_sessions(tmp_path) -> None:
+    provider = SerialProvider()
+    config = AshConfig(
+        model="ollama/sdk-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    async with await AshClient.create(config=config, provider=provider) as client:
+        assert client.loop.current_session is not None
+        first_session = client.loop.current_session.session_id
+        second_session = await client.new_session()
+
+        first, second = await asyncio.gather(
+            client.prompt("first explicit", session_id=first_session),
+            client.prompt("second explicit", session_id=second_session),
+        )
+        first_messages = client.loop.session_store.load_session(first_session).messages
+        second_messages = client.loop.session_store.load_session(second_session).messages
+
+    assert first.session_id == first_session
+    assert second.session_id == second_session
+    assert any(message.content == "first explicit" for message in first_messages)
+    assert not any(message.content == "second explicit" for message in first_messages)
+    assert any(message.content == "second explicit" for message in second_messages)
+    assert not any(message.content == "first explicit" for message in second_messages)
+
+
+@pytest.mark.asyncio
 async def test_async_sdk_steers_running_turn_without_waiting_for_prompt_lock(
     tmp_path,
 ) -> None:
