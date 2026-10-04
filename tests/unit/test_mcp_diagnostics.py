@@ -144,6 +144,7 @@ async def test_repl_preserves_normal_prompt_indentation(
         safety_tier="interactive",
     )
     config = SimpleNamespace(
+        custom_providers={},
         input_mode="emacs",
         keybindings={},
         tui_mode="inline",
@@ -173,7 +174,28 @@ async def test_repl_status_uses_active_model_and_models_rejects_extra_arguments(
     monkeypatch: pytest.MonkeyPatch,
     capsys,
 ) -> None:
-    commands = iter(("/status", "/models nonsense", "exit"))
+    commands = iter(
+        (
+            "/status",
+            "/models nonsense",
+            "/status nonsense",
+            "/recovery nonsense",
+            "/cancel nonsense",
+            "/new nonsense",
+            "/undo nonsense",
+            "/compact nonsense",
+            "/reload-plugins nonsense",
+            "/hooks nonsense",
+            "/commands nonsense",
+            "/sandbox nonsense",
+            "/doctor nonsense",
+            "/context nonsense",
+            "/memory index-workspace nope",
+            "/memory index-workspace 0",
+            "/exit nonsense",
+            "exit",
+        )
+    )
     FakeTerminalUI = _install_fake_repl_frontend(monkeypatch, commands)
     monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -210,6 +232,8 @@ async def test_repl_status_uses_active_model_and_models_rejects_extra_arguments(
         safety_tier="interactive",
         recovered_turns=0,
         recovery_summary=None,
+        _config=None,
+        _memory_pipeline=None,
     )
     config = SimpleNamespace(
         model="openai/primary",
@@ -240,6 +264,24 @@ async def test_repl_status_uses_active_model_and_models_rejects_extra_arguments(
     assert "Model: groq/fallback-model" in captured.out
     assert "Configured route: openai/primary" in captured.out
     assert "Usage: /models [--refresh]" in captured.err
+    for usage in (
+        "/status",
+        "/recovery",
+        "/cancel",
+        "/new",
+        "/undo",
+        "/compact",
+        "/reload-plugins",
+        "/hooks",
+        "/commands",
+        "/sandbox",
+        "/doctor",
+        "/context [--provenance]",
+        "/exit",
+    ):
+        assert f"Usage: {usage}" in captured.err
+    assert "memory index-workspace LIMIT must be an integer" in captured.err
+    assert "memory index-workspace LIMIT must be between 1 and 10000" in captured.err
 
 
 def _prepared_prompt(prompt: str):
@@ -324,6 +366,7 @@ async def test_repl_permission_mode_audit_records_actual_previous_mode(
         _emit_event=lambda event: None,
     )
     config = SimpleNamespace(
+        custom_providers={},
         input_mode="emacs",
         keybindings={},
         tui_mode="inline",
@@ -432,6 +475,7 @@ async def test_repl_reports_targetless_reload_errors_and_redacts_cancel_failure(
     loop.reload_plugin_runtime_tools = reload_plugin_runtime_tools
 
     config = SimpleNamespace(
+        custom_providers={},
         input_mode="emacs",
         keybindings={},
         tui_mode="inline",
@@ -511,6 +555,7 @@ async def test_repl_plugin_reload_failure_preserves_simple_live_state(
     loop.reload_mcp_servers = unexpected_mcp_reload
 
     config = SimpleNamespace(
+        custom_providers={},
         input_mode="emacs",
         keybindings={},
         tui_mode="inline",
@@ -598,6 +643,7 @@ async def test_repl_plugin_reload_refuses_replaced_workspace_root(
     loop.reload_mcp_servers = reload_mcp_servers
 
     config = SimpleNamespace(
+        custom_providers={},
         input_mode="emacs",
         keybindings={},
         tui_mode="inline",
@@ -673,6 +719,7 @@ async def test_repl_mcp_reload_exception_commits_other_plugin_state_and_reports_
     loop.reload_mcp_servers = fail_mcp_reload
 
     config = SimpleNamespace(
+        custom_providers={},
         input_mode="emacs",
         keybindings={},
         tui_mode="inline",
@@ -757,6 +804,7 @@ async def test_repl_plugin_action_reports_persisted_state_when_reload_fails(
     loop.reload_mcp_servers = unexpected_mcp_reload
 
     config = SimpleNamespace(
+        custom_providers={},
         input_mode="emacs",
         keybindings={},
         tui_mode="inline",

@@ -1031,6 +1031,22 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             "ASH · type /help for commands",
             flush=True,
         )
+    no_argument_commands = frozenset(
+        {
+            "exit",
+            "status",
+            "recovery",
+            "cancel",
+            "new",
+            "undo",
+            "compact",
+            "reload-plugins",
+            "hooks",
+            "commands",
+            "sandbox",
+            "doctor",
+        }
+    )
     while True:
         try:
             submitted_input = await prompt_input.read("> ")
@@ -1101,6 +1117,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
         if parsed_command is not None:
             command, arguments = parsed_command
+            invalid_arguments = (
+                command.name in no_argument_commands and bool(arguments)
+            ) or (
+                command.name == "context"
+                and arguments not in ([], ["--provenance"])
+            )
+            if invalid_arguments:
+                print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                continue
             if command.name == "exit":
                 return 0
             if command.name == "help":
@@ -2295,6 +2320,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         print(f"{capability['server']}: {identifier}")
                 continue
             if command.name == "memory":
+                from ash.safety.guard import SafetyViolation
+
                 action = arguments[0] if arguments else "status"
                 if action == "status" and len(arguments) == 1 or not arguments:
                     state = (
@@ -2307,18 +2334,26 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     )
                     continue
                 if action == "index" and len(arguments) == 2:
-                    memory_path = loop.safety_guard.validate_path(arguments[1])
+                    try:
+                        memory_path = loop.safety_guard.validate_path(arguments[1])
+                    except (OSError, RuntimeError, ValueError, SafetyViolation) as exc:
+                        _print_classified_error(exc)
+                        continue
                     if not memory_path.is_file():
                         print(f"Error: not a file: {memory_path}", file=sys.stderr)
                         continue
-                    indexed = await loop.index_file_for_memory(
-                        memory_path,
-                        max_bytes_per_file=(
-                            loop._config.memory_auto_index_max_bytes_per_file
-                            if loop._config is not None
-                            else 128_000
-                        ),
-                    )
+                    try:
+                        indexed = await loop.index_file_for_memory(
+                            memory_path,
+                            max_bytes_per_file=(
+                                loop._config.memory_auto_index_max_bytes_per_file
+                                if loop._config is not None
+                                else 128_000
+                            ),
+                        )
+                    except (OSError, RuntimeError, ValueError, SafetyViolation) as exc:
+                        _print_classified_error(exc)
+                        continue
                     if indexed:
                         print(f"Indexed {memory_path}")
                     else:
@@ -2340,19 +2375,31 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     if len(arguments) == 2:
                         try:
                             limit = int(arguments[1])
-                        except ValueError as exc:
-                            raise ValueError(
-                                "memory index-workspace limit must be an integer"
-                            ) from exc
+                        except ValueError:
+                            print(
+                                "Error: memory index-workspace LIMIT must be an integer.",
+                                file=sys.stderr,
+                            )
+                            continue
                     if limit < 1 or limit > 10_000:
-                        raise ValueError(
-                            "memory index-workspace limit must be between 1 and 10000"
+                        print(
+                            "Error: memory index-workspace LIMIT must be between 1 and 10000.",
+                            file=sys.stderr,
                         )
-                    indexed = await loop.index_project_memory(max_files=limit)
+                        continue
+                    try:
+                        indexed = await loop.index_project_memory(max_files=limit)
+                    except (OSError, RuntimeError, ValueError, SafetyViolation) as exc:
+                        _print_classified_error(exc)
+                        continue
                     print(f"Indexed {indexed} workspace file(s).")
                     continue
                 if action == "search" and len(arguments) >= 2:
-                    hits = await loop.search_memory(" ".join(arguments[1:]))
+                    try:
+                        hits = await loop.search_memory(" ".join(arguments[1:]))
+                    except (OSError, RuntimeError, ValueError, SafetyViolation) as exc:
+                        _print_classified_error(exc)
+                        continue
                     if not hits:
                         print("No memory matches.")
                     for hit in hits:
