@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -73,14 +74,11 @@ async def test_inline_prompt_bracketed_paste_preserves_multiline_input(
 def test_screen_reader_mode_uses_reduced_dynamic_prompt(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured = {}
-
-    class FakePromptSession:
+    class FailPromptSession:
         def __init__(self, **kwargs) -> None:
-            captured.update(kwargs)
+            raise AssertionError("screen-reader mode must not create prompt-toolkit UI")
 
-    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
-
+    monkeypatch.setattr(prompt_module, "PromptSession", FailPromptSession)
     prompt = PromptInput(
         input_stream=TtyStringIO(),
         history_path=tmp_path / "history",
@@ -90,10 +88,43 @@ def test_screen_reader_mode_uses_reduced_dynamic_prompt(
 
     assert prompt.uses_viewport is False
     assert prompt.screen_reader_mode is True
-    assert captured["auto_suggest"] is None
-    assert captured["completer"] is None
-    assert captured["complete_while_typing"] is False
-    assert captured["bottom_toolbar"] is None
+    assert prompt._session is None
+    assert prompt._completer is None
+
+
+@pytest.mark.asyncio
+async def test_screen_reader_mode_reads_linearly_without_prompt_toolkit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+
+    class TtyPipe:
+        encoding = "utf-8"
+
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return read_fd
+
+    output = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", output)
+    prompt = PromptInput(
+        input_stream=TtyPipe(),
+        history_path=tmp_path / "history",
+        screen_reader_mode=True,
+    )
+    try:
+        pending = asyncio.create_task(prompt.read("accessible> "))
+        await asyncio.sleep(0)
+        os.write(write_fd, b"hello\n")
+
+        assert await pending == "hello"
+        assert output.getvalue() == "accessible> "
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
 
 
 def test_prompt_completion_updates_after_plugin_reload(

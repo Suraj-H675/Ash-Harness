@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -18,6 +19,7 @@ from prompt_toolkit.enums import EditingMode
 from ash.commands.slash import COMMANDS
 from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.ui.history import PrivateFileHistory
+from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript
 from ash.ui.viewport import TranscriptViewport
 
@@ -299,8 +301,9 @@ class PromptInput:
         self._session: PromptSession[str] | None = None
         self._viewport: TranscriptViewport | None = None
         self._completer: AshCompleter | None = None
+        self._linear_input_buffer = ""
         self.screen_reader_mode = screen_reader_mode
-        if self.interactive:
+        if self.interactive and not screen_reader_mode:
             path = history_path or (Path.home() / ".ash" / "history")
             if history_path is None:
                 try:
@@ -341,7 +344,7 @@ class PromptInput:
                 mcp_runtime=mcp_runtime,
             )
             self._completer = completer
-            if tui_mode == "viewport" and not screen_reader_mode:
+            if tui_mode == "viewport":
                 self._viewport = TranscriptViewport(
                     transcript or Transcript(),
                     history_path=path,
@@ -357,11 +360,9 @@ class PromptInput:
             else:
                 self._session = PromptSession(
                     history=history,
-                    auto_suggest=(
-                        None if screen_reader_mode else AutoSuggestFromHistory()
-                    ),
-                    completer=None if screen_reader_mode else completer,
-                    complete_while_typing=not screen_reader_mode,
+                    auto_suggest=AutoSuggestFromHistory(),
+                    completer=completer,
+                    complete_while_typing=True,
                     key_bindings=_key_bindings(
                         keybindings
                         if keybindings is not None
@@ -375,7 +376,7 @@ class PromptInput:
                     ),
                     multiline=False,
                     enable_open_in_editor=True,
-                    bottom_toolbar=None if screen_reader_mode else status_provider,
+                    bottom_toolbar=status_provider,
                 )
 
     @property
@@ -404,6 +405,8 @@ class PromptInput:
         )
 
     async def read(self, prompt: str = "> ") -> str:
+        if self.interactive and self.screen_reader_mode:
+            return await self._read_linear(prompt)
         if self._viewport is not None:
             return await self._viewport.read(prompt)
         if self._session is not None:
@@ -412,6 +415,61 @@ class PromptInput:
         if line == "":
             raise EOFError
         return line.rstrip("\r\n")
+
+    async def _read_linear(self, prompt: str) -> str:
+        """Read one cooked-terminal line without cursor-addressing redraws."""
+
+        safe_prompt = terminal_safe_text(prompt, single_line=True)
+        sys.stdout.write(safe_prompt)
+        sys.stdout.flush()
+
+        newline = self._linear_input_buffer.find("\n")
+        if newline >= 0:
+            line = self._linear_input_buffer[:newline]
+            self._linear_input_buffer = self._linear_input_buffer[newline + 1 :]
+            return line.rstrip("\r")
+
+        try:
+            fd = self.input_stream.fileno()
+        except (AttributeError, OSError, ValueError):
+            line = self.input_stream.readline()
+            if line == "":
+                raise EOFError
+            return line.rstrip("\r\n")
+
+        loop = asyncio.get_running_loop()
+        completed: asyncio.Future[str] = loop.create_future()
+        encoding = getattr(self.input_stream, "encoding", None) or "utf-8"
+
+        def on_readable() -> None:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError as exc:
+                if not completed.done():
+                    completed.set_exception(exc)
+                return
+            if not chunk:
+                if not completed.done():
+                    if self._linear_input_buffer:
+                        line = self._linear_input_buffer
+                        self._linear_input_buffer = ""
+                        completed.set_result(line.rstrip("\r"))
+                    else:
+                        completed.set_exception(EOFError())
+                return
+            self._linear_input_buffer += chunk.decode(encoding, errors="replace")
+            newline = self._linear_input_buffer.find("\n")
+            if newline < 0 or completed.done():
+                return
+            line = self._linear_input_buffer[:newline]
+            self._linear_input_buffer = self._linear_input_buffer[newline + 1 :]
+            completed.set_result(line.rstrip("\r"))
+
+        loop.add_reader(fd, on_readable)
+        try:
+            return await completed
+        finally:
+            loop.remove_reader(fd)
 
     def close(self) -> None:
         if self._viewport is not None:
