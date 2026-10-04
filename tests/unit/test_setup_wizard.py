@@ -1193,7 +1193,7 @@ def test_first_run_provider_scope_surfaces_detected_route_first(
     assert [descriptor.id for descriptor in selected] == ["openai"]
 
 
-def test_scoped_provider_picker_rejects_hidden_global_number(
+def test_scoped_provider_picker_numbers_the_visible_scope(
     monkeypatch: pytest.MonkeyPatch,
     capsys,
 ) -> None:
@@ -1201,7 +1201,7 @@ def test_scoped_provider_picker_rejects_hidden_global_number(
 
     gateways = [descriptor for descriptor in PROVIDERS if descriptor.category == "Gateway"]
     monkeypatch.setattr("ash.commands.setup.get_env_value", lambda _name: None)
-    monkeypatch.setattr("builtins.input", _fake_input(["1", "7"]))
+    monkeypatch.setattr("builtins.input", _fake_input(["1"]))
 
     selected = _prompt_provider(
         SimpleNamespace(model="", openai_auth_mode="api_key"),
@@ -1209,7 +1209,35 @@ def test_scoped_provider_picker_rejects_hidden_global_number(
     )
 
     assert selected.id == "openrouter"
-    assert "Invalid choice." in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "OpenRouter" in output
+    assert "Invalid choice." not in output
+
+
+def test_scoped_provider_picker_does_not_default_to_hidden_current_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands.setup import PROVIDERS, _prompt_provider
+
+    local = [
+        descriptor for descriptor in PROVIDERS if descriptor.category == "Local runtime"
+    ]
+    monkeypatch.setattr("ash.commands.setup.get_env_value", lambda _name: None)
+    monkeypatch.setattr("builtins.input", _fake_input(["", "1"]))
+
+    selected = _prompt_provider(
+        SimpleNamespace(
+            model="anthropic/claude-sonnet-5-5",
+            openai_auth_mode="api_key",
+        ),
+        initial_scope=local,
+    )
+
+    assert selected.id == "ollama"
+    output = capsys.readouterr().out
+    assert "Provider [Anthropic]" not in output
+    assert "Choose a visible provider by number or name." in output
 
 
 def test_provider_catalog_marks_filtered_scope(
@@ -1376,6 +1404,53 @@ def test_setup_status_shows_actionable_optional_capability_next_steps(
     assert "ash mcp add" in output
     assert "Observability" in output
     assert "ASH_OBSERVABILITY_ENABLED" in output
+
+
+def test_fresh_setup_status_does_not_present_default_model_as_user_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from io import StringIO
+
+    from rich.console import Console
+
+    from ash.commands.setup import _render_setup_status
+
+    stream = StringIO()
+    monkeypatch.setattr(
+        "ash.commands.setup._setup_console",
+        lambda: Console(file=stream, width=80, force_terminal=False),
+    )
+    monkeypatch.setattr(
+        "ash.commands.setup._setup_status_payload",
+        lambda _config: {
+            "profile": "default",
+            "model": "anthropic/claude-sonnet-5-5",
+            "provider": {"name": "Anthropic", "ready": False},
+            "fallback_models": [],
+            "capabilities": {
+                "web_search": {"configured": False},
+                "browser": {"installed": False},
+                "mcp": {"configured": False},
+                "observability": {
+                    "enabled": False,
+                    "available": False,
+                    "ready": False,
+                },
+                "memory": {"backend": "sqlite"},
+                "sandbox": {"backend": "auto"},
+            },
+        },
+    )
+    config = SimpleNamespace(config_source=lambda field: ("default", "built-in"))
+
+    _render_setup_status(config, title="Before you begin", show_capabilities=False)
+
+    output = stream.getvalue()
+    assert "Provider" in output
+    assert "Not connected" in output
+    assert "Not selected" in output
+    assert "Anthropic" not in output
+    assert "Web search" not in output
 
 
 class TestProbeModels:

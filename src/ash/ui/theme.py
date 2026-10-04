@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from prompt_toolkit.styles import BaseStyle, DummyStyle, Style
+
 
 ThemeName = Literal["dark", "light"]
 
@@ -147,3 +149,37 @@ def viewport_styles(theme: Theme) -> dict[str, str]:
         "empty-title": theme.empty_title,
         "muted": theme.muted,
     }
+
+
+def overlay_styles(theme: Theme) -> dict[str, str]:
+    """Return one coherent Ash palette for searchable full-screen overlays."""
+
+    selected = (
+        "bold bg:#005f87 #ffffff"
+        if theme.name == "dark"
+        else "bold bg:#d7eaff #003b70"
+    )
+    return {
+        "title": theme.user_prefix,
+        "muted": theme.muted,
+        "label": theme.empty_title,
+        "selected": selected,
+        "option": "bold",
+        "session-title": "bold",
+        "usage": "bold",
+        "meta": theme.muted,
+        "current": theme.user_prefix,
+        "separator": theme.separator,
+        "detail": theme.composer,
+        "preview": theme.composer,
+        "footer": theme.status,
+        "empty": f"italic {theme.muted}",
+    }
+
+
+def prompt_style(styles: dict[str, str], *, no_color: bool = False) -> BaseStyle:
+    """Build a prompt-toolkit style while honoring Ash's no-color contract."""
+
+    if no_color:
+        return DummyStyle()
+    return Style.from_dict(styles)

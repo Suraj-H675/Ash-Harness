@@ -17,7 +17,7 @@ TranscriptKind = Literal[
     "status",
     "error",
 ]
-TranscriptAction = Literal["added", "updated", "finalized", "reset"]
+TranscriptAction = Literal["added", "updated", "finalized", "removed", "reset"]
 
 
 @dataclass(frozen=True)
@@ -113,6 +113,16 @@ class Transcript:
         self._emit("updated", updated)
         return updated
 
+    def replace_content(self, entry_id: str, text: str) -> TranscriptEntry:
+        index = self._entry_index(entry_id)
+        current = self._entries[index]
+        if current.finalized:
+            raise ValueError(f"transcript entry is already finalized: {entry_id}")
+        updated = replace(current, content=text)
+        self._entries[index] = updated
+        self._emit("updated", updated)
+        return updated
+
     def finalize(self, entry_id: str) -> TranscriptEntry:
         index = self._entry_index(entry_id)
         current = self._entries[index]
@@ -127,6 +137,12 @@ class Transcript:
     def clear(self) -> None:
         self._entries.clear()
         self._emit("reset", None)
+
+    def remove(self, entry_id: str) -> TranscriptEntry:
+        index = self._entry_index(entry_id)
+        removed = self._entries.pop(index)
+        self._emit("removed", removed)
+        return removed
 
     def subscribe(self, listener: TranscriptListener) -> Callable[[], None]:
         self._listeners.add(listener)

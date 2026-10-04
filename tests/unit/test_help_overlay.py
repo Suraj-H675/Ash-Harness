@@ -20,6 +20,23 @@ async def test_help_overlay_filters_and_closes() -> None:
     assert all("git" in overlay._search_text(command) for command in overlay._filtered)
 
 
+def test_help_overlay_searches_injected_custom_commands() -> None:
+    overlay = HelpOverlay(
+        [
+            SlashCommand("help", "Show help", "/help"),
+            SlashCommand(
+                "project:review",
+                "Review release notes",
+                "/project:review [arguments]",
+            ),
+        ],
+        initial_query="release",
+        output=DummyOutput(),
+    )
+
+    assert [command.name for command in overlay._filtered] == ["project:review"]
+
+
 def test_help_overlay_uses_supplied_command_sequence() -> None:
     overlay = HelpOverlay(
         [

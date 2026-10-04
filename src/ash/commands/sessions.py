@@ -42,6 +42,8 @@ async def pick_session(
     project_path: str,
     initial_query: str = "",
     limit: int = 200,
+    theme: str = "dark",
+    no_color: bool = False,
 ) -> str | None:
     """Open the metadata-only session picker for one project."""
 
@@ -54,6 +56,8 @@ async def pick_session(
         sessions,
         load_session=store.load_session,
         initial_query=initial_query,
+        theme=theme,
+        no_color=no_color,
     ).run()
 
 
@@ -67,6 +71,8 @@ async def select_startup_session(
     fork_session: bool = False,
     interactive: bool = False,
     picker: Callable[[], Awaitable[str | None]] | None = None,
+    theme: str = "dark",
+    no_color: bool = False,
 ) -> StartupSessionSelection:
     """Resolve startup continuation flags before provider initialization."""
 
@@ -87,7 +93,12 @@ async def select_startup_session(
             selected = await (
                 picker()
                 if picker is not None
-                else pick_session(store, project_path=project_path)
+                else pick_session(
+                    store,
+                    project_path=project_path,
+                    theme=theme,
+                    no_color=no_color,
+                )
             )
             if selected is None:
                 return StartupSessionSelection(None, cancelled=True)

@@ -156,6 +156,24 @@ def test_debug_disabled_does_not_create_structured_log(tmp_path: Path) -> None:
         _reset_logging()
 
 
+def test_default_logging_keeps_info_diagnostics_off_user_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", captured)
+    try:
+        configure_logging(no_color=True, debug=False)
+        logger = get_logger("user-output")
+        logger.info("internal lifecycle detail")
+        logger.warning("actionable warning")
+
+        rendered = captured.getvalue()
+        assert "internal lifecycle detail" not in rendered
+        assert "actionable warning" in rendered
+    finally:
+        _reset_logging()
+
+
 def test_temporary_level_enables_debug_and_restores_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

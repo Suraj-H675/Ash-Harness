@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 import ash.ui.prompt as prompt_module
 import ash.ui.history as history_module
@@ -36,6 +38,36 @@ def test_invalid_input_mode_is_rejected() -> None:
         PromptInput(input_stream=io.StringIO(""), input_mode="modal")
     with pytest.raises(ValueError, match="tui_mode"):
         PromptInput(input_stream=io.StringIO(""), tui_mode="floating")
+
+
+@pytest.mark.asyncio
+async def test_inline_prompt_bracketed_paste_preserves_multiline_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from prompt_toolkit import PromptSession
+
+    with create_pipe_input() as pipe:
+        real_session = PromptSession(
+            input=pipe,
+            output=DummyOutput(),
+            multiline=False,
+        )
+        monkeypatch.setattr(
+            prompt_module,
+            "PromptSession",
+            lambda **kwargs: real_session,
+        )
+        prompt = PromptInput(
+            input_stream=TtyStringIO(),
+            history_path=tmp_path / "history",
+            tui_mode="inline",
+        )
+        pending = asyncio.create_task(prompt.read())
+        pipe.send_bytes(b"\x1b[200~first\nsecond\x1b[201~")
+        pipe.send_text("\r")
+
+        assert await pending == "first\nsecond"
 
 
 def test_screen_reader_mode_uses_reduced_dynamic_prompt(
@@ -89,6 +121,52 @@ def test_prompt_completion_updates_after_plugin_reload(
     )
 
     assert [completion.text for completion in completions] == ["/example:review"]
+    assert [completion.display_meta_text for completion in completions] == [
+        "custom command"
+    ]
+
+
+def test_prompt_completion_preserves_custom_command_description(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = {}
+
+    class FakePromptSession:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
+    PromptInput(
+        input_stream=TtyStringIO(),
+        history_path=tmp_path / "history",
+        extra_commands={"project:review": "Review release notes"},
+    )
+
+    completions = list(
+        captured["completer"].get_completions(
+            Document("/project:r"), CompleteEvent(completion_requested=True)
+        )
+    )
+
+    assert [completion.text for completion in completions] == ["/project:review"]
+    assert [completion.display_meta_text for completion in completions] == [
+        "Review release notes"
+    ]
+
+
+def test_builtin_slash_completion_has_description_while_filtering_prefix(
+    tmp_path,
+) -> None:
+    completer = AshCompleter(["/model", "/models", "/status"], tmp_path)
+
+    completions = list(
+        completer.get_completions(
+            Document("/mo"), CompleteEvent(completion_requested=True)
+        )
+    )
+
+    assert [completion.text for completion in completions] == ["/model", "/models"]
+    assert all(completion.display_meta_text for completion in completions)
 
 
 def test_path_completion_scans_a_bounded_number_of_entries(

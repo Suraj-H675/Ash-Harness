@@ -7,9 +7,11 @@ from prompt_toolkit.formatted_text import to_formatted_text
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.layout.menus import CompletionsMenu
 
 from ash.ui.history import PrivateFileHistory as CorePrivateFileHistory
 from ash.ui.transcript import Transcript
+from ash.ui.prompt import AshCompleter
 from ash.ui.viewport import (
     PrivateFileHistory,
     RichTranscriptFormatter,
@@ -47,6 +49,17 @@ def test_format_transcript_preserves_semantics_and_streaming_state() -> None:
     assert "YOU\n  inspect this" in rendered
     assert "ASH\n  working  …" in rendered
     assert "TOOL  ·  read_file\n  completed" in rendered
+
+
+def test_working_status_does_not_render_duplicate_streaming_ellipsis() -> None:
+    transcript = Transcript()
+    working = transcript.begin("status", title="working")
+    transcript.replace_content(working, "Thinking…")
+
+    rendered = _plain(format_transcript(transcript.snapshot()))
+
+    assert "Thinking…" in rendered
+    assert "Thinking…  …" not in rendered
 
 
 def test_rich_transcript_formatter_renders_markdown_and_caches_cells() -> None:
@@ -140,6 +153,61 @@ async def test_viewport_submits_input_and_can_be_reused(tmp_path: Path) -> None:
         viewport.close()
 
 
+@pytest.mark.asyncio
+async def test_viewport_enter_accepts_visible_slash_completion_before_submit(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            Transcript(),
+            history_path=tmp_path / "history",
+            completer=AshCompleter(["/model", "/models"], tmp_path),
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = asyncio.create_task(viewport.read())
+        pipe.send_text("/mo")
+        await asyncio.sleep(0.05)
+        pipe.send_text("\r")
+        await asyncio.sleep(0.05)
+
+        assert pending.done() is False
+        assert viewport.input_buffer.text == "/model"
+
+        pipe.send_text("\r")
+        assert await pending == "/model"
+        viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_tab_accepts_first_visible_slash_completion(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            Transcript(),
+            history_path=tmp_path / "history",
+            completer=AshCompleter(["/model", "/models"], tmp_path),
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = asyncio.create_task(viewport.read())
+        pipe.send_text("/mo")
+        await asyncio.sleep(0.05)
+        pipe.send_text("\t")
+        await asyncio.sleep(0.05)
+
+        assert viewport.input_buffer.text == "/model"
+
+        pipe.send_text("\r")
+        assert await pending == "/model"
+        viewport.close()
+
+
 def test_viewport_chrome_separates_identity_runtime_and_composer(
     tmp_path: Path,
 ) -> None:
@@ -169,6 +237,20 @@ def test_viewport_chrome_separates_identity_runtime_and_composer(
     viewport.close()
 
 
+def test_viewport_includes_visible_completion_menu(tmp_path: Path) -> None:
+    viewport = TranscriptViewport(
+        Transcript(),
+        history_path=tmp_path / "history",
+        output=DummyOutput(),
+    )
+
+    assert any(
+        isinstance(float_.content, CompletionsMenu)
+        for float_ in viewport.application.layout.container.floats
+    )
+    viewport.close()
+
+
 @pytest.mark.asyncio
 async def test_viewport_honors_custom_multiline_binding(tmp_path: Path) -> None:
     with create_pipe_input() as pipe:
@@ -183,6 +265,25 @@ async def test_viewport_honors_custom_multiline_binding(tmp_path: Path) -> None:
         pipe.send_text("first")
         pipe.send_bytes(b"\x0f")  # Ctrl+O
         pipe.send_text("second\r")
+
+        assert await pending == "first\nsecond"
+        viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_bracketed_paste_preserves_multiline_input(
+    tmp_path: Path,
+) -> None:
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            Transcript(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = viewport.read()
+        pipe.send_bytes(b"\x1b[200~first\nsecond\x1b[201~")
+        pipe.send_text("\r")
 
         assert await pending == "first\nsecond"
         viewport.close()

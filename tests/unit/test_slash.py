@@ -1,6 +1,6 @@
 import pytest
 
-from ash.commands.slash import parse_slash_command, render_help
+from ash.commands.slash import COMMANDS, SlashCommand, parse_slash_command, render_help
 
 
 def test_parse_normal_prompt_returns_none() -> None:
@@ -82,3 +82,19 @@ def test_help_lists_browser_runtime_actions() -> None:
         "disconnect|reset-profile]" in rendered
     )
     assert "Attach or return browser tools at runtime" in rendered
+
+
+def test_help_can_render_runtime_custom_command_catalog() -> None:
+    commands = (
+        *COMMANDS,
+        SlashCommand(
+            "project:review",
+            "Review this project's release notes",
+            "/project:review [arguments]",
+        ),
+    )
+
+    rendered = render_help("release", commands=commands)
+
+    assert "/project:review [arguments]" in rendered
+    assert "Review this project's release notes" in rendered

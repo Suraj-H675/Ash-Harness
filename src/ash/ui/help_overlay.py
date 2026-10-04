@@ -20,9 +20,8 @@ from prompt_toolkit.layout import (
 )
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.output.base import Output
-from prompt_toolkit.styles import Style
-
 from ash.commands.slash import COMMANDS, SlashCommand
+from ash.ui.theme import get_theme, overlay_styles, prompt_style
 
 
 class HelpOverlay:
@@ -33,6 +32,8 @@ class HelpOverlay:
         commands: Sequence[SlashCommand] = COMMANDS,
         *,
         initial_query: str = "",
+        theme: str = "dark",
+        no_color: bool = False,
         input: Input | None = None,
         output: Output | None = None,
     ) -> None:
@@ -97,19 +98,9 @@ class HelpOverlay:
             key_bindings=self._key_bindings(),
             full_screen=True,
             erase_when_done=False,
-            style=Style.from_dict(
-                {
-                    "title": "bold #5fd7ff",
-                    "muted": "#808080",
-                    "label": "bold #bcbcbc",
-                    "selected": "bold bg:#005f87 #ffffff",
-                    "usage": "bold",
-                    "meta": "#808080",
-                    "separator": "#444444",
-                    "detail": "bg:#1c1c1c #d0d0d0",
-                    "footer": "bg:#262626 #bcbcbc",
-                    "empty": "italic #808080",
-                }
+            style=prompt_style(
+                overlay_styles(get_theme(theme)),
+                no_color=no_color,
             ),
             input=input,
             output=output,
@@ -229,10 +220,20 @@ class HelpOverlay:
 
 async def show_help_overlay(
     *,
+    commands: Sequence[SlashCommand] = COMMANDS,
     initial_query: str = "",
+    theme: str = "dark",
+    no_color: bool = False,
     input: Input | None = None,
     output: Output | None = None,
 ) -> None:
     """Open the full-screen slash help overlay."""
 
-    await HelpOverlay(initial_query=initial_query, input=input, output=output).run()
+    await HelpOverlay(
+        commands,
+        initial_query=initial_query,
+        theme=theme,
+        no_color=no_color,
+        input=input,
+        output=output,
+    ).run()

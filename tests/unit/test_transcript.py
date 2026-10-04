@@ -44,6 +44,22 @@ def test_transcript_subscription_is_ordered_and_unsubscribes() -> None:
     assert [event.revision for event in events] == [1, 2, 3]
 
 
+def test_transcript_can_replace_and_remove_ephemeral_entry() -> None:
+    transcript = Transcript()
+    events = []
+    transcript.subscribe(events.append)
+    entry_id = transcript.begin("status", title="working")
+
+    updated = transcript.replace_content(entry_id, "Thinking…")
+    removed = transcript.remove(entry_id)
+
+    assert updated.content == "Thinking…"
+    assert updated.finalized is False
+    assert removed.entry_id == entry_id
+    assert transcript.snapshot() == ()
+    assert [event.action for event in events] == ["added", "updated", "removed"]
+
+
 def test_transcript_rejects_invalid_limits_and_finalized_updates() -> None:
     for kwargs in ({"max_entries": 0}, {"max_characters": 0}):
         try:

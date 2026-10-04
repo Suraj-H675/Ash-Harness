@@ -44,6 +44,7 @@ MAX_EDIT_PREVIEW_FILE_BYTES = 1_000_000
 MAX_EDIT_PREVIEW_TEXT_CHARS = 128_000
 MAX_EDIT_PREVIEW_LINES = 400
 DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
+MAX_LINEAR_HISTORY_ENTRIES = 12
 _EDITOR_ENV_ALLOWLIST = (
     "COLORTERM",
     "DBUS_SESSION_BUS_ADDRESS",
@@ -208,6 +209,8 @@ class TerminalUI:
         self.transcript = transcript or Transcript()
         self._assistant_entry_id: str | None = None
         self._reasoning_entry_id: str | None = None
+        self._activity_entry_id: str | None = None
+        self._activity_status = ""
         self._tool_output_entries: dict[str, str] = {}
         self.viewport_mode = False
         self._token_progress = (
@@ -512,6 +515,8 @@ class TerminalUI:
     def _render_active_turn(self) -> Panel:
         buffers = self._active_buffers_required()
         parts: list[Any] = []
+        if self._activity_status and not buffers.thought and not buffers.response:
+            parts.append(Text(self._activity_status, style="dim italic"))
         if buffers.thought:
             parts.append(buffers.thought)
         if buffers.tool_output:
@@ -621,6 +626,27 @@ class TerminalUI:
         """Render concise tool lifecycle state outside the assistant panel."""
 
         event_type = payload.get("type")
+        if event_type in {"turn.started", "model.request.started"}:
+            attempt = int(payload.get("attempt", 1) or 1)
+            maximum = int(payload.get("max_attempts", attempt) or attempt)
+            if attempt > 1:
+                self._set_activity_status(f"Retrying model ({attempt}/{maximum})…")
+            else:
+                self._set_activity_status("Thinking…")
+        elif event_type == "provider.retrying":
+            attempt = int(payload.get("attempt", 1) or 1)
+            maximum = int(payload.get("max_attempts", attempt) or attempt)
+            self._set_activity_status(f"Retrying model ({attempt}/{maximum})…")
+        elif event_type in {
+            "assistant.delta",
+            "reasoning.delta",
+            "tool.started",
+            "turn.completed",
+            "turn.cancelled",
+            "turn.error",
+        }:
+            self._set_activity_status("")
+
         if event_type not in {
             "tool.started",
             "tool.output",
@@ -692,6 +718,38 @@ class TerminalUI:
         line.append(f" [{label}]", style=style)
         if not self.viewport_mode:
             self.console.print(line)
+
+    def _set_activity_status(self, text: str) -> None:
+        """Update one ephemeral turn-status surface without polluting history."""
+
+        text = terminal_safe_text(text, single_line=True)
+        if text == self._activity_status:
+            return
+        self._activity_status = text
+        if self.viewport_mode:
+            if not text:
+                if self._activity_entry_id is not None:
+                    try:
+                        self.transcript.remove(self._activity_entry_id)
+                    except KeyError:
+                        pass
+                    self._activity_entry_id = None
+                return
+            if self._activity_entry_id is None:
+                self._activity_entry_id = self.transcript.begin(
+                    "status",
+                    title="working",
+                )
+            self.transcript.replace_content(self._activity_entry_id, text)
+            return
+        if self.screen_reader_mode and text:
+            self.console.print(
+                f"Status: {text}",
+                markup=False,
+                highlight=False,
+            )
+        if self._active_buffers is not None:
+            self._refresh_live()
 
     # --- approval surface -------------------------------------------------
 
@@ -836,6 +894,8 @@ class TerminalUI:
     def load_session_transcript(self, session: Any | None) -> None:
         """Replace viewport history from a durable session snapshot."""
 
+        self._activity_entry_id = None
+        self._activity_status = ""
         self.transcript.clear()
         if session is None:
             return
@@ -855,6 +915,41 @@ class TerminalUI:
                     title="tool result",
                     metadata=dict(message.metadata),
                 )
+        if not self.viewport_mode and self.transcript.snapshot():
+            self._render_linear_history()
+
+    def _render_linear_history(self) -> None:
+        """Render a bounded recent-history recap for non-rewriting terminals."""
+
+        entries = self.transcript.snapshot()
+        visible = entries[-MAX_LINEAR_HISTORY_ENTRIES:]
+        omitted = len(entries) - len(visible)
+        self.console.print(
+            (
+                f"Recent conversation ({omitted} earlier entr"
+                f"{'y' if omitted == 1 else 'ies'} omitted):"
+                if omitted
+                else "Recent conversation:"
+            ),
+            markup=False,
+            highlight=False,
+        )
+        labels = {
+            "user": "YOU",
+            "assistant": "ASH",
+            "reasoning": "THINK",
+            "tool": "TOOL",
+            "approval": "APPROVAL",
+            "status": "STATUS",
+            "error": "ERROR",
+        }
+        for entry in visible:
+            label = labels[entry.kind]
+            self.console.print(
+                f"{label}: {entry.content}",
+                markup=False,
+                highlight=False,
+            )
 
     def _edit_preview(
         self,

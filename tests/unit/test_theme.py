@@ -1,4 +1,12 @@
-from ash.ui.theme import get_theme, normalize_theme_name, viewport_styles
+from prompt_toolkit.styles import DummyStyle
+
+from ash.ui.theme import (
+    get_theme,
+    normalize_theme_name,
+    overlay_styles,
+    prompt_style,
+    viewport_styles,
+)
 from ash.ui.viewport import TranscriptViewport
 from ash.ui.transcript import Transcript
 
@@ -32,3 +40,28 @@ def test_viewport_uses_selected_theme_styles(tmp_path):
     styles = viewport_styles(get_theme("light"))
 
     assert dict(viewport.application.style.style_rules) == styles
+
+
+def test_overlay_palette_tracks_selected_theme():
+    dark = overlay_styles(get_theme("dark"))
+    light = overlay_styles(get_theme("light"))
+
+    assert dark["detail"] == get_theme("dark").composer
+    assert light["detail"] == get_theme("light").composer
+    assert dark["selected"] != light["selected"]
+
+
+def test_no_color_uses_prompt_toolkit_dummy_style(tmp_path):
+    assert isinstance(
+        prompt_style(viewport_styles(get_theme("dark")), no_color=True),
+        DummyStyle,
+    )
+
+    viewport = TranscriptViewport(
+        transcript=Transcript(),
+        history_path=tmp_path / "history",
+        theme="light",
+        no_color=True,
+    )
+
+    assert isinstance(viewport.application.style, DummyStyle)

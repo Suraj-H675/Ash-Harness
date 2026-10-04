@@ -23,14 +23,16 @@ from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import (
     BufferControl,
+    Float,
+    FloatContainer,
     FormattedTextControl,
     HSplit,
     Layout,
     Window,
 )
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.output.base import Output
-from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markdown import Markdown
 
@@ -38,7 +40,7 @@ from ash.ui.history import PrivateFileHistory
 from ash.ui.history import validate_history_path as _validate_history_path
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript, TranscriptEntry, TranscriptEvent
-from ash.ui.theme import Theme, get_theme, viewport_styles
+from ash.ui.theme import Theme, get_theme, prompt_style, viewport_styles
 
 
 validate_history_path = _validate_history_path
@@ -114,7 +116,9 @@ def format_transcript(entries: tuple[TranscriptEntry, ...]) -> AnyFormattedText:
         fragments.append(("", "\n"))
         body_style = "class:reasoning" if entry.kind == "reasoning" else ""
         fragments.append((body_style, _entry_body(entry)))
-        if not entry.finalized:
+        if not entry.finalized and not (
+            entry.kind == "status" and entry.title == "working"
+        ):
             fragments.append(("class:streaming", "  …"))
     return FormattedText(fragments)
 
@@ -151,7 +155,9 @@ class RichTranscriptFormatter:
             else:
                 body_style = "class:reasoning" if entry.kind == "reasoning" else ""
                 fragments.append((body_style, _entry_body(entry)))
-            if not entry.finalized:
+            if not entry.finalized and not (
+                entry.kind == "status" and entry.title == "working"
+            ):
                 fragments.append(("class:streaming", "  …"))
         if len(self._cache) > max(32, len(live_keys) * 4):
             self._cache = {
@@ -188,6 +194,7 @@ class TranscriptViewport:
         input_mode: str = "emacs",
         keybindings: dict[str, list[str]] | None = None,
         theme: str = "dark",
+        no_color: bool = False,
         input: Input | None = None,
         output: Output | None = None,
     ) -> None:
@@ -234,7 +241,7 @@ class TranscriptViewport:
             ],
             style="class:composer",
         )
-        root = HSplit(
+        body = HSplit(
             [
                 Window(
                     self.header_control,
@@ -251,13 +258,23 @@ class TranscriptViewport:
                 ),
             ]
         )
+        root = FloatContainer(
+            content=body,
+            floats=[
+                Float(
+                    xcursor=True,
+                    ycursor=True,
+                    content=CompletionsMenu(max_height=8, scroll_offset=1),
+                )
+            ],
+        )
         self.application: Application[str] = Application(
             layout=Layout(root, focused_element=self.input_buffer),
             key_bindings=self._key_bindings(),
             full_screen=True,
             erase_when_done=False,
             editing_mode=EditingMode.VI if input_mode == "vi" else EditingMode.EMACS,
-            style=Style.from_dict(viewport_styles(selected_theme)),
+            style=prompt_style(viewport_styles(selected_theme), no_color=no_color),
             input=input,
             output=output,
             min_redraw_interval=0.03,
@@ -350,10 +367,21 @@ class TranscriptViewport:
         @bindings.add("enter")
         def submit(event) -> None:
             state = self.input_buffer.complete_state
-            if state is not None and state.current_completion is not None:
-                self.input_buffer.apply_completion(state.current_completion)
-                return
+            if state is not None and state.completions:
+                completion = state.current_completion or state.completions[0]
+                if self.input_buffer.text.strip() != completion.text:
+                    self.input_buffer.apply_completion(completion)
+                    return
             event.app.exit(result=self.input_buffer.text)
+
+        @bindings.add("tab")
+        def complete(event) -> None:
+            state = self.input_buffer.complete_state
+            if state is not None and state.completions:
+                completion = state.current_completion or state.completions[0]
+                self.input_buffer.apply_completion(completion)
+                return
+            self.input_buffer.start_completion(select_first=True)
 
         def newline(event) -> None:
             event.current_buffer.insert_text("\n")

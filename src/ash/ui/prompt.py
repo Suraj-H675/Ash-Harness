@@ -34,16 +34,49 @@ class AshCompleter(Completer):
         commands: list[str],
         workspace_root: Path,
         *,
+        command_descriptions: dict[str, str] | None = None,
         repo_map: Any | None = None,
         mcp_runtime: Any | None = None,
     ) -> None:
-        self._commands = WordCompleter(commands, sentence=True)
+        self._commands = self._build_command_completer(
+            commands,
+            command_descriptions=command_descriptions,
+        )
         self._root = workspace_root.resolve()
         self._repo_map = repo_map
         self._mcp_runtime = mcp_runtime
 
-    def set_commands(self, commands: list[str]) -> None:
-        self._commands = WordCompleter(commands, sentence=True)
+    def set_commands(
+        self,
+        commands: list[str],
+        *,
+        command_descriptions: dict[str, str] | None = None,
+    ) -> None:
+        self._commands = self._build_command_completer(
+            commands,
+            command_descriptions=command_descriptions,
+        )
+
+    @staticmethod
+    def _build_command_completer(
+        commands: list[str],
+        *,
+        command_descriptions: dict[str, str] | None = None,
+    ) -> WordCompleter:
+        metadata = {
+            f"/{name}": command.description
+            for command in COMMANDS
+            for name in (command.name, *command.aliases)
+        }
+        metadata.update(command_descriptions or {})
+        for command in commands:
+            metadata.setdefault(command, "custom command")
+        return WordCompleter(
+            commands,
+            sentence=True,
+            ignore_case=True,
+            meta_dict=metadata,
+        )
 
     def set_providers(
         self,
@@ -245,13 +278,14 @@ class PromptInput:
         status_provider: Callable[[], str] | None = None,
         header_provider: Callable[[], str] | None = None,
         viewport_status_provider: Callable[[], str] | None = None,
-        extra_commands: list[str] | None = None,
+        extra_commands: dict[str, str] | list[str] | None = None,
         input_mode: str = "emacs",
         keybindings: dict[str, list[str]] | None = None,
         workspace_root: Path | None = None,
         transcript: Transcript | None = None,
         tui_mode: str = "inline",
         theme: str = "dark",
+        no_color: bool = False,
         repo_map: Any | None = None,
         mcp_runtime: Any | None = None,
         screen_reader_mode: bool = False,
@@ -289,11 +323,20 @@ class PromptInput:
                     for name in (command.name, *command.aliases)
                 }
             )
-            words.extend(f"/{name}" for name in (extra_commands or []))
+            extra_descriptions: dict[str, str] = {}
+            if isinstance(extra_commands, dict):
+                words.extend(f"/{name}" for name in extra_commands)
+                extra_descriptions = {
+                    f"/{name}": description
+                    for name, description in extra_commands.items()
+                }
+            else:
+                words.extend(f"/{name}" for name in (extra_commands or []))
             words = sorted(set(words))
             completer = AshCompleter(
                 words,
                 workspace_root or Path.cwd(),
+                command_descriptions=extra_descriptions,
                 repo_map=repo_map,
                 mcp_runtime=mcp_runtime,
             )
@@ -309,6 +352,7 @@ class PromptInput:
                     input_mode=input_mode,
                     keybindings=keybindings,
                     theme=theme,
+                    no_color=no_color,
                 )
             else:
                 self._session = PromptSession(
@@ -338,7 +382,7 @@ class PromptInput:
     def uses_viewport(self) -> bool:
         return self._viewport is not None
 
-    def set_extra_commands(self, names: list[str]) -> None:
+    def set_extra_commands(self, commands: dict[str, str] | list[str]) -> None:
         if self._completer is None:
             return
         words = {
@@ -346,8 +390,18 @@ class PromptInput:
             for command in COMMANDS
             for name in (command.name, *command.aliases)
         }
-        words.update(f"/{name}" for name in names)
-        self._completer.set_commands(sorted(words))
+        descriptions: dict[str, str] = {}
+        if isinstance(commands, dict):
+            words.update(f"/{name}" for name in commands)
+            descriptions = {
+                f"/{name}": description for name, description in commands.items()
+            }
+        else:
+            words.update(f"/{name}" for name in commands)
+        self._completer.set_commands(
+            sorted(words),
+            command_descriptions=descriptions,
+        )
 
     async def read(self, prompt: str = "> ") -> str:
         if self._viewport is not None:

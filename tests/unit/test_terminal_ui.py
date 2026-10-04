@@ -216,6 +216,79 @@ def test_terminal_ui_viewport_mode_uses_transcript_without_live_output() -> None
     ]
 
 
+def test_terminal_ui_viewport_activity_is_ephemeral_and_not_duplicated() -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.viewport_mode = True
+
+    ui.emit_event({"type": "turn.started"})
+    ui.emit_event(
+        {
+            "type": "model.request.started",
+            "attempt": 1,
+            "max_attempts": 3,
+        }
+    )
+
+    working = ui.transcript.snapshot()
+    assert len(working) == 1
+    assert working[0].kind == "status"
+    assert working[0].content == "Thinking…"
+    assert working[0].finalized is False
+
+    ui.emit_event(
+        {
+            "type": "tool.started",
+            "tool": "read_file",
+            "call_id": "c1",
+        }
+    )
+
+    entries = ui.transcript.snapshot()
+    assert [entry.kind for entry in entries] == ["tool"]
+    assert entries[0].content == "read_file [started]"
+    assert ui._activity_status == ""
+    assert ui._activity_entry_id is None
+
+
+def test_terminal_ui_viewport_activity_clears_on_first_assistant_delta() -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.viewport_mode = True
+
+    ui.emit_event({"type": "turn.started"})
+    ui.emit_event({"type": "assistant.delta", "text": "hello"})
+
+    assert ui.transcript.snapshot() == ()
+    assert ui._activity_status == ""
+
+
+def test_screen_reader_activity_is_linear_and_deduplicated() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(file=output, force_terminal=False, width=80),
+        screen_reader_mode=True,
+    )
+
+    ui.emit_event({"type": "turn.started"})
+    ui.emit_event(
+        {
+            "type": "model.request.started",
+            "attempt": 1,
+            "max_attempts": 3,
+        }
+    )
+    ui.emit_event(
+        {
+            "type": "provider.retrying",
+            "attempt": 2,
+            "max_attempts": 3,
+        }
+    )
+
+    rendered = output.getvalue()
+    assert rendered.count("Status: Thinking…") == 1
+    assert "Status: Retrying model (2/3)…" in rendered
+
+
 def test_terminal_ui_hydrates_bounded_durable_session_transcript() -> None:
     ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
     session = SimpleNamespace(
@@ -240,6 +313,60 @@ def test_terminal_ui_hydrates_bounded_durable_session_transcript() -> None:
     assert entries[1].content == "answer"
     assert len(entries[2].content) < 4100
     assert entries[2].metadata == {"call_id": "c1"}
+
+
+def test_inline_resume_renders_bounded_recent_conversation() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(file=output, force_terminal=False, width=80),
+    )
+    session = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="user",
+                content=f"question {index}",
+                metadata={},
+            )
+            for index in range(14)
+        ]
+        + [
+            SimpleNamespace(
+                role="assistant",
+                content="latest answer",
+                metadata={},
+            )
+        ]
+    )
+
+    ui.load_session_transcript(session)
+
+    rendered = output.getvalue()
+    assert "Recent conversation (3 earlier entries omitted):" in rendered
+    assert "question 0" not in rendered
+    assert "question 3" in rendered
+    assert "ASH: latest answer" in rendered
+
+
+def test_viewport_resume_does_not_duplicate_transcript_to_console() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(file=output, force_terminal=False, width=80),
+    )
+    ui.viewport_mode = True
+    ui.load_session_transcript(
+        SimpleNamespace(
+            messages=[
+                SimpleNamespace(role="user", content="question", metadata={}),
+                SimpleNamespace(role="assistant", content="answer", metadata={}),
+            ]
+        )
+    )
+
+    assert output.getvalue() == ""
+    assert [entry.content for entry in ui.transcript.snapshot()] == [
+        "question",
+        "answer",
+    ]
 
 
 def test_terminal_ui_dry_run_denies_all():

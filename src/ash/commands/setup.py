@@ -141,8 +141,43 @@ def _setup_console() -> Console:
 
     return Console(
         no_color=_env_truthy("NO_COLOR") or _env_truthy("ASH_NO_COLOR"),
-        soft_wrap=True,
+        soft_wrap=False,
     )
+
+
+def _interactive_setup_picker_enabled() -> bool:
+    """Use full-screen pickers only when both terminal streams can support them."""
+
+    return bool(
+        is_interactive_stdin()
+        and getattr(sys.stdout, "isatty", lambda: False)()
+        and not _env_truthy("ASH_SCREEN_READER_MODE")
+    )
+
+
+def _run_setup_picker(
+    title: str,
+    options: list[tuple[str, str, str, tuple[str, ...], str]],
+    *,
+    current_value: str | None = None,
+) -> str | None:
+    from ash.ui.picker import FilterPicker, PickerOption
+
+    return FilterPicker(
+        title,
+        [
+            PickerOption(
+                value=value,
+                label=label,
+                description=description,
+                keywords=keywords,
+                state=state,
+            )
+            for value, label, description, keywords, state in options
+        ],
+        current_value=current_value,
+        no_color=_env_truthy("NO_COLOR") or _env_truthy("ASH_NO_COLOR"),
+    ).run()
 
 
 def _setup_status_text(label: str) -> Text:
@@ -296,6 +331,7 @@ def _render_setup_status(
     *,
     title: str = "Current setup",
     json_output: bool = False,
+    show_capabilities: bool = True,
 ) -> None:
     """Render a bounded, secret-free setup summary."""
 
@@ -309,6 +345,15 @@ def _render_setup_status(
     model = str(payload["model"] or "not selected")
     provider = payload["provider"]
     provider_name = str(provider["name"] or "Not configured")
+    model_source = getattr(config, "config_source", lambda _field: None)("model")
+    default_unconfigured_route = bool(
+        not provider["ready"]
+        and isinstance(model_source, tuple)
+        and model_source[:1] == ("default",)
+    )
+    if default_unconfigured_route:
+        provider_name = "Not connected"
+        model = "Not selected"
     provider_state = "ready to test" if provider["ready"] else "needs setup"
     fallback_count = len(payload["fallback_models"])
     capabilities = payload["capabilities"]
@@ -368,6 +413,8 @@ def _render_setup_status(
             padding=(1, 2),
         )
     )
+    if not show_capabilities:
+        return
     table = Table(
         show_header=True,
         header_style="bold",
@@ -462,7 +509,11 @@ def run_setup_wizard(args) -> SetupOutcome:
 
     # Banner
     _print_setup_banner()
-    _render_setup_status(config, title="Before you begin")
+    _render_setup_status(
+        config,
+        title="Before you begin",
+        show_capabilities=_has_provider_configured(config),
+    )
 
     # Check for old ash.toml and offer migration
     _migrate_old_ash_toml()
@@ -856,10 +907,11 @@ def select_provider_and_model(config) -> SetupOutcome:
                 if not _has_provider_configured(config)
                 else list(PROVIDERS)
             )
-            print(
-                "Choose by number, provider name, or provider ID. "
-                "Type all from a filtered view to show every route.\n"
-            )
+            if not _interactive_setup_picker_enabled():
+                print(
+                    "Choose by number, provider name, or provider ID. "
+                    "Type all from a filtered view to show every route.\n"
+                )
             descriptor = _prompt_provider(config, initial_scope=initial_scope)
             provider_id = descriptor.id
             current = _get_current_model_for_provider(config, provider_id)
@@ -2143,6 +2195,25 @@ def _require_secure_provider_transport(
 
 def _prompt_model_list(models: list[str], current: str) -> str:
     """Show models and return a selection, or raise a navigation signal."""
+    if _interactive_setup_picker_enabled() and models:
+        selected = _run_setup_picker(
+            "Choose a model",
+            [
+                (
+                    model,
+                    terminal_safe_text(model, single_line=True),
+                    "Model discovered from the selected provider.",
+                    (),
+                    "current" if model == current else "",
+                )
+                for model in models
+            ],
+            current_value=current if current in models else None,
+        )
+        if selected is None:
+            raise SetupBack
+        return selected
+
     visible = list(models)
 
     while True:
@@ -2267,7 +2338,7 @@ def _render_provider_catalog(
     show_about = width >= 112
     if show_about:
         table.add_column("About")
-    positions = {descriptor.id: index for index, descriptor in enumerate(PROVIDERS, 1)}
+    positions = {descriptor.id: index for index, descriptor in enumerate(descriptors, 1)}
     for descriptor in descriptors:
         status = _provider_status(config, descriptor)
         display_status = _compact_provider_status(status) if width < 60 else status
@@ -2331,17 +2402,42 @@ def _prompt_provider(
     default = next(
         (
             descriptor
-            for descriptor in PROVIDERS
+            for descriptor in scope
             if descriptor.id == current_provider
         ),
         None,
     )
+    if default is not None and not _provider_is_detected_or_configured(config, default):
+        default = None
+
+    if _interactive_setup_picker_enabled():
+        selected = _run_setup_picker(
+            "Choose an inference provider",
+            [
+                (
+                    descriptor.id,
+                    descriptor.name,
+                    descriptor.description,
+                    (descriptor.id, descriptor.category),
+                    _provider_status(config, descriptor),
+                )
+                for descriptor in scope
+            ],
+            current_value=default.id if default is not None else None,
+        )
+        if selected is None:
+            raise SetupBack if initial_scope is not None else SetupCancelled
+        return next(descriptor for descriptor in scope if descriptor.id == selected)
+
     while True:
         _render_provider_catalog(config, visible)
         suffix = f" [{default.name}]" if default is not None else ""
         value = input(f"\n  Provider{suffix} › ").strip()
         if not value and default is not None:
             return default
+        if not value:
+            print("  Choose a visible provider by number or name.")
+            continue
         if value.casefold() in {"c", "cancel", "q", "quit"}:
             raise SetupCancelled
         if value.casefold() in {"all", "*"}:
@@ -2376,8 +2472,8 @@ def _prompt_provider(
             except ValueError:
                 print("  Invalid choice.")
                 continue
-            if 0 <= index < len(PROVIDERS) and PROVIDERS[index] in scope:
-                return PROVIDERS[index]
+            if 0 <= index < len(visible):
+                return visible[index]
             print("  Invalid choice.")
             continue
         query = value.casefold()
@@ -2405,6 +2501,25 @@ def _prompt_provider(
 
 def _prompt_choice(prompt: str, options: list[str], default: int) -> int:
     """Ask for a numbered option, raising when the user cancels."""
+    if _interactive_setup_picker_enabled():
+        selected = _run_setup_picker(
+            terminal_safe_text(prompt, single_line=True),
+            [
+                (
+                    str(index),
+                    terminal_safe_text(option, single_line=True),
+                    "",
+                    (),
+                    "default" if index == default else "",
+                )
+                for index, option in enumerate(options)
+            ],
+            current_value=str(default),
+        )
+        if selected is None:
+            raise SetupCancelled
+        return int(selected)
+
     multiline = len(options) > 4 or sum(len(option) for option in options) > 72
     if multiline:
         print(f"\n  {prompt}:")

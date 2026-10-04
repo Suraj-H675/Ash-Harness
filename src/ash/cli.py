@@ -517,31 +517,96 @@ async def _interactive_model_picker(
     *,
     discovered: list[str] | None = None,
 ) -> None:
-    """Show models grouped by provider, let user pick by provider number."""
-    write_output(
-        _render_model_list(
-            config,
-            numbered=True,
-            discovered=discovered or [],
-        )
+    """Switch models within the active provider without exposing irrelevant routes."""
+    active_provider, _active_model = _parse_model_string(config.model)
+    catalog = [
+        model
+        for model in _model_catalog(config, discovered or [])
+        if _parse_model_string(model)[0] == active_provider
+    ]
+    if config.model not in catalog:
+        catalog.insert(0, config.model)
+    catalog = list(dict.fromkeys(catalog))
+
+    use_overlay = bool(
+        getattr(prompt_input, "interactive", False)
+        and not getattr(prompt_input, "screen_reader_mode", False)
     )
-    choice = (await prompt_input.read("Pick a number (or 'c' to cancel)> ")).strip()
-    if choice.lower() == "c":
-        return
-    try:
-        idx = int(choice) - 1
-        catalog = [
-            f"{provider}/{model}"
-            for provider, models in _grouped_model_catalog(
-                config,
-                discovered or [],
-            ).items()
-            for model in models
-        ]
-        model_str = catalog[idx]
-    except (ValueError, IndexError):
-        write_output("Invalid selection.", file=sys.stderr)
-        return
+    if use_overlay:
+        from ash.ui.picker import FilterPicker, PickerOption
+
+        def picker_options(models: list[str]) -> list[PickerOption]:
+            return [
+                PickerOption(
+                    value=model,
+                    label=_parse_model_string(model)[1],
+                    description=_render_model_capabilities(model, config),
+                    state="current" if model == config.model else "",
+                )
+                for model in models
+            ]
+
+        picker = FilterPicker(
+            f"Switch model · {active_provider}",
+            picker_options(catalog),
+            current_value=config.model,
+            hint="type to filter · refreshing live catalog…",
+            theme=config.theme,
+            no_color=config.no_color,
+        )
+
+        async def refresh_picker() -> None:
+            try:
+                live_models = await _discover_live_model_catalog(config)
+            except Exception:  # noqa: BLE001 - picker remains usable with cached choices
+                picker.set_hint("type to filter · live catalog unavailable")
+                return
+            live_for_provider = [
+                model
+                for model in live_models
+                if _parse_model_string(model)[0] == active_provider
+            ]
+            if live_for_provider:
+                refreshed = list(
+                    dict.fromkeys([config.model, *live_for_provider])
+                )
+                picker.set_options(picker_options(refreshed))
+                picker.set_hint(
+                    f"type to filter · {len(live_for_provider)} live model"
+                    + ("s" if len(live_for_provider) != 1 else "")
+                )
+            else:
+                picker.set_hint("type to filter · no live models returned")
+
+        refresh_task = asyncio.create_task(refresh_picker())
+        try:
+            model_str = await picker.run_async()
+        finally:
+            if not refresh_task.done():
+                refresh_task.cancel()
+                try:
+                    await refresh_task
+                except asyncio.CancelledError:
+                    pass
+        if model_str is None:
+            return
+    else:
+        lines = [f"Available {active_provider} models:"]
+        for index, model in enumerate(catalog, 1):
+            marker = " (current)" if model == config.model else ""
+            lines.append(
+                f"  [{index}] {_parse_model_string(model)[1]}{marker}"
+            )
+        write_output("\n".join(lines))
+        choice = (await prompt_input.read("Pick a number (or 'c' to cancel)> ")).strip()
+        if choice.lower() == "c":
+            return
+        try:
+            idx = int(choice) - 1
+            model_str = catalog[idx]
+        except (ValueError, IndexError):
+            write_output("Invalid selection.", file=sys.stderr)
+            return
 
     try:
         loop.switch_model(model_str)
@@ -697,7 +762,7 @@ async def _handle_browser_command(
 async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     from ash.ui.terminal import TerminalUI
     from ash.commands.custom_commands import CommandSource, CustomCommandCatalog
-    from ash.commands.slash import parse_slash_command, render_help
+    from ash.commands.slash import COMMANDS, SlashCommand, parse_slash_command, render_help
     from ash.safety.trust import is_workspace_trusted
     from ash.ui.prompt import PromptInput
     from ash.ui.status import StatusLine
@@ -736,13 +801,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         status_provider=status_line,
         header_provider=status_line.header,
         viewport_status_provider=status_line.footer,
-        extra_commands=[command.name for command in discovered_commands],
+        extra_commands={
+            command.name: command.description for command in discovered_commands
+        },
         input_mode=config.input_mode,
         keybindings=config.keybindings,
         workspace_root=loop.project_root,
         transcript=loop.ui.transcript if isinstance(loop.ui, TerminalUI) else None,
         tui_mode=config.tui_mode,
         theme=config.theme,
+        no_color=config.no_color,
         repo_map=getattr(loop, "repo_map", None),
         mcp_runtime=getattr(loop, "_mcp_runtime", None),
         screen_reader_mode=config.screen_reader_mode,
@@ -750,9 +818,20 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     if not isinstance(loop.ui, TerminalUI):
         raise TypeError("interactive REPL requires TerminalUI")
     loop.ui.viewport_mode = prompt_input.uses_viewport
-    if prompt_input.uses_viewport:
-        loop.ui.load_session_transcript(loop.current_session)
+    loop.ui.load_session_transcript(loop.current_session)
     print = ReplPrinter(loop.ui, viewport=prompt_input.uses_viewport)  # noqa: A001
+
+    def _print_classified_error(exc: BaseException) -> None:
+        """Route interactive classified failures through the active UI surface."""
+
+        from ash.exceptions import classify_exception, format_error
+
+        print(
+            format_error(classify_exception(exc)),
+            file=sys.stderr,
+            flush=True,
+        )
+
     turn_controller = InteractiveTurnController(
         loop,
         prompt_input,
@@ -924,7 +1003,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         custom_commands = next_commands
         discovered_commands = next_discovered_commands
         prompt_input.set_extra_commands(
-            [command.name for command in discovered_commands]
+            {
+                command.name: command.description
+                for command in discovered_commands
+            }
         )
         summary = (
             f"Reloaded {len(plugins)} plugin(s): {len(discovered_skills)} skills, "
@@ -940,10 +1022,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             ),
         )
 
-    print(
-        "ash - type /help for commands",
-        flush=True,
-    )
+    if not prompt_input.uses_viewport:
+        print(
+            "ASH · type /help for commands",
+            flush=True,
+        )
     while True:
         try:
             user_input = (await prompt_input.read("> ")).strip()
@@ -986,7 +1069,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(f"Error: {custom_exc}", file=sys.stderr, flush=True)
                 continue
             if custom is None:
-                _print_classified_error(exc)
+                print(f"Error: {exc}", file=sys.stderr, flush=True)
                 continue
             custom_command, custom_arguments = custom
             user_input = custom_command.expand(custom_arguments)
@@ -1012,10 +1095,38 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 return 0
             if command.name == "help":
                 help_query = " ".join(arguments)
+                builtin_names = {
+                    name
+                    for builtin in COMMANDS
+                    for name in (builtin.name, *builtin.aliases)
+                }
+                help_commands = (
+                    *COMMANDS,
+                    *(
+                        SlashCommand(
+                            custom.name,
+                            custom.description,
+                            f"/{custom.name} [arguments]",
+                        )
+                        for custom in discovered_commands
+                        if custom.name not in builtin_names
+                    ),
+                )
                 if prompt_input.interactive and not config.screen_reader_mode:
-                    await show_help_overlay(initial_query=help_query)
+                    await show_help_overlay(
+                        commands=help_commands,
+                        initial_query=help_query,
+                        theme=config.theme,
+                        no_color=config.no_color,
+                    )
                 else:
-                    print(render_help(help_query or None), flush=True)
+                    print(
+                        render_help(
+                            help_query or None,
+                            commands=help_commands,
+                        ),
+                        flush=True,
+                    )
                 continue
             if command.name == "status":
                 session = loop.current_session
@@ -1201,6 +1312,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         selected_session_id = await pick_session(
                             loop.session_store,
                             project_path=str(loop.project_root),
+                            theme=config.theme,
+                            no_color=config.no_color,
                         )
                         if selected_session_id is None:
                             print("Resume cancelled.", flush=True)
@@ -5205,14 +5318,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
             "executable configuration.",
             flush=True,
         )
-        answer = (
-            input(
+        try:
+            answer = input(
                 f"Trust project-controlled Ash configuration in "
                 f"{config.workspace_root.resolve()}? [y/N] "
-            )
-            .strip()
-            .casefold()
-        )
+            ).strip().casefold()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
         if answer in {"y", "yes"}:
             set_workspace_trusted(config.workspace_root, True)
             workspace_trusted = True
@@ -5262,30 +5375,33 @@ def _main_impl(argv: list[str] | None = None) -> int:
             "Run 'ash setup' to configure your provider and API key.",
             flush=True,
         )
-        reply = input(
-            "Press Enter to run setup, or type 'repl' to continue without a provider: "
-        ).strip()
-        if reply.lower() not in ("repl", "continue"):
-            from ash.commands.setup import cmd_setup
+        try:
+            reply = input("Press Enter to run setup, or type 'q' to exit: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if reply.casefold() in {"q", "quit", "exit"}:
+            return 0
+        from ash.commands.setup import cmd_setup
 
-            setup_code = cmd_setup(
-                argparse.Namespace(section="model", quick=True, non_interactive=False)
+        setup_code = cmd_setup(
+            argparse.Namespace(section="model", quick=True, non_interactive=False)
+        )
+        if setup_code != 0:
+            return setup_code
+        loaded_config, config_exit_code = _load_config_or_report(
+            event_output=runtime_event_output,
+            **runtime_overrides
+        )
+        if loaded_config is None:
+            return config_exit_code
+        config = loaded_config
+        if not _has_provider_configured(config):
+            print(
+                "Ash is still not configured. Run 'ash setup' to complete provider setup.",
+                file=sys.stderr,
             )
-            if setup_code != 0:
-                return setup_code
-            loaded_config, config_exit_code = _load_config_or_report(
-                event_output=runtime_event_output,
-                **runtime_overrides
-            )
-            if loaded_config is None:
-                return config_exit_code
-            config = loaded_config
-            if not _has_provider_configured(config):
-                print(
-                    "Ash is still not configured. Run 'ash setup' to complete provider setup.",
-                    file=sys.stderr,
-                )
-                return 2
+            return 2
 
     from ash.safety.grants import (
         PermissionGrantError,
@@ -5337,6 +5453,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                         and sys.stdin.isatty()
                         and sys.stdout.isatty()
                     ),
+                    theme=config.theme,
+                    no_color=config.no_color,
                 )
             )
         except (KeyError, ValueError) as exc:

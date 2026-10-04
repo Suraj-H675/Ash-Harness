@@ -148,26 +148,34 @@ def parse_slash_command(text: str) -> tuple[SlashCommand, list[str]] | None:
     return command, parts[1:]
 
 
-def matching_commands(query: str | None = None) -> tuple[SlashCommand, ...]:
+def matching_commands(
+    query: str | None = None,
+    *,
+    commands: tuple[SlashCommand, ...] = COMMANDS,
+) -> tuple[SlashCommand, ...]:
     """Return slash commands matching a free-text query."""
 
     normalized_query = " ".join((query or "").split()).casefold()
     return tuple(
         command
-        for command in COMMANDS
+        for command in commands
         if not normalized_query or _command_matches(command, normalized_query)
     )
 
 
-def render_help(query: str | None = None) -> str:
+def render_help(
+    query: str | None = None,
+    *,
+    commands: tuple[SlashCommand, ...] = COMMANDS,
+) -> str:
     """Render a stable, compact command reference."""
 
-    commands = matching_commands(query)
-    if not commands:
+    matches = matching_commands(query, commands=commands)
+    if not matches:
         return f"No slash commands match {query!r}."
-    width = min(max(len(command.usage) for command in commands), 48)
+    width = min(max(len(command.usage) for command in matches), 48)
     lines: list[str] = []
-    for command in commands:
+    for command in matches:
         suffix = command.description + _render_aliases(command.aliases)
         if len(command.usage) > width:
             lines.extend(

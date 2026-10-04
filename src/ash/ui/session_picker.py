@@ -21,10 +21,9 @@ from prompt_toolkit.layout import (
 )
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.output.base import Output
-from prompt_toolkit.styles import Style
-
 from ash.core.session import Session, SessionSummary
 from ash.ui.safe_text import terminal_safe_text
+from ash.ui.theme import get_theme, overlay_styles, prompt_style
 
 
 def _relative_time(value: datetime) -> str:
@@ -52,6 +51,8 @@ class SessionPicker:
         *,
         load_session: Callable[[str], Session] | None = None,
         initial_query: str = "",
+        theme: str = "dark",
+        no_color: bool = False,
         input: Input | None = None,
         output: Output | None = None,
     ) -> None:
@@ -117,19 +118,9 @@ class SessionPicker:
             key_bindings=self._key_bindings(),
             full_screen=True,
             erase_when_done=False,
-            style=Style.from_dict(
-                {
-                    "title": "bold #5fd7ff",
-                    "muted": "#808080",
-                    "label": "bold #bcbcbc",
-                    "selected": "bold bg:#005f87 #ffffff",
-                    "session-title": "bold",
-                    "meta": "#808080",
-                    "separator": "#444444",
-                    "preview": "bg:#1c1c1c #d0d0d0",
-                    "footer": "bg:#262626 #bcbcbc",
-                    "empty": "italic #808080",
-                }
+            style=prompt_style(
+                overlay_styles(get_theme(theme)),
+                no_color=no_color,
             ),
             input=input,
             output=output,

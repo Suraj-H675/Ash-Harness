@@ -279,7 +279,7 @@ def _apply_configuration(*, level_override: str | None = None) -> Any:
         _file_sink = None
     _loguru_logger.remove()
     _loguru_logger.configure(patcher=_patch_record)
-    stderr_level = level_override or ("DEBUG" if _active_debug else "INFO")
+    stderr_level = level_override or ("DEBUG" if _active_debug else "WARNING")
     _loguru_logger.add(
         _write_stderr,
         format=(

@@ -1224,17 +1224,20 @@ def test_model_picker_can_switch_to_cached_live_discovery() -> None:
 
     from ash.cli import (
         AVAILABLE_MODELS,
-        _grouped_model_catalog,
         _interactive_model_picker,
     )
     from ash.config import AshConfig
 
-    config = AshConfig(model=AVAILABLE_MODELS[0])
+    config = AshConfig(model="openai/gpt-6-astra")
     discovered = ["openai/live-model"]
     rendered_order = [
-        f"{provider}/{model}"
-        for provider, models in _grouped_model_catalog(config, discovered).items()
-        for model in models
+        model
+        for model in [
+            item
+            for item in AVAILABLE_MODELS
+            if item.startswith("openai/")
+        ]
+        + discovered
     ]
     live_index = rendered_order.index("openai/live-model") + 1
 
@@ -1257,7 +1260,7 @@ def test_model_picker_can_switch_to_cached_live_discovery() -> None:
         )
     )
 
-    assert "Openai:" in output[0]
+    assert "Available openai models:" in output[0]
     assert "live-model" in output[0]
     assert selected == ["openai/live-model"]
     assert config.model == "openai/live-model"
