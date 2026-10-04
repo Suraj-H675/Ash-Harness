@@ -637,10 +637,18 @@ class TerminalUI:
             attempt = int(payload.get("attempt", 1) or 1)
             maximum = int(payload.get("max_attempts", attempt) or attempt)
             self._set_activity_status(f"Retrying model ({attempt}/{maximum})…")
+        elif event_type == "tool.started":
+            tool = terminal_safe_text(
+                str(payload.get("tool", "unknown")), single_line=True
+            )
+            self._set_activity_status(f"Running {tool}…")
         elif event_type in {
             "assistant.delta",
             "reasoning.delta",
-            "tool.started",
+            "tool.output",
+            "tool.completed",
+            "tool.denied",
+            "tool.error",
             "turn.completed",
             "turn.cancelled",
             "turn.error",
@@ -661,6 +669,8 @@ class TerminalUI:
         # Keep the provider/runtime call identity exact for internal lookup and
         # metadata.  Only the human-facing title/content is sanitized.
         call_id = str(payload.get("call_id", ""))
+        if event_type == "tool.started":
+            return
         if event_type == "tool.output":
             delta = terminal_safe_text(str(payload.get("delta", "")))
             if not delta:

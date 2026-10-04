@@ -244,8 +244,22 @@ def test_terminal_ui_viewport_activity_is_ephemeral_and_not_duplicated() -> None
     )
 
     entries = ui.transcript.snapshot()
-    assert [entry.kind for entry in entries] == ["tool"]
-    assert entries[0].content == "read_file [started]"
+    assert len(entries) == 1
+    assert entries[0].kind == "status"
+    assert entries[0].content == "Running read_file…"
+    assert ui._activity_status == "Running read_file…"
+
+    ui.emit_event(
+        {
+            "type": "tool.completed",
+            "tool": "read_file",
+            "call_id": "c1",
+            "success": True,
+        }
+    )
+
+    entries = ui.transcript.snapshot()
+    assert [entry.content for entry in entries] == ["read_file [completed]"]
     assert ui._activity_status == ""
     assert ui._activity_entry_id is None
 
