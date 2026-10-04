@@ -515,7 +515,7 @@ class TerminalUI:
     def _render_active_turn(self) -> Panel:
         buffers = self._active_buffers_required()
         parts: list[Any] = []
-        if self._activity_status and not buffers.thought and not buffers.response:
+        if self._activity_status:
             parts.append(Text(self._activity_status, style="dim italic"))
         if buffers.thought:
             parts.append(buffers.thought)

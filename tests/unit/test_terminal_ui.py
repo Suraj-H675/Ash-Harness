@@ -275,6 +275,91 @@ def test_terminal_ui_viewport_activity_clears_on_first_assistant_delta() -> None
     assert ui._activity_status == ""
 
 
+def test_inline_long_tool_activity_remains_visible_after_reasoning() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False))
+
+    with ui.begin_turn():
+        ui.print_thought("I should inspect the repository first.")
+        ui.emit_event(
+            {
+                "type": "tool.started",
+                "tool": "read_file",
+                "call_id": "c1",
+            }
+        )
+
+        rendered = ui._render_active_turn()
+        ui.console.print(rendered)
+
+    assert "Running read_file…" in output.getvalue()
+
+
+@pytest.mark.parametrize("terminal_event", ["turn.completed", "turn.cancelled", "turn.error"])
+def test_terminal_activity_clears_on_every_turn_terminal_event(terminal_event: str) -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.viewport_mode = True
+
+    ui.emit_event(
+        {
+            "type": "provider.retrying",
+            "attempt": 2,
+            "max_attempts": 3,
+        }
+    )
+    assert ui._activity_status == "Retrying model (2/3)…"
+
+    ui.emit_event({"type": terminal_event})
+
+    assert ui._activity_status == ""
+    assert ui._activity_entry_id is None
+
+
+def test_tool_output_replaces_long_tool_activity_with_visible_output() -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.viewport_mode = True
+
+    ui.emit_event({"type": "tool.started", "tool": "run_command", "call_id": "c1"})
+    assert ui._activity_status == "Running run_command…"
+
+    ui.emit_event(
+        {
+            "type": "tool.output",
+            "tool": "run_command",
+            "call_id": "c1",
+            "stream": "stdout",
+            "delta": "building…\n",
+        }
+    )
+
+    entries = ui.transcript.snapshot()
+    assert ui._activity_status == ""
+    assert ui._activity_entry_id is None
+    assert [entry.content for entry in entries] == ["building…\n"]
+
+
+def test_multiple_tools_keep_only_terminal_lifecycle_rows() -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.viewport_mode = True
+
+    for call_id, tool in (("c1", "read_file"), ("c2", "search_text")):
+        ui.emit_event({"type": "tool.started", "tool": tool, "call_id": call_id})
+        ui.emit_event(
+            {
+                "type": "tool.completed",
+                "tool": tool,
+                "call_id": call_id,
+                "success": True,
+            }
+        )
+
+    assert [entry.content for entry in ui.transcript.snapshot()] == [
+        "read_file [completed]",
+        "search_text [completed]",
+    ]
+    assert ui._activity_status == ""
+
+
 def test_screen_reader_activity_is_linear_and_deduplicated() -> None:
     output = StringIO()
     ui = TerminalUI(
