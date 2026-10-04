@@ -5583,6 +5583,7 @@ async def _bootstrap_and_repl(
     from ash.logging import get_logger
 
     primary_error: BaseException | None = None
+    result_code = 0
     try:
         await loop.start_session(session_id)
         if loop.recovery_summary is not None and loop.recovered_turns:
@@ -5603,7 +5604,7 @@ async def _bootstrap_and_repl(
                     file=sys.stderr,
                     flush=True,
                 )
-        return await _repl(loop, config, sandbox_manager)
+        result_code = await _repl(loop, config, sandbox_manager)
     except asyncio.CancelledError as exc:
         primary_error = exc
         raise
@@ -5611,17 +5612,23 @@ async def _bootstrap_and_repl(
         primary_error = exc
         error = classify_exception(exc)
         print(format_error(error), file=sys.stderr)
-        return error.exit_code
+        result_code = error.exit_code
     finally:
         try:
             await loop.aclose()
         except BaseException as cleanup_error:
-            if primary_error is None:
+            if primary_error is not None:
+                get_logger(__name__).warning(
+                    "CLI runtime cleanup failed after an earlier REPL failure: {}",
+                    cleanup_error,
+                )
+            elif isinstance(cleanup_error, asyncio.CancelledError):
                 raise
-            get_logger(__name__).warning(
-                "CLI runtime cleanup failed after an earlier REPL failure: {}",
-                cleanup_error,
-            )
+            else:
+                error = classify_exception(cleanup_error)
+                print(format_error(error), file=sys.stderr)
+                result_code = error.exit_code
+    return result_code
 
 
 async def _bootstrap_and_headless(
@@ -5638,6 +5645,8 @@ async def _bootstrap_and_headless(
     from ash.logging import get_logger
 
     primary_error: BaseException | None = None
+    result_payload: dict[str, Any] | None = None
+    result_code = 0
     try:
         session = await loop.start_session(session_id)
         safety_guard = getattr(loop, "safety_guard", None)
@@ -5681,8 +5690,7 @@ async def _bootstrap_and_headless(
             payload["recovery"] = loop.recovery_summary.to_dict()
         if schema is not None:
             payload["structured_output"] = validate_structured_output(response, schema)
-        ui.emit_result(payload)
-        return 0
+        result_payload = payload
     except asyncio.CancelledError as exc:
         primary_error = exc
         raise
@@ -5695,17 +5703,34 @@ async def _bootstrap_and_headless(
             print(json.dumps({"type": "error", "error": error.to_dict()}), flush=True)
         else:
             print(format_error(error), file=sys.stderr)
-        return error.exit_code
+        result_code = error.exit_code
     finally:
         try:
             await loop.aclose()
         except BaseException as cleanup_error:
-            if primary_error is None:
+            if primary_error is not None:
+                get_logger(__name__).warning(
+                    "CLI runtime cleanup failed after an earlier headless failure: {}",
+                    cleanup_error,
+                )
+            elif isinstance(cleanup_error, asyncio.CancelledError):
                 raise
-            get_logger(__name__).warning(
-                "CLI runtime cleanup failed after an earlier headless failure: {}",
-                cleanup_error,
-            )
+            else:
+                error = classify_exception(cleanup_error)
+                if hasattr(ui, "emit_error"):
+                    ui.emit_error(error.to_dict())
+                elif ui.output_format in {"json", "stream-json"}:
+                    print(
+                        json.dumps({"type": "error", "error": error.to_dict()}),
+                        flush=True,
+                    )
+                else:
+                    print(format_error(error), file=sys.stderr)
+                result_code = error.exit_code
+                result_payload = None
+    if result_payload is not None:
+        ui.emit_result(result_payload)
+    return result_code
 
 
 def _load_json_schema(path: Path) -> dict[str, Any]:

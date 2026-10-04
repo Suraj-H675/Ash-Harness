@@ -331,3 +331,79 @@ async def test_repl_bootstrap_preserves_error_when_runtime_close_fails(capsys) -
     stderr = capsys.readouterr().err
     assert "Error [session]: Session not found: missing" in stderr
     assert "List sessions" in stderr
+
+
+@pytest.mark.asyncio
+async def test_repl_bootstrap_classifies_cleanup_failure_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    class ClosingLoop:
+        recovery_summary = None
+        recovered_turns = []
+
+        async def start_session(self, session_id=None):
+            return SimpleNamespace(session_id="s1")
+
+        async def aclose(self):
+            raise RuntimeError("runtime close failure")
+
+    async def successful_repl(loop, config, sandbox_manager):
+        del loop, config, sandbox_manager
+        return 0
+
+    monkeypatch.setattr("ash.cli._repl", successful_repl)
+
+    code = await _bootstrap_and_repl(
+        ClosingLoop(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        session_id=None,
+    )
+
+    assert code == 1
+    stderr = capsys.readouterr().err
+    assert "Error [internal]: runtime close failure" in stderr
+    assert "Run `ash doctor`" in stderr
+
+
+@pytest.mark.asyncio
+async def test_headless_cleanup_failure_replaces_success_with_one_json_error() -> None:
+    class ClosingLoop:
+        active_model_id = "openai/test"
+        _last_context_tokens = 0
+        last_turn_usage = {}
+        recovery_summary = None
+        recovered_turns = []
+        safety_guard = None
+        provider = None
+
+        async def start_session(self, session_id=None):
+            return SimpleNamespace(session_id="s1")
+
+        async def run_turn(self, prompt):
+            del prompt
+            return "successful response"
+
+        async def aclose(self):
+            raise RuntimeError("runtime close failure")
+
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="json", stream=stream)
+
+    code = await _bootstrap_and_headless(
+        ClosingLoop(),
+        SimpleNamespace(attachment_token_budget=1024),
+        prompt="hello",
+        session_id=None,
+        ui=ui,
+    )
+
+    assert code == 1
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["type"] == "error"
+    assert payload["error"]["category"] == "internal"
+    assert payload["error"]["message"] == "runtime close failure"
+    assert "successful response" not in stream.getvalue()
