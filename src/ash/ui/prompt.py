@@ -106,6 +106,7 @@ class AshCompleter(Completer):
         workspace_root: Path,
         *,
         command_descriptions: dict[str, str] | None = None,
+        model_choices: list[str] | None = None,
         repo_map: Any | None = None,
         mcp_runtime: Any | None = None,
     ) -> None:
@@ -116,6 +117,7 @@ class AshCompleter(Completer):
         self._root = workspace_root.resolve()
         self._repo_map = repo_map
         self._mcp_runtime = mcp_runtime
+        self._model_choices = list(dict.fromkeys(model_choices or []))
 
     def set_commands(
         self,
@@ -134,6 +136,15 @@ class AshCompleter(Completer):
         *,
         command_descriptions: dict[str, str] | None = None,
     ) -> WordCompleter:
+        builtin_order = [
+            f"/{name}"
+            for command in COMMANDS
+            for name in (command.name, *command.aliases)
+        ]
+        ordered_commands = [item for item in builtin_order if item in commands]
+        ordered_commands.extend(
+            item for item in commands if item not in set(ordered_commands)
+        )
         metadata = {
             f"/{name}": command.description
             for command in COMMANDS
@@ -144,7 +155,7 @@ class AshCompleter(Completer):
         for command in commands:
             metadata.setdefault(command, "custom command")
         return WordCompleter(
-            commands,
+            ordered_commands,
             sentence=True,
             ignore_case=True,
             meta_dict=metadata,
@@ -160,6 +171,9 @@ class AshCompleter(Completer):
             self._repo_map = repo_map
         if mcp_runtime is not None:
             self._mcp_runtime = mcp_runtime
+
+    def set_model_choices(self, model_choices: list[str]) -> None:
+        self._model_choices = list(dict.fromkeys(model_choices))
 
     def get_completions(self, document: Document, complete_event):
         word = document.get_word_before_cursor(WORD=True)
@@ -289,8 +303,7 @@ class AshCompleter(Completer):
                 display_meta=meta[:120],
             )
 
-    @staticmethod
-    def _slash_argument_completions(text: str):
+    def _slash_argument_completions(self, text: str):
         command_token, separator, remainder = text.partition(" ")
         if not separator or not command_token.startswith("/"):
             return
@@ -311,7 +324,11 @@ class AshCompleter(Completer):
             prefix = ""
 
         if not completed:
-            candidates = _SLASH_FIRST_ARGUMENTS.get(canonical, ())
+            candidates = (
+                self._model_argument_candidates(prefix)
+                if canonical == "model"
+                else _SLASH_FIRST_ARGUMENTS.get(canonical, ())
+            )
         elif len(completed) == 1:
             candidates = _SLASH_SECOND_ARGUMENTS.get(
                 (canonical, completed[0].casefold()),
@@ -335,6 +352,25 @@ class AshCompleter(Completer):
                 display=value,
                 display_meta=description,
             )
+
+    def _model_argument_candidates(self, prefix: str) -> tuple[tuple[str, str], ...]:
+        if "/" in prefix:
+            normalized = prefix.casefold()
+            return tuple(
+                (model, "Known model")
+                for model in self._model_choices
+                if model.casefold().startswith(normalized)
+            )
+
+        candidates = list(_SLASH_FIRST_ARGUMENTS["model"])
+        known_providers = {value.removesuffix("/").casefold() for value, _ in candidates}
+        for model in self._model_choices:
+            provider, separator, _model_name = model.partition("/")
+            if not separator or provider.casefold() in known_providers:
+                continue
+            known_providers.add(provider.casefold())
+            candidates.append((f"{provider}/", "Configured custom provider"))
+        return tuple(candidates)
 
     @staticmethod
     def _slash_followup_candidates(
@@ -433,6 +469,7 @@ class PromptInput:
         header_provider: Callable[[], str] | None = None,
         viewport_status_provider: Callable[[], str] | None = None,
         extra_commands: dict[str, str] | list[str] | None = None,
+        model_choices: list[str] | None = None,
         input_mode: str = "emacs",
         keybindings: dict[str, list[str]] | None = None,
         workspace_root: Path | None = None,
@@ -484,6 +521,7 @@ class PromptInput:
                 words,
                 workspace_root or Path.cwd(),
                 command_descriptions=extra_descriptions,
+                model_choices=model_choices,
                 repo_map=repo_map,
                 mcp_runtime=mcp_runtime,
             )
@@ -542,6 +580,10 @@ class PromptInput:
             _ordered_slash_words(extra_names),
             command_descriptions=descriptions,
         )
+
+    def set_model_choices(self, model_choices: list[str]) -> None:
+        if self._completer is not None:
+            self._completer.set_model_choices(model_choices)
 
     async def read(self, prompt: str = "> ") -> str:
         if self.interactive and self.screen_reader_mode:

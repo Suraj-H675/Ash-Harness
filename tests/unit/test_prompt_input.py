@@ -200,6 +200,27 @@ def test_builtin_slash_completion_has_description_while_filtering_prefix(
     assert all(completion.display_meta_text for completion in completions)
 
 
+def test_bare_slash_completion_keeps_curated_builtin_order(tmp_path) -> None:
+    completer = AshCompleter(
+        ["/agents", "/browser", "/help", "/status", "/model", "/custom:review"],
+        tmp_path,
+    )
+
+    completions = list(
+        completer.get_completions(
+            Document("/"), CompleteEvent(completion_requested=True)
+        )
+    )
+
+    assert [completion.text for completion in completions[:4]] == [
+        "/help",
+        "/status",
+        "/model",
+        "/agents",
+    ]
+    assert completions[-1].text == "/custom:review"
+
+
 def test_slash_argument_completion_and_builtin_metadata_are_contextual(
     tmp_path,
 ) -> None:
@@ -247,6 +268,32 @@ def test_slash_argument_completion_and_builtin_metadata_are_contextual(
     ]
     assert [completion.display_meta_text for completion in status] == [
         "Show session and runtime status"
+    ]
+
+
+def test_model_completion_includes_custom_providers_and_known_models(tmp_path) -> None:
+    completer = AshCompleter(
+        ["/model"],
+        tmp_path,
+        model_choices=[
+            "openai/gpt-6-astra",
+            "my-gateway/agent-model",
+            "my-gateway/fast-model",
+        ],
+    )
+    event = CompleteEvent(completion_requested=True)
+
+    providers = list(completer.get_completions(Document("/model my"), event))
+    models = list(
+        completer.get_completions(Document("/model my-gateway/"), event)
+    )
+
+    assert [(item.text, item.display_meta_text) for item in providers] == [
+        ("my-gateway/", "Configured custom provider")
+    ]
+    assert [item.text for item in models] == [
+        "my-gateway/agent-model",
+        "my-gateway/fast-model",
     ]
 
 

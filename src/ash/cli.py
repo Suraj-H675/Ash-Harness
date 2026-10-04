@@ -611,6 +611,9 @@ async def _interactive_model_picker(
     try:
         loop.switch_model(model_str)
         config.model = model_str
+        config.fallback_models = [
+            fallback for fallback in config.fallback_models if fallback != model_str
+        ]
         write_output(
             "Switched to "
             + terminal_safe_text(model_str, single_line=True)
@@ -804,6 +807,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         extra_commands={
             command.name: command.description for command in discovered_commands
         },
+        model_choices=_model_catalog(config),
         input_mode=config.input_mode,
         keybindings=config.keybindings,
         workspace_root=loop.project_root,
@@ -1138,6 +1142,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 session = loop.current_session
                 goal = loop.current_goal
                 capabilities = loop.provider.capabilities
+                active_model = str(loop.active_model_id)
+                model_lines = [
+                    "Model: "
+                    + terminal_safe_text(active_model, single_line=True)
+                ]
+                if active_model != config.model:
+                    model_lines.append(
+                        "Configured route: "
+                        + terminal_safe_text(config.model, single_line=True)
+                    )
                 provider_circuit = loop.provider_circuit_breaker.snapshot(
                     loop._provider_circuit_key
                 )
@@ -1149,8 +1163,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(
                     "\n".join(
                         (
-                            "Model: "
-                            + terminal_safe_text(config.model, single_line=True),
+                            *model_lines,
                             f"Workspace: {config.workspace_root}",
                             f"Mode: {loop.safety_tier}",
                             f"Session: {session.session_id if session else '(none)'}",
@@ -2392,10 +2405,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     file=sys.stderr,
                 )
                 continue
-            print(_render_model_capabilities(model_str, config))
             try:
                 loop.switch_model(model_str)
                 config.model = model_str
+                config.fallback_models = [
+                    fallback
+                    for fallback in config.fallback_models
+                    if fallback != model_str
+                ]
+                print(_render_model_capabilities(model_str, config))
                 print(
                     "Switched to "
                     + terminal_safe_text(model_str, single_line=True)
@@ -2409,7 +2427,14 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
         # /models → list
         if parsed_command is not None and parsed_command[0].name == "models":
-            refresh = bool(arguments) and arguments[0] == "--refresh"
+            if arguments not in ([], ["--refresh"]):
+                print(
+                    f"Usage: {parsed_command[0].usage}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            refresh = arguments == ["--refresh"]
             lines = ["Available models:", _render_model_list(config)]
             custom_models = [
                 model
@@ -2424,6 +2449,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     live_models = await _discover_live_model_catalog(config)
                     provider, _model = _parse_model_string(config.model)
                     live_model_catalogs[provider] = live_models
+                    prompt_input.set_model_choices(
+                        _model_catalog(
+                            config,
+                            [
+                                model
+                                for models in live_model_catalogs.values()
+                                for model in models
+                            ],
+                        )
+                    )
                     print(render_model_catalog_refresh(config, live_models))
                 except Exception as exc:
                     print(

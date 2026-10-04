@@ -75,6 +75,31 @@ def test_status_line_splits_viewport_identity_from_runtime(tmp_path: Path) -> No
     )
 
 
+def test_status_line_uses_active_runtime_model_and_invalidates_identity_cache(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    loop = SimpleNamespace(
+        current_session=session,
+        session_store=store,
+        permission_policy=PermissionPolicy("interactive"),
+        project_root=tmp_path,
+        _last_context_tokens=0,
+        active_model_id="openai/primary",
+    )
+    config = AshConfig(workspace_root=tmp_path, model="openai/primary")
+    sandbox = SimpleNamespace(backend_name="scoped", is_fully_isolated=lambda: True)
+    status = StatusLine(loop, config, sandbox, refresh_seconds=60)
+
+    assert "openai/primary" in status.header()
+
+    loop.active_model_id = "groq/fallback"
+
+    assert "groq/fallback" in status.header()
+    assert "openai/primary" not in status.header()
+
+
 def test_status_line_does_not_render_unknown_pricing_as_free(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     session = store.create_session(str(tmp_path))

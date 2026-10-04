@@ -5320,6 +5320,41 @@ async def test_switch_model_closes_previous_provider(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_switch_model_removes_new_primary_from_fallback_chain(tmp_path):
+    replacement = MockProvider()
+    built_configs: list[AshConfig] = []
+    config = AshConfig(
+        model="ollama/primary",
+        fallback_models=["ollama/backup", "openai/secondary"],
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+
+    def build(next_config: AshConfig):
+        built_configs.append(next_config)
+        return replacement
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "fallback-switch.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        provider_factory=build,
+        config=config,
+    )
+    await loop.start_session()
+
+    loop.switch_model("ollama/backup")
+
+    assert built_configs[-1].model == "ollama/backup"
+    assert built_configs[-1].fallback_models == ["openai/secondary"]
+    assert loop._config is built_configs[-1]
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_switch_model_rolls_back_if_protocol_sync_fails(tmp_path):
     replacement_closed = []
 

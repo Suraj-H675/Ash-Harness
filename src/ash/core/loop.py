@@ -6734,7 +6734,16 @@ class AshLoop:
             raise RuntimeError("AshLoop was not constructed with a config object")
         provider_name, model_name = parse_model_string(f"{provider}/{model}")
         model_str = f"{provider_name}/{model_name}"
-        new_config = self._config.model_copy(update={"model": model_str})
+        new_config = self._config.model_copy(
+            update={
+                "model": model_str,
+                "fallback_models": [
+                    fallback
+                    for fallback in self._config.fallback_models
+                    if fallback != model_str
+                ],
+            }
+        )
         self._commit_provider_switch(
             new_config,
             reason="switch_provider",
@@ -6754,8 +6763,16 @@ class AshLoop:
             provider_name, model_name = parse_model_string(
                 f"{current_provider}/{model}"
             )
+        model_str = f"{provider_name}/{model_name}"
         new_config = self._config.model_copy(
-            update={"model": f"{provider_name}/{model_name}"}
+            update={
+                "model": model_str,
+                "fallback_models": [
+                    fallback
+                    for fallback in self._config.fallback_models
+                    if fallback != model_str
+                ],
+            }
         )
         self._commit_provider_switch(new_config, reason="switch_model")
 

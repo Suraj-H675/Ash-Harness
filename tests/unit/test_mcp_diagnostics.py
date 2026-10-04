@@ -167,6 +167,81 @@ async def test_repl_preserves_normal_prompt_indentation(
     assert turns == [submitted]
 
 
+@pytest.mark.asyncio
+async def test_repl_status_uses_active_model_and_models_rejects_extra_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    commands = iter(("/status", "/models nonsense", "exit"))
+    FakeTerminalUI = _install_fake_repl_frontend(monkeypatch, commands)
+    monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    loop = SimpleNamespace(
+        ui=FakeTerminalUI(),
+        project_root=tmp_path,
+        repo_map=None,
+        _mcp_runtime=None,
+        _mcp_configs={},
+        safety_guard=SafetyGuard(tmp_path),
+        tools={},
+        current_session=None,
+        current_goal=None,
+        active_model_id="groq/fallback-model",
+        provider=SimpleNamespace(
+            capabilities=SimpleNamespace(
+                native_tools=True,
+                vision=False,
+                reasoning=True,
+                local=False,
+            ),
+            count_tokens=lambda text: len(text),
+        ),
+        provider_circuit_breaker=SimpleNamespace(
+            snapshot=lambda _key: {
+                "open": False,
+                "retry_after": 0.0,
+                "failures": 0,
+            }
+        ),
+        _provider_circuit_key="failover:openai/primary,groq/fallback-model",
+        permission_policy=PermissionPolicy("interactive"),
+        safety_tier="interactive",
+        recovered_turns=0,
+        recovery_summary=None,
+    )
+    config = SimpleNamespace(
+        model="openai/primary",
+        fallback_models=[],
+        custom_providers={},
+        workspace_root=tmp_path,
+        input_mode="emacs",
+        keybindings={},
+        tui_mode="inline",
+        theme="dark",
+        no_color=True,
+        screen_reader_mode=False,
+        notification_method="off",
+        notification_events=(),
+        notification_include_preview=False,
+        sandbox_backend="auto",
+        sandbox_docker_image="ash-sandbox:latest",
+        sandbox_docker_memory_mb=4096,
+        sandbox_docker_cpus=2.0,
+        allow_unsafe_plugin_runtime=False,
+        allow_unsafe_auto_approve=False,
+        safety_tier="interactive",
+        attachment_token_budget=1024,
+    )
+
+    assert await _repl(loop, config, SimpleNamespace()) == 0
+    captured = capsys.readouterr()
+    assert "Model: groq/fallback-model" in captured.out
+    assert "Configured route: openai/primary" in captured.out
+    assert "Usage: /models [--refresh]" in captured.err
+
+
 def _prepared_prompt(prompt: str):
     return SimpleNamespace(prompt=prompt, message_metadata=lambda: None)
 

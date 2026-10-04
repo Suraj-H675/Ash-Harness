@@ -42,6 +42,7 @@ class StatusLine:
         self._cached = ""
         self._cached_header = ""
         self._cached_footer = ""
+        self._cached_identity: tuple[str, str, str] | None = None
 
     def __call__(self) -> str:
         """Return the compact all-in-one toolbar used by inline mode."""
@@ -63,11 +64,21 @@ class StatusLine:
 
     def _refresh(self) -> None:
         now = time.monotonic()
-        if self._cached and now - self._last_refresh < self.refresh_seconds:
-            return
-        self._last_refresh = now
         session = self.loop.current_session
         session_id = session.session_id[:8] if session else "none"
+        active_model = str(
+            getattr(self.loop, "active_model_id", self.config.model) or self.config.model
+        )
+        permission_mode = self.loop.permission_policy.mode.value
+        cache_identity = (active_model, permission_mode, session_id)
+        if (
+            self._cached
+            and cache_identity == self._cached_identity
+            and now - self._last_refresh < self.refresh_seconds
+        ):
+            return
+        self._last_refresh = now
+        self._cached_identity = cache_identity
         cost = 0.0
         cache_read = 0
         cache_write = 0
@@ -90,18 +101,18 @@ class StatusLine:
         sandbox_label = self.sandbox.backend_name
         if not self.sandbox.is_fully_isolated():
             sandbox_label += "!"
-        display_model = terminal_safe_text(self.config.model, single_line=True)
+        display_model = terminal_safe_text(active_model, single_line=True)
         root_name = self.loop.project_root.name or str(self.loop.project_root)
         display_root = terminal_safe_text(root_name, single_line=True)
         branch = git_branch(self.loop.project_root)
 
-        identity = [
+        header_identity = [
             display_model,
-            self.loop.permission_policy.mode.value,
+            permission_mode,
         ]
         if branch != "none":
-            identity.append(f"git {branch}")
-        identity.append(display_root)
+            header_identity.append(f"git {branch}")
+        header_identity.append(display_root)
 
         cost_display = (
             f"{'~' if estimated_cost > 0 else ''}${cost:.4f}"
@@ -121,7 +132,7 @@ class StatusLine:
             runtime.append(f"cache {cache_read}r/{cache_write}w")
         runtime.append(f"session {session_id}")
 
-        self._cached_header = "  ·  ".join(identity)
+        self._cached_header = "  ·  ".join(header_identity)
         self._cached_footer = "  ·  ".join(runtime)
         self._cached = f" {self._cached_header}  ·  {self._cached_footer} "
 
