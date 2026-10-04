@@ -17,6 +17,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.enums import EditingMode
 
 from ash.commands.slash import COMMANDS
+from ash.provider_catalog import BUILTIN_PROVIDERS
 from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.ui.history import PrivateFileHistory
 from ash.ui.safe_text import terminal_safe_text
@@ -26,6 +27,74 @@ from ash.ui.viewport import TranscriptViewport
 
 MAX_PATH_COMPLETION_SCAN_ENTRIES = 10_000
 MAX_PATH_COMPLETIONS = 200
+
+
+_SLASH_CANONICAL = {
+    name: command.name
+    for command in COMMANDS
+    for name in (command.name, *command.aliases)
+}
+
+_SLASH_FIRST_ARGUMENTS: dict[str, tuple[tuple[str, str], ...]] = {
+    "help": tuple((command.name, command.description) for command in COMMANDS),
+    "model": tuple((f"{provider.id}/", f"{provider.name} provider") for provider in BUILTIN_PROVIDERS),
+    "models": (("--refresh", "Probe the active provider's live model catalog"),),
+    "sessions": (("search", "Search prior conversation text"), ("prune", "Delete old sessions")),
+    "export": (("jsonl", "Export JSONL"), ("markdown", "Export Markdown")),
+    "context": (("--provenance", "Show context provenance details"),),
+    "capabilities": (("--refresh", "Refresh negotiated model capabilities"),),
+    "plan": (("on", "Enable sprint planning"), ("off", "Disable sprint planning")),
+    "goal": (("pause", "Pause the active goal"), ("resume", "Resume the active goal"), ("clear", "Clear the active goal")),
+    "plugins": (("install", "Install a plugin"), ("update", "Update a plugin"), ("enable", "Enable a plugin"), ("disable", "Disable a plugin"), ("uninstall", "Uninstall a plugin")),
+    "agents": (("--full", "Show full agent details"), ("stop", "Stop an agent"), ("resume", "Resume an agent")),
+    "diff": (("--staged", "Show staged changes"), ("--turn", "Show the latest Ash turn diff")),
+    "review": (("worktree", "Review working tree changes"), ("staged", "Review staged changes"), ("commit", "Review a commit"), ("branch", "Review against a base branch")),
+    "permissions": (
+        ("modes", "Compare permission modes"),
+        ("interactive", "Interactive permission mode"),
+        ("auto_edit", "Auto-edit permission mode"),
+        ("plan", "Plan-only permission mode"),
+        ("auto_approve", "Auto-approve permission mode"),
+        ("dry_run", "Dry-run permission mode"),
+        ("allow", "Persistently allow a tool"),
+        ("ask", "Persistently ask for a tool"),
+        ("deny", "Persistently deny a tool"),
+        ("revoke", "Remove allow rules for a tool"),
+        ("remove", "Remove a permission rule by ID"),
+    ),
+    "browser": (("status", "Show browser runtime status"), ("inspect", "Inspect a CDP browser source"), ("connect", "Connect browser tools"), ("disconnect", "Disconnect browser tools"), ("reset-profile", "Clear the Ash browser profile")),
+    "mcp": (
+        ("status", "Show MCP server status"),
+        ("refresh", "Reload MCP capabilities"),
+        ("login", "Authorize an OAuth MCP server"),
+        ("logout", "Clear MCP OAuth authorization"),
+        ("tools", "List MCP tools"),
+        ("resources", "List MCP resources"),
+        ("prompts", "List MCP prompts"),
+        ("watch", "Watch an MCP resource"),
+        ("unwatch", "Stop watching an MCP resource"),
+        ("watches", "List MCP resource watches"),
+        ("tasks", "List MCP tasks"),
+        ("cancel", "Cancel an MCP task"),
+    ),
+    "memory": (("status", "Show memory status"), ("index", "Index one file"), ("index-workspace", "Index workspace files"), ("search", "Search memory"), ("export", "Export memory"), ("clear", "Clear project memory")),
+}
+
+_SLASH_SECOND_ARGUMENTS: dict[tuple[str, str], tuple[tuple[str, str], ...]] = {
+    ("mcp", "status"): (("--json", "Render MCP status as JSON"),),
+    ("plugins", "update"): (("--all", "Update every installed plugin"),),
+    ("browser", "connect"): (("--reuse-storage-state", "Reuse bounded user-owned browser storage state"),),
+}
+
+
+def _ordered_slash_words(extra_names: list[str] | tuple[str, ...] = ()) -> list[str]:
+    core = [
+        f"/{name}"
+        for command in COMMANDS
+        for name in (command.name, *command.aliases)
+    ]
+    extras = sorted((f"/{name}" for name in extra_names), key=str.casefold)
+    return list(dict.fromkeys((*core, *extras)))
 
 
 class AshCompleter(Completer):
@@ -70,7 +139,8 @@ class AshCompleter(Completer):
             for command in COMMANDS
             for name in (command.name, *command.aliases)
         }
-        metadata.update(command_descriptions or {})
+        for command, description in (command_descriptions or {}).items():
+            metadata.setdefault(command, description)
         for command in commands:
             metadata.setdefault(command, "custom command")
         return WordCompleter(
@@ -94,6 +164,11 @@ class AshCompleter(Completer):
     def get_completions(self, document: Document, complete_event):
         word = document.get_word_before_cursor(WORD=True)
         if not word.startswith("@"):
+            if document.text_before_cursor.startswith("/") and any(
+                character.isspace() for character in document.text_before_cursor
+            ):
+                yield from self._slash_argument_completions(document.text_before_cursor)
+                return
             yield from self._commands.get_completions(document, complete_event)
             return
         typed = word[1:].strip("\"'")
@@ -214,6 +289,83 @@ class AshCompleter(Completer):
                 display_meta=meta[:120],
             )
 
+    @staticmethod
+    def _slash_argument_completions(text: str):
+        command_token, separator, remainder = text.partition(" ")
+        if not separator or not command_token.startswith("/"):
+            return
+        canonical = _SLASH_CANONICAL.get(command_token[1:].casefold())
+        if canonical is None:
+            return
+
+        trailing_space = bool(remainder) and remainder[-1].isspace()
+        parts = remainder.split()
+        if trailing_space:
+            completed = parts
+            prefix = ""
+        elif parts:
+            completed = parts[:-1]
+            prefix = parts[-1]
+        else:
+            completed = []
+            prefix = ""
+
+        if not completed:
+            candidates = _SLASH_FIRST_ARGUMENTS.get(canonical, ())
+        elif len(completed) == 1:
+            candidates = _SLASH_SECOND_ARGUMENTS.get(
+                (canonical, completed[0].casefold()),
+                (),
+            )
+            if canonical == "rewind" and not completed[0].startswith("-"):
+                candidates = (("--files", "Restore direct file edits too"),)
+        else:
+            candidates = AshCompleter._slash_followup_candidates(
+                canonical,
+                completed,
+            )
+
+        normalized_prefix = prefix.casefold()
+        for value, description in candidates:
+            if normalized_prefix and not value.casefold().startswith(normalized_prefix):
+                continue
+            yield Completion(
+                value,
+                start_position=-len(prefix),
+                display=value,
+                display_meta=description,
+            )
+
+    @staticmethod
+    def _slash_followup_candidates(
+        canonical: str,
+        completed: list[str],
+    ) -> tuple[tuple[str, str], ...]:
+        action = completed[0].casefold() if completed else ""
+        if canonical == "plugins" and len(completed) >= 2:
+            if action == "install" and "--ref" not in completed:
+                candidates = [
+                    ("--replace", "Replace an existing plugin install"),
+                    ("--ref", "Install a specific Git ref"),
+                ]
+                if "--replace" in completed:
+                    candidates = [item for item in candidates if item[0] != "--replace"]
+                return tuple(candidates)
+            if action == "uninstall" and "--yes" not in completed:
+                return (("--yes", "Confirm plugin uninstall"),)
+        if (
+            canonical == "browser"
+            and action == "connect"
+            and "--reuse-storage-state" not in completed
+        ):
+            return (
+                (
+                    "--reuse-storage-state",
+                    "Reuse bounded user-owned browser storage state",
+                ),
+            )
+        return ()
+
     async def get_completions_async(self, document: Document, complete_event):
         word = document.get_word_before_cursor(WORD=True)
         typed = word[1:].strip("\"'") if word.startswith("@") else ""
@@ -319,23 +471,15 @@ class PromptInput:
                         f"refusing to use redirected prompt history path: {path}"
                     ) from exc
             history = PrivateFileHistory(path)
-            words = sorted(
-                {
-                    f"/{name}"
-                    for command in COMMANDS
-                    for name in (command.name, *command.aliases)
-                }
-            )
+            extra_names = list(extra_commands or [])
             extra_descriptions: dict[str, str] = {}
             if isinstance(extra_commands, dict):
-                words.extend(f"/{name}" for name in extra_commands)
+                extra_names = list(extra_commands)
                 extra_descriptions = {
                     f"/{name}": description
                     for name, description in extra_commands.items()
                 }
-            else:
-                words.extend(f"/{name}" for name in (extra_commands or []))
-            words = sorted(set(words))
+            words = _ordered_slash_words(extra_names)
             completer = AshCompleter(
                 words,
                 workspace_root or Path.cwd(),
@@ -386,21 +530,16 @@ class PromptInput:
     def set_extra_commands(self, commands: dict[str, str] | list[str]) -> None:
         if self._completer is None:
             return
-        words = {
-            f"/{name}"
-            for command in COMMANDS
-            for name in (command.name, *command.aliases)
-        }
         descriptions: dict[str, str] = {}
         if isinstance(commands, dict):
-            words.update(f"/{name}" for name in commands)
+            extra_names = list(commands)
             descriptions = {
                 f"/{name}": description for name, description in commands.items()
             }
         else:
-            words.update(f"/{name}" for name in commands)
+            extra_names = list(commands)
         self._completer.set_commands(
-            sorted(words),
+            _ordered_slash_words(extra_names),
             command_descriptions=descriptions,
         )
 

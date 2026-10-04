@@ -26,13 +26,13 @@ def test_custom_command_front_matter_accepts_crlf(tmp_path: Path) -> None:
     root.mkdir()
     path = root / "review.md"
     path.write_bytes(
-        b"---\r\nname: review\r\ndescription: Review security\r\n---\r\nReview $ARGUMENTS\r\n"
+        b"---\r\nname: review-note\r\ndescription: Review security\r\n---\r\nReview $ARGUMENTS\r\n"
     )
 
     commands = CustomCommandCatalog(((root, "user"),)).discover()
 
     assert len(commands) == 1
-    assert commands[0].name == "review"
+    assert commands[0].name == "review-note"
     assert commands[0].description == "Review security"
     assert commands[0].expand(["src", "app"]) == "Review src app"
 
@@ -75,6 +75,32 @@ def test_custom_command_catalog_reports_duplicate_names(tmp_path) -> None:
 
     assert len(commands) == 1
     assert "duplicate command name" in catalog.errors[str(second)]
+
+
+@pytest.mark.parametrize(
+    ("name", "builtin"),
+    [("status", "status"), ("clear", "new"), ("QUIT", "exit")],
+)
+def test_custom_command_catalog_rejects_builtin_names_and_aliases(
+    tmp_path: Path,
+    name: str,
+    builtin: str,
+) -> None:
+    root = tmp_path / "commands"
+    root.mkdir()
+    path = root / "collision.md"
+    path.write_text(
+        f"---\nname: {name}\n---\nRun this prompt.\n",
+        encoding="utf-8",
+    )
+    catalog = CustomCommandCatalog(((root, "user"),))
+
+    assert catalog.discover() == []
+    assert catalog.parse(f"/{name}") is None
+    assert (
+        f"conflicts with built-in slash command /{builtin}"
+        in catalog.errors[str(path)]
+    )
 
 
 def test_custom_command_catalog_rejects_duplicate_metadata_keys(tmp_path) -> None:
@@ -212,11 +238,11 @@ def test_custom_command_rejects_aba_swapped_source_generation(tmp_path: Path) ->
     replacement_root = replacement / ".ash" / "commands"
     original_root.mkdir(parents=True)
     replacement_root.mkdir(parents=True)
-    (original_root / "review.md").write_text(
+    (original_root / "audit.md").write_text(
         "ORIGINAL_COMMAND $ARGUMENTS",
         encoding="utf-8",
     )
-    (replacement_root / "review.md").write_text(
+    (replacement_root / "audit.md").write_text(
         "REPLACEMENT_COMMAND_SECRET $ARGUMENTS",
         encoding="utf-8",
     )
@@ -232,4 +258,4 @@ def test_custom_command_rejects_aba_swapped_source_generation(tmp_path: Path) ->
 
     assert len(commands) == 1
     with pytest.raises(ValueError, match="command source identity changed after discovery"):
-        catalog.parse("/review inspect")
+        catalog.parse("/audit inspect")

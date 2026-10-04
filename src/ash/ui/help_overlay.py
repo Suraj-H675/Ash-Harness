@@ -20,6 +20,7 @@ from prompt_toolkit.layout import (
 )
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.output.base import Output
+from rich.cells import cell_len, set_cell_size
 from ash.commands.slash import COMMANDS, SlashCommand
 from ash.ui.theme import get_theme, overlay_styles, prompt_style
 
@@ -148,20 +149,23 @@ class HelpOverlay:
             return FormattedText([("class:empty", " No matching slash commands")])
         app = get_app_or_none()
         columns = app.output.get_size().columns if app is self.application else 80
-        usage_width = min(42, max(len(command.usage) for command in self._filtered))
+        label_width = min(
+            max(6, columns // 3),
+            28,
+            max(cell_len(f"/{command.name}") for command in self._filtered),
+        )
+        description_width = max(0, columns - label_width - 4)
         fragments: list[tuple[str, str]] = []
         start, end = self._page()
         for index, command in enumerate(self._filtered[start:end], start=start):
             style = "class:selected" if index == self._selected else ""
-            usage = command.usage
-            description = command.description
-            available = max(8, columns - usage_width - 6)
-            if len(description) > available:
-                description = description[: max(1, available - 1)] + "..."
+            label = _fit_help_cell_text(f"/{command.name}", label_width)
+            label_padding = " " * max(0, label_width - cell_len(label))
+            description = _fit_help_cell_text(command.description, description_width)
             fragments.extend(
                 [
                     (style, "> " if index == self._selected else "  "),
-                    (f"{style} class:usage".strip(), f"{usage:<{usage_width}}"),
+                    (f"{style} class:usage".strip(), label + label_padding),
                     (style, "  "),
                     (f"{style} class:meta".strip(), description),
                     (style, "\n"),
@@ -216,6 +220,16 @@ class HelpOverlay:
             event.app.exit(result=None)
 
         return bindings
+
+
+def _fit_help_cell_text(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if cell_len(value) <= width:
+        return value
+    if width == 1:
+        return "…"
+    return set_cell_size(value, width - 1).rstrip() + "…"
 
 
 async def show_help_overlay(

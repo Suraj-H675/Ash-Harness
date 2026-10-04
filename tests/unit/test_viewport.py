@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 import time
 from unittest.mock import Mock
@@ -197,6 +198,27 @@ async def test_viewport_enter_accepts_visible_slash_completion_before_submit(
 
         pipe.send_text("\r")
         assert await pending == "/model"
+        viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_bare_slash_submits_help_trigger_without_autoselect(
+    tmp_path: Path,
+) -> None:
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            Transcript(),
+            history_path=tmp_path / "history",
+            completer=AshCompleter(["/agents", "/help", "/model"], tmp_path),
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = asyncio.create_task(viewport.read())
+        pipe.send_text("/")
+        await asyncio.sleep(0.05)
+        pipe.send_text("\r")
+
+        assert await pending == "/"
         viewport.close()
 
 

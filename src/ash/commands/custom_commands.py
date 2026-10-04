@@ -7,6 +7,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from ash.commands.slash import COMMANDS
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import read_scoped_bytes
 
@@ -14,6 +15,12 @@ from ash.safety.scoped_io import read_scoped_bytes
 MAX_COMMAND_BYTES = 128 * 1024
 MAX_COMMAND_DISCOVERY_ENTRIES = 100_000
 MAX_COMMAND_DISCOVERY_DEPTH = 32
+
+_BUILTIN_SLASH_NAMES = {
+    name.casefold(): command.name
+    for command in COMMANDS
+    for name in (command.name, *command.aliases)
+}
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,13 @@ class CustomCommandCatalog:
                     )
                 except (OSError, UnicodeError, ValueError) as exc:
                     self.errors[str(path)] = str(exc)
+                    continue
+                builtin = _BUILTIN_SLASH_NAMES.get(command.name.casefold())
+                if builtin is not None:
+                    self.errors[str(path)] = (
+                        f"custom command name {command.name!r} conflicts with "
+                        f"built-in slash command /{builtin}"
+                    )
                     continue
                 existing = commands.get(command.name)
                 if existing is not None:

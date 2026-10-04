@@ -1,6 +1,8 @@
 import pytest
 from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.formatted_text import to_formatted_text
 from prompt_toolkit.output import DummyOutput
+from rich.cells import cell_len
 
 from ash.commands.slash import SlashCommand
 from ash.ui.help_overlay import HelpOverlay
@@ -61,3 +63,17 @@ def test_help_overlay_renders_alias_details() -> None:
     assert "/new" in rendered
     assert "Start a new session" in rendered
     assert "Aliases: /clear" in rendered
+
+
+def test_help_overlay_list_keeps_long_commands_within_terminal_width() -> None:
+    overlay = HelpOverlay(initial_query="mcp", output=DummyOutput())
+
+    rendered = "".join(fragment[1] for fragment in to_formatted_text(overlay._render_list()))
+    line = rendered.splitlines()[0]
+    detail = "".join(
+        fragment[1] for fragment in to_formatted_text(overlay._render_detail())
+    )
+
+    assert cell_len(line) <= 80
+    assert line.lstrip().startswith("> /mcp")
+    assert "/mcp [status [--json]" in detail

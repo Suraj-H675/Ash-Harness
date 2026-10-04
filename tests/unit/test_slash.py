@@ -21,6 +21,11 @@ def test_unknown_command_has_helpful_error() -> None:
         parse_slash_command("/wat")
 
 
+def test_unknown_command_suggests_close_match() -> None:
+    with pytest.raises(ValueError, match=r"Did you mean /model\?"):
+        parse_slash_command("/modle")
+
+
 def test_help_lists_core_session_commands() -> None:
     rendered = render_help()
     assert "/sessions [search QUERY|prune DAYS]" in rendered

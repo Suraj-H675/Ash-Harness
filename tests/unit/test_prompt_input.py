@@ -200,6 +200,84 @@ def test_builtin_slash_completion_has_description_while_filtering_prefix(
     assert all(completion.display_meta_text for completion in completions)
 
 
+def test_slash_argument_completion_and_builtin_metadata_are_contextual(
+    tmp_path,
+) -> None:
+    completer = AshCompleter(
+        ["/model", "/permissions", "/mcp", "/status"],
+        tmp_path,
+        command_descriptions={"/status": "custom collision"},
+    )
+    event = CompleteEvent(completion_requested=True)
+
+    model = list(completer.get_completions(Document("/model "), event))
+    permissions = list(
+        completer.get_completions(Document("/permissions a"), event)
+    )
+    mcp = list(completer.get_completions(Document("/mcp status "), event))
+    plugin_install = list(
+        completer.get_completions(Document("/plugins install demo "), event)
+    )
+    plugin_uninstall = list(
+        completer.get_completions(Document("/plugins uninstall demo "), event)
+    )
+    browser_connect = list(
+        completer.get_completions(
+            Document("/browser connect http://127.0.0.1:9222 "),
+            event,
+        )
+    )
+    status = list(completer.get_completions(Document("/sta"), event))
+
+    assert "openai/" in [completion.text for completion in model]
+    assert {completion.text for completion in permissions} >= {
+        "allow",
+        "ask",
+        "auto_edit",
+        "auto_approve",
+    }
+    assert [completion.text for completion in mcp] == ["--json"]
+    assert [completion.text for completion in plugin_install] == [
+        "--replace",
+        "--ref",
+    ]
+    assert [completion.text for completion in plugin_uninstall] == ["--yes"]
+    assert [completion.text for completion in browser_connect] == [
+        "--reuse-storage-state"
+    ]
+    assert [completion.display_meta_text for completion in status] == [
+        "Show session and runtime status"
+    ]
+
+
+def test_prompt_keeps_curated_builtin_command_order_before_custom_commands(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    class FakePromptSession:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
+    PromptInput(
+        input_stream=TtyStringIO(),
+        history_path=tmp_path / "history",
+        extra_commands=["zzz:custom", "aaa:custom"],
+    )
+
+    completions = list(
+        captured["completer"].get_completions(
+            Document("/"), CompleteEvent(completion_requested=True)
+        )
+    )
+    words = [completion.text for completion in completions]
+
+    assert words[:5] == ["/help", "/status", "/cancel", "/model", "/models"]
+    assert words[-2:] == ["/aaa:custom", "/zzz:custom"]
+
+
 def test_path_completion_scans_a_bounded_number_of_entries(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

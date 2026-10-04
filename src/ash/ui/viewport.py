@@ -368,6 +368,12 @@ class TranscriptViewport:
         @bindings.add("enter")
         def submit(event) -> None:
             state = self.input_buffer.complete_state
+            if (
+                self.input_buffer.text.strip() == "/"
+                and (state is None or state.complete_index is None)
+            ):
+                event.app.exit(result="/")
+                return
             if state is not None and state.completions:
                 completion = state.current_completion or state.completions[0]
                 if self.input_buffer.text.strip() != completion.text:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import shlex
 import textwrap
 from dataclasses import dataclass
+from difflib import get_close_matches
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,7 @@ COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand(
         "plugins",
         "List or manage local, Git, and catalog plugins",
-        "/plugins [install PATH|URL|@publisher/name [--ref REF]|update NAME|update --all|enable NAME|disable NAME|uninstall NAME --yes]",
+        "/plugins [install TARGET [--replace] [--ref REF]|update NAME|update --all|enable NAME|disable NAME|uninstall NAME --yes]",
     ),
     SlashCommand(
         "reload-plugins", "Reload active plugin components", "/reload-plugins"
@@ -144,7 +145,12 @@ def parse_slash_command(text: str) -> tuple[SlashCommand, list[str]] | None:
         return _COMMAND_LOOKUP["help"], []
     command = _COMMAND_LOOKUP.get(parts[0].casefold())
     if command is None:
-        raise ValueError(f"Unknown command: /{parts[0]}. Use /help for commands.")
+        normalized = parts[0].casefold()
+        match = get_close_matches(normalized, _COMMAND_LOOKUP, n=1, cutoff=0.6)
+        suggestion = f" Did you mean /{match[0]}?" if match else ""
+        raise ValueError(
+            f"Unknown command: /{parts[0]}.{suggestion} Use /help for commands."
+        )
     return command, parts[1:]
 
 
