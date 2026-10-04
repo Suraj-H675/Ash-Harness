@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from pathlib import Path
@@ -82,6 +83,15 @@ class SetupBack(Exception):
 
 class SetupCancelled(Exception):
     """Cancel setup without treating it as an internal error."""
+
+
+def _report_setup_stop(outcome: SetupOutcome) -> None:
+    """Describe why setup stopped without mislabeling failures as cancellation."""
+
+    if outcome == SetupOutcome.CANCELLED:
+        print("Setup cancelled.", file=sys.stderr)
+    elif outcome == SetupOutcome.ERROR:
+        print("Setup not completed.", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +295,15 @@ def _setup_status_payload(config) -> dict[str, Any]:
     from ash.profiles import active_profile_name
 
     model = str(getattr(config, "model", "") or "")
-    provider_id = model.split("/", 1)[0] if "/" in model else ""
+    provider_ready = _has_provider_configured(config)
+    model_source = getattr(config, "config_source", lambda _field: None)("model")
+    default_unconfigured_route = bool(
+        not provider_ready
+        and isinstance(model_source, tuple)
+        and model_source[:1] == ("default",)
+    )
+    visible_model = "" if default_unconfigured_route else model
+    provider_id = visible_model.split("/", 1)[0] if "/" in visible_model else ""
     descriptor = get_provider_descriptor(provider_id) if provider_id else None
     workspace_root = getattr(config, "workspace_root", Path.cwd())
     if not isinstance(workspace_root, Path):
@@ -293,12 +311,12 @@ def _setup_status_payload(config) -> dict[str, Any]:
     telemetry = observability_status(config)
     return {
         "profile": active_profile_name(),
-        "model": model or None,
+        "model": visible_model or None,
         "provider": {
             "id": provider_id or None,
             "name": descriptor.name if descriptor else provider_id or None,
             "category": descriptor.category if descriptor else None,
-            "ready": _has_provider_configured(config),
+            "ready": provider_ready,
         },
         "fallback_models": list(getattr(config, "fallback_models", []) or []),
         "capabilities": {
@@ -345,13 +363,7 @@ def _render_setup_status(
     model = str(payload["model"] or "not selected")
     provider = payload["provider"]
     provider_name = str(provider["name"] or "Not configured")
-    model_source = getattr(config, "config_source", lambda _field: None)("model")
-    default_unconfigured_route = bool(
-        not provider["ready"]
-        and isinstance(model_source, tuple)
-        and model_source[:1] == ("default",)
-    )
-    if default_unconfigured_route:
+    if payload["model"] is None and not provider["ready"]:
         provider_name = "Not connected"
         model = "Not selected"
     provider_state = "ready to test" if provider["ready"] else "needs setup"
@@ -502,7 +514,8 @@ def run_setup_wizard(args) -> SetupOutcome:
             return SetupOutcome.SUCCESS
         print("Error: ash setup requires an interactive terminal.", file=sys.stderr)
         print(
-            "Set ASH_MODEL and its provider API key, configure Ollama, or rerun in a TTY.",
+            "Set ASH_MODEL and the authentication/configuration its provider requires, "
+            "configure a local runtime, or rerun in a TTY.",
             file=sys.stderr,
         )
         return SetupOutcome.ERROR
@@ -539,7 +552,7 @@ def run_setup_wizard(args) -> SetupOutcome:
             setup_result = setup_model_provider(config, quick=quick)
 
     if setup_result != SetupOutcome.SUCCESS:
-        print("Setup cancelled.", file=sys.stderr)
+        _report_setup_stop(setup_result)
         return setup_result
 
     if section == "all" and quick:
@@ -548,13 +561,13 @@ def run_setup_wizard(args) -> SetupOutcome:
     if section == "web" or (section == "all" and not quick):
         result = setup_web_search()
         if result != SetupOutcome.SUCCESS:
-            print("Setup cancelled.", file=sys.stderr)
+            _report_setup_stop(result)
             return result
 
     if section == "browser":
         setup_result = setup_browser()
         if setup_result != SetupOutcome.SUCCESS:
-            print("Setup cancelled.", file=sys.stderr)
+            _report_setup_stop(setup_result)
             return setup_result
 
     try:
@@ -902,11 +915,9 @@ def select_provider_and_model(config) -> SetupOutcome:
         _print_header("Select your inference provider")
 
         try:
-            initial_scope = (
-                _prompt_first_run_provider_scope(config)
-                if not _has_provider_configured(config)
-                else list(PROVIDERS)
-            )
+            initial_scope = None
+            if not _has_provider_configured(config):
+                initial_scope = _prompt_first_run_provider_scope(config)
             if not _interactive_setup_picker_enabled():
                 print(
                     "Choose by number, provider name, or provider ID. "
@@ -1648,6 +1659,14 @@ def _flow_openai_compatible() -> SetupOutcome:
     if api_key:
         custom_provider["key_env"] = key_env
 
+    existing_config = load_config(strict=True)
+    existing_custom = existing_config.get("custom_providers", {})
+    if not isinstance(existing_custom, dict):
+        raise ValueError("custom_providers must be a TOML table")
+    had_custom_table = "custom_providers" in existing_config
+    previous_provider_present = name in existing_custom
+    previous_provider = deepcopy(existing_custom.get(name))
+
     def save_custom_provider(user_config: dict[str, Any]) -> None:
         custom = user_config.get("custom_providers", {})
         if not isinstance(custom, dict):
@@ -1660,7 +1679,35 @@ def _flow_openai_compatible() -> SetupOutcome:
     settings = {"ASH_MODEL": f"{name}/{model}"}
     if api_key:
         settings[key_env] = api_key
-    save_env_values(settings)
+    try:
+        save_env_values(settings)
+    except Exception as exc:
+        def rollback_custom_provider(user_config: dict[str, Any]) -> None:
+            custom = user_config.get("custom_providers", {})
+            if not isinstance(custom, dict):
+                raise ValueError("custom_providers must be a TOML table")
+            if custom.get(name) != custom_provider:
+                raise ValueError(
+                    "custom provider changed while setup rollback was pending"
+                )
+            if previous_provider_present:
+                custom[name] = deepcopy(previous_provider)
+                user_config["custom_providers"] = custom
+                return
+            custom.pop(name, None)
+            if had_custom_table or custom:
+                user_config["custom_providers"] = custom
+            else:
+                user_config.pop("custom_providers", None)
+
+        try:
+            mutate_config(rollback_custom_provider)
+        except Exception as rollback_exc:
+            raise RuntimeError(
+                "custom provider credentials were not saved and the provider "
+                f"configuration could not be rolled back: {rollback_exc}"
+            ) from exc
+        raise
     print(
         "\n  Saved custom provider "
         f"'{terminal_safe_text(name, single_line=True)}' to "
@@ -1805,7 +1852,9 @@ def _discover_models(
     probe: Callable[[], ModelProbe],
     *,
     fallback: list[str] | None = None,
-    guidance: str = "",
+    guidance: str = (
+        "Check credentials (if required), the endpoint, and network access, then retry."
+    ),
 ) -> tuple[list[str], bool]:
     """Probe with explicit retry/back/cancel/save-unverified decisions."""
 
@@ -2123,7 +2172,26 @@ def _prompt_api_key(
             existing_env = candidate
             break
     if existing:
-        print(f"  Found existing {desc}: {mask_key(existing_env)}")
+        process_owned = existing_env in os.environ
+        source = f" from exported {existing_env}" if process_owned else ""
+        print(f"  Found existing {desc}{source}: {mask_key(existing_env)}")
+        if process_owned:
+            print(
+                f"  Exported {existing_env} overrides credentials saved by Ash. "
+                "Update or unset it in your shell before rotating this credential."
+            )
+            resp = input("    Rotate? [y/N, b back, c cancel] ").strip().casefold()
+            if resp in {"c", "cancel", "q", "quit"}:
+                raise SetupCancelled
+            if resp in {"b", "back"}:
+                raise SetupBack
+            if resp in {"y", "yes"}:
+                print(
+                    f"  Cannot rotate exported {existing_env} from Ash. "
+                    "Update or unset it in your shell, then rerun setup."
+                )
+                raise SetupBack
+            return existing
         resp = input("    Rotate? [y/N, b back, c cancel] ").strip().casefold()
         if resp in {"c", "cancel", "q", "quit"}:
             raise SetupCancelled
@@ -2407,7 +2475,11 @@ def _prompt_provider(
         ),
         None,
     )
-    if default is not None and not _provider_is_detected_or_configured(config, default):
+    if (
+        default is not None
+        and initial_scope is not None
+        and not _provider_is_detected_or_configured(config, default)
+    ):
         default = None
 
     if _interactive_setup_picker_enabled():

@@ -150,4 +150,6 @@ def test_noninteractive_setup_fails_cleanly_without_credentials(tmp_path: Path) 
     assert result.stdout == ""
     assert "requires an interactive terminal" in result.stderr
     assert "Set ASH_MODEL" in result.stderr
+    assert "authentication/configuration" in result.stderr
+    assert "local runtime" in result.stderr
     assert "Traceback" not in result.stderr

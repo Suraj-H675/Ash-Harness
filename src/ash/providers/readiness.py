@@ -1035,12 +1035,40 @@ def _read_error_detail(
             if total > MAX_PROVIDER_ERROR_BYTES:
                 return ""
             chunks.append(chunk)
+        raw_detail = b"".join(chunks).decode("utf-8", errors="replace").strip()
         return _redact_catalog_error(
-            b"".join(chunks).decode("utf-8", errors="replace").strip(),
+            _human_provider_error_detail(raw_detail),
             headers,
         )
     except (OSError, TypeError, ValueError, httpx.HTTPError):
         return ""
+
+
+def _human_provider_error_detail(raw_detail: str) -> str:
+    """Prefer a provider's human error message over its JSON envelope."""
+
+    if not raw_detail:
+        return ""
+    try:
+        payload = strict_json_loads(raw_detail)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return raw_detail
+    if not isinstance(payload, dict):
+        return raw_detail
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    elif isinstance(error, str) and error.strip():
+        return error.strip()
+
+    for key in ("message", "detail"):
+        message = payload.get(key)
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return raw_detail
 
 
 def verify_provider_connection(

@@ -5372,7 +5372,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
             )
         print(
             "Ash is not configured yet. "
-            "Run 'ash setup' to configure your provider and API key.",
+            "Run 'ash setup' to choose an inference provider and model.",
             flush=True,
         )
         try:

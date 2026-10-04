@@ -468,6 +468,32 @@ def test_probe_model_catalog_rejects_invalid_content_length(monkeypatch) -> None
         )
 
 
+def test_probe_model_catalog_surfaces_human_json_error_message(monkeypatch) -> None:
+    patch_catalog_client(
+        monkeypatch,
+        lambda request: httpx.Response(
+            401,
+            json={
+                "error": {
+                    "message": "invalid API key",
+                    "type": "authentication_error",
+                }
+            },
+            request=request,
+        ),
+    )
+
+    with pytest.raises(
+        readiness.ProviderVerificationError,
+        match=r"provider catalog returned HTTP 401: invalid API key$",
+    ):
+        readiness.probe_model_catalog(
+            "https://gateway.example/v1/models",
+            headers={"Authorization": "Bearer secret-value"},
+            catalog_format="openai",
+        )
+
+
 def test_probe_model_catalog_rejects_duplicate_json_keys(monkeypatch) -> None:
     patch_catalog_client(
         monkeypatch,

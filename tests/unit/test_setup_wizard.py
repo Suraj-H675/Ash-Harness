@@ -204,6 +204,38 @@ class TestAnthropicFlow:
         save.assert_not_called()
 
 
+def test_exported_api_key_cannot_be_falsely_rotated(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands.setup import SetupBack, _prompt_api_key
+
+    monkeypatch.setenv("OPENAI_API_KEY", "exported-key")
+    monkeypatch.setattr("builtins.input", _fake_input(["y"]))
+    getpass_prompt = MagicMock(side_effect=AssertionError("must not prompt for rotation"))
+    monkeypatch.setattr("ash.commands.setup.getpass.getpass", getpass_prompt)
+
+    with pytest.raises(SetupBack):
+        _prompt_api_key("OPENAI_API_KEY", "OpenAI API key")
+
+    getpass_prompt.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Exported OPENAI_API_KEY overrides credentials saved by Ash" in output
+    assert "Update or unset it in your shell" in output
+    assert "Cannot rotate exported OPENAI_API_KEY from Ash" in output
+
+
+def test_exported_api_key_can_be_reused_without_persistence_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import _prompt_api_key
+
+    monkeypatch.setenv("OPENAI_API_KEY", "exported-key")
+    monkeypatch.setattr("builtins.input", _fake_input([""]))
+
+    assert _prompt_api_key("OPENAI_API_KEY", "OpenAI API key") == "exported-key"
+
+
 class TestGroqFlow:
     """Tests for _flow_groq — verifies correct env values are saved."""
 
@@ -837,7 +869,9 @@ def test_openai_compatible_builtin_provider_saves_base_override(
 
 
 class TestDiscoveryRecovery:
-    def test_probe_can_retry_then_verify(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_probe_can_retry_then_verify(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
         from ash.commands.setup import ModelProbe, _discover_models
 
         monkeypatch.setattr("builtins.input", _fake_input(["r"]))
@@ -850,6 +884,7 @@ class TestDiscoveryRecovery:
 
         assert _discover_models("Provider", probe) == (["model-a"], True)
         assert probe.call_count == 2
+        assert "Check credentials (if required), the endpoint, and network access" in capsys.readouterr().out
 
     def test_probe_can_continue_explicitly_without_verification(
         self, monkeypatch: pytest.MonkeyPatch
@@ -951,6 +986,43 @@ class TestOpenaiCompatibleFlow:
             env_text = (tmp_path / ".ash" / ".env").read_text()
             assert "ASH_PROVIDER_MY_MINIMAX_API_KEY=sk-cp-test\n" in env_text
             assert "ASH_MODEL=my-minimax/MiniMax-M2.7\n" in env_text
+
+    def test_custom_provider_rolls_back_if_env_persistence_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ash.commands.setup import ModelProbe, _flow_openai_compatible
+
+        state: dict[str, object] = {"theme": "light"}
+
+        def mutate(mutator):
+            mutator(state)
+            return json.loads(json.dumps(state))
+
+        monkeypatch.setattr(
+            "builtins.input",
+            _fake_input(["my-provider", "https://api.example.test/v1", "model-a"]),
+        )
+        monkeypatch.setattr("ash.commands.setup.getpass.getpass", _FakeGetpass(""))
+        monkeypatch.setattr(
+            "ash.commands.setup.load_config",
+            lambda *, strict=False: {"theme": "light"},
+        )
+
+        with (
+            patch(
+                "ash.commands.setup._probe_models_detailed",
+                return_value=ModelProbe(models=("model-a",)),
+            ),
+            patch("ash.commands.setup.mutate_config", side_effect=mutate),
+            patch(
+                "ash.commands.setup.save_env_values",
+                side_effect=OSError("dotenv unavailable"),
+            ),
+            pytest.raises(OSError, match="dotenv unavailable"),
+        ):
+            _flow_openai_compatible()
+
+        assert state == {"theme": "light"}
 
     def test_normalizes_custom_provider_name_to_runtime_identifier(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1240,6 +1312,21 @@ def test_scoped_provider_picker_does_not_default_to_hidden_current_provider(
     assert "Choose a visible provider by number or name." in output
 
 
+def test_full_provider_picker_keeps_current_local_provider_as_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import _prompt_provider
+
+    monkeypatch.setattr("ash.commands.setup.get_env_value", lambda _name: None)
+    monkeypatch.setattr("builtins.input", _fake_input([""]))
+
+    selected = _prompt_provider(
+        SimpleNamespace(model="ollama/test-model", openai_auth_mode="api_key")
+    )
+
+    assert selected.id == "ollama"
+
+
 def test_provider_catalog_marks_filtered_scope(
     monkeypatch: pytest.MonkeyPatch,
     capsys,
@@ -1424,8 +1511,8 @@ def test_fresh_setup_status_does_not_present_default_model_as_user_choice(
         "ash.commands.setup._setup_status_payload",
         lambda _config: {
             "profile": "default",
-            "model": "anthropic/claude-sonnet-5-5",
-            "provider": {"name": "Anthropic", "ready": False},
+            "model": None,
+            "provider": {"name": None, "ready": False},
             "fallback_models": [],
             "capabilities": {
                 "web_search": {"configured": False},
@@ -1441,7 +1528,7 @@ def test_fresh_setup_status_does_not_present_default_model_as_user_choice(
             },
         },
     )
-    config = SimpleNamespace(config_source=lambda field: ("default", "built-in"))
+    config = SimpleNamespace()
 
     _render_setup_status(config, title="Before you begin", show_capabilities=False)
 
@@ -1451,6 +1538,46 @@ def test_fresh_setup_status_does_not_present_default_model_as_user_choice(
     assert "Not selected" in output
     assert "Anthropic" not in output
     assert "Web search" not in output
+
+
+def test_fresh_setup_status_payload_hides_unconfigured_builtin_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import _setup_status_payload
+
+    config = SimpleNamespace(
+        model="anthropic/claude-sonnet-5-5",
+        workspace_root=Path.cwd(),
+        config_source=lambda field: ("default", "built-in") if field == "model" else None,
+        fallback_models=[],
+        web_search_provider="auto",
+        memory_backend="sqlite",
+        sandbox_backend="auto",
+    )
+    monkeypatch.setattr("ash.commands.setup._has_provider_configured", lambda _config: False)
+    monkeypatch.setattr("ash.commands.setup._has_web_search_configured", lambda _config: False)
+    monkeypatch.setattr("ash.commands.setup._browser_is_installed", lambda: False)
+    monkeypatch.setattr(
+        "ash.observability.observability_status",
+        lambda _config: SimpleNamespace(
+            enabled=False,
+            available=True,
+            traces_endpoint=None,
+            metrics_endpoint=None,
+            sample_rate=1.0,
+            content_capture=False,
+        ),
+    )
+
+    payload = _setup_status_payload(config)
+
+    assert payload["model"] is None
+    assert payload["provider"] == {
+        "id": None,
+        "name": None,
+        "category": None,
+        "ready": False,
+    }
 
 
 class TestProbeModels:
@@ -2228,6 +2355,30 @@ class TestSetupNavigation:
         assert result == SetupOutcome.CANCELLED
         assert "Setup complete!" not in capsys.readouterr().out
 
+    def test_failed_setup_is_not_reported_as_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        from ash.commands.setup import SetupOutcome, run_setup_wizard
+
+        config = SimpleNamespace(model="")
+        args = SimpleNamespace(section="model", quick=False, non_interactive=False)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: True)
+
+        with (
+            patch("ash.config.AshConfig.load", return_value=config),
+            patch("ash.commands.setup._migrate_old_ash_toml"),
+            patch(
+                "ash.commands.setup.setup_model_provider",
+                return_value=SetupOutcome.ERROR,
+            ),
+        ):
+            result = run_setup_wizard(args)
+
+        assert result == SetupOutcome.ERROR
+        captured = capsys.readouterr()
+        assert "Setup not completed." in captured.err
+        assert "Setup cancelled." not in captured.err
+
     def test_invalid_provider_choice_retries_without_dispatch(
         self, monkeypatch: pytest.MonkeyPatch, capsys
     ) -> None:
@@ -2249,6 +2400,23 @@ class TestSetupNavigation:
         monkeypatch.setattr("builtins.input", _fake_input(["c"]))
 
         assert select_provider_and_model(MagicMock(model="")) == SetupOutcome.CANCELLED
+
+    def test_configured_provider_selection_cancel_has_no_fake_parent_scope(
+        self,
+    ) -> None:
+        from ash.commands.setup import SetupCancelled, SetupOutcome, select_provider_and_model
+
+        config = SimpleNamespace(model="ollama/test-model")
+        with (
+            patch("ash.commands.setup._has_provider_configured", return_value=True),
+            patch(
+                "ash.commands.setup._prompt_provider",
+                side_effect=SetupCancelled,
+            ) as prompt_provider,
+        ):
+            assert select_provider_and_model(config) == SetupOutcome.CANCELLED
+
+        prompt_provider.assert_called_once_with(config, initial_scope=None)
 
     def test_blank_api_key_returns_to_provider_selection(
         self, monkeypatch: pytest.MonkeyPatch

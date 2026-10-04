@@ -97,4 +97,6 @@ def test_empty_interactive_start_runs_setup_by_default_and_refuses_broken_repl(
 
     captured = capsys.readouterr()
     assert "Ash is not configured yet" in captured.out
+    assert "choose an inference provider and model" in captured.out
+    assert "provider and API key" not in captured.out
     assert "still not configured" in captured.err
