@@ -27,6 +27,8 @@ from ash.safety.policy import PermissionPolicy
 def _install_fake_repl_frontend(
     monkeypatch: pytest.MonkeyPatch,
     commands,
+    *,
+    turn_inputs: list[str] | None = None,
 ):
     class FakeTerminalUI:
         transcript = None
@@ -36,6 +38,9 @@ def _install_fake_repl_frontend(
 
         def write_status(self, text: str, *, error: bool = False) -> None:
             builtins.print(text, end="", file=__import__("sys").stderr if error else None)
+
+        def load_session_transcript(self, session) -> None:
+            del session
 
     class FakePromptInput:
         interactive = False
@@ -72,6 +77,12 @@ def _install_fake_repl_frontend(
         def __init__(self, *args, **kwargs) -> None:
             pass
 
+        async def run(self, user_input: str, *, user_metadata=None) -> str:
+            del user_metadata
+            if turn_inputs is not None:
+                turn_inputs.append(user_input)
+            return "ok"
+
     class FakePrinter:
         def __init__(self, *args, **kwargs) -> None:
             pass
@@ -88,6 +99,76 @@ def _install_fake_repl_frontend(
     )
     monkeypatch.setattr("ash.ui.output.ReplPrinter", FakePrinter)
     return FakeTerminalUI
+
+
+@pytest.mark.asyncio
+async def test_repl_preserves_normal_prompt_indentation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted = "    preserve this indentation    "
+    commands = iter((submitted, "exit"))
+    turns: list[str] = []
+    FakeTerminalUI = _install_fake_repl_frontend(
+        monkeypatch,
+        commands,
+        turn_inputs=turns,
+    )
+    monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
+
+    async def prepare_prompt(prompt: str, *args, **kwargs):
+        del args, kwargs
+        return _prepared_prompt(prompt)
+
+    monkeypatch.setattr(
+        "ash.commands.attachments.prepare_extended_mentions",
+        prepare_prompt,
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    loop = SimpleNamespace(
+        ui=FakeTerminalUI(),
+        project_root=tmp_path,
+        repo_map=None,
+        _mcp_runtime=None,
+        _mcp_configs={},
+        safety_guard=SafetyGuard(tmp_path),
+        tools={},
+        current_session=None,
+        current_goal=None,
+        provider=SimpleNamespace(
+            capabilities=SimpleNamespace(vision=False),
+            count_tokens=lambda text: len(text),
+        ),
+        permission_policy=PermissionPolicy("interactive"),
+        safety_tier="interactive",
+    )
+    config = SimpleNamespace(
+        input_mode="emacs",
+        keybindings={},
+        tui_mode="inline",
+        theme="dark",
+        no_color=True,
+        screen_reader_mode=False,
+        notification_method="off",
+        notification_events=(),
+        notification_include_preview=False,
+        sandbox_backend="auto",
+        sandbox_docker_image="ash-sandbox:latest",
+        sandbox_docker_memory_mb=4096,
+        sandbox_docker_cpus=2.0,
+        allow_unsafe_plugin_runtime=False,
+        allow_unsafe_auto_approve=False,
+        safety_tier="interactive",
+        attachment_token_budget=1024,
+    )
+
+    assert await _repl(loop, config, SimpleNamespace()) == 0
+    assert turns == [submitted]
+
+
+def _prepared_prompt(prompt: str):
+    return SimpleNamespace(prompt=prompt, message_metadata=lambda: None)
 
 
 def test_targetless_mcp_reload_message_reflects_errors_and_preservation() -> None:
@@ -172,6 +253,7 @@ async def test_repl_permission_mode_audit_records_actual_previous_mode(
         keybindings={},
         tui_mode="inline",
         theme="default",
+        no_color=False,
         screen_reader_mode=False,
         notification_method="off",
         notification_events=(),
@@ -279,6 +361,7 @@ async def test_repl_reports_targetless_reload_errors_and_redacts_cancel_failure(
         keybindings={},
         tui_mode="inline",
         theme="default",
+        no_color=False,
         screen_reader_mode=False,
         notification_method="off",
         notification_events=(),
@@ -357,6 +440,7 @@ async def test_repl_plugin_reload_failure_preserves_simple_live_state(
         keybindings={},
         tui_mode="inline",
         theme="default",
+        no_color=False,
         screen_reader_mode=False,
         notification_method="off",
         notification_events=(),
@@ -443,6 +527,7 @@ async def test_repl_plugin_reload_refuses_replaced_workspace_root(
         keybindings={},
         tui_mode="inline",
         theme="default",
+        no_color=False,
         screen_reader_mode=False,
         notification_method="off",
         notification_events=(),
@@ -517,6 +602,7 @@ async def test_repl_mcp_reload_exception_commits_other_plugin_state_and_reports_
         keybindings={},
         tui_mode="inline",
         theme="default",
+        no_color=False,
         screen_reader_mode=False,
         notification_method="off",
         notification_events=(),
@@ -600,6 +686,7 @@ async def test_repl_plugin_action_reports_persisted_state_when_reload_fails(
         keybindings={},
         tui_mode="inline",
         theme="default",
+        no_color=False,
         screen_reader_mode=False,
         notification_method="off",
         notification_events=(),

@@ -1029,10 +1029,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         )
     while True:
         try:
-            user_input = (await prompt_input.read("> ")).strip()
+            submitted_input = await prompt_input.read("> ")
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
+        user_input = submitted_input.strip()
         if not user_input:
             continue
         if user_input.lower() in {"exit", "quit"}:
@@ -1059,6 +1060,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             continue
 
         expand_mentions = False
+        custom_expansion = False
         try:
             parsed_command = parse_slash_command(user_input)
             expand_mentions = parsed_command is None
@@ -1075,6 +1077,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             user_input = custom_command.expand(custom_arguments)
             parsed_command = None
             expand_mentions = True
+            custom_expansion = True
+
+        if parsed_command is None and not custom_expansion:
+            user_input = submitted_input
 
         safe_displaced_commands = {"exit", "help", "status"}
         if not (

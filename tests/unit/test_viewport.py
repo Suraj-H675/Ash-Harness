@@ -16,6 +16,7 @@ from ash.ui.viewport import (
     PrivateFileHistory,
     RichTranscriptFormatter,
     TranscriptViewport,
+    _fit_segments,
     format_transcript,
 )
 
@@ -82,7 +83,7 @@ def test_rich_transcript_formatter_renders_markdown_and_caches_cells() -> None:
     assert len(formatter._cache) == cache_size == 1
 
 
-def test_cached_redraw_rerenders_only_changed_markdown() -> None:
+def test_streaming_assistant_avoids_reparsing_growing_markdown() -> None:
     transcript = Transcript(max_entries=1000, max_characters=2_000_000)
     for index in range(200):
         transcript.append(
@@ -100,7 +101,25 @@ def test_cached_redraw_rerenders_only_changed_markdown() -> None:
     transcript.append_delta(live, " with one update")
     formatter.format(transcript.snapshot(), width=100)
 
+    assert render_markdown.call_count == 0
+
+    transcript.finalize(live)
+    formatter.format(transcript.snapshot(), width=100)
+
     assert render_markdown.call_count == 1
+
+
+def test_fit_segments_respects_terminal_cell_width_and_emoji_clusters() -> None:
+    from rich.cells import cell_len
+
+    fitted_cjk = _fit_segments("模型你好世界  ·  interactive", 7)
+    fitted_emoji = _fit_segments("👨‍💻 developer", 4)
+
+    assert cell_len(fitted_cjk) <= 7
+    assert fitted_cjk.endswith("…")
+    assert cell_len(fitted_emoji) <= 4
+    assert "👨‍💻" in fitted_emoji
+    assert fitted_emoji.endswith("…")
 
 
 @pytest.mark.parametrize(
@@ -286,6 +305,43 @@ async def test_viewport_bracketed_paste_preserves_multiline_input(
         pipe.send_text("\r")
 
         assert await pending == "first\nsecond"
+        viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_emacs_ctrl_u_clears_current_input(tmp_path: Path) -> None:
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            Transcript(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = viewport.read()
+        pipe.send_text("discard me")
+        pipe.send_bytes(bytes([21]))  # Ctrl+U
+        pipe.send_text("keep this\r")
+
+        assert await pending == "keep this"
+        viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_vi_mode_supports_normal_mode_editing(tmp_path: Path) -> None:
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            Transcript(),
+            history_path=tmp_path / "history",
+            input_mode="vi",
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = viewport.read()
+        pipe.send_text("abc")
+        pipe.send_bytes(bytes([27]))  # Escape to vi normal mode.
+        pipe.send_text("0xiX\r")
+
+        assert await pending == "Xbc"
         viewport.close()
 
 

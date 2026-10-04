@@ -33,6 +33,7 @@ from prompt_toolkit.layout import (
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.output.base import Output
+from rich.cells import cell_len, set_cell_size
 from rich.console import Console
 from rich.markdown import Markdown
 
@@ -88,20 +89,20 @@ def _entry_body(entry: TranscriptEntry) -> str:
 def _fit_segments(value: str, width: int) -> str:
     if width <= 0 or not value:
         return ""
-    if len(value) <= width:
+    if cell_len(value) <= width:
         return value
     parts = [part.strip() for part in value.split("  ·  ") if part.strip()]
     kept: list[str] = []
     for part in parts:
         candidate = "  ·  ".join((*kept, part))
-        if len(candidate) > width:
+        if cell_len(candidate) > width:
             break
         kept.append(part)
     if kept:
         return "  ·  ".join(kept)
     if width == 1:
         return "…"
-    return value[: width - 1].rstrip() + "…"
+    return set_cell_size(value, width - 1).rstrip() + "…"
 
 
 def format_transcript(entries: tuple[TranscriptEntry, ...]) -> AnyFormattedText:
@@ -143,7 +144,7 @@ class RichTranscriptFormatter:
             style, heading = _entry_heading(entry)
             fragments.append((style, heading))
             fragments.append(("", "\n"))
-            if entry.kind == "assistant" and entry.content:
+            if entry.kind == "assistant" and entry.content and entry.finalized:
                 safe_content = terminal_safe_text(entry.content)
                 key = (entry.entry_id, safe_content, width)
                 live_keys.add(key)
