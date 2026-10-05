@@ -1676,12 +1676,30 @@ class AshConfig(BaseSettings):
     @field_validator("keybindings")
     @classmethod
     def validate_keybindings(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.keys import Keys
+
         allowed_actions = {"newline", "open_editor"}
         unknown = set(value) - allowed_actions
         if unknown:
             raise ValueError(
                 f"unknown keybinding action(s): {', '.join(sorted(unknown))}"
             )
+        reserved_sequences = {
+            (Keys.ControlM,),
+            (Keys.ControlI,),
+            (Keys.ControlC,),
+            (Keys.ControlD,),
+            (Keys.Escape,),
+            (Keys.Up,),
+            (Keys.Down,),
+            (Keys.Left,),
+            (Keys.Right,),
+            (Keys.Home,),
+            (Keys.End,),
+            (Keys.PageUp,),
+            (Keys.PageDown,),
+        }
         normalized: dict[str, list[str]] = {}
         owners: dict[tuple[str, ...], str] = {}
         for action, sequences in value.items():
@@ -1690,6 +1708,18 @@ class AshConfig(BaseSettings):
                 keys = tuple(raw_sequence.casefold().split())
                 if not keys:
                     raise ValueError(f"empty key sequence for {action}")
+                probe = KeyBindings()
+                try:
+                    probe.add(*keys)(lambda event: None)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid key sequence {raw_sequence!r} for {action}"
+                    ) from exc
+                canonical_keys = probe.bindings[-1].keys
+                if canonical_keys in reserved_sequences:
+                    raise ValueError(
+                        f"key sequence {raw_sequence!r} is reserved for core terminal interaction"
+                    )
                 owner = owners.get(keys)
                 if owner is not None:
                     raise ValueError(

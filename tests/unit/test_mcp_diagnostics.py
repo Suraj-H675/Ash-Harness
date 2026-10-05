@@ -45,6 +45,7 @@ def _install_fake_repl_frontend(
     class FakePromptInput:
         interactive = False
         uses_viewport = False
+        supports_full_screen_ui = False
 
         def __init__(self, *args, **kwargs) -> None:
             pass
@@ -166,6 +167,73 @@ async def test_repl_preserves_normal_prompt_indentation(
 
     assert await _repl(loop, config, SimpleNamespace()) == 0
     assert turns == [submitted]
+
+
+@pytest.mark.asyncio
+async def test_repl_screen_reader_resume_uses_linear_session_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    commands = iter(("/resume", "exit"))
+    FakeTerminalUI = _install_fake_repl_frontend(monkeypatch, commands)
+    monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    session_store = SessionStore(tmp_path / "sessions.db")
+    session = session_store.create_session(str(tmp_path), model="ollama/test-model")
+    session_store.rename_session(session.session_id, "Accessible Session")
+
+    async def forbidden_picker(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("screen-reader mode must not open the session picker")
+
+    monkeypatch.setattr("ash.commands.sessions.pick_session", forbidden_picker)
+
+    loop = SimpleNamespace(
+        ui=FakeTerminalUI(),
+        project_root=tmp_path,
+        repo_map=None,
+        _mcp_runtime=None,
+        _mcp_configs={},
+        safety_guard=SafetyGuard(tmp_path),
+        tools={},
+        current_session=None,
+        current_goal=None,
+        session_store=session_store,
+        provider=SimpleNamespace(
+            capabilities=SimpleNamespace(vision=False),
+            count_tokens=lambda text: len(text),
+        ),
+        permission_policy=PermissionPolicy("interactive"),
+        safety_tier="interactive",
+    )
+    config = SimpleNamespace(
+        custom_providers={},
+        input_mode="emacs",
+        keybindings={},
+        tui_mode="inline",
+        theme="dark",
+        no_color=True,
+        screen_reader_mode=True,
+        notification_method="off",
+        notification_events=(),
+        notification_include_preview=False,
+        sandbox_backend="auto",
+        sandbox_docker_image="ash-sandbox:latest",
+        sandbox_docker_memory_mb=4096,
+        sandbox_docker_cpus=2.0,
+        allow_unsafe_plugin_runtime=False,
+        allow_unsafe_auto_approve=False,
+        safety_tier="interactive",
+        attachment_token_budget=1024,
+    )
+
+    assert await _repl(loop, config, SimpleNamespace()) == 0
+    output = capsys.readouterr().out
+    assert session.session_id in output
+    assert "Accessible Session" in output
+    assert "Use /resume <session-id-or-title>." in output
 
 
 @pytest.mark.asyncio

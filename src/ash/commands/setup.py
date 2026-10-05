@@ -158,10 +158,21 @@ def _setup_console() -> Console:
 def _interactive_setup_picker_enabled() -> bool:
     """Use full-screen pickers only when both terminal streams can support them."""
 
+    screen_reader_mode = _env_truthy("ASH_SCREEN_READER_MODE")
+    if not screen_reader_mode:
+        try:
+            from ash.config import AshConfig
+
+            screen_reader_mode = bool(AshConfig.load().screen_reader_mode)
+        except Exception:  # noqa: BLE001 - setup will report config failures at its boundary
+            screen_reader_mode = False
+
+    from ash.ui.prompt import terminal_supports_cursor_ui
+
     return bool(
         is_interactive_stdin()
-        and getattr(sys.stdout, "isatty", lambda: False)()
-        and not _env_truthy("ASH_SCREEN_READER_MODE")
+        and terminal_supports_cursor_ui()
+        and not screen_reader_mode
     )
 
 

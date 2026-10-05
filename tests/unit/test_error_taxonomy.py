@@ -64,6 +64,16 @@ def test_session_classification_does_not_match_unrelated_value_errors() -> None:
         == ErrorCategory.SESSION
     )
     assert (
+        classify_exception(
+            ValueError(
+                "--resume without a session uses a full-screen picker, which is "
+                "unavailable in limited terminal mode; run `ash sessions list`, "
+                "then use `ash --resume SESSION`"
+            )
+        ).category
+        == ErrorCategory.SESSION
+    )
+    assert (
         classify_exception(ValueError("session_retention_days cannot be negative")).category
         != ErrorCategory.SESSION
     )

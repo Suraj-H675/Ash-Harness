@@ -70,6 +70,8 @@ async def select_startup_session(
     legacy_session_id: str | None = None,
     fork_session: bool = False,
     interactive: bool = False,
+    screen_reader_mode: bool = False,
+    limited_terminal_mode: bool = False,
     picker: Callable[[], Awaitable[str | None]] | None = None,
     theme: str = "dark",
     no_color: bool = False,
@@ -86,6 +88,18 @@ async def select_startup_session(
         if resume:
             session_id = store.resolve_session(resume, project_path).session_id
         else:
+            if screen_reader_mode:
+                raise ValueError(
+                    "--resume without a session uses a full-screen picker, which is "
+                    "unavailable in screen-reader mode; run `ash sessions list`, then "
+                    "use `ash --resume SESSION`"
+                )
+            if limited_terminal_mode:
+                raise ValueError(
+                    "--resume without a session uses a full-screen picker, which is "
+                    "unavailable in limited terminal mode; run `ash sessions list`, "
+                    "then use `ash --resume SESSION`"
+                )
             if not interactive:
                 raise ValueError(
                     "--resume without a session requires an interactive terminal"

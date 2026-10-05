@@ -528,10 +528,7 @@ async def _interactive_model_picker(
         catalog.insert(0, config.model)
     catalog = list(dict.fromkeys(catalog))
 
-    use_overlay = bool(
-        getattr(prompt_input, "interactive", False)
-        and not getattr(prompt_input, "screen_reader_mode", False)
-    )
+    use_overlay = bool(getattr(prompt_input, "supports_full_screen_ui", False))
     if use_overlay:
         from ash.ui.picker import FilterPicker, PickerOption
 
@@ -1147,7 +1144,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         if custom.name not in builtin_names
                     ),
                 )
-                if prompt_input.interactive and not config.screen_reader_mode:
+                if prompt_input.supports_full_screen_ui:
                     await show_help_overlay(
                         commands=help_commands,
                         initial_query=help_query,
@@ -1351,6 +1348,25 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         )
                         selected_session_id = summary.session_id
                     else:
+                        if not prompt_input.supports_full_screen_ui:
+                            from ash.commands.sessions import render_session_summaries
+
+                            sessions = loop.session_store.list_sessions(
+                                project_path=str(loop.project_root),
+                                limit=20,
+                            )
+                            print(render_session_summaries(sessions), flush=True)
+                            mode = (
+                                "Screen-reader"
+                                if config.screen_reader_mode
+                                else "Limited terminal"
+                            )
+                            print(
+                                f"{mode} mode uses linear session selection. "
+                                "Use /resume <session-id-or-title>.",
+                                flush=True,
+                            )
+                            continue
                         from ash.commands.sessions import pick_session
 
                         selected_session_id = await pick_session(
@@ -5525,7 +5541,23 @@ def _main_impl(argv: list[str] | None = None) -> int:
         )
     startup_session_id = args.session
     if args.continue_session or args.resume is not None or args.fork_session:
-        from ash.commands.sessions import select_startup_session
+        from ash.commands.sessions import render_session_summaries, select_startup_session
+        from ash.ui.prompt import terminal_supports_cursor_ui
+
+        cursor_ui_available = terminal_supports_cursor_ui()
+        limited_terminal_mode = (
+            args.prompt is None
+            and sys.stdin.isatty()
+            and sys.stdout.isatty()
+            and not cursor_ui_available
+        )
+
+        if args.resume == "" and (config.screen_reader_mode or limited_terminal_mode):
+            sessions = session_store.list_sessions(
+                project_path=str(config.workspace_root),
+                limit=20,
+            )
+            print(render_session_summaries(sessions), flush=True)
 
         try:
             startup_selection = asyncio.run(
@@ -5538,9 +5570,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     fork_session=args.fork_session,
                     interactive=(
                         args.prompt is None
-                        and sys.stdin.isatty()
-                        and sys.stdout.isatty()
+                        and cursor_ui_available
                     ),
+                    screen_reader_mode=config.screen_reader_mode,
+                    limited_terminal_mode=limited_terminal_mode,
                     theme=config.theme,
                     no_color=config.no_color,
                 )

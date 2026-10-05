@@ -29,6 +29,25 @@ MAX_PATH_COMPLETION_SCAN_ENTRIES = 10_000
 MAX_PATH_COMPLETIONS = 200
 
 
+def terminal_supports_cursor_ui(
+    *,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
+    environment: dict[str, str] | None = None,
+) -> bool:
+    """Return whether cursor-addressing/full-screen terminal UI is appropriate."""
+
+    stdin = input_stream or sys.stdin
+    stdout = output_stream or sys.stdout
+    if not bool(getattr(stdin, "isatty", lambda: False)()):
+        return False
+    if not bool(getattr(stdout, "isatty", lambda: False)()):
+        return False
+    env = os.environ if environment is None else environment
+    term = env.get("TERM", "").strip().casefold()
+    return term not in {"dumb", "unknown"}
+
+
 _SLASH_CANONICAL = {
     name: command.name
     for command in COMMANDS
@@ -492,7 +511,11 @@ class PromptInput:
         self._completer: AshCompleter | None = None
         self._linear_input_buffer = ""
         self.screen_reader_mode = screen_reader_mode
-        if self.interactive and not screen_reader_mode:
+        self.supports_full_screen_ui = terminal_supports_cursor_ui(
+            input_stream=self.input_stream,
+        ) and not screen_reader_mode
+        self.linear_mode = self.interactive and not self.supports_full_screen_ui
+        if self.interactive and self.supports_full_screen_ui:
             path = history_path or (Path.home() / ".ash" / "history")
             if history_path is None:
                 try:
@@ -586,7 +609,7 @@ class PromptInput:
             self._completer.set_model_choices(model_choices)
 
     async def read(self, prompt: str = "> ") -> str:
-        if self.interactive and self.screen_reader_mode:
+        if self.linear_mode:
             return await self._read_linear(prompt)
         if self._viewport is not None:
             return await self._viewport.read(prompt)

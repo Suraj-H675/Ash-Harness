@@ -147,6 +147,12 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
             "no session found to continue in this project",
             "session belongs to a different workspace",
             "--resume without a session requires an interactive terminal",
+            "--resume without a session uses a full-screen picker, which is unavailable "
+            "in screen-reader mode; run `ash sessions list`, then use `ash --resume "
+            "session`",
+            "--resume without a session uses a full-screen picker, which is unavailable "
+            "in limited terminal mode; run `ash sessions list`, then use `ash --resume "
+            "session`",
             "--fork-session requires --continue, --resume, or --session",
         }
     )

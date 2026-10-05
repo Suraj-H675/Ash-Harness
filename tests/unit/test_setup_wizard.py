@@ -1876,6 +1876,46 @@ class TestCmdSetup:
         assert "providers test" in output
         assert "does not make a billable model completion request" in output
 
+
+    def test_setup_picker_honors_screen_reader_mode_from_loaded_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands.setup import _interactive_setup_picker_enabled
+
+        monkeypatch.delenv("ASH_SCREEN_READER_MODE", raising=False)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: True)
+        monkeypatch.setattr(
+            "ash.commands.setup.sys.stdout",
+            SimpleNamespace(isatty=lambda: True),
+        )
+        with patch(
+            "ash.config.AshConfig.load",
+            return_value=SimpleNamespace(screen_reader_mode=True),
+        ):
+            assert _interactive_setup_picker_enabled() is False
+
+    def test_setup_picker_is_disabled_for_dumb_terminal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from ash.commands.setup import _interactive_setup_picker_enabled
+
+        class TtyStream:
+            def isatty(self) -> bool:
+                return True
+
+        monkeypatch.setenv("TERM", "dumb")
+        monkeypatch.delenv("ASH_SCREEN_READER_MODE", raising=False)
+        monkeypatch.setattr("ash.commands.setup.is_interactive_stdin", lambda: True)
+        monkeypatch.setattr("ash.commands.setup.sys.stdin", TtyStream())
+        monkeypatch.setattr("ash.commands.setup.sys.stdout", TtyStream())
+        with patch(
+            "ash.config.AshConfig.load",
+            return_value=SimpleNamespace(screen_reader_mode=False),
+        ):
+            assert _interactive_setup_picker_enabled() is False
+
     def test_status_json_is_secret_free_and_reports_capabilities(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
     ) -> None:

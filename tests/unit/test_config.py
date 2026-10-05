@@ -639,6 +639,50 @@ def test_terminal_keybinding_collisions_are_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "sequence",
+    [
+        "enter",
+        "c-m",
+        "tab",
+        "c-i",
+        "c-c",
+        "c-d",
+        "escape",
+        "up",
+        "down",
+        "left",
+        "right",
+        "home",
+        "end",
+        "pageup",
+        "pagedown",
+    ],
+)
+def test_terminal_keybindings_cannot_override_core_interaction_keys(
+    sequence: str,
+) -> None:
+    with pytest.raises(ValueError, match="reserved for core terminal interaction"):
+        AshConfig(keybindings={"newline": [sequence]})
+
+
+def test_terminal_keybindings_reject_invalid_prompt_toolkit_keys() -> None:
+    with pytest.raises(ValueError, match="invalid key sequence"):
+        AshConfig(keybindings={"open_editor": ["definitely-not-a-key"]})
+
+
+def test_terminal_keybindings_allow_safe_multikey_sequences() -> None:
+    config = AshConfig(
+        keybindings={
+            "newline": ["escape enter", "c-j"],
+            "open_editor": ["c-x c-e"],
+        }
+    )
+
+    assert config.keybindings["newline"] == ["escape enter", "c-j"]
+    assert config.keybindings["open_editor"] == ["c-x c-e"]
+
+
 def test_unknown_terminal_input_mode_is_rejected() -> None:
     with pytest.raises(ValueError, match="input_mode"):
         AshConfig(input_mode="modal")

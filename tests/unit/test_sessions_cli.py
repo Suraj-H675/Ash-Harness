@@ -447,6 +447,83 @@ def test_bare_resume_requires_tty_and_honors_picker_cancel(tmp_path: Path) -> No
     assert selection.cancelled is True
 
 
+def test_bare_resume_rejects_full_screen_picker_in_screen_reader_mode(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.create_session(str(tmp_path))
+
+    async def forbidden_picker() -> None:
+        raise AssertionError("screen-reader mode must not open the session picker")
+
+    with pytest.raises(ValueError, match="screen-reader mode"):
+        asyncio.run(
+            select_startup_session(
+                store,
+                project_path=str(tmp_path),
+                resume="",
+                interactive=True,
+                screen_reader_mode=True,
+                picker=forbidden_picker,
+            )
+        )
+
+
+def test_bare_resume_rejects_full_screen_picker_in_limited_terminal_mode(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    store.create_session(str(tmp_path))
+
+    async def forbidden_picker() -> None:
+        raise AssertionError("limited terminal mode must not open the session picker")
+
+    with pytest.raises(ValueError, match="limited terminal mode"):
+        asyncio.run(
+            select_startup_session(
+                store,
+                project_path=str(tmp_path),
+                resume="",
+                interactive=False,
+                limited_terminal_mode=True,
+                picker=forbidden_picker,
+            )
+        )
+
+
+def test_startup_bare_resume_lists_sessions_linearly_in_screen_reader_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    db_dir = tmp_path / "db"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = SessionStore(db_dir / "sessions.db")
+    session = store.create_session(str(workspace), model="ollama/test-model")
+    store.rename_session(session.session_id, "Accessible Session")
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_SCREEN_READER_MODE", "true")
+
+    status = main(
+        [
+            "--db-directory",
+            str(db_dir),
+            "--resume",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert status == 1
+    assert session.session_id in captured.out
+    assert "Accessible Session" in captured.out
+    assert "screen-reader mode" in captured.err.casefold()
+    assert "--resume SESSION" in captured.err
+
+
 def test_continue_reports_empty_project(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
 

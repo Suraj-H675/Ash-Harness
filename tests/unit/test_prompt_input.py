@@ -21,6 +21,15 @@ class TtyStringIO(io.StringIO):
         return True
 
 
+@pytest.fixture
+def cursor_ui(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        prompt_module,
+        "terminal_supports_cursor_ui",
+        lambda **kwargs: True,
+    )
+
+
 def test_redirected_input_uses_line_fallback() -> None:
     stream = io.StringIO("hello\n")
     prompt = PromptInput(input_stream=stream)
@@ -45,6 +54,7 @@ def test_invalid_input_mode_is_rejected() -> None:
 async def test_inline_prompt_bracketed_paste_preserves_multiline_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cursor_ui: None,
 ) -> None:
     from prompt_toolkit import PromptSession
 
@@ -92,6 +102,50 @@ def test_screen_reader_mode_uses_reduced_dynamic_prompt(
     assert prompt._completer is None
 
 
+@pytest.mark.parametrize("term", ["dumb", "unknown"])
+def test_terminal_capability_rejects_limited_terminals(term: str) -> None:
+    assert (
+        prompt_module.terminal_supports_cursor_ui(
+            input_stream=TtyStringIO(),
+            output_stream=TtyStringIO(),
+            environment={"TERM": term},
+        )
+        is False
+    )
+
+
+def test_terminal_capability_requires_tty_output() -> None:
+    assert (
+        prompt_module.terminal_supports_cursor_ui(
+            input_stream=TtyStringIO(),
+            output_stream=io.StringIO(),
+            environment={"TERM": "xterm-256color"},
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_limited_terminal_uses_linear_reader_without_prompt_toolkit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailPromptSession:
+        def __init__(self, **kwargs) -> None:
+            raise AssertionError("limited terminals must not create prompt-toolkit UI")
+
+    output = TtyStringIO()
+    monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.setattr(sys, "stdout", output)
+    monkeypatch.setattr(prompt_module, "PromptSession", FailPromptSession)
+    prompt = PromptInput(input_stream=TtyStringIO("hello\n"), tui_mode="viewport")
+
+    assert prompt.linear_mode is True
+    assert prompt.supports_full_screen_ui is False
+    assert prompt.uses_viewport is False
+    assert await prompt.read("limited> ") == "hello"
+    assert output.getvalue() == "limited> "
+
+
 @pytest.mark.asyncio
 async def test_screen_reader_mode_reads_linearly_without_prompt_toolkit(
     tmp_path: Path,
@@ -128,7 +182,7 @@ async def test_screen_reader_mode_reads_linearly_without_prompt_toolkit(
 
 
 def test_prompt_completion_updates_after_plugin_reload(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path, monkeypatch: pytest.MonkeyPatch, cursor_ui: None
 ) -> None:
     captured = {}
 
@@ -158,7 +212,7 @@ def test_prompt_completion_updates_after_plugin_reload(
 
 
 def test_prompt_completion_preserves_custom_command_description(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path, monkeypatch: pytest.MonkeyPatch, cursor_ui: None
 ) -> None:
     captured = {}
 
@@ -300,6 +354,7 @@ def test_model_completion_includes_custom_providers_and_known_models(tmp_path) -
 def test_prompt_keeps_curated_builtin_command_order_before_custom_commands(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    cursor_ui: None,
 ) -> None:
     captured = {}
 
@@ -348,7 +403,9 @@ def test_path_completion_scans_a_bounded_number_of_entries(
     assert len(completions) == prompt_module.MAX_PATH_COMPLETIONS
 
 
-def test_interactive_prompt_history_rejects_symlink(tmp_path, monkeypatch) -> None:
+def test_interactive_prompt_history_rejects_symlink(
+    tmp_path, monkeypatch, cursor_ui: None
+) -> None:
     target = tmp_path / "target"
     target.write_text("keep", encoding="utf-8")
     history_path = tmp_path / "history"
@@ -365,7 +422,7 @@ def test_interactive_prompt_history_rejects_symlink(tmp_path, monkeypatch) -> No
 
 
 def test_interactive_prompt_history_is_private_and_nofollow(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, cursor_ui: None
 ) -> None:
     captured = {}
 
@@ -458,7 +515,7 @@ def test_interactive_prompt_history_bounds_single_persisted_entry(
 
 
 def test_interactive_prompt_history_repairs_existing_posix_permissions(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, cursor_ui: None
 ) -> None:
     if os.name == "nt":
         pytest.skip("POSIX permissions are unavailable")
@@ -552,7 +609,7 @@ def test_prompt_history_closes_file_when_parent_validation_fails_after_open(
 
 
 def test_prompt_history_ancestor_symlink_cannot_create_external_parent(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path, monkeypatch: pytest.MonkeyPatch, cursor_ui: None
 ) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
