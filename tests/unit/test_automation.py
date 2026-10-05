@@ -511,6 +511,22 @@ def test_automation_runner_rejects_unavailable_parent_lifeline_descriptor(
 def test_automation_subprocess_dies_with_abrupt_worker_parent(
     tmp_path: Path,
 ) -> None:
+    def read_int_file(path: Path, *, timeout: float = 1.0) -> int:
+        deadline = time.monotonic() + timeout
+        last_value = ""
+        while time.monotonic() < deadline:
+            try:
+                last_value = path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                last_value = ""
+            if last_value:
+                try:
+                    return int(last_value)
+                except ValueError:
+                    break
+            time.sleep(0.005)
+        pytest.fail(f"expected integer in {path}, got {last_value!r}")
+
     def process_is_running(pid: int) -> bool:
         completed = subprocess.run(
             ["ps", "-o", "stat=", "-p", str(pid)],
@@ -583,8 +599,8 @@ def test_automation_subprocess_dies_with_abrupt_worker_parent(
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if runner_pid_path.exists() and child_pid_path.exists() and heartbeat_path.exists():
-                runner_pid = int(runner_pid_path.read_text(encoding="utf-8"))
-                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                runner_pid = read_int_file(runner_pid_path)
+                child_pid = read_int_file(child_pid_path)
                 break
             if worker.poll() is not None:
                 stderr = worker.stderr.read() if worker.stderr is not None else ""
@@ -595,7 +611,7 @@ def test_automation_subprocess_dies_with_abrupt_worker_parent(
 
         assert process_is_running(runner_pid)
         assert process_is_running(child_pid)
-        before = int(heartbeat_path.read_text(encoding="utf-8"))
+        before = read_int_file(heartbeat_path)
         os.kill(worker.pid, signal.SIGKILL)
         worker.wait(timeout=5)
 
@@ -606,9 +622,9 @@ def test_automation_subprocess_dies_with_abrupt_worker_parent(
             time.sleep(0.05)
         assert not process_is_running(runner_pid)
         assert not process_is_running(child_pid)
-        after = int(heartbeat_path.read_text(encoding="utf-8"))
+        after = read_int_file(heartbeat_path)
         time.sleep(0.15)
-        assert int(heartbeat_path.read_text(encoding="utf-8")) == after
+        assert read_int_file(heartbeat_path) == after
         assert after >= before
     finally:
         if worker.poll() is None:
