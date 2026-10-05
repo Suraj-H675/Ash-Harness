@@ -59,6 +59,11 @@ def test_session_classification_does_not_match_unrelated_value_errors() -> None:
         ).category
         == ErrorCategory.SESSION
     )
+    remedy = classify_exception(
+        ValueError("--resume without a session requires an interactive terminal")
+    ).remedy
+    assert "ash sessions list" in remedy
+    assert "/sessions" in remedy
     assert (
         classify_exception(ValueError("session belongs to a different workspace")).category
         == ErrorCategory.SESSION

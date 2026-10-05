@@ -1,5 +1,10 @@
+import ast
+import inspect
+from pathlib import Path
+
 import pytest
 
+import ash.cli as cli_module
 from ash.commands.slash import COMMANDS, SlashCommand, parse_slash_command, render_help
 
 
@@ -120,3 +125,28 @@ def test_help_can_render_runtime_custom_command_catalog() -> None:
 
     assert "/project:review [arguments]" in rendered
     assert "Review this project's release notes" in rendered
+
+
+def test_every_registered_slash_command_has_a_repl_handler() -> None:
+    source_path = Path(inspect.getsourcefile(cli_module) or "")
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    handled: set[str] = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not isinstance(node.left, ast.Attribute) or node.left.attr != "name":
+            continue
+        for comparator in node.comparators:
+            if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
+                handled.add(comparator.value)
+            elif isinstance(comparator, (ast.Set, ast.Tuple, ast.List)):
+                handled.update(
+                    element.value
+                    for element in comparator.elts
+                    if isinstance(element, ast.Constant)
+                    and isinstance(element.value, str)
+                )
+
+    registered = {command.name for command in COMMANDS}
+    assert registered - handled == set()

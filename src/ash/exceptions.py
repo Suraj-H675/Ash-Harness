@@ -160,7 +160,8 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
         return ErrorInfo(
             ErrorCategory.SESSION,
             message.strip("'"),
-            "List sessions with `/sessions` or start a new session without --session.",
+            "List sessions with `ash sessions list` (or `/sessions` inside the REPL), "
+            "then resume a listed session or start a new session without --session.",
         )
 
     if name in {"SafetyViolation", "PermissionDeniedError"} or module.startswith(

@@ -2892,7 +2892,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         dest="chatgpt_auth_action",
         required=True,
     )
-    chatgpt_status = chatgpt_actions.add_parser("status")
+    chatgpt_status = chatgpt_actions.add_parser(
+        "status", help="Show ChatGPT authentication and active-account status"
+    )
     chatgpt_status.add_argument("--json", action="store_true")
     chatgpt_login = chatgpt_actions.add_parser(
         "login",
@@ -2904,14 +2906,22 @@ def _main_impl(argv: list[str] | None = None) -> int:
         help="Saved issued client ID to reauthorize; omit to register another account",
     )
     chatgpt_login.add_argument("--json", action="store_true")
-    chatgpt_logout = chatgpt_actions.add_parser("logout")
+    chatgpt_logout = chatgpt_actions.add_parser(
+        "logout", help="Remove the active ChatGPT authentication session"
+    )
     chatgpt_logout.add_argument("--json", action="store_true")
-    chatgpt_accounts = chatgpt_actions.add_parser("accounts")
+    chatgpt_accounts = chatgpt_actions.add_parser(
+        "accounts", help="List saved ChatGPT account registrations"
+    )
     chatgpt_accounts.add_argument("--json", action="store_true")
-    chatgpt_use = chatgpt_actions.add_parser("use")
+    chatgpt_use = chatgpt_actions.add_parser(
+        "use", help="Select which saved ChatGPT account Ash should use"
+    )
     chatgpt_use.add_argument("client_id")
     chatgpt_use.add_argument("--json", action="store_true")
-    chatgpt_models = chatgpt_actions.add_parser("models")
+    chatgpt_models = chatgpt_actions.add_parser(
+        "models", help="List models available through ChatGPT authentication"
+    )
     chatgpt_models.add_argument("--json", action="store_true")
     doctor_parser = subparsers.add_parser(
         "doctor", help="Diagnose local setup and runtime dependencies"
@@ -2928,9 +2938,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
     sandbox_subparsers = sandbox_parser.add_subparsers(
         dest="sandbox_action", required=True
     )
-    sandbox_status_parser = sandbox_subparsers.add_parser("status")
+    sandbox_status_parser = sandbox_subparsers.add_parser(
+        "status", help="Show the selected sandbox backend and enforcement readiness"
+    )
     sandbox_status_parser.add_argument("--json", action="store_true")
-    sandbox_build_parser = sandbox_subparsers.add_parser("build")
+    sandbox_build_parser = sandbox_subparsers.add_parser(
+        "build", help="Build the local Docker sandbox image"
+    )
     sandbox_build_parser.add_argument("--image", default=None)
     config_parser = subparsers.add_parser(
         "config", help="Inspect Ash configuration sources"
@@ -2976,7 +2990,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
     ollama_subparsers = ollama_parser.add_subparsers(
         dest="ollama_action", required=True
     )
-    ollama_pull = ollama_subparsers.add_parser("pull")
+    ollama_pull = ollama_subparsers.add_parser(
+        "pull", help="Download one model through the local Ollama service"
+    )
     ollama_pull.add_argument("model")
     ollama_pull.add_argument(
         "--timeout",
@@ -2987,7 +3003,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
     trust_parser = subparsers.add_parser(
         "trust", help="Inspect or change project extension trust"
     )
-    trust_parser.add_argument("action", choices=["status", "add", "remove"])
+    trust_parser.add_argument(
+        "action",
+        choices=["status", "add", "remove"],
+        help="status inspects trust; add trusts the path; remove revokes trust",
+    )
     trust_parser.add_argument("path", nargs="?", type=Path, default=Path.cwd())
     reset_parser = subparsers.add_parser(
         "reset", help="Selectively remove Ash local configuration or data"
@@ -3036,11 +3056,17 @@ def _main_impl(argv: list[str] | None = None) -> int:
     storage_subparsers = storage_parser.add_subparsers(
         dest="storage_action", required=True
     )
-    storage_check = storage_subparsers.add_parser("check")
+    storage_check = storage_subparsers.add_parser(
+        "check", help="Validate session database integrity and report storage state"
+    )
     storage_check.add_argument("--json", action="store_true")
-    storage_backup = storage_subparsers.add_parser("backup")
+    storage_backup = storage_subparsers.add_parser(
+        "backup", help="Create a consistent backup of the session database"
+    )
     storage_backup.add_argument("destination", nargs="?", type=Path)
-    storage_restore = storage_subparsers.add_parser("restore")
+    storage_restore = storage_subparsers.add_parser(
+        "restore", help="Replace the session database from a validated backup"
+    )
     storage_restore.add_argument("backup", type=Path)
     storage_restore.add_argument("--yes", action="store_true")
     storage_debug = storage_subparsers.add_parser(
@@ -3055,13 +3081,19 @@ def _main_impl(argv: list[str] | None = None) -> int:
         "audit", help="Inspect or export tamper-evident session audit logs"
     )
     audit_subparsers = audit_parser.add_subparsers(dest="audit_action", required=True)
-    audit_list = audit_subparsers.add_parser("list")
+    audit_list = audit_subparsers.add_parser(
+        "list", help="List tamper-evident audit records for one session"
+    )
     audit_list.add_argument("--session", required=True, dest="audit_session")
     audit_list.add_argument("--json", action="store_true")
-    audit_verify = audit_subparsers.add_parser("verify")
+    audit_verify = audit_subparsers.add_parser(
+        "verify", help="Verify the hash chain for one session audit log"
+    )
     audit_verify.add_argument("--session", required=True, dest="audit_session")
     audit_verify.add_argument("--json", action="store_true")
-    audit_export = audit_subparsers.add_parser("export")
+    audit_export = audit_subparsers.add_parser(
+        "export", help="Export one session audit log to a file"
+    )
     audit_export.add_argument("--session", required=True, dest="audit_session")
     audit_export.add_argument("--output", required=True, type=Path)
     sessions_parser = subparsers.add_parser("sessions", help="List saved Ash sessions")
@@ -3070,6 +3102,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         nargs="?",
         choices=["list", "tree", "recovery", "search"],
         default="list",
+        help=(
+            "list sessions; tree shows branch lineage; recovery shows interrupted-turn "
+            "reports; search finds transcript text"
+        ),
     )
     sessions_parser.add_argument(
         "--session",
@@ -3083,14 +3119,20 @@ def _main_impl(argv: list[str] | None = None) -> int:
         "plans", help="Inspect or update persisted sprint plans"
     )
     plans_subparsers = plans_parser.add_subparsers(dest="plans_action", required=True)
-    plans_list = plans_subparsers.add_parser("list")
+    plans_list = plans_subparsers.add_parser(
+        "list", help="List persisted sprint plans"
+    )
     plans_list.add_argument("--limit", type=int, default=20)
     plans_list.add_argument("--all-projects", action="store_true")
     plans_list.add_argument("--json", action="store_true")
-    plans_show = plans_subparsers.add_parser("show")
+    plans_show = plans_subparsers.add_parser(
+        "show", help="Show one sprint plan and its items"
+    )
     plans_show.add_argument("sprint_id")
     plans_show.add_argument("--json", action="store_true")
-    plans_update = plans_subparsers.add_parser("update")
+    plans_update = plans_subparsers.add_parser(
+        "update", help="Update one item in a persisted sprint plan"
+    )
     plans_update.add_argument("sprint_id")
     plans_update.add_argument("item_idx", type=int)
     plans_update.add_argument(
@@ -3209,7 +3251,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
     permissions_subparsers = permissions_parser.add_subparsers(
         dest="permissions_action"
     )
-    permissions_status = permissions_subparsers.add_parser("status")
+    permissions_status = permissions_subparsers.add_parser(
+        "status", help="Show persistent and managed permission rules"
+    )
     permissions_status.add_argument("--json", action="store_true")
     permissions_modes = permissions_subparsers.add_parser(
         "modes",
@@ -3217,7 +3261,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     )
     permissions_modes.add_argument("--json", action="store_true")
     for effect in ("allow", "ask", "deny"):
-        permissions_rule = permissions_subparsers.add_parser(effect)
+        permissions_rule = permissions_subparsers.add_parser(
+            effect,
+            help=f"Add a persistent {effect} rule for one tool",
+        )
         permissions_rule.add_argument("tool_name")
         permissions_rule.add_argument(
             "--exact",
@@ -3281,13 +3328,19 @@ def _main_impl(argv: list[str] | None = None) -> int:
             metavar="TOKEN",
         )
         permissions_rule.add_argument("--json", action="store_true")
-    permissions_revoke = permissions_subparsers.add_parser("revoke")
+    permissions_revoke = permissions_subparsers.add_parser(
+        "revoke", help="Remove persistent rules for one tool"
+    )
     permissions_revoke.add_argument("tool_name")
     permissions_revoke.add_argument("--json", action="store_true")
-    permissions_remove = permissions_subparsers.add_parser("remove")
+    permissions_remove = permissions_subparsers.add_parser(
+        "remove", help="Remove one persistent permission rule by ID"
+    )
     permissions_remove.add_argument("rule_id")
     permissions_remove.add_argument("--json", action="store_true")
-    permissions_clear = permissions_subparsers.add_parser("clear")
+    permissions_clear = permissions_subparsers.add_parser(
+        "clear", help="Remove all persistent project permission rules"
+    )
     permissions_clear.add_argument("--yes", action="store_true")
     permissions_clear.add_argument("--json", action="store_true")
     extensions_parser = subparsers.add_parser(
@@ -3313,6 +3366,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
             "uninstall",
         ],
         default="all",
+        help=(
+            "inspect extension catalogs or search, install, update, enable, disable, "
+            "validate, and uninstall extension components"
+        ),
     )
     extensions_parser.add_argument("extensions_target", nargs="?")
     extensions_parser.add_argument("--ref")
@@ -3339,12 +3396,18 @@ def _main_impl(argv: list[str] | None = None) -> int:
     agents_subparsers = agents_parser.add_subparsers(
         dest="agents_action", required=True
     )
-    agents_list = agents_subparsers.add_parser("list")
+    agents_list = agents_subparsers.add_parser(
+        "list", help="List persisted subagent summaries"
+    )
     agents_list.add_argument("--json", action="store_true")
-    agents_reports = agents_subparsers.add_parser("reports")
+    agents_reports = agents_subparsers.add_parser(
+        "reports", help="Show recent durable subagent completion reports"
+    )
     agents_reports.add_argument("--limit", type=int, default=20)
     agents_reports.add_argument("--json", action="store_true")
-    agents_tasks = agents_subparsers.add_parser("tasks")
+    agents_tasks = agents_subparsers.add_parser(
+        "tasks", help="Inspect durable delegated task state"
+    )
     agents_tasks.add_argument(
         "--state",
         choices=("queued", "leased", "running", "succeeded", "failed", "cancelled"),
@@ -3353,18 +3416,24 @@ def _main_impl(argv: list[str] | None = None) -> int:
     agents_tasks.add_argument("--graph", dest="graph_id")
     agents_tasks.add_argument("--limit", type=int, default=100)
     agents_tasks.add_argument("--json", action="store_true")
-    agents_events = agents_subparsers.add_parser("events")
+    agents_events = agents_subparsers.add_parser(
+        "events", help="Inspect durable subagent task events"
+    )
     agents_events.add_argument("--task", dest="task_id")
     agents_events.add_argument("--type", dest="event_type")
     agents_events.add_argument("--after", type=int, default=0, dest="after_sequence")
     agents_events.add_argument("--limit", type=int, default=100)
     agents_events.add_argument("--json", action="store_true")
-    agents_cancel = agents_subparsers.add_parser("cancel")
+    agents_cancel = agents_subparsers.add_parser(
+        "cancel", help="Cancel a delegated task graph"
+    )
     agents_cancel.add_argument("graph_id")
     agents_cancel.add_argument("--reason", default="cancelled by operator")
     agents_cancel.add_argument("--yes", action="store_true")
     agents_cancel.add_argument("--json", action="store_true")
-    agents_messages = agents_subparsers.add_parser("messages")
+    agents_messages = agents_subparsers.add_parser(
+        "messages", help="List durable messages exchanged with subagents"
+    )
     agents_messages.add_argument("--recipient", default="lead")
     agents_messages.add_argument("--all", action="store_true", dest="all_messages")
     agents_messages.add_argument("--limit", type=int, default=50)
@@ -3386,7 +3455,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
     agents_deny.add_argument("request_id", type=int)
     agents_deny.add_argument("--feedback", default="")
     agents_deny.add_argument("--json", action="store_true")
-    agents_send = agents_subparsers.add_parser("send")
+    agents_send = agents_subparsers.add_parser(
+        "send", help="Send a durable message to a subagent"
+    )
     agents_send.add_argument("recipient")
     agents_send.add_argument("content")
     agents_send.add_argument("--sender", default="lead")
@@ -3394,11 +3465,17 @@ def _main_impl(argv: list[str] | None = None) -> int:
     agents_send.add_argument("--json-content", action="store_true")
     agents_send.add_argument("--force", action="store_true")
     agents_send.add_argument("--json", action="store_true")
-    agents_branches = agents_subparsers.add_parser("branches")
+    agents_branches = agents_subparsers.add_parser(
+        "branches", help="List isolated subagent worktree branches"
+    )
     agents_branches.add_argument("--json", action="store_true")
-    agents_apply = agents_subparsers.add_parser("apply")
+    agents_apply = agents_subparsers.add_parser(
+        "apply", help="Apply a completed subagent branch into the current worktree"
+    )
     agents_apply.add_argument("branch")
-    agents_discard = agents_subparsers.add_parser("discard")
+    agents_discard = agents_subparsers.add_parser(
+        "discard", help="Discard an isolated subagent branch and worktree"
+    )
     agents_discard.add_argument("branch")
     agents_discard.add_argument("--yes", action="store_true")
     serve_parser = subparsers.add_parser(
@@ -3592,17 +3669,27 @@ def _main_impl(argv: list[str] | None = None) -> int:
         default=None,
     )
     lsp_query.add_argument("--json", action="store_true")
-    mcp_subparser = subparsers.add_parser("mcp")
+    mcp_subparser = subparsers.add_parser(
+        "mcp", help="Configure, authenticate, inspect, and probe MCP servers"
+    )
     mcp_action_subparsers = mcp_subparser.add_subparsers(dest="action", required=True)
-    mcp_list = mcp_action_subparsers.add_parser("list")
+    mcp_list = mcp_action_subparsers.add_parser(
+        "list", help="List configured MCP servers without connecting"
+    )
     mcp_list.add_argument("--json", action="store_true")
-    mcp_status = mcp_action_subparsers.add_parser("status")
+    mcp_status = mcp_action_subparsers.add_parser(
+        "status", help="Show configured MCP servers and authentication state"
+    )
     mcp_status.add_argument("--json", action="store_true")
-    mcp_probe = mcp_action_subparsers.add_parser("probe")
+    mcp_probe = mcp_action_subparsers.add_parser(
+        "probe", help="Connect to one MCP server and inspect its capabilities"
+    )
     mcp_probe.add_argument("server_name")
     mcp_probe.add_argument("--timeout", type=float, default=30.0)
     mcp_probe.add_argument("--json", action="store_true")
-    mcp_add = mcp_action_subparsers.add_parser("add")
+    mcp_add = mcp_action_subparsers.add_parser(
+        "add", help="Add or replace one MCP server configuration"
+    )
     mcp_add.add_argument("server_name")
     mcp_add.add_argument(
         "--transport", choices=["stdio", "http", "sse"], default="stdio"
@@ -3634,14 +3721,20 @@ def _main_impl(argv: list[str] | None = None) -> int:
     mcp_add.add_argument("--oauth-scope", default="")
     mcp_add.add_argument("--oauth-redirect-port", type=int, default=0)
     mcp_add.add_argument("--json", action="store_true")
-    mcp_remove = mcp_action_subparsers.add_parser("remove")
+    mcp_remove = mcp_action_subparsers.add_parser(
+        "remove", help="Remove one MCP server configuration"
+    )
     mcp_remove.add_argument("server_name")
-    mcp_login = mcp_action_subparsers.add_parser("login")
+    mcp_login = mcp_action_subparsers.add_parser(
+        "login", help="Authorize one OAuth-enabled MCP server"
+    )
     mcp_login.add_argument("server_name")
     mcp_login.add_argument("--no-browser", action="store_true")
     mcp_login.add_argument("--timeout", type=float, default=300.0)
     mcp_login.add_argument("--scope", default="")
-    mcp_logout = mcp_action_subparsers.add_parser("logout")
+    mcp_logout = mcp_action_subparsers.add_parser(
+        "logout", help="Remove saved OAuth credentials for one MCP server"
+    )
     mcp_logout.add_argument("server_name")
     parser.add_argument(
         "--db-directory",
