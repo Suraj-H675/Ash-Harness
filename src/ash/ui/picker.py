@@ -13,6 +13,7 @@ from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import BufferControl, FormattedTextControl, HSplit, Layout, VSplit, Window
 from prompt_toolkit.output.base import Output
+from rich.cells import cell_len, set_cell_size
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.theme import get_theme, overlay_styles, prompt_style
 
@@ -119,7 +120,11 @@ class FilterPicker:
         self.application.invalidate()
 
     def _title_text(self) -> FormattedText:
-        fragments: list[tuple[str, str]] = [("class:title", self.title)]
+        fragments: list[tuple[str, str]] = [
+            ("class:title", "ASH"),
+            ("class:muted", "  ·  "),
+            ("class:title", self.title),
+        ]
         if self._hint:
             fragments.extend([("", "  "), ("class:muted", self._hint)])
         return FormattedText(fragments)
@@ -184,11 +189,19 @@ class FilterPicker:
             marker = "> " if selected else "  "
             current = option.value == self._current_value
             state = option.state or ("current" if current else "")
-            suffix = f"  {state}" if state else ""
             label = terminal_safe_text(option.label, single_line=True)
-            available = max(8, columns - len(marker) - len(suffix) - 1)
-            if len(label) > available:
-                label = label[: max(1, available - 1)] + "…"
+            state = terminal_safe_text(state, single_line=True)
+            row_budget = max(1, columns - cell_len(marker))
+            suffix = ""
+            if state and row_budget > 4:
+                state_budget = min(
+                    cell_len(state),
+                    max(3, row_budget // 3),
+                    max(1, row_budget - 4),
+                )
+                suffix = "  " + _fit_cell_text(state, state_budget)
+            label_budget = max(1, row_budget - cell_len(suffix))
+            label = _fit_cell_text(label, label_budget)
             fragments.append((style, marker))
             fragments.append(
                 (f"{style} class:option".strip(), label)
@@ -248,5 +261,14 @@ class FilterPicker:
         @bindings.add("c-c", eager=True)
         def cancel(event: Any) -> None:
             event.app.exit(result=None)
-
         return bindings
+
+
+def _fit_cell_text(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if cell_len(value) <= width:
+        return value
+    if width == 1:
+        return "…"
+    return set_cell_size(value, width - 1).rstrip() + "…"

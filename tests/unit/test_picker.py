@@ -1,9 +1,25 @@
 import pytest
 import asyncio
+from prompt_toolkit.data_structures import Size
+from prompt_toolkit.formatted_text import to_formatted_text
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from rich.cells import cell_len
 
 from ash.ui.picker import FilterPicker, PickerOption
+
+
+class SizedDummyOutput(DummyOutput):
+    def __init__(self, columns: int, rows: int = 24) -> None:
+        self.columns = columns
+        self.rows = rows
+
+    def get_size(self) -> Size:
+        return Size(rows=self.rows, columns=self.columns)
+
+
+def _plain(value) -> str:
+    return "".join(fragment[1] for fragment in to_formatted_text(value))
 
 
 @pytest.mark.asyncio
@@ -92,3 +108,26 @@ def test_filter_picker_refresh_preserves_filter_and_selected_value() -> None:
     assert "3 live models" in "".join(
         fragment[1] for fragment in picker._title_text()
     )
+
+
+def test_filter_picker_uses_ash_identity_and_cell_safe_narrow_rows(monkeypatch) -> None:
+    output = SizedDummyOutput(columns=28)
+    picker = FilterPicker(
+        "Model",
+        [
+            PickerOption(
+                "wide",
+                "模型👨‍💻-very-long-model-name",
+                state="current-provider-with-long-state",
+            )
+        ],
+        output=output,
+    )
+    monkeypatch.setattr("ash.ui.picker.get_app_or_none", lambda: picker.application)
+
+    title = _plain(picker._title_text())
+    row = _plain(picker._render_list()).rstrip("\n")
+
+    assert title.startswith("ASH  ·  Model")
+    assert cell_len(row) <= 28
+    assert "模型" in row or "👨‍💻" in row

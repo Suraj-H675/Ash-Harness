@@ -2,12 +2,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.formatted_text import to_formatted_text
 from prompt_toolkit.output import DummyOutput
+from rich.cells import cell_len
 
 from ash.core.session import Message, Session, SessionSummary
 from ash.ui.session_picker import SessionPicker
+
+
+class SizedDummyOutput(DummyOutput):
+    def __init__(self, columns: int, rows: int = 24) -> None:
+        self.columns = columns
+        self.rows = rows
+
+    def get_size(self) -> Size:
+        return Size(rows=self.rows, columns=self.columns)
 
 
 def _summary(session_id: str, title: str) -> SessionSummary:
@@ -104,7 +115,7 @@ def test_session_picker_sanitizes_persisted_list_metadata() -> None:
     assert "\u202e" not in rendered
     assert rendered.count("\n") == 1
     assert "s\\x1b" in rendered
-    assert "openai/model\\x1b]0;owned\\x07\\x0aforged-model" in rendered
+    assert "openai/model\\x1b]0;owned" in rendered
 
 
 def test_session_picker_sanitizes_transcript_preview(tmp_path: Path) -> None:
@@ -135,3 +146,23 @@ def test_session_picker_sanitizes_transcript_preview(tmp_path: Path) -> None:
     assert "\x1b[2J" not in rendered
     assert "\u202e" not in rendered
     assert "answer\\x1b[2J\\u202ehidden\\u202c" in rendered
+
+
+def test_session_picker_uses_ash_identity_and_cell_safe_narrow_rows(
+    monkeypatch,
+) -> None:
+    summary = _summary("abcdefgh-1234", "会議👨‍💻-extremely-long-session-title")
+    summary.model = "custom/非常に長いモデル名-with-extra-suffix"
+    output = SizedDummyOutput(columns=34)
+    picker = SessionPicker([summary], output=output)
+    monkeypatch.setattr(
+        "ash.ui.session_picker.get_app_or_none",
+        lambda: picker.application,
+    )
+
+    title = _plain(picker.application.layout.container.children[0].content.text)
+    row = _plain(picker._render_list()).rstrip("\n")
+
+    assert title.startswith("ASH  ·  Resume session")
+    assert cell_len(row) <= 34
+    assert "会議" in row or "👨‍💻" in row

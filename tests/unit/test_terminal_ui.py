@@ -176,7 +176,8 @@ def test_terminal_ui_renders_markdown_and_reasoning() -> None:
     ui.finalize_turn()
 
     rendered = output.getvalue()
-    assert "reasoning: checking" in rendered
+    assert "THINK  checking" in rendered
+    assert "ASH" in rendered
     assert "bold" in rendered
     assert "print('ok')" in rendered
     assert "**bold**" not in rendered
@@ -293,6 +294,22 @@ def test_inline_long_tool_activity_remains_visible_after_reasoning() -> None:
         ui.console.print(rendered)
 
     assert "Running read_file…" in output.getvalue()
+
+
+def test_inline_tool_lifecycle_uses_shared_semantic_label() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False))
+
+    ui.emit_event(
+        {
+            "type": "tool.completed",
+            "tool": "read_file",
+            "call_id": "c1",
+            "success": True,
+        }
+    )
+
+    assert "TOOL  read_file [completed]" in output.getvalue()
 
 
 @pytest.mark.parametrize("terminal_event", ["turn.completed", "turn.cancelled", "turn.error"])
@@ -622,7 +639,7 @@ def test_terminal_ui_renders_tool_lifecycle_without_arguments() -> None:
             "arguments": {"file_path": "secret"},
         }
     )
-    assert "tool read_file [completed]" in output.getvalue()
+    assert "TOOL  read_file [completed]" in output.getvalue()
     assert "secret" not in output.getvalue()
     assert ui.transcript.snapshot()[-1].content == "read_file [completed]"
     assert "arguments" not in (ui.transcript.snapshot()[-1].metadata or {})

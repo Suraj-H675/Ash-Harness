@@ -445,3 +445,49 @@ async def test_viewport_survives_narrow_wide_resize_and_live_updates(
         pipe.send_text("resize intact\r")
         assert await pending == "resize intact"
         viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_starts_at_tail_and_end_restores_tail_after_page_up(
+    tmp_path: Path,
+) -> None:
+    transcript = Transcript()
+    for index in range(8):
+        transcript.append(
+            "assistant",
+            f"response {index}: " + ("wrapped content " * 5),
+            title="ash",
+        )
+    transcript.append("status", "newest status marker", title="status")
+
+    output = SizedDummyOutput(columns=40, rows=16)
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            transcript,
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=output,
+        )
+        pending = asyncio.create_task(viewport.read())
+        await asyncio.sleep(0.05)
+
+        tail = viewport.transcript_window.render_info
+        assert tail is not None
+        assert tail.vertical_scroll > 0 or viewport.transcript_window.vertical_scroll_2 > 0
+        assert max(tail.displayed_lines) == tail.content_height - 1
+
+        pipe.send_bytes(b"\x1b[5~")  # PageUp
+        await asyncio.sleep(0.05)
+        paged = viewport.transcript_window.render_info
+        assert paged is not None
+        assert max(paged.displayed_lines) < paged.content_height - 1
+
+        pipe.send_bytes(b"\x1b[F")  # End / follow tail
+        await asyncio.sleep(0.05)
+        restored = viewport.transcript_window.render_info
+        assert restored is not None
+        assert max(restored.displayed_lines) == restored.content_height - 1
+
+        pipe.send_text("tail intact\r")
+        assert await pending == "tail intact"
+        viewport.close()

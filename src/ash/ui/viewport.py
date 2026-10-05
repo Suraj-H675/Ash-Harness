@@ -10,6 +10,7 @@ from typing import Any
 from prompt_toolkit.application import Application, get_app_or_none
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.formatted_text import (
@@ -18,6 +19,7 @@ from prompt_toolkit.formatted_text import (
     FormattedText,
     to_formatted_text,
 )
+from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 from prompt_toolkit.history import History
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
@@ -207,8 +209,9 @@ class TranscriptViewport:
         self._prompt = "> "
         self._running = False
         self._follow_tail = True
-        self._vertical_scroll = 10**9
+        self._manual_cursor_line = 0
         self._formatter = RichTranscriptFormatter()
+        self._last_transcript_text: AnyFormattedText | None = None
         self._configured_keybindings = keybindings or {
             "newline": ["escape enter", "c-j"],
             "open_editor": ["c-x c-e"],
@@ -222,12 +225,15 @@ class TranscriptViewport:
             complete_while_typing=True,
             multiline=True,
         )
-        self.transcript_control = FormattedTextControl(self._transcript_text)
+        self.transcript_control = FormattedTextControl(
+            self._transcript_text,
+            get_cursor_position=self._transcript_cursor_position,
+            show_cursor=False,
+        )
         self.transcript_window = Window(
             self.transcript_control,
             wrap_lines=True,
             always_hide_cursor=True,
-            get_vertical_scroll=lambda _: self._vertical_scroll,
         )
         self.header_control = FormattedTextControl(self._header_text)
         self.prompt_control = FormattedTextControl(self._composer_label)
@@ -289,7 +295,9 @@ class TranscriptViewport:
         self._running = True
         self._prompt = prompt
         self._follow_tail = True
-        self._vertical_scroll = 10**9
+        self._manual_cursor_line = 0
+        self.transcript_window.vertical_scroll = 0
+        self.transcript_window.vertical_scroll_2 = 0
         self.input_buffer.set_document(Document("", 0), bypass_readonly=True)
         try:
             return await self.application.run_async()
@@ -304,7 +312,7 @@ class TranscriptViewport:
         width = app.output.get_size().columns if app is self.application else 80
         entries = self.transcript.snapshot()
         if not entries:
-            return FormattedText(
+            rendered: AnyFormattedText = FormattedText(
                 [
                     ("class:empty-title", "\n  Ready"),
                     (
@@ -313,7 +321,19 @@ class TranscriptViewport:
                     ),
                 ]
             )
-        return self._formatter.format(entries, width=width)
+        else:
+            rendered = self._formatter.format(entries, width=width)
+        self._last_transcript_text = rendered
+        return rendered
+
+    def _transcript_cursor_position(self) -> Point | None:
+        rendered = self._last_transcript_text or self._transcript_text()
+        text = fragment_list_to_text(to_formatted_text(rendered))
+        lines = text.split("\n") or [""]
+        if self._follow_tail:
+            return Point(x=len(lines[-1]), y=len(lines) - 1)
+        line = min(max(0, self._manual_cursor_line), len(lines) - 1)
+        return Point(x=0, y=line)
 
     def _header_text(self) -> AnyFormattedText:
         identity = terminal_safe_text(self.header_provider(), single_line=True)
@@ -352,8 +372,7 @@ class TranscriptViewport:
 
     def _on_transcript_event(self, event: TranscriptEvent) -> None:
         del event
-        if self._follow_tail:
-            self._vertical_scroll = 10**9
+        self._last_transcript_text = None
         app = get_app_or_none()
         if app is self.application:
             app.invalidate()
@@ -421,20 +440,26 @@ class TranscriptViewport:
             info = self.transcript_window.render_info
             current = info.vertical_scroll if info is not None else 0
             self._follow_tail = False
-            self._vertical_scroll = max(0, current - self._page_height())
+            target = max(0, current - self._page_height())
+            self._manual_cursor_line = target
+            self.transcript_window.vertical_scroll = target
+            self.transcript_window.vertical_scroll_2 = 0
             event.app.invalidate()
 
         @bindings.add("pagedown")
         def page_down(event) -> None:
             info = self.transcript_window.render_info
             current = info.vertical_scroll if info is not None else 0
-            self._vertical_scroll = current + self._page_height()
+            self._follow_tail = False
+            target = current + self._page_height()
+            self._manual_cursor_line = target
+            self.transcript_window.vertical_scroll = target
+            self.transcript_window.vertical_scroll_2 = 0
             event.app.invalidate()
 
         @bindings.add("end")
         def follow_tail(event) -> None:
             self._follow_tail = True
-            self._vertical_scroll = 10**9
             event.app.invalidate()
 
         return bindings

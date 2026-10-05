@@ -53,6 +53,8 @@ class HelpOverlay:
             FormattedTextControl(
                 FormattedText(
                     [
+                        ("class:title", "ASH"),
+                        ("class:muted", "  ·  "),
                         ("class:title", "Slash commands"),
                         ("", "  "),
                         ("class:muted", "type to search"),
@@ -77,7 +79,7 @@ class HelpOverlay:
             [
                 title,
                 search,
-                Window(height=1, char="-", style="class:separator"),
+                Window(height=1, char="─", style="class:separator"),
                 Window(self._list_control, wrap_lines=False),
                 Window(
                     self._detail_control,

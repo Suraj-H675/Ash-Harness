@@ -77,3 +77,12 @@ def test_help_overlay_list_keeps_long_commands_within_terminal_width() -> None:
     assert cell_len(line) <= 80
     assert line.lstrip().startswith("> /mcp")
     assert "/mcp [status [--json]" in detail
+
+
+def test_help_overlay_keeps_ash_identity() -> None:
+    overlay = HelpOverlay(output=DummyOutput())
+
+    title = overlay.application.layout.container.children[0].content.text
+    rendered = "".join(fragment[1] for fragment in to_formatted_text(title))
+
+    assert rendered.startswith("ASH  ·  Slash commands")

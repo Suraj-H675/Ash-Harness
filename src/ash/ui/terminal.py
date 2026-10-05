@@ -533,7 +533,7 @@ class TerminalUI:
             )
         return Panel(
             Group(*parts),
-            title="ash",
+            title="ASH",
             border_style=self.theme.border_primary,
             padding=(0, 1),
         )
@@ -568,7 +568,7 @@ class TerminalUI:
         self.transcript.append_delta(self._reasoning_entry_id, text)
         if buffers.thought:
             buffers.thought.append("\n")
-        buffers.thought.append("reasoning: " + text, style="dim italic")
+        buffers.thought.append("THINK  " + text, style="dim italic")
         if self.screen_reader_mode:
             self.console.print(
                 f"Reasoning: {text}",
@@ -722,7 +722,7 @@ class TerminalUI:
             },
         )
         line = Text(
-            "tool ", style="dim italic" if self.theme.name == "light" else "dim"
+            "TOOL  ", style="dim italic" if self.theme.name == "light" else "dim"
         )
         line.append(tool, style="bold")
         line.append(f" [{label}]", style=style)
