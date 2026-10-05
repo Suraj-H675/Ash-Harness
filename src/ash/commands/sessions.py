@@ -55,6 +55,16 @@ async def pick_session(
     return await SessionPicker(
         sessions,
         load_session=store.load_session,
+        search_session_ids=lambda query: tuple(
+            dict.fromkeys(
+                hit.session_id
+                for hit in store.search_session_messages(
+                    project_path=project_path,
+                    query=query,
+                    limit=50,
+                )
+            )
+        ),
         initial_query=initial_query,
         theme=theme,
         no_color=no_color,

@@ -15,6 +15,18 @@ def test_parse_alias_and_quoted_argument() -> None:
     alias, _ = parse_slash_command("/clear")
     assert alias.name == "new"
 
+    expected_aliases = {
+        "/reset": "new",
+        "/continue": "resume",
+        "/branch": "fork",
+        "/checkpoint": "rewind",
+        "/compress": "compact",
+        "/tasks": "agents",
+    }
+    for text, canonical in expected_aliases.items():
+        parsed, _ = parse_slash_command(text)
+        assert parsed.name == canonical
+
 
 def test_unknown_command_has_helpful_error() -> None:
     with pytest.raises(ValueError, match="/help"):
@@ -32,17 +44,22 @@ def test_help_lists_core_session_commands() -> None:
     assert "/rewind <message-count> [--files]" in rendered
     assert "/resume [session]" in rendered
     assert "/status" in rendered
+    assert "/usage" in rendered
+    assert "/settings" in rendered
     assert "/cancel" in rendered
+    assert "/retry" in rendered
     assert "/review [worktree|staged|commit REF|branch BASE]" in rendered
     assert "/diff [--staged|--turn] [path]" in rendered
+    assert "/copy" in rendered
     assert "/plan [on|off]" in rendered
+    assert "/processes [stop JOB_ID]" in rendered
     assert "/goal [pause|resume|clear|OBJECTIVE]" in rendered
     assert "/hooks" in rendered
     assert "/reload-plugins" in rendered
     assert "update NAME" in rendered
     assert "update --all" in rendered
     assert "/help [query]" in rendered
-    assert "aliases: /clear" in rendered
+    assert "aliases: /clear, /reset" in rendered
     assert "/capabilities [--refresh]" in rendered
     assert (
         "/memory [status|index PATH|index-workspace [LIMIT]|search QUERY|export|clear]"

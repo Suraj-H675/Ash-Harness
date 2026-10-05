@@ -376,7 +376,16 @@ def test_prompt_keeps_curated_builtin_command_order_before_custom_commands(
     )
     words = [completion.text for completion in completions]
 
-    assert words[:5] == ["/help", "/status", "/cancel", "/model", "/models"]
+    assert words[:8] == [
+        "/help",
+        "/status",
+        "/usage",
+        "/cost",
+        "/settings",
+        "/cancel",
+        "/model",
+        "/models",
+    ]
     assert words[-2:] == ["/aaa:custom", "/zzz:custom"]
 
 

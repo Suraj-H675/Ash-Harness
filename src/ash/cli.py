@@ -66,6 +66,39 @@ class PluginReloadResult:
     previous_mcp_runtime_preserved: bool
 
 
+def _session_usage_lines(usage: Any | None) -> tuple[str, ...]:
+    if usage is None:
+        return (
+            "Tokens: 0 prompt, 0 completion",
+            "Prompt cache: 0 read, 0 written",
+            "Cost: $0.000000",
+        )
+
+    token_line = (
+        f"Tokens: {usage.prompt_tokens} prompt, {usage.completion_tokens} completion"
+    )
+    if usage.has_estimates:
+        token_line += (
+            f" ({usage.estimated_prompt_tokens} prompt, "
+            f"{usage.estimated_completion_tokens} completion estimated)"
+        )
+
+    if usage.cost_known:
+        cost_line = f"Cost: ${usage.cost_usd:.6f}"
+    elif usage.cost_usd > 0:
+        cost_line = f"Cost: unknown (known subtotal ${usage.cost_usd:.6f})"
+    else:
+        cost_line = "Cost: unknown"
+    if usage.estimated_cost_usd > 0:
+        cost_line += f"; estimated subtotal ${usage.estimated_cost_usd:.6f}"
+
+    return (
+        token_line,
+        f"Prompt cache: {usage.cache_read_tokens} read, {usage.cache_write_tokens} written",
+        cost_line,
+    )
+
+
 def _print_mcp_reload_errors(errors: dict[str, str]) -> None:
     for name, error in sorted(errors.items()):
         print(
@@ -1230,38 +1263,53 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                                 if provider_circuit["open"]
                                 else f"closed ({provider_circuit['failures']} failures)"
                             ),
-                            "Tokens: "
-                            + (
-                                f"{session_usage.prompt_tokens} prompt, "
-                                f"{session_usage.completion_tokens} completion"
-                                + (
-                                    " "
-                                    f"({session_usage.estimated_prompt_tokens} prompt, "
-                                    f"{session_usage.estimated_completion_tokens} completion estimated)"
-                                    if session_usage.has_estimates
-                                    else " (provider reported)"
-                                )
-                                if session_usage is not None
-                                else "0 prompt, 0 completion"
-                            ),
-                            "Prompt cache: "
-                            + (
-                                f"{session_usage.cache_read_tokens} read, "
-                                f"{session_usage.cache_write_tokens} written"
-                                if session_usage is not None
-                                else "0 read, 0 written"
-                            ),
-                            "Cost: "
-                            + (
-                                f"${session_usage.cost_usd:.6f}"
-                                + (
-                                    f" (${session_usage.estimated_cost_usd:.6f} estimated)"
-                                    if session_usage.estimated_cost_usd > 0
-                                    else ""
-                                )
-                                if session_usage is not None
-                                else "$0.000000"
-                            ),
+                            *_session_usage_lines(session_usage),
+                        ),
+                    ),
+                    flush=True,
+                )
+                continue
+            if command.name == "usage":
+                if arguments:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                session = loop.current_session
+                usage = (
+                    loop.session_store.get_session_usage(session.session_id)
+                    if session is not None
+                    else None
+                )
+                print("\n".join(_session_usage_lines(usage)), flush=True)
+                continue
+            if command.name == "settings":
+                if arguments:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                active_model = terminal_safe_text(
+                    str(loop.active_model_id), single_line=True
+                )
+                fallbacks = ", ".join(
+                    terminal_safe_text(model, single_line=True)
+                    for model in config.fallback_models
+                ) or "none"
+                print(
+                    "\n".join(
+                        (
+                            "Active runtime settings:",
+                            f"  Model: {active_model}",
+                            f"  Fallbacks: {fallbacks}",
+                            f"  Permission mode: {loop.safety_tier}",
+                            f"  TUI: {config.tui_mode}",
+                            f"  Input: {config.input_mode}",
+                            f"  Theme: {config.theme}",
+                            f"  Screen reader: {'on' if config.screen_reader_mode else 'off'}",
+                            f"  Reduced motion: {'on' if config.reduced_motion else 'off'}",
+                            f"  Token meter: {'on' if config.show_token_meter else 'off'}",
+                            f"  Notifications: {config.notification_method}",
+                            f"  Sandbox: {config.sandbox_backend}",
+                            f"  Memory: {config.memory_backend}",
+                            "Run `ash config` outside the REPL for the complete "
+                            "source-aware configuration.",
                         )
                     ),
                     flush=True,
@@ -1281,6 +1329,109 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             if command.name == "cancel":
                 print("No turn is currently running.", flush=True)
+                continue
+            if command.name == "retry":
+                if arguments:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                session = loop.current_session
+                if session is None:
+                    print("No user turn to retry.", flush=True)
+                    continue
+                retry_index = next(
+                    (
+                        index
+                        for index in range(len(session.messages) - 1, -1, -1)
+                        if session.messages[index].role == "user"
+                        and not bool(session.messages[index].metadata.get("steering"))
+                    ),
+                    None,
+                )
+                if retry_index is None:
+                    print("No user turn to retry.", flush=True)
+                    continue
+                retry_message = session.messages[retry_index]
+                retry_metadata = dict(retry_message.metadata)
+                had_images = bool(retry_metadata.get("images"))
+                has_replayable_media = bool(
+                    retry_metadata.get("image_blocks")
+                    or retry_metadata.get("content_blocks")
+                )
+                if had_images and not has_replayable_media:
+                    print(
+                        "Cannot retry the last image turn after it was resumed from "
+                        "saved history because image bytes are intentionally not "
+                        "persisted. Reattach the image and resend the prompt.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+
+                tool_names: set[str] = set()
+                for message in session.messages[retry_index:]:
+                    calls = message.metadata.get("tool_calls")
+                    if message.role != "assistant" or not isinstance(calls, list):
+                        continue
+                    for call in calls:
+                        if not isinstance(call, dict):
+                            continue
+                        name = call.get("name")
+                        if isinstance(name, str) and name:
+                            tool_names.add(name)
+
+                from ash.safety.policy import EDIT_TOOLS, READ_ONLY_TOOLS
+
+                retry_unsafe_read_only = {
+                    "activate_skill",
+                    "recover_remote_agent_task",
+                    "update_goal",
+                }
+                safe_read_only = READ_ONLY_TOOLS - retry_unsafe_read_only
+                unsafe_tools = sorted(
+                    tool_names - safe_read_only - EDIT_TOOLS
+                )
+                if unsafe_tools:
+                    print(
+                        "Cannot safely retry the last turn because it dispatched "
+                        "non-reversible tool(s): "
+                        + ", ".join(unsafe_tools)
+                        + ". Use /rewind to choose an explicit transcript boundary, "
+                        "then resend the request after checking external side effects.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+
+                boundary = session.resident_message_offset + retry_index
+                try:
+                    if tool_names & EDIT_TOOLS:
+                        from ash.core.checkpoints import rewind_session_with_files
+
+                        rewound, _restored = rewind_session_with_files(
+                            loop.session_store,
+                            loop.safety_guard,
+                            session.session_id,
+                            boundary,
+                        )
+                    else:
+                        rewound = loop.session_store.rewind_session(
+                            session.session_id,
+                            boundary,
+                        )
+                    loop.current_session = rewound
+                    loop.ui.load_session_transcript(rewound)
+                    response = await turn_controller.run(
+                        retry_message.content,
+                        user_metadata=retry_metadata or None,
+                    )
+                except EOFError:
+                    print()
+                    return 0
+                except Exception as exc:  # noqa: BLE001
+                    _print_classified_error(exc)
+                    continue
+                if response is not None and not prompt_input.uses_viewport:
+                    print(response, flush=True)
                 continue
             if command.name == "new":
                 session = await loop.start_session()
@@ -1498,6 +1649,38 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     if restored
                     else "No file checkpoint is available."
                 )
+                continue
+            if command.name == "copy":
+                if arguments:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                session = loop.current_session
+                response_message = (
+                    next(
+                        (
+                            message
+                            for message in reversed(session.messages)
+                            if message.role == "assistant" and message.content
+                        ),
+                        None,
+                    )
+                    if session is not None
+                    else None
+                )
+                if response_message is None:
+                    print("No assistant response to copy.", flush=True)
+                    continue
+                from ash.ui.clipboard import ClipboardUnavailable, copy_to_clipboard
+
+                try:
+                    backend = copy_to_clipboard(
+                        response_message.content,
+                        workspace_root=loop.project_root,
+                    )
+                except (ClipboardUnavailable, OSError, TypeError, ValueError) as exc:
+                    print(f"Copy failed: {exc}", file=sys.stderr, flush=True)
+                    continue
+                print(f"Copied latest assistant response via {backend}.", flush=True)
                 continue
             if command.name == "export":
                 if loop.current_session is None or len(arguments) > 2:
@@ -2437,6 +2620,30 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         print("Project memory index cleared.")
                     continue
                 print(f"Usage: {command.usage}", file=sys.stderr)
+                continue
+            if command.name == "processes":
+                process_tool = loop.tools.get("background_process")
+                if process_tool is None:
+                    print("Background process runtime is unavailable.", flush=True)
+                    continue
+                if not arguments:
+                    result = await process_tool.run(action="list")
+                elif len(arguments) == 2 and arguments[0].casefold() == "stop":
+                    result = await process_tool.run(
+                        action="stop",
+                        job_id=arguments[1],
+                    )
+                else:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                if result.success:
+                    print(result.output or "Done.", flush=True)
+                else:
+                    print(
+                        "Process command failed: " + (result.error or "unknown error"),
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 continue
 
         # /model with no args → interactive picker (from setup wizard)

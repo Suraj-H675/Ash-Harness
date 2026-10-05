@@ -51,6 +51,7 @@ class SessionPicker:
         sessions: Sequence[SessionSummary],
         *,
         load_session: Callable[[str], Session] | None = None,
+        search_session_ids: Callable[[str], Sequence[str]] | None = None,
         initial_query: str = "",
         theme: str = "dark",
         no_color: bool = False,
@@ -59,6 +60,7 @@ class SessionPicker:
     ) -> None:
         self._sessions = tuple(sessions)
         self._load_session = load_session
+        self._search_session_ids = search_session_ids
         self._filtered = list(self._sessions)
         self._selected = 0
         self._previewed_id: str | None = None
@@ -109,7 +111,7 @@ class SessionPicker:
                 ),
                 Window(
                     FormattedTextControl(
-                        " ↑/↓ navigate  Enter resume  Space preview  Esc cancel "
+                        " ↑/↓ navigate  Enter resume  Ctrl-Space preview  Esc cancel "
                     ),
                     height=1,
                     style="class:footer",
@@ -136,10 +138,17 @@ class SessionPicker:
 
     def _on_query_changed(self, _: Buffer) -> None:
         terms = self.search_buffer.text.casefold().split()
+        content_matches: set[str] = set()
+        if terms and self._search_session_ids is not None:
+            try:
+                content_matches = set(self._search_session_ids(" ".join(terms)))
+            except Exception:  # noqa: BLE001 - metadata search remains available
+                content_matches = set()
         self._filtered = [
             session
             for session in self._sessions
             if all(term in self._search_text(session) for term in terms)
+            or session.session_id in content_matches
         ]
         self._selected = 0
         self._clear_preview()
@@ -213,7 +222,7 @@ class SessionPicker:
     def _render_preview(self) -> FormattedText:
         if not self._previewed_id:
             return FormattedText(
-                [("class:muted", " Space previews the selected transcript")]
+                [("class:muted", " Ctrl-Space previews the selected transcript")]
             )
         return FormattedText([("", self._preview_text or "No transcript messages")])
 
@@ -273,7 +282,7 @@ class SessionPicker:
             )
             event.app.exit(result=selected)
 
-        @bindings.add(" ", eager=True)
+        @bindings.add("c-space", eager=True)
         def preview(event: Any) -> None:
             self._toggle_preview()
             event.app.invalidate()

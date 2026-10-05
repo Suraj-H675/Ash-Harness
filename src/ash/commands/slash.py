@@ -19,6 +19,13 @@ class SlashCommand:
 COMMANDS: tuple[SlashCommand, ...] = (
     SlashCommand("help", "Show available commands", "/help [query]"),
     SlashCommand("status", "Show session and runtime status", "/status"),
+    SlashCommand(
+        "usage",
+        "Show session token, cache, and cost usage",
+        "/usage",
+        aliases=("cost",),
+    ),
+    SlashCommand("settings", "Show active runtime settings", "/settings"),
     SlashCommand("cancel", "Cancel the running turn", "/cancel"),
     SlashCommand(
         "model",
@@ -30,13 +37,21 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "List known models; --refresh probes the live endpoint",
         "/models [--refresh]",
     ),
-    SlashCommand("new", "Start a new session", "/new", aliases=("clear",)),
+    SlashCommand(
+        "new", "Start a new session", "/new", aliases=("clear", "reset")
+    ),
     SlashCommand(
         "sessions",
         "List sessions or search prior conversation text",
         "/sessions [search QUERY|prune DAYS]",
     ),
-    SlashCommand("resume", "Resume a session by ID or name", "/resume [session]"),
+    SlashCommand(
+        "resume",
+        "Resume a session by ID or name",
+        "/resume [session]",
+        aliases=("continue",),
+    ),
+    SlashCommand("retry", "Retry the last user turn", "/retry"),
     SlashCommand("rename", "Rename the current session", "/rename <title>"),
     SlashCommand(
         "recovery",
@@ -47,24 +62,32 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "fork",
         "Fork the session at a message boundary",
         "/fork [message-count] [branch-name]",
+        aliases=("branch",),
     ),
     SlashCommand("tree", "Show the current session branch tree", "/tree"),
     SlashCommand(
         "rewind",
         "Rewind transcript, optionally restoring direct file edits",
         "/rewind <message-count> [--files]",
+        aliases=("checkpoint",),
     ),
     SlashCommand("undo", "Undo Ash's latest direct file edits", "/undo"),
     SlashCommand(
         "export", "Export a redacted transcript", "/export [jsonl|markdown] [path]"
     ),
+    SlashCommand("copy", "Copy the latest assistant response", "/copy"),
     SlashCommand("import", "Import an Ash JSONL transcript", "/import <path>"),
     SlashCommand(
         "context",
         "Show context usage or --provenance details",
         "/context [--provenance]",
     ),
-    SlashCommand("compact", "Compact older conversation history", "/compact"),
+    SlashCommand(
+        "compact",
+        "Compact older conversation history",
+        "/compact",
+        aliases=("compress",),
+    ),
     SlashCommand(
         "capabilities",
         "Show the active model's negotiated capabilities",
@@ -91,6 +114,13 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "agents",
         "Show basic or full subagent status; stop or resume",
         "/agents [--full] [stop|resume AGENT_ID]",
+        aliases=("tasks",),
+    ),
+    SlashCommand(
+        "processes",
+        "List or stop managed background processes",
+        "/processes [stop JOB_ID]",
+        aliases=("ps", "jobs"),
     ),
     SlashCommand(
         "diff",

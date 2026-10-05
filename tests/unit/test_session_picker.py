@@ -76,6 +76,53 @@ async def test_session_picker_filters_without_loading_transcripts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_picker_can_match_transcript_search_without_loading_transcripts() -> None:
+    loaded: list[str] = []
+    queries: list[str] = []
+
+    def load_session(session_id: str) -> Session:
+        loaded.append(session_id)
+        raise AssertionError("search must not load transcripts")
+
+    def search_session_ids(query: str) -> tuple[str, ...]:
+        queries.append(query)
+        return ("first-id",) if query == "websocket reconnect" else ()
+
+    with create_pipe_input() as pipe:
+        picker = SessionPicker(
+            [_summary("first-id", "Frontend"), _summary("second-id", "Backend")],
+            load_session=load_session,
+            search_session_ids=search_session_ids,
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = picker.run()
+        pipe.send_text("websocket reconnect\r")
+
+        assert await pending == "first-id"
+        assert queries[-1] == "websocket reconnect"
+        assert loaded == []
+
+
+@pytest.mark.asyncio
+async def test_session_picker_transcript_search_failure_keeps_metadata_search_available() -> None:
+    def search_session_ids(query: str) -> tuple[str, ...]:
+        raise RuntimeError(f"search unavailable for {query}")
+
+    with create_pipe_input() as pipe:
+        picker = SessionPicker(
+            [_summary("first-id", "Frontend"), _summary("second-id", "Backend")],
+            search_session_ids=search_session_ids,
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = picker.run()
+        pipe.send_text("backend\r")
+
+        assert await pending == "second-id"
+
+
+@pytest.mark.asyncio
 async def test_session_picker_previews_on_demand_and_cancels(tmp_path: Path) -> None:
     loaded: list[str] = []
 
@@ -96,7 +143,7 @@ async def test_session_picker_previews_on_demand_and_cancels(tmp_path: Path) -> 
             output=DummyOutput(),
         )
         pending = picker.run()
-        pipe.send_text(" ")
+        pipe.send_bytes(b"\x00")
         pipe.send_bytes(b"\x03")
 
         assert await pending is None
