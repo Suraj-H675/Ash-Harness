@@ -276,7 +276,7 @@ def test_extensions_cli_commands_respects_project_trust(
     home = tmp_path / "home"
     workspace = tmp_path / "repo"
     workspace.mkdir()
-    command = workspace / ".ash" / "commands" / "review.md"
+    command = workspace / ".ash" / "commands" / "project-review.md"
     command.parent.mkdir(parents=True)
     command.write_text("Review $ARGUMENTS", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
@@ -288,7 +288,7 @@ def test_extensions_cli_commands_respects_project_trust(
     set_workspace_trusted(workspace, True)
     assert main(["extensions", "commands", "--json"]) == 0
     commands = json.loads(capsys.readouterr().out)["commands"]
-    assert commands[0]["name"] == "review"
+    assert commands[0]["name"] == "project-review"
     assert commands[0]["source"] == "project"
 
 
