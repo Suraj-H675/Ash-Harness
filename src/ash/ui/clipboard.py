@@ -73,7 +73,10 @@ def copy_to_clipboard(text: str, *, workspace_root: str | Path) -> str:
         if result.returncode == 0:
             return command
 
-    raise ClipboardUnavailable(
-        "no usable host clipboard helper was found; install wl-clipboard on Wayland, "
-        "xclip/xsel on X11, or use /export"
-    )
+    if sys.platform == "darwin":
+        guidance = "pbcopy is unavailable; restore the standard macOS clipboard tools or use /export"
+    else:
+        guidance = (
+            "install wl-clipboard on Wayland, xclip/xsel on X11, or use /export"
+        )
+    raise ClipboardUnavailable(f"no usable host clipboard helper was found; {guidance}")

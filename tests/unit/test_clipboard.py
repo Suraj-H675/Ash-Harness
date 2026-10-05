@@ -26,6 +26,7 @@ def test_copy_to_clipboard_uses_resolved_host_backend(
 
     monkeypatch.setattr(clipboard_module, "resolve_host_executable", resolve)
     monkeypatch.setattr(clipboard_module.subprocess, "run", run)
+    monkeypatch.setattr(clipboard_module.sys, "platform", "linux")
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-1")
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
 
@@ -56,6 +57,7 @@ def test_copy_to_clipboard_falls_back_after_backend_failure(
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(clipboard_module.subprocess, "run", run)
+    monkeypatch.setattr(clipboard_module.sys, "platform", "linux")
 
     assert copy_to_clipboard("answer", workspace_root=tmp_path) == "xclip"
     assert attempts == ["/usr/bin/wl-copy", "/usr/bin/xclip"]
@@ -82,6 +84,7 @@ def test_copy_to_clipboard_rejects_oversized_payload_before_launch(
 def test_copy_to_clipboard_reports_missing_backend(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(clipboard_module.sys, "platform", "linux")
     monkeypatch.setattr(
         clipboard_module,
         "resolve_host_executable",
@@ -89,4 +92,33 @@ def test_copy_to_clipboard_reports_missing_backend(
     )
 
     with pytest.raises(ClipboardUnavailable, match="wl-clipboard"):
+        copy_to_clipboard("answer", workspace_root=tmp_path)
+
+
+def test_copy_to_clipboard_uses_pbcopy_and_macos_guidance(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(clipboard_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        clipboard_module,
+        "resolve_host_executable",
+        lambda command, **kwargs: "/usr/bin/pbcopy" if command == "pbcopy" else None,
+    )
+
+    def run(argv, **kwargs):
+        del kwargs
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(clipboard_module.subprocess, "run", run)
+    assert copy_to_clipboard("answer", workspace_root=tmp_path) == "pbcopy"
+    assert calls == [["/usr/bin/pbcopy"]]
+
+    monkeypatch.setattr(
+        clipboard_module,
+        "resolve_host_executable",
+        lambda command, **kwargs: None,
+    )
+    with pytest.raises(ClipboardUnavailable, match="pbcopy is unavailable"):
         copy_to_clipboard("answer", workspace_root=tmp_path)
