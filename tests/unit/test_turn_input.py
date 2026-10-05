@@ -1,5 +1,6 @@
 import asyncio
 import io
+import signal
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from ash.tools.agent import SpawnAgentTool
 from ash.tools.browser import BrowserTypeTool
 from ash.tools.filesystem import WriteFileTool
 from ash.ui.terminal import TerminalUI
+from ash.ui.input_signals import PromptInterrupted
 from ash.ui.notifications import NotificationEvent
 from ash.ui.turn_input import (
     InteractiveTurnController,
@@ -216,6 +218,77 @@ async def test_interactive_controller_cancels_running_turn(tmp_path: Path) -> No
         loop.session_store.reconcile_interrupted_turns(loop.current_session.session_id)
         == 0
     )
+
+
+@pytest.mark.asyncio
+async def test_interactive_controller_cancels_on_prompt_interrupt(tmp_path: Path) -> None:
+    provider = BlockingProvider()
+    statuses: list[str] = []
+    ui = make_ui()
+
+    class InterruptedPrompt:
+        async def read(self, prompt: str = "> ") -> str:
+            del prompt
+            await provider.started.wait()
+            raise PromptInterrupted
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        provider,
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(
+        loop,
+        InterruptedPrompt(),  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+
+    assert await controller.run("start") is None
+    assert statuses == ["Turn cancelled."]
+    assert loop.is_turn_running is False
+
+
+@pytest.mark.asyncio
+async def test_interactive_controller_cancels_linear_turn_on_sigint(
+    tmp_path: Path,
+) -> None:
+    provider = BlockingProvider()
+    statuses: list[str] = []
+    ui = make_ui()
+
+    class LinearPrompt:
+        linear_mode = True
+
+        async def read(self, prompt: str = "> ") -> str:
+            del prompt
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        provider,
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(
+        loop,
+        LinearPrompt(),  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    turn = asyncio.create_task(controller.run("start"))
+    await provider.started.wait()
+    signal.raise_signal(signal.SIGINT)
+
+    assert await turn is None
+    assert statuses == ["Turn cancelled."]
+    assert loop.is_turn_running is False
+    assert signal.getsignal(signal.SIGINT) == previous_sigint
 
 
 @pytest.mark.asyncio

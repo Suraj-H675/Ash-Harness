@@ -41,6 +41,7 @@ from rich.markdown import Markdown
 
 from ash.ui.history import PrivateFileHistory
 from ash.ui.history import validate_history_path as _validate_history_path
+from ash.ui.input_signals import PromptInterrupted
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript, TranscriptEntry, TranscriptEvent
 from ash.ui.theme import Theme, get_theme, prompt_style, viewport_styles
@@ -426,7 +427,7 @@ class TranscriptViewport:
 
         @bindings.add("c-c")
         def interrupt(event) -> None:
-            event.app.exit(exception=KeyboardInterrupt())
+            event.app.exit(exception=PromptInterrupted())
 
         @bindings.add("c-d")
         def eof(event) -> None:

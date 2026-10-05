@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,7 @@ from ash.safety.grants import (
 )
 from ash.safety.policy import PolicyAction
 from ash.tools.base import sensitive_tool_argument_fields
+from ash.ui.input_signals import PromptInterrupted
 from ash.ui.notifications import NotificationEvent, NotificationSink
 
 if TYPE_CHECKING:
@@ -76,6 +78,22 @@ class InteractiveTurnController:
         self.loop.on_plan_approval = self._request_plan_approval
         if callable(set_foreground_broker):
             set_foreground_broker(self._request_subagent_approval)
+        previous_sigint: Any = None
+        signal_handler_installed = False
+        interrupt_wait: asyncio.Task[bool] | None = None
+        if getattr(self.prompt_input, "linear_mode", False):
+            current_loop = asyncio.get_running_loop()
+            previous_sigint = signal.getsignal(signal.SIGINT)
+            interrupt_event = asyncio.Event()
+            try:
+                def on_sigint(_signum: int, _frame: Any) -> None:
+                    current_loop.call_soon_threadsafe(interrupt_event.set)
+
+                signal.signal(signal.SIGINT, on_sigint)
+                signal_handler_installed = True
+                interrupt_wait = asyncio.create_task(interrupt_event.wait())
+            except (OSError, RuntimeError, ValueError):
+                pass
         turn = asyncio.create_task(
             self.loop.run_turn(user_input, user_metadata=user_metadata)
         )
@@ -83,10 +101,17 @@ class InteractiveTurnController:
             while not turn.done():
                 steering_read = asyncio.create_task(self.prompt_input.read("steer> "))
                 self._steering_read = steering_read
+                wait_tasks: set[asyncio.Task[Any]] = {turn, steering_read}
+                if interrupt_wait is not None:
+                    wait_tasks.add(interrupt_wait)
                 done, _ = await asyncio.wait(
-                    {turn, steering_read},
+                    wait_tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                if interrupt_wait is not None and interrupt_wait in done:
+                    await self._cancel_steering_read()
+                    await self._cancel_turn(turn)
+                    return None
                 if turn in done:
                     await self._cancel_steering_read()
                     break
@@ -98,7 +123,7 @@ class InteractiveTurnController:
                         await self._approval_complete.wait()
                         continue
                     raise
-                except KeyboardInterrupt:
+                except (KeyboardInterrupt, PromptInterrupted):
                     await self._cancel_turn(turn)
                     return None
 
@@ -113,11 +138,11 @@ class InteractiveTurnController:
                     )
                     continue
                 try:
-                    pending = self.loop.queue_steering(steering)
+                    pending_count = self.loop.queue_steering(steering)
                 except (ValueError, OverflowError) as exc:
                     self.write_status(f"Steering rejected: {exc}")
                     continue
-                self.write_status(f"Steering queued ({pending} pending).")
+                self.write_status(f"Steering queued ({pending_count} pending).")
             response = await turn
             message = "Ash turn complete."
             if self.notification_include_preview and response.strip():
@@ -128,6 +153,11 @@ class InteractiveTurnController:
             await self._cancel_steering_read()
             if not turn.done():
                 await self._cancel_turn(turn)
+            if interrupt_wait is not None and not interrupt_wait.done():
+                interrupt_wait.cancel()
+                await asyncio.gather(interrupt_wait, return_exceptions=True)
+            if signal_handler_installed:
+                signal.signal(signal.SIGINT, previous_sigint)
             self.loop.on_tool_approval = previous_approval
             self.loop.on_plan_approval = previous_plan_approval
             if callable(set_foreground_broker):
@@ -162,7 +192,7 @@ class InteractiveTurnController:
                 )
             ).strip().casefold()
             return answer in {"y", "yes"}
-        except (EOFError, KeyboardInterrupt, TypeError, ValueError):
+        except (EOFError, KeyboardInterrupt, PromptInterrupted, TypeError, ValueError):
             return False
         finally:
             self._approval_active = False
@@ -236,7 +266,7 @@ class InteractiveTurnController:
                 if action in {"n", "no", "decline"}:
                     return {"action": "decline"}
                 return {"action": "cancel"}
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, PromptInterrupted):
             return {"action": "cancel"}
         finally:
             self._approval_active = False
@@ -382,7 +412,7 @@ class InteractiveTurnController:
         except PermissionGrantError as exc:
             self.write_status(f"Permission scope rejected: {exc}")
             return False
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, PromptInterrupted):
             return False
         finally:
             self._approval_active = False
@@ -495,7 +525,7 @@ class InteractiveTurnController:
                         .strip()
                         .casefold()
                     )
-                except (EOFError, KeyboardInterrupt):
+                except (EOFError, KeyboardInterrupt, PromptInterrupted):
                     return False
                 if answer in {"y", "yes"}:
                     return True

@@ -12,6 +12,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 
 from ash.ui.history import PrivateFileHistory as CorePrivateFileHistory
 from ash.ui.transcript import Transcript
+from ash.ui.input_signals import PromptInterrupted
 from ash.ui.prompt import AshCompleter
 from ash.ui.viewport import (
     PrivateFileHistory,
@@ -380,7 +381,7 @@ async def test_viewport_interrupt_and_eof_restore_input_ownership(
         )
         interrupted = viewport.read()
         pipe.send_bytes(b"\x03")
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(PromptInterrupted):
             await interrupted
 
         ended = viewport.read()

@@ -20,6 +20,7 @@ from ash.commands.slash import COMMANDS
 from ash.provider_catalog import BUILTIN_PROVIDERS
 from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.ui.history import PrivateFileHistory
+from ash.ui.input_signals import PromptInterrupted
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript
 from ash.ui.viewport import TranscriptViewport
@@ -473,6 +474,10 @@ def _key_bindings(bindings_by_action: dict[str, list[str]]) -> KeyBindings:
         for sequence in sequences:
             bindings.add(*sequence.split())(handler)
 
+    @bindings.add("c-c", eager=True)
+    def _interrupt(event) -> None:
+        event.app.exit(exception=PromptInterrupted())
+
     return bindings
 
 
@@ -644,7 +649,6 @@ class PromptInput:
         loop = asyncio.get_running_loop()
         completed: asyncio.Future[str] = loop.create_future()
         encoding = getattr(self.input_stream, "encoding", None) or "utf-8"
-
         def on_readable() -> None:
             try:
                 chunk = os.read(fd, 4096)

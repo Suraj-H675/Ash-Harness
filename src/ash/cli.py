@@ -24,6 +24,7 @@ from ash.safe_io import read_bounded_bytes, read_bounded_text, strict_json_loads
 from ash.mcp.diagnostics import safe_mcp_diagnostic
 from ash.safety.scoped_io import atomic_write_scoped_text_chunks
 from ash.ui.safe_text import terminal_safe_text
+from ash.ui.input_signals import PromptInterrupted
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
@@ -1080,7 +1081,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     while True:
         try:
             submitted_input = await prompt_input.read("> ")
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, PromptInterrupted):
             print()
             return 0
         user_input = submitted_input.strip()
