@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -46,7 +47,9 @@ def test_bootstrap_installer_bootstraps_uv_when_runtime_manager_is_missing(
     _write_executable(bin_dir / "uname", "#!/bin/sh\necho Linux\n")
     _write_executable(bin_dir / "dirname", "#!/bin/sh\n/usr/bin/dirname \"$@\"\n")
     for name in ("sh", "mkdir", "chmod"):
-        (bin_dir / name).symlink_to(Path("/usr/bin") / name)
+        resolved = shutil.which(name)
+        assert resolved is not None
+        (bin_dir / name).symlink_to(Path(resolved))
     _write_executable(
         bin_dir / "python3",
         f"#!/bin/sh\n"
