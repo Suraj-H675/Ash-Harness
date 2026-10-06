@@ -268,7 +268,7 @@ class TranscriptViewport:
         self._running = False
         self._follow_tail = True
         self._manual_cursor_line = 0
-        self._mouse_capture_enabled = mouse_support
+        self.mouse_support = mouse_support
         self._choice_mode = False
         self._choice_title = ""
         self._choice_options: tuple[ViewportChoice, ...] = ()
@@ -370,7 +370,7 @@ class TranscriptViewport:
             erase_when_done=False,
             editing_mode=EditingMode.VI if input_mode == "vi" else EditingMode.EMACS,
             style=prompt_style(viewport_styles(selected_theme), no_color=no_color),
-            mouse_support=Condition(lambda: self._mouse_capture_enabled),
+            mouse_support=mouse_support,
             input=input,
             output=output,
             min_redraw_interval=0.03,
@@ -449,12 +449,13 @@ class TranscriptViewport:
             )
         else:
             rendered = self._formatter.format(entries, width=width)
-        rendered = FormattedText(
-            [
-                (fragment[0], fragment[1], self._handle_transcript_mouse)
-                for fragment in to_formatted_text(rendered)
-            ]
-        )
+        if self.mouse_support:
+            rendered = FormattedText(
+                [
+                    (fragment[0], fragment[1], self._handle_transcript_mouse)
+                    for fragment in to_formatted_text(rendered)
+                ]
+            )
         self._last_transcript_text = rendered
         return rendered
 
@@ -587,15 +588,6 @@ class TranscriptViewport:
             self.application.exit(result=self._choice_options[index].value)
             return None
         return NotImplemented
-
-    @property
-    def mouse_capture_enabled(self) -> bool:
-        return self._mouse_capture_enabled
-
-    def set_mouse_capture(self, enabled: bool) -> None:
-        self._mouse_capture_enabled = bool(enabled)
-        if self._running:
-            self.application.invalidate()
 
     def _key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()

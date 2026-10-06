@@ -9,12 +9,18 @@ from pathlib import Path
 from typing import Any, Callable, TextIO
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.completion.base import Completer, Completion
 from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.layout import FormattedTextControl, HSplit, Layout, Window
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.input.base import Input
+from prompt_toolkit.output.base import Output
 
 from ash.commands.slash import COMMANDS
 from ash.provider_catalog import BUILTIN_PROVIDERS
@@ -23,11 +29,108 @@ from ash.ui.history import PrivateFileHistory
 from ash.ui.input_signals import PromptInterrupted
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript
+from ash.ui.theme import get_theme, prompt_style, viewport_styles
 from ash.ui.viewport import TranscriptViewport, ViewportChoice
 
 
 MAX_PATH_COMPLETION_SCAN_ENTRIES = 10_000
 MAX_PATH_COMPLETIONS = 200
+
+
+async def _choose_inline(
+    title: str,
+    options: tuple[ViewportChoice, ...],
+    *,
+    default_value: str | None = None,
+    theme: str = "dark",
+    no_color: bool = False,
+    input: Input | None = None,
+    output: Output | None = None,
+) -> str | None:
+    """Render a compact keyboard selector without taking terminal mouse ownership."""
+
+    if not options:
+        return None
+    selected = 0
+    if default_value is not None:
+        try:
+            selected = next(
+                index
+                for index, option in enumerate(options)
+                if option.value == default_value
+            )
+        except StopIteration as exc:
+            raise ValueError("default choice is not present in options") from exc
+
+    safe_title = terminal_safe_text(title, single_line=True)
+    bindings = KeyBindings()
+
+    def choice_text() -> FormattedText:
+        fragments: list[tuple[str, str]] = [
+            ("class:approval-prefix", " APPROVAL "),
+            ("", "  "),
+            ("class:muted", safe_title),
+            ("", "\n"),
+        ]
+        for index, option in enumerate(options):
+            style = "class:selected" if index == selected else ""
+            marker = "> " if index == selected else "  "
+            fragments.append((style, marker))
+            fragments.append(
+                (f"{style} class:option".strip(), option.label)
+            )
+            fragments.append((style, "\n"))
+        description = terminal_safe_text(options[selected].description)
+        if description:
+            fragments.append(("class:meta", " " + description))
+            fragments.append(("", "\n"))
+        fragments.append(
+            ("class:muted", " ↑/↓ choose  Enter select  Esc deny")
+        )
+        return FormattedText(fragments)
+
+    control = FormattedTextControl(choice_text)
+    window = Window(
+        control,
+        height=Dimension(min=4, max=max(4, len(options) + 3)),
+        wrap_lines=True,
+    )
+    app: Application[str | None] = Application(
+        layout=Layout(HSplit([window])),
+        key_bindings=bindings,
+        full_screen=False,
+        erase_when_done=True,
+        mouse_support=False,
+        style=prompt_style(viewport_styles(get_theme(theme)), no_color=no_color),
+        input=input,
+        output=output,
+    )
+
+    def move(offset: int) -> None:
+        nonlocal selected
+        selected = (selected + offset) % len(options)
+        app.invalidate()
+
+    @bindings.add("up")
+    def select_previous(event) -> None:
+        del event
+        move(-1)
+
+    @bindings.add("down")
+    def select_next(event) -> None:
+        del event
+        move(1)
+
+    @bindings.add("enter")
+    def accept(event) -> None:
+        event.app.exit(result=options[selected].value)
+
+    @bindings.add("escape")
+    @bindings.add("c-c")
+    def cancel(event) -> None:
+        event.app.exit(result=None)
+
+    return await app.run_async()
 
 
 def terminal_supports_cursor_ui(
@@ -516,6 +619,8 @@ class PromptInput:
         self._viewport: TranscriptViewport | None = None
         self._completer: AshCompleter | None = None
         self._linear_input_buffer = ""
+        self._theme = theme
+        self._no_color = no_color
         self.screen_reader_mode = screen_reader_mode
         self.supports_full_screen_ui = terminal_supports_cursor_ui(
             input_stream=self.input_stream,
@@ -598,29 +703,29 @@ class PromptInput:
         *,
         default_value: str | None = None,
     ) -> str | None:
-        if self._viewport is None:
-            raise RuntimeError("choice UI requires viewport mode")
-        return await self._viewport.choose(
-            title,
-            options,
-            default_value=default_value,
-        )
+        if self._viewport is not None:
+            return await self._viewport.choose(
+                title,
+                options,
+                default_value=default_value,
+            )
+        if self._session is not None:
+            return await _choose_inline(
+                title,
+                options,
+                default_value=default_value,
+                theme=self._theme,
+                no_color=self._no_color,
+            )
+        raise RuntimeError("choice UI requires an interactive cursor terminal")
 
     @property
     def uses_viewport(self) -> bool:
         return self._viewport is not None
 
     @property
-    def mouse_capture_enabled(self) -> bool:
-        return bool(
-            self._viewport is not None and self._viewport.mouse_capture_enabled
-        )
-
-    def set_mouse_capture(self, enabled: bool) -> bool:
-        if self._viewport is None:
-            return False
-        self._viewport.set_mouse_capture(enabled)
-        return True
+    def supports_choice_ui(self) -> bool:
+        return self._viewport is not None or self._session is not None
 
     def set_extra_commands(self, commands: dict[str, str] | list[str]) -> None:
         if self._completer is None:

@@ -651,13 +651,15 @@ class AshConfig(BaseSettings):
         description="Interactive editor mode: emacs or vi.",
     )
     tui_mode: str = Field(
-        "viewport",
-        description="Interactive terminal renderer: viewport or inline.",
+        "inline",
+        description=(
+            "Interactive terminal renderer: inline/scrollback or viewport/fullscreen."
+        ),
     )
     tui_mouse: bool = Field(
         True,
         description=(
-            "Enable full-screen terminal mouse capture for wheel and click interaction."
+            "Enable mouse capture when using the full-screen viewport renderer."
         ),
     )
     notification_method: str = Field(
@@ -1740,9 +1742,18 @@ class AshConfig(BaseSettings):
     @classmethod
     def validate_tui_mode(cls, value: str) -> str:
         normalized = value.casefold()
-        if normalized not in {"viewport", "inline"}:
-            raise ValueError("tui_mode must be viewport or inline")
-        return normalized
+        aliases = {
+            "inline": "inline",
+            "scrollback": "inline",
+            "viewport": "viewport",
+            "fullscreen": "viewport",
+        }
+        try:
+            return aliases[normalized]
+        except KeyError as exc:
+            raise ValueError(
+                "tui_mode must be scrollback/inline or fullscreen/viewport"
+            ) from exc
 
     @field_validator("theme")
     @classmethod

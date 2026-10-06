@@ -13,12 +13,22 @@ from prompt_toolkit.output import DummyOutput
 
 import ash.ui.prompt as prompt_module
 import ash.ui.history as history_module
-from ash.ui.prompt import AshCompleter, PromptInput
+from ash.ui.prompt import AshCompleter, PromptInput, _choose_inline
+from ash.ui.viewport import ViewportChoice
 
 
 class TtyStringIO(io.StringIO):
     def isatty(self) -> bool:
         return True
+
+
+class TrackingMouseOutput(DummyOutput):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mouse_enabled = 0
+
+    def enable_mouse_support(self) -> None:
+        self.mouse_enabled += 1
 
 
 @pytest.fixture
@@ -79,6 +89,61 @@ async def test_inline_prompt_bracketed_paste_preserves_multiline_input(
         pipe.send_text("\r")
 
         assert await pending == "first\nsecond"
+
+
+@pytest.mark.asyncio
+async def test_default_inline_prompt_does_not_capture_terminal_mouse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cursor_ui: None,
+) -> None:
+    from prompt_toolkit import PromptSession
+
+    with create_pipe_input() as pipe:
+        output = TrackingMouseOutput()
+        real_session = PromptSession(
+            input=pipe,
+            output=output,
+            multiline=False,
+        )
+        monkeypatch.setattr(
+            prompt_module,
+            "PromptSession",
+            lambda **kwargs: real_session,
+        )
+        prompt = PromptInput(
+            input_stream=TtyStringIO(),
+            history_path=tmp_path / "history",
+        )
+        pending = asyncio.create_task(prompt.read())
+        pipe.send_text("hello\r")
+
+        assert await pending == "hello"
+        assert prompt.uses_viewport is False
+        assert output.mouse_enabled == 0
+
+
+@pytest.mark.asyncio
+async def test_inline_choice_selector_uses_keyboard_without_mouse_capture() -> None:
+    with create_pipe_input() as pipe:
+        output = DummyOutput()
+        pending = asyncio.create_task(
+            _choose_inline(
+                "write_file permission",
+                (
+                    ViewportChoice("y", "Allow once", "This request only."),
+                    ViewportChoice("n", "Deny", "Reject this request."),
+                ),
+                default_value="n",
+                input=pipe,
+                output=output,
+            )
+        )
+        await asyncio.sleep(0.05)
+
+        pipe.send_text("\r")
+
+        assert await pending == "n"
 
 
 def test_screen_reader_mode_uses_reduced_dynamic_prompt(

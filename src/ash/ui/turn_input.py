@@ -314,7 +314,7 @@ class InteractiveTurnController:
             diff_mode=self.diff_mode,
         )
         try:
-            if getattr(self.prompt_input, "uses_viewport", False):
+            if getattr(self.prompt_input, "supports_choice_ui", False):
                 answer = await self._select_approval(tool_name)
             else:
                 choices = (

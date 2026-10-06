@@ -420,6 +420,12 @@ def test_terminal_preferences_are_validated() -> None:
     assert config.keybindings["newline"] == ["c-o"]
 
 
+def test_terminal_renderer_defaults_to_native_scrollback_and_accepts_ui_aliases() -> None:
+    assert AshConfig().tui_mode == "inline"
+    assert AshConfig(tui_mode="SCROLLBACK").tui_mode == "inline"
+    assert AshConfig(tui_mode="FULLSCREEN").tui_mode == "viewport"
+
+
 def test_approval_diff_mode_is_validated() -> None:
     config = AshConfig(approval_diff_mode="SIDE_BY_SIDE")
     assert config.approval_diff_mode == "side-by-side"

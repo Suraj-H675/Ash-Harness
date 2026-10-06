@@ -350,11 +350,13 @@ foreground work; use durable automation for scheduled or unattended jobs.
 
 The interactive interface is built for sustained terminal work:
 
-- responsive full-screen transcript viewport with mouse-wheel/page navigation
-  and live tailing; `/mouse [on|off|toggle]` releases or restores terminal
-  mouse capture at runtime, while `tui_mouse = false` disables capture at
-  startup;
-- inline rendering fallback for terminals that do not support a viewport;
+- native scrollback is the default: conversation output lives in the terminal's
+  normal buffer, so wheel scrolling, selection, copy, links, and context-menu
+  behavior remain owned by the terminal;
+- an optional full-screen viewport keeps the composer pinned and provides
+  app-owned transcript navigation; set `tui_mode = "fullscreen"` (the
+  `viewport` alias is also accepted);
+- `tui_mouse` only controls mouse capture in the optional full-screen mode;
 - Rich Markdown and fenced-code rendering with bounded repaint frequency;
 - streaming user, assistant, reasoning, tool, approval, status, error, and
   recovery entries;
@@ -365,8 +367,7 @@ The interactive interface is built for sustained terminal work:
 - `/` command registry with aliases, parsing, completion, and stable help;
 - `@` file, directory, image, symbol, and MCP-resource completion;
 - unified or side-by-side bounded approval diffs with high-contrast,
-  theme-aware added/removed highlighting and an in-context approval selector
-  that supports keyboard or mouse selection;
+  theme-aware added/removed highlighting and a compact approval selector;
 - status surfaces for model, branch, context, cache, cost, sandbox, session,
   and working directory;
 - validated dark and light themes;

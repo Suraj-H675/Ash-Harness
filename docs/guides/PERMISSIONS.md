@@ -32,11 +32,11 @@ edit diff visible while presenting a selector for the common decisions:
 - **More approval options…** — open the less common persistent or broader
   permission choices.
 
-Use the arrow keys and Enter or click a choice with the left mouse button.
-When terminal mouse capture is enabled, `/mouse off` releases the mouse back
-to the terminal for native selection and context-menu behavior; `/mouse on`
-restores Ash wheel/click interaction. Terminals such as Ghostty also reserve
-Shift+mouse for native selection while application mouse reporting is active.
+Use the arrow keys and Enter to choose. In Ash's default scrollback interface,
+the selector does not enable mouse reporting, so the terminal keeps normal
+selection, copy, scrolling, links, and context-menu behavior. The optional
+full-screen interface can additionally make the choices clickable because it
+owns terminal mouse input while active.
 
 The advanced selector retains Ash's explicit permission scopes: allow a tool
 for the session, persist an exact project scope, edit and persist an exact

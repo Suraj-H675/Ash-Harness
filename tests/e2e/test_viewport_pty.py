@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import pty
+import select
 import shutil
 import subprocess
 import sys
@@ -8,6 +10,76 @@ import time
 from pathlib import Path
 
 import pytest
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_default_scrollback_does_not_enable_mouse_reporting(tmp_path: Path) -> None:
+    code = """
+import asyncio
+from pathlib import Path
+from ash.ui.prompt import PromptInput
+
+async def main():
+    prompt = PromptInput(history_path=Path(%r))
+    try:
+        value = await prompt.read("native> ")
+    finally:
+        prompt.close()
+    print("SCROLLBACK_RESULT=" + value, flush=True)
+
+asyncio.run(main())
+""" % str(tmp_path / "history")
+    master_fd, slave_fd = pty.openpty()
+    environment = os.environ.copy()
+    environment.pop("NO_COLOR", None)
+    environment["TERM"] = "xterm-256color"
+    environment["COLORTERM"] = "truecolor"
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    captured = bytearray()
+    sent = False
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.05)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 65_536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                captured.extend(chunk)
+            if not sent and b"native>" in captured:
+                os.write(master_fd, b"hello\r")
+                sent = True
+            if b"SCROLLBACK_RESULT=hello" in captured:
+                break
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)
+
+    raw = bytes(captured)
+    assert b"SCROLLBACK_RESULT=hello" in raw
+    for sequence in (
+        b"\x1b[?1000h",
+        b"\x1b[?1002h",
+        b"\x1b[?1003h",
+        b"\x1b[?1006h",
+        b"\x1b[?1015h",
+    ):
+        assert sequence not in raw
 
 
 @pytest.mark.skipif(

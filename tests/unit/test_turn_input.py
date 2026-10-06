@@ -30,6 +30,9 @@ from ash.ui.turn_input import (
 
 
 class RoutedPrompt:
+    uses_viewport = False
+    supports_choice_ui = False
+
     def __init__(self) -> None:
         self.steering: asyncio.Queue[str] = asyncio.Queue()
         self.approvals: asyncio.Queue[str] = asyncio.Queue()
@@ -44,6 +47,7 @@ class RoutedPrompt:
 
 class ViewportApprovalPrompt(RoutedPrompt):
     uses_viewport = True
+    supports_choice_ui = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -55,6 +59,10 @@ class ViewportApprovalPrompt(RoutedPrompt):
         self.choice_calls.append((title, tuple(option.label for option in options)))
         self.choice_defaults.append(default_value)
         return await self.selections.get()
+
+
+class InlineApprovalPrompt(ViewportApprovalPrompt):
+    uses_viewport = False
 
 
 class RecordingNotifier:
@@ -344,10 +352,15 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_viewport_approval_uses_selector_instead_of_letter_prompt(
+@pytest.mark.parametrize(
+    "prompt_type",
+    (ViewportApprovalPrompt, InlineApprovalPrompt),
+)
+async def test_interactive_approval_uses_selector_instead_of_letter_prompt(
     tmp_path: Path,
+    prompt_type,
 ) -> None:
-    prompt = ViewportApprovalPrompt()
+    prompt = prompt_type()
     await prompt.selections.put("y")
     ui = make_ui()
     guard = SafetyGuard(tmp_path)

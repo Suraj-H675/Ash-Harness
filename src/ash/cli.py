@@ -1134,7 +1134,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         if parsed_command is None and not custom_expansion:
             user_input = submitted_input
 
-        safe_displaced_commands = {"exit", "help", "status", "mouse"}
+        safe_displaced_commands = {"exit", "help", "status"}
         if not (
             parsed_command is not None
             and parsed_command[0].name in safe_displaced_commands
@@ -1290,6 +1290,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 active_model = terminal_safe_text(
                     str(loop.active_model_id), single_line=True
                 )
+                tui_label = (
+                    "fullscreen"
+                    if config.tui_mode == "viewport"
+                    else "scrollback"
+                )
+                mouse_label = (
+                    ("Ash capture on" if config.tui_mouse else "Ash capture off")
+                    if config.tui_mode == "viewport"
+                    else "terminal-native"
+                )
                 fallbacks = ", ".join(
                     terminal_safe_text(model, single_line=True)
                     for model in config.fallback_models
@@ -1301,9 +1311,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"  Model: {active_model}",
                             f"  Fallbacks: {fallbacks}",
                             f"  Permission mode: {loop.safety_tier}",
-                            f"  TUI: {config.tui_mode}",
+                            f"  TUI: {tui_label}",
                             f"  Input: {config.input_mode}",
-                            f"  Mouse: {'on' if config.tui_mouse else 'off'}",
+                            f"  Mouse: {mouse_label}",
                             f"  Theme: {config.theme}",
                             f"  Screen reader: {'on' if config.screen_reader_mode else 'off'}",
                             f"  Reduced motion: {'on' if config.reduced_motion else 'off'}",
@@ -1317,48 +1327,6 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     ),
                     flush=True,
                 )
-                continue
-            if command.name == "mouse":
-                if len(arguments) > 1:
-                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
-                    continue
-                action = arguments[0].casefold() if arguments else "toggle"
-                if action not in {"on", "off", "toggle"}:
-                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
-                    continue
-                if not prompt_input.uses_viewport:
-                    print(
-                        "Mouse capture is only available in the full-screen "
-                        "viewport.",
-                        flush=True,
-                    )
-                    continue
-                enabled = (
-                    not prompt_input.mouse_capture_enabled
-                    if action == "toggle"
-                    else action == "on"
-                )
-                if not prompt_input.set_mouse_capture(enabled):
-                    print(
-                        "Mouse capture is unavailable in this terminal mode.",
-                        flush=True,
-                    )
-                    continue
-                config.tui_mouse = enabled
-                if enabled:
-                    print(
-                        "Mouse capture on for this session: wheel scrolling and "
-                        "Ash clicks are enabled. Hold Shift for terminal-native "
-                        "mouse handling, or use /mouse off to release the mouse.",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        "Mouse capture off for this session: terminal-native "
-                        "selection and context menus are restored. Use PageUp/"
-                        "PageDown to scroll Ash.",
-                        flush=True,
-                    )
                 continue
             if command.name == "recovery":
                 from ash.commands.sessions import render_recovery_reports
