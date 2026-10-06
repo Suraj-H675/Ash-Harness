@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from pathlib import Path
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -124,8 +127,9 @@ def _run_bootstrap(
 def _installer_prefix() -> str:
     command = install_command()
     assert command == (
+        "(tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT && "
         "curl -fsSL --proto '=https' --tlsv1.2 "
-        f"{PUBLIC_BOOTSTRAP_URL} | sh"
+        f"{PUBLIC_BOOTSTRAP_URL} -o \"$tmp\" && sh \"$tmp\")"
     )
     assert "\n" not in command
     assert "\r" not in command
@@ -148,9 +152,43 @@ def test_public_install_command_keeps_sorted_capability_extras() -> None:
     command = install_command("server", "browser", "server")
 
     assert command == (
+        "(tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT && "
         "curl -fsSL --proto '=https' --tlsv1.2 "
-        f"{PUBLIC_BOOTSTRAP_URL} | sh -s -- --extra browser --extra server"
+        f"{PUBLIC_BOOTSTRAP_URL} -o \"$tmp\" && sh \"$tmp\" "
+        "--extra browser --extra server)"
     )
+
+
+def test_public_install_command_does_not_execute_shell_after_curl_failure(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    invoked = tmp_path / "installer-invoked"
+    curl = fake_bin / "curl"
+    curl.write_text("#!/bin/sh\nexit 22\n", encoding="utf-8")
+    curl.chmod(0o755)
+    shell = fake_bin / "sh"
+    shell.write_text(
+        "#!/bin/sh\nprintf '%s\\n' invoked > \"$ASH_TEST_INVOKED\"\n",
+        encoding="utf-8",
+    )
+    shell.chmod(0o755)
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", install_command()],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "ASH_TEST_INVOKED": str(invoked),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+        },
+    )
+
+    assert completed.returncode == 22
+    assert not invoked.exists()
 
 
 def test_install_command_rejects_nonrelease_ref() -> None:

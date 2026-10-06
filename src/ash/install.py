@@ -194,12 +194,13 @@ def install_command(*extras: str, ref: str | None = None) -> str:
     arguments = [part for extra in normalized for part in ("--extra", extra)]
     if ref is None:
         command = (
+            "(tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT && "
             "curl -fsSL --proto '=https' --tlsv1.2 "
-            f"{PUBLIC_BOOTSTRAP_URL} | sh"
+            f"{PUBLIC_BOOTSTRAP_URL} -o \"$tmp\" && sh \"$tmp\""
         )
         if arguments:
-            command += " -s -- " + " ".join(shlex.quote(value) for value in arguments)
-        return command
+            command += " " + " ".join(shlex.quote(value) for value in arguments)
+        return command + ")"
     if ref:
         arguments.extend(("--ref", ref))
     suffix = (

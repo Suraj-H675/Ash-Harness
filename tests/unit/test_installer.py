@@ -195,9 +195,6 @@ def test_existing_pipx_install_is_rebuilt_without_exposing_uv_edge_cases() -> No
         "/usr/bin/pipx",
         "install",
         "--force",
-        "--python",
-        _current_runtime_python(),
-        "--fetch-python=missing",
         "ash-ai[browser,server] @ git+https://github.com/Suraj-H675/Ash-Harness.git",
     ]
     assert install_kwargs["env"]["UV_VENV_CLEAR"] == "1"
@@ -443,14 +440,14 @@ def test_release_journey_install_upgrade_repair_and_explicit_rollback() -> None:
         "installed": False,
         "version": "",
         "extras": (),
+        "install_count": 0,
+        "package_spec": "",
     }
     target_version = ""
 
     def pipx_payload() -> str:
         if not state["installed"]:
             return '{"venvs": {}}'
-        extras = state["extras"]
-        rendered_extras = f"[{','.join(extras)}]" if extras else ""
         return json.dumps(
             {
                 "venvs": {
@@ -458,7 +455,8 @@ def test_release_journey_install_upgrade_repair_and_explicit_rollback() -> None:
                         "metadata": {
                             "python_version": "Python 3.14.7",
                             "main_package": {
-                                "package_or_url": f"ash-ai{rendered_extras}",
+                                "package_or_url": state["package_spec"],
+                                "package_version": state["version"],
                                 "app_paths": [
                                     {
                                         "__Path__": "/isolated/bin/ash",
@@ -477,7 +475,9 @@ def test_release_journey_install_upgrade_repair_and_explicit_rollback() -> None:
         if command == ["/usr/bin/pipx", "list", "--json"]:
             return _completed(stdout=pipx_payload())
         if command[1:3] == ["install", "--force"]:
+            state["install_count"] += 1
             requirement = command[-1]
+            state["package_spec"] = requirement
             package = requirement.split(" @ ", 1)[0]
             if "[" in package:
                 rendered = package.split("[", 1)[1].removesuffix("]")
@@ -524,14 +524,176 @@ def test_release_journey_install_upgrade_repair_and_explicit_rollback() -> None:
     upgraded = run_release("0.2.0")
     assert upgraded.version == "ash 0.2.0"
     assert state["extras"] == ("browser",)
+    assert state["install_count"] == 2
+
+    current = run_release("0.2.0")
+    assert current.version == "ash 0.2.0"
+    assert current.changed is False
+    assert state["install_count"] == 2
 
     repaired = run_release("0.2.0", extras=["observability"])
     assert repaired.version == "ash 0.2.0"
     assert state["extras"] == ("browser", "observability")
+    assert repaired.changed is True
+    assert state["install_count"] == 3
 
     rolled_back = run_release("0.1.0")
     assert rolled_back.version == "ash 0.1.0"
     assert state["extras"] == ("browser", "observability")
+    assert state["install_count"] == 4
+
+
+def test_existing_uv_release_install_skips_reinstall_when_already_current() -> None:
+    calls: list[list[str]] = []
+    uv_listing = (
+        "ash-ai v0.3.1 [required: file:///tmp/ash_ai-0.3.1-py3-none-any.whl] "
+        "[extras: browser] [CPython 3.14.7] (/isolated/tools/ash-ai)\n"
+        "- ash (/isolated/bin/ash)\n"
+    )
+
+    def runner(command, **kwargs):
+        del kwargs
+        calls.append(list(command))
+        if command[1:] == [
+            "tool",
+            "list",
+            "--show-paths",
+            "--show-version-specifiers",
+            "--show-extras",
+            "--show-python",
+        ]:
+            return _completed(stdout=uv_listing)
+        if command[1:] == ["tool", "dir", "--bin"]:
+            return _completed(stdout="/isolated/bin\n")
+        if command == ["/isolated/bin/ash", "--version"]:
+            return _completed(stdout="ash 0.3.1\n")
+        if command[1:3] == ["tool", "install"]:
+            pytest.fail("current uv install must not be reinstalled")
+        raise AssertionError(f"unexpected command: {command}")
+
+    outcome = install(
+        extras=["browser"],
+        ref="ash-v0.3.1",
+        runtime_python="3.14",
+        runner=runner,
+        which=lambda name: "/usr/bin/uv" if name == "uv" else None,
+        environ={"PATH": f"/isolated/bin{os.pathsep}/usr/bin"},
+    )
+
+    assert outcome.manager == "uv"
+    assert outcome.version == "ash 0.3.1"
+    assert outcome.changed is False
+    assert not any(command[1:3] == ["tool", "install"] for command in calls)
+
+
+def test_same_version_source_install_is_repaired_to_verified_release() -> None:
+    calls: list[list[str]] = []
+    list_calls = 0
+    source_metadata = json.dumps(
+        {
+            "venvs": {
+                "ash-ai": {
+                    "metadata": {
+                        "main_package": {
+                            "package_or_url": (
+                                "ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git"
+                            ),
+                            "package_version": "0.3.1",
+                            "app_paths": [
+                                {
+                                    "__Path__": "/isolated/bin/ash",
+                                    "__type__": "Path",
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    )
+    release_metadata = json.dumps(
+        {
+            "venvs": {
+                "ash-ai": {
+                    "metadata": {
+                        "main_package": {
+                            "package_or_url": (
+                                "ash-ai @ file:///tmp/ash_ai-0.3.1-py3-none-any.whl"
+                                "#sha256=" + _TEST_RELEASE_SHA256
+                            ),
+                            "package_version": "0.3.1",
+                            "app_paths": [
+                                {
+                                    "__Path__": "/isolated/bin/ash",
+                                    "__type__": "Path",
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+    )
+
+    def runner(command, **kwargs):
+        nonlocal list_calls
+        del kwargs
+        calls.append(list(command))
+        if command == ["/usr/bin/pipx", "list", "--json"]:
+            list_calls += 1
+            return _completed(stdout=source_metadata if list_calls == 1 else release_metadata)
+        if command[1:3] == ["install", "--force"]:
+            return _completed()
+        if command == ["/isolated/bin/ash", "--version"]:
+            return _completed(stdout="ash 0.3.1\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    outcome = install(
+        ref="ash-v0.3.1",
+        runtime_python="3.14",
+        runner=runner,
+        which=lambda name: "/usr/bin/pipx" if name == "pipx" else None,
+        environ={
+            "PATH": f"/isolated/bin{os.pathsep}/usr/bin",
+            "PIPX_BIN_DIR": "/isolated/bin",
+        },
+        release_opener=_release_opener(
+            ref="ash-v0.3.1",
+            wheel_name="ash_ai-0.3.1-py3-none-any.whl",
+        ),
+    )
+
+    assert outcome.changed is True
+    assert any(command[1:3] == ["install", "--force"] for command in calls)
+
+
+def test_public_installer_reports_already_latest_version() -> None:
+    stdout = io.StringIO()
+
+    def fake_install(**kwargs):
+        del kwargs
+        return InstallResult(
+            "pipx",
+            "/isolated/bin/ash",
+            "ash 0.3.1",
+            changed=False,
+        )
+
+    assert (
+        main(
+            ["--ref", "ash-v0.3.1"],
+            installer=fake_install,
+            stdout=stdout,
+            stderr=io.StringIO(),
+            python_version=(3, 12),
+        )
+        == 0
+    )
+    assert (
+        stdout.getvalue()
+        == "Ash is already on the latest version (ash 0.3.1) via pipx.\n"
+        "Executable: /isolated/bin/ash\n"
+    )
 
 
 def test_release_ref_rejects_mutable_wheel_before_manager_mutation() -> None:
@@ -822,9 +984,6 @@ def test_existing_pypi_style_pipx_spec_preserves_capability_extras() -> None:
         "/usr/bin/pipx",
         "install",
         "--force",
-        "--python",
-        "3.14",
-        "--fetch-python=missing",
         "ash-ai[browser,server] @ git+https://github.com/Suraj-H675/Ash-Harness.git",
     ] in calls
 
@@ -877,9 +1036,6 @@ def test_existing_pipx_install_drops_obsolete_extra_but_preserves_supported_one(
         "/usr/bin/pipx",
         "install",
         "--force",
-        "--python",
-        "3.14",
-        "--fetch-python=missing",
         "ash-ai[browser] @ git+https://github.com/Suraj-H675/Ash-Harness.git",
     ] in calls
     warning = capsys.readouterr().err
@@ -887,7 +1043,7 @@ def test_existing_pipx_install_drops_obsolete_extra_but_preserves_supported_one(
     assert "vector" in warning
 
 
-def test_existing_pipx_install_preserves_supported_runtime_minor() -> None:
+def test_existing_pipx_install_reuses_existing_runtime_without_override() -> None:
     calls: list[list[str]] = []
     metadata = json.dumps(
         {
@@ -934,14 +1090,11 @@ def test_existing_pipx_install_preserves_supported_runtime_minor() -> None:
         "/usr/bin/pipx",
         "install",
         "--force",
-        "--python",
-        "3.14",
-        "--fetch-python=missing",
         "ash-ai[browser] @ git+https://github.com/Suraj-H675/Ash-Harness.git",
     ] in calls
 
 
-def test_existing_pipx_install_does_not_preserve_unsupported_runtime_minor() -> None:
+def test_existing_pipx_install_does_not_pass_ineffective_runtime_override() -> None:
     calls: list[list[str]] = []
     metadata = json.dumps(
         {
@@ -988,9 +1141,6 @@ def test_existing_pipx_install_does_not_preserve_unsupported_runtime_minor() -> 
         "/usr/bin/pipx",
         "install",
         "--force",
-        "--python",
-        "3.12",
-        "--fetch-python=missing",
         "ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git",
     ] in calls
 
@@ -1041,9 +1191,6 @@ def test_explicit_pipx_extra_is_additive_to_existing_capability_packs() -> None:
         "/usr/bin/pipx",
         "install",
         "--force",
-        "--python",
-        _current_runtime_python(),
-        "--fetch-python=missing",
         "ash-ai[browser,server] @ git+https://github.com/Suraj-H675/Ash-Harness.git",
     ] in calls
 

@@ -40,7 +40,7 @@ branches.
 Ash's production install path is one command on Linux and macOS:
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/install.sh | sh
+(tmp=$(mktemp) && trap 'rm -f "$tmp"' EXIT && curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/install.sh -o "$tmp" && sh "$tmp")
 ```
 
 The bootstrap owns the installation machinery for the user. If necessary it
@@ -49,10 +49,16 @@ Ash release, verifies the standalone installer against GitHub's release SHA-256
 metadata, and then installs the verified release wheel through Ash's existing
 pipx/uv installer. No GitHub CLI or manual release/tag handling is required.
 
+Run the same command again at any time. If Ash is not installed, it installs
+the latest release. If the managed installation is older, it updates through
+the same pipx/uv owner while preserving enabled capability packs. If the exact
+verified release is already installed, Ash makes no package changes and reports
+that the user is already on the latest version.
+
 Optional capability packs use the same install flow:
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/install.sh | sh -s -- --extra browser
+(tmp=$(mktemp) && trap 'rm -f "$tmp"' EXIT && curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/install.sh -o "$tmp" && sh "$tmp" --extra browser)
 ```
 
 Development setup and release-maintainer instructions are intentionally

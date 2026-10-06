@@ -51,6 +51,11 @@ _EXTRAS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _UV_EXTRAS_PATTERN = re.compile(r"\[extras:\s*([^]]+)\]", re.IGNORECASE)
+_UV_REQUIRED_PATTERN = re.compile(r"\[required:\s*([^]]+)\]", re.IGNORECASE)
+_UV_VERSION_PATTERN = re.compile(
+    rf"^{re.escape(_PACKAGE_NAME)}\s+v([^\s]+)",
+    re.IGNORECASE,
+)
 _UV_ASH_PATH_PATTERN = re.compile(r"^-\s+ash\s+\(([^)]+)\)\s*$", re.MULTILINE)
 _UV_PYTHON_PATTERN = re.compile(
     r"\[[A-Za-z][A-Za-z0-9_.+-]*\s+(\d+\.\d+(?:\.\d+)?)\]"
@@ -326,6 +331,7 @@ class InstallResult:
     executable: str
     version: str
     shell_restart_required: bool = False
+    changed: bool = True
 
 
 @dataclass(frozen=True)
@@ -334,6 +340,8 @@ class _PipxState:
     extras: tuple[str, ...] = ()
     executable: str | None = None
     runtime_python: str | None = None
+    package_version: str | None = None
+    package_spec: str | None = None
 
 
 @dataclass(frozen=True)
@@ -352,6 +360,8 @@ class _UvState:
     extras: tuple[str, ...] = ()
     executable: str | None = None
     runtime_python: str | None = None
+    package_version: str | None = None
+    package_spec: str | None = None
 
 
 @dataclass(frozen=True)
@@ -487,6 +497,43 @@ def install(
     # already-enabled pack when a user adds another one later.
     selected_extras = _merge_capability_extras(previous.extras, requested_extras)
     selected_runtime_python = previous.runtime_python or runtime_python
+    launcher_directory = None
+    existing_executable = None
+    current_version = None
+    if previous.installed and ref is not None:
+        launcher_directory = _pipx_bin_directory(
+            pipx,
+            runner=runner,
+            environment=environment,
+        )
+        existing_executable = _executable_in_directory(launcher_directory)
+        current_version = _current_release_version(
+            existing_executable,
+            existing_extras=previous.extras,
+            selected_extras=selected_extras,
+            package_version=previous.package_version,
+            package_spec=previous.package_spec,
+            ref=ref,
+            require_digest=True,
+            runner=runner,
+            environment=environment,
+        )
+    if current_version is not None:
+        restart_required = _ensure_shell_path(
+            pipx,
+            manager="pipx",
+            launcher_directory=launcher_directory,
+            runner=runner,
+            environment=environment,
+        )
+        assert existing_executable is not None
+        return InstallResult(
+            manager="pipx",
+            executable=existing_executable,
+            version=current_version,
+            shell_restart_required=restart_required,
+            changed=False,
+        )
     install_environment = dict(environment)
     install_environment["UV_VENV_CLEAR"] = "1"
     with _prepared_package_spec(
@@ -495,7 +542,7 @@ def install(
         release_opener=release_opener,
     ) as package_spec:
         install_command = [pipx, "install", "--force"]
-        if selected_runtime_python is not None:
+        if selected_runtime_python is not None and not previous.installed:
             install_command.extend(
                 ["--python", selected_runtime_python, "--fetch-python=missing"]
             )
@@ -666,6 +713,43 @@ def _install_with_uv(
     # pipx/uv invocation. This makes upgrades and repairs additive and safe.
     selected_extras = _merge_capability_extras(previous.extras, extras)
     selected_runtime_python = previous.runtime_python or runtime_python
+    launcher_directory = None
+    existing_executable = None
+    current_version = None
+    if previous.installed and ref is not None:
+        launcher_directory = _uv_bin_directory(
+            uv,
+            runner=runner,
+            environment=environment,
+        )
+        existing_executable = _executable_in_directory(launcher_directory)
+        current_version = _current_release_version(
+            existing_executable,
+            existing_extras=previous.extras,
+            selected_extras=selected_extras,
+            package_version=previous.package_version,
+            package_spec=previous.package_spec,
+            ref=ref,
+            require_digest=False,
+            runner=runner,
+            environment=environment,
+        )
+    if current_version is not None:
+        restart_required = _ensure_shell_path(
+            uv,
+            manager="uv",
+            launcher_directory=launcher_directory,
+            runner=runner,
+            environment=environment,
+        )
+        assert existing_executable is not None
+        return InstallResult(
+            manager="uv",
+            executable=existing_executable,
+            version=current_version,
+            shell_restart_required=restart_required,
+            changed=False,
+        )
     with _prepared_package_spec(
         selected_extras,
         ref=ref,
@@ -688,19 +772,11 @@ def _install_with_uv(
         raise InstallError(
             "uv reported a successful install, but Ash is absent from the resulting uv state."
         )
-    directory = _run_captured(
-        [uv, "tool", "dir", "--bin"],
+    launcher_directory = _uv_bin_directory(
+        uv,
         runner=runner,
         environment=environment,
-        timeout=_QUERY_TIMEOUT_SECONDS,
-        max_bytes=_MAX_QUERY_OUTPUT_BYTES,
-        description="uv tool directory query",
     )
-    if int(getattr(directory, "returncode", 1)) != 0:
-        raise InstallError(
-            "Ash was installed, but uv did not report its executable directory."
-        )
-    launcher_directory = str(getattr(directory, "stdout", "")).strip()
     executable = _executable_in_directory(launcher_directory)
     if not executable:
         raise InstallError(
@@ -721,6 +797,88 @@ def _install_with_uv(
         version=version,
         shell_restart_required=restart_required,
     )
+
+
+def _uv_bin_directory(
+    uv: str,
+    *,
+    runner: Callable[..., Any],
+    environment: Mapping[str, str],
+) -> str | None:
+    directory = _run_captured(
+        [uv, "tool", "dir", "--bin"],
+        runner=runner,
+        environment=environment,
+        timeout=_QUERY_TIMEOUT_SECONDS,
+        max_bytes=_MAX_QUERY_OUTPUT_BYTES,
+        description="uv tool directory query",
+    )
+    if int(getattr(directory, "returncode", 1)) != 0:
+        return None
+    rendered = str(getattr(directory, "stdout", "")).strip()
+    return rendered or None
+
+
+def _current_release_version(
+    executable: str | None,
+    *,
+    existing_extras: Sequence[str],
+    selected_extras: Sequence[str],
+    package_version: str | None,
+    package_spec: str | None,
+    ref: str | None,
+    require_digest: bool,
+    runner: Callable[..., Any],
+    environment: Mapping[str, str],
+) -> str | None:
+    if ref is None or executable is None:
+        return None
+    if _normalize_extras(existing_extras) != _normalize_extras(selected_extras):
+        return None
+    if not _matches_release_package(
+        package_version=package_version,
+        package_spec=package_spec,
+        ref=ref,
+        require_digest=require_digest,
+    ):
+        return None
+    try:
+        version = _verify_executable(
+            executable,
+            runner=runner,
+            environment=environment,
+        )
+    except InstallError:
+        return None
+    try:
+        _verify_release_version(version, ref=ref)
+    except InstallError:
+        return None
+    return version
+
+
+def _matches_release_package(
+    *,
+    package_version: str | None,
+    package_spec: str | None,
+    ref: str,
+    require_digest: bool,
+) -> bool:
+    expected_version = ref.removeprefix("ash-v")
+    if package_version != expected_version or not package_spec:
+        return False
+    requirement = package_spec.split(" @ ", 1)[-1].strip()
+    parsed = urllib.parse.urlsplit(requirement)
+    if parsed.scheme != "file" or parsed.query:
+        return False
+    filename = Path(urllib.parse.unquote(parsed.path)).name
+    if filename != f"ash_ai-{expected_version}-py3-none-any.whl":
+        return False
+    if require_digest:
+        return re.fullmatch(r"sha256=[0-9a-f]{64}", parsed.fragment) is not None
+    return not parsed.fragment or re.fullmatch(
+        r"sha256=[0-9a-f]{64}", parsed.fragment
+    ) is not None
 
 
 def _ensure_shell_path(
@@ -831,6 +989,12 @@ def _read_pipx_state(
     if not isinstance(main, dict):
         return _PipxInspection(None, "pipx returned an unexpected JSON shape")
     package_spec = str(main.get("package_or_url", ""))
+    raw_package_version = main.get("package_version")
+    package_version = (
+        str(raw_package_version).strip()
+        if isinstance(raw_package_version, str) and raw_package_version.strip()
+        else None
+    )
     match = _EXTRAS_PATTERN.match(package_spec)
     extras = _normalize_extras(
         match.group(1).split(",") if match and match.group(1) else ()
@@ -849,6 +1013,8 @@ def _read_pipx_state(
             extras=extras,
             executable=executable,
             runtime_python=runtime_python,
+            package_version=package_version,
+            package_spec=package_spec or None,
         )
     )
 
@@ -913,6 +1079,10 @@ def _read_uv_state(
     block = "\n".join(block_lines)
     extras_match = _UV_EXTRAS_PATTERN.search(block_lines[0])
     extras = _normalize_extras(extras_match.group(1).split(",") if extras_match else ())
+    version_match = _UV_VERSION_PATTERN.search(block_lines[0])
+    package_version = version_match.group(1) if version_match else None
+    required_match = _UV_REQUIRED_PATTERN.search(block_lines[0])
+    package_spec = required_match.group(1).strip() if required_match else None
     path_match = _UV_ASH_PATH_PATTERN.search(block)
     executable = path_match.group(1).strip() if path_match else None
     python_match = _UV_PYTHON_PATTERN.search(block_lines[0]) if show_python else None
@@ -924,6 +1094,8 @@ def _read_uv_state(
         extras=extras,
         executable=executable,
         runtime_python=runtime_python,
+        package_version=package_version,
+        package_spec=package_spec,
     )
 
 
@@ -1627,7 +1799,13 @@ def main(
             "Ash installation cancelled; no Ash configuration was changed.", file=errors
         )
         return 130
-    print(f"Ash is ready ({result.version}) via {result.manager}.", file=output)
+    if result.changed:
+        print(f"Ash is ready ({result.version}) via {result.manager}.", file=output)
+    else:
+        print(
+            f"Ash is already on the latest version ({result.version}) via {result.manager}.",
+            file=output,
+        )
     print(f"Executable: {result.executable}", file=output)
     if result.shell_restart_required:
         print(
