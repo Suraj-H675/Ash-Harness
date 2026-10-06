@@ -38,6 +38,19 @@ class SizedDummyOutput(DummyOutput):
         return Size(rows=self.rows, columns=self.columns)
 
 
+class TrackingMouseOutput(SizedDummyOutput):
+    def __init__(self, columns: int, rows: int) -> None:
+        super().__init__(columns, rows)
+        self.mouse_enabled = 0
+        self.mouse_disabled = 0
+
+    def enable_mouse_support(self) -> None:
+        self.mouse_enabled += 1
+
+    def disable_mouse_support(self) -> None:
+        self.mouse_disabled += 1
+
+
 def _plain(value) -> str:
     return "".join(fragment[1] for fragment in to_formatted_text(value))
 
@@ -565,6 +578,85 @@ def test_viewport_mouse_wheel_scrolls_transcript(tmp_path: Path) -> None:
     assert result is None
     assert viewport.transcript_window.vertical_scroll == 6
     assert viewport._follow_tail is False
+    viewport.close()
+
+
+def test_viewport_mouse_capture_can_toggle_at_runtime(tmp_path: Path) -> None:
+    viewport = TranscriptViewport(
+        Transcript(),
+        history_path=tmp_path / "history",
+        mouse_support=True,
+    )
+
+    assert viewport.mouse_capture_enabled is True
+    assert viewport.application.renderer.mouse_support() is True
+
+    viewport.set_mouse_capture(False)
+    assert viewport.mouse_capture_enabled is False
+    assert viewport.application.renderer.mouse_support() is False
+
+    viewport.set_mouse_capture(True)
+    assert viewport.mouse_capture_enabled is True
+    assert viewport.application.renderer.mouse_support() is True
+    viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_runtime_mouse_toggle_updates_terminal_reporting(
+    tmp_path: Path,
+) -> None:
+    with create_pipe_input() as pipe:
+        output = TrackingMouseOutput(columns=80, rows=24)
+        viewport = TranscriptViewport(
+            Transcript(),
+            history_path=tmp_path / "history",
+            mouse_support=True,
+            input=pipe,
+            output=output,
+        )
+        pending = asyncio.create_task(viewport.read("> "))
+        await asyncio.sleep(0.05)
+        assert output.mouse_enabled >= 1
+
+        viewport.set_mouse_capture(False)
+        await asyncio.sleep(0.05)
+        assert output.mouse_disabled >= 1
+
+        pipe.send_text("done\r")
+        assert await pending == "done"
+        viewport.close()
+
+
+def test_viewport_choice_supports_left_click(tmp_path: Path) -> None:
+    viewport = TranscriptViewport(
+        Transcript(),
+        history_path=tmp_path / "history",
+        mouse_support=True,
+    )
+    viewport._choice_mode = True
+    viewport._choice_options = (
+        ViewportChoice("once", "Allow once"),
+        ViewportChoice("deny", "Deny"),
+    )
+    viewport._choice_selected = 0
+    viewport._running = True
+    exit_mock = Mock()
+    viewport.application.exit = exit_mock
+
+    result = viewport._handle_choice_mouse(
+        1,
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        ),
+    )
+
+    assert result is None
+    assert viewport._choice_selected == 1
+    exit_mock.assert_called_once_with(result="deny")
+    viewport._running = False
     viewport.close()
 
 

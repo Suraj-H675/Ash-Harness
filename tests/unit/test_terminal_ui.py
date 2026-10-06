@@ -594,8 +594,8 @@ def test_side_by_side_rich_diff_styles_each_changed_half() -> None:
     styled = [
         (str(span.style), body.plain[span.start : span.end]) for span in body.spans
     ]
-    assert ("#c8c8c8 on #3a2222", "- old                                 ") in styled
-    assert ("#c8c8c8 on #1f3324", "+ new") in styled
+    assert ("#c8c8c8 on #6b252e", "- old                                 ") in styled
+    assert ("#c8c8c8 on #14532d", "+ new") in styled
 
 
 def test_terminal_ui_does_not_read_oversized_existing_file(tmp_path, monkeypatch):

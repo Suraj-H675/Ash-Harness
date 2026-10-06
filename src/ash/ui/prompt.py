@@ -610,6 +610,18 @@ class PromptInput:
     def uses_viewport(self) -> bool:
         return self._viewport is not None
 
+    @property
+    def mouse_capture_enabled(self) -> bool:
+        return bool(
+            self._viewport is not None and self._viewport.mouse_capture_enabled
+        )
+
+    def set_mouse_capture(self, enabled: bool) -> bool:
+        if self._viewport is None:
+            return False
+        self._viewport.set_mouse_capture(enabled)
+        return True
+
     def set_extra_commands(self, commands: dict[str, str] | list[str]) -> None:
         if self._completer is None:
             return

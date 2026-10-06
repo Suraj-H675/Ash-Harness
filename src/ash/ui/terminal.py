@@ -96,21 +96,14 @@ def _append_preview_truncation(preview: str, truncated: bool) -> str:
 
 
 def _rich_diff_style(theme_name: str, line: str) -> str:
+    theme = get_theme(theme_name)
     if line.startswith(("+++", "---", "@@")):
-        return "bold #5f87af" if theme_name == "dark" else "bold #005faf"
+        return theme.diff_hunk
     if line.startswith("+"):
-        return (
-            "#c8c8c8 on #1f3324"
-            if theme_name == "dark"
-            else "#333333 on #dff3e4"
-        )
+        return theme.diff_added.replace(" bg:", " on ")
     if line.startswith("-"):
-        return (
-            "#c8c8c8 on #3a2222"
-            if theme_name == "dark"
-            else "#333333 on #f8dddd"
-        )
-    return "#a8a8a8" if theme_name == "dark" else "#555555"
+        return theme.diff_removed.replace(" bg:", " on ")
+    return theme.diff_context
 
 
 def _append_styled_diff(

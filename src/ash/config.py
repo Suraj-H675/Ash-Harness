@@ -656,7 +656,9 @@ class AshConfig(BaseSettings):
     )
     tui_mouse: bool = Field(
         True,
-        description="Enable mouse interaction in the full-screen terminal UI.",
+        description=(
+            "Enable full-screen terminal mouse capture for wheel and click interaction."
+        ),
     )
     notification_method: str = Field(
         "off",

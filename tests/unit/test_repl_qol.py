@@ -21,6 +21,7 @@ def _install_frontend(
     *,
     turn_inputs: list[str] | None = None,
     turn_metadata: list[dict | None] | None = None,
+    mouse_states: list[bool] | None = None,
 ):
     class FakeTerminalUI:
         transcript = None
@@ -44,7 +45,9 @@ def _install_frontend(
         supports_full_screen_ui = False
 
         def __init__(self, *args, **kwargs) -> None:
-            pass
+            del args
+            self.uses_viewport = kwargs.get("tui_mode") == "viewport"
+            self.mouse_capture_enabled = bool(kwargs.get("mouse_support", False))
 
         async def read(self, prompt: str) -> str:
             del prompt
@@ -52,6 +55,14 @@ def _install_frontend(
 
         def set_extra_commands(self, commands) -> None:
             del commands
+
+        def set_mouse_capture(self, enabled: bool) -> bool:
+            if not self.uses_viewport:
+                return False
+            self.mouse_capture_enabled = enabled
+            if mouse_states is not None:
+                mouse_states.append(enabled)
+            return True
 
     class FakeStatusLine:
         def __init__(self, *args, **kwargs) -> None:
@@ -145,12 +156,14 @@ async def _run_repl(
     config_overrides: dict | None = None,
     turn_inputs: list[str] | None = None,
     turn_metadata: list[dict | None] | None = None,
+    mouse_states: list[bool] | None = None,
 ) -> int:
     ui_type = _install_frontend(
         monkeypatch,
         commands,
         turn_inputs=turn_inputs,
         turn_metadata=turn_metadata,
+        mouse_states=mouse_states,
     )
     monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -550,3 +563,29 @@ async def test_settings_shows_runtime_terminal_and_safety_preferences(
         "Run `ash config`",
     ):
         assert expected in output
+
+
+@pytest.mark.asyncio
+async def test_mouse_command_toggles_viewport_capture_for_current_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    states: list[bool] = []
+
+    assert (
+        await _run_repl(
+            tmp_path,
+            monkeypatch,
+            iter(("/mouse off", "/mouse on", "/mouse", "/settings", "exit")),
+            config_overrides={"tui_mode": "viewport", "tui_mouse": True},
+            mouse_states=states,
+        )
+        == 0
+    )
+
+    assert states == [False, True, False]
+    output = capsys.readouterr().out
+    assert "terminal-native selection and context menus are restored" in output
+    assert "wheel scrolling and Ash clicks are enabled" in output
+    assert "Mouse: off" in output

@@ -32,6 +32,12 @@ edit diff visible while presenting a selector for the common decisions:
 - **More approval options…** — open the less common persistent or broader
   permission choices.
 
+Use the arrow keys and Enter or click a choice with the left mouse button.
+When terminal mouse capture is enabled, `/mouse off` releases the mouse back
+to the terminal for native selection and context-menu behavior; `/mouse on`
+restores Ash wheel/click interaction. Terminals such as Ghostty also reserve
+Shift+mouse for native selection while application mouse reporting is active.
+
 The advanced selector retains Ash's explicit permission scopes: allow a tool
 for the session, persist an exact project scope, edit and persist an exact
 scope, persist an exact deny, and (for `run_command`) persist a verified command

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from io import StringIO
 from typing import Any
@@ -36,7 +37,7 @@ from prompt_toolkit.layout import (
     Window,
 )
 from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.output.base import Output
 from rich.cells import cell_len, set_cell_size
@@ -267,7 +268,7 @@ class TranscriptViewport:
         self._running = False
         self._follow_tail = True
         self._manual_cursor_line = 0
-        self.mouse_support = mouse_support
+        self._mouse_capture_enabled = mouse_support
         self._choice_mode = False
         self._choice_title = ""
         self._choice_options: tuple[ViewportChoice, ...] = ()
@@ -369,7 +370,7 @@ class TranscriptViewport:
             erase_when_done=False,
             editing_mode=EditingMode.VI if input_mode == "vi" else EditingMode.EMACS,
             style=prompt_style(viewport_styles(selected_theme), no_color=no_color),
-            mouse_support=mouse_support,
+            mouse_support=Condition(lambda: self._mouse_capture_enabled),
             input=input,
             output=output,
             min_redraw_interval=0.03,
@@ -448,13 +449,12 @@ class TranscriptViewport:
             )
         else:
             rendered = self._formatter.format(entries, width=width)
-        if self.mouse_support:
-            rendered = FormattedText(
-                [
-                    (fragment[0], fragment[1], self._handle_transcript_mouse)
-                    for fragment in to_formatted_text(rendered)
-                ]
-            )
+        rendered = FormattedText(
+            [
+                (fragment[0], fragment[1], self._handle_transcript_mouse)
+                for fragment in to_formatted_text(rendered)
+            ]
+        )
         self._last_transcript_text = rendered
         return rendered
 
@@ -512,13 +512,16 @@ class TranscriptViewport:
         )
 
     def _choice_text(self) -> AnyFormattedText:
-        fragments: list[tuple[str, str]] = []
+        fragments: list[tuple[str, str] | tuple[str, str, Any]] = []
         for index, option in enumerate(self._choice_options):
             selected = index == self._choice_selected
             style = "class:selected" if selected else ""
             marker = "> " if selected else "  "
-            fragments.append((style, marker))
-            fragments.append((f"{style} class:option".strip(), option.label))
+            mouse_handler = partial(self._handle_choice_mouse, index)
+            fragments.append((style, marker, mouse_handler))
+            fragments.append(
+                (f"{style} class:option".strip(), option.label, mouse_handler)
+            )
             fragments.append((style, "\n"))
         return FormattedText(fragments)
 
@@ -566,6 +569,33 @@ class TranscriptViewport:
             self._scroll_transcript(3)
             return None
         return NotImplemented
+
+    def _handle_choice_mouse(self, index: int, event: MouseEvent) -> object:
+        if (
+            not self._choice_mode
+            or index < 0
+            or index >= len(self._choice_options)
+            or event.button != MouseButton.LEFT
+        ):
+            return NotImplemented
+        if event.event_type == MouseEventType.MOUSE_DOWN:
+            self._choice_selected = index
+            self.application.invalidate()
+            return None
+        if event.event_type == MouseEventType.MOUSE_UP:
+            self._choice_selected = index
+            self.application.exit(result=self._choice_options[index].value)
+            return None
+        return NotImplemented
+
+    @property
+    def mouse_capture_enabled(self) -> bool:
+        return self._mouse_capture_enabled
+
+    def set_mouse_capture(self, enabled: bool) -> None:
+        self._mouse_capture_enabled = bool(enabled)
+        if self._running:
+            self.application.invalidate()
 
     def _key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()

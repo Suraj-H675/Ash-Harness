@@ -1134,7 +1134,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         if parsed_command is None and not custom_expansion:
             user_input = submitted_input
 
-        safe_displaced_commands = {"exit", "help", "status"}
+        safe_displaced_commands = {"exit", "help", "status", "mouse"}
         if not (
             parsed_command is not None
             and parsed_command[0].name in safe_displaced_commands
@@ -1317,6 +1317,48 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     ),
                     flush=True,
                 )
+                continue
+            if command.name == "mouse":
+                if len(arguments) > 1:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                action = arguments[0].casefold() if arguments else "toggle"
+                if action not in {"on", "off", "toggle"}:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                if not prompt_input.uses_viewport:
+                    print(
+                        "Mouse capture is only available in the full-screen "
+                        "viewport.",
+                        flush=True,
+                    )
+                    continue
+                enabled = (
+                    not prompt_input.mouse_capture_enabled
+                    if action == "toggle"
+                    else action == "on"
+                )
+                if not prompt_input.set_mouse_capture(enabled):
+                    print(
+                        "Mouse capture is unavailable in this terminal mode.",
+                        flush=True,
+                    )
+                    continue
+                config.tui_mouse = enabled
+                if enabled:
+                    print(
+                        "Mouse capture on for this session: wheel scrolling and "
+                        "Ash clicks are enabled. Hold Shift for terminal-native "
+                        "mouse handling, or use /mouse off to release the mouse.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "Mouse capture off for this session: terminal-native "
+                        "selection and context menus are restored. Use PageUp/"
+                        "PageDown to scroll Ash.",
+                        flush=True,
+                    )
                 continue
             if command.name == "recovery":
                 from ash.commands.sessions import render_recovery_reports

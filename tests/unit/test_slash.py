@@ -51,6 +51,7 @@ def test_help_lists_core_session_commands() -> None:
     assert "/status" in rendered
     assert "/usage" in rendered
     assert "/settings" in rendered
+    assert "/mouse [on|off|toggle]" in rendered
     assert "/cancel" in rendered
     assert "/retry" in rendered
     assert "/review [worktree|staged|commit REF|branch BASE]" in rendered

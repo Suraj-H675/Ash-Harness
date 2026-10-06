@@ -28,6 +28,8 @@ def test_default_and_light_themes_expose_distinct_palettes():
 
     assert dark.name == "dark"
     assert dark.composer == "bg:#1c1c1c"
+    assert dark.diff_added == "#c8c8c8 bg:#14532d"
+    assert dark.diff_removed == "#c8c8c8 bg:#6b252e"
     assert light.composer == "bg:#eaeaea #111111"
 
 

@@ -26,6 +26,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         aliases=("cost",),
     ),
     SlashCommand("settings", "Show active runtime settings", "/settings"),
+    SlashCommand(
+        "mouse",
+        "Toggle or set full-screen terminal mouse capture",
+        "/mouse [on|off|toggle]",
+    ),
     SlashCommand("cancel", "Cancel the running turn", "/cancel"),
     SlashCommand(
         "model",
