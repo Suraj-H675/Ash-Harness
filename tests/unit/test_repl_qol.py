@@ -26,7 +26,7 @@ def _install_frontend(
         transcript = None
 
         def __init__(self, *args, **kwargs) -> None:
-            self.viewport_mode = False
+            pass
 
         def write_status(self, text: str, *, error: bool = False) -> None:
             builtins.print(
@@ -40,13 +40,11 @@ def _install_frontend(
 
     class FakePromptInput:
         interactive = False
-        uses_viewport = True
-        supports_choice_ui = True
         supports_full_screen_ui = False
 
         def __init__(self, *args, **kwargs) -> None:
-            del args
-            del kwargs
+            del args, kwargs
+            self.supports_choice_ui = True
 
         async def read(self, prompt: str) -> str:
             del prompt
@@ -193,6 +191,7 @@ def _persist_turn(
 async def test_retry_rewinds_old_answer_and_replays_primary_user_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys,
 ) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     session = store.create_session(str(tmp_path), model="ollama/test-model")
@@ -234,6 +233,7 @@ async def test_retry_rewinds_old_answer_and_replays_primary_user_metadata(
     )
     assert turns == ["retry this request"]
     assert metadata == [{"source": "test"}]
+    assert "ok" in capsys.readouterr().out
     assert store.load_session(session.session_id).messages == []
 
 
@@ -537,8 +537,7 @@ async def test_settings_shows_runtime_terminal_and_safety_preferences(
         "Fallbacks: groq/fallback",
         "Permission mode: auto_edit",
         "Input: vi",
-        "Interface: Ash viewport",
-        "Mouse: Ash-managed",
+        "Interface: terminal-native",
         "Reduced motion: on",
         "Token meter: on",
         "Sandbox: native",

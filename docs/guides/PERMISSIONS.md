@@ -32,10 +32,9 @@ edit diff visible while presenting a selector for the common decisions:
 - **More approval options…** — open the less common persistent or broader
   permission choices.
 
-Use the arrow keys and Enter or click a choice with the left mouse button.
-Ash owns mouse interaction inside its terminal viewport: wheel events scroll
-the transcript, drag selection is highlighted and copied by Ash, and
-right-click copies an active selection or pastes into the composer.
+Use the arrow keys and Enter to choose. Normal conversation interaction remains
+terminal-native: selection, copy, wheel scrolling, links, and context-menu
+behavior are not routed through Ash's transcript renderer.
 
 The advanced selector retains Ash's explicit permission scopes: allow a tool
 for the session, persist an exact project scope, edit and persist an exact

@@ -34,7 +34,7 @@ def _install_fake_repl_frontend(
         transcript = None
 
         def __init__(self, *args, **kwargs) -> None:
-            self.viewport_mode = False
+            pass
 
         def write_status(self, text: str, *, error: bool = False) -> None:
             builtins.print(text, end="", file=__import__("sys").stderr if error else None)
@@ -44,7 +44,6 @@ def _install_fake_repl_frontend(
 
     class FakePromptInput:
         interactive = False
-        uses_viewport = False
         supports_full_screen_ui = False
 
         def __init__(self, *args, **kwargs) -> None:

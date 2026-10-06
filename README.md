@@ -350,12 +350,11 @@ foreground work; use durable automation for scheduled or unattended jobs.
 
 The interactive interface is built for sustained terminal work:
 
-- one full-screen Ash viewport with app-owned wheel scrolling, transcript
-  selection/copy, composer cursor placement and selection, right-click
-  copy/paste behavior, and clickable approval choices;
-- normal keyboard navigation remains available, while limited terminals,
-  redirected input, and screen-reader mode use the deterministic linear
-  fallback;
+- conversation output lives in the terminal's normal scrollback, so wheel
+  scrolling, selection, copy, links, and context-menu behavior remain
+  terminal-native and do not depend on Ash repainting the transcript;
+- Ash uses a compact non-full-screen editor for input and temporarily owns only
+  bounded interactive surfaces such as approval selectors;
 - Rich Markdown and fenced-code rendering with bounded repaint frequency;
 - streaming user, assistant, reasoning, tool, approval, status, error, and
   recovery entries;
@@ -366,8 +365,7 @@ The interactive interface is built for sustained terminal work:
 - `/` command registry with aliases, parsing, completion, and stable help;
 - `@` file, directory, image, symbol, and MCP-resource completion;
 - unified or side-by-side bounded approval diffs with high-contrast,
-  theme-aware added/removed highlighting and a compact keyboard/mouse approval
-  selector;
+  theme-aware added/removed highlighting and a compact approval selector;
 - status surfaces for model, branch, context, cache, cost, sandbox, session,
   and working directory;
 - validated dark and light themes;

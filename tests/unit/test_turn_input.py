@@ -30,7 +30,6 @@ from ash.ui.turn_input import (
 
 
 class RoutedPrompt:
-    uses_viewport = False
     supports_choice_ui = False
 
     def __init__(self) -> None:
@@ -45,8 +44,7 @@ class RoutedPrompt:
         return await self.steering.get()
 
 
-class ViewportApprovalPrompt(RoutedPrompt):
-    uses_viewport = True
+class SelectorApprovalPrompt(RoutedPrompt):
     supports_choice_ui = True
 
     def __init__(self) -> None:
@@ -59,7 +57,6 @@ class ViewportApprovalPrompt(RoutedPrompt):
         self.choice_calls.append((title, tuple(option.label for option in options)))
         self.choice_defaults.append(default_value)
         return await self.selections.get()
-
 
 class RecordingNotifier:
     def __init__(self) -> None:
@@ -348,10 +345,10 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_viewport_approval_uses_selector_instead_of_letter_prompt(
+async def test_interactive_approval_uses_selector_instead_of_letter_prompt(
     tmp_path: Path,
 ) -> None:
-    prompt = ViewportApprovalPrompt()
+    prompt = SelectorApprovalPrompt()
     await prompt.selections.put("y")
     ui = make_ui()
     guard = SafetyGuard(tmp_path)
@@ -390,10 +387,10 @@ async def test_viewport_approval_uses_selector_instead_of_letter_prompt(
 
 
 @pytest.mark.asyncio
-async def test_viewport_approval_keeps_broader_rules_behind_more_options(
+async def test_selector_approval_keeps_broader_rules_behind_more_options(
     tmp_path: Path,
 ) -> None:
-    prompt = ViewportApprovalPrompt()
+    prompt = SelectorApprovalPrompt()
     await prompt.selections.put("more")
     await prompt.selections.put("a")
     ui = make_ui()

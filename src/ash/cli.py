@@ -833,8 +833,6 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
 
     prompt_input = PromptInput(
         status_provider=status_line,
-        header_provider=status_line.header,
-        viewport_status_provider=status_line.footer,
         extra_commands={
             command.name: command.description for command in discovered_commands
         },
@@ -842,7 +840,6 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         input_mode=config.input_mode,
         keybindings=config.keybindings,
         workspace_root=loop.project_root,
-        transcript=loop.ui.transcript if isinstance(loop.ui, TerminalUI) else None,
         theme=config.theme,
         no_color=config.no_color,
         repo_map=getattr(loop, "repo_map", None),
@@ -851,9 +848,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     )
     if not isinstance(loop.ui, TerminalUI):
         raise TypeError("interactive REPL requires TerminalUI")
-    loop.ui.viewport_mode = prompt_input.uses_viewport
     loop.ui.load_session_transcript(loop.current_session)
-    print = ReplPrinter(loop.ui, viewport=prompt_input.uses_viewport)  # noqa: A001
+    print = ReplPrinter(loop.ui, viewport=False)  # noqa: A001
 
     def _print_classified_error(exc: BaseException) -> None:
         """Route interactive classified failures through the active UI surface."""
@@ -1056,11 +1052,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             ),
         )
 
-    if not prompt_input.uses_viewport:
-        print(
-            "ASH · type /help for commands",
-            flush=True,
-        )
+    print(
+        "ASH · type /help for commands",
+        flush=True,
+    )
     no_argument_commands = frozenset(
         {
             "exit",
@@ -1300,8 +1295,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"  Fallbacks: {fallbacks}",
                             f"  Permission mode: {loop.safety_tier}",
                             f"  Input: {config.input_mode}",
-                            "  Interface: Ash viewport",
-                            "  Mouse: Ash-managed",
+                            "  Interface: terminal-native",
                             f"  Theme: {config.theme}",
                             f"  Screen reader: {'on' if config.screen_reader_mode else 'off'}",
                             f"  Reduced motion: {'on' if config.reduced_motion else 'off'}",
@@ -1431,7 +1425,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 except Exception as exc:  # noqa: BLE001
                     _print_classified_error(exc)
                     continue
-                if response is not None and not prompt_input.uses_viewport:
+                if response is not None:
                     print(response, flush=True)
                 continue
             if command.name == "new":
@@ -2772,8 +2766,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         except Exception as exc:  # noqa: BLE001
             _print_classified_error(exc)
             continue
-        if not prompt_input.uses_viewport:
-            print(response, flush=True)
+        print(response, flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:

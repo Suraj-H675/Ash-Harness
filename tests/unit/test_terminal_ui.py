@@ -201,80 +201,25 @@ def test_terminal_ui_does_not_commit_empty_assistant_entry() -> None:
     assert ui.transcript.snapshot() == ()
 
 
-def test_terminal_ui_viewport_mode_uses_transcript_without_live_output() -> None:
-    output = StringIO()
-    ui = TerminalUI(console=Console(file=output, force_terminal=False))
-    ui.viewport_mode = True
-
-    with ui.begin_turn():
-        ui.print_token("visible in viewport")
-    ui.finalize_turn()
-    ui.write_status("queued")
-
-    assert output.getvalue() == ""
-    assert [entry.content for entry in ui.transcript.snapshot()] == [
-        "visible in viewport",
-        "queued",
-    ]
-
-
-def test_terminal_ui_viewport_activity_is_ephemeral_and_not_duplicated() -> None:
+def test_suspend_live_render_pauses_and_resumes_same_live_instance() -> None:
     ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
-    ui.viewport_mode = True
+    calls: list[tuple[str, bool | None]] = []
 
-    ui.emit_event({"type": "turn.started"})
-    ui.emit_event(
-        {
-            "type": "model.request.started",
-            "attempt": 1,
-            "max_attempts": 3,
-        }
-    )
+    class FakeLive:
+        def stop(self) -> None:
+            calls.append(("stop", None))
 
-    working = ui.transcript.snapshot()
-    assert len(working) == 1
-    assert working[0].kind == "status"
-    assert working[0].content == "Thinking…"
-    assert working[0].finalized is False
+        def start(self, refresh: bool = False) -> None:
+            calls.append(("start", refresh))
 
-    ui.emit_event(
-        {
-            "type": "tool.started",
-            "tool": "read_file",
-            "call_id": "c1",
-        }
-    )
+    live = FakeLive()
+    ui._active_live = live  # type: ignore[assignment]
 
-    entries = ui.transcript.snapshot()
-    assert len(entries) == 1
-    assert entries[0].kind == "status"
-    assert entries[0].content == "Running read_file…"
-    assert ui._activity_status == "Running read_file…"
+    with ui.suspend_live_render():
+        assert calls == [("stop", None)]
+        assert ui._active_live is live
 
-    ui.emit_event(
-        {
-            "type": "tool.completed",
-            "tool": "read_file",
-            "call_id": "c1",
-            "success": True,
-        }
-    )
-
-    entries = ui.transcript.snapshot()
-    assert [entry.content for entry in entries] == ["read_file [completed]"]
-    assert ui._activity_status == ""
-    assert ui._activity_entry_id is None
-
-
-def test_terminal_ui_viewport_activity_clears_on_first_assistant_delta() -> None:
-    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
-    ui.viewport_mode = True
-
-    ui.emit_event({"type": "turn.started"})
-    ui.emit_event({"type": "assistant.delta", "text": "hello"})
-
-    assert ui.transcript.snapshot() == ()
-    assert ui._activity_status == ""
+    assert calls == [("stop", None), ("start", True)]
 
 
 def test_inline_long_tool_activity_remains_visible_after_reasoning() -> None:
@@ -316,7 +261,6 @@ def test_inline_tool_lifecycle_uses_shared_semantic_label() -> None:
 @pytest.mark.parametrize("terminal_event", ["turn.completed", "turn.cancelled", "turn.error"])
 def test_terminal_activity_clears_on_every_turn_terminal_event(terminal_event: str) -> None:
     ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
-    ui.viewport_mode = True
 
     ui.emit_event(
         {
@@ -330,12 +274,10 @@ def test_terminal_activity_clears_on_every_turn_terminal_event(terminal_event: s
     ui.emit_event({"type": terminal_event})
 
     assert ui._activity_status == ""
-    assert ui._activity_entry_id is None
 
 
 def test_tool_output_replaces_long_tool_activity_with_visible_output() -> None:
     ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
-    ui.viewport_mode = True
 
     ui.emit_event({"type": "tool.started", "tool": "run_command", "call_id": "c1"})
     assert ui._activity_status == "Running run_command…"
@@ -352,13 +294,11 @@ def test_tool_output_replaces_long_tool_activity_with_visible_output() -> None:
 
     entries = ui.transcript.snapshot()
     assert ui._activity_status == ""
-    assert ui._activity_entry_id is None
     assert [entry.content for entry in entries] == ["building…\n"]
 
 
 def test_multiple_tools_keep_only_terminal_lifecycle_rows() -> None:
     ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
-    ui.viewport_mode = True
 
     for call_id, tool in (("c1", "read_file"), ("c2", "search_text")):
         ui.emit_event({"type": "tool.started", "tool": tool, "call_id": call_id})
@@ -462,28 +402,6 @@ def test_inline_resume_renders_bounded_recent_conversation() -> None:
     assert "question 0" not in rendered
     assert "question 3" in rendered
     assert "ASH: latest answer" in rendered
-
-
-def test_viewport_resume_does_not_duplicate_transcript_to_console() -> None:
-    output = StringIO()
-    ui = TerminalUI(
-        console=Console(file=output, force_terminal=False, width=80),
-    )
-    ui.viewport_mode = True
-    ui.load_session_transcript(
-        SimpleNamespace(
-            messages=[
-                SimpleNamespace(role="user", content="question", metadata={}),
-                SimpleNamespace(role="assistant", content="answer", metadata={}),
-            ]
-        )
-    )
-
-    assert output.getvalue() == ""
-    assert [entry.content for entry in ui.transcript.snapshot()] == [
-        "question",
-        "answer",
-    ]
 
 
 def test_terminal_ui_dry_run_denies_all():

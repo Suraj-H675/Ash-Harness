@@ -13,7 +13,7 @@ import pytest
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
-def test_default_interface_enables_app_owned_mouse_reporting(tmp_path: Path) -> None:
+def test_default_interface_does_not_enable_mouse_reporting(tmp_path: Path) -> None:
     code = """
 import asyncio
 from pathlib import Path
@@ -58,7 +58,7 @@ asyncio.run(main())
                 if not chunk:
                     break
                 captured.extend(chunk)
-            if not sent and b"native" in captured:
+            if not sent and b"native>" in captured:
                 os.write(master_fd, b"hello\r")
                 sent = True
             if b"ASH_RESULT=hello" in captured:
@@ -72,9 +72,14 @@ asyncio.run(main())
 
     raw = bytes(captured)
     assert b"ASH_RESULT=hello" in raw
-    assert b"\x1b[?1000h" in raw
-    assert b"\x1b[?1003h" in raw
-    assert b"\x1b[?1006h" in raw
+    for sequence in (
+        b"\x1b[?1000h",
+        b"\x1b[?1002h",
+        b"\x1b[?1003h",
+        b"\x1b[?1006h",
+        b"\x1b[?1015h",
+    ):
+        assert sequence not in raw
 
 
 @pytest.mark.skipif(
@@ -83,24 +88,22 @@ asyncio.run(main())
     or os.environ.get("ASH_RUN_PTY_TESTS") != "1",
     reason="set ASH_RUN_PTY_TESTS=1 with a POSIX tmux pseudo-terminal",
 )
-def test_viewport_restores_terminal_after_live_resize(tmp_path: Path) -> None:
-    session = f"ash-viewport-{os.getpid()}-{time.monotonic_ns()}"
+def test_interactive_prompt_survives_live_resize(tmp_path: Path) -> None:
+    session = f"ash-prompt-{os.getpid()}-{time.monotonic_ns()}"
     code = """
 import asyncio
 from pathlib import Path
 from ash.ui.prompt import PromptInput
-from ash.ui.transcript import Transcript
 
 async def main():
     prompt = PromptInput(
         history_path=Path(%r),
-        transcript=Transcript(),
     )
     try:
         value = await prompt.read("smoke> ")
     finally:
         prompt.close()
-    print("VIEWPORT_RESULT=" + value, flush=True)
+    print("PROMPT_RESULT=" + value, flush=True)
     await asyncio.sleep(5)
 
 asyncio.run(main())
@@ -158,9 +161,7 @@ asyncio.run(main())
                 capture_output=True,
                 text=True,
             ).stdout
-            prompt_visible = any(
-                line.strip() == "smoke" for line in resized_capture.splitlines()
-            )
+            prompt_visible = "smoke>" in resized_capture
             if pane_size == "40x10" and prompt_visible:
                 resized = True
                 break
@@ -179,10 +180,10 @@ asyncio.run(main())
                 capture_output=True,
                 text=True,
             ).stdout
-            if "VIEWPORT_RESULT=hello" in capture:
+            if "PROMPT_RESULT=hello" in capture:
                 break
             time.sleep(0.1)
-        assert "VIEWPORT_RESULT=hello" in capture
+        assert "PROMPT_RESULT=hello" in capture
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", session],

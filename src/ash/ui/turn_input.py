@@ -23,7 +23,7 @@ from ash.safety.policy import PolicyAction
 from ash.tools.base import sensitive_tool_argument_fields
 from ash.ui.input_signals import PromptInterrupted
 from ash.ui.notifications import NotificationEvent, NotificationSink
-from ash.ui.viewport import ViewportChoice
+from ash.ui.prompt import PromptChoice
 
 if TYPE_CHECKING:
     from ash.ui.prompt import PromptInput
@@ -307,28 +307,29 @@ class InteractiveTurnController:
         )
         if requester is not None:
             self.write_status(f"{requester} requests approval for {tool_name}.")
-        self.ui.show_tool_approval(
-            tool_name,
-            arguments,
-            auto=False,
-            diff_mode=self.diff_mode,
-        )
         try:
-            if getattr(self.prompt_input, "supports_choice_ui", False):
-                answer = await self._select_approval(tool_name)
-            else:
-                choices = (
-                    "Approve [y] once, [s] scope/session, [a] tool/session, "
-                    "[p] scope/project, [e] edit exact scope/project, "
-                    "[x] deny scope/project, [f] deny with feedback"
+            with self.ui.suspend_live_render():
+                self.ui.show_tool_approval(
+                    tool_name,
+                    arguments,
+                    auto=False,
+                    diff_mode=self.diff_mode,
                 )
-                if tool_name == "run_command":
-                    choices += ", [c] command prefix/project"
-                answer = (
-                    (await self.prompt_input.read(f"{choices}, [N] deny? "))
-                    .strip()
-                    .casefold()
-                )
+                if getattr(self.prompt_input, "supports_choice_ui", False):
+                    answer = await self._select_approval(tool_name)
+                else:
+                    choices = (
+                        "Approve [y] once, [s] scope/session, [a] tool/session, "
+                        "[p] scope/project, [e] edit exact scope/project, "
+                        "[x] deny scope/project, [f] deny with feedback"
+                    )
+                    if tool_name == "run_command":
+                        choices += ", [c] command prefix/project"
+                    answer = (
+                        (await self.prompt_input.read(f"{choices}, [N] deny? "))
+                        .strip()
+                        .casefold()
+                    )
             if answer is None:
                 return False
             if answer in {"y", "yes"}:
@@ -426,49 +427,49 @@ class InteractiveTurnController:
 
     async def _select_approval(self, tool_name: str) -> str | None:
         primary = (
-            ViewportChoice(
+            PromptChoice(
                 "y",
                 "Allow once",
                 "Approve only this tool request.",
             ),
-            ViewportChoice(
+            PromptChoice(
                 "s",
                 "Allow this scope for session",
                 "Allow matching safe arguments until this Ash session ends.",
             ),
-            ViewportChoice(
+            PromptChoice(
                 "n",
                 "Deny",
                 "Reject only this request.",
             ),
-            ViewportChoice(
+            PromptChoice(
                 "f",
                 "Deny and guide Ash",
                 "Reject this request and provide corrective feedback.",
             ),
-            ViewportChoice(
+            PromptChoice(
                 "more",
                 "More approval options…",
                 "Broader session/project rules and command-prefix approvals.",
             ),
         )
         advanced = [
-            ViewportChoice(
+            PromptChoice(
                 "a",
                 "Allow this tool for session",
                 "Allow every use of this tool until this Ash session ends.",
             ),
-            ViewportChoice(
+            PromptChoice(
                 "p",
                 "Allow this scope for project",
                 "Persist the current exact safe scope for this project.",
             ),
-            ViewportChoice(
+            PromptChoice(
                 "e",
                 "Edit scope and allow for project",
                 "Edit the exact persisted scope before approving it.",
             ),
-            ViewportChoice(
+            PromptChoice(
                 "x",
                 "Deny this scope for project",
                 "Persist a deny rule for this exact scope in this project.",
@@ -476,14 +477,14 @@ class InteractiveTurnController:
         ]
         if tool_name == "run_command":
             advanced.append(
-                ViewportChoice(
+                PromptChoice(
                     "c",
                     "Allow command prefix for project",
                     "Persist an allow rule for a verified shell-command prefix.",
                 )
             )
         advanced.append(
-            ViewportChoice(
+            PromptChoice(
                 "back",
                 "Back",
                 "Return to the common approval choices.",

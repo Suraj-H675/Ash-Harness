@@ -7,8 +7,6 @@ from ash.ui.theme import (
     prompt_style,
     viewport_styles,
 )
-from ash.ui.viewport import TranscriptViewport
-from ash.ui.transcript import Transcript
 
 
 def test_theme_names_are_validated_and_normalized():
@@ -33,17 +31,6 @@ def test_default_and_light_themes_expose_distinct_palettes():
     assert light.composer == "bg:#eaeaea #111111"
 
 
-def test_viewport_uses_selected_theme_styles(tmp_path):
-    viewport = TranscriptViewport(
-        transcript=Transcript(),
-        history_path=tmp_path / "history",
-        theme="light",
-    )
-    styles = viewport_styles(get_theme("light"))
-
-    assert dict(viewport.application.style.style_rules) == styles
-
-
 def test_overlay_palette_tracks_selected_theme():
     dark = overlay_styles(get_theme("dark"))
     light = overlay_styles(get_theme("light"))
@@ -58,12 +45,3 @@ def test_no_color_uses_prompt_toolkit_dummy_style(tmp_path):
         prompt_style(viewport_styles(get_theme("dark")), no_color=True),
         DummyStyle,
     )
-
-    viewport = TranscriptViewport(
-        transcript=Transcript(),
-        history_path=tmp_path / "history",
-        theme="light",
-        no_color=True,
-    )
-
-    assert isinstance(viewport.application.style, DummyStyle)

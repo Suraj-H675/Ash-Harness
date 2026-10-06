@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -239,10 +239,8 @@ class TerminalUI:
         self.transcript = transcript or Transcript()
         self._assistant_entry_id: str | None = None
         self._reasoning_entry_id: str | None = None
-        self._activity_entry_id: str | None = None
         self._activity_status = ""
         self._tool_output_entries: dict[str, str] = {}
-        self.viewport_mode = False
         self._token_progress = (
             Progress(
                 TextColumn("[progress.description]{task.description}"),
@@ -309,7 +307,7 @@ class TerminalUI:
                     highlight=False,
                 )
                 self.console.print(body.plain, markup=False, highlight=False)
-            elif not self.viewport_mode:
+            else:
                 self.console.print(
                     Panel(
                         body,
@@ -390,14 +388,14 @@ class TerminalUI:
             if allowed is None and field_schema.get("type") == "array":
                 allowed = field_schema.get("items", {}).get("enum")
             while True:
-                if description and not self.viewport_mode:
+                if description:
                     self.console.print(
                         terminal_safe_text(description),
                         style="dim",
                         markup=False,
                         highlight=False,
                     )
-                if isinstance(allowed, list) and allowed and not self.viewport_mode:
+                if isinstance(allowed, list) and allowed:
                     options = ", ".join(terminal_safe_text(str(item)) for item in allowed)
                     self.console.print(
                         f"Options: {options}", markup=False, highlight=False
@@ -405,8 +403,7 @@ class TerminalUI:
                 default = previous.get(name, field_schema.get("default"))
                 suffix = f" [{terminal_safe_text(str(default))}]" if default is not None else ""
                 prompt = f"{terminal_safe_text(label, single_line=True)}{suffix}: "
-                if not self.viewport_mode:
-                    self.console.print(prompt, end="", markup=False, highlight=False)
+                self.console.print(prompt, end="", markup=False, highlight=False)
                 raw_line = self._input_stream.readline()
                 if raw_line == "":
                     return None
@@ -417,20 +414,18 @@ class TerminalUI:
                         break
                     if name not in required:
                         break
-                    if not self.viewport_mode:
-                        self.console.print("A value is required.", style=self.theme.error)
+                    self.console.print("A value is required.", style=self.theme.error)
                     continue
                 try:
                     output[name] = self._parse_mcp_form_value(raw, field_schema)
                     break
                 except (TypeError, ValueError) as exc:
-                    if not self.viewport_mode:
-                        self.console.print(
-                            terminal_safe_text(f"Invalid value: {exc}"),
-                            style=self.theme.error,
-                            markup=False,
-                            highlight=False,
-                        )
+                    self.console.print(
+                        terminal_safe_text(f"Invalid value: {exc}"),
+                        style=self.theme.error,
+                        markup=False,
+                        highlight=False,
+                    )
         return output
 
     def request_mcp_elicitation(
@@ -443,35 +438,33 @@ class TerminalUI:
             live.stop()
         try:
             safe_server = terminal_safe_text(server, single_line=True)
-            if not self.viewport_mode:
-                self.console.print(
-                    Panel(
-                        terminal_safe_text(message),
-                        title=f"MCP form — {safe_server}",
-                        border_style=self.theme.border_approval,
-                    )
+            self.console.print(
+                Panel(
+                    terminal_safe_text(message),
+                    title=f"MCP form — {safe_server}",
+                    border_style=self.theme.border_approval,
                 )
+            )
             previous: dict[str, Any] = {}
             while True:
                 values = self._collect_mcp_form(schema, previous)
                 if values is None:
                     return {"action": "cancel"}
                 previous = values
-                if not self.viewport_mode:
-                    self.console.print("Review MCP form response:", style="bold")
-                    for key, value in values.items():
-                        self.console.print(
-                            f"  {terminal_safe_text(str(key), single_line=True)} = "
-                            f"{terminal_safe_text(repr(value))}",
-                            markup=False,
-                            highlight=False,
-                        )
+                self.console.print("Review MCP form response:", style="bold")
+                for key, value in values.items():
                     self.console.print(
-                        "Submit [y], edit [e], decline [n], or cancel [c]? ",
-                        end="",
+                        f"  {terminal_safe_text(str(key), single_line=True)} = "
+                        f"{terminal_safe_text(repr(value))}",
                         markup=False,
                         highlight=False,
                     )
+                self.console.print(
+                    "Submit [y], edit [e], decline [n], or cancel [c]? ",
+                    end="",
+                    markup=False,
+                    highlight=False,
+                )
                 raw = self._input_stream.readline()
                 if raw == "":
                     return {"action": "cancel"}
@@ -490,8 +483,7 @@ class TerminalUI:
                     return {"action": "decline"}
                 if action in {"c", "cancel", ""}:
                     return {"action": "cancel"}
-                if not self.viewport_mode:
-                    self.console.print("Choose y, e, n, or c.", style=self.theme.error)
+                self.console.print("Choose y, e, n, or c.", style=self.theme.error)
         except (EOFError, KeyboardInterrupt):
             return {"action": "cancel"}
         finally:
@@ -527,7 +519,7 @@ class TerminalUI:
         else:
             self._token_task = None
 
-        if self.viewport_mode or self.screen_reader_mode:
+        if self.screen_reader_mode:
             self._active_live = None
             self._last_refresh = 0.0
             return nullcontext()
@@ -541,6 +533,19 @@ class TerminalUI:
         self._active_live = live
         self._last_refresh = 0.0
         return live
+
+    @contextmanager
+    def suspend_live_render(self):
+        """Pause Rich Live while another interactive prompt owns the cursor."""
+
+        live = self._active_live
+        if live is not None:
+            live.stop()
+        try:
+            yield
+        finally:
+            if live is not None and self._active_live is live:
+                live.start(refresh=True)
 
     def _render_active_turn(self) -> Panel:
         buffers = self._active_buffers_required()
@@ -719,7 +724,7 @@ class TerminalUI:
             if self._active_buffers is not None:
                 self._active_buffers.tool_output.append(delta, style=style)
                 self._refresh_live()
-            elif not self.viewport_mode:
+            else:
                 self.console.print(
                     delta,
                     style=style,
@@ -756,8 +761,7 @@ class TerminalUI:
         )
         line.append(tool, style="bold")
         line.append(f" [{label}]", style=style)
-        if not self.viewport_mode:
-            self.console.print(line)
+        self.console.print(line)
 
     def _set_activity_status(self, text: str) -> None:
         """Update one ephemeral turn-status surface without polluting history."""
@@ -766,22 +770,6 @@ class TerminalUI:
         if text == self._activity_status:
             return
         self._activity_status = text
-        if self.viewport_mode:
-            if not text:
-                if self._activity_entry_id is not None:
-                    try:
-                        self.transcript.remove(self._activity_entry_id)
-                    except KeyError:
-                        pass
-                    self._activity_entry_id = None
-                return
-            if self._activity_entry_id is None:
-                self._activity_entry_id = self.transcript.begin(
-                    "status",
-                    title="working",
-                )
-            self.transcript.replace_content(self._activity_entry_id, text)
-            return
         if self.screen_reader_mode and text:
             self.console.print(
                 f"Status: {text}",
@@ -859,11 +847,6 @@ class TerminalUI:
         auto: bool,
         side_by_side: bool = False,
     ) -> str:
-        # Suspend the live render while we print the approval panel.
-        live = getattr(self, "_active_live", None)
-        if live is not None:
-            live.stop()
-
         body = Text()
         body.append("Tool: ", style="bold")
         display_tool_name = terminal_safe_text(tool_name, single_line=True)
@@ -903,21 +886,18 @@ class TerminalUI:
             title=display_tool_name,
             metadata={"auto": auto},
         )
-        if not self.viewport_mode:
-            if self.screen_reader_mode:
-                self.console.print("Approval:", markup=False, highlight=False)
-                self.console.print(body.plain, markup=False, highlight=False)
-            else:
-                self.console.print(
-                    Panel(
-                        body,
-                        border_style=self.theme.border_approval,
-                        title="approval",
-                    )
+        if self.screen_reader_mode:
+            self.console.print("Approval:", markup=False, highlight=False)
+            self.console.print(body.plain, markup=False, highlight=False)
+        else:
+            self.console.print(
+                Panel(
+                    body,
+                    border_style=self.theme.border_approval,
+                    title="approval",
                 )
+            )
 
-        if live is not None:
-            live.start()
         return body.plain
 
     def record_user_input(self, text: str) -> None:
@@ -928,7 +908,6 @@ class TerminalUI:
     def load_session_transcript(self, session: Any | None) -> None:
         """Replace viewport history from a durable session snapshot."""
 
-        self._activity_entry_id = None
         self._activity_status = ""
         self.transcript.clear()
         if session is None:
@@ -949,7 +928,7 @@ class TerminalUI:
                     title="tool result",
                     metadata=dict(message.metadata),
                 )
-        if not self.viewport_mode and self.transcript.snapshot():
+        if self.transcript.snapshot():
             self._render_linear_history()
 
     def _render_linear_history(self) -> None:
@@ -1246,22 +1225,21 @@ class TerminalUI:
             title=f"sprint {execution.contract.contract_id[:8]}",
             metadata={"type": "plan.approval"},
         )
-        if not self.viewport_mode:
-            if self.screen_reader_mode:
-                self.console.print(
-                    f"Sprint {execution.contract.contract_id[:8]}:",
-                    markup=False,
-                    highlight=False,
+        if self.screen_reader_mode:
+            self.console.print(
+                f"Sprint {execution.contract.contract_id[:8]}:",
+                markup=False,
+                highlight=False,
+            )
+            self.console.print(body.plain, markup=False, highlight=False)
+        else:
+            self.console.print(
+                Panel(
+                    body,
+                    border_style=self.theme.border_primary,
+                    title=f"sprint {execution.contract.contract_id[:8]}",
                 )
-                self.console.print(body.plain, markup=False, highlight=False)
-            else:
-                self.console.print(
-                    Panel(
-                        body,
-                        border_style=self.theme.border_primary,
-                        title=f"sprint {execution.contract.contract_id[:8]}",
-                    )
-                )
+            )
 
     def write_status(self, text: str, *, error: bool = False) -> None:
         text = terminal_safe_text(text)
@@ -1269,13 +1247,12 @@ class TerminalUI:
             self.transcript.append("error", text, title="error")
         else:
             self.transcript.append("status", text, title="status")
-        if not self.viewport_mode:
-            self.console.print(
-                text,
-                style=self.theme.error if error else None,
-                markup=False,
-                highlight=False,
-            )
+        self.console.print(
+            text,
+            style=self.theme.error if error else None,
+            markup=False,
+            highlight=False,
+        )
 
     def _edit_plan(self, execution: Any) -> None:
         from ash.core.planner import apply_sprint_markdown_edit, render_sprint_markdown

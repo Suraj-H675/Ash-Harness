@@ -267,4 +267,4 @@ jobs:
       - name: Real viewport PTY integration
         env:
           ASH_RUN_PTY_TESTS: "1"
-        run: uv run --locked pytest -q tests/e2e/test_viewport_pty.py --timeout=30 --timeout-method=thread
+        run: uv run --locked pytest -q tests/e2e/test_terminal_pty.py --timeout=30 --timeout-method=thread
