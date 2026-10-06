@@ -137,8 +137,8 @@ def get_theme(name: str | None) -> Theme:
     return _THEMES[normalize_theme_name(name)]
 
 
-def viewport_styles(theme: Theme) -> dict[str, str]:
-    """Return the prompt-toolkit style mapping for a viewport theme."""
+def terminal_styles(theme: Theme) -> dict[str, str]:
+    """Return the prompt-toolkit style mapping for Ash's retained surface."""
 
     return {
         "user-prefix": theme.user_prefix,

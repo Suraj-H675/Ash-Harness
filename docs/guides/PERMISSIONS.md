@@ -21,8 +21,8 @@ rather than silently ignoring the restriction.
 
 ## Interactive Approvals
 
-In the full-screen terminal UI, Ash keeps the requested tool arguments and any
-edit diff visible while presenting a selector for the common decisions:
+In the interactive terminal UI, Ash keeps the requested tool arguments and any
+edit diff visible while presenting a compact selector for the common decisions:
 
 - **Allow once** — approve only the current request.
 - **Allow this scope for session** — allow matching safe arguments until the
@@ -40,7 +40,7 @@ The advanced selector retains Ash's explicit permission scopes: allow a tool
 for the session, persist an exact project scope, edit and persist an exact
 scope, persist an exact deny, and (for `run_command`) persist a verified command
 prefix. Limited terminals and screen-reader mode use the equivalent text prompt
-instead of the full-screen selector.
+instead of the retained selector.
 
 ## Policy Locations
 

@@ -353,9 +353,11 @@ The interactive interface is built for sustained terminal work:
 - conversation output lives in the terminal's normal scrollback, so wheel
   scrolling, selection, copy, links, and context-menu behavior remain
   terminal-native and do not depend on Ash repainting the transcript;
-- Ash uses a compact non-full-screen editor for input and temporarily owns only
-  bounded interactive surfaces such as approval selectors;
-- Rich Markdown and fenced-code rendering with bounded repaint frequency;
+- Ash keeps one bounded retained surface for the active turn, composer, model /
+  workspace header, and runtime footer; completed turns are committed once to
+  native scrollback instead of being redrawn with session history;
+- Rich Markdown and fenced-code rendering with bounded live previews, chunked
+  token accumulation, cached frames, and bounded repaint frequency;
 - streaming user, assistant, reasoning, tool, approval, status, error, and
   recovery entries;
 - searchable full-screen help with a linear fallback for redirected input and
@@ -369,7 +371,7 @@ The interactive interface is built for sustained terminal work:
 - status surfaces for model, branch, context, cache, cost, sandbox, session,
   and working directory;
 - validated dark and light themes;
-- reduced-motion, no-color, inline, and dedicated screen-reader modes;
+- reduced-motion, no-color, and dedicated screen-reader fallbacks;
 - configurable cross-platform keybindings; and
 - opt-in OSC 9, BEL, and terminal-aware desktop notifications with bounded
   previews and failure isolation.

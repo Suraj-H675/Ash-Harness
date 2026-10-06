@@ -11,6 +11,7 @@ automated tests and CI can drive the loop.
 from __future__ import annotations
 
 import difflib
+from io import StringIO
 import json
 import math
 import os
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
+from prompt_toolkit.formatted_text import ANSI, AnyFormattedText, FormattedText
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -45,6 +47,8 @@ MAX_EDIT_PREVIEW_TEXT_CHARS = 128_000
 MAX_EDIT_PREVIEW_LINES = 400
 DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
 MAX_LINEAR_HISTORY_ENTRIES = 12
+LIVE_RESPONSE_PREVIEW_CHARS = 4_000
+LIVE_AUX_PREVIEW_CHARS = 3_000
 _EDITOR_ENV_ALLOWLIST = (
     "COLORTERM",
     "DBUS_SESSION_BUS_ADDRESS",
@@ -66,12 +70,28 @@ _EDITOR_ENV_ALLOWLIST = (
 @dataclass
 class _LiveBuffers:
     thought: Text
-    response: str
+    response_chunks: list[str]
     tool_output: Text
 
     @classmethod
     def fresh(cls) -> "_LiveBuffers":
-        return cls(thought=Text(), response="", tool_output=Text())
+        return cls(thought=Text(), response_chunks=[], tool_output=Text())
+
+    @property
+    def response(self) -> str:
+        return "".join(self.response_chunks)
+
+
+def _live_markdown_tail(value: str) -> tuple[str, bool]:
+    """Return a bounded recent Markdown slice for the retained live surface."""
+
+    if len(value) <= LIVE_RESPONSE_PREVIEW_CHARS:
+        return value, False
+    tail = value[-LIVE_RESPONSE_PREVIEW_CHARS:]
+    boundary = tail.find("\n\n")
+    if boundary >= 0:
+        tail = tail[boundary + 2 :]
+    return tail, True
 
 
 def _bounded_preview_lines(value: str) -> tuple[list[str], bool]:
@@ -231,7 +251,11 @@ class TerminalUI:
         self.theme = get_theme(theme)
         self._input_stream = input_stream or sys.stdin
         self._active_buffers: _LiveBuffers | None = None
+        self._completed_buffers: _LiveBuffers | None = None
         self._active_live: Live | None = None
+        self._prompt_invalidator: Callable[[], None] | None = None
+        self._prompt_revision = 0
+        self._prompt_render_cache: tuple[int, int, AnyFormattedText] | None = None
         self._session_approvals: set[str] = set()
         self.show_token_meter = show_token_meter
         self.reduced_motion = reduced_motion
@@ -254,6 +278,33 @@ class TerminalUI:
         self._current_tokens = 0
         self._maximum_tokens = 100000
         self._last_refresh = 0.0
+
+    def bind_prompt_surface(self, invalidator: Callable[[], None]) -> None:
+        """Route interactive live updates through the bounded prompt surface."""
+
+        self._prompt_invalidator = invalidator
+
+    def prompt_live_view(self, width: int) -> tuple[int, AnyFormattedText]:
+        """Return the current-turn render only; committed history is not touched."""
+
+        buffers = self._active_buffers or self._completed_buffers
+        if buffers is None:
+            return self._prompt_revision, FormattedText([])
+        cached = self._prompt_render_cache
+        if cached is not None and cached[:2] == (self._prompt_revision, width):
+            return self._prompt_revision, cached[2]
+        stream = StringIO()
+        console = Console(
+            file=stream,
+            force_terminal=True,
+            color_system="truecolor",
+            width=max(20, width),
+            soft_wrap=False,
+        )
+        console.print(self._render_turn(buffers, live=True))
+        rendered: AnyFormattedText = ANSI(stream.getvalue().rstrip("\n"))
+        self._prompt_render_cache = (self._prompt_revision, width, rendered)
+        return self._prompt_revision, rendered
 
     @property
     def has_approval_callback(self) -> bool:
@@ -510,6 +561,7 @@ class TerminalUI:
 
         buffers: _LiveBuffers = _LiveBuffers.fresh()
         self._active_buffers = buffers
+        self._completed_buffers = None
         self._assistant_entry_id = None
         self._reasoning_entry_id = None
         if self._token_progress is not None:
@@ -519,9 +571,10 @@ class TerminalUI:
         else:
             self._token_task = None
 
-        if self.screen_reader_mode:
+        if self.screen_reader_mode or self._prompt_invalidator is not None:
             self._active_live = None
             self._last_refresh = 0.0
+            self._refresh_live(force=True)
             return nullcontext()
 
         live = Live(
@@ -547,16 +600,28 @@ class TerminalUI:
             if live is not None and self._active_live is live:
                 live.start(refresh=True)
 
-    def _render_active_turn(self) -> Panel:
-        buffers = self._active_buffers_required()
+    def _render_turn(self, buffers: _LiveBuffers, *, live: bool = False) -> Panel:
         parts: list[Any] = []
         if self._activity_status:
             parts.append(Text(self._activity_status, style="dim italic"))
-        if buffers.thought:
-            parts.append(buffers.thought)
-        if buffers.tool_output:
-            parts.append(buffers.tool_output)
-        parts.append(Markdown(buffers.response, hyperlinks=False))
+        thought = buffers.thought
+        tool_output = buffers.tool_output
+        response = buffers.response
+        response_truncated = False
+        if live:
+            if len(thought) > LIVE_AUX_PREVIEW_CHARS:
+                thought = thought[-LIVE_AUX_PREVIEW_CHARS:]
+            if len(tool_output) > LIVE_AUX_PREVIEW_CHARS:
+                tool_output = tool_output[-LIVE_AUX_PREVIEW_CHARS:]
+            response, response_truncated = _live_markdown_tail(response)
+        if thought:
+            parts.append(thought)
+        if tool_output:
+            parts.append(tool_output)
+        if response_truncated:
+            parts.append(Text("… earlier response hidden from live preview", style="dim"))
+        if response:
+            parts.append(Markdown(response, hyperlinks=False))
         if self.show_token_meter and self._token_task is not None:
             parts.append(
                 Text(
@@ -573,6 +638,9 @@ class TerminalUI:
             padding=(0, 1),
         )
 
+    def _render_active_turn(self) -> Panel:
+        return self._render_turn(self._active_buffers_required())
+
     def _active_buffers_required(self) -> _LiveBuffers:
         if not hasattr(self, "_active_buffers") or self._active_buffers is None:
             raise RuntimeError("begin_turn() must be called before streaming output")
@@ -583,7 +651,7 @@ class TerminalUI:
             return
         text = terminal_safe_text(text)
         buffers = self._active_buffers_required()
-        buffers.response += text
+        buffers.response_chunks.append(text)
         if self._assistant_entry_id is None:
             self._assistant_entry_id = self.transcript.begin("assistant", title="ash")
         self.transcript.append_delta(self._assistant_entry_id, text)
@@ -626,6 +694,8 @@ class TerminalUI:
             self.transcript.finalize(self._reasoning_entry_id)
         if self._assistant_entry_id is not None:
             self.transcript.finalize(self._assistant_entry_id)
+        if self._prompt_invalidator is not None:
+            self._completed_buffers = self._active_buffers
         self._active_buffers = None
         self._active_live = None
         self._reasoning_entry_id = None
@@ -633,6 +703,34 @@ class TerminalUI:
         if self._token_progress is not None:
             self._token_progress.stop()
         self._token_task = None
+        if self._prompt_invalidator is not None:
+            self._refresh_live(force=True)
+
+    def commit_completed_turn(self) -> None:
+        """Commit one finalized turn to native scrollback exactly once."""
+
+        buffers = self._completed_buffers
+        if buffers is None:
+            return
+        parts: list[Any] = []
+        if buffers.thought:
+            parts.append(buffers.thought)
+        if buffers.tool_output:
+            parts.append(buffers.tool_output)
+        if buffers.response:
+            parts.append(Markdown(buffers.response, hyperlinks=False))
+        if parts:
+            self.console.print(
+                Panel(
+                    Group(*parts),
+                    title="ASH",
+                    border_style=self.theme.border_primary,
+                    padding=(0, 1),
+                )
+            )
+        self._completed_buffers = None
+        self._prompt_render_cache = None
+        self._prompt_revision += 1
 
     def update_token_count(self, current: int, maximum: int | None = None) -> None:
         """Update the token progress bar with current / maximum counts."""
@@ -647,7 +745,19 @@ class TerminalUI:
             total=self._maximum_tokens,
         )
 
-    def _refresh_live(self) -> None:
+    def _refresh_live(self, *, force: bool = False) -> None:
+        if self._prompt_invalidator is not None:
+            if self.reduced_motion and not force:
+                return
+            now = time.monotonic()
+            repaint = force or now - self._last_refresh >= 0.05
+            if not repaint:
+                return
+            self._last_refresh = now
+            self._prompt_revision += 1
+            self._prompt_render_cache = None
+            self._prompt_invalidator()
+            return
         live = getattr(self, "_active_live", None)
         if live is None or self.reduced_motion:
             return
@@ -761,7 +871,16 @@ class TerminalUI:
         )
         line.append(tool, style="bold")
         line.append(f" [{label}]", style=style)
-        self.console.print(line)
+        if self._prompt_invalidator is not None and (
+            self._active_buffers is not None or self._completed_buffers is not None
+        ):
+            if self._active_buffers is not None:
+                if self._active_buffers.tool_output:
+                    self._active_buffers.tool_output.append("\n")
+                self._active_buffers.tool_output.append_text(line)
+                self._refresh_live()
+        else:
+            self.console.print(line)
 
     def _set_activity_status(self, text: str) -> None:
         """Update one ephemeral turn-status surface without polluting history."""
@@ -903,10 +1022,21 @@ class TerminalUI:
     def record_user_input(self, text: str) -> None:
         """Commit submitted user input to the interactive transcript."""
 
-        self.transcript.append("user", terminal_safe_text(text), title="you")
+        safe = terminal_safe_text(text)
+        self.transcript.append("user", safe, title="you")
+        if self._prompt_invalidator is not None and not self.screen_reader_mode:
+            body = Text(safe)
+            self.console.print(
+                Panel(
+                    body,
+                    title="YOU",
+                    border_style=self.theme.prompt,
+                    padding=(0, 1),
+                )
+            )
 
     def load_session_transcript(self, session: Any | None) -> None:
-        """Replace viewport history from a durable session snapshot."""
+        """Replace interactive history from a durable session snapshot."""
 
         self._activity_status = ""
         self.transcript.clear()
@@ -932,37 +1062,42 @@ class TerminalUI:
             self._render_linear_history()
 
     def _render_linear_history(self) -> None:
-        """Render a bounded recent-history recap for non-rewriting terminals."""
+        """Render bounded committed history using the same semantic cards as live turns."""
 
         entries = self.transcript.snapshot()
         visible = entries[-MAX_LINEAR_HISTORY_ENTRIES:]
         omitted = len(entries) - len(visible)
-        self.console.print(
-            (
-                f"Recent conversation ({omitted} earlier entr"
-                f"{'y' if omitted == 1 else 'ies'} omitted):"
-                if omitted
-                else "Recent conversation:"
-            ),
-            markup=False,
-            highlight=False,
+        heading = (
+            f"Recent conversation · {omitted} earlier entr"
+            f"{'y' if omitted == 1 else 'ies'} omitted"
+            if omitted
+            else "Recent conversation"
         )
-        labels = {
-            "user": "YOU",
-            "assistant": "ASH",
-            "reasoning": "THINK",
-            "tool": "TOOL",
-            "approval": "APPROVAL",
-            "status": "STATUS",
-            "error": "ERROR",
-        }
+        self.console.print(Text(heading, style="dim"))
         for entry in visible:
-            label = labels[entry.kind]
-            self.console.print(
-                f"{label}: {entry.content}",
-                markup=False,
-                highlight=False,
-            )
+            if entry.kind == "user":
+                self.console.print(
+                    Panel(
+                        Text(entry.content),
+                        title="YOU",
+                        border_style=self.theme.prompt,
+                        padding=(0, 1),
+                    )
+                )
+            elif entry.kind == "assistant":
+                self.console.print(
+                    Panel(
+                        Markdown(entry.content, hyperlinks=False),
+                        title="ASH",
+                        border_style=self.theme.border_primary,
+                        padding=(0, 1),
+                    )
+                )
+            else:
+                label = entry.kind.upper()
+                line = Text(f"{label}  ", style="dim bold")
+                line.append(entry.content, style="dim")
+                self.console.print(line)
 
     def _edit_preview(
         self,
@@ -1247,6 +1382,16 @@ class TerminalUI:
             self.transcript.append("error", text, title="error")
         else:
             self.transcript.append("status", text, title="status")
+        if self._prompt_invalidator is not None and self._active_buffers is not None:
+            if self._active_buffers.tool_output:
+                self._active_buffers.tool_output.append("\n")
+            prefix = "ERROR  " if error else "STATUS  "
+            self._active_buffers.tool_output.append(
+                prefix + text,
+                style=self.theme.error if error else "dim",
+            )
+            self._refresh_live(force=True)
+            return
         self.console.print(
             text,
             style=self.theme.error if error else None,

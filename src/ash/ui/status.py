@@ -51,13 +51,13 @@ class StatusLine:
         return self._cached
 
     def header(self) -> str:
-        """Return stable workspace identity for the viewport header."""
+        """Return stable workspace identity for the retained header."""
 
         self._refresh()
         return self._cached_header
 
     def footer(self) -> str:
-        """Return runtime/usage health for the viewport footer."""
+        """Return runtime/usage health for the retained footer."""
 
         self._refresh()
         return self._cached_footer

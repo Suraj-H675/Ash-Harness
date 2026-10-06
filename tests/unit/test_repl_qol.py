@@ -233,7 +233,6 @@ async def test_retry_rewinds_old_answer_and_replays_primary_user_metadata(
     )
     assert turns == ["retry this request"]
     assert metadata == [{"source": "test"}]
-    assert "ok" in capsys.readouterr().out
     assert store.load_session(session.session_id).messages == []
 
 

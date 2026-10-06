@@ -7,6 +7,8 @@ from ash.ui.terminal import TerminalUI
 from ash.ui.safe_text import terminal_safe_text
 from io import StringIO
 import pytest
+from prompt_toolkit.formatted_text import to_formatted_text
+from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 from rich.console import Console
 from rich.text import Text
 from types import SimpleNamespace
@@ -199,6 +201,70 @@ def test_terminal_ui_does_not_commit_empty_assistant_entry() -> None:
     ui.finalize_turn()
 
     assert ui.transcript.snapshot() == ()
+
+
+def test_prompt_live_view_does_not_read_committed_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False, width=80))
+    for index in range(1_000):
+        ui.transcript.append("assistant", f"old answer {index}", title="ash")
+    ui.bind_prompt_surface(lambda: None)
+    with ui.begin_turn():
+        ui.print_token("current answer")
+
+        def fail_snapshot():
+            raise AssertionError("live rendering must not scan committed history")
+
+        monkeypatch.setattr(ui.transcript, "snapshot", fail_snapshot)
+        _revision, rendered = ui.prompt_live_view(80)
+
+    plain = fragment_list_to_text(to_formatted_text(rendered))
+    assert "current answer" in plain
+    assert "old answer" not in plain
+
+
+def test_prompt_surface_commits_final_turn_to_scrollback_once() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False, width=80))
+    ui.bind_prompt_surface(lambda: None)
+
+    with ui.begin_turn():
+        ui.print_thought("checking")
+        ui.print_token("final answer")
+    ui.finalize_turn()
+
+    assert output.getvalue() == ""
+    ui.commit_completed_turn()
+    committed = output.getvalue()
+    assert committed.count("final answer") == 1
+    assert "THINK  checking" in committed
+
+    ui.commit_completed_turn()
+    assert output.getvalue() == committed
+
+
+def test_prompt_live_view_bounds_long_response_but_final_commit_is_complete() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False, width=80))
+    ui.bind_prompt_surface(lambda: None)
+    response = "START-" + ("x" * 5_000) + "-END"
+
+    with ui.begin_turn():
+        for offset in range(0, len(response), 37):
+            ui.print_token(response[offset : offset + 37])
+        _revision, rendered = ui.prompt_live_view(80)
+
+    live = fragment_list_to_text(to_formatted_text(rendered))
+    assert "earlier response hidden from live preview" in live
+    assert "START-" not in live
+    assert "-END" in live
+
+    ui.finalize_turn()
+    ui.commit_completed_turn()
+    committed = output.getvalue()
+    assert "START-" in committed
+    assert "-END" in committed
 
 
 def test_suspend_live_render_pauses_and_resumes_same_live_instance() -> None:
@@ -398,10 +464,12 @@ def test_inline_resume_renders_bounded_recent_conversation() -> None:
     ui.load_session_transcript(session)
 
     rendered = output.getvalue()
-    assert "Recent conversation (3 earlier entries omitted):" in rendered
+    assert "Recent conversation · 3 earlier entries omitted" in rendered
     assert "question 0" not in rendered
     assert "question 3" in rendered
-    assert "ASH: latest answer" in rendered
+    assert "YOU" in rendered
+    assert "ASH" in rendered
+    assert "latest answer" in rendered
 
 
 def test_terminal_ui_dry_run_denies_all():

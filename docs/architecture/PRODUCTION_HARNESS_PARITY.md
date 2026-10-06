@@ -2014,13 +2014,13 @@ truthful evidence boundaries, not open mission blockers.
 | Capability | Ash status | Required production behavior |
 |---|---|---|
 | Multiline editor | Verified locally | Prompt-toolkit editor with persistent history and multiline bindings |
-| Responsive full-screen TUI | Verified hosted | Transcript-owned prompt-toolkit viewport, narrow/wide resize reflow, page navigation, live tail, terminal restoration, and inline fallback are covered by real tmux PTY E2E on both supported native hosts (Linux and macOS) in hosted CI; native Windows is outside the supported host matrix and Windows users run the Linux path through WSL2 |
-| Streaming transcript | Verified locally | Immutable semantic user/assistant/reasoning/tool/approval/status/error entries, bounded mutable live cells, rich cached Markdown, command output routing, and durable-session hydration |
+| Responsive hybrid terminal UI | Verified locally | One non-full-screen prompt-toolkit surface owns only the active turn, composer, cached header/footer, completion menu, and approval selector; committed turns are emitted once to native terminal scrollback, mouse reporting stays disabled, live Markdown/output is bounded and cached, and raw PTY regressions verify the retained surface plus terminal-native mouse ownership. Hosted CI for this replacement architecture is the remaining evidence step |
+| Streaming transcript | Verified locally | Immutable semantic user/assistant/reasoning/tool/approval/status/error entries remain durable; only bounded current-turn state is redrawn, response tokens accumulate in chunks, finalized output is committed once to native scrollback, and durable-session hydration renders a bounded semantic recap |
 | Markdown/code rendering | Verified locally | Streamed Rich Markdown with fenced-code highlighting and bounded repaint frequency |
 | Diff preview | Verified locally | Bounded unified and selectable persisted side-by-side previews for writes/replacements/patches are wired into the interactive approval flow |
-| Approval dialog | Verified locally | Allow once, exact/broad session, exact/edited project scopes, persisted exact deny, verified command-prefix project scopes, bounded deny-with-feedback, and the full-screen scope editor are wired |
+| Approval dialog | Verified locally | Allow once, exact/broad session, exact/edited project scopes, persisted exact deny, verified command-prefix project scopes, bounded deny-with-feedback, and compact retained common/advanced selectors are wired |
 | Status line | Verified locally | Cached model, mode, branch, context budget, prompt-cache totals, cost, sandbox, session, and cwd state |
-| Themes | Verified locally | Validated dark/light palettes are wired through config precedence, streamed Rich panels, approvals/status output, inline prompts, and the responsive viewport; screen-reader/no-color fallback remains ANSI-safe |
+| Themes | Verified locally | Validated dark/light palettes are wired through config precedence, streamed Rich panels, approvals/status output, and the retained prompt surface; screen-reader/no-color fallback remains ANSI-safe |
 | Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |
 | Vim input mode | Verified locally | Optional Emacs or Vim prompt-toolkit editing mode |
 | External editor | Verified locally | Prompt-toolkit external-editor integration |

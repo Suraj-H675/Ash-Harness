@@ -830,9 +830,12 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     discovered_commands = custom_commands.discover()
 
     status_line = StatusLine(loop, config, sandbox_manager)
+    live_provider = getattr(loop.ui, "prompt_live_view", lambda _width: (0, ""))
 
     prompt_input = PromptInput(
-        status_provider=status_line,
+        status_provider=status_line.footer,
+        header_provider=status_line.header,
+        live_provider=live_provider,
         extra_commands={
             command.name: command.description for command in discovered_commands
         },
@@ -848,8 +851,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     )
     if not isinstance(loop.ui, TerminalUI):
         raise TypeError("interactive REPL requires TerminalUI")
+    bind_prompt_surface = getattr(loop.ui, "bind_prompt_surface", None)
+    if callable(bind_prompt_surface) and prompt_input.supports_live_surface:
+        bind_prompt_surface(prompt_input.invalidate)
     loop.ui.load_session_transcript(loop.current_session)
-    print = ReplPrinter(loop.ui, viewport=False)  # noqa: A001
+    print = ReplPrinter()  # noqa: A001
 
     def _print_classified_error(exc: BaseException) -> None:
         """Route interactive classified failures through the active UI surface."""
@@ -1425,8 +1431,6 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 except Exception as exc:  # noqa: BLE001
                     _print_classified_error(exc)
                     continue
-                if response is not None:
-                    print(response, flush=True)
                 continue
             if command.name == "new":
                 session = await loop.start_session()
@@ -2766,7 +2770,6 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         except Exception as exc:  # noqa: BLE001
             _print_classified_error(exc)
             continue
-        print(response, flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:

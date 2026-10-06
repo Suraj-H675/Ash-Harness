@@ -58,7 +58,7 @@ asyncio.run(main())
                 if not chunk:
                     break
                 captured.extend(chunk)
-            if not sent and b"native>" in captured:
+            if not sent and b"YOU" in captured:
                 os.write(master_fd, b"hello\r")
                 sent = True
             if b"ASH_RESULT=hello" in captured:
@@ -72,6 +72,101 @@ asyncio.run(main())
 
     raw = bytes(captured)
     assert b"ASH_RESULT=hello" in raw
+    for sequence in (
+        b"\x1b[?1000h",
+        b"\x1b[?1002h",
+        b"\x1b[?1003h",
+        b"\x1b[?1006h",
+        b"\x1b[?1015h",
+    ):
+        assert sequence not in raw
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_hybrid_surface_renders_live_turn_and_composer_without_mouse_capture(
+    tmp_path: Path,
+) -> None:
+    code = """
+import asyncio
+from pathlib import Path
+from ash.ui.prompt import PromptInput
+from ash.ui.terminal import TerminalUI
+
+async def main():
+    ui = TerminalUI()
+    prompt = PromptInput(
+        history_path=Path(%r),
+        header_provider=lambda: "model · interactive · git main · Ash-Harness",
+        status_provider=lambda: "ctx ~1200/64000 · sandbox native · session abc12345",
+        live_provider=ui.prompt_live_view,
+    )
+    ui.bind_prompt_surface(prompt.invalidate)
+    with ui.begin_turn():
+        ui.print_thought("Inspecting the repository")
+        ui.print_token("I found the issue and I am applying the fix.")
+        value = await prompt.read("steer> ")
+    ui.finalize_turn()
+    ui.commit_completed_turn()
+    print("HYBRID_RESULT=" + value, flush=True)
+
+asyncio.run(main())
+""" % str(tmp_path / "hybrid-history")
+    master_fd, slave_fd = pty.openpty()
+    environment = os.environ.copy()
+    environment.pop("NO_COLOR", None)
+    environment["TERM"] = "xterm-256color"
+    environment["COLORTERM"] = "truecolor"
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    captured = bytearray()
+    sent = False
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.05)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 65_536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                captured.extend(chunk)
+            if (
+                not sent
+                and b"STEER" in captured
+                and b"Inspecting the repository" in captured
+            ):
+                os.write(master_fd, b"continue\r")
+                sent = True
+            if b"HYBRID_RESULT=continue" in captured:
+                break
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)
+
+    raw = bytes(captured)
+    assert b"HYBRID_RESULT=continue" in raw
+    for marker in (
+        b"ASH",
+        b"Inspecting the repository",
+        b"I found the issue and I am applying the fix.",
+        b"STEER",
+        b"model",
+        b"ctx ~1200/64000",
+    ):
+        assert marker in raw
     for sequence in (
         b"\x1b[?1000h",
         b"\x1b[?1002h",

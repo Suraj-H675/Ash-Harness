@@ -145,6 +145,7 @@ class InteractiveTurnController:
                     continue
                 self.write_status(f"Steering queued ({pending_count} pending).")
             response = await turn
+            self.ui.commit_completed_turn()
             message = "Ash turn complete."
             if self.notification_include_preview and response.strip():
                 message = f"Ash finished: {response}"

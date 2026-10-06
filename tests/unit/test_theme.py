@@ -5,7 +5,7 @@ from ash.ui.theme import (
     normalize_theme_name,
     overlay_styles,
     prompt_style,
-    viewport_styles,
+    terminal_styles,
 )
 
 
@@ -42,6 +42,6 @@ def test_overlay_palette_tracks_selected_theme():
 
 def test_no_color_uses_prompt_toolkit_dummy_style(tmp_path):
     assert isinstance(
-        prompt_style(viewport_styles(get_theme("dark")), no_color=True),
+        prompt_style(terminal_styles(get_theme("dark")), no_color=True),
         DummyStyle,
     )
