@@ -13,6 +13,9 @@ import zlib
 REPOSITORY_URL = "https://github.com/Suraj-H675/Ash-Harness.git"
 RELEASES_API = "https://api.github.com/repos/Suraj-H675/Ash-Harness/releases"
 LATEST_RELEASE_API = f"{RELEASES_API}/latest"
+PUBLIC_BOOTSTRAP_URL = (
+    "https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/install.sh"
+)
 INSTALLER_ASSET_NAME = "install-ash.py"
 GITHUB_API_VERSION = "2026-03-10"
 _RELEASE_REF_PATTERN = re.compile(r"^ash-v\d+(?:\.\d+)+(?:[0-9A-Za-z._+-]*)$")
@@ -189,6 +192,14 @@ def install_command(*extras: str, ref: str | None = None) -> str:
 
     normalized = sorted({extra.strip() for extra in extras if extra.strip()})
     arguments = [part for extra in normalized for part in ("--extra", extra)]
+    if ref is None:
+        command = (
+            "curl -fsSL --proto '=https' --tlsv1.2 "
+            f"{PUBLIC_BOOTSTRAP_URL} | sh"
+        )
+        if arguments:
+            command += " -s -- " + " ".join(shlex.quote(value) for value in arguments)
+        return command
     if ref:
         arguments.extend(("--ref", ref))
     suffix = (

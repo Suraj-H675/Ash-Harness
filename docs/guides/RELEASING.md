@@ -46,13 +46,15 @@ smoke-tests the wheel, tests the standalone installer on Python 3.10, emits
 `SHA256SUMS`, creates artifact provenance, and publishes the assets through a
 draft release before verifying that the final release is immutable.
 
-The release also publishes the repository-root `install.sh` as the normal-user
-one-line bootstrap. It can bootstrap `uv` and a supported Python runtime when
-the host does not already have a usable installer toolchain. It then resolves
-the latest immutable release, selects exactly the uploaded `install-ash.py`
-asset from the GitHub Releases API, and checks its declared size and SHA-256
-digest before execution. The standalone `install-ash.py` asset is copied from
-`src/ash/installer.py`.
+The repository-root `install.sh` is the stable normal-user bootstrap and is
+also published as a release asset for provenance. The public one-liner fetches
+that bootstrap from the repository rather than from `releases/latest`, so a
+release that is still publishing cannot turn the install entrypoint into a
+404. The bootstrap can install `uv` and a supported Python runtime when needed,
+then resolves the latest immutable release, selects exactly the uploaded
+`install-ash.py` asset from the GitHub Releases API, and checks its declared
+size and SHA-256 digest before execution. The standalone `install-ash.py` asset
+is copied from `src/ash/installer.py`.
 The standalone installer then resolves exactly one uploaded universal Ash wheel
 from that same immutable release, validates its GitHub URL, size, and SHA-256
 digest, streams it into a private temporary directory, and independently

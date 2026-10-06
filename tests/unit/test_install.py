@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shlex
 import sys
 import urllib.error
 import urllib.request
@@ -12,6 +11,7 @@ import pytest
 from ash.install import (
     INSTALLER_ASSET_NAME,
     LATEST_RELEASE_API,
+    PUBLIC_BOOTSTRAP_URL,
     _BOOTSTRAP_CODE,
     install_command,
     pipx_install_command,
@@ -123,14 +123,13 @@ def _run_bootstrap(
 
 def _installer_prefix() -> str:
     command = install_command()
-    argv = shlex.split(command)
-    assert argv[:3] == [sys.executable, "-I", "-c"]
-    assert "curl" not in command
-    assert " | " not in command
+    assert command == (
+        "curl -fsSL --proto '=https' --tlsv1.2 "
+        f"{PUBLIC_BOOTSTRAP_URL} | sh"
+    )
     assert "\n" not in command
     assert "\r" not in command
-    assert "raw.githubusercontent.com" not in command
-    assert LATEST_RELEASE_API in command
+    assert "raw.githubusercontent.com" in command
     return command
 
 
@@ -143,6 +142,15 @@ def test_install_command_keeps_sorted_capability_extras_and_ref() -> None:
 
     assert "/releases/tags/ash-v1.2.3" in command
     assert command.endswith(" --extra browser --extra server --ref ash-v1.2.3")
+
+
+def test_public_install_command_keeps_sorted_capability_extras() -> None:
+    command = install_command("server", "browser", "server")
+
+    assert command == (
+        "curl -fsSL --proto '=https' --tlsv1.2 "
+        f"{PUBLIC_BOOTSTRAP_URL} | sh -s -- --extra browser --extra server"
+    )
 
 
 def test_install_command_rejects_nonrelease_ref() -> None:

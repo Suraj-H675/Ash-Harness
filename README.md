@@ -40,7 +40,7 @@ branches.
 Ash's production install path is one command on Linux and macOS:
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://github.com/Suraj-H675/Ash-Harness/releases/latest/download/install.sh | sh
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/install.sh | sh
 ```
 
 The bootstrap owns the installation machinery for the user. If necessary it
@@ -52,7 +52,7 @@ pipx/uv installer. No GitHub CLI or manual release/tag handling is required.
 Optional capability packs use the same install flow:
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://github.com/Suraj-H675/Ash-Harness/releases/latest/download/install.sh | sh -s -- --extra browser
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/install.sh | sh -s -- --extra browser
 ```
 
 Development setup and release-maintainer instructions are intentionally

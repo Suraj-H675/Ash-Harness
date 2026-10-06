@@ -698,8 +698,7 @@ def test_browser_doctor_distinguishes_missing_extra_and_binary(
     )
     missing_extra = _check_browser()
     assert missing_extra.status == "warn"
-    assert "api.github.com/repos/Suraj-H675/Ash-Harness/releases/latest" in missing_extra.remedy
-    assert "raw.githubusercontent.com" not in missing_extra.remedy
+    assert "raw.githubusercontent.com/Suraj-H675/Ash-Harness/main/install.sh" in missing_extra.remedy
     assert "--extra browser" in missing_extra.remedy
     assert "pipx install" not in missing_extra.remedy
 
