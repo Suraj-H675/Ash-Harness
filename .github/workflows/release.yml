@@ -60,6 +60,7 @@ jobs:
           sdist="$(printf '%s\n' dist/*.tar.gz)"
           uv build --wheel "$sdist" --out-dir dist
           cp src/ash/installer.py dist/install-ash.py
+          cp install.sh dist/install.sh
           sha256sum dist/* > dist/SHA256SUMS
 
       - name: Verify release artifacts
@@ -75,6 +76,7 @@ jobs:
           fi
           .release-smoke/bin/python tests/packaging/smoke_minimal_install.py
           uv run --python 3.10 --no-project python -I tests/packaging/smoke_standalone_installer_py310.py
+          sh -n dist/install.sh
           sha256sum --check dist/SHA256SUMS
 
       - name: Attest release artifacts
@@ -84,6 +86,7 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
             dist/install-ash.py
+            dist/install.sh
             dist/SHA256SUMS
 
       - name: Create draft GitHub release
@@ -95,6 +98,7 @@ jobs:
             dist/*.whl \
             dist/*.tar.gz \
             dist/install-ash.py \
+            dist/install.sh \
             dist/SHA256SUMS \
             --verify-tag \
             --generate-notes \

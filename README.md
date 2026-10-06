@@ -37,38 +37,24 @@ branches.
 
 ### Installation
 
-Ash's intended production install path is an **immutable GitHub Release**, not
-a moving branch. The release workflow builds and attests the artifacts and the
-installer verifies the selected release before installation.
+Ash's production install path is one command on Linux and macOS:
 
-**Current status:** Ash publishes immutable, attested GitHub Releases. Resolve
-the latest published immutable tag at install time rather than copying a moving
-branch or hardcoding a release number. The release workflow verifies the wheel,
-standalone installer, and checksums, creates artifact provenance attestations,
-and checks release immutability before the release becomes the supported
-production artifact.
-
-The production install flow is:
-
-```bash
-repo="Suraj-H675/Ash-Harness"
-tag="$(gh release view -R "$repo" --json tagName,isImmutable --jq 'select(.isImmutable == true) | .tagName')"
-test -n "$tag" || { echo >&2 "No immutable Ash release is available."; exit 1; }
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-gh release verify "$tag" -R "$repo"
-gh release download "$tag" -R "$repo" --pattern install-ash.py --dir "$tmp"
-gh release verify-asset "$tag" "$tmp/install-ash.py" -R "$repo"
-python3 -I "$tmp/install-ash.py" --ref "$tag"
+```sh
+curl -fsSL --proto '=https' --tlsv1.2 https://github.com/Suraj-H675/Ash-Harness/releases/latest/download/install.sh | sh
 ```
 
-This requires the GitHub CLI (`gh`). The installer preserves an existing
-pipx/uv-managed Ash installation when possible, resolves the wheel from that
-same immutable release, downloads it into a private temporary directory, and
-verifies the exact byte count and GitHub SHA-256 digest itself before invoking
-the package manager. pipx/uv then install that already-verified local wheel;
-the hash fragment is retained only as defense in depth. Optional capability
-packs such as `--extra browser` remain available on that wheel install.
+The bootstrap owns the installation machinery for the user. If necessary it
+bootstraps `uv` and a supported Python runtime, resolves the latest immutable
+Ash release, verifies the standalone installer against GitHub's release SHA-256
+metadata, and then installs the verified release wheel through Ash's existing
+pipx/uv installer. No GitHub CLI or manual release/tag handling is required.
+
+Optional capability packs use the same install flow:
+
+```sh
+curl -fsSL --proto '=https' --tlsv1.2 https://github.com/Suraj-H675/Ash-Harness/releases/latest/download/install.sh | sh -s -- --extra browser
+```
+
 Development setup and release-maintainer instructions are intentionally
 separate; see [Contributing](CONTRIBUTING.md) and
 [Releasing Ash](docs/guides/RELEASING.md).
