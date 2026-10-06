@@ -108,6 +108,7 @@ def _entry_body_fragments(entry: TranscriptEntry) -> list[tuple[str, str]]:
 
     fragments: list[tuple[str, str]] = []
     in_diff = False
+    side_by_side = False
     for index, raw_line in enumerate(safe.splitlines() or [""]):
         if index:
             fragments.append(("", "\n"))
@@ -115,9 +116,26 @@ def _entry_body_fragments(entry: TranscriptEntry) -> list[tuple[str, str]]:
         stripped = raw_line.strip()
         if stripped.startswith("Diff preview"):
             in_diff = True
+            side_by_side = stripped.startswith("Diff preview (side-by-side)")
         elif in_diff:
             if raw_line.startswith(("+++", "---", "@@")):
                 style = "class:diff-hunk"
+            elif side_by_side and " | " in raw_line:
+                left, right = raw_line.split(" | ", 1)
+                left_style = (
+                    "class:diff-removed"
+                    if left.startswith("- ")
+                    else "class:diff-context"
+                )
+                right_style = (
+                    "class:diff-added"
+                    if right.startswith("+ ")
+                    else "class:diff-context"
+                )
+                fragments.append((left_style, "  " + left))
+                fragments.append(("class:diff-context", " | "))
+                fragments.append((right_style, right))
+                continue
             elif raw_line.startswith("+"):
                 style = "class:diff-added"
             elif raw_line.startswith("-"):
@@ -379,16 +397,28 @@ class TranscriptViewport:
         self,
         title: str,
         options: tuple[ViewportChoice, ...],
+        *,
+        default_value: str | None = None,
     ) -> str | None:
         if self._running:
             raise RuntimeError("transcript viewport already owns terminal input")
         if not options:
             return None
+        selected = 0
+        if default_value is not None:
+            try:
+                selected = next(
+                    index
+                    for index, option in enumerate(options)
+                    if option.value == default_value
+                )
+            except StopIteration as exc:
+                raise ValueError("default choice is not present in options") from exc
         self._running = True
         self._choice_mode = True
         self._choice_title = terminal_safe_text(title, single_line=True)
         self._choice_options = options
-        self._choice_selected = 0
+        self._choice_selected = selected
         self._follow_tail = True
         self._manual_cursor_line = 0
         try:

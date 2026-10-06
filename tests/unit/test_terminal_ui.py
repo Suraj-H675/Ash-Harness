@@ -8,6 +8,7 @@ from ash.ui.safe_text import terminal_safe_text
 from io import StringIO
 import pytest
 from rich.console import Console
+from rich.text import Text
 from types import SimpleNamespace
 
 
@@ -563,6 +564,7 @@ def test_side_by_side_approval_preview_is_bounded_and_labeled(tmp_path):
     assert lines[0].startswith("--- a/example.txt")
     assert lines[1].startswith("+++ b/example.txt")
     assert " | " in preview
+    assert any(line.startswith("- ") and " | + " in line for line in lines[2:])
     assert len(lines) <= 201
     assert lines[-1] == "[diff preview truncated]"
 
@@ -577,6 +579,23 @@ def test_side_by_side_approval_preview_is_bounded_and_labeled(tmp_path):
     assert "Diff preview (side-by-side):" in approval.content
     assert "old 0" in approval.content
     assert " | " in approval.content
+
+
+def test_side_by_side_rich_diff_styles_each_changed_half() -> None:
+    body = Text()
+
+    terminal_module._append_styled_diff(
+        body,
+        "- old                                  | + new",
+        theme_name="dark",
+        side_by_side=True,
+    )
+
+    styled = [
+        (str(span.style), body.plain[span.start : span.end]) for span in body.spans
+    ]
+    assert ("#c8c8c8 on #3a2222", "- old                                 ") in styled
+    assert ("#c8c8c8 on #1f3324", "+ new") in styled
 
 
 def test_terminal_ui_does_not_read_oversized_existing_file(tmp_path, monkeypatch):

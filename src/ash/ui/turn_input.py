@@ -494,12 +494,14 @@ class InteractiveTurnController:
             selected = await self.prompt_input.choose(
                 f"{tool_name} permission",
                 primary,
+                default_value="n",
             )
             if selected != "more":
                 return selected
             selected = await self.prompt_input.choose(
                 f"{tool_name} permission · advanced",
                 tuple(advanced),
+                default_value="back",
             )
             if selected == "back":
                 continue

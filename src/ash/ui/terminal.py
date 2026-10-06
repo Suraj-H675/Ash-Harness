@@ -113,10 +113,22 @@ def _rich_diff_style(theme_name: str, line: str) -> str:
     return "#a8a8a8" if theme_name == "dark" else "#555555"
 
 
-def _append_styled_diff(body: Text, preview: str, *, theme_name: str) -> None:
+def _append_styled_diff(
+    body: Text,
+    preview: str,
+    *,
+    theme_name: str,
+    side_by_side: bool = False,
+) -> None:
     for index, line in enumerate(preview.splitlines()):
         if index:
             body.append("\n")
+        if side_by_side and " | " in line and not line.startswith(("---", "+++")):
+            left, right = line.split(" | ", 1)
+            body.append(left, style=_rich_diff_style(theme_name, left))
+            body.append(" | ", style=_rich_diff_style(theme_name, " "))
+            body.append(right, style=_rich_diff_style(theme_name, right))
+            continue
         body.append(line, style=_rich_diff_style(theme_name, line))
 
 
@@ -884,7 +896,12 @@ class TerminalUI:
                 "\nDiff preview (side-by-side):\n" if side_by_side else "\nDiff preview:\n",
                 style="bold",
             )
-            _append_styled_diff(body, preview, theme_name=self.theme.name)
+            _append_styled_diff(
+                body,
+                preview,
+                theme_name=self.theme.name,
+                side_by_side=side_by_side,
+            )
         if auto:
             body.append("\n[auto-approved]", style=self.theme.success)
         self.transcript.append(
@@ -1105,20 +1122,21 @@ class TerminalUI:
             )
         matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
         left_width, right_width = 38, 38
-        rows: list[tuple[str, str]] = []
+        rows: list[tuple[str, str, str]] = []
         for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
             old_slice = old_lines[old_start:old_end]
             new_slice = new_lines[new_start:new_end]
             if tag == "equal":
-                rows.extend((line, line) for line in old_slice)
+                rows.extend(("equal", line, line) for line in old_slice)
             elif tag == "delete":
-                rows.extend((line, "") for line in old_slice)
+                rows.extend(("delete", line, "") for line in old_slice)
             elif tag == "insert":
-                rows.extend(("", line) for line in new_slice)
+                rows.extend(("insert", "", line) for line in new_slice)
             else:
                 for index in range(max(len(old_slice), len(new_slice))):
                     rows.append(
                         (
+                            "replace",
                             old_slice[index] if index < len(old_slice) else "",
                             new_slice[index] if index < len(new_slice) else "",
                         )
@@ -1127,11 +1145,22 @@ class TerminalUI:
             "--- " + old_name.ljust(left_width)[:left_width],
             "+++ " + new_name.ljust(right_width)[:right_width],
         ]
-        for old_line, new_line in rows[:198]:
+        content_width = 36
+        for row_tag, old_line, new_line in rows[:198]:
+            left_marker = (
+                "-" if row_tag in {"delete", "replace"} and old_line else " "
+            )
+            right_marker = (
+                "+" if row_tag in {"insert", "replace"} and new_line else " "
+            )
             output.append(
-                old_line.ljust(left_width)[:left_width]
+                left_marker
+                + " "
+                + old_line.ljust(content_width)[:content_width]
                 + " | "
-                + new_line[:right_width]
+                + right_marker
+                + " "
+                + new_line[:content_width]
             )
         if len(rows) > 198:
             output.append(DIFF_PREVIEW_TRUNCATED)

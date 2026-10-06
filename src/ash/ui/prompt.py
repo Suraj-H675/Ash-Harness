@@ -595,10 +595,16 @@ class PromptInput:
         self,
         title: str,
         options: tuple[ViewportChoice, ...],
+        *,
+        default_value: str | None = None,
     ) -> str | None:
         if self._viewport is None:
             raise RuntimeError("choice UI requires viewport mode")
-        return await self._viewport.choose(title, options)
+        return await self._viewport.choose(
+            title,
+            options,
+            default_value=default_value,
+        )
 
     @property
     def uses_viewport(self) -> bool:

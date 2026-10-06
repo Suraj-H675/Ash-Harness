@@ -88,6 +88,34 @@ def test_approval_diff_uses_semantic_add_remove_styles() -> None:
     )
 
 
+def test_side_by_side_approval_diff_styles_each_changed_half() -> None:
+    transcript = Transcript()
+    transcript.append(
+        "approval",
+        (
+            "Tool: whole_edit\n"
+            "Diff preview (side-by-side):\n"
+            "--- a/example.py\n"
+            "+++ b/example.py\n"
+            "- old                                  | + new\n"
+            "  same                                 |   same"
+        ),
+        title="whole_edit",
+    )
+
+    rendered = RichTranscriptFormatter().format(transcript.snapshot(), width=80)
+    fragments = list(to_formatted_text(rendered))
+
+    assert any(
+        "class:diff-removed" in style and "- old" in text
+        for style, text, *_ in fragments
+    )
+    assert any(
+        "class:diff-added" in style and "+ new" in text
+        for style, text, *_ in fragments
+    )
+
+
 def test_rich_transcript_formatter_renders_markdown_and_caches_cells() -> None:
     transcript = Transcript()
     transcript.append(
@@ -541,6 +569,38 @@ def test_viewport_mouse_wheel_scrolls_transcript(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_viewport_receives_xterm_mouse_wheel_sequence(tmp_path: Path) -> None:
+    transcript = Transcript()
+    for index in range(80):
+        transcript.append("assistant", f"line {index}", title="ash")
+
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            transcript,
+            history_path=tmp_path / "history",
+            mouse_support=True,
+            input=pipe,
+            output=SizedDummyOutput(columns=80, rows=24),
+        )
+        pending = asyncio.create_task(viewport.read("> "))
+        await asyncio.sleep(0.05)
+        render_info = viewport.transcript_window.render_info
+        assert render_info is not None
+        before = render_info.vertical_scroll
+
+        pipe.send_bytes(b"\x1b[<64;2;6M")
+        await asyncio.sleep(0.05)
+
+        render_info = viewport.transcript_window.render_info
+        assert render_info is not None
+        assert render_info.vertical_scroll < before
+        assert viewport._follow_tail is False
+        pipe.send_text("done\r")
+        assert await pending == "done"
+        viewport.close()
+
+
+@pytest.mark.asyncio
 async def test_viewport_choice_selector_uses_arrow_keys_and_enter(tmp_path: Path) -> None:
     with create_pipe_input() as pipe:
         viewport = TranscriptViewport(
@@ -565,3 +625,51 @@ async def test_viewport_choice_selector_uses_arrow_keys_and_enter(tmp_path: Path
 
         assert await pending == "deny"
         viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_choice_selector_honors_safe_default(tmp_path: Path) -> None:
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            Transcript(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=SizedDummyOutput(columns=80, rows=24),
+        )
+        pending = asyncio.create_task(
+            viewport.choose(
+                "write_file permission",
+                (
+                    ViewportChoice("once", "Allow once", "This request only."),
+                    ViewportChoice("deny", "Deny", "Reject this request."),
+                ),
+                default_value="deny",
+            )
+        )
+        await asyncio.sleep(0.05)
+
+        pipe.send_text("\r")
+
+        assert await pending == "deny"
+        viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_choice_selector_rejects_unknown_default_cleanly(
+    tmp_path: Path,
+) -> None:
+    viewport = TranscriptViewport(
+        Transcript(),
+        history_path=tmp_path / "history",
+        output=SizedDummyOutput(columns=80, rows=24),
+    )
+
+    with pytest.raises(ValueError, match="default choice"):
+        await viewport.choose(
+            "write_file permission",
+            (ViewportChoice("once", "Allow once"),),
+            default_value="deny",
+        )
+
+    assert viewport._running is False
+    viewport.close()

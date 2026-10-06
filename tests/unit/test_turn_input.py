@@ -49,9 +49,11 @@ class ViewportApprovalPrompt(RoutedPrompt):
         super().__init__()
         self.selections: asyncio.Queue[str | None] = asyncio.Queue()
         self.choice_calls: list[tuple[str, tuple[str, ...]]] = []
+        self.choice_defaults: list[str | None] = []
 
-    async def choose(self, title, options):
+    async def choose(self, title, options, *, default_value=None):
         self.choice_calls.append((title, tuple(option.label for option in options)))
+        self.choice_defaults.append(default_value)
         return await self.selections.get()
 
 
@@ -401,6 +403,7 @@ async def test_viewport_approval_keeps_broader_rules_behind_more_options(
     selected = await controller._select_approval("write_file")
 
     assert selected == "a"
+    assert prompt.choice_defaults == ["n", "back"]
     assert prompt.choice_calls[0][1][-1] == "More approval options…"
     assert prompt.choice_calls[1][1] == (
         "Allow this tool for session",
