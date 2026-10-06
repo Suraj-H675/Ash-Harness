@@ -843,10 +843,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         keybindings=config.keybindings,
         workspace_root=loop.project_root,
         transcript=loop.ui.transcript if isinstance(loop.ui, TerminalUI) else None,
-        tui_mode=config.tui_mode,
         theme=config.theme,
         no_color=config.no_color,
-        mouse_support=config.tui_mouse,
         repo_map=getattr(loop, "repo_map", None),
         mcp_runtime=getattr(loop, "_mcp_runtime", None),
         screen_reader_mode=config.screen_reader_mode,
@@ -1290,16 +1288,6 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 active_model = terminal_safe_text(
                     str(loop.active_model_id), single_line=True
                 )
-                tui_label = (
-                    "fullscreen"
-                    if config.tui_mode == "viewport"
-                    else "scrollback"
-                )
-                mouse_label = (
-                    ("Ash capture on" if config.tui_mouse else "Ash capture off")
-                    if config.tui_mode == "viewport"
-                    else "terminal-native"
-                )
                 fallbacks = ", ".join(
                     terminal_safe_text(model, single_line=True)
                     for model in config.fallback_models
@@ -1311,9 +1299,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"  Model: {active_model}",
                             f"  Fallbacks: {fallbacks}",
                             f"  Permission mode: {loop.safety_tier}",
-                            f"  TUI: {tui_label}",
                             f"  Input: {config.input_mode}",
-                            f"  Mouse: {mouse_label}",
+                            "  Interface: Ash viewport",
+                            "  Mouse: Ash-managed",
                             f"  Theme: {config.theme}",
                             f"  Screen reader: {'on' if config.screen_reader_mode else 'off'}",
                             f"  Reduced motion: {'on' if config.reduced_motion else 'off'}",

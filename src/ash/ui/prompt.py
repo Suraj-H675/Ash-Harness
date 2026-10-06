@@ -8,129 +8,21 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.application import Application
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.completion.base import Completer, Completion
 from prompt_toolkit.document import Document
-from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.enums import EditingMode
-from prompt_toolkit.layout import FormattedTextControl, HSplit, Layout, Window
-from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.input.base import Input
-from prompt_toolkit.output.base import Output
 
 from ash.commands.slash import COMMANDS
 from ash.provider_catalog import BUILTIN_PROVIDERS
 from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.ui.history import PrivateFileHistory
-from ash.ui.input_signals import PromptInterrupted
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript
-from ash.ui.theme import get_theme, prompt_style, viewport_styles
 from ash.ui.viewport import TranscriptViewport, ViewportChoice
 
 
 MAX_PATH_COMPLETION_SCAN_ENTRIES = 10_000
 MAX_PATH_COMPLETIONS = 200
-
-
-async def _choose_inline(
-    title: str,
-    options: tuple[ViewportChoice, ...],
-    *,
-    default_value: str | None = None,
-    theme: str = "dark",
-    no_color: bool = False,
-    input: Input | None = None,
-    output: Output | None = None,
-) -> str | None:
-    """Render a compact keyboard selector without taking terminal mouse ownership."""
-
-    if not options:
-        return None
-    selected = 0
-    if default_value is not None:
-        try:
-            selected = next(
-                index
-                for index, option in enumerate(options)
-                if option.value == default_value
-            )
-        except StopIteration as exc:
-            raise ValueError("default choice is not present in options") from exc
-
-    safe_title = terminal_safe_text(title, single_line=True)
-    bindings = KeyBindings()
-
-    def choice_text() -> FormattedText:
-        fragments: list[tuple[str, str]] = [
-            ("class:approval-prefix", " APPROVAL "),
-            ("", "  "),
-            ("class:muted", safe_title),
-            ("", "\n"),
-        ]
-        for index, option in enumerate(options):
-            style = "class:selected" if index == selected else ""
-            marker = "> " if index == selected else "  "
-            fragments.append((style, marker))
-            fragments.append(
-                (f"{style} class:option".strip(), option.label)
-            )
-            fragments.append((style, "\n"))
-        description = terminal_safe_text(options[selected].description)
-        if description:
-            fragments.append(("class:meta", " " + description))
-            fragments.append(("", "\n"))
-        fragments.append(
-            ("class:muted", " ↑/↓ choose  Enter select  Esc deny")
-        )
-        return FormattedText(fragments)
-
-    control = FormattedTextControl(choice_text)
-    window = Window(
-        control,
-        height=Dimension(min=4, max=max(4, len(options) + 3)),
-        wrap_lines=True,
-    )
-    app: Application[str | None] = Application(
-        layout=Layout(HSplit([window])),
-        key_bindings=bindings,
-        full_screen=False,
-        erase_when_done=True,
-        mouse_support=False,
-        style=prompt_style(viewport_styles(get_theme(theme)), no_color=no_color),
-        input=input,
-        output=output,
-    )
-
-    def move(offset: int) -> None:
-        nonlocal selected
-        selected = (selected + offset) % len(options)
-        app.invalidate()
-
-    @bindings.add("up")
-    def select_previous(event) -> None:
-        del event
-        move(-1)
-
-    @bindings.add("down")
-    def select_next(event) -> None:
-        del event
-        move(1)
-
-    @bindings.add("enter")
-    def accept(event) -> None:
-        event.app.exit(result=options[selected].value)
-
-    @bindings.add("escape")
-    @bindings.add("c-c")
-    def cancel(event) -> None:
-        event.app.exit(result=None)
-
-    return await app.run_async()
 
 
 def terminal_supports_cursor_ui(
@@ -559,31 +451,6 @@ class AshCompleter(Completer):
             yield from self._mcp_completions(prefix, word)
 
 
-def _key_bindings(bindings_by_action: dict[str, list[str]]) -> KeyBindings:
-    bindings = KeyBindings()
-
-    def _insert_newline(event) -> None:
-        event.current_buffer.insert_text("\n")
-
-    def _open_editor(event) -> None:
-        event.current_buffer.open_in_editor()
-
-    handlers = {
-        "newline": _insert_newline,
-        "open_editor": _open_editor,
-    }
-    for action, sequences in bindings_by_action.items():
-        handler = handlers[action]
-        for sequence in sequences:
-            bindings.add(*sequence.split())(handler)
-
-    @bindings.add("c-c", eager=True)
-    def _interrupt(event) -> None:
-        event.app.exit(exception=PromptInterrupted())
-
-    return bindings
-
-
 class PromptInput:
     """Prompt-toolkit input with a deterministic fallback for redirected stdin."""
 
@@ -601,26 +468,19 @@ class PromptInput:
         keybindings: dict[str, list[str]] | None = None,
         workspace_root: Path | None = None,
         transcript: Transcript | None = None,
-        tui_mode: str = "inline",
         theme: str = "dark",
         no_color: bool = False,
-        mouse_support: bool = True,
         repo_map: Any | None = None,
         mcp_runtime: Any | None = None,
         screen_reader_mode: bool = False,
     ) -> None:
         if input_mode not in {"emacs", "vi"}:
             raise ValueError("input_mode must be emacs or vi")
-        if tui_mode not in {"viewport", "inline"}:
-            raise ValueError("tui_mode must be viewport or inline")
         self.input_stream = input_stream or sys.stdin
         self.interactive = bool(getattr(self.input_stream, "isatty", lambda: False)())
-        self._session: PromptSession[str] | None = None
         self._viewport: TranscriptViewport | None = None
         self._completer: AshCompleter | None = None
         self._linear_input_buffer = ""
-        self._theme = theme
-        self._no_color = no_color
         self.screen_reader_mode = screen_reader_mode
         self.supports_full_screen_ui = terminal_supports_cursor_ui(
             input_stream=self.input_stream,
@@ -660,41 +520,19 @@ class PromptInput:
                 mcp_runtime=mcp_runtime,
             )
             self._completer = completer
-            if tui_mode == "viewport":
-                self._viewport = TranscriptViewport(
-                    transcript or Transcript(),
-                    history_path=path,
-                    history=history,
-                    completer=completer,
-                    status_provider=viewport_status_provider or status_provider,
-                    header_provider=header_provider,
-                    input_mode=input_mode,
-                    keybindings=keybindings,
-                    theme=theme,
-                    no_color=no_color,
-                    mouse_support=mouse_support,
-                )
-            else:
-                self._session = PromptSession(
-                    history=history,
-                    auto_suggest=AutoSuggestFromHistory(),
-                    completer=completer,
-                    complete_while_typing=True,
-                    key_bindings=_key_bindings(
-                        keybindings
-                        if keybindings is not None
-                        else {
-                            "newline": ["escape enter", "c-j"],
-                            "open_editor": ["c-x c-e"],
-                        }
-                    ),
-                    editing_mode=(
-                        EditingMode.VI if input_mode == "vi" else EditingMode.EMACS
-                    ),
-                    multiline=False,
-                    enable_open_in_editor=True,
-                    bottom_toolbar=status_provider,
-                )
+            self._viewport = TranscriptViewport(
+                transcript or Transcript(),
+                history_path=path,
+                history=history,
+                completer=completer,
+                status_provider=viewport_status_provider or status_provider,
+                header_provider=header_provider,
+                input_mode=input_mode,
+                keybindings=keybindings,
+                theme=theme,
+                no_color=no_color,
+                workspace_root=workspace_root,
+            )
 
     async def choose(
         self,
@@ -709,14 +547,6 @@ class PromptInput:
                 options,
                 default_value=default_value,
             )
-        if self._session is not None:
-            return await _choose_inline(
-                title,
-                options,
-                default_value=default_value,
-                theme=self._theme,
-                no_color=self._no_color,
-            )
         raise RuntimeError("choice UI requires an interactive cursor terminal")
 
     @property
@@ -725,7 +555,7 @@ class PromptInput:
 
     @property
     def supports_choice_ui(self) -> bool:
-        return self._viewport is not None or self._session is not None
+        return self._viewport is not None
 
     def set_extra_commands(self, commands: dict[str, str] | list[str]) -> None:
         if self._completer is None:
@@ -752,8 +582,6 @@ class PromptInput:
             return await self._read_linear(prompt)
         if self._viewport is not None:
             return await self._viewport.read(prompt)
-        if self._session is not None:
-            return await self._session.prompt_async(prompt)
         line = self.input_stream.readline()
         if line == "":
             raise EOFError

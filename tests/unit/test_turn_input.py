@@ -61,10 +61,6 @@ class ViewportApprovalPrompt(RoutedPrompt):
         return await self.selections.get()
 
 
-class InlineApprovalPrompt(ViewportApprovalPrompt):
-    uses_viewport = False
-
-
 class RecordingNotifier:
     def __init__(self) -> None:
         self.calls: list[tuple[NotificationEvent, str]] = []
@@ -352,15 +348,10 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "prompt_type",
-    (ViewportApprovalPrompt, InlineApprovalPrompt),
-)
-async def test_interactive_approval_uses_selector_instead_of_letter_prompt(
+async def test_viewport_approval_uses_selector_instead_of_letter_prompt(
     tmp_path: Path,
-    prompt_type,
 ) -> None:
-    prompt = prompt_type()
+    prompt = ViewportApprovalPrompt()
     await prompt.selections.put("y")
     ui = make_ui()
     guard = SafetyGuard(tmp_path)

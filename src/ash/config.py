@@ -214,8 +214,6 @@ PROJECT_CONFIG_FIELDS = frozenset(
         "theme",
         "show_token_meter",
         "input_mode",
-        "tui_mode",
-        "tui_mouse",
         "notification_method",
         "notification_events",
         "notification_include_preview",
@@ -649,18 +647,6 @@ class AshConfig(BaseSettings):
     input_mode: str = Field(
         "emacs",
         description="Interactive editor mode: emacs or vi.",
-    )
-    tui_mode: str = Field(
-        "inline",
-        description=(
-            "Interactive terminal renderer: inline/scrollback or viewport/fullscreen."
-        ),
-    )
-    tui_mouse: bool = Field(
-        True,
-        description=(
-            "Enable mouse capture when using the full-screen viewport renderer."
-        ),
     )
     notification_method: str = Field(
         "off",
@@ -1738,23 +1724,6 @@ class AshConfig(BaseSettings):
                 normalized[action].append(" ".join(keys))
         return normalized
 
-    @field_validator("tui_mode")
-    @classmethod
-    def validate_tui_mode(cls, value: str) -> str:
-        normalized = value.casefold()
-        aliases = {
-            "inline": "inline",
-            "scrollback": "inline",
-            "viewport": "viewport",
-            "fullscreen": "viewport",
-        }
-        try:
-            return aliases[normalized]
-        except KeyError as exc:
-            raise ValueError(
-                "tui_mode must be scrollback/inline or fullscreen/viewport"
-            ) from exc
-
     @field_validator("theme")
     @classmethod
     def validate_theme(cls, value: str) -> str:
@@ -1837,7 +1806,6 @@ class AshConfig(BaseSettings):
         self.theme = "dark"
         self.reduced_motion = True
         self.show_token_meter = False
-        self.tui_mode = "inline"
         return self
 
     @property
@@ -2117,7 +2085,6 @@ class AshConfig(BaseSettings):
             "no_color",
             "reduced_motion",
             "show_token_meter",
-            "tui_mode",
             "theme",
         ):
             self._config_sources[field] = ("derived", "screen_reader_mode")

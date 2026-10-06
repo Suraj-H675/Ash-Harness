@@ -8,27 +8,14 @@ from pathlib import Path
 import pytest
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
-from prompt_toolkit.input.defaults import create_pipe_input
-from prompt_toolkit.output import DummyOutput
-
 import ash.ui.prompt as prompt_module
 import ash.ui.history as history_module
-from ash.ui.prompt import AshCompleter, PromptInput, _choose_inline
-from ash.ui.viewport import ViewportChoice
+from ash.ui.prompt import AshCompleter, PromptInput
 
 
 class TtyStringIO(io.StringIO):
     def isatty(self) -> bool:
         return True
-
-
-class TrackingMouseOutput(DummyOutput):
-    def __init__(self) -> None:
-        super().__init__()
-        self.mouse_enabled = 0
-
-    def enable_mouse_support(self) -> None:
-        self.mouse_enabled += 1
 
 
 @pytest.fixture
@@ -38,6 +25,17 @@ def cursor_ui(monkeypatch: pytest.MonkeyPatch) -> None:
         "terminal_supports_cursor_ui",
         lambda **kwargs: True,
     )
+
+
+def _capture_viewport(
+    monkeypatch: pytest.MonkeyPatch,
+    captured: dict,
+) -> None:
+    class FakeViewport:
+        def __init__(self, *args, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(prompt_module, "TranscriptViewport", FakeViewport)
 
 
 def test_redirected_input_uses_line_fallback() -> None:
@@ -56,114 +54,24 @@ def test_redirected_eof_is_reported() -> None:
 def test_invalid_input_mode_is_rejected() -> None:
     with pytest.raises(ValueError, match="input_mode"):
         PromptInput(input_stream=io.StringIO(""), input_mode="modal")
-    with pytest.raises(ValueError, match="tui_mode"):
-        PromptInput(input_stream=io.StringIO(""), tui_mode="floating")
-
-
-@pytest.mark.asyncio
-async def test_inline_prompt_bracketed_paste_preserves_multiline_input(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    cursor_ui: None,
-) -> None:
-    from prompt_toolkit import PromptSession
-
-    with create_pipe_input() as pipe:
-        real_session = PromptSession(
-            input=pipe,
-            output=DummyOutput(),
-            multiline=False,
-        )
-        monkeypatch.setattr(
-            prompt_module,
-            "PromptSession",
-            lambda **kwargs: real_session,
-        )
-        prompt = PromptInput(
-            input_stream=TtyStringIO(),
-            history_path=tmp_path / "history",
-            tui_mode="inline",
-        )
-        pending = asyncio.create_task(prompt.read())
-        pipe.send_bytes(b"\x1b[200~first\nsecond\x1b[201~")
-        pipe.send_text("\r")
-
-        assert await pending == "first\nsecond"
-
-
-@pytest.mark.asyncio
-async def test_default_inline_prompt_does_not_capture_terminal_mouse(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    cursor_ui: None,
-) -> None:
-    from prompt_toolkit import PromptSession
-
-    with create_pipe_input() as pipe:
-        output = TrackingMouseOutput()
-        real_session = PromptSession(
-            input=pipe,
-            output=output,
-            multiline=False,
-        )
-        monkeypatch.setattr(
-            prompt_module,
-            "PromptSession",
-            lambda **kwargs: real_session,
-        )
-        prompt = PromptInput(
-            input_stream=TtyStringIO(),
-            history_path=tmp_path / "history",
-        )
-        pending = asyncio.create_task(prompt.read())
-        pipe.send_text("hello\r")
-
-        assert await pending == "hello"
-        assert prompt.uses_viewport is False
-        assert output.mouse_enabled == 0
-
-
-@pytest.mark.asyncio
-async def test_inline_choice_selector_uses_keyboard_without_mouse_capture() -> None:
-    with create_pipe_input() as pipe:
-        output = DummyOutput()
-        pending = asyncio.create_task(
-            _choose_inline(
-                "write_file permission",
-                (
-                    ViewportChoice("y", "Allow once", "This request only."),
-                    ViewportChoice("n", "Deny", "Reject this request."),
-                ),
-                default_value="n",
-                input=pipe,
-                output=output,
-            )
-        )
-        await asyncio.sleep(0.05)
-
-        pipe.send_text("\r")
-
-        assert await pending == "n"
 
 
 def test_screen_reader_mode_uses_reduced_dynamic_prompt(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class FailPromptSession:
+    class FailViewport:
         def __init__(self, **kwargs) -> None:
             raise AssertionError("screen-reader mode must not create prompt-toolkit UI")
 
-    monkeypatch.setattr(prompt_module, "PromptSession", FailPromptSession)
+    monkeypatch.setattr(prompt_module, "TranscriptViewport", FailViewport)
     prompt = PromptInput(
         input_stream=TtyStringIO(),
         history_path=tmp_path / "history",
-        tui_mode="viewport",
         screen_reader_mode=True,
     )
 
     assert prompt.uses_viewport is False
     assert prompt.screen_reader_mode is True
-    assert prompt._session is None
     assert prompt._completer is None
 
 
@@ -194,15 +102,15 @@ def test_terminal_capability_requires_tty_output() -> None:
 async def test_limited_terminal_uses_linear_reader_without_prompt_toolkit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FailPromptSession:
+    class FailViewport:
         def __init__(self, **kwargs) -> None:
             raise AssertionError("limited terminals must not create prompt-toolkit UI")
 
     output = TtyStringIO()
     monkeypatch.setenv("TERM", "dumb")
     monkeypatch.setattr(sys, "stdout", output)
-    monkeypatch.setattr(prompt_module, "PromptSession", FailPromptSession)
-    prompt = PromptInput(input_stream=TtyStringIO("hello\n"), tui_mode="viewport")
+    monkeypatch.setattr(prompt_module, "TranscriptViewport", FailViewport)
+    prompt = PromptInput(input_stream=TtyStringIO("hello\n"))
 
     assert prompt.linear_mode is True
     assert prompt.supports_full_screen_ui is False
@@ -250,12 +158,7 @@ def test_prompt_completion_updates_after_plugin_reload(
     tmp_path, monkeypatch: pytest.MonkeyPatch, cursor_ui: None
 ) -> None:
     captured = {}
-
-    class FakePromptSession:
-        def __init__(self, **kwargs) -> None:
-            captured.update(kwargs)
-
-    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
+    _capture_viewport(monkeypatch, captured)
     prompt = PromptInput(
         input_stream=TtyStringIO(),
         history_path=tmp_path / "history",
@@ -280,12 +183,7 @@ def test_prompt_completion_preserves_custom_command_description(
     tmp_path, monkeypatch: pytest.MonkeyPatch, cursor_ui: None
 ) -> None:
     captured = {}
-
-    class FakePromptSession:
-        def __init__(self, **kwargs) -> None:
-            captured.update(kwargs)
-
-    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
+    _capture_viewport(monkeypatch, captured)
     PromptInput(
         input_stream=TtyStringIO(),
         history_path=tmp_path / "history",
@@ -422,12 +320,7 @@ def test_prompt_keeps_curated_builtin_command_order_before_custom_commands(
     cursor_ui: None,
 ) -> None:
     captured = {}
-
-    class FakePromptSession:
-        def __init__(self, **kwargs) -> None:
-            captured.update(kwargs)
-
-    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
+    _capture_viewport(monkeypatch, captured)
     PromptInput(
         input_stream=TtyStringIO(),
         history_path=tmp_path / "history",
@@ -488,7 +381,7 @@ def test_interactive_prompt_history_rejects_symlink(
     except OSError as exc:
         pytest.skip(f"symlink creation is unavailable: {exc}")
 
-    monkeypatch.setattr(prompt_module, "PromptSession", lambda **kwargs: None)
+    _capture_viewport(monkeypatch, {})
 
     with pytest.raises(ValueError, match="symlinked prompt history"):
         PromptInput(input_stream=TtyStringIO(), history_path=history_path)
@@ -499,12 +392,7 @@ def test_interactive_prompt_history_is_private_and_nofollow(
     tmp_path, monkeypatch, cursor_ui: None
 ) -> None:
     captured = {}
-
-    class FakePromptSession:
-        def __init__(self, **kwargs) -> None:
-            captured.update(kwargs)
-
-    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
+    _capture_viewport(monkeypatch, captured)
     history_path = tmp_path / "history"
     PromptInput(input_stream=TtyStringIO(), history_path=history_path)
     history = captured["history"]
@@ -594,12 +482,7 @@ def test_interactive_prompt_history_repairs_existing_posix_permissions(
     if os.name == "nt":
         pytest.skip("POSIX permissions are unavailable")
     captured = {}
-
-    class FakePromptSession:
-        def __init__(self, **kwargs) -> None:
-            captured.update(kwargs)
-
-    monkeypatch.setattr(prompt_module, "PromptSession", FakePromptSession)
+    _capture_viewport(monkeypatch, captured)
     history_path = tmp_path / "history"
     history_path.write_text("", encoding="utf-8")
     history_path.chmod(0o644)
@@ -693,7 +576,7 @@ def test_prompt_history_ancestor_symlink_cannot_create_external_parent(
     except OSError as exc:
         pytest.skip(f"symlink creation is unavailable: {exc}")
 
-    monkeypatch.setattr(prompt_module, "PromptSession", lambda **kwargs: None)
+    _capture_viewport(monkeypatch, {})
     history_path = alias / "nested" / "history"
 
     with pytest.raises((OSError, ValueError)):

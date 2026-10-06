@@ -164,6 +164,7 @@ def viewport_styles(theme: Theme) -> dict[str, str]:
         "diff-removed": theme.diff_removed,
         "diff-hunk": theme.diff_hunk,
         "diff-context": theme.diff_context,
+        "selection": "reverse",
         "selected": "reverse bold",
         "option": "",
         "meta": theme.muted,

@@ -40,13 +40,13 @@ def _install_frontend(
 
     class FakePromptInput:
         interactive = False
-        uses_viewport = False
+        uses_viewport = True
+        supports_choice_ui = True
         supports_full_screen_ui = False
 
         def __init__(self, *args, **kwargs) -> None:
             del args
-            self.uses_viewport = kwargs.get("tui_mode") == "viewport"
-            self.supports_choice_ui = True
+            del kwargs
 
         async def read(self, prompt: str) -> str:
             del prompt
@@ -109,8 +109,6 @@ def _config(tmp_path: Path, **overrides):
         "workspace_root": tmp_path,
         "input_mode": "emacs",
         "keybindings": {},
-        "tui_mode": "inline",
-        "tui_mouse": True,
         "theme": "dark",
         "no_color": True,
         "reduced_motion": False,
@@ -195,7 +193,6 @@ def _persist_turn(
 async def test_retry_rewinds_old_answer_and_replays_primary_user_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys,
 ) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     session = store.create_session(str(tmp_path), model="ollama/test-model")
@@ -237,7 +234,6 @@ async def test_retry_rewinds_old_answer_and_replays_primary_user_metadata(
     )
     assert turns == ["retry this request"]
     assert metadata == [{"source": "test"}]
-    assert "ok" in capsys.readouterr().out
     assert store.load_session(session.session_id).messages == []
 
 
@@ -524,8 +520,6 @@ async def test_settings_shows_runtime_terminal_and_safety_preferences(
                 "model": "openai/configured-model",
                 "fallback_models": ["groq/fallback"],
                 "input_mode": "vi",
-                "tui_mode": "viewport",
-                "tui_mouse": False,
                 "no_color": False,
                 "reduced_motion": True,
                 "show_token_meter": True,
@@ -542,9 +536,9 @@ async def test_settings_shows_runtime_terminal_and_safety_preferences(
         "Model: openai/runtime-model",
         "Fallbacks: groq/fallback",
         "Permission mode: auto_edit",
-        "TUI: fullscreen",
         "Input: vi",
-        "Mouse: Ash capture off",
+        "Interface: Ash viewport",
+        "Mouse: Ash-managed",
         "Reduced motion: on",
         "Token meter: on",
         "Sandbox: native",

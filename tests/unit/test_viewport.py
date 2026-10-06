@@ -21,6 +21,7 @@ from ash.ui.viewport import (
     TranscriptViewport,
     ViewportChoice,
     _fit_segments,
+    _open_external_url,
     format_transcript,
 )
 
@@ -549,7 +550,6 @@ def test_viewport_mouse_wheel_scrolls_transcript(tmp_path: Path) -> None:
     viewport = TranscriptViewport(
         Transcript(),
         history_path=tmp_path / "history",
-        mouse_support=True,
     )
     viewport.transcript_window.vertical_scroll = 9
 
@@ -568,11 +568,331 @@ def test_viewport_mouse_wheel_scrolls_transcript(tmp_path: Path) -> None:
     viewport.close()
 
 
+def test_transcript_drag_selection_highlights_and_copies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = Transcript()
+    transcript.append("assistant", "hello world", title="ash")
+    copied: list[tuple[str, Path]] = []
+    monkeypatch.setattr(
+        "ash.ui.viewport.copy_to_clipboard",
+        lambda text, *, workspace_root: copied.append(
+            (text, Path(workspace_root))
+        )
+        or "test",
+    )
+    viewport = TranscriptViewport(
+        transcript,
+        history_path=tmp_path / "history",
+        workspace_root=tmp_path,
+    )
+    viewport._transcript_text()
+
+    viewport._handle_transcript_mouse(
+        MouseEvent(
+            position=Point(x=0, y=1),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+    viewport._handle_transcript_mouse(
+        MouseEvent(
+            position=Point(x=5, y=1),
+            event_type=MouseEventType.MOUSE_MOVE,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+    viewport._handle_transcript_mouse(
+        MouseEvent(
+            position=Point(x=5, y=1),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+
+    assert copied == [("hello", tmp_path)]
+    rendered = list(to_formatted_text(viewport._transcript_text()))
+    selected = "".join(
+        text
+        for style, text, *_ in rendered
+        if "class:selection" in style
+    )
+    assert selected == "hello"
+    viewport.close()
+
+
+def test_transcript_reverse_multiline_selection_copies_without_render_padding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = Transcript()
+    transcript.append("assistant", "hello\n\nworld", title="ash")
+    copied: list[str] = []
+    monkeypatch.setattr(
+        "ash.ui.viewport.copy_to_clipboard",
+        lambda text, *, workspace_root: copied.append(text) or "test",
+    )
+    viewport = TranscriptViewport(
+        transcript,
+        history_path=tmp_path / "history",
+        workspace_root=tmp_path,
+    )
+    viewport._transcript_text()
+
+    viewport._handle_transcript_mouse(
+        MouseEvent(
+            position=Point(x=5, y=3),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+    viewport._handle_transcript_mouse(
+        MouseEvent(
+            position=Point(x=0, y=1),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+
+    assert copied == ["hello\n\nworld"]
+    viewport.close()
+
+
+def test_transcript_right_click_without_selection_pastes_into_composer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = Transcript()
+    transcript.append("assistant", "hello", title="ash")
+    monkeypatch.setattr(
+        "ash.ui.viewport.read_from_clipboard",
+        lambda *, workspace_root, selection="clipboard": "pasted",
+    )
+    viewport = TranscriptViewport(
+        transcript,
+        history_path=tmp_path / "history",
+        workspace_root=tmp_path,
+    )
+
+    result = viewport._handle_transcript_mouse(
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.RIGHT,
+            modifiers=frozenset(),
+        )
+    )
+
+    assert result is None
+    assert viewport.input_buffer.text == "pasted"
+    viewport.close()
+
+
+def test_middle_click_uses_primary_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selections: list[str] = []
+    for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
+        monkeypatch.delenv(name, raising=False)
+
+    def read_clipboard(*, workspace_root, selection="clipboard"):
+        del workspace_root
+        selections.append(selection)
+        return "primary text"
+
+    monkeypatch.setattr("ash.ui.viewport.read_from_clipboard", read_clipboard)
+    viewport = TranscriptViewport(
+        Transcript(),
+        history_path=tmp_path / "history",
+        workspace_root=tmp_path,
+    )
+
+    viewport._handle_transcript_mouse(
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.MIDDLE,
+            modifiers=frozenset(),
+        )
+    )
+
+    assert selections == ["primary"]
+    assert viewport.input_buffer.text == "primary text"
+    viewport.close()
+
+
+def test_stationary_left_click_opens_local_transcript_url(tmp_path: Path) -> None:
+    transcript = Transcript()
+    transcript.append("assistant", "https://example.com/docs", title="ash")
+    opened: list[str] = []
+    viewport = TranscriptViewport(
+        transcript,
+        history_path=tmp_path / "history",
+        workspace_root=tmp_path,
+        open_url=lambda url: opened.append(url) or True,
+    )
+    viewport._transcript_text()
+
+    for event_type in (MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_UP):
+        viewport._handle_transcript_mouse(
+            MouseEvent(
+                position=Point(x=5, y=1),
+                event_type=event_type,
+                button=MouseButton.LEFT,
+                modifiers=frozenset(),
+            )
+        )
+
+    assert opened == ["https://example.com/docs"]
+    viewport.close()
+
+
+def test_default_link_opener_refuses_remote_ssh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened = False
+
+    def open_browser(url: str) -> bool:
+        nonlocal opened
+        del url
+        opened = True
+        return True
+
+    monkeypatch.setenv("SSH_CONNECTION", "host 22 client 12345")
+    monkeypatch.setattr("ash.ui.viewport.webbrowser.open", open_browser)
+
+    assert _open_external_url("https://example.com") is False
+    assert opened is False
+
+
+def test_right_click_paste_is_disabled_over_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads = 0
+
+    def read_clipboard(*, workspace_root, selection="clipboard"):
+        nonlocal reads
+        del workspace_root, selection
+        reads += 1
+        return "remote clipboard"
+
+    monkeypatch.setenv("SSH_TTY", "/dev/pts/4")
+    monkeypatch.setattr("ash.ui.viewport.read_from_clipboard", read_clipboard)
+    viewport = TranscriptViewport(
+        Transcript(),
+        history_path=tmp_path / "history",
+        workspace_root=tmp_path,
+    )
+
+    viewport._handle_transcript_mouse(
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.RIGHT,
+            modifiers=frozenset(),
+        )
+    )
+
+    assert reads == 0
+    assert viewport.input_buffer.text == ""
+    viewport.close()
+
+
+def test_transcript_right_click_does_not_paste_behind_approval_selector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads = 0
+
+    def read_clipboard(*, workspace_root, selection="clipboard"):
+        nonlocal reads
+        del workspace_root, selection
+        reads += 1
+        return "pasted"
+
+    monkeypatch.setattr("ash.ui.viewport.read_from_clipboard", read_clipboard)
+    viewport = TranscriptViewport(
+        Transcript(),
+        history_path=tmp_path / "history",
+        workspace_root=tmp_path,
+    )
+    viewport._choice_mode = True
+
+    result = viewport._handle_transcript_mouse(
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.RIGHT,
+            modifiers=frozenset(),
+        )
+    )
+
+    assert result is None
+    assert reads == 0
+    assert viewport.input_buffer.text == ""
+    viewport.close()
+
+
+def test_composer_right_click_copies_selection_or_pastes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copied: list[str] = []
+    monkeypatch.setattr(
+        "ash.ui.viewport.copy_to_clipboard",
+        lambda text, *, workspace_root: copied.append(text) or "test",
+    )
+    monkeypatch.setattr(
+        "ash.ui.viewport.read_from_clipboard",
+        lambda *, workspace_root, selection="clipboard": " + paste",
+    )
+    viewport = TranscriptViewport(
+        Transcript(),
+        history_path=tmp_path / "history",
+        workspace_root=tmp_path,
+    )
+    viewport.input_buffer.text = "hello"
+    viewport.input_buffer.cursor_position = 0
+    viewport.input_buffer.start_selection()
+    viewport.input_buffer.cursor_position = 5
+
+    result = viewport.composer_control.mouse_handler(
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.RIGHT,
+            modifiers=frozenset(),
+        )
+    )
+    assert result is None
+    assert copied == ["hello"]
+
+    viewport.input_buffer.exit_selection()
+    viewport.input_buffer.cursor_position = len(viewport.input_buffer.text)
+    viewport.composer_control.mouse_handler(
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.RIGHT,
+            modifiers=frozenset(),
+        )
+    )
+    assert viewport.input_buffer.text == "hello + paste"
+    viewport.close()
+
+
 def test_viewport_choice_supports_left_click(tmp_path: Path) -> None:
     viewport = TranscriptViewport(
         Transcript(),
         history_path=tmp_path / "history",
-        mouse_support=True,
     )
     viewport._choice_mode = True
     viewport._choice_options = (
@@ -611,8 +931,7 @@ async def test_viewport_receives_xterm_mouse_wheel_sequence(tmp_path: Path) -> N
         viewport = TranscriptViewport(
             transcript,
             history_path=tmp_path / "history",
-            mouse_support=True,
-            input=pipe,
+                input=pipe,
             output=SizedDummyOutput(columns=80, rows=24),
         )
         pending = asyncio.create_task(viewport.read("> "))
@@ -622,14 +941,54 @@ async def test_viewport_receives_xterm_mouse_wheel_sequence(tmp_path: Path) -> N
         before = render_info.vertical_scroll
 
         pipe.send_bytes(b"\x1b[<64;2;6M")
-        await asyncio.sleep(0.05)
-
-        render_info = viewport.transcript_window.render_info
-        assert render_info is not None
-        assert render_info.vertical_scroll < before
+        deadline = asyncio.get_running_loop().time() + 0.5
+        while True:
+            await asyncio.sleep(0.01)
+            render_info = viewport.transcript_window.render_info
+            assert render_info is not None
+            if render_info.vertical_scroll < before:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("mouse wheel event did not scroll transcript")
         assert viewport._follow_tail is False
         pipe.send_text("done\r")
         assert await pending == "done"
+        viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_receives_xterm_drag_selection_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transcript = Transcript()
+    transcript.append("assistant", "hello world", title="ash")
+    copied: list[str] = []
+    monkeypatch.setattr(
+        "ash.ui.viewport.copy_to_clipboard",
+        lambda text, *, workspace_root: copied.append(text) or "test",
+    )
+
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            transcript,
+            history_path=tmp_path / "history",
+            workspace_root=tmp_path,
+            input=pipe,
+            output=SizedDummyOutput(columns=60, rows=20),
+        )
+        pending = asyncio.create_task(viewport.read("> "))
+        await asyncio.sleep(0.05)
+
+        # Header is screen row 1; the assistant body begins on row 3.
+        pipe.send_bytes(b"\x1b[<0;1;3M")
+        pipe.send_bytes(b"\x1b[<32;6;3M")
+        pipe.send_bytes(b"\x1b[<0;6;3m")
+        await asyncio.sleep(0.05)
+
+        pipe.send_text("done\r")
+        assert await pending == "done"
+        assert copied == ["hello"]
         viewport.close()
 
 

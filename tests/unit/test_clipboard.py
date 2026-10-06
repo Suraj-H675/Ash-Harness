@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import ash.ui.clipboard as clipboard_module
-from ash.ui.clipboard import ClipboardUnavailable, copy_to_clipboard
+from ash.ui.clipboard import ClipboardUnavailable, copy_to_clipboard, read_from_clipboard
 
 
 def test_copy_to_clipboard_uses_resolved_host_backend(
@@ -122,3 +122,88 @@ def test_copy_to_clipboard_uses_pbcopy_and_macos_guidance(
     )
     with pytest.raises(ClipboardUnavailable, match="pbcopy is unavailable"):
         copy_to_clipboard("answer", workspace_root=tmp_path)
+
+
+def test_read_from_clipboard_uses_wayland_backend(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(clipboard_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        clipboard_module,
+        "resolve_host_executable",
+        lambda command, **kwargs: "/usr/bin/wl-paste" if command == "wl-paste" else None,
+    )
+
+    def run(argv, **kwargs):
+        del kwargs
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="hello", stderr="")
+
+    monkeypatch.setattr(clipboard_module.subprocess, "run", run)
+
+    assert read_from_clipboard(workspace_root=tmp_path) == "hello"
+    assert calls == [["/usr/bin/wl-paste"]]
+
+
+def test_read_primary_selection_uses_wayland_primary_backend(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(clipboard_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        clipboard_module,
+        "resolve_host_executable",
+        lambda command, **kwargs: "/usr/bin/wl-paste" if command == "wl-paste" else None,
+    )
+
+    def run(argv, **kwargs):
+        del kwargs
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="primary", stderr="")
+
+    monkeypatch.setattr(clipboard_module.subprocess, "run", run)
+
+    assert (
+        read_from_clipboard(workspace_root=tmp_path, selection="primary")
+        == "primary"
+    )
+    assert calls == [["/usr/bin/wl-paste", "--primary"]]
+
+
+def test_read_from_clipboard_rejects_oversized_payload(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(clipboard_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        clipboard_module,
+        "resolve_host_executable",
+        lambda command, **kwargs: "/usr/bin/wl-paste" if command == "wl-paste" else None,
+    )
+    monkeypatch.setattr(clipboard_module, "MAX_CLIPBOARD_BYTES", 4)
+    monkeypatch.setattr(
+        clipboard_module.subprocess,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="12345",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="clipboard text exceeds"):
+        read_from_clipboard(workspace_root=tmp_path)
+
+
+def test_read_from_clipboard_reports_missing_backend(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(clipboard_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        clipboard_module,
+        "resolve_host_executable",
+        lambda command, **kwargs: None,
+    )
+
+    with pytest.raises(ClipboardUnavailable, match="wl-clipboard"):
+        read_from_clipboard(workspace_root=tmp_path)

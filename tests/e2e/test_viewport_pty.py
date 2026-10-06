@@ -13,7 +13,7 @@ import pytest
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
-def test_default_scrollback_does_not_enable_mouse_reporting(tmp_path: Path) -> None:
+def test_default_interface_enables_app_owned_mouse_reporting(tmp_path: Path) -> None:
     code = """
 import asyncio
 from pathlib import Path
@@ -25,7 +25,7 @@ async def main():
         value = await prompt.read("native> ")
     finally:
         prompt.close()
-    print("SCROLLBACK_RESULT=" + value, flush=True)
+    print("ASH_RESULT=" + value, flush=True)
 
 asyncio.run(main())
 """ % str(tmp_path / "history")
@@ -58,10 +58,10 @@ asyncio.run(main())
                 if not chunk:
                     break
                 captured.extend(chunk)
-            if not sent and b"native>" in captured:
+            if not sent and b"native" in captured:
                 os.write(master_fd, b"hello\r")
                 sent = True
-            if b"SCROLLBACK_RESULT=hello" in captured:
+            if b"ASH_RESULT=hello" in captured:
                 break
         process.wait(timeout=5)
     finally:
@@ -71,15 +71,10 @@ asyncio.run(main())
         os.close(master_fd)
 
     raw = bytes(captured)
-    assert b"SCROLLBACK_RESULT=hello" in raw
-    for sequence in (
-        b"\x1b[?1000h",
-        b"\x1b[?1002h",
-        b"\x1b[?1003h",
-        b"\x1b[?1006h",
-        b"\x1b[?1015h",
-    ):
-        assert sequence not in raw
+    assert b"ASH_RESULT=hello" in raw
+    assert b"\x1b[?1000h" in raw
+    assert b"\x1b[?1003h" in raw
+    assert b"\x1b[?1006h" in raw
 
 
 @pytest.mark.skipif(
@@ -100,7 +95,6 @@ async def main():
     prompt = PromptInput(
         history_path=Path(%r),
         transcript=Transcript(),
-        tui_mode="viewport",
     )
     try:
         value = await prompt.read("smoke> ")
@@ -220,7 +214,6 @@ async def main():
 
     prompt = PromptInput(
         history_path=Path(%r),
-        tui_mode="viewport",
         screen_reader_mode=True,
     )
     try:

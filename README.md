@@ -350,13 +350,12 @@ foreground work; use durable automation for scheduled or unattended jobs.
 
 The interactive interface is built for sustained terminal work:
 
-- native scrollback is the default: conversation output lives in the terminal's
-  normal buffer, so wheel scrolling, selection, copy, links, and context-menu
-  behavior remain owned by the terminal;
-- an optional full-screen viewport keeps the composer pinned and provides
-  app-owned transcript navigation; set `tui_mode = "fullscreen"` (the
-  `viewport` alias is also accepted);
-- `tui_mouse` only controls mouse capture in the optional full-screen mode;
+- one full-screen Ash viewport with app-owned wheel scrolling, transcript
+  selection/copy, composer cursor placement and selection, right-click
+  copy/paste behavior, and clickable approval choices;
+- normal keyboard navigation remains available, while limited terminals,
+  redirected input, and screen-reader mode use the deterministic linear
+  fallback;
 - Rich Markdown and fenced-code rendering with bounded repaint frequency;
 - streaming user, assistant, reasoning, tool, approval, status, error, and
   recovery entries;
@@ -367,7 +366,8 @@ The interactive interface is built for sustained terminal work:
 - `/` command registry with aliases, parsing, completion, and stable help;
 - `@` file, directory, image, symbol, and MCP-resource completion;
 - unified or side-by-side bounded approval diffs with high-contrast,
-  theme-aware added/removed highlighting and a compact approval selector;
+  theme-aware added/removed highlighting and a compact keyboard/mouse approval
+  selector;
 - status surfaces for model, branch, context, cache, cost, sandbox, session,
   and working directory;
 - validated dark and light themes;

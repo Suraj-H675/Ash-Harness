@@ -343,7 +343,6 @@ def test_with_overrides_revalidates_values_and_derived_preferences() -> None:
 
     accessible = config.with_overrides({"screen_reader_mode": True})
     assert accessible.screen_reader_mode is True
-    assert accessible.tui_mode == "inline"
     assert accessible.theme == "dark"
     assert accessible.no_color is True
     assert accessible.reduced_motion is True
@@ -406,24 +405,16 @@ def test_config_loads_without_api_key(
 def test_terminal_preferences_are_validated() -> None:
     config = AshConfig(
         input_mode="VI",
-        tui_mode="INLINE",
         no_color=True,
         reduced_motion=True,
         show_token_meter=True,
         keybindings={"newline": ["c-o"], "open_editor": ["c-x c-e"]},
     )
     assert config.input_mode == "vi"
-    assert config.tui_mode == "inline"
     assert config.no_color is True
     assert config.reduced_motion is True
     assert config.show_token_meter is True
     assert config.keybindings["newline"] == ["c-o"]
-
-
-def test_terminal_renderer_defaults_to_native_scrollback_and_accepts_ui_aliases() -> None:
-    assert AshConfig().tui_mode == "inline"
-    assert AshConfig(tui_mode="SCROLLBACK").tui_mode == "inline"
-    assert AshConfig(tui_mode="FULLSCREEN").tui_mode == "viewport"
 
 
 def test_approval_diff_mode_is_validated() -> None:
@@ -436,7 +427,6 @@ def test_approval_diff_mode_is_validated() -> None:
 def test_screen_reader_mode_forces_linear_terminal_preferences() -> None:
     config = AshConfig(
         screen_reader_mode=True,
-        tui_mode="viewport",
         theme="light",
         no_color=False,
         reduced_motion=False,
@@ -444,7 +434,6 @@ def test_screen_reader_mode_forces_linear_terminal_preferences() -> None:
     )
 
     assert config.screen_reader_mode is True
-    assert config.tui_mode == "inline"
     assert config.theme == "dark"
     assert config.no_color is True
     assert config.reduced_motion is True
@@ -693,14 +682,6 @@ def test_terminal_keybindings_allow_safe_multikey_sequences() -> None:
 def test_unknown_terminal_input_mode_is_rejected() -> None:
     with pytest.raises(ValueError, match="input_mode"):
         AshConfig(input_mode="modal")
-
-    with pytest.raises(ValueError, match="tui_mode"):
-        AshConfig(tui_mode="floating")
-
-
-def test_viewport_mouse_support_defaults_on_and_can_be_disabled() -> None:
-    assert AshConfig().tui_mouse is True
-    assert AshConfig(tui_mouse=False).tui_mouse is False
 
 
 def test_backward_compat_ash_api_key_promoted_to_anthropic(
