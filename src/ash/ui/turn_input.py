@@ -23,6 +23,7 @@ from ash.safety.policy import PolicyAction
 from ash.tools.base import sensitive_tool_argument_fields
 from ash.ui.input_signals import PromptInterrupted
 from ash.ui.notifications import NotificationEvent, NotificationSink
+from ash.ui.viewport import ViewportChoice
 
 if TYPE_CHECKING:
     from ash.ui.prompt import PromptInput
@@ -313,18 +314,23 @@ class InteractiveTurnController:
             diff_mode=self.diff_mode,
         )
         try:
-            choices = (
-                "Approve [y] once, [s] scope/session, [a] tool/session, "
-                "[p] scope/project, [e] edit exact scope/project, "
-                "[x] deny scope/project, [f] deny with feedback"
-            )
-            if tool_name == "run_command":
-                choices += ", [c] command prefix/project"
-            answer = (
-                (await self.prompt_input.read(f"{choices}, [N] deny? "))
-                .strip()
-                .casefold()
-            )
+            if getattr(self.prompt_input, "uses_viewport", False):
+                answer = await self._select_approval(tool_name)
+            else:
+                choices = (
+                    "Approve [y] once, [s] scope/session, [a] tool/session, "
+                    "[p] scope/project, [e] edit exact scope/project, "
+                    "[x] deny scope/project, [f] deny with feedback"
+                )
+                if tool_name == "run_command":
+                    choices += ", [c] command prefix/project"
+                answer = (
+                    (await self.prompt_input.read(f"{choices}, [N] deny? "))
+                    .strip()
+                    .casefold()
+                )
+            if answer is None:
+                return False
             if answer in {"y", "yes"}:
                 return True
             if answer in {"a", "always", "session", "tool"}:
@@ -417,6 +423,87 @@ class InteractiveTurnController:
         finally:
             self._approval_active = False
             self._approval_complete.set()
+
+    async def _select_approval(self, tool_name: str) -> str | None:
+        primary = (
+            ViewportChoice(
+                "y",
+                "Allow once",
+                "Approve only this tool request.",
+            ),
+            ViewportChoice(
+                "s",
+                "Allow this scope for session",
+                "Allow matching safe arguments until this Ash session ends.",
+            ),
+            ViewportChoice(
+                "n",
+                "Deny",
+                "Reject only this request.",
+            ),
+            ViewportChoice(
+                "f",
+                "Deny and guide Ash",
+                "Reject this request and provide corrective feedback.",
+            ),
+            ViewportChoice(
+                "more",
+                "More approval options…",
+                "Broader session/project rules and command-prefix approvals.",
+            ),
+        )
+        advanced = [
+            ViewportChoice(
+                "a",
+                "Allow this tool for session",
+                "Allow every use of this tool until this Ash session ends.",
+            ),
+            ViewportChoice(
+                "p",
+                "Allow this scope for project",
+                "Persist the current exact safe scope for this project.",
+            ),
+            ViewportChoice(
+                "e",
+                "Edit scope and allow for project",
+                "Edit the exact persisted scope before approving it.",
+            ),
+            ViewportChoice(
+                "x",
+                "Deny this scope for project",
+                "Persist a deny rule for this exact scope in this project.",
+            ),
+        ]
+        if tool_name == "run_command":
+            advanced.append(
+                ViewportChoice(
+                    "c",
+                    "Allow command prefix for project",
+                    "Persist an allow rule for a verified shell-command prefix.",
+                )
+            )
+        advanced.append(
+            ViewportChoice(
+                "back",
+                "Back",
+                "Return to the common approval choices.",
+            )
+        )
+
+        while True:
+            selected = await self.prompt_input.choose(
+                f"{tool_name} permission",
+                primary,
+            )
+            if selected != "more":
+                return selected
+            selected = await self.prompt_input.choose(
+                f"{tool_name} permission · advanced",
+                tuple(advanced),
+            )
+            if selected == "back":
+                continue
+            return selected
 
     def _exact_scope_rule(
         self,

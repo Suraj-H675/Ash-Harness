@@ -19,6 +19,25 @@ They cannot edit them from `ash permissions`, project configuration, plugins,
 or interactive session approvals. A malformed managed file prevents startup
 rather than silently ignoring the restriction.
 
+## Interactive Approvals
+
+In the full-screen terminal UI, Ash keeps the requested tool arguments and any
+edit diff visible while presenting a selector for the common decisions:
+
+- **Allow once** — approve only the current request.
+- **Allow this scope for session** — allow matching safe arguments until the
+  current Ash session ends.
+- **Deny** — reject only the current request.
+- **Deny and guide Ash** — reject the request and provide corrective feedback.
+- **More approval options…** — open the less common persistent or broader
+  permission choices.
+
+The advanced selector retains Ash's explicit permission scopes: allow a tool
+for the session, persist an exact project scope, edit and persist an exact
+scope, persist an exact deny, and (for `run_command`) persist a verified command
+prefix. Limited terminals and screen-reader mode use the equivalent text prompt
+instead of the full-screen selector.
+
 ## Policy Locations
 
 Place one or more JSON files in the platform policy directory:

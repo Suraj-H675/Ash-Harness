@@ -5,8 +5,9 @@ from unittest.mock import Mock
 
 import pytest
 from prompt_toolkit.formatted_text import to_formatted_text
-from prompt_toolkit.data_structures import Size
+from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.layout.menus import CompletionsMenu
 
@@ -18,6 +19,7 @@ from ash.ui.viewport import (
     PrivateFileHistory,
     RichTranscriptFormatter,
     TranscriptViewport,
+    ViewportChoice,
     _fit_segments,
     format_transcript,
 )
@@ -63,6 +65,27 @@ def test_working_status_does_not_render_duplicate_streaming_ellipsis() -> None:
 
     assert "Thinking…" in rendered
     assert "Thinking…  …" not in rendered
+
+
+def test_approval_diff_uses_semantic_add_remove_styles() -> None:
+    transcript = Transcript()
+    transcript.append(
+        "approval",
+        "Tool: whole_edit\nDiff preview:\n--- a/example.py\n+++ b/example.py\n-old\n+new\n same",
+        title="whole_edit",
+    )
+
+    rendered = RichTranscriptFormatter().format(transcript.snapshot(), width=80)
+    fragments = list(to_formatted_text(rendered))
+
+    assert any(
+        "class:diff-removed" in style and "-old" in text
+        for style, text, *_ in fragments
+    )
+    assert any(
+        "class:diff-added" in style and "+new" in text
+        for style, text, *_ in fragments
+    )
 
 
 def test_rich_transcript_formatter_renders_markdown_and_caches_cells() -> None:
@@ -491,4 +514,54 @@ async def test_viewport_starts_at_tail_and_end_restores_tail_after_page_up(
 
         pipe.send_text("tail intact\r")
         assert await pending == "tail intact"
+        viewport.close()
+
+
+def test_viewport_mouse_wheel_scrolls_transcript(tmp_path: Path) -> None:
+    viewport = TranscriptViewport(
+        Transcript(),
+        history_path=tmp_path / "history",
+        mouse_support=True,
+    )
+    viewport.transcript_window.vertical_scroll = 9
+
+    result = viewport._handle_transcript_mouse(
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.SCROLL_UP,
+            button=MouseButton.NONE,
+            modifiers=frozenset(),
+        )
+    )
+
+    assert result is None
+    assert viewport.transcript_window.vertical_scroll == 6
+    assert viewport._follow_tail is False
+    viewport.close()
+
+
+@pytest.mark.asyncio
+async def test_viewport_choice_selector_uses_arrow_keys_and_enter(tmp_path: Path) -> None:
+    with create_pipe_input() as pipe:
+        viewport = TranscriptViewport(
+            Transcript(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=SizedDummyOutput(columns=80, rows=24),
+        )
+        pending = asyncio.create_task(
+            viewport.choose(
+                "write_file permission",
+                (
+                    ViewportChoice("once", "Allow once", "This request only."),
+                    ViewportChoice("deny", "Deny", "Reject this request."),
+                ),
+            )
+        )
+        await asyncio.sleep(0.05)
+
+        pipe.send_bytes(b"\x1b[B")  # Down
+        pipe.send_text("\r")
+
+        assert await pending == "deny"
         viewport.close()

@@ -95,6 +95,31 @@ def _append_preview_truncation(preview: str, truncated: bool) -> str:
     return preview
 
 
+def _rich_diff_style(theme_name: str, line: str) -> str:
+    if line.startswith(("+++", "---", "@@")):
+        return "bold #5f87af" if theme_name == "dark" else "bold #005faf"
+    if line.startswith("+"):
+        return (
+            "#c8c8c8 on #1f3324"
+            if theme_name == "dark"
+            else "#333333 on #dff3e4"
+        )
+    if line.startswith("-"):
+        return (
+            "#c8c8c8 on #3a2222"
+            if theme_name == "dark"
+            else "#333333 on #f8dddd"
+        )
+    return "#a8a8a8" if theme_name == "dark" else "#555555"
+
+
+def _append_styled_diff(body: Text, preview: str, *, theme_name: str) -> None:
+    for index, line in enumerate(preview.splitlines()):
+        if index:
+            body.append("\n")
+        body.append(line, style=_rich_diff_style(theme_name, line))
+
+
 def _read_preview_file(path: Path) -> str | None:
     try:
         raw = read_bounded_bytes(
@@ -784,6 +809,11 @@ class TerminalUI:
             return False
 
         self._render_approval_notice(tool_name, arguments, auto=False)
+        self.console.print(
+            "Approve once [y], for this session [a], or deny [N]? ",
+            end="",
+            style=self.theme.approval_prompt,
+        )
         try:
             answer = self._input_stream.readline().strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -806,14 +836,13 @@ class TerminalUI:
         *,
         auto: bool,
         diff_mode: str = "unified",
-    ) -> None:
+    ) -> str:
         if diff_mode not in {"unified", "side-by-side"}:
             raise ValueError("diff_mode must be unified or side-by-side")
-        self._render_approval_notice(
+        return self._render_approval_notice(
             tool_name,
             dict(arguments),
             auto=auto,
-            scope_options=not auto,
             side_by_side=diff_mode == "side-by-side",
         )
 
@@ -823,9 +852,8 @@ class TerminalUI:
         arguments: dict[str, Any],
         *,
         auto: bool,
-        scope_options: bool = False,
         side_by_side: bool = False,
-    ) -> None:
+    ) -> str:
         # Suspend the live render while we print the approval panel.
         live = getattr(self, "_active_live", None)
         if live is not None:
@@ -856,24 +884,9 @@ class TerminalUI:
                 "\nDiff preview (side-by-side):\n" if side_by_side else "\nDiff preview:\n",
                 style="bold",
             )
-            body.append(preview, style="dim")
+            _append_styled_diff(body, preview, theme_name=self.theme.name)
         if auto:
             body.append("\n[auto-approved]", style=self.theme.success)
-        elif scope_options:
-            command_choice = (
-                ", command prefix for project [c]" if tool_name == "run_command" else ""
-            )
-            body.append(
-                "\nApprove once [y], scoped for session [s], tool for session [a], "
-                "scoped for project [p], deny scope for project [x]"
-                f"{command_choice}, or deny [N]? ",
-                style=self.theme.approval_prompt,
-            )
-        else:
-            body.append(
-                "\nApprove once [y], for this session [a], or deny [N]? ",
-                style=self.theme.approval_prompt,
-            )
         self.transcript.append(
             "approval",
             body.plain,
@@ -895,6 +908,7 @@ class TerminalUI:
 
         if live is not None:
             live.start()
+        return body.plain
 
     def record_user_input(self, text: str) -> None:
         """Commit submitted user input to the interactive transcript."""

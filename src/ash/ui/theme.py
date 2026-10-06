@@ -37,6 +37,10 @@ class Theme:
     status: str
     empty_title: str
     muted: str
+    diff_added: str
+    diff_removed: str
+    diff_hunk: str
+    diff_context: str
     border_primary: str
     border_approval: str
     approval_prompt: str
@@ -65,6 +69,10 @@ DARK_THEME = Theme(
     status="bg:#202020 #a8a8a8",
     empty_title="bold #d0d0d0",
     muted="#808080",
+    diff_added="#c8c8c8 bg:#1f3324",
+    diff_removed="#c8c8c8 bg:#3a2222",
+    diff_hunk="bold #5f87af",
+    diff_context="#a8a8a8",
     border_primary="cyan",
     border_approval="yellow",
     approval_prompt="bold yellow",
@@ -94,6 +102,10 @@ LIGHT_THEME = Theme(
     status="bg:#dddddd #333333",
     empty_title="bold #222222",
     muted="#666666",
+    diff_added="#333333 bg:#dff3e4",
+    diff_removed="#333333 bg:#f8dddd",
+    diff_hunk="bold #005faf",
+    diff_context="#555555",
     border_primary="#005faf",
     border_approval="#96500a",
     approval_prompt="bold #96500a",
@@ -148,6 +160,13 @@ def viewport_styles(theme: Theme) -> dict[str, str]:
         "status": theme.status,
         "empty-title": theme.empty_title,
         "muted": theme.muted,
+        "diff-added": theme.diff_added,
+        "diff-removed": theme.diff_removed,
+        "diff-hunk": theme.diff_hunk,
+        "diff-context": theme.diff_context,
+        "selected": "reverse bold",
+        "option": "",
+        "meta": theme.muted,
     }
 
 

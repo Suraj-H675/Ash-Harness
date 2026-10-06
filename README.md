@@ -350,8 +350,8 @@ foreground work; use durable automation for scheduled or unattended jobs.
 
 The interactive interface is built for sustained terminal work:
 
-- responsive full-screen transcript viewport with page navigation and live
-  tailing;
+- responsive full-screen transcript viewport with mouse-wheel/page navigation
+  and live tailing (`tui_mouse = false` disables mouse capture);
 - inline rendering fallback for terminals that do not support a viewport;
 - Rich Markdown and fenced-code rendering with bounded repaint frequency;
 - streaming user, assistant, reasoning, tool, approval, status, error, and
@@ -362,7 +362,8 @@ The interactive interface is built for sustained terminal work:
   Emacs input modes, and external-editor support;
 - `/` command registry with aliases, parsing, completion, and stable help;
 - `@` file, directory, image, symbol, and MCP-resource completion;
-- unified or side-by-side bounded approval diffs;
+- unified or side-by-side bounded approval diffs with theme-aware added/removed
+  highlighting and an in-context approval selector;
 - status surfaces for model, branch, context, cache, cost, sandbox, session,
   and working directory;
 - validated dark and light themes;

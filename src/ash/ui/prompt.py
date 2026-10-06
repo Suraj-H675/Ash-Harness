@@ -23,7 +23,7 @@ from ash.ui.history import PrivateFileHistory
 from ash.ui.input_signals import PromptInterrupted
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript
-from ash.ui.viewport import TranscriptViewport
+from ash.ui.viewport import TranscriptViewport, ViewportChoice
 
 
 MAX_PATH_COMPLETION_SCAN_ENTRIES = 10_000
@@ -501,6 +501,7 @@ class PromptInput:
         tui_mode: str = "inline",
         theme: str = "dark",
         no_color: bool = False,
+        mouse_support: bool = True,
         repo_map: Any | None = None,
         mcp_runtime: Any | None = None,
         screen_reader_mode: bool = False,
@@ -566,6 +567,7 @@ class PromptInput:
                     keybindings=keybindings,
                     theme=theme,
                     no_color=no_color,
+                    mouse_support=mouse_support,
                 )
             else:
                 self._session = PromptSession(
@@ -588,6 +590,15 @@ class PromptInput:
                     enable_open_in_editor=True,
                     bottom_toolbar=status_provider,
                 )
+
+    async def choose(
+        self,
+        title: str,
+        options: tuple[ViewportChoice, ...],
+    ) -> str | None:
+        if self._viewport is None:
+            raise RuntimeError("choice UI requires viewport mode")
+        return await self._viewport.choose(title, options)
 
     @property
     def uses_viewport(self) -> bool:

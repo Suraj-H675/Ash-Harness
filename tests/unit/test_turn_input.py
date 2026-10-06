@@ -42,6 +42,19 @@ class RoutedPrompt:
         return await self.steering.get()
 
 
+class ViewportApprovalPrompt(RoutedPrompt):
+    uses_viewport = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.selections: asyncio.Queue[str | None] = asyncio.Queue()
+        self.choice_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    async def choose(self, title, options):
+        self.choice_calls.append((title, tuple(option.label for option in options)))
+        return await self.selections.get()
+
+
 class RecordingNotifier:
     def __init__(self) -> None:
         self.calls: list[tuple[NotificationEvent, str]] = []
@@ -326,6 +339,76 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
         (NotificationEvent.APPROVAL_REQUIRED, "Ash needs approval: write_file"),
         (NotificationEvent.TURN_COMPLETE, "Ash turn complete."),
     ]
+
+
+@pytest.mark.asyncio
+async def test_viewport_approval_uses_selector_instead_of_letter_prompt(
+    tmp_path: Path,
+) -> None:
+    prompt = ViewportApprovalPrompt()
+    await prompt.selections.put("y")
+    ui = make_ui()
+    guard = SafetyGuard(tmp_path)
+    tool = WriteFileTool(guard)
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        WriteProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={tool.name: tool},
+    )
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+    )
+
+    response = await controller.run("write the file")
+
+    assert response == "done"
+    assert (tmp_path / "approved.txt").read_text() == "written"
+    assert prompt.choice_calls == [
+        (
+            "write_file permission",
+            (
+                "Allow once",
+                "Allow this scope for session",
+                "Deny",
+                "Deny and guide Ash",
+                "More approval options…",
+            ),
+        )
+    ]
+    assert not any(item.startswith("Approve") for item in prompt.prompts)
+
+
+@pytest.mark.asyncio
+async def test_viewport_approval_keeps_broader_rules_behind_more_options(
+    tmp_path: Path,
+) -> None:
+    prompt = ViewportApprovalPrompt()
+    await prompt.selections.put("more")
+    await prompt.selections.put("a")
+    ui = make_ui()
+    loop = SimpleNamespace(_config=AshConfig())
+    controller = InteractiveTurnController(
+        loop,  # type: ignore[arg-type]
+        prompt,  # type: ignore[arg-type]
+        ui,
+    )
+
+    selected = await controller._select_approval("write_file")
+
+    assert selected == "a"
+    assert prompt.choice_calls[0][1][-1] == "More approval options…"
+    assert prompt.choice_calls[1][1] == (
+        "Allow this tool for session",
+        "Allow this scope for project",
+        "Edit scope and allow for project",
+        "Deny this scope for project",
+        "Back",
+    )
 
 
 @pytest.mark.asyncio

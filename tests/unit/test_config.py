@@ -21,6 +21,7 @@ ENV_KEYS = [
     "ASH_NOTIFICATION_EVENTS",
     "ASH_NOTIFICATION_INCLUDE_PREVIEW",
     "ASH_SCREEN_READER_MODE",
+    "ASH_TUI_MOUSE",
     "ASH_SAFETY_TIER",
     "ASH_WORKSPACE_ROOT",
     "ASH_COMMAND_BLOCKLIST",
@@ -689,6 +690,11 @@ def test_unknown_terminal_input_mode_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="tui_mode"):
         AshConfig(tui_mode="floating")
+
+
+def test_viewport_mouse_support_defaults_on_and_can_be_disabled() -> None:
+    assert AshConfig().tui_mouse is True
+    assert AshConfig(tui_mouse=False).tui_mouse is False
 
 
 def test_backward_compat_ash_api_key_promoted_to_anthropic(

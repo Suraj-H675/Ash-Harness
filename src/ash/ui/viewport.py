@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from io import StringIO
 from typing import Any
@@ -13,6 +14,7 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import (
     ANSI,
     AnyFormattedText,
@@ -30,9 +32,11 @@ from prompt_toolkit.layout import (
     FormattedTextControl,
     HSplit,
     Layout,
+    ConditionalContainer,
     Window,
 )
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.output.base import Output
 from rich.cells import cell_len, set_cell_size
@@ -71,6 +75,13 @@ _DEFAULT_ENTRY_TITLES = {
 }
 
 
+@dataclass(frozen=True)
+class ViewportChoice:
+    value: str
+    label: str
+    description: str = ""
+
+
 def _entry_heading(entry: TranscriptEntry) -> tuple[str, str]:
     style, label = _ENTRY_STYLE[entry.kind]
     title = terminal_safe_text(entry.title, single_line=True)
@@ -87,6 +98,34 @@ def _entry_body(entry: TranscriptEntry) -> str:
         if safe.startswith(prefix) and safe.endswith("]"):
             safe = safe[len(prefix) : -1] or "completed"
     return "  " + safe.replace("\n", "\n  ")
+
+
+def _entry_body_fragments(entry: TranscriptEntry) -> list[tuple[str, str]]:
+    safe = terminal_safe_text(entry.content) or " "
+    base_style = "class:reasoning" if entry.kind == "reasoning" else ""
+    if entry.kind != "approval" or "Diff preview" not in safe:
+        return [(base_style, _entry_body(entry))]
+
+    fragments: list[tuple[str, str]] = []
+    in_diff = False
+    for index, raw_line in enumerate(safe.splitlines() or [""]):
+        if index:
+            fragments.append(("", "\n"))
+        style = base_style
+        stripped = raw_line.strip()
+        if stripped.startswith("Diff preview"):
+            in_diff = True
+        elif in_diff:
+            if raw_line.startswith(("+++", "---", "@@")):
+                style = "class:diff-hunk"
+            elif raw_line.startswith("+"):
+                style = "class:diff-added"
+            elif raw_line.startswith("-"):
+                style = "class:diff-removed"
+            elif stripped:
+                style = "class:diff-context"
+        fragments.append((style, "  " + raw_line))
+    return fragments
 
 
 def _fit_segments(value: str, width: int) -> str:
@@ -118,8 +157,7 @@ def format_transcript(entries: tuple[TranscriptEntry, ...]) -> AnyFormattedText:
         style, heading = _entry_heading(entry)
         fragments.append((style, heading))
         fragments.append(("", "\n"))
-        body_style = "class:reasoning" if entry.kind == "reasoning" else ""
-        fragments.append((body_style, _entry_body(entry)))
+        fragments.extend(_entry_body_fragments(entry))
         if not entry.finalized and not (
             entry.kind == "status" and entry.title == "working"
         ):
@@ -157,8 +195,7 @@ class RichTranscriptFormatter:
                     self._cache[key] = rendered
                 fragments.extend(to_formatted_text(rendered))
             else:
-                body_style = "class:reasoning" if entry.kind == "reasoning" else ""
-                fragments.append((body_style, _entry_body(entry)))
+                fragments.extend(_entry_body_fragments(entry))
             if not entry.finalized and not (
                 entry.kind == "status" and entry.title == "working"
             ):
@@ -199,6 +236,7 @@ class TranscriptViewport:
         keybindings: dict[str, list[str]] | None = None,
         theme: str = "dark",
         no_color: bool = False,
+        mouse_support: bool = True,
         input: Input | None = None,
         output: Output | None = None,
     ) -> None:
@@ -211,6 +249,11 @@ class TranscriptViewport:
         self._running = False
         self._follow_tail = True
         self._manual_cursor_line = 0
+        self.mouse_support = mouse_support
+        self._choice_mode = False
+        self._choice_title = ""
+        self._choice_options: tuple[ViewportChoice, ...] = ()
+        self._choice_selected = 0
         self._formatter = RichTranscriptFormatter()
         self._last_transcript_text: AnyFormattedText | None = None
         self._configured_keybindings = keybindings or {
@@ -249,6 +292,30 @@ class TranscriptViewport:
             ],
             style="class:composer",
         )
+        self._choice_control = FormattedTextControl(self._choice_text)
+        self._choice_detail_control = FormattedTextControl(self._choice_detail_text)
+        choice_panel = HSplit(
+            [
+                Window(
+                    FormattedTextControl(self._choice_heading),
+                    height=1,
+                    style="class:composer",
+                ),
+                Window(
+                    self._choice_control,
+                    height=Dimension(min=1, max=6),
+                    dont_extend_height=True,
+                    style="class:composer",
+                ),
+                Window(
+                    self._choice_detail_control,
+                    height=2,
+                    wrap_lines=True,
+                    style="class:composer",
+                ),
+            ]
+        )
+        choice_active = Condition(lambda: self._choice_mode)
         body = HSplit(
             [
                 Window(
@@ -258,7 +325,8 @@ class TranscriptViewport:
                 ),
                 self.transcript_window,
                 Window(height=1, char="─", style="class:separator"),
-                composer,
+                ConditionalContainer(composer, filter=~choice_active),
+                ConditionalContainer(choice_panel, filter=choice_active),
                 Window(
                     FormattedTextControl(self._status_text),
                     height=1,
@@ -283,6 +351,7 @@ class TranscriptViewport:
             erase_when_done=False,
             editing_mode=EditingMode.VI if input_mode == "vi" else EditingMode.EMACS,
             style=prompt_style(viewport_styles(selected_theme), no_color=no_color),
+            mouse_support=mouse_support,
             input=input,
             output=output,
             min_redraw_interval=0.03,
@@ -294,6 +363,7 @@ class TranscriptViewport:
         if self._running:
             raise RuntimeError("transcript viewport already owns terminal input")
         self._running = True
+        self._choice_mode = False
         self._prompt = prompt
         self._follow_tail = True
         self._manual_cursor_line = 0
@@ -303,6 +373,30 @@ class TranscriptViewport:
         try:
             return await self.application.run_async()
         finally:
+            self._running = False
+
+    async def choose(
+        self,
+        title: str,
+        options: tuple[ViewportChoice, ...],
+    ) -> str | None:
+        if self._running:
+            raise RuntimeError("transcript viewport already owns terminal input")
+        if not options:
+            return None
+        self._running = True
+        self._choice_mode = True
+        self._choice_title = terminal_safe_text(title, single_line=True)
+        self._choice_options = options
+        self._choice_selected = 0
+        self._follow_tail = True
+        self._manual_cursor_line = 0
+        try:
+            return await self.application.run_async()
+        finally:
+            self._choice_mode = False
+            self._choice_options = ()
+            self._choice_selected = 0
             self._running = False
 
     def close(self) -> None:
@@ -324,6 +418,13 @@ class TranscriptViewport:
             )
         else:
             rendered = self._formatter.format(entries, width=width)
+        if self.mouse_support:
+            rendered = FormattedText(
+                [
+                    (fragment[0], fragment[1], self._handle_transcript_mouse)
+                    for fragment in to_formatted_text(rendered)
+                ]
+            )
         self._last_transcript_text = rendered
         return rendered
 
@@ -371,6 +472,37 @@ class TranscriptViewport:
         fitted = _fit_segments(value, max(0, width - 2))
         return FormattedText([("", f" {fitted} ")])
 
+    def _choice_heading(self) -> AnyFormattedText:
+        return FormattedText(
+            [
+                ("class:approval-prefix", " APPROVAL "),
+                ("", "  "),
+                ("class:muted", self._choice_title),
+            ]
+        )
+
+    def _choice_text(self) -> AnyFormattedText:
+        fragments: list[tuple[str, str]] = []
+        for index, option in enumerate(self._choice_options):
+            selected = index == self._choice_selected
+            style = "class:selected" if selected else ""
+            marker = "> " if selected else "  "
+            fragments.append((style, marker))
+            fragments.append((f"{style} class:option".strip(), option.label))
+            fragments.append((style, "\n"))
+        return FormattedText(fragments)
+
+    def _choice_detail_text(self) -> AnyFormattedText:
+        if not self._choice_options:
+            return FormattedText([("class:muted", "")])
+        option = self._choice_options[self._choice_selected]
+        return FormattedText(
+            [
+                ("class:meta", " " + terminal_safe_text(option.description)),
+                ("class:muted", "\n ↑/↓ choose  Enter select  Esc deny"),
+            ]
+        )
+
     def _on_transcript_event(self, event: TranscriptEvent) -> None:
         del event
         self._last_transcript_text = None
@@ -382,11 +514,37 @@ class TranscriptViewport:
         info = self.transcript_window.render_info
         return max(1, info.window_height - 1) if info is not None else 10
 
+    def _scroll_transcript(self, offset: int) -> None:
+        info = self.transcript_window.render_info
+        current = (
+            info.vertical_scroll
+            if info is not None
+            else self.transcript_window.vertical_scroll
+        )
+        self._follow_tail = False
+        target = max(0, current + offset)
+        self._manual_cursor_line = target
+        self.transcript_window.vertical_scroll = target
+        self.transcript_window.vertical_scroll_2 = 0
+        self.application.invalidate()
+
+    def _handle_transcript_mouse(self, event: MouseEvent) -> object:
+        if event.event_type == MouseEventType.SCROLL_UP:
+            self._scroll_transcript(-3)
+            return None
+        if event.event_type == MouseEventType.SCROLL_DOWN:
+            self._scroll_transcript(3)
+            return None
+        return NotImplemented
+
     def _key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
 
         @bindings.add("enter")
         def submit(event) -> None:
+            if self._choice_mode:
+                event.app.exit(result=self._choice_options[self._choice_selected].value)
+                return
             state = self.input_buffer.complete_state
             if (
                 self.input_buffer.text.strip() == "/"
@@ -436,27 +594,39 @@ class TranscriptViewport:
             else:
                 event.current_buffer.delete()
 
+        choice_active = Condition(lambda: self._choice_mode)
+
+        @bindings.add("up", filter=choice_active, eager=True)
+        def choice_up(event) -> None:
+            del event
+            if self._choice_options:
+                self._choice_selected = (
+                    self._choice_selected - 1
+                ) % len(self._choice_options)
+                self.application.invalidate()
+
+        @bindings.add("down", filter=choice_active, eager=True)
+        def choice_down(event) -> None:
+            del event
+            if self._choice_options:
+                self._choice_selected = (
+                    self._choice_selected + 1
+                ) % len(self._choice_options)
+                self.application.invalidate()
+
+        @bindings.add("escape", filter=choice_active, eager=True)
+        def choice_deny(event) -> None:
+            event.app.exit(result=None)
+
         @bindings.add("pageup")
         def page_up(event) -> None:
-            info = self.transcript_window.render_info
-            current = info.vertical_scroll if info is not None else 0
-            self._follow_tail = False
-            target = max(0, current - self._page_height())
-            self._manual_cursor_line = target
-            self.transcript_window.vertical_scroll = target
-            self.transcript_window.vertical_scroll_2 = 0
-            event.app.invalidate()
+            del event
+            self._scroll_transcript(-self._page_height())
 
         @bindings.add("pagedown")
         def page_down(event) -> None:
-            info = self.transcript_window.render_info
-            current = info.vertical_scroll if info is not None else 0
-            self._follow_tail = False
-            target = current + self._page_height()
-            self._manual_cursor_line = target
-            self.transcript_window.vertical_scroll = target
-            self.transcript_window.vertical_scroll_2 = 0
-            event.app.invalidate()
+            del event
+            self._scroll_transcript(self._page_height())
 
         @bindings.add("end")
         def follow_tail(event) -> None:

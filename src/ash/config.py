@@ -215,6 +215,7 @@ PROJECT_CONFIG_FIELDS = frozenset(
         "show_token_meter",
         "input_mode",
         "tui_mode",
+        "tui_mouse",
         "notification_method",
         "notification_events",
         "notification_include_preview",
@@ -652,6 +653,10 @@ class AshConfig(BaseSettings):
     tui_mode: str = Field(
         "viewport",
         description="Interactive terminal renderer: viewport or inline.",
+    )
+    tui_mouse: bool = Field(
+        True,
+        description="Enable mouse interaction in the full-screen terminal UI.",
     )
     notification_method: str = Field(
         "off",
