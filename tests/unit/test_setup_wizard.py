@@ -2030,6 +2030,7 @@ class TestBrowserSetup:
         capsys,
     ) -> None:
         from ash.commands.setup import SetupOutcome, setup_browser
+        from ash.install import install_command
 
         monkeypatch.setattr(
             "ash.commands.setup.importlib.util.find_spec", lambda name: None
@@ -2037,10 +2038,7 @@ class TestBrowserSetup:
 
         assert setup_browser() == SetupOutcome.ERROR
         error = capsys.readouterr().err
-        assert " -I -c " in error
-        assert "api.github.com/repos/Suraj-H675/Ash-Harness/releases/latest" in error
-        assert "--extra browser" in error
-        assert "curl" not in error
+        assert install_command("browser") in error
         assert "pipx install" not in error
 
     def test_existing_browser_never_runs_installer(
