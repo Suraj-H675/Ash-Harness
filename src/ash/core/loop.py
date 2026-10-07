@@ -1337,6 +1337,13 @@ class AshLoop:
         )
         self._provider_circuit_key = _provider_circuit_key(provider)
         self._last_context_tokens = 0
+        self._last_context_maximum = max(
+            1,
+            (
+                getattr(config, "max_context_tokens", 1)
+                - getattr(config, "max_completion_tokens", 0)
+            ),
+        )
         self._last_context_budget: Any | None = None
         self._last_turn_prompt_tokens = 0
         self._last_turn_completion_tokens = 0
@@ -1453,6 +1460,10 @@ class AshLoop:
 
     async def _aclose_owned_resources(self) -> None:
         """Deterministically release provider and subprocess resources."""
+
+        repo_map_close = getattr(self.repo_map, "close", None)
+        if callable(repo_map_close):
+            await asyncio.to_thread(repo_map_close)
 
         if self._memory_auto_index_task is not None and not (
             self._memory_auto_index_task.done()
@@ -6278,15 +6289,19 @@ class AshLoop:
         repo_section = ""
         if self.repo_map is not None:
             try:
-                if self._repo_map_dirty:
+                repo_ready = bool(getattr(self.repo_map, "ready", True))
+                if not repo_ready:
+                    repo_section = ""
+                elif self._repo_map_dirty:
                     try:
                         self.repo_map.refresh()
                     finally:
                         self._repo_map_dirty = False
-                ranked = self.repo_map.rank(self._repo_map_active_files)
-                repo_section = self.repo_map.render(
-                    ranked, top_files=5, symbols_per_file=6
-                )
+                if repo_ready:
+                    ranked = self.repo_map.rank(self._repo_map_active_files)
+                    repo_section = self.repo_map.render(
+                        ranked, top_files=5, symbols_per_file=6
+                    )
             except Exception as exc:  # noqa: BLE001 — repo map is best-effort
                 repo_section = f"(repo map unavailable: {exc})"
 
@@ -6460,6 +6475,7 @@ class AshLoop:
                 result.estimated_tokens + native_tool_schema_tokens
             )
             maximum_input = max(1, maximum_context - self._config.max_completion_tokens)
+            self._last_context_maximum = maximum_input
             if self._last_context_tokens > maximum_input:
                 raise ContextBudgetExceededError(
                     self._last_context_tokens,

@@ -833,8 +833,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     live_provider = getattr(loop.ui, "prompt_live_view", lambda _width: (0, ""))
 
     prompt_input = PromptInput(
-        status_provider=status_line.footer,
-        header_provider=status_line.header,
+        status_provider=status_line.left,
+        context_provider=status_line.context_usage,
         live_provider=live_provider,
         extra_commands={
             command.name: command.description for command in discovered_commands
@@ -854,6 +854,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     bind_prompt_surface = getattr(loop.ui, "bind_prompt_surface", None)
     if callable(bind_prompt_surface) and prompt_input.supports_live_surface:
         bind_prompt_surface(prompt_input.invalidate)
+        prompt_input.clear_visible_screen()
     loop.ui.load_session_transcript(loop.current_session)
     print = ReplPrinter()  # noqa: A001
 

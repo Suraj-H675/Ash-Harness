@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from ash.context.instructions import MAX_INSTRUCTION_FILE_BYTES
-from ash.runtime import _memory_database_path, build_runtime, build_tools
+from ash.runtime import _memory_database_path, build_repo_map, build_runtime, build_tools
 from ash.context.turn import TurnContext
 from ash.config import AshConfig
 from ash.mcp.server import MCPServerConfig
@@ -31,6 +31,26 @@ class RuntimeProvider(ProviderABC):
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         if False:
             yield
+
+
+def test_build_repo_map_defers_expensive_initial_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRepoMap:
+        def __init__(self, project_root, **kwargs) -> None:
+            captured["project_root"] = project_root
+            captured.update(kwargs)
+
+    monkeypatch.setattr("ash.repo.repomap.RepoMap", FakeRepoMap)
+    config = AshConfig(workspace_root=tmp_path, repo_map_enabled=True)
+
+    repo_map = build_repo_map(config)
+
+    assert isinstance(repo_map, FakeRepoMap)
+    assert captured["defer_initial_refresh"] is True
 
 
 @pytest.mark.asyncio

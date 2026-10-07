@@ -244,6 +244,39 @@ def test_prompt_surface_commits_final_turn_to_scrollback_once() -> None:
     assert output.getvalue() == committed
 
 
+def test_hybrid_conversation_uses_blue_user_text_and_unboxed_assistant() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(
+            file=output,
+            force_terminal=True,
+            color_system="truecolor",
+            no_color=False,
+            width=80,
+        )
+    )
+    ui.bind_prompt_surface(lambda: None)
+
+    ui.record_user_input("hello from user")
+    with ui.begin_turn():
+        ui.print_token("hello from ash")
+    _revision, live = ui.prompt_live_view(80)
+    live_text = fragment_list_to_text(to_formatted_text(live))
+    ui.finalize_turn()
+    ui.commit_completed_turn()
+
+    rendered = output.getvalue()
+    assert "hello from user" in rendered
+    assert "38;2;95;135;255" in rendered
+    assert "YOU" not in rendered
+    assert "╭" not in rendered
+    assert "╰" not in rendered
+    assert "ASH" in live_text
+    assert "hello from ash" in live_text
+    assert "╭" not in live_text
+    assert "╰" not in live_text
+
+
 def test_prompt_live_view_bounds_long_response_but_final_commit_is_complete() -> None:
     output = StringIO()
     ui = TerminalUI(console=Console(file=output, force_terminal=False, width=80))
@@ -467,9 +500,11 @@ def test_inline_resume_renders_bounded_recent_conversation() -> None:
     assert "Recent conversation · 3 earlier entries omitted" in rendered
     assert "question 0" not in rendered
     assert "question 3" in rendered
-    assert "YOU" in rendered
+    assert "YOU" not in rendered
     assert "ASH" in rendered
     assert "latest answer" in rendered
+    assert "╭" not in rendered
+    assert "╰" not in rendered
 
 
 def test_terminal_ui_dry_run_denies_all():

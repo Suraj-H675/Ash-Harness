@@ -600,8 +600,8 @@ class TerminalUI:
             if live is not None and self._active_live is live:
                 live.start(refresh=True)
 
-    def _render_turn(self, buffers: _LiveBuffers, *, live: bool = False) -> Panel:
-        parts: list[Any] = []
+    def _render_turn(self, buffers: _LiveBuffers, *, live: bool = False) -> Group:
+        parts: list[Any] = [Text("ASH", style=self.theme.assistant_prefix)]
         if self._activity_status:
             parts.append(Text(self._activity_status, style="dim italic"))
         thought = buffers.thought
@@ -631,14 +631,9 @@ class TerminalUI:
                     style="dim italic" if self.theme.name == "light" else "dim",
                 )
             )
-        return Panel(
-            Group(*parts),
-            title="ASH",
-            border_style=self.theme.border_primary,
-            padding=(0, 1),
-        )
+        return Group(*parts)
 
-    def _render_active_turn(self) -> Panel:
+    def _render_active_turn(self) -> Group:
         return self._render_turn(self._active_buffers_required())
 
     def _active_buffers_required(self) -> _LiveBuffers:
@@ -712,22 +707,8 @@ class TerminalUI:
         buffers = self._completed_buffers
         if buffers is None:
             return
-        parts: list[Any] = []
-        if buffers.thought:
-            parts.append(buffers.thought)
-        if buffers.tool_output:
-            parts.append(buffers.tool_output)
-        if buffers.response:
-            parts.append(Markdown(buffers.response, hyperlinks=False))
-        if parts:
-            self.console.print(
-                Panel(
-                    Group(*parts),
-                    title="ASH",
-                    border_style=self.theme.border_primary,
-                    padding=(0, 1),
-                )
-            )
+        if buffers.thought or buffers.tool_output or buffers.response:
+            self.console.print(self._render_turn(buffers))
         self._completed_buffers = None
         self._prompt_render_cache = None
         self._prompt_revision += 1
@@ -1025,15 +1006,7 @@ class TerminalUI:
         safe = terminal_safe_text(text)
         self.transcript.append("user", safe, title="you")
         if self._prompt_invalidator is not None and not self.screen_reader_mode:
-            body = Text(safe)
-            self.console.print(
-                Panel(
-                    body,
-                    title="YOU",
-                    border_style=self.theme.prompt,
-                    padding=(0, 1),
-                )
-            )
+            self.console.print(Text(safe, style=self.theme.user_prefix))
 
     def load_session_transcript(self, session: Any | None) -> None:
         """Replace interactive history from a durable session snapshot."""
@@ -1076,21 +1049,12 @@ class TerminalUI:
         self.console.print(Text(heading, style="dim"))
         for entry in visible:
             if entry.kind == "user":
-                self.console.print(
-                    Panel(
-                        Text(entry.content),
-                        title="YOU",
-                        border_style=self.theme.prompt,
-                        padding=(0, 1),
-                    )
-                )
+                self.console.print(Text(entry.content, style=self.theme.user_prefix))
             elif entry.kind == "assistant":
                 self.console.print(
-                    Panel(
+                    Group(
+                        Text("ASH", style=self.theme.assistant_prefix),
                         Markdown(entry.content, hyperlinks=False),
-                        title="ASH",
-                        border_style=self.theme.border_primary,
-                        padding=(0, 1),
                     )
                 )
             else:

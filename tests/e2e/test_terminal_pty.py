@@ -22,6 +22,7 @@ from ash.ui.prompt import PromptInput
 async def main():
     prompt = PromptInput(history_path=Path(%r))
     try:
+        prompt.clear_visible_screen()
         value = await prompt.read("native> ")
     finally:
         prompt.close()
@@ -58,7 +59,7 @@ asyncio.run(main())
                 if not chunk:
                     break
                 captured.extend(chunk)
-            if not sent and b"YOU" in captured:
+            if not sent and "›".encode() in captured:
                 os.write(master_fd, b"hello\r")
                 sent = True
             if b"ASH_RESULT=hello" in captured:
@@ -72,6 +73,8 @@ asyncio.run(main())
 
     raw = bytes(captured)
     assert b"ASH_RESULT=hello" in raw
+    assert b"\x1b[2J" in raw
+    assert b"\x1b[3J" not in raw
     for sequence in (
         b"\x1b[?1000h",
         b"\x1b[?1002h",
@@ -96,8 +99,8 @@ async def main():
     ui = TerminalUI()
     prompt = PromptInput(
         history_path=Path(%r),
-        header_provider=lambda: "model · interactive · git main · Ash-Harness",
-        status_provider=lambda: "ctx ~1200/64000 · sandbox native · session abc12345",
+        status_provider=lambda: "gpt-test · reasoning · ~/Ash-Harness",
+        context_provider=lambda: (32_000, 64_000),
         live_provider=ui.prompt_live_view,
     )
     ui.bind_prompt_surface(prompt.invalidate)
@@ -142,7 +145,7 @@ asyncio.run(main())
                 captured.extend(chunk)
             if (
                 not sent
-                and b"STEER" in captured
+                and b"gpt-test" in captured
                 and b"Inspecting the repository" in captured
             ):
                 os.write(master_fd, b"continue\r")
@@ -162,11 +165,13 @@ asyncio.run(main())
         b"ASH",
         b"Inspecting the repository",
         b"I found the issue and I am applying the fix.",
-        b"STEER",
-        b"model",
-        b"ctx ~1200/64000",
+        b"gpt-test",
+        b"reasoning",
+        b"50%",
     ):
         assert marker in raw
+    assert b"YOU" not in raw
+    assert b"STEER" not in raw
     for sequence in (
         b"\x1b[?1000h",
         b"\x1b[?1002h",

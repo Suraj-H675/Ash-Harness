@@ -13,6 +13,7 @@ from prompt_toolkit.output import DummyOutput
 
 import ash.ui.history as history_module
 import ash.ui.prompt as prompt_module
+from ash.repo.parser import Symbol
 from ash.ui.prompt import AshCompleter, PromptChoice, PromptInput
 
 
@@ -55,6 +56,76 @@ def test_redirected_eof_is_reported() -> None:
 def test_invalid_input_mode_is_rejected() -> None:
     with pytest.raises(ValueError, match="input_mode"):
         PromptInput(input_stream=io.StringIO(""), input_mode="modal")
+
+
+def test_symbol_completion_queries_ready_snapshot_without_refresh(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeRepoMap:
+        files = []
+        ready = True
+
+        def find_definitions(self, name: str, **kwargs):
+            calls.append({"name": name, **kwargs})
+            return [
+                Symbol(
+                    name="Service",
+                    kind="class",
+                    file_path=str(tmp_path / "service.py"),
+                    start_line=1,
+                    end_line=10,
+                )
+            ]
+
+    completer = AshCompleter(
+        ["/help"],
+        tmp_path,
+        repo_map=FakeRepoMap(),
+    )
+    completions = list(
+        completer.get_completions(
+            Document("@symbol:Ser"),
+            CompleteEvent(completion_requested=True),
+        )
+    )
+
+    assert [item.text for item in completions] == ["@symbol:Service"]
+    assert calls == [
+        {
+            "name": "Ser",
+            "case_sensitive": True,
+            "refresh": False,
+        }
+    ]
+
+
+def test_symbol_completion_does_not_wait_for_repo_map_startup(
+    tmp_path: Path,
+) -> None:
+    class BuildingRepoMap:
+        ready = False
+
+        @property
+        def files(self):
+            raise AssertionError("completion must not touch an unready map")
+
+        def find_definitions(self, *args, **kwargs):
+            raise AssertionError("completion must not wait for an unready map")
+
+    completer = AshCompleter(
+        ["/help"],
+        tmp_path,
+        repo_map=BuildingRepoMap(),
+    )
+
+    assert list(
+        completer.get_completions(
+            Document("@symbol:Ser"),
+            CompleteEvent(completion_requested=True),
+        )
+    ) == []
 
 
 @pytest.mark.asyncio

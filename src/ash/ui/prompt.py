@@ -248,12 +248,19 @@ class AshCompleter(Completer):
     def _symbol_completions(self, prefix: str, word: str):
         if self._repo_map is None or not prefix:
             return
+        if not bool(getattr(self._repo_map, "ready", True)):
+            return
         try:
-            matches = self._repo_map.find_definitions(prefix, case_sensitive=True)
+            matches = self._repo_map.find_definitions(
+                prefix,
+                case_sensitive=True,
+                refresh=False,
+            )
             if not matches:
                 matches = self._repo_map.find_definitions(
                     prefix,
                     case_sensitive=False,
+                    refresh=False,
                 )
             if not matches:
                 matches = [
@@ -463,7 +470,7 @@ class PromptInput:
         history_path: Path | None = None,
         input_stream: TextIO | None = None,
         status_provider: Callable[[], str] | None = None,
-        header_provider: Callable[[], str] | None = None,
+        context_provider: Callable[[], tuple[int, int]] | None = None,
         live_provider: Callable[[int], tuple[int, Any]] | None = None,
         extra_commands: dict[str, str] | list[str] | None = None,
         model_choices: list[str] | None = None,
@@ -530,7 +537,7 @@ class PromptInput:
                 history=history,
                 completer=completer,
                 status_provider=status_provider or (lambda: ""),
-                header_provider=header_provider or (lambda: ""),
+                context_provider=context_provider or (lambda: (0, 1)),
                 live_provider=live_provider or (lambda _width: (0, FormattedText([]))),
                 input_mode=input_mode,
                 keybindings=(
@@ -573,6 +580,10 @@ class PromptInput:
     def invalidate(self) -> None:
         if self._surface is not None:
             self._surface.invalidate()
+
+    def clear_visible_screen(self) -> None:
+        if self._surface is not None:
+            self._surface.clear_visible_screen()
 
     def set_extra_commands(self, commands: dict[str, str] | list[str]) -> None:
         if self._completer is None:

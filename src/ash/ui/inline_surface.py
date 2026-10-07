@@ -33,11 +33,14 @@ from prompt_toolkit.layout import (
     FormattedTextControl,
     HSplit,
     Layout,
+    VSplit,
     Window,
 )
+from prompt_toolkit.layout.containers import WindowAlign
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.output.base import Output
+from prompt_toolkit.utils import get_cwidth
 
 from ash.ui.input_signals import PromptInterrupted
 from ash.ui.safe_text import terminal_safe_text
@@ -45,6 +48,7 @@ from ash.ui.theme import Theme, prompt_style, terminal_styles
 
 
 LiveViewProvider = Callable[[int], tuple[int, AnyFormattedText]]
+ContextUsageProvider = Callable[[], tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,20 @@ class PromptChoice:
     value: str
     label: str
     description: str = ""
+
+
+def format_context_bar(used: int, maximum: int, *, cells: int = 8) -> FormattedText:
+    maximum = max(1, maximum)
+    ratio = min(1.0, max(0.0, used / maximum))
+    filled = min(cells, max(0, round(ratio * cells)))
+    percent = min(100, max(0, round(ratio * 100)))
+    return FormattedText(
+        [
+            ("class:context-used", "█" * filled),
+            ("class:context-empty", "░" * (cells - filled)),
+            ("class:status", f" {percent:>3}% "),
+        ]
+    )
 
 
 class InlinePromptSurface:
@@ -63,7 +81,7 @@ class InlinePromptSurface:
         history: History,
         completer,
         status_provider: Callable[[], str],
-        header_provider: Callable[[], str],
+        context_provider: ContextUsageProvider,
         live_provider: LiveViewProvider,
         input_mode: str,
         keybindings: dict[str, list[str]],
@@ -73,7 +91,7 @@ class InlinePromptSurface:
         output: Output | None = None,
     ) -> None:
         self.status_provider = status_provider
-        self.header_provider = header_provider
+        self.context_provider = context_provider
         self.live_provider = live_provider
         self._prompt = "> "
         self._running = False
@@ -106,18 +124,20 @@ class InlinePromptSurface:
         )
         live_visible = Condition(self._live_visible)
 
-        self.prompt_control = FormattedTextControl(self._composer_label)
-        composer = HSplit(
+        composer = VSplit(
             [
                 Window(
-                    self.prompt_control,
-                    height=1,
-                    dont_extend_height=True,
+                    FormattedTextControl(
+                        FormattedText([("class:prompt", " › ")])
+                    ),
+                    width=3,
+                    height=self._composer_height,
+                    dont_extend_width=True,
                     style="class:composer",
                 ),
                 Window(
                     BufferControl(buffer=self.input_buffer),
-                    height=Dimension(min=1, max=8),
+                    height=self._composer_height,
                     wrap_lines=True,
                     style="class:composer",
                 ),
@@ -147,28 +167,37 @@ class InlinePromptSurface:
             ]
         )
         choice_active = Condition(lambda: self._choice_mode)
-
-        body = HSplit(
+        status_row = VSplit(
             [
-                ConditionalContainer(live_window, filter=live_visible),
-                ConditionalContainer(
-                    Window(height=1, char="─", style="class:separator"),
-                    filter=live_visible,
-                ),
-                Window(
-                    FormattedTextControl(self._header_text),
-                    height=1,
-                    dont_extend_height=True,
-                    style="class:header",
-                ),
-                ConditionalContainer(composer, filter=~choice_active),
-                ConditionalContainer(choice_panel, filter=choice_active),
                 Window(
                     FormattedTextControl(self._status_text),
                     height=1,
                     dont_extend_height=True,
                     style="class:status",
                 ),
+                Window(
+                    FormattedTextControl(self._context_text),
+                    width=self._context_width,
+                    height=1,
+                    dont_extend_width=True,
+                    dont_extend_height=True,
+                    align=WindowAlign.RIGHT,
+                    style="class:status",
+                ),
+            ]
+        )
+
+        body = HSplit(
+            [
+                Window(height=Dimension(weight=1)),
+                ConditionalContainer(live_window, filter=live_visible),
+                ConditionalContainer(
+                    Window(height=1, char="─", style="class:separator"),
+                    filter=live_visible,
+                ),
+                ConditionalContainer(composer, filter=~choice_active),
+                ConditionalContainer(choice_panel, filter=choice_active),
+                status_row,
             ]
         )
         root = FloatContainer(
@@ -250,11 +279,32 @@ class InlinePromptSurface:
         if self._running:
             self.application.invalidate()
 
+    def clear_visible_screen(self) -> None:
+        """Clear only the visible terminal viewport, preserving scrollback."""
+
+        output = self.application.output
+        output.erase_screen()
+        output.cursor_goto(0, 0)
+        output.flush()
+
     def _output_width(self) -> int:
         app = get_app_or_none()
         if app is self.application:
             return max(20, app.output.get_size().columns)
+        if hasattr(self, "application"):
+            return max(20, self.application.output.get_size().columns)
         return 80
+
+    def _composer_height(self) -> int:
+        available = max(1, self._output_width() - 3)
+        rows = 0
+        for line in self.input_buffer.document.lines:
+            width = get_cwidth(line)
+            rows += max(1, (width + available - 1) // available)
+        return min(8, max(1, rows))
+
+    def _context_width(self) -> int:
+        return 10 if self._output_width() < 48 else 14
 
     def _live_text(self) -> AnyFormattedText:
         width = self._output_width()
@@ -277,29 +327,14 @@ class InlinePromptSurface:
 
         return Point(x=len(lines[-1]), y=len(lines) - 1)
 
-    def _header_text(self) -> FormattedText:
-        value = terminal_safe_text(self.header_provider(), single_line=True)
-        if not value:
-            return FormattedText([("class:header-brand", " ASH ")])
-        return FormattedText(
-            [
-                ("class:header-brand", " ASH "),
-                ("class:header-meta", "  " + value + " "),
-            ]
-        )
-
     def _status_text(self) -> FormattedText:
         value = terminal_safe_text(self.status_provider(), single_line=True)
-        return FormattedText([("class:status", f" {value} " if value else " ")])
+        return FormattedText([("class:status", f" {value}" if value else " ")])
 
-    def _composer_label(self) -> FormattedText:
-        label = "STEER" if self._prompt.casefold().startswith("steer") else "YOU"
-        return FormattedText(
-            [
-                ("class:composer-label", f" {label} › "),
-                ("class:muted", "Enter send  ·  Ctrl+J newline"),
-            ]
-        )
+    def _context_text(self) -> FormattedText:
+        used, maximum = self.context_provider()
+        cells = 4 if self._output_width() < 48 else 8
+        return format_context_bar(used, maximum, cells=cells)
 
     def _choice_heading(self) -> FormattedText:
         return FormattedText(

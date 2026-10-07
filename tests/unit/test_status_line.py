@@ -1,247 +1,121 @@
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
 from types import SimpleNamespace
 
-import ash.ui.status as status_module
 from ash.config import AshConfig
-from ash.core.session import SessionStore
-from ash.safety.policy import PermissionPolicy
-from ash.ui.status import StatusLine, git_branch
+from ash.ui.status import StatusLine
 
 
-def test_status_line_includes_runtime_git_cost_and_sandbox(tmp_path: Path) -> None:
-    store = SessionStore(tmp_path / "sessions.db")
-    session = store.create_session(str(tmp_path))
-    store.save_session_token_stats(
-        session.session_id,
-        10,
-        5,
-        0.0123,
-        cache_read_tokens=7,
-        cache_write_tokens=2,
-        estimated_prompt_tokens=3,
-        estimated_cost_usd=0.004,
+def _loop(root: Path, *, model: str, reasoning: bool, context: int = 0):
+    return SimpleNamespace(
+        project_root=root,
+        active_model_id=model,
+        provider=SimpleNamespace(
+            capabilities=SimpleNamespace(reasoning=reasoning)
+        ),
+        _last_context_tokens=context,
     )
-    loop = SimpleNamespace(
-        current_session=session,
-        session_store=store,
-        permission_policy=PermissionPolicy("interactive"),
-        project_root=tmp_path,
-        _last_context_tokens=123,
-    )
+
+
+def test_status_line_shows_model_reasoning_and_directory() -> None:
+    root = Path.home() / "projects" / "Ash-Harness"
     config = AshConfig(
-        workspace_root=tmp_path,
-        max_context_tokens=1000,
-        max_completion_tokens=100,
-    )
-    sandbox = SimpleNamespace(backend_name="scoped", is_fully_isolated=lambda: False)
-
-    rendered = StatusLine(loop, config, sandbox, refresh_seconds=60)()
-
-    assert "ctx ~123/900" in rendered
-    assert "cache 7r/2w" in rendered
-    assert "~$0.0123" in rendered
-    assert "sandbox scoped!" in rendered
-    assert f"session {session.session_id[:8]}" in rendered
-
-
-def test_status_line_splits_viewport_identity_from_runtime(tmp_path: Path) -> None:
-    store = SessionStore(tmp_path / "sessions.db")
-    session = store.create_session(str(tmp_path))
-    loop = SimpleNamespace(
-        current_session=session,
-        session_store=store,
-        permission_policy=PermissionPolicy("interactive"),
-        project_root=tmp_path,
-        _last_context_tokens=250,
-    )
-    config = AshConfig(
-        workspace_root=tmp_path,
+        workspace_root=root,
         model="openai/gpt-test",
-        max_context_tokens=2000,
+    )
+    status = StatusLine(
+        _loop(root, model="openai/gpt-test", reasoning=True),
+        config,
+    )
+
+    assert status.left() == "gpt-test  ·  reasoning  ·  ~/projects/Ash-Harness"
+
+
+def test_status_line_reports_no_reasoning_when_active_model_lacks_it() -> None:
+    root = Path.home() / "project"
+    config = AshConfig(workspace_root=root, model="local/plain")
+    status = StatusLine(
+        _loop(root, model="local/plain", reasoning=False),
+        config,
+    )
+
+    assert "no reasoning" in status.left()
+
+
+def test_status_line_tracks_active_runtime_model_without_io() -> None:
+    root = Path.home() / "project"
+    loop = _loop(root, model="openai/primary", reasoning=True)
+    status = StatusLine(loop, AshConfig(workspace_root=root, model="openai/primary"))
+
+    assert status.left().startswith("primary  ·")
+    loop.active_model_id = "groq/fallback"
+    loop.provider.capabilities.reasoning = False
+
+    assert status.left().startswith("fallback  ·  no reasoning  ·")
+
+
+def test_status_line_only_adds_safety_state_when_non_default(tmp_path: Path) -> None:
+    loop = _loop(tmp_path, model="provider/model", reasoning=True)
+    loop.permission_policy = SimpleNamespace(
+        mode=SimpleNamespace(value="auto_edit")
+    )
+    sandbox = SimpleNamespace(is_fully_isolated=lambda: False)
+
+    rendered = StatusLine(
+        loop,
+        AshConfig(workspace_root=tmp_path, model="provider/model"),
+        sandbox,
+    ).left()
+
+    assert "auto_edit" in rendered
+    assert "⚠ limited isolation" in rendered
+
+
+def test_status_line_context_usage_uses_prompt_context_ceiling(tmp_path: Path) -> None:
+    config = AshConfig(
+        workspace_root=tmp_path,
+        max_context_tokens=2_000,
         max_completion_tokens=500,
     )
-    sandbox = SimpleNamespace(backend_name="docker", is_fully_isolated=lambda: True)
-    status = StatusLine(loop, config, sandbox, refresh_seconds=60)
-
-    assert status.header() == (
-        f"openai/gpt-test  ·  interactive  ·  {tmp_path.name}"
-    )
-    assert status.footer() == (
-        f"ctx ~250/1500  ·  sandbox docker  ·  $0.0000  ·  "
-        f"session {session.session_id[:8]}"
+    status = StatusLine(
+        _loop(tmp_path, model="openai/test", reasoning=True, context=375),
+        config,
     )
 
+    assert status.context_usage() == (375, 1_500)
 
-def test_status_line_uses_active_runtime_model_and_invalidates_identity_cache(
+
+def test_status_line_context_usage_prefers_negotiated_runtime_ceiling(
     tmp_path: Path,
 ) -> None:
-    store = SessionStore(tmp_path / "sessions.db")
-    session = store.create_session(str(tmp_path))
-    loop = SimpleNamespace(
-        current_session=session,
-        session_store=store,
-        permission_policy=PermissionPolicy("interactive"),
-        project_root=tmp_path,
-        _last_context_tokens=0,
-        active_model_id="openai/primary",
-    )
-    config = AshConfig(workspace_root=tmp_path, model="openai/primary")
-    sandbox = SimpleNamespace(backend_name="scoped", is_fully_isolated=lambda: True)
-    status = StatusLine(loop, config, sandbox, refresh_seconds=60)
-
-    assert "openai/primary" in status.header()
-
-    loop.active_model_id = "groq/fallback"
-
-    assert "groq/fallback" in status.header()
-    assert "openai/primary" not in status.header()
-
-
-def test_status_line_does_not_render_unknown_pricing_as_free(tmp_path: Path) -> None:
-    store = SessionStore(tmp_path / "sessions.db")
-    session = store.create_session(str(tmp_path))
-    store.save_session_token_stats(
-        session.session_id,
-        10,
-        5,
-        0.0,
-        cost_known=False,
-    )
-    loop = SimpleNamespace(
-        current_session=session,
-        session_store=store,
-        permission_policy=PermissionPolicy("interactive"),
-        project_root=tmp_path,
-        _last_context_tokens=15,
-    )
-    config = AshConfig(workspace_root=tmp_path)
-    sandbox = SimpleNamespace(backend_name="scoped", is_fully_isolated=lambda: True)
-
-    rendered = StatusLine(loop, config, sandbox, refresh_seconds=60)()
-
-    assert "cost unknown" in rendered
-    assert "$0.0000" not in rendered
-
-
-def test_status_line_sanitizes_persisted_model_controls(tmp_path: Path) -> None:
-    loop = SimpleNamespace(
-        current_session=None,
-        session_store=SimpleNamespace(),
-        permission_policy=PermissionPolicy("interactive"),
-        project_root=tmp_path,
-        _last_context_tokens=0,
-    )
     config = AshConfig(
         workspace_root=tmp_path,
-        model="openrouter/model\x1b[2J\u202ehidden\u202c",
+        max_context_tokens=2_000,
+        max_completion_tokens=500,
     )
-    sandbox = SimpleNamespace(backend_name="scoped", is_fully_isolated=lambda: False)
+    loop = _loop(
+        tmp_path,
+        model="provider/smaller",
+        reasoning=True,
+        context=225,
+    )
+    loop._last_context_maximum = 900
 
-    rendered = StatusLine(loop, config, sandbox, refresh_seconds=60)()
+    assert StatusLine(loop, config).context_usage() == (225, 900)
 
-    assert "openrouter/model\\x1b[2J\\u202ehidden\\u202c" in rendered
+
+def test_status_line_sanitizes_model_and_directory_controls(tmp_path: Path) -> None:
+    root = tmp_path / "safe\u202ehidden\u202c"
+    loop = _loop(
+        root,
+        model="provider/model\x1b[2J\u202ehidden\u202c",
+        reasoning=True,
+    )
+    status = StatusLine(loop, AshConfig(workspace_root=root, model="provider/model"))
+
+    rendered = status.left()
+    assert "model\\x1b[2J\\u202ehidden\\u202c" in rendered
+    assert "safe\\u202ehidden\\u202c" in rendered
     assert "\x1b[2J" not in rendered
     assert "\u202e" not in rendered
-
-
-def test_status_line_sanitizes_workspace_path_controls(tmp_path: Path) -> None:
-    project_root = tmp_path / "safe\u202ehidden\u202c"
-    project_root.mkdir()
-    loop = SimpleNamespace(
-        current_session=None,
-        session_store=SimpleNamespace(),
-        permission_policy=PermissionPolicy("interactive"),
-        project_root=project_root,
-        _last_context_tokens=0,
-    )
-    config = AshConfig(workspace_root=project_root)
-    sandbox = SimpleNamespace(backend_name="scoped", is_fully_isolated=lambda: False)
-
-    rendered = StatusLine(loop, config, sandbox, refresh_seconds=60)()
-
-    assert "safe\\u202ehidden\\u202c" in rendered
-    assert "\u202e" not in rendered
-    assert "\u202c" not in rendered
-
-
-def test_git_branch_reports_branch_and_handles_non_repository(
-    tmp_path: Path,
-) -> None:
-    assert git_branch(tmp_path) == "none"
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, capture_output=True)
-    assert git_branch(tmp_path) in {"main", "master"}
-
-
-def test_git_branch_ignores_parent_git_dir_redirection(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    inside = tmp_path / "inside"
-    outside = tmp_path / "outside"
-    inside.mkdir()
-    outside.mkdir()
-    for repo, branch in ((inside, "inside-branch"), (outside, "outside-branch")):
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        subprocess.run(
-            ["git", "symbolic-ref", "HEAD", f"refs/heads/{branch}"],
-            cwd=repo,
-            check=True,
-        )
-    monkeypatch.setenv("GIT_DIR", str(outside / ".git"))
-    monkeypatch.setenv("GIT_WORK_TREE", str(outside))
-
-    assert git_branch(inside) == "inside-branch"
-
-
-def test_git_branch_renders_bidi_controls_visibly(tmp_path: Path) -> None:
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, capture_output=True)
-    branch = "safe\u202ehidden\u202c"
-    subprocess.run(
-        ["git", "symbolic-ref", "HEAD", f"refs/heads/{branch}"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-
-    rendered = git_branch(tmp_path)
-
-    assert rendered == "safe\\u202ehidden\\u202c"
-    assert "\u202e" not in rendered
-    assert "\u202c" not in rendered
-
-
-def test_git_branch_refuses_workspace_path_swap(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    root = tmp_path / "workspace"
-    replacement = tmp_path / "replacement"
-    root.mkdir()
-    replacement.mkdir()
-    for repo, branch in ((root, "original"), (replacement, "replacement")):
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
-        subprocess.run(
-            ["git", "symbolic-ref", "HEAD", f"refs/heads/{branch}"],
-            cwd=repo,
-            check=True,
-            capture_output=True,
-        )
-
-    real_resolve = status_module.resolve_host_executable
-    swapped = False
-
-    def resolve_and_swap(name: str, *, workspace_root: Path, cwd: Path):
-        nonlocal swapped
-        resolved = real_resolve(name, workspace_root=workspace_root, cwd=cwd)
-        if not swapped:
-            swapped = True
-            root.rename(tmp_path / "moved-original")
-            root.symlink_to(replacement, target_is_directory=True)
-        return resolved
-
-    monkeypatch.setattr(status_module, "resolve_host_executable", resolve_and_swap)
-
-    assert git_branch(root) == "none"

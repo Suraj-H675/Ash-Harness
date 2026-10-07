@@ -2019,7 +2019,7 @@ truthful evidence boundaries, not open mission blockers.
 | Markdown/code rendering | Verified locally | Streamed Rich Markdown with fenced-code highlighting and bounded repaint frequency |
 | Diff preview | Verified locally | Bounded unified and selectable persisted side-by-side previews for writes/replacements/patches are wired into the interactive approval flow |
 | Approval dialog | Verified locally | Allow once, exact/broad session, exact/edited project scopes, persisted exact deny, verified command-prefix project scopes, bounded deny-with-feedback, and compact retained common/advanced selectors are wired |
-| Status line | Verified locally | Cached model, mode, branch, context budget, prompt-cache totals, cost, sandbox, session, and cwd state |
+| Status line | Verified locally | The persistent row keeps cached model, reasoning availability, cwd, and a right-aligned context-usage bar; non-default permission or degraded-isolation state is surfaced only when operationally important, while detailed cost/cache/session diagnostics remain available through explicit commands |
 | Themes | Verified locally | Validated dark/light palettes are wired through config precedence, streamed Rich panels, approvals/status output, and the retained prompt surface; screen-reader/no-color fallback remains ANSI-safe |
 | Configurable keybindings | Verified locally | Cross-platform newline/editor actions with collision validation |
 | Vim input mode | Verified locally | Optional Emacs or Vim prompt-toolkit editing mode |

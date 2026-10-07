@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -15,6 +16,58 @@ from ash.repo.parser import SymbolExtractor
 from ash.repo import repomap as repomap_module
 from ash.repo.repomap import RepoMap, calculate_personalized_pagerank
 from ash.safety.guard import SafetyGuard
+
+
+def test_repomap_can_defer_initial_refresh_without_losing_first_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    real_refresh = RepoMap._refresh
+
+    def delayed_refresh(self: RepoMap, **kwargs) -> None:
+        started.set()
+        assert release.wait(timeout=2)
+        real_refresh(self, **kwargs)
+
+    monkeypatch.setattr(RepoMap, "_refresh", delayed_refresh)
+
+    repo_map = RepoMap(tmp_path, defer_initial_refresh=True)
+    assert started.wait(timeout=1)
+    assert repo_map._initial_refresh_ready.is_set() is False
+
+    release.set()
+    assert repo_map.files == []
+    assert repo_map._initial_refresh_ready.is_set() is True
+
+
+def test_repomap_close_requests_deferred_refresh_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    cancelled = threading.Event()
+
+    def cancellable_refresh(
+        self: RepoMap,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        del self
+        started.set()
+        assert cancel_event is not None
+        assert cancel_event.wait(timeout=2)
+        cancelled.set()
+
+    monkeypatch.setattr(RepoMap, "_refresh", cancellable_refresh)
+    repo_map = RepoMap(tmp_path, defer_initial_refresh=True)
+    assert started.wait(timeout=1)
+
+    repo_map.close()
+
+    assert cancelled.wait(timeout=1)
+    assert repo_map._initial_refresh_ready.wait(timeout=1)
 
 
 def test_pagerank_concentrates_on_teleport_node() -> None:
@@ -624,6 +677,9 @@ def test_repomap_dot_graph_quotes_untrusted_filenames(tmp_path: Path) -> None:
     ]
     repo_map._index = {source.resolve(): 0, dependency.resolve(): 1}
     repo_map._adjacency = [[0.0, 0.0], [1.0, 0.0]]
+    repo_map._initial_refresh_ready = threading.Event()
+    repo_map._initial_refresh_ready.set()
+    repo_map._initial_refresh_error = None
 
     graph = repo_map.to_dot_graph([source])
 

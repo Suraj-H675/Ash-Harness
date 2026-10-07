@@ -57,14 +57,11 @@ def _install_frontend(
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        def __call__(self) -> str:
+        def left(self) -> str:
             return ""
 
-        def header(self) -> str:
-            return ""
-
-        def footer(self) -> str:
-            return ""
+        def context_usage(self) -> tuple[int, int]:
+            return (0, 1)
 
     class FakeNotifier:
         def __init__(self, *args, **kwargs) -> None:

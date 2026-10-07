@@ -18,6 +18,7 @@ from __future__ import annotations
 import fnmatch
 import stat
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -544,6 +545,7 @@ class RepoMap:
         extractor: SymbolExtractor | None = None,
         max_files: int = 500,
         exclude_patterns: list[str] | None = None,
+        defer_initial_refresh: bool = False,
     ) -> None:
         self.project_root = project_root.resolve()
         self._guard = SafetyGuard(self.project_root)
@@ -556,18 +558,47 @@ class RepoMap:
         self._index: dict[Path, int] = {}
         self._adjacency: list[list[float]] | None = None
         self._file_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
-        self._refresh()
+        self._initial_refresh_ready = threading.Event()
+        self._initial_refresh_error: BaseException | None = None
+        self._initial_refresh_cancel = threading.Event()
+        self._initial_refresh_thread: threading.Thread | None = None
+        if defer_initial_refresh:
+            self._initial_refresh_thread = threading.Thread(
+                target=self._run_initial_refresh,
+                name="ash-repo-map",
+                daemon=True,
+            )
+            self._initial_refresh_thread.start()
+        else:
+            self._refresh()
+            self._initial_refresh_ready.set()
 
     # --- public API -----------------------------------------------------
 
     @property
     def files(self) -> list[FileNode]:
+        self._wait_for_initial_refresh()
         return list(self._files)
+
+    @property
+    def ready(self) -> bool:
+        """Whether the initial repository snapshot is available without waiting."""
+
+        return self._initial_refresh_ready.is_set()
 
     def refresh(self) -> None:
         """Re-walk the workspace and rebuild the graph."""
 
+        self._wait_for_initial_refresh()
         self._refresh()
+
+    def close(self) -> None:
+        """Request cancellation of a deferred initial refresh."""
+
+        self._initial_refresh_cancel.set()
+        thread = self._initial_refresh_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.2)
 
     def find_definitions(
         self,
@@ -576,12 +607,15 @@ class RepoMap:
         case_sensitive: bool = True,
         path_glob: str | None = None,
         limit: int = 100,
+        refresh: bool = True,
     ) -> list[Symbol]:
         """Find exact structural definitions in the current workspace index."""
 
         if limit <= 0:
             return []
-        self.refresh()
+        self._wait_for_initial_refresh()
+        if refresh:
+            self._refresh()
         expected = name if case_sensitive else name.casefold()
         matches: list[Symbol] = []
         for file_node in self._files:
@@ -604,12 +638,15 @@ class RepoMap:
         case_sensitive: bool = True,
         path_glob: str | None = None,
         limit: int = 200,
+        refresh: bool = True,
     ) -> list[SourceLocation]:
         """Find structural identifier uses, excluding declaration names."""
 
         if limit <= 0:
             return []
-        self.refresh()
+        self._wait_for_initial_refresh()
+        if refresh:
+            self._refresh()
         matches: list[SourceLocation] = []
         for file_node in self._files:
             if not self._matches_path_glob(file_node.path, path_glob):
@@ -643,6 +680,7 @@ class RepoMap:
     ) -> list[tuple[Path, float]]:
         """Return ``[(file_path, score), ...]`` sorted by descending PPR."""
 
+        self._wait_for_initial_refresh()
         if not self._files or self._adjacency is None:
             return []
 
@@ -698,6 +736,7 @@ class RepoMap:
         and their top-K symbols, suitable for injection into the system prompt.
         """
 
+        self._wait_for_initial_refresh()
         lines = ["## Repository Map", ""]
         selected = ranked[:top_files]
         if not selected:
@@ -743,6 +782,7 @@ class RepoMap:
 
         Users can pipe the result to ``dot -Tpng`` to visualize the graph.
         """
+        self._wait_for_initial_refresh()
         lines = ["digraph repo {", "  rankdir=LR;"]
         for src_path in ranked:
             src_idx = self._index.get(src_path.resolve())
@@ -758,7 +798,25 @@ class RepoMap:
                     lines.append(f"  {src_label} -> {dep_label};")
         lines.append("}")
         return "\n".join(lines)
+
     # --- internal -------------------------------------------------------
+
+    def _run_initial_refresh(self) -> None:
+        try:
+            self._refresh(cancel_event=self._initial_refresh_cancel)
+        except OSError as exc:
+            from ash.logging import get_logger
+
+            get_logger(__name__).warning("repository map unavailable: {}", exc)
+        except BaseException as exc:
+            self._initial_refresh_error = exc
+        finally:
+            self._initial_refresh_ready.set()
+
+    def _wait_for_initial_refresh(self) -> None:
+        self._initial_refresh_ready.wait()
+        if self._initial_refresh_error is not None:
+            raise self._initial_refresh_error
 
     def _node_for_path(self, path: Path) -> FileNode | None:
         try:
@@ -769,24 +827,32 @@ class RepoMap:
             return None
         return self._files[self._index[resolved]]
 
-    def _refresh(self) -> None:
+    def _refresh(self, *, cancel_event: threading.Event | None = None) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            return
         discovered = _discover_source_files(
             self.project_root,
             exclude_patterns=self._exclude_patterns,
             guard=self._guard,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            return
         ignored = _git_ignored_files(
             self.project_root,
             discovered,
             guard=self._guard,
             expected_root_identity=self._project_root_identity,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            return
         paths = [path for path in discovered if path not in ignored][: self._max_files]
         files: list[FileNode] = []
         module_index: dict[str, Path] = {}
         next_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
 
         for path in paths:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             try:
                 resolved, metadata = stat_scoped_path(path, self._guard)
             except (OSError, SafetyViolation):

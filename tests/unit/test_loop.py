@@ -1988,6 +1988,18 @@ class LargeRepoMap:
         return "repo " * 120
 
 
+class BuildingRepoMap:
+    ready = False
+
+    def rank(self, active):
+        del active
+        raise AssertionError("prompt construction must not wait for startup indexing")
+
+    def render(self, ranked, top_files=5, symbols_per_file=6):
+        del ranked, top_files, symbols_per_file
+        raise AssertionError("an unready repo map must not be rendered")
+
+
 class EventUI(TerminalUI):
     def __init__(self, safety_tier="auto_approve"):
         super().__init__(safety_tier=safety_tier)
@@ -5092,6 +5104,23 @@ def test_build_messages_injects_untrusted_content_boundary(tmp_path: Path) -> No
 
     assert messages[0]["content"].startswith("Trusted runtime instructions.")
     assert "Untrusted-content boundary:" in messages[0]["content"]
+
+
+def test_build_messages_does_not_wait_for_deferred_repo_map(tmp_path: Path) -> None:
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        repo_map=BuildingRepoMap(),
+        system_prompt="Trusted runtime instructions.",
+    )
+    session = asyncio.run(loop.start_session())
+
+    messages = loop._build_messages(session)
+
+    assert "Trusted runtime instructions." in messages[0]["content"]
 
 
 @pytest.mark.asyncio

@@ -414,6 +414,7 @@ def build_repo_map(config: AshConfig) -> Any | None:
             config.workspace_root,
             max_files=config.repo_map_max_files,
             exclude_patterns=config.repo_map_exclude_patterns,
+            defer_initial_refresh=True,
         )
     except OSError as exc:
         get_logger(__name__).warning("repository map unavailable: {}", exc)

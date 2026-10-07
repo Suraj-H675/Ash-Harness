@@ -50,8 +50,8 @@ class Theme:
 
 DARK_THEME = Theme(
     name="dark",
-    user_prefix="bold #5fd7ff",
-    assistant_prefix="bold #5fff87",
+    user_prefix="bold #5f87ff",
+    assistant_prefix="bold #d0d0d0",
     reasoning_prefix="italic #808080",
     reasoning_body="italic #a8a8a8",
     tool_prefix="bold #ffd75f",
@@ -84,7 +84,7 @@ DARK_THEME = Theme(
 LIGHT_THEME = Theme(
     name="light",
     user_prefix="bold #005faf",
-    assistant_prefix="bold #007000",
+    assistant_prefix="bold #222222",
     reasoning_prefix="italic #666666",
     reasoning_body="italic #444444",
     tool_prefix="bold #8a5300",
@@ -158,6 +158,8 @@ def terminal_styles(theme: Theme) -> dict[str, str]:
         "header-brand": theme.header_brand,
         "header-meta": theme.header_meta,
         "status": theme.status,
+        "context-used": theme.user_prefix,
+        "context-empty": theme.muted,
         "empty-title": theme.empty_title,
         "muted": theme.muted,
         "diff-added": theme.diff_added,
