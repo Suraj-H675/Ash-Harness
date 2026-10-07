@@ -287,6 +287,11 @@ class CredentialHelperProvider(ProviderABC):
         for provider in self._owned:
             provider.configure_max_tokens(max_tokens)
 
+    def configure_reasoning_effort(self, effort: str | None) -> None:
+        super().configure_reasoning_effort(effort)
+        for provider in self._owned:
+            provider.configure_reasoning_effort(effort)
+
     async def detect_capabilities(
         self,
         *,
@@ -430,6 +435,8 @@ class CredentialHelperProvider(ProviderABC):
                 ) from None
             if self._configured_max_tokens is not None:
                 provider.configure_max_tokens(self._configured_max_tokens)
+            if self.configured_reasoning_effort is not None:
+                provider.configure_reasoning_effort(self.configured_reasoning_effort)
             self._owned.append(provider)
             previous = self._active
             self._active = provider

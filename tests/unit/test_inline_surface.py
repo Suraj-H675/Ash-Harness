@@ -36,12 +36,18 @@ def test_context_bar_represents_usage_and_clamps_bounds() -> None:
 @pytest.mark.asyncio
 async def test_composer_and_status_dock_to_bottom_without_fullscreen() -> None:
     with create_pipe_input() as pipe:
+        thinking = [""]
+        revision = [0]
+
+        def thinking_provider(_width: int):
+            return revision[0], thinking[0]
+
         surface = InlinePromptSurface(
             history=InMemoryHistory(),
             completer=None,
             status_provider=lambda: "model · reasoning · ~/repo",
             context_provider=lambda: (25, 100),
-            live_provider=lambda _width: (0, ""),
+            thinking_provider=thinking_provider,
             input_mode="emacs",
             keybindings={
                 "newline": ["c-j"],
@@ -69,6 +75,35 @@ async def test_composer_and_status_dock_to_bottom_without_fullscreen() -> None:
         assert composer_row == 18
         assert status_row == 19
 
+        thinking[0] = "thinking content"
+        revision[0] += 1
+        surface.invalidate()
+        await asyncio.sleep(0.05)
+        screen = surface.application.renderer._last_screen
+        assert screen is not None
+        rows = {
+            y: "".join(cell.char for _x, cell in sorted(cells.items())).rstrip()
+            for y, cells in screen.data_buffer.items()
+        }
+        reasoning_row = next(
+            y for y, text in rows.items() if "thinking content" in text
+        )
+        composer_row_after = next(y for y, text in rows.items() if "›" in text)
+        assert composer_row_after == composer_row
+        assert reasoning_row + 2 == composer_row_after
+
+        thinking[0] = ""
+        revision[0] += 1
+        surface.invalidate()
+        await asyncio.sleep(0.05)
+        screen = surface.application.renderer._last_screen
+        assert screen is not None
+        rows = {
+            y: "".join(cell.char for _x, cell in sorted(cells.items())).rstrip()
+            for y, cells in screen.data_buffer.items()
+        }
+        assert next(y for y, text in rows.items() if "›" in text) == composer_row
+
         pipe.send_text("done\r")
         assert await pending == "done"
 
@@ -81,7 +116,7 @@ def test_composer_height_counts_wrapped_rows() -> None:
         completer=None,
         status_provider=lambda: "",
         context_provider=lambda: (0, 100),
-        live_provider=lambda _width: (0, ""),
+        thinking_provider=lambda _width: (0, ""),
         input_mode="emacs",
         keybindings={"newline": ["c-j"], "open_editor": ["c-x c-e"]},
         theme=get_theme("dark"),
@@ -104,7 +139,7 @@ def test_context_bar_compacts_on_narrow_terminal() -> None:
         completer=None,
         status_provider=lambda: "model · reasoning · ~/very/long/project",
         context_provider=lambda: (50, 100),
-        live_provider=lambda _width: (0, ""),
+        thinking_provider=lambda _width: (0, ""),
         input_mode="emacs",
         keybindings={"newline": ["c-j"], "open_editor": ["c-x c-e"]},
         theme=get_theme("dark"),

@@ -212,6 +212,7 @@ class AnthropicProvider(ProviderABC):
                 if thinking is not None
                 else baseline.reasoning
             ),
+            reasoning_effort=baseline.reasoning_effort,
             context_window=(
                 positive_limit(getattr(info, "max_input_tokens", None))
                 or baseline.context_window
@@ -271,6 +272,10 @@ class AnthropicProvider(ProviderABC):
             "model": self._model_name,
             "messages": conversation,
         }
+        if self.configured_reasoning_effort is not None:
+            request_kwargs["output_config"] = {
+                "effort": self.configured_reasoning_effort
+            }
         # Anthropic deprecated sampling temperature for current Claude models,
         # and the 1.x Python SDK no longer accepts the argument. Keep the
         # provider-neutral method signature, but let Anthropic use its supported

@@ -366,6 +366,10 @@ class OpenAIResponsesProvider(ProviderABC):
                 request_options["prompt_cache_key"] = self._prompt_cache_key
         else:
             request_options["prompt_cache_options"] = {"mode": "explicit"}
+        if self.configured_reasoning_effort is not None:
+            request_options["reasoning"] = {
+                "effort": self.configured_reasoning_effort
+            }
 
         client = self._resolve_client()
         async for chunk in stream_openai_responses(

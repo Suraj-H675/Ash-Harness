@@ -136,6 +136,7 @@ class AshCompleter(Completer):
         self._repo_map = repo_map
         self._mcp_runtime = mcp_runtime
         self._model_choices = list(dict.fromkeys(model_choices or []))
+        self.effort_provider: Callable[[], tuple[str, ...]] = lambda: ()
 
     def set_commands(
         self,
@@ -349,11 +350,18 @@ class AshCompleter(Completer):
             prefix = ""
 
         if not completed:
-            candidates = (
-                self._model_argument_candidates(prefix)
-                if canonical == "model"
-                else _SLASH_FIRST_ARGUMENTS.get(canonical, ())
-            )
+            if canonical == "model":
+                candidates = self._model_argument_candidates(prefix)
+            elif canonical == "effort":
+                levels = self.effort_provider()
+                candidates = (
+                    (("default", "Use the provider default"),)
+                    + tuple((level, "Reasoning effort") for level in levels)
+                    if levels
+                    else ()
+                )
+            else:
+                candidates = _SLASH_FIRST_ARGUMENTS.get(canonical, ())
         elif len(completed) == 1:
             candidates = _SLASH_SECOND_ARGUMENTS.get(
                 (canonical, completed[0].casefold()),
@@ -471,7 +479,7 @@ class PromptInput:
         input_stream: TextIO | None = None,
         status_provider: Callable[[], str] | None = None,
         context_provider: Callable[[], tuple[int, int]] | None = None,
-        live_provider: Callable[[int], tuple[int, Any]] | None = None,
+        thinking_provider: Callable[[int], tuple[int, Any]] | None = None,
         extra_commands: dict[str, str] | list[str] | None = None,
         model_choices: list[str] | None = None,
         input_mode: str = "emacs",
@@ -538,7 +546,10 @@ class PromptInput:
                 completer=completer,
                 status_provider=status_provider or (lambda: ""),
                 context_provider=context_provider or (lambda: (0, 1)),
-                live_provider=live_provider or (lambda _width: (0, FormattedText([]))),
+                thinking_provider=(
+                    thinking_provider
+                    or (lambda _width: (0, FormattedText([])))
+                ),
                 input_mode=input_mode,
                 keybindings=(
                     keybindings
@@ -576,6 +587,16 @@ class PromptInput:
     @property
     def supports_live_surface(self) -> bool:
         return self._surface is not None
+
+    def set_effort_provider(self, provider: Callable[[], tuple[str, ...]]) -> None:
+        if self._completer is not None:
+            self._completer.effort_provider = provider
+
+    def write_terminal(self, callback: Callable[[], None]) -> None:
+        if self._surface is None:
+            callback()
+        else:
+            self._surface.write_terminal(callback)
 
     def invalidate(self) -> None:
         if self._surface is not None:

@@ -1,16 +1,18 @@
 """Small retained prompt surface backed by native terminal scrollback.
 
-Only the current turn and composer are redrawn. Completed conversation history
-is emitted once by :mod:`ash.ui.terminal`, so render cost does not grow with
-session length and the terminal keeps ownership of mouse selection/scrolling.
+Only the fixed reasoning dock and composer are redrawn. Conversation output is
+appended to native scrollback, so render cost does not grow with session length
+and the terminal keeps ownership of mouse selection and scrolling.
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
-from prompt_toolkit.application import Application, get_app_or_none
+from prompt_toolkit.application import Application, get_app_or_none, run_in_terminal
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
@@ -19,9 +21,7 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import (
     AnyFormattedText,
     FormattedText,
-    to_formatted_text,
 )
-from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 from prompt_toolkit.history import History
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
@@ -47,7 +47,7 @@ from ash.ui.safe_text import terminal_safe_text
 from ash.ui.theme import Theme, prompt_style, terminal_styles
 
 
-LiveViewProvider = Callable[[int], tuple[int, AnyFormattedText]]
+ThinkingViewProvider = Callable[[int], tuple[int, AnyFormattedText]]
 ContextUsageProvider = Callable[[], tuple[int, int]]
 
 
@@ -82,7 +82,7 @@ class InlinePromptSurface:
         completer,
         status_provider: Callable[[], str],
         context_provider: ContextUsageProvider,
-        live_provider: LiveViewProvider,
+        thinking_provider: ThinkingViewProvider | None = None,
         input_mode: str,
         keybindings: dict[str, list[str]],
         theme: Theme,
@@ -92,15 +92,18 @@ class InlinePromptSurface:
     ) -> None:
         self.status_provider = status_provider
         self.context_provider = context_provider
-        self.live_provider = live_provider
+        self.thinking_provider = thinking_provider or (lambda _width: (0, ""))
         self._prompt = "> "
         self._running = False
+        self._terminal_callbacks: deque[Callable[[], None]] = deque()
+        self._terminal_wakeup: asyncio.Event | None = None
+        self._terminal_loop: asyncio.AbstractEventLoop | None = None
         self._choice_mode = False
         self._choice_title = ""
         self._choice_options: tuple[PromptChoice, ...] = ()
         self._choice_selected = 0
-        self._live_cache_key: tuple[int, int] | None = None
-        self._live_cache: AnyFormattedText = FormattedText([])
+        self._thinking_cache_key: tuple[int, int] | None = None
+        self._thinking_cache: AnyFormattedText = FormattedText([])
         self._configured_keybindings = keybindings
 
         self.input_buffer = Buffer(
@@ -110,19 +113,17 @@ class InlinePromptSurface:
             complete_while_typing=True,
             multiline=True,
         )
-        self.live_control = FormattedTextControl(
-            self._live_text,
-            get_cursor_position=self._live_cursor_position,
+        self.thinking_control = FormattedTextControl(
+            self._thinking_text,
             show_cursor=False,
         )
-        live_window = Window(
-            self.live_control,
-            height=Dimension(min=1, max=16),
+        thinking_window = Window(
+            self.thinking_control,
+            height=2,
             wrap_lines=False,
             always_hide_cursor=True,
             dont_extend_height=True,
         )
-        live_visible = Condition(self._live_visible)
 
         composer = VSplit(
             [
@@ -190,11 +191,7 @@ class InlinePromptSurface:
         body = HSplit(
             [
                 Window(height=Dimension(weight=1)),
-                ConditionalContainer(live_window, filter=live_visible),
-                ConditionalContainer(
-                    Window(height=1, char="─", style="class:separator"),
-                    filter=live_visible,
-                ),
+                thinking_window,
                 ConditionalContainer(composer, filter=~choice_active),
                 ConditionalContainer(choice_panel, filter=choice_active),
                 status_row,
@@ -223,6 +220,36 @@ class InlinePromptSurface:
             min_redraw_interval=0.03,
             terminal_size_polling_interval=0.5,
         )
+        self.application.pre_run_callables.append(self._start_terminal_pump)
+
+    def write_terminal(self, callback: Callable[[], None]) -> None:
+        if not self.application.is_running:
+            callback()
+            return
+        self._terminal_callbacks.append(callback)
+        loop = self._terminal_loop
+        wakeup = self._terminal_wakeup
+        if loop is not None and wakeup is not None:
+            loop.call_soon_threadsafe(wakeup.set)
+
+    def _start_terminal_pump(self) -> None:
+        self._terminal_loop = asyncio.get_running_loop()
+        self._terminal_wakeup = asyncio.Event()
+        self.application.create_background_task(self._pump_terminal())
+
+    async def _pump_terminal(self) -> None:
+        wakeup = self._terminal_wakeup
+        if wakeup is None:
+            return
+        while self.application.is_running:
+            await wakeup.wait()
+            wakeup.clear()
+            if self._terminal_callbacks:
+                await run_in_terminal(self._drain_terminal)
+
+    def _drain_terminal(self) -> None:
+        while self._terminal_callbacks:
+            self._terminal_callbacks.popleft()()
 
     async def read(self, prompt: str = "> ") -> str:
         if self._running:
@@ -231,7 +258,7 @@ class InlinePromptSurface:
         self._choice_mode = False
         self._prompt = terminal_safe_text(prompt, single_line=True)
         self.input_buffer.set_document(Document("", 0), bypass_readonly=True)
-        self._live_cache_key = None
+        self._thinking_cache_key = None
         try:
             result = await self.application.run_async()
             if result is None:
@@ -239,6 +266,7 @@ class InlinePromptSurface:
             return result
         finally:
             self._running = False
+            self._drain_terminal()
 
     async def choose(
         self,
@@ -273,9 +301,10 @@ class InlinePromptSurface:
             self._choice_options = ()
             self._choice_selected = 0
             self._running = False
+            self._drain_terminal()
 
     def invalidate(self) -> None:
-        self._live_cache_key = None
+        self._thinking_cache_key = None
         if self._running:
             self.application.invalidate()
 
@@ -306,26 +335,14 @@ class InlinePromptSurface:
     def _context_width(self) -> int:
         return 10 if self._output_width() < 48 else 14
 
-    def _live_text(self) -> AnyFormattedText:
+    def _thinking_text(self) -> AnyFormattedText:
         width = self._output_width()
-        revision, rendered = self.live_provider(width)
+        revision, rendered = self.thinking_provider(width)
         key = (revision, width)
-        if key != self._live_cache_key:
-            self._live_cache_key = key
-            self._live_cache = rendered
-        return self._live_cache
-
-    def _live_visible(self) -> bool:
-        return bool(fragment_list_to_text(to_formatted_text(self._live_text())))
-
-    def _live_cursor_position(self):
-        text = fragment_list_to_text(to_formatted_text(self._live_text()))
-        if not text:
-            return None
-        lines = text.split("\n")
-        from prompt_toolkit.data_structures import Point
-
-        return Point(x=len(lines[-1]), y=len(lines) - 1)
+        if key != self._thinking_cache_key:
+            self._thinking_cache_key = key
+            self._thinking_cache = rendered
+        return self._thinking_cache
 
     def _status_text(self) -> FormattedText:
         value = terminal_safe_text(self.status_provider(), single_line=True)

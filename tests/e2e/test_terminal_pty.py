@@ -99,15 +99,24 @@ async def main():
     ui = TerminalUI()
     prompt = PromptInput(
         history_path=Path(%r),
-        status_provider=lambda: "gpt-test · reasoning · ~/Ash-Harness",
+        status_provider=lambda: "gpt-test · effort medium · ~/Ash-Harness",
         context_provider=lambda: (32_000, 64_000),
-        live_provider=ui.prompt_live_view,
+        thinking_provider=ui.prompt_thinking_view,
     )
-    ui.bind_prompt_surface(prompt.invalidate)
+    ui.bind_prompt_surface(prompt.invalidate, prompt.write_terminal)
+    ui.record_user_input("hello from user")
     with ui.begin_turn():
-        ui.print_thought("Inspecting the repository")
-        ui.print_token("I found the issue and I am applying the fix.")
+        async def stream_response():
+            await asyncio.sleep(0.2)
+            ui.print_thought("Inspecting the repository")
+            ui.print_token("I found the issue ")
+            await asyncio.sleep(0.2)
+            ui.print_token("and I am applying the fix.")
+
+        stream_task = asyncio.create_task(stream_response())
         value = await prompt.read("steer> ")
+        await stream_task
+        prompt.close()
     ui.finalize_turn()
     ui.commit_completed_turn()
     print("HYBRID_RESULT=" + value, flush=True)
@@ -143,15 +152,15 @@ asyncio.run(main())
                 if not chunk:
                     break
                 captured.extend(chunk)
-            if (
-                not sent
-                and b"gpt-test" in captured
-                and b"Inspecting the repository" in captured
-            ):
+            if not sent and b"I found the issue and I am applying the fix." in captured:
                 os.write(master_fd, b"continue\r")
                 sent = True
             if b"HYBRID_RESULT=continue" in captured:
                 break
+        assert sent, bytes(captured).decode("utf-8", errors="replace")[-3000:]
+        assert b"HYBRID_RESULT=continue" in captured, bytes(captured).decode(
+            "utf-8", errors="replace"
+        )[-3000:]
         process.wait(timeout=5)
     finally:
         if process.poll() is None:
@@ -162,16 +171,22 @@ asyncio.run(main())
     raw = bytes(captured)
     assert b"HYBRID_RESULT=continue" in raw
     for marker in (
+        b"hello from user",
         b"ASH",
         b"Inspecting the repository",
         b"I found the issue and I am applying the fix.",
         b"gpt-test",
-        b"reasoning",
+        b"effort medium",
         b"50%",
     ):
         assert marker in raw
+    assert raw.index(b"hello from user") < raw.index(
+        b"I found the issue and I am applying the fix."
+    )
+    assert raw.count(b"I found the issue and I am applying the fix.") == 1
     assert b"YOU" not in raw
     assert b"STEER" not in raw
+    assert b"\x1b[3J" not in raw
     for sequence in (
         b"\x1b[?1000h",
         b"\x1b[?1002h",

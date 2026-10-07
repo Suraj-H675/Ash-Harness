@@ -27,22 +27,29 @@ class StatusLine:
         self._directory = _display_directory(loop.project_root)
 
     def left(self) -> str:
-        """Return model, reasoning capability, and workspace directory."""
+        """Return model, effective reasoning effort, and workspace directory."""
 
         active_model = str(
             getattr(self.loop, "active_model_id", self.config.model)
             or self.config.model
         )
         model_name = active_model.rsplit("/", 1)[-1] or active_model
-        capabilities = getattr(getattr(self.loop, "provider", None), "capabilities", None)
-        reasoning = (
-            "reasoning"
-            if bool(getattr(capabilities, "reasoning", False))
-            else "no reasoning"
-        )
+        effort = getattr(self.loop, "reasoning_effort_label", None)
+        if not isinstance(effort, str):
+            capabilities = getattr(
+                getattr(self.loop, "provider", None), "capabilities", None
+            )
+            support = getattr(capabilities, "reasoning_effort", None)
+            selected = getattr(self.loop, "reasoning_effort", None)
+            effective = selected or getattr(support, "default", None)
+            effort = (
+                f"effort {effective or 'default'}"
+                if support is not None
+                else "effort unavailable"
+            )
         segments = [
             terminal_safe_text(model_name, single_line=True),
-            reasoning,
+            effort,
         ]
         mode = getattr(getattr(self.loop, "permission_policy", None), "mode", None)
         mode_value = getattr(mode, "value", str(mode or ""))

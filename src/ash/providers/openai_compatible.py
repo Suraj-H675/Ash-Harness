@@ -208,6 +208,7 @@ class CatalogOpenAIProvider(OpenAIProvider):
                 native_tools=native_tools,
                 vision=vision,
                 reasoning=reasoning,
+                reasoning_effort=declared_capabilities.reasoning_effort,
                 local=self._local,
                 context_window=(
                     min(context_windows)

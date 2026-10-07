@@ -95,7 +95,11 @@ model request. After setup:
 Inside a session, /model changes only that running session. Use
 ash setup model to save a new default model and ash setup fallbacks to
 manage the ordered fallback chain (ash setup providers remains a compatibility
-alias).
+alias). Use `/effort` to choose a model's supported reasoning effort for
+subsequent requests; `/effort default` restores the provider default. The status
+bar shows the effective selection. Unsupported models do not offer effort
+choices. Reasoning effort controls generation behavior; it does not control
+whether provider-exposed thinking text appears in the dock.
 
 ## Capability overview
 

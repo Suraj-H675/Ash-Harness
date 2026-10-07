@@ -1300,6 +1300,11 @@ class AshLoop:
         self.max_steering_messages = max_steering_messages
         self._steering_messages: deque[str] = deque()
         self._turn_running = False
+        self.reasoning_effort: str | None = getattr(
+            provider,
+            "configured_reasoning_effort",
+            None,
+        )
         self._active_turn_user_message: Message | None = None
         self.repo_map = repo_map
         self.auto_commit = auto_commit
@@ -4056,6 +4061,20 @@ class AshLoop:
         )
         return _provider_model_id(self.provider, configured_model)
 
+    @property
+    def reasoning_effort_label(self) -> str:
+        support = self.provider.capabilities.reasoning_effort
+        if support is None:
+            return "effort unavailable"
+        effective = self.reasoning_effort or support.default
+        return f"effort {effective or 'default'}"
+
+    def set_reasoning_effort(self, effort: str | None) -> None:
+        if self._turn_running:
+            raise RuntimeError("reasoning effort cannot change while a turn is running")
+        self.provider.configure_reasoning_effort(effort)
+        self.reasoning_effort = effort
+
     def _active_model_pricing(self) -> dict[str, float]:
         """Resolve pricing for the provider/model serving the current completion."""
 
@@ -4695,6 +4714,16 @@ class AshLoop:
                                 )
                             if chunk.reasoning:
                                 reasoning_blocks.extend(chunk.reasoning)
+                                for block in chunk.reasoning:
+                                    text = (
+                                        block.get("thinking")
+                                        if block.get("type") == "thinking"
+                                        else block.get("text")
+                                        if block.get("type") == "summary_text"
+                                        else None
+                                    )
+                                    if isinstance(text, str) and text:
+                                        self.ui.print_thought(text)
                             if chunk.provider_state:
                                 if provider_state:
                                     raise ProviderCompletionError(
@@ -5086,8 +5115,9 @@ class AshLoop:
             self.ui.print_token(payload)
             text_chunks.append(payload)
         elif kind == "thought" and isinstance(payload, str):
-            self._emit_event({"type": "reasoning.delta", "text": payload})
-            self.ui.print_thought(payload)
+            # Ash fallback markup is generated completion text, not a native
+            # provider reasoning block. Only chunk.reasoning reaches the dock.
+            return
         elif kind == "tool_call" and isinstance(payload, dict):
             if len(tool_calls) >= MAX_TOOL_CALLS_PER_COMPLETION:
                 raise ProviderCompletionError(
@@ -6722,7 +6752,12 @@ class AshLoop:
         old_base_prompt = self._base_system_prompt
         old_system_prompt = self.system_prompt
         replacement = self._provider_factory(new_config)
+        effort = self.reasoning_effort
         try:
+            support = replacement.capabilities.reasoning_effort
+            if support is None or effort not in support.supported:
+                effort = None
+            replacement.configure_reasoning_effort(effort)
             self.provider = replacement
             self._provider_closed = False
             self._config = new_config
@@ -6740,6 +6775,7 @@ class AshLoop:
                 self._retire_provider(replacement)
             raise
 
+        self.reasoning_effort = effort
         self._fire_config_changed(reason, {"model": new_config.model})
         if replacement is not old_provider and isinstance(old_provider, ProviderABC):
             self._retire_provider(old_provider)

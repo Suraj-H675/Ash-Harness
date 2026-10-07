@@ -4,35 +4,53 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from ash.config import AshConfig
+from ash.providers.reasoning import ReasoningEffortSpec
 from ash.ui.status import StatusLine
 
 
-def _loop(root: Path, *, model: str, reasoning: bool, context: int = 0):
+def _loop(
+    root: Path,
+    *,
+    model: str,
+    reasoning: bool,
+    context: int = 0,
+    effort: ReasoningEffortSpec | None = None,
+    selected_effort: str | None = None,
+):
     return SimpleNamespace(
         project_root=root,
         active_model_id=model,
         provider=SimpleNamespace(
-            capabilities=SimpleNamespace(reasoning=reasoning)
+            capabilities=SimpleNamespace(
+                reasoning=reasoning,
+                reasoning_effort=effort,
+            )
         ),
+        reasoning_effort=selected_effort,
         _last_context_tokens=context,
     )
 
 
-def test_status_line_shows_model_reasoning_and_directory() -> None:
+def test_status_line_shows_effective_default_effort_and_directory() -> None:
     root = Path.home() / "projects" / "Ash-Harness"
     config = AshConfig(
         workspace_root=root,
         model="openai/gpt-test",
     )
     status = StatusLine(
-        _loop(root, model="openai/gpt-test", reasoning=True),
+        _loop(
+            root,
+            model="openai/gpt-test",
+            reasoning=True,
+            effort=ReasoningEffortSpec(("low", "medium", "high"), "medium"),
+        ),
         config,
     )
 
-    assert status.left() == "gpt-test  ·  reasoning  ·  ~/projects/Ash-Harness"
+    assert status.left() == "gpt-test  ·  effort medium  ·  ~/projects/Ash-Harness"
 
 
-def test_status_line_reports_no_reasoning_when_active_model_lacks_it() -> None:
+def test_status_line_reports_effort_unavailable_for_unsupported_model() -> None:
     root = Path.home() / "project"
     config = AshConfig(workspace_root=root, model="local/plain")
     status = StatusLine(
@@ -40,19 +58,41 @@ def test_status_line_reports_no_reasoning_when_active_model_lacks_it() -> None:
         config,
     )
 
-    assert "no reasoning" in status.left()
+    assert "effort unavailable" in status.left()
+
+
+def test_status_line_shows_runtime_selected_effort() -> None:
+    root = Path.home() / "project"
+    loop = _loop(
+        root,
+        model="openai/gpt-6.1-sol",
+        reasoning=True,
+        effort=ReasoningEffortSpec(("low", "medium", "high", "xhigh"), "medium"),
+        selected_effort="xhigh",
+    )
+
+    assert "effort xhigh" in StatusLine(
+        loop,
+        AshConfig(workspace_root=root, model="openai/gpt-6.1-sol"),
+    ).left()
 
 
 def test_status_line_tracks_active_runtime_model_without_io() -> None:
     root = Path.home() / "project"
-    loop = _loop(root, model="openai/primary", reasoning=True)
+    loop = _loop(
+        root,
+        model="openai/primary",
+        reasoning=True,
+        effort=ReasoningEffortSpec(("low", "medium", "high"), "medium"),
+    )
     status = StatusLine(loop, AshConfig(workspace_root=root, model="openai/primary"))
 
     assert status.left().startswith("primary  ·")
     loop.active_model_id = "groq/fallback"
     loop.provider.capabilities.reasoning = False
+    loop.provider.capabilities.reasoning_effort = None
 
-    assert status.left().startswith("fallback  ·  no reasoning  ·")
+    assert status.left().startswith("fallback  ·  effort unavailable  ·")
 
 
 def test_status_line_only_adds_safety_state_when_non_default(tmp_path: Path) -> None:

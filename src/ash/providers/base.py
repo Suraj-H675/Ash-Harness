@@ -334,6 +334,22 @@ class ProviderABC(ABC):
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
 
+    def configure_reasoning_effort(self, effort: str | None) -> None:
+        """Apply a verified effort level, or restore the provider default."""
+
+        support = self.capabilities.reasoning_effort
+        if effort is not None and (
+            support is None or effort not in support.supported
+        ):
+            raise ValueError(
+                f"reasoning effort {effort!r} is unavailable for {self.model_name}"
+            )
+        self._configured_reasoning_effort = effort
+
+    @property
+    def configured_reasoning_effort(self) -> str | None:
+        return getattr(self, "_configured_reasoning_effort", None)
+
     @property
     @abstractmethod
     def model_name(self) -> str:

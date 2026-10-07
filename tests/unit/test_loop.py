@@ -4,6 +4,7 @@ import os
 import shlex
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import ash.core.loop as loop_module
@@ -5310,6 +5311,124 @@ async def test_switch_model_negotiates_dynamic_protocol_before_next_turn(
     assert replacement.probed is True
     assert "provider's native tool-calling interface" in loop.system_prompt
     assert injected in loop.system_prompt
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_is_runtime_scoped_and_model_aware(tmp_path) -> None:
+    from ash.providers.reasoning import ReasoningEffortSpec
+
+    class EffortProvider(MockProvider):
+        def __init__(self, spec: ReasoningEffortSpec) -> None:
+            self._spec = spec
+
+        @property
+        def capabilities(self) -> ProviderCapabilities:
+            return ProviderCapabilities(reasoning_effort=self._spec)
+
+    compatible = EffortProvider(
+        ReasoningEffortSpec(("low", "medium", "high"), "medium")
+    )
+    config = AshConfig(
+        model="provider/initial",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "reasoning-effort.db"),
+        EffortProvider(ReasoningEffortSpec(("low", "medium", "high"), "medium")),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        provider_factory=lambda _next_config: compatible,
+        config=config,
+    )
+
+    loop.set_reasoning_effort("high")
+    assert loop.reasoning_effort_label == "effort high"
+    with pytest.raises(ValueError, match="unavailable"):
+        loop.set_reasoning_effort("xhigh")
+
+    loop.switch_model("provider/compatible")
+    assert compatible.configured_reasoning_effort == "high"
+    assert loop.reasoning_effort_label == "effort high"
+    await loop.aclose()
+
+    incompatible = EffortProvider(ReasoningEffortSpec(("low", "medium"), "medium"))
+    next_config = AshConfig(
+        model="provider/initial",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db-next",
+        memory_backend="off",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "reasoning-effort-reset.db"),
+        EffortProvider(ReasoningEffortSpec(("low", "medium", "high"), "medium")),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        provider_factory=lambda _next_config: incompatible,
+        config=next_config,
+    )
+    loop.set_reasoning_effort("high")
+    loop.switch_model("provider/incompatible")
+    assert incompatible.configured_reasoning_effort is None
+    assert loop.reasoning_effort is None
+    assert loop.reasoning_effort_label == "effort medium"
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_surface_uses_only_provider_reported_reasoning(tmp_path) -> None:
+    class ThoughtProvider(ProviderABC):
+        model_name = "thought-test"
+        _ash_declared_capabilities = ProviderCapabilities()
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            yield StreamChunk(
+                content=(
+                    "<thought>generated fallback thought</thought>"
+                    "<response>visible answer</response>"
+                ),
+                reasoning=[
+                    {
+                        "type": "thinking",
+                        "thinking": "provider-reported thinking",
+                    }
+                ],
+                is_done=True,
+                stop_reason="stop",
+            )
+
+    class ThoughtUI(TerminalUI):
+        def __init__(self):
+            super().__init__()
+            self.thoughts: list[str] = []
+            self.events: list[dict[str, Any]] = []
+
+        def print_thought(self, text: str) -> None:
+            self.thoughts.append(text)
+
+        def emit_event(self, payload: dict[str, Any]) -> None:
+            self.events.append(payload)
+
+    ui = ThoughtUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "provider-reasoning.db"),
+        ThoughtProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+
+    assert await loop.run_turn("answer") == "visible answer"
+    assert ui.thoughts == ["provider-reported thinking"]
+    assert not any(event.get("type") == "reasoning.delta" for event in ui.events)
     await loop.aclose()
 
 

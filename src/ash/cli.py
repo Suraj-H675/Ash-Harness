@@ -830,12 +830,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     discovered_commands = custom_commands.discover()
 
     status_line = StatusLine(loop, config, sandbox_manager)
-    live_provider = getattr(loop.ui, "prompt_live_view", lambda _width: (0, ""))
+    thinking_provider = getattr(
+        loop.ui,
+        "prompt_thinking_view",
+        lambda _width: (0, ""),
+    )
 
     prompt_input = PromptInput(
         status_provider=status_line.left,
         context_provider=status_line.context_usage,
-        live_provider=live_provider,
+        thinking_provider=thinking_provider,
         extra_commands={
             command.name: command.description for command in discovered_commands
         },
@@ -853,7 +857,14 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         raise TypeError("interactive REPL requires TerminalUI")
     bind_prompt_surface = getattr(loop.ui, "bind_prompt_surface", None)
     if callable(bind_prompt_surface) and prompt_input.supports_live_surface:
-        bind_prompt_surface(prompt_input.invalidate)
+        bind_prompt_surface(prompt_input.invalidate, prompt_input.write_terminal)
+        prompt_input.set_effort_provider(
+            lambda: tuple(
+                loop.provider.capabilities.reasoning_effort.supported
+                if loop.provider.capabilities.reasoning_effort is not None
+                else ()
+            )
+        )
         prompt_input.clear_visible_screen()
     loop.ui.load_session_transcript(loop.current_session)
     print = ReplPrinter()  # noqa: A001
@@ -1283,6 +1294,73 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 )
                 print("\n".join(_session_usage_lines(usage)), flush=True)
                 continue
+            if command.name == "effort":
+                if len(arguments) > 1:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                support = loop.provider.capabilities.reasoning_effort
+                if support is None:
+                    print(
+                        "Configurable reasoning effort is unavailable for this model.",
+                        flush=True,
+                    )
+                    continue
+
+                selected = arguments[0].casefold() if arguments else None
+                if selected is None:
+                    from ash.ui.inline_surface import PromptChoice
+
+                    default_description = (
+                        f"Use the provider default ({support.default})"
+                        if support.default is not None
+                        else "Use the provider default"
+                    )
+                    options = (
+                        PromptChoice(
+                            "default",
+                            (
+                                f"Default ({support.default})"
+                                if support.default is not None
+                                else "Default"
+                            ),
+                            default_description,
+                        ),
+                        *(
+                            PromptChoice(level, level, "Reasoning effort")
+                            for level in support.supported
+                        ),
+                    )
+                    if prompt_input.supports_choice_ui:
+                        selected = await prompt_input.choose(
+                            "Reasoning effort",
+                            options,
+                            default_value=loop.reasoning_effort or "default",
+                        )
+                    else:
+                        print(
+                            "Reasoning effort choices: "
+                            + ", ".join(("default", *support.supported)),
+                            flush=True,
+                        )
+                        entered = (
+                            await prompt_input.read("Effort (blank or c to cancel)> ")
+                        ).strip().casefold()
+                        selected = entered if entered and entered != "c" else None
+
+                if selected is not None:
+                    try:
+                        loop.set_reasoning_effort(
+                            None if selected == "default" else selected
+                        )
+                    except (ValueError, RuntimeError) as exc:
+                        print(str(exc), file=sys.stderr, flush=True)
+                    else:
+                        print(
+                            f"Reasoning effort set to {loop.reasoning_effort_label} "
+                            "for this runtime.",
+                            flush=True,
+                        )
+                continue
             if command.name == "settings":
                 if arguments:
                     print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
@@ -1299,6 +1377,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         (
                             "Active runtime settings:",
                             f"  Model: {active_model}",
+                            f"  Reasoning effort: {loop.reasoning_effort_label}",
                             f"  Fallbacks: {fallbacks}",
                             f"  Permission mode: {loop.safety_tier}",
                             f"  Input: {config.input_mode}",

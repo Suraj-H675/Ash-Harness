@@ -286,6 +286,8 @@ class OpenAIProvider(ProviderABC):
             kwargs["tools"] = tools
         if hasattr(self, "_max_tokens"):
             kwargs["max_tokens"] = self._max_tokens
+        if self.configured_reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.configured_reasoning_effort
         try:
             client = self._resolve_client()
             stream = await client.chat.completions.create(**kwargs)

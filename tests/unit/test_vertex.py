@@ -46,6 +46,7 @@ def test_vertex_openai_base_url_requires_explicit_safe_scope() -> None:
 
 def test_vertex_current_gemini_capabilities_are_exact_and_unknowns_conservative() -> None:
     from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.reasoning import ReasoningEffortSpec
 
     current = VertexProvider(
         "google/gemini-3.8-flash",
@@ -74,6 +75,7 @@ def test_vertex_current_gemini_capabilities_are_exact_and_unknowns_conservative(
         reasoning=True,
         context_window=1_048_576,
         max_output_tokens=65_536,
+        reasoning_effort=ReasoningEffortSpec(("low", "medium", "high")),
     )
     assert unknown.capabilities == ProviderCapabilities()
 

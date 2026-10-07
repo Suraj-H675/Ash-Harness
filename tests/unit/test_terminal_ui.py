@@ -203,7 +203,7 @@ def test_terminal_ui_does_not_commit_empty_assistant_entry() -> None:
     assert ui.transcript.snapshot() == ()
 
 
-def test_prompt_live_view_does_not_read_committed_history(
+def test_prompt_thinking_view_does_not_read_committed_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False, width=80))
@@ -211,37 +211,41 @@ def test_prompt_live_view_does_not_read_committed_history(
         ui.transcript.append("assistant", f"old answer {index}", title="ash")
     ui.bind_prompt_surface(lambda: None)
     with ui.begin_turn():
-        ui.print_token("current answer")
+        ui.print_thought("current reasoning")
 
         def fail_snapshot():
             raise AssertionError("live rendering must not scan committed history")
 
         monkeypatch.setattr(ui.transcript, "snapshot", fail_snapshot)
-        _revision, rendered = ui.prompt_live_view(80)
+        _revision, rendered = ui.prompt_thinking_view(80)
 
     plain = fragment_list_to_text(to_formatted_text(rendered))
-    assert "current answer" in plain
+    assert "current reasoning" in plain
     assert "old answer" not in plain
 
 
-def test_prompt_surface_commits_final_turn_to_scrollback_once() -> None:
+def test_prompt_surface_streams_to_scrollback_without_final_reprint() -> None:
     output = StringIO()
     ui = TerminalUI(console=Console(file=output, force_terminal=False, width=80))
     ui.bind_prompt_surface(lambda: None)
+    ui.record_user_input("question")
 
     with ui.begin_turn():
         ui.print_thought("checking")
-        ui.print_token("final answer")
+        ui.print_token("first ")
+        ui.print_token("answer")
     ui.finalize_turn()
-
-    assert output.getvalue() == ""
     ui.commit_completed_turn()
-    committed = output.getvalue()
-    assert committed.count("final answer") == 1
-    assert "THINK  checking" in committed
+    rendered = output.getvalue()
+    assert "question\n\nASH  first answer" in rendered
+    assert rendered.count("first answer") == 1
+    assert "checking" not in rendered
+    assert "THINK  checking" in fragment_list_to_text(
+        to_formatted_text(ui.prompt_thinking_view(80)[1])
+    )
 
     ui.commit_completed_turn()
-    assert output.getvalue() == committed
+    assert output.getvalue() == rendered
 
 
 def test_hybrid_conversation_uses_blue_user_text_and_unboxed_assistant() -> None:
@@ -259,9 +263,11 @@ def test_hybrid_conversation_uses_blue_user_text_and_unboxed_assistant() -> None
 
     ui.record_user_input("hello from user")
     with ui.begin_turn():
+        ui.print_thought("checking")
         ui.print_token("hello from ash")
-    _revision, live = ui.prompt_live_view(80)
-    live_text = fragment_list_to_text(to_formatted_text(live))
+    reasoning_text = fragment_list_to_text(
+        to_formatted_text(ui.prompt_thinking_view(80)[1])
+    )
     ui.finalize_turn()
     ui.commit_completed_turn()
 
@@ -271,13 +277,15 @@ def test_hybrid_conversation_uses_blue_user_text_and_unboxed_assistant() -> None
     assert "YOU" not in rendered
     assert "╭" not in rendered
     assert "╰" not in rendered
-    assert "ASH" in live_text
-    assert "hello from ash" in live_text
-    assert "╭" not in live_text
-    assert "╰" not in live_text
+    assert "ASH" in rendered
+    assert rendered.count("hello from ash") == 1
+    assert "THINK  " not in rendered
+    assert "THINK  checking" in reasoning_text
+    assert "╭" not in rendered
+    assert "╰" not in rendered
 
 
-def test_prompt_live_view_bounds_long_response_but_final_commit_is_complete() -> None:
+def test_prompt_surface_streams_long_response_once_without_preview_truncation() -> None:
     output = StringIO()
     ui = TerminalUI(console=Console(file=output, force_terminal=False, width=80))
     ui.bind_prompt_surface(lambda: None)
@@ -286,18 +294,13 @@ def test_prompt_live_view_bounds_long_response_but_final_commit_is_complete() ->
     with ui.begin_turn():
         for offset in range(0, len(response), 37):
             ui.print_token(response[offset : offset + 37])
-        _revision, rendered = ui.prompt_live_view(80)
-
-    live = fragment_list_to_text(to_formatted_text(rendered))
-    assert "earlier response hidden from live preview" in live
-    assert "START-" not in live
-    assert "-END" in live
 
     ui.finalize_turn()
     ui.commit_completed_turn()
-    committed = output.getvalue()
-    assert "START-" in committed
-    assert "-END" in committed
+    rendered = output.getvalue()
+    assert "START-" in rendered
+    assert "-END" in rendered
+    assert rendered.count("x" * 100) == 50
 
 
 def test_suspend_live_render_pauses_and_resumes_same_live_instance() -> None:

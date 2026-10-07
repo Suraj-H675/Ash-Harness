@@ -25,6 +25,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "/usage",
         aliases=("cost",),
     ),
+    SlashCommand(
+        "effort",
+        "Select reasoning effort for this runtime",
+        "/effort [default|LEVEL]",
+    ),
     SlashCommand("settings", "Show active runtime settings", "/settings"),
     SlashCommand("cancel", "Cancel the running turn", "/cancel"),
     SlashCommand(

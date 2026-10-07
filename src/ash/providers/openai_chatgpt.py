@@ -109,12 +109,18 @@ class OpenAIChatGPTProvider(ProviderABC):
         access_token = await self._auth_session.access_token()
         client = self._new_client(access_token)
         owns_client = self._client_factory is None
+        request_options: dict[str, Any] = {}
+        if self.configured_reasoning_effort is not None:
+            request_options["reasoning"] = {
+                "effort": self.configured_reasoning_effort
+            }
         try:
             async for chunk in stream_openai_responses(
                 client,
                 model_name=self._model_name,
                 messages=messages,
                 tools=tools,
+                request_options=request_options,
                 error_label="OpenAI ChatGPT Responses",
                 error_secrets=(access_token,),
                 terminal_error_factory=ChatGPTResponsesTerminalError,

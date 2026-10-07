@@ -980,6 +980,38 @@ def _google_tool_chunk(arguments: str, *, signature: str) -> Any:
     )
 
 
+@pytest.mark.asyncio
+async def test_google_effort_selection_reaches_openai_compatible_request() -> None:
+    from ash.providers.capabilities import google_capabilities
+    from ash.providers.openai_compatible import CatalogOpenAIProvider
+
+    model = "gemini-3.8-flash"
+    client = _FakeOpenAIClient([_openai_chunk(content="ok", finish_reason="stop")])
+    provider = CatalogOpenAIProvider(
+        model_name=model,
+        api_key="test-key",
+        provider_family="google",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        catalog_endpoint=(
+            "https://generativelanguage.googleapis.com/v1beta/models/" + model
+        ),
+        catalog_format="google",
+        catalog_headers={"x-goog-api-key": "test-key"},
+        declared_capabilities=google_capabilities(model),
+        client=client,
+    )
+    provider.configure_reasoning_effort("high")
+
+    _ = [
+        chunk
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "hello"}]
+        )
+    ]
+
+    assert client.completions.kwargs["reasoning_effort"] == "high"
+
+
 @pytest.mark.parametrize(
     ("provider_name", "error_name"),
     [
@@ -1193,6 +1225,7 @@ async def test_openai_responses_provider_uses_native_tools_and_normalizes_cache_
         cache_key="ash-project-test",
         retention="memory",
     )
+    provider.configure_reasoning_effort("high")
 
     chunks = [
         chunk
@@ -1220,6 +1253,7 @@ async def test_openai_responses_provider_uses_native_tools_and_normalizes_cache_
     assert request["max_output_tokens"] == 4096
     assert request["prompt_cache_key"] == "ash-project-test"
     assert request["prompt_cache_options"] == {"mode": "implicit", "ttl": "30m"}
+    assert request["reasoning"] == {"effort": "high"}
     assert "temperature" not in request
     assert request["tools"][0]["name"] == "read_file"
     terminal = chunks[-1]
@@ -1978,10 +2012,11 @@ async def test_anthropic_does_not_forward_deprecated_temperature() -> None:
 
     messages = _FakeAnthropicMessages(SimpleNamespace())
     provider = AnthropicProvider(
-        model_name="claude-test",
+        model_name="claude-opus-5-5",
         api_key="test-key",
         client=SimpleNamespace(messages=messages),
     )
+    provider.configure_reasoning_effort("xhigh")
 
     _ = [
         chunk
@@ -1992,6 +2027,7 @@ async def test_anthropic_does_not_forward_deprecated_temperature() -> None:
     ]
 
     assert "temperature" not in messages.kwargs
+    assert messages.kwargs["output_config"] == {"effort": "xhigh"}
 
 
 @pytest.mark.asyncio
@@ -2196,7 +2232,7 @@ async def test_anthropic_prompt_cache_normalizes_usage() -> None:
 @pytest.mark.asyncio
 async def test_anthropic_capabilities_use_provider_model_metadata() -> None:
     from ash.providers.anthropic import AnthropicProvider
-    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
 
     class Models:
         async def retrieve(self, model: str) -> Any:
@@ -2227,6 +2263,9 @@ async def test_anthropic_capabilities_use_provider_model_metadata() -> None:
         reasoning=True,
         context_window=1_000_000,
         max_output_tokens=128_000,
+        reasoning_effort=infer_capabilities(
+            "anthropic", "claude-sonnet-5-5"
+        ).reasoning_effort,
     )
 
 
@@ -2268,7 +2307,7 @@ async def test_anthropic_unknown_model_metadata_keeps_tools_conservative() -> No
 @pytest.mark.asyncio
 async def test_anthropic_capability_probe_without_models_api_uses_static_truth() -> None:
     from ash.providers.anthropic import AnthropicProvider
-    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
 
     provider = AnthropicProvider(
         model_name="claude-sonnet-5-5",
@@ -2282,6 +2321,9 @@ async def test_anthropic_capability_probe_without_models_api_uses_static_truth()
         reasoning=True,
         context_window=1_000_000,
         max_output_tokens=128_000,
+        reasoning_effort=infer_capabilities(
+            "anthropic", "claude-sonnet-5-5"
+        ).reasoning_effort,
     )
 
 

@@ -11,7 +11,6 @@ automated tests and CI can drive the loop.
 from __future__ import annotations
 
 import difflib
-from io import StringIO
 import json
 import math
 import os
@@ -25,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
-from prompt_toolkit.formatted_text import ANSI, AnyFormattedText, FormattedText
+from prompt_toolkit.formatted_text import FormattedText
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -47,7 +46,6 @@ MAX_EDIT_PREVIEW_TEXT_CHARS = 128_000
 MAX_EDIT_PREVIEW_LINES = 400
 DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
 MAX_LINEAR_HISTORY_ENTRIES = 12
-LIVE_RESPONSE_PREVIEW_CHARS = 4_000
 LIVE_AUX_PREVIEW_CHARS = 3_000
 _EDITOR_ENV_ALLOWLIST = (
     "COLORTERM",
@@ -80,18 +78,6 @@ class _LiveBuffers:
     @property
     def response(self) -> str:
         return "".join(self.response_chunks)
-
-
-def _live_markdown_tail(value: str) -> tuple[str, bool]:
-    """Return a bounded recent Markdown slice for the retained live surface."""
-
-    if len(value) <= LIVE_RESPONSE_PREVIEW_CHARS:
-        return value, False
-    tail = value[-LIVE_RESPONSE_PREVIEW_CHARS:]
-    boundary = tail.find("\n\n")
-    if boundary >= 0:
-        tail = tail[boundary + 2 :]
-    return tail, True
 
 
 def _bounded_preview_lines(value: str) -> tuple[list[str], bool]:
@@ -251,11 +237,16 @@ class TerminalUI:
         self.theme = get_theme(theme)
         self._input_stream = input_stream or sys.stdin
         self._active_buffers: _LiveBuffers | None = None
-        self._completed_buffers: _LiveBuffers | None = None
         self._active_live: Live | None = None
         self._prompt_invalidator: Callable[[], None] | None = None
+        self._terminal_writer: Callable[[Callable[[], None]], None] = (
+            lambda callback: callback()
+        )
+        self._conversation_line_open = False
+        self._assistant_prefix_pending = True
+        self._reasoning_tail = ""
         self._prompt_revision = 0
-        self._prompt_render_cache: tuple[int, int, AnyFormattedText] | None = None
+        self._thinking_render_cache: tuple[int, int, FormattedText] | None = None
         self._session_approvals: set[str] = set()
         self.show_token_meter = show_token_meter
         self.reduced_motion = reduced_motion
@@ -279,31 +270,44 @@ class TerminalUI:
         self._maximum_tokens = 100000
         self._last_refresh = 0.0
 
-    def bind_prompt_surface(self, invalidator: Callable[[], None]) -> None:
+    def bind_prompt_surface(
+        self,
+        invalidator: Callable[[], None],
+        terminal_writer: Callable[[Callable[[], None]], None] | None = None,
+    ) -> None:
         """Route interactive live updates through the bounded prompt surface."""
 
         self._prompt_invalidator = invalidator
+        self._terminal_writer = terminal_writer or (lambda callback: callback())
+        self._conversation_line_open = False
+        self._assistant_prefix_pending = True
 
-    def prompt_live_view(self, width: int) -> tuple[int, AnyFormattedText]:
-        """Return the current-turn render only; committed history is not touched."""
+    def prompt_thinking_view(self, width: int) -> tuple[int, FormattedText]:
+        """Return only bounded provider-exposed text for the fixed reasoning dock."""
 
-        buffers = self._active_buffers or self._completed_buffers
-        if buffers is None:
-            return self._prompt_revision, FormattedText([])
-        cached = self._prompt_render_cache
+        cached = self._thinking_render_cache
         if cached is not None and cached[:2] == (self._prompt_revision, width):
             return self._prompt_revision, cached[2]
-        stream = StringIO()
-        console = Console(
-            file=stream,
-            force_terminal=True,
-            color_system="truecolor",
-            width=max(20, width),
-            soft_wrap=False,
-        )
-        console.print(self._render_turn(buffers, live=True))
-        rendered: AnyFormattedText = ANSI(stream.getvalue().rstrip("\n"))
-        self._prompt_render_cache = (self._prompt_revision, width, rendered)
+        lines = self._reasoning_tail.splitlines()[-2:]
+        if self._reasoning_tail and not lines:
+            lines = [self._reasoning_tail]
+        rendered = FormattedText([])
+        if lines:
+            prefix = "THINK  "
+            first_width = max(1, width - len(prefix))
+            fragments: list[tuple[str, str]] = [
+                ("class:reasoning-prefix", prefix),
+                ("class:reasoning", lines[0][-first_width:]),
+            ]
+            if len(lines) > 1:
+                fragments.extend(
+                    [
+                        ("", "\n"),
+                        ("class:reasoning", lines[1][-max(1, width):]),
+                    ]
+                )
+            rendered = FormattedText(fragments)
+        self._thinking_render_cache = (self._prompt_revision, width, rendered)
         return self._prompt_revision, rendered
 
     @property
@@ -561,9 +565,9 @@ class TerminalUI:
 
         buffers: _LiveBuffers = _LiveBuffers.fresh()
         self._active_buffers = buffers
-        self._completed_buffers = None
         self._assistant_entry_id = None
         self._reasoning_entry_id = None
+        self._assistant_prefix_pending = True
         if self._token_progress is not None:
             self._token_task = self._token_progress.add_task(
                 "[dim]Tokens", total=100000, completed=0
@@ -600,26 +604,12 @@ class TerminalUI:
             if live is not None and self._active_live is live:
                 live.start(refresh=True)
 
-    def _render_turn(self, buffers: _LiveBuffers, *, live: bool = False) -> Group:
+    def _render_conversation(self, buffers: _LiveBuffers) -> Group:
         parts: list[Any] = [Text("ASH", style=self.theme.assistant_prefix)]
-        if self._activity_status:
-            parts.append(Text(self._activity_status, style="dim italic"))
-        thought = buffers.thought
         tool_output = buffers.tool_output
         response = buffers.response
-        response_truncated = False
-        if live:
-            if len(thought) > LIVE_AUX_PREVIEW_CHARS:
-                thought = thought[-LIVE_AUX_PREVIEW_CHARS:]
-            if len(tool_output) > LIVE_AUX_PREVIEW_CHARS:
-                tool_output = tool_output[-LIVE_AUX_PREVIEW_CHARS:]
-            response, response_truncated = _live_markdown_tail(response)
-        if thought:
-            parts.append(thought)
         if tool_output:
             parts.append(tool_output)
-        if response_truncated:
-            parts.append(Text("… earlier response hidden from live preview", style="dim"))
         if response:
             parts.append(Markdown(response, hyperlinks=False))
         if self.show_token_meter and self._token_task is not None:
@@ -633,13 +623,56 @@ class TerminalUI:
             )
         return Group(*parts)
 
+    def _render_thinking(self, buffers: _LiveBuffers) -> Group | None:
+        thought = buffers.thought
+        if len(thought) > LIVE_AUX_PREVIEW_CHARS:
+            thought = thought[-LIVE_AUX_PREVIEW_CHARS:]
+        if thought:
+            rendered = Text("THINK  ", style="dim bold")
+            rendered.append_text(thought)
+            return Group(rendered)
+        return None
+
     def _render_active_turn(self) -> Group:
-        return self._render_turn(self._active_buffers_required())
+        buffers = self._active_buffers_required()
+        thinking = self._render_thinking(buffers)
+        parts: list[Any] = []
+        if thinking is not None:
+            parts.append(thinking)
+        if self._activity_status:
+            parts.append(Text(self._activity_status, style="dim italic"))
+        parts.append(self._render_conversation(buffers))
+        return Group(*parts)
 
     def _active_buffers_required(self) -> _LiveBuffers:
         if not hasattr(self, "_active_buffers") or self._active_buffers is None:
             raise RuntimeError("begin_turn() must be called before streaming output")
         return self._active_buffers
+
+    def _write_conversation(
+        self,
+        content: str | Text,
+        *,
+        style: str = "",
+        end: str = "",
+    ) -> None:
+        renderable = Text(content, style=style) if isinstance(content, str) else content
+        plain = renderable.plain + end
+
+        def write() -> None:
+            self.console.print(
+                renderable,
+                end=end,
+                soft_wrap=True,
+                highlight=False,
+            )
+
+        self._terminal_writer(write)
+        self._conversation_line_open = not plain.endswith("\n")
+
+    def _seal_conversation(self) -> None:
+        if self._conversation_line_open:
+            self._write_conversation("\n")
 
     def print_token(self, text: str) -> None:
         if not text:
@@ -650,6 +683,14 @@ class TerminalUI:
         if self._assistant_entry_id is None:
             self._assistant_entry_id = self.transcript.begin("assistant", title="ash")
         self.transcript.append_delta(self._assistant_entry_id, text)
+        if self._prompt_invalidator is not None:
+            if self._assistant_prefix_pending:
+                self._seal_conversation()
+                self._write_conversation(
+                    Text("ASH  ", style=self.theme.assistant_prefix)
+                )
+                self._assistant_prefix_pending = False
+            self._write_conversation(text)
         self._refresh_live()
 
     def print_thought(self, text: str) -> None:
@@ -657,16 +698,16 @@ class TerminalUI:
             return
         text = terminal_safe_text(text)
         buffers = self._active_buffers_required()
+        if self._prompt_invalidator is not None:
+            self._reasoning_tail = (
+                self._reasoning_tail + text
+            )[-LIVE_AUX_PREVIEW_CHARS:]
         if self._reasoning_entry_id is None:
             self._reasoning_entry_id = self.transcript.begin(
                 "reasoning", title="reasoning"
             )
-        elif buffers.thought:
-            self.transcript.append_delta(self._reasoning_entry_id, "\n")
         self.transcript.append_delta(self._reasoning_entry_id, text)
-        if buffers.thought:
-            buffers.thought.append("\n")
-        buffers.thought.append("THINK  " + text, style="dim italic")
+        buffers.thought.append(text, style="dim italic")
         if self.screen_reader_mode:
             self.console.print(
                 f"Reasoning: {text}",
@@ -690,7 +731,7 @@ class TerminalUI:
         if self._assistant_entry_id is not None:
             self.transcript.finalize(self._assistant_entry_id)
         if self._prompt_invalidator is not None:
-            self._completed_buffers = self._active_buffers
+            self._seal_conversation()
         self._active_buffers = None
         self._active_live = None
         self._reasoning_entry_id = None
@@ -702,16 +743,9 @@ class TerminalUI:
             self._refresh_live(force=True)
 
     def commit_completed_turn(self) -> None:
-        """Commit one finalized turn to native scrollback exactly once."""
+        """Retained for callers; prompt-bound output is already in scrollback."""
 
-        buffers = self._completed_buffers
-        if buffers is None:
-            return
-        if buffers.thought or buffers.tool_output or buffers.response:
-            self.console.print(self._render_turn(buffers))
-        self._completed_buffers = None
-        self._prompt_render_cache = None
-        self._prompt_revision += 1
+        return
 
     def update_token_count(self, current: int, maximum: int | None = None) -> None:
         """Update the token progress bar with current / maximum counts."""
@@ -736,7 +770,7 @@ class TerminalUI:
                 return
             self._last_refresh = now
             self._prompt_revision += 1
-            self._prompt_render_cache = None
+            self._thinking_render_cache = None
             self._prompt_invalidator()
             return
         live = getattr(self, "_active_live", None)
@@ -812,7 +846,10 @@ class TerminalUI:
             self.transcript.append_delta(entry_id, delta)
             stream = str(payload.get("stream", "stdout"))
             style = "red" if stream == "stderr" else ""
-            if self._active_buffers is not None:
+            if self._prompt_invalidator is not None:
+                self._seal_conversation()
+                self._write_conversation(delta, style=style)
+            elif self._active_buffers is not None:
                 self._active_buffers.tool_output.append(delta, style=style)
                 self._refresh_live()
             else:
@@ -852,14 +889,9 @@ class TerminalUI:
         )
         line.append(tool, style="bold")
         line.append(f" [{label}]", style=style)
-        if self._prompt_invalidator is not None and (
-            self._active_buffers is not None or self._completed_buffers is not None
-        ):
-            if self._active_buffers is not None:
-                if self._active_buffers.tool_output:
-                    self._active_buffers.tool_output.append("\n")
-                self._active_buffers.tool_output.append_text(line)
-                self._refresh_live()
+        if self._prompt_invalidator is not None:
+            self._seal_conversation()
+            self._write_conversation(line, end="\n")
         else:
             self.console.print(line)
 
@@ -876,7 +908,7 @@ class TerminalUI:
                 markup=False,
                 highlight=False,
             )
-        if self._active_buffers is not None:
+        if self._active_buffers is not None and self._prompt_invalidator is None:
             self._refresh_live()
 
     # --- approval surface -------------------------------------------------
@@ -1006,7 +1038,10 @@ class TerminalUI:
         safe = terminal_safe_text(text)
         self.transcript.append("user", safe, title="you")
         if self._prompt_invalidator is not None and not self.screen_reader_mode:
-            self.console.print(Text(safe, style=self.theme.user_prefix))
+            self._reasoning_tail = ""
+            self._write_conversation(Text(safe, style=self.theme.user_prefix), end="\n")
+            self._write_conversation("\n")
+            self._refresh_live(force=True)
 
     def load_session_transcript(self, session: Any | None) -> None:
         """Replace interactive history from a durable session snapshot."""

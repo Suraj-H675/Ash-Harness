@@ -112,6 +112,11 @@ class CredentialPoolProvider(ProviderABC):
     def count_tokens(self, text: str) -> int:
         return self.providers[self.active_index].count_tokens(text)
 
+    def configure_reasoning_effort(self, effort: str | None) -> None:
+        super().configure_reasoning_effort(effort)
+        for provider in self.providers:
+            provider.configure_reasoning_effort(effort)
+
     def configure_max_tokens(self, max_tokens: int) -> None:
         super().configure_max_tokens(max_tokens)
         for provider in self.providers:

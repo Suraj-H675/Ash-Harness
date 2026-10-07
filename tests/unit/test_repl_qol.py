@@ -162,6 +162,7 @@ async def _run_repl(
         current_goal=None,
         session_store=store,
         active_model_id=active_model_id,
+        reasoning_effort_label="effort unavailable",
         provider=SimpleNamespace(
             capabilities=SimpleNamespace(vision=vision),
             count_tokens=lambda text: len(text),
@@ -530,6 +531,7 @@ async def test_settings_shows_runtime_terminal_and_safety_preferences(
     output = capsys.readouterr().out
     for expected in (
         "Model: openai/runtime-model",
+        "Reasoning effort: effort unavailable",
         "Fallbacks: groq/fallback",
         "Permission mode: auto_edit",
         "Input: vi",

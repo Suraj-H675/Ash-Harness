@@ -19,6 +19,7 @@ from ash.providers.base import (
 )
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.messages import MessageInput
+from ash.providers.reasoning import ReasoningEffortSpec
 
 
 class FailoverProvider(ProviderABC):
@@ -54,11 +55,28 @@ class FailoverProvider(ProviderABC):
         capabilities = [provider.capabilities for provider in self.providers]
         context_windows = [item.context_window for item in capabilities]
         output_limits = [item.max_output_tokens for item in capabilities]
+        effort_supports = [item.reasoning_effort for item in capabilities]
+        effort_support = None
+        if all(item is not None for item in effort_supports):
+            known_efforts = [item for item in effort_supports if item is not None]
+            levels = tuple(
+                level
+                for level in known_efforts[0].supported
+                if all(level in item.supported for item in known_efforts)
+            )
+            defaults = {item.default for item in known_efforts}
+            default = known_efforts[0].default if len(defaults) == 1 else None
+            if levels:
+                effort_support = ReasoningEffortSpec(
+                    levels,
+                    default if default in levels else None,
+                )
         return ProviderCapabilities(
             native_tools=all(item.native_tools for item in capabilities),
             vision=all(item.vision for item in capabilities),
             reasoning=all(item.reasoning for item in capabilities),
             local=all(item.local for item in capabilities),
+            reasoning_effort=effort_support,
             context_window=(
                 min(value for value in context_windows if value is not None)
                 if all(value is not None for value in context_windows)
@@ -73,6 +91,11 @@ class FailoverProvider(ProviderABC):
 
     def count_tokens(self, text: str) -> int:
         return max(provider.count_tokens(text) for provider in self.providers)
+
+    def configure_reasoning_effort(self, effort: str | None) -> None:
+        super().configure_reasoning_effort(effort)
+        for provider in self.providers:
+            provider.configure_reasoning_effort(effort)
 
     def configure_max_tokens(self, max_tokens: int) -> None:
         super().configure_max_tokens(max_tokens)

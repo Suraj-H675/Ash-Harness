@@ -233,6 +233,7 @@ def test_vertex_registry_enables_current_gemini_capabilities_and_replay(
     tmp_path,
 ) -> None:
     from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.reasoning import ReasoningEffortSpec
     from ash.providers.vertex import VertexProvider
 
     result = create_default_provider_registry().build(
@@ -252,6 +253,7 @@ def test_vertex_registry_enables_current_gemini_capabilities_and_replay(
         reasoning=True,
         context_window=1_048_576,
         max_output_tokens=65_536,
+        reasoning_effort=ReasoningEffortSpec(("low", "medium", "high")),
     )
     assert result._google_replay is not None
 
@@ -636,6 +638,7 @@ def test_custom_bearer_provider_supports_credential_helper() -> None:
 
 def test_openai_current_responses_models_have_exact_capabilities() -> None:
     from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
+    from ash.providers.reasoning import ReasoningEffortSpec
 
     capabilities = infer_capabilities("openai", "gpt-6.1-sol")
 
@@ -645,6 +648,9 @@ def test_openai_current_responses_models_have_exact_capabilities() -> None:
         reasoning=True,
         context_window=1_050_000,
         max_output_tokens=128_000,
+        reasoning_effort=ReasoningEffortSpec(
+            ("low", "medium", "high", "xhigh", "max"), "medium"
+        ),
     )
     assert infer_capabilities("openai", "gpt-5.2") == ProviderCapabilities(
         native_tools=True,
@@ -674,6 +680,7 @@ def test_openai_current_models_use_responses_for_api_keys(
 
 def test_google_current_model_has_exact_offline_capability_floor() -> None:
     from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
+    from ash.providers.reasoning import ReasoningEffortSpec
 
     assert infer_capabilities(
         "google", "gemini-3.8-flash"
@@ -683,12 +690,14 @@ def test_google_current_model_has_exact_offline_capability_floor() -> None:
         reasoning=True,
         context_window=1_000_000,
         max_output_tokens=64_000,
+        reasoning_effort=ReasoningEffortSpec(("low", "medium", "high"), "medium"),
     )
     assert infer_capabilities("google", "future-gemini") == ProviderCapabilities()
 
 
 def test_anthropic_current_capabilities_are_exact_and_unknowns_fail_closed() -> None:
     from ash.providers.capabilities import ProviderCapabilities, infer_capabilities
+    from ash.providers.reasoning import ReasoningEffortSpec
 
     assert infer_capabilities(
         "anthropic", "claude-sonnet-5-5"
@@ -698,6 +707,9 @@ def test_anthropic_current_capabilities_are_exact_and_unknowns_fail_closed() -> 
         reasoning=True,
         context_window=1_000_000,
         max_output_tokens=128_000,
+        reasoning_effort=ReasoningEffortSpec(
+            ("low", "medium", "high", "xhigh", "max"), "high"
+        ),
     )
     assert infer_capabilities(
         "anthropic", "claude-sonnet-4-6"
@@ -1105,7 +1117,7 @@ async def test_mistral_negotiates_capabilities_from_provider_catalog(
 async def test_google_uses_native_selected_model_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.capabilities import ProviderCapabilities, google_capabilities
     from ash.providers.readiness import ProviderModelMetadata
 
     monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
@@ -1137,6 +1149,7 @@ async def test_google_uses_native_selected_model_metadata(
         reasoning=True,
         context_window=1_000_000,
         max_output_tokens=64_000,
+        reasoning_effort=google_capabilities("gemini-3.8-flash").reasoning_effort,
     )
     assert len(calls) == 1
     assert calls[0][0].endswith("/v1beta/models/gemini-3.8-flash")
@@ -1150,7 +1163,7 @@ async def test_google_uses_native_selected_model_metadata(
 async def test_google_native_alias_inherits_verified_base_model_capabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.capabilities import ProviderCapabilities, google_capabilities
     from ash.providers.readiness import ProviderModelMetadata
 
     monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
@@ -1176,6 +1189,7 @@ async def test_google_native_alias_inherits_verified_base_model_capabilities(
         reasoning=True,
         context_window=1_000_000,
         max_output_tokens=64_000,
+        reasoning_effort=google_capabilities("gemini-3.8-flash").reasoning_effort,
     )
     assert provider._canonical_model_id == "gemini-3.8-flash"
     await provider.aclose()

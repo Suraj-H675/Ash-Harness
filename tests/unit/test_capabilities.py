@@ -5,7 +5,13 @@ import pytest
 from ash.sdk import AshClient
 from ash.config import AshConfig
 from ash.providers.base import ProviderABC, StreamChunk
-from ash.providers.capabilities import CapabilityRegistry, ProviderCapabilities
+from ash.providers.capabilities import (
+    CapabilityRegistry,
+    ProviderCapabilities,
+    google_capabilities,
+    infer_capabilities,
+    vertex_google_capabilities,
+)
 from ash.providers.registry import ProviderRegistry, get_provider_registry
 
 
@@ -143,6 +149,46 @@ def test_unknown_capability_family_uses_stable_defaults() -> None:
 
     assert capabilities == ProviderCapabilities()
     assert capabilities.native_tools is False
+
+
+def test_reasoning_effort_is_declared_only_for_verified_model_routes() -> None:
+    assert infer_capabilities("openai", "gpt-6.1-sol").reasoning_effort is not None
+    assert infer_capabilities("openai", "gpt-6.1-sol").reasoning_effort.supported == (
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    )
+    assert infer_capabilities(
+        "anthropic", "claude-sonnet-4-6"
+    ).reasoning_effort.supported == ("low", "medium", "high", "max")
+    assert google_capabilities("gemini-3.5-flash-lite").reasoning_effort.supported == (
+        "minimal",
+        "low",
+        "medium",
+        "high",
+    )
+    assert google_capabilities("gemini-2.5-flash").reasoning_effort.supported == (
+        "none",
+        "low",
+        "medium",
+        "high",
+    )
+    assert "none" not in google_capabilities(
+        "gemini-2.5-pro"
+    ).reasoning_effort.supported
+    assert vertex_google_capabilities(
+        "google/gemini-3.5-flash"
+    ).reasoning_effort.supported == ("low", "medium", "high")
+    assert infer_capabilities("openai", "gpt-unknown").reasoning_effort is None
+    assert infer_capabilities("openrouter", "vendor/model").reasoning_effort is None
+
+
+def test_provider_rejects_unsupported_reasoning_effort() -> None:
+    provider = DeclaredProvider("model")
+    with pytest.raises(ValueError, match="unavailable"):
+        provider.configure_reasoning_effort("high")
 
 
 @pytest.mark.asyncio

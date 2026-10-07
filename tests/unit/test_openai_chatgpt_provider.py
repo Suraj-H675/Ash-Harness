@@ -269,10 +269,11 @@ async def test_chatgpt_provider_streams_refusal_text() -> None:
         ]
     )
     provider = OpenAIChatGPTProvider(
-        "gpt-test",
+        "gpt-6.1-sol",
         auth_session=_AuthSession(),  # type: ignore[arg-type]
         client_factory=lambda _token: client,
     )
+    provider.configure_reasoning_effort("high")
 
     chunks = [
         chunk
@@ -283,6 +284,8 @@ async def test_chatgpt_provider_streams_refusal_text() -> None:
 
     assert chunks[0].content == "I cannot help with that."
     assert chunks[-1].is_done is True
+    assert client.responses.kwargs is not None
+    assert client.responses.kwargs["reasoning"] == {"effort": "high"}
 
 
 @pytest.mark.asyncio

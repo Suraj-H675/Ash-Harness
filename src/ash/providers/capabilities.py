@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Callable
+
+from ash.providers.reasoning import ReasoningEffortSpec, reasoning_effort_spec
 
 
 @dataclass(frozen=True)
@@ -15,6 +17,7 @@ class ProviderCapabilities:
     local: bool = False
     context_window: int | None = None
     max_output_tokens: int | None = None
+    reasoning_effort: ReasoningEffortSpec | None = None
 
 
 CapabilityResolver = Callable[[str], ProviderCapabilities]
@@ -129,9 +132,11 @@ _ANTHROPIC_STATIC_CAPABILITIES: dict[str, ProviderCapabilities] = {
 
 
 def _anthropic(model: str) -> ProviderCapabilities:
-    return _ANTHROPIC_STATIC_CAPABILITIES.get(
-        model.casefold(),
-        ProviderCapabilities(),
+    name = model.casefold()
+    base = _ANTHROPIC_STATIC_CAPABILITIES.get(name, ProviderCapabilities())
+    return replace(
+        base,
+        reasoning_effort=reasoning_effort_spec("anthropic", name),
     )
 
 
@@ -216,7 +221,12 @@ def openai_uses_responses_api(model: str) -> bool:
 
 
 def _openai(model: str) -> ProviderCapabilities:
-    return _OPENAI_STATIC_CAPABILITIES.get(model.casefold(), ProviderCapabilities())
+    name = model.casefold()
+    base = _OPENAI_STATIC_CAPABILITIES.get(name, ProviderCapabilities())
+    return replace(
+        base,
+        reasoning_effort=reasoning_effort_spec("openai", name),
+    )
 
 
 _GOOGLE_FUNCTION_CALLING_MODELS = frozenset(
@@ -241,6 +251,7 @@ def google_capabilities(model: str) -> ProviderCapabilities:
     name = model.casefold()
     if name not in _GOOGLE_FUNCTION_CALLING_MODELS:
         return ProviderCapabilities()
+    effort = reasoning_effort_spec("google", name)
     if name == "gemini-3.8-flash":
         return ProviderCapabilities(
             native_tools=True,
@@ -248,11 +259,13 @@ def google_capabilities(model: str) -> ProviderCapabilities:
             reasoning=True,
             context_window=1_000_000,
             max_output_tokens=64_000,
+            reasoning_effort=effort,
         )
     return ProviderCapabilities(
         native_tools=True,
         vision=True,
         reasoning=True,
+        reasoning_effort=effort,
     )
 
 
@@ -273,6 +286,7 @@ def vertex_google_capabilities(model: str) -> ProviderCapabilities:
     base = google_capabilities(gemini_model)
     if base == ProviderCapabilities():
         return base
+    effort = reasoning_effort_spec("vertex", name)
     if gemini_model == "gemini-3.8-flash":
         return ProviderCapabilities(
             native_tools=True,
@@ -280,11 +294,13 @@ def vertex_google_capabilities(model: str) -> ProviderCapabilities:
             reasoning=True,
             context_window=1_048_576,
             max_output_tokens=65_536,
+            reasoning_effort=effort,
         )
     return ProviderCapabilities(
         native_tools=base.native_tools,
         vision=base.vision,
         reasoning=base.reasoning,
+        reasoning_effort=effort,
     )
 
 

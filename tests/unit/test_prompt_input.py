@@ -427,6 +427,19 @@ def test_slash_argument_completion_and_builtin_metadata_are_contextual(
         "Show session and runtime status"
     ]
 
+    effort_completer = AshCompleter(["/effort"], tmp_path)
+    effort_completer.effort_provider = lambda: ("low", "high")
+    effort = list(
+        effort_completer.get_completions(Document("/effort "), event)
+    )
+    assert [completion.text for completion in effort] == [
+        "default",
+        "low",
+        "high",
+    ]
+    effort_completer.effort_provider = lambda: ()
+    assert list(effort_completer.get_completions(Document("/effort "), event)) == []
+
 
 def test_model_completion_includes_custom_providers_and_known_models(tmp_path) -> None:
     completer = AshCompleter(
@@ -472,11 +485,12 @@ def test_prompt_keeps_curated_builtin_command_order_before_custom_commands(
     )
     words = [completion.text for completion in completions]
 
-    assert words[:8] == [
+    assert words[:9] == [
         "/help",
         "/status",
         "/usage",
         "/cost",
+        "/effort",
         "/settings",
         "/cancel",
         "/model",
