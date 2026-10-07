@@ -943,7 +943,7 @@ async def main():
     try:
         value = await prompt.read("smoke> ")
     finally:
-        prompt.close()
+        await prompt.aclose()
     print("PROMPT_RESULT=" + value, flush=True)
     await asyncio.sleep(5)
 
