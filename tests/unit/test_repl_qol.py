@@ -182,6 +182,15 @@ async def _run_repl(
         permission_policy=PermissionPolicy(safety_tier),
         safety_tier=safety_tier,
         notify_permission_rules_changed=lambda **_kwargs: None,
+        _last_context_tokens=0,
+        _last_context_maximum=1024,
+        _last_context_budget=None,
+        last_turn_usage={
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "usage_source": "unavailable",
+        },
     )
 
     async def start_session(session_id: str | None = None):
@@ -538,6 +547,30 @@ def test_usage_lines_render_complete_known_cost() -> None:
         "Prompt cache: 0 read, 0 written",
         "Cost: $0.004200",
     )
+
+
+@pytest.mark.asyncio
+async def test_context_command_uses_effective_runtime_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    assert (
+        await _run_repl(
+            tmp_path,
+            monkeypatch,
+            iter(("/context", "exit")),
+            config_overrides={
+                "max_context_tokens": 4096,
+                "max_completion_tokens": 512,
+            },
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "Context: ~0/1024 input tokens" in output
+    assert "Context: ~0/3584 input tokens" not in output
 
 
 @pytest.mark.asyncio

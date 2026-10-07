@@ -55,7 +55,11 @@ def _silent_console():
 
 
 def _make_ui() -> TerminalUI:
-    return TerminalUI(safety_tier="auto_approve", console=_silent_console())
+    return TerminalUI(
+        safety_tier="interactive",
+        approval_callback=lambda _tool, _arguments: True,
+        console=_silent_console(),
+    )
 
 
 # --- fixtures ---------------------------------------------------------------

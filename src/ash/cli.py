@@ -1877,7 +1877,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 transition_feedback("Imported and resumed chat.")
                 continue
             if command.name == "context":
-                maximum = config.max_context_tokens - config.max_completion_tokens
+                maximum = max(
+                    1,
+                    int(
+                        getattr(
+                            loop,
+                            "_last_context_maximum",
+                            config.max_context_tokens - config.max_completion_tokens,
+                        )
+                    ),
+                )
                 has_summary = bool(
                     loop.current_session and loop.current_session.context_summary
                 )
