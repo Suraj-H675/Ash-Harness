@@ -223,7 +223,38 @@ def test_v17_migration_marks_historical_usage_pricing_unknown(tmp_path: Path) ->
         ).fetchone()[0] == CURRENT_SCHEMA_VERSION
 
 
-def test_v18_migration_backup_remains_v16_rollback_state(tmp_path: Path) -> None:
+def test_v19_migration_adds_session_permission_mode_override(tmp_path: Path) -> None:
+    db_path = tmp_path / "v18.db"
+    store = SessionStore(db_path)
+    session = store.create_session(str(tmp_path), model="ollama/test")
+
+    with closing(get_db_connection(db_path)) as conn, conn:
+        conn.execute("ALTER TABLE sessions DROP COLUMN permission_mode")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 19")
+
+    migrated = SessionStore(db_path)
+
+    assert len(
+        list(
+            tmp_path.glob(
+                f"v18.db.before-v{CURRENT_SCHEMA_VERSION}-migration.*.backup"
+            )
+        )
+    ) == 1
+    with get_db_connection(db_path) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == CURRENT_SCHEMA_VERSION
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+        assert "permission_mode" in columns
+    loaded = migrated.load_session(session.session_id)
+    assert loaded.permission_mode == ""
+    assert migrated.session_permission_mode(session.session_id) == ""
+
+
+def test_current_migration_backup_remains_v16_rollback_state(tmp_path: Path) -> None:
     db_path = tmp_path / "v16.db"
     store = SessionStore(db_path)
     session = store.create_session(str(tmp_path))
@@ -254,7 +285,11 @@ def test_v18_migration_backup_remains_v16_rollback_state(tmp_path: Path) -> None
 
     SessionStore(db_path)
 
-    backups = list(tmp_path.glob("v16.db.before-v18-migration.*.backup"))
+    backups = list(
+        tmp_path.glob(
+            f"v16.db.before-v{CURRENT_SCHEMA_VERSION}-migration.*.backup"
+        )
+    )
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as backup_conn:
         assert backup_conn.execute(
@@ -270,7 +305,7 @@ def test_v18_migration_backup_remains_v16_rollback_state(tmp_path: Path) -> None
     with get_db_connection(db_path) as migrated_conn:
         assert migrated_conn.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 18
+        ).fetchone()[0] == CURRENT_SCHEMA_VERSION
         assert "pricing_unknown_turns" in {
             row[1] for row in migrated_conn.execute("PRAGMA table_info(sessions)")
         }

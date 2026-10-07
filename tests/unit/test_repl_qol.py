@@ -11,7 +11,7 @@ import pytest
 from ash.cli import _repl, _session_usage_lines
 from ash.core.session import Message, SessionStore, SessionUsage
 from ash.safety.guard import SafetyGuard
-from ash.safety.policy import PermissionPolicy
+from ash.safety.policy import PermissionMode, PermissionPolicy
 from ash.tools.base import ToolResult
 
 
@@ -181,6 +181,7 @@ async def _run_repl(
         ),
         permission_policy=PermissionPolicy(safety_tier),
         safety_tier=safety_tier,
+        notify_permission_rules_changed=lambda **_kwargs: None,
     )
 
     async def start_session(session_id: str | None = None):
@@ -196,6 +197,26 @@ async def _run_repl(
 
     loop.start_session = start_session
     config = _config(tmp_path, **(config_overrides or {}))
+
+    def set_permission_mode(mode):
+        resolved = PermissionMode(mode)
+        loop.permission_policy = PermissionPolicy(
+            resolved,
+            managed_rules=loop.permission_policy.managed_rules,
+            persistent_rules=loop.permission_policy.persistent_rules,
+            session_rules=loop.permission_policy.session_rules,
+        )
+        loop.safety_tier = resolved.value
+        config.safety_tier = resolved.value
+        loop.ui.safety_tier = resolved.value
+        if loop.current_session is not None:
+            store.update_session_permission_mode(
+                loop.current_session.session_id, resolved.value
+            )
+            loop.current_session.permission_mode = resolved.value
+        return resolved
+
+    loop.set_permission_mode = set_permission_mode
     return await _repl(loop, config, SimpleNamespace())
 
 
@@ -517,6 +538,32 @@ def test_usage_lines_render_complete_known_cost() -> None:
         "Prompt cache: 0 read, 0 written",
         "Cost: $0.004200",
     )
+
+
+@pytest.mark.asyncio
+async def test_permissions_mode_command_persists_current_session_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    store = SessionStore(tmp_path / "permission-mode-repl.db")
+    session = store.create_session(str(tmp_path), model="ollama/test-model")
+
+    assert (
+        await _run_repl(
+            tmp_path,
+            monkeypatch,
+            iter(("/permissions plan", "/permissions", "exit")),
+            session_store=store,
+            current_session=session,
+        )
+        == 0
+    )
+
+    assert store.session_permission_mode(session.session_id) == "plan"
+    output = capsys.readouterr().out
+    assert "Permission mode: plan" in output
+    assert "current Ash session only" in output
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ import pytest
 from ash.context.instructions import MAX_INSTRUCTION_FILE_BYTES
 from ash.runtime import _memory_database_path, build_repo_map, build_runtime, build_tools
 from ash.context.turn import TurnContext
+from ash.core.session import SessionStore
 from ash.config import AshConfig
 from ash.mcp.server import MCPServerConfig
 from ash.platform_support import UnsupportedPlatformError
@@ -1861,7 +1862,7 @@ def test_runtime_rejects_macos_sandbox_exec_auto_approve(tmp_path, monkeypatch) 
 
     with pytest.raises(
         SandboxBackendUnavailable,
-        match="aggregate CPU and memory containment",
+        match="containment",
     ):
         build_runtime(
             config,
@@ -1869,6 +1870,52 @@ def test_runtime_rejects_macos_sandbox_exec_auto_approve(tmp_path, monkeypatch) 
             provider=RuntimeProvider(),
             run_maintenance=False,
         )
+
+
+def test_resumed_auto_approve_session_rechecks_current_sandbox(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("ash.sandbox.manager.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_sandbox_exec", lambda _workspace=None: True
+    )
+    monkeypatch.setattr(
+        "ash.sandbox.manager.has_docker",
+        lambda _image, *, workspace_root=None: False,
+    )
+    config = AshConfig(
+        model="ollama/runtime-model",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        safety_tier="interactive",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path), model=config.model)
+    store.update_session_permission_mode(session.session_id, "auto_approve")
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(),
+        session_store=store,
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+
+    try:
+        with pytest.raises(
+            SandboxBackendUnavailable,
+            match="auto_approve requires an available OS sandbox",
+        ):
+            asyncio.run(runtime.loop.start_session(session.session_id))
+        assert runtime.loop.current_session is None
+        assert runtime.loop.permission_policy.mode.value == "interactive"
+    finally:
+        asyncio.run(runtime.loop.aclose())
 
 
 def test_runtime_auto_approve_prefers_resource_bounded_docker(

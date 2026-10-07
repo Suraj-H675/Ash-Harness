@@ -44,6 +44,7 @@ from ash.safety.grants import (
     load_permission_rules,
 )
 from ash.safety.guard import SafetyGuard
+from ash.safety.policy import PermissionMode
 from ash.safety.trust import is_workspace_trusted
 from ash.sandbox import (
     SandboxBackendUnavailable,
@@ -431,6 +432,32 @@ def _memory_database_path(config: AshConfig) -> Path:
     return database_root / "memory" / f"v1-{identity}" / "memory.db"
 
 
+def _require_permission_mode_safety(
+    mode: str | PermissionMode,
+    sandbox: SandboxManager,
+    *,
+    allow_unsafe: bool,
+) -> None:
+    """Revalidate environment-dependent authority before activating a mode."""
+
+    resolved = PermissionMode(mode)
+    if resolved is not PermissionMode.AUTO_APPROVE:
+        return
+    if not allow_unsafe and not sandbox.has_aggregate_resource_limits():
+        try:
+            sandbox.require_aggregate_resource_containment()
+        except SandboxBackendUnavailable:
+            safety_error = auto_approve_safety_error(
+                sandbox, allow_unsafe=allow_unsafe
+            )
+            if safety_error:
+                raise SandboxBackendUnavailable(safety_error) from None
+            raise
+    safety_error = auto_approve_safety_error(sandbox, allow_unsafe=allow_unsafe)
+    if safety_error:
+        raise SandboxBackendUnavailable(safety_error)
+
+
 def build_runtime(
     config: AshConfig,
     ui: LoopUI,
@@ -469,12 +496,11 @@ def build_runtime(
             and not config.allow_unsafe_auto_approve
         ),
     )
-    safety_error = auto_approve_safety_error(
+    _require_permission_mode_safety(
+        config.safety_tier,
         sandbox,
         allow_unsafe=config.allow_unsafe_auto_approve,
     )
-    if config.safety_tier == "auto_approve" and safety_error:
-        raise SandboxBackendUnavailable(safety_error)
 
     store = session_store or SessionStore(config.db_directory / "sessions.db")
     if run_maintenance and config.session_retention_days > 0:
@@ -672,6 +698,11 @@ def build_runtime(
             enable_sprint_planning=config.enable_sprint_planning,
             max_goal_continuations=config.max_goal_continuations,
             safety_tier=config.safety_tier,
+            permission_mode_validator=lambda mode: _require_permission_mode_safety(
+                mode,
+                sandbox,
+                allow_unsafe=config.allow_unsafe_auto_approve,
+            ),
             on_tool_approval=approval_callback,
             mcp_configs=mcp_configs,
             mcp_interactions=mcp_interactions,

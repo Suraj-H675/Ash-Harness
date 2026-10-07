@@ -2282,7 +2282,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     remove_permission_rule,
                     remove_permission_rules_for_tool,
                 )
-                from ash.safety.policy import PermissionMode, PermissionPolicy
+                from ash.safety.policy import PermissionMode
 
                 if not arguments:
                     print(f"Permission mode: {loop.permission_policy.mode.value}")
@@ -2350,44 +2350,16 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     allowed = ", ".join(item.value for item in PermissionMode)
                     print(f"Error: mode must be one of: {allowed}", file=sys.stderr)
                     continue
-                if mode == PermissionMode.AUTO_APPROVE:
-                    from ash.sandbox import (
-                        SandboxBackendUnavailable,
-                        auto_approve_safety_error,
-                    )
-
-                    if (
-                        not config.allow_unsafe_auto_approve
-                        and not sandbox_manager.has_aggregate_resource_limits()
-                    ):
-                        try:
-                            sandbox_manager.require_aggregate_resource_containment()
-                        except SandboxBackendUnavailable as exc:
-                            print(f"Error: {exc}", file=sys.stderr)
-                            continue
-
-                    safety_error = auto_approve_safety_error(
-                        sandbox_manager,
-                        allow_unsafe=config.allow_unsafe_auto_approve,
-                    )
-                    if safety_error:
-                        print(f"Error: {safety_error}", file=sys.stderr)
-                        continue
                 previous_mode = loop.permission_policy.mode.value
-                loop.permission_policy = PermissionPolicy(
-                    mode,
-                    managed_rules=loop.permission_policy.managed_rules,
-                    persistent_rules=loop.permission_policy.persistent_rules,
-                    session_rules=loop.permission_policy.session_rules,
-                )
+                try:
+                    loop.set_permission_mode(mode)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    continue
                 loop.notify_permission_rules_changed(
                     source="permission_mode",
                     rule_count=len(loop.permission_policy.persistent_rules),
                 )
-                loop.safety_tier = mode.value
-                config.safety_tier = mode.value
-                if hasattr(loop.ui, "safety_tier"):
-                    loop.ui.safety_tier = mode.value
                 if loop.current_session is not None:
                     loop.session_store.append_audit_log(
                         loop.current_session.session_id,

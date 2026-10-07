@@ -105,7 +105,7 @@ from ash.providers.retry import (
 )
 from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard, SafetyViolation
-from ash.safety.policy import PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
+from ash.safety.policy import PermissionMode, PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
 from ash.safety.scoped_io import (
     read_scoped_bytes,
     snapshot_scoped_file,
@@ -1231,6 +1231,7 @@ class AshLoop:
         max_continuous_turns: int = 10,
         max_goal_continuations: int = DEFAULT_MAX_GOAL_CONTINUATIONS,
         safety_tier: str = "interactive",
+        permission_mode_validator: Callable[[PermissionMode], None] | None = None,
         enable_project_memory: bool = False,
         embedding_provider: str = "none",
         openai_api_key: str = "",
@@ -1380,6 +1381,8 @@ class AshLoop:
             max_goal_continuations
         )
         self._last_turn_non_goal_tool_calls = 0
+        self._default_session_permission_mode = PermissionMode(safety_tier)
+        self._permission_mode_validator = permission_mode_validator
         self.safety_tier = safety_tier
         self.permission_policy = PermissionPolicy(safety_tier)
         self.enable_project_memory = enable_project_memory
@@ -1697,7 +1700,6 @@ class AshLoop:
         hooks = self._active_hooks()
         if not self._hook_session_open or hooks is None or self.current_session is None:
             return
-        self._hook_session_open = False
         await hooks.fire_lifecycle(
             "session_end",
             {
@@ -1705,6 +1707,7 @@ class AshLoop:
                 "reason": reason,
             },
         )
+        self._hook_session_open = False
 
     def _active_hooks(self) -> "HookRegistry | None":
         if self.permission_policy.mode.value == "dry_run":
@@ -1952,18 +1955,27 @@ class AshLoop:
             target_model = self.current_session.model or (
                 self._config.model if self._config is not None else self.active_model_id
             )
+            target_permission_mode = self.permission_policy.mode
         elif session_id is not None:
             self.session_store.require_session_project(session_id, self.project_root)
             target_model = (
                 self.session_store.session_model(session_id)
                 or self._default_session_model
             )
+            stored_permission_mode = self.session_store.session_permission_mode(session_id)
+            target_permission_mode = self._validated_session_permission_mode(
+                stored_permission_mode or self._default_session_permission_mode.value
+            )
         else:
             target_model = self._default_session_model
-        self._activate_session_model(target_model)
-        await self._negotiate_provider_capabilities()
+            target_permission_mode = self._validated_session_permission_mode(
+                self._default_session_permission_mode.value
+            )
         if self._mcp_configs and self._mcp_runtime is None:
             await self._start_mcp_runtime()
+        prepared_provider = await self._prepare_session_model(target_model)
+        if prepared_provider is None:
+            await self._negotiate_provider_capabilities()
         search_tool = self.tools.get("search_tools")
         reset_activations = getattr(search_tool, "reset_activations", None)
         if callable(reset_activations):
@@ -1983,8 +1995,36 @@ class AshLoop:
                     if session_id == self.current_session.session_id
                     else "switch"
                 )
-                await self._fire_session_end(reason)
+                try:
+                    await self._fire_session_end(reason)
+                except BaseException as primary_error:
+                    if prepared_provider is not None:
+                        await self._close_prepared_provider(
+                            prepared_provider[1], primary_error
+                        )
+                    raise
+            if prepared_provider is not None:
+                try:
+                    self._commit_provider_switch(
+                        prepared_provider[0],
+                        reason="session_model_restore",
+                        persist_session_model=False,
+                        emit_config_changed=False,
+                        replacement=prepared_provider[1],
+                    )
+                except BaseException:
+                    if self.hooks is not None:
+                        self._hook_session_open = True
+                    raise
             self.current_session = None
+        elif prepared_provider is not None:
+            self._commit_provider_switch(
+                prepared_provider[0],
+                reason="session_model_restore",
+                persist_session_model=False,
+                emit_config_changed=False,
+                replacement=prepared_provider[1],
+            )
         self._reset_session_runtime_state()
         self.system_prompt = self._base_system_prompt
 
@@ -2015,6 +2055,7 @@ class AshLoop:
             finally:
                 session_lease.close()
             self.current_session = restored_session
+            self._apply_session_permission_mode(target_permission_mode)
             set_log_context(
                 session_id=restored_session.session_id,
                 turn_id=None,
@@ -2062,9 +2103,10 @@ class AshLoop:
             self._config.model if self._config is not None else self.active_model_id
         )
         session = self.session_store.create_session(
-            str(self.project_root), model=requested_model
+            str(self.project_root), model=requested_model, permission_mode=""
         )
         self.current_session = session
+        self._apply_session_permission_mode(target_permission_mode)
         set_log_context(
             session_id=session.session_id,
             turn_id=None,
@@ -2094,6 +2136,10 @@ class AshLoop:
         self.turn_context = None
         set_log_context(session_id=None, turn_id=None, operation_id=None)
         self._steering_messages.clear()
+        self.permission_policy.session_rules.clear()
+        clear_session_approvals = getattr(self.ui, "clear_session_approvals", None)
+        if callable(clear_session_approvals):
+            clear_session_approvals()
         self._last_context_tokens = 0
         self._last_context_maximum = max(
             1,
@@ -5388,6 +5434,59 @@ class AshLoop:
             }
             self._emit_event({"type": "tool.requested", **event_base})
 
+            if tool is None:
+                record.error = _bounded_durable_tool_error(
+                    f"Unknown tool: {tool_name}",
+                    fallback="Unknown tool",
+                )
+                if not defer_terminal_persistence:
+                    self.session_store.save_tool_call(
+                        session.session_id,
+                        record,
+                        turn_id=(
+                            self.turn_context.turn_id if self.turn_context else None
+                        ),
+                    )
+                self._append_tool_audit(
+                    session,
+                    action_type="tool_call",
+                    target_resource=tool_name,
+                    details={
+                        "call_id": record.call_id,
+                        "arguments": record.arguments,
+                        "error": record.error,
+                    },
+                    result="FAILURE",
+                )
+                self.circuit_breaker.record_failure(tool_name)
+                self._emit_event(
+                    {"type": "tool.error", **event_base, "error": record.error}
+                )
+                await self._fire_tool_error_hook(
+                    session,
+                    call_id=record.call_id,
+                    tool_name=tool_name,
+                    arguments=record.arguments,
+                    error=record.error,
+                )
+                result_payload = self._tool_result_payload(
+                    {
+                        "success": False,
+                        "output": "",
+                        "error": f"Unknown tool: {tool_name}",
+                    },
+                    record,
+                    defer_terminal_persistence=defer_terminal_persistence,
+                )
+                if persist_tool_messages:
+                    self._persist_deferred_tool_result(
+                        session=session,
+                        call=call,
+                        result=result_payload,
+                    )
+                results.append(result_payload)
+                continue
+
             decision = self.permission_policy.evaluate(
                 tool_name, deepcopy(arguments)
             )
@@ -5515,58 +5614,7 @@ class AshLoop:
                 record,
                 turn_id=self.turn_context.turn_id if self.turn_context else None,
             )
-            if tool is None:
-                record.error = _bounded_durable_tool_error(
-                    f"Unknown tool: {tool_name}",
-                    fallback="Unknown tool",
-                )
-                if not defer_terminal_persistence:
-                    self.session_store.save_tool_call(
-                        session.session_id,
-                        record,
-                        turn_id=(
-                            self.turn_context.turn_id if self.turn_context else None
-                        ),
-                    )
-                self._append_tool_audit(
-                    session,
-                    action_type="tool_call",
-                    target_resource=tool_name,
-                    details={
-                        "call_id": record.call_id,
-                        "arguments": record.arguments,
-                        "error": record.error,
-                    },
-                    result="FAILURE",
-                )
-                self.circuit_breaker.record_failure(tool_name)
-                self._emit_event(
-                    {"type": "tool.error", **event_base, "error": record.error}
-                )
-                await self._fire_tool_error_hook(
-                    session,
-                    call_id=record.call_id,
-                    tool_name=tool_name,
-                    arguments=record.arguments,
-                    error=record.error,
-                )
-                result_payload = self._tool_result_payload(
-                    {
-                        "success": False,
-                        "output": "",
-                        "error": f"Unknown tool: {tool_name}",
-                    },
-                    record,
-                    defer_terminal_persistence=defer_terminal_persistence,
-                )
-                if persist_tool_messages:
-                    self._persist_deferred_tool_result(
-                        session=session,
-                        call=call,
-                        result=result_payload,
-                    )
-                results.append(result_payload)
-                continue
+
 
             dispatched = False
             tool_started = False
@@ -6806,6 +6854,49 @@ class AshLoop:
             or self._retired_provider_cleanup_failures
         )
 
+    def _validated_session_permission_mode(
+        self, mode: str | PermissionMode
+    ) -> PermissionMode:
+        resolved = PermissionMode(mode)
+        if self._permission_mode_validator is not None:
+            self._permission_mode_validator(resolved)
+        return resolved
+
+    def _apply_session_permission_mode(self, mode: PermissionMode) -> None:
+        self.permission_policy = PermissionPolicy(
+            mode,
+            managed_rules=self.permission_policy.managed_rules,
+            persistent_rules=self.permission_policy.persistent_rules,
+            session_rules=self.permission_policy.session_rules,
+        )
+        self.safety_tier = mode.value
+        if self._config is not None:
+            self._config.safety_tier = mode.value
+        if hasattr(self.ui, "safety_tier"):
+            self.ui.safety_tier = mode.value
+
+    def set_permission_mode(self, mode: str | PermissionMode) -> PermissionMode:
+        """Set and persist the active conversation's permission-mode override."""
+
+        if self._turn_running:
+            raise RuntimeError("cannot change permission mode while a turn is running")
+        resolved = self._validated_session_permission_mode(mode)
+        session = self.current_session
+        lease = None
+        if session is not None:
+            lease = self.session_store.acquire_session_runtime_lease(session.session_id)
+        try:
+            if session is not None:
+                self.session_store.update_session_permission_mode(
+                    session.session_id, resolved.value
+                )
+                session.permission_mode = resolved.value
+            self._apply_session_permission_mode(resolved)
+        finally:
+            if lease is not None:
+                lease.close()
+        return resolved
+
     def _session_model_config(self, model: str) -> "AshConfig":
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")
@@ -6822,23 +6913,67 @@ class AshLoop:
             }
         )
 
-    def _activate_session_model(self, model: str) -> None:
-        """Activate one session's requested route without mutating another session."""
+    async def _close_prepared_provider(
+        self, provider: ProviderABC, primary_error: BaseException
+    ) -> None:
+        close_task = asyncio.create_task(
+            provider.aclose(), name="ash-session-provider-candidate-cleanup"
+        )
+        cleanup_error, cleanup_cancelled = await _settle_owned_cleanup_task(close_task)
+        if cleanup_error is not None:
+            primary_error.add_note(
+                "prepared provider cleanup failed: "
+                + redact_text(str(cleanup_error))[:500]
+            )
+        if cleanup_cancelled and not isinstance(primary_error, asyncio.CancelledError):
+            cancellation = asyncio.CancelledError()
+            cancellation.add_note(
+                "session provider preparation failed before cleanup was cancelled"
+            )
+            raise cancellation from primary_error
+
+    async def _prepare_session_model(
+        self, model: str
+    ) -> tuple["AshConfig", ProviderABC] | None:
+        """Build and capability-check a session route before activating it."""
 
         if self._config is None or self._provider_factory is None or not model:
-            return
+            return None
         new_config = self._session_model_config(model)
         if (
             new_config.model == self._config.model
             and new_config.fallback_models == self._config.fallback_models
         ):
-            return
-        self._commit_provider_switch(
-            new_config,
-            reason="session_model_restore",
-            persist_session_model=False,
-            emit_config_changed=False,
-        )
+            return None
+        if self._provider_cleanup_debt():
+            if self._retired_provider_cleanup_failures:
+                raise RuntimeError(
+                    "provider cleanup previously failed; close or restart the "
+                    "runtime before switching providers again"
+                )
+            raise RuntimeError(
+                "provider cleanup is still in progress; retry the switch after "
+                "the previous provider has closed"
+            )
+        replacement = self._provider_factory(new_config)
+        try:
+            detect = getattr(replacement, "detect_capabilities", None)
+            if callable(detect):
+                try:
+                    await detect()
+                except ProviderCapabilityError:
+                    raise
+                except Exception:
+                    # Match ordinary runtime negotiation: retain conservative
+                    # adapter capabilities when an optional probe is unavailable.
+                    pass
+            # Force capability access before the old session is ended so a
+            # malformed provider adapter cannot fail after activation.
+            _ = replacement.capabilities
+        except BaseException as primary_error:
+            await self._close_prepared_provider(replacement, primary_error)
+            raise
+        return new_config, replacement
 
     def _commit_provider_switch(
         self,
@@ -6847,6 +6982,7 @@ class AshLoop:
         reason: str,
         persist_session_model: bool,
         emit_config_changed: bool = True,
+        replacement: ProviderABC | None = None,
     ) -> None:
         if self._provider_factory is None:
             raise RuntimeError(
@@ -6871,7 +7007,7 @@ class AshLoop:
         old_core_prompt = self._core_system_prompt
         old_base_prompt = self._base_system_prompt
         old_system_prompt = self.system_prompt
-        replacement = self._provider_factory(new_config)
+        replacement = replacement or self._provider_factory(new_config)
         effort = self.reasoning_effort
         session = self.current_session if persist_session_model else None
         session_lease = None

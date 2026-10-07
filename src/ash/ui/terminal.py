@@ -1256,6 +1256,11 @@ class TerminalUI:
     def approve_tool_for_session(self, tool_name: str) -> None:
         self._session_approvals.add(tool_name)
 
+    def clear_session_approvals(self) -> None:
+        """Drop ephemeral tool approvals when the active chat changes."""
+
+        self._session_approvals.clear()
+
     def show_tool_approval(
         self,
         tool_name: str,

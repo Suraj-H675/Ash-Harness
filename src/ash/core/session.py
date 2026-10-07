@@ -57,7 +57,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 18
+CURRENT_SCHEMA_VERSION = 19
 SQLITE_INTEGER_MAX = 2**63 - 1
 SQLITE_REAL_MAX = sys.float_info.max
 MAX_SESSION_IMPORT_BYTES = 64 * 1024 * 1024
@@ -383,6 +383,7 @@ class Session(BaseModel):
     context_summary: str = ""
     context_summary_message_count: int = 0
     model: str = ""
+    permission_mode: str = ""
     parent_session_id: str | None = None
     root_session_id: str = ""
     fork_message_count: int | None = None
@@ -417,6 +418,15 @@ class Session(BaseModel):
 
 
 MAX_SESSION_TITLE_CHARS = 256
+_SESSION_PERMISSION_MODES = frozenset(
+    {"", "interactive", "auto_edit", "plan", "auto_approve", "dry_run"}
+)
+
+
+def _validate_session_permission_mode(value: str) -> str:
+    if not isinstance(value, str) or value not in _SESSION_PERMISSION_MODES:
+        raise ValueError(f"invalid session permission mode: {value!r}")
+    return value
 
 
 def _normalize_session_title(title: str, *, allow_empty: bool = False) -> str:
@@ -1221,6 +1231,8 @@ class SessionStore:
                 self._migrate_v17(conn)
             if from_version < 18:
                 self._migrate_v18(conn)
+            if from_version < 19:
+                self._migrate_v19(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -1755,6 +1767,21 @@ class SessionStore:
             (18, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v19(self, conn: sqlite3.Connection) -> None:
+        """Persist an explicit permission-mode override per conversation session."""
+
+        if not _column_exists(conn, "sessions", "permission_mode"):
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN permission_mode TEXT NOT NULL "
+                "DEFAULT '' CHECK(permission_mode IN "
+                "('', 'interactive', 'auto_edit', 'plan', 'auto_approve', 'dry_run'))"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (19, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -1922,6 +1949,11 @@ class SessionStore:
                     context_summary_message_count INTEGER NOT NULL DEFAULT 0
                         CHECK(context_summary_message_count >= 0),
                     model TEXT DEFAULT '',
+                    permission_mode TEXT NOT NULL DEFAULT ''
+                        CHECK(permission_mode IN (
+                            '', 'interactive', 'auto_edit', 'plan',
+                            'auto_approve', 'dry_run'
+                        )),
                     total_tokens INTEGER DEFAULT 0,
                     total_cost_inr REAL DEFAULT 0,
                     total_cost_usd REAL DEFAULT 0,
@@ -2096,6 +2128,7 @@ class SessionStore:
         *,
         session_id: str | None = None,
         model: str = "",
+        permission_mode: str = "",
         parent_session_id: str | None = None,
         fork_message_count: int | None = None,
         branch_name: str = "",
@@ -2104,6 +2137,7 @@ class SessionStore:
         canonical_project_path = normalize_project_path(project_path)
         session_id = session_id or str(uuid4())
         model = _validate_session_model(model)
+        permission_mode = _validate_session_permission_mode(permission_mode)
         normalized_branch_name, normalized_branch_summary = _normalize_branch_metadata(
             branch_name, branch_summary
         )
@@ -2138,6 +2172,7 @@ class SessionStore:
             created_at=_utc_now(),
             updated_at=_utc_now(),
             model=model,
+            permission_mode=permission_mode,
             parent_session_id=parent_session_id,
             root_session_id=root_session_id,
             fork_message_count=fork_message_count,
@@ -2151,10 +2186,10 @@ class SessionStore:
             """
             INSERT INTO sessions (
                 session_id, project_path, project_key, created_at, updated_at,
-                model, parent_session_id, root_session_id, fork_message_count,
-                branch_name, branch_summary, depth
+                model, permission_mode, parent_session_id, root_session_id,
+                fork_message_count, branch_name, branch_summary, depth
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session.session_id,
@@ -2163,6 +2198,7 @@ class SessionStore:
                 _serialize_datetime(session.created_at),
                 _serialize_datetime(updated_at),
                 session.model,
+                session.permission_mode,
                 session.parent_session_id,
                 session.root_session_id,
                 session.fork_message_count,
@@ -2179,6 +2215,7 @@ class SessionStore:
         project_path: str,
         *,
         model: str = "",
+        permission_mode: str = "",
     ) -> Session:
         """Create a new session record in SQLite and return its model."""
 
@@ -2187,6 +2224,7 @@ class SessionStore:
                 conn,
                 project_path,
                 model=model,
+                permission_mode=permission_mode,
             )
 
     def load_session(
@@ -2202,7 +2240,7 @@ class SessionStore:
                 """
                 SELECT session_id, project_path, created_at, title, updated_at,
                        context_summary, context_summary_message_count, model,
-                       parent_session_id, root_session_id,
+                       permission_mode, parent_session_id, root_session_id,
                        fork_message_count, branch_name, branch_summary, depth
                 FROM sessions
                 WHERE session_id = ?
@@ -2281,6 +2319,9 @@ class SessionStore:
                 context_summary=session_row["context_summary"] or "",
                 context_summary_message_count=summary_message_count,
                 model=session_row["model"] or "",
+                permission_mode=_validate_session_permission_mode(
+                    str(session_row["permission_mode"] or "")
+                ),
                 parent_session_id=session_row["parent_session_id"],
                 root_session_id=session_row["root_session_id"]
                 or session_row["session_id"],
@@ -2354,6 +2395,35 @@ class SessionStore:
         with closing(self._connect()) as conn, conn:
             cursor = conn.execute(
                 "UPDATE sessions SET model = ? WHERE session_id = ?",
+                (validated, session_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Session not found: {session_id}")
+
+    def session_permission_mode(self, session_id: str) -> str:
+        """Return the durable permission-mode override for one session."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT permission_mode FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Session not found: {session_id}")
+        try:
+            return _validate_session_permission_mode(
+                str(row["permission_mode"] or "")
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
+
+    def update_session_permission_mode(self, session_id: str, mode: str) -> None:
+        """Persist one session's explicit permission-mode override."""
+
+        validated = _validate_session_permission_mode(mode)
+        with closing(self._connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE sessions SET permission_mode = ? WHERE session_id = ?",
                 (validated, session_id),
             )
             if cursor.rowcount == 0:

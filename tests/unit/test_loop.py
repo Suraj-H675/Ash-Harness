@@ -42,7 +42,7 @@ from ash.providers.failover import FailoverProvider
 from ash.providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
 from ash.safety.grants import PermissionRule, RuleEffect
 from ash.safety.guard import SafetyGuard
-from ash.safety.policy import PermissionMode
+from ash.safety.policy import PermissionMode, PolicyAction
 from ash.ui.terminal import TerminalUI
 from ash.tools.command import RunCommandTool
 from ash.tools.browser import (
@@ -2455,6 +2455,93 @@ async def test_session_switch_clears_previous_conversation_runtime_state(tmp_pat
     finally:
         await loop.aclose()
         replace_log_context(previous_log_context)
+
+
+@pytest.mark.asyncio
+async def test_permission_mode_override_resumes_but_new_session_uses_default(tmp_path):
+    store = SessionStore(tmp_path / "permission-mode-session.db")
+    ui = TerminalUI(safety_tier="interactive")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+        safety_tier="interactive",
+    )
+
+    first = await loop.start_session()
+    loop.set_permission_mode(PermissionMode.PLAN)
+
+    assert first.permission_mode == "plan"
+    assert store.session_permission_mode(first.session_id) == "plan"
+    assert loop.permission_policy.mode is PermissionMode.PLAN
+    assert ui.safety_tier == "plan"
+
+    second = await loop.start_session()
+
+    assert second.permission_mode == ""
+    assert loop.permission_policy.mode is PermissionMode.INTERACTIVE
+    assert ui.safety_tier == "interactive"
+
+    resumed = await loop.start_session(first.session_id)
+
+    assert resumed.permission_mode == "plan"
+    assert loop.permission_policy.mode is PermissionMode.PLAN
+    assert ui.safety_tier == "plan"
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fork_does_not_inherit_parent_permission_mode_override(tmp_path):
+    store = SessionStore(tmp_path / "permission-mode-fork.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        TerminalUI(safety_tier="interactive"),
+        tmp_path,
+        safety_tier="interactive",
+    )
+    parent = await loop.start_session()
+    loop.set_permission_mode(PermissionMode.AUTO_EDIT)
+    fork = store.fork_session(parent.session_id, message_count=0)
+
+    assert parent.permission_mode == "auto_edit"
+    assert fork.permission_mode == ""
+
+    resumed_fork = await loop.start_session(fork.session_id)
+
+    assert resumed_fork.permission_mode == ""
+    assert loop.permission_policy.mode is PermissionMode.INTERACTIVE
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_session_switch_clears_ephemeral_tool_approvals(tmp_path):
+    ui = TerminalUI(safety_tier="interactive")
+    loop = AshLoop(
+        SessionStore(tmp_path / "session-approval-isolation.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    await loop.start_session()
+    loop.permission_policy.add_session_rule(
+        PermissionRule.create(RuleEffect.ALLOW, "write_file")
+    )
+    ui.approve_tool_for_session("write_file")
+
+    assert loop.permission_policy.evaluate("write_file", {}).action == PolicyAction.ALLOW
+    assert ui.is_tool_approved_for_session("write_file") is True
+
+    await loop.start_session()
+
+    assert loop.permission_policy.session_rules == []
+    assert loop.permission_policy.evaluate("write_file", {}).action == PolicyAction.ASK
+    assert ui.is_tool_approved_for_session("write_file") is False
+    await loop.aclose()
 
 
 @pytest.mark.asyncio
@@ -5604,6 +5691,81 @@ async def test_switch_model_removes_new_primary_from_fallback_chain(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_failed_resumed_session_provider_preparation_preserves_current_session(tmp_path):
+    from ash.config import AshConfig
+    from ash.providers.base import ProviderCapabilityError
+    from ash.providers.identifiers import parse_model_string
+
+    class RoutedProvider(ProviderABC):
+        def __init__(self, route: str, *, fail_capabilities: bool = False) -> None:
+            provider, model = parse_model_string(route)
+            self.provider_family = provider
+            self._model_name = model
+            self.fail_capabilities = fail_capabilities
+            self.closed = False
+
+        @property
+        def model_name(self) -> str:
+            return self._model_name
+
+        def count_tokens(self, text):
+            return len(str(text).split())
+
+        async def detect_capabilities(self, *, refresh: bool = False):
+            del refresh
+            if self.fail_capabilities:
+                raise ProviderCapabilityError("incompatible tool protocol")
+            return self.capabilities
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            yield StreamChunk(content="done", is_done=True)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    config = AshConfig(
+        model="provider/default",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    active_provider = RoutedProvider(config.model)
+    created: list[RoutedProvider] = []
+
+    def provider_factory(next_config):
+        provider = RoutedProvider(
+            next_config.model,
+            fail_capabilities=next_config.model == "provider/broken",
+        )
+        created.append(provider)
+        return provider
+
+    store = SessionStore(tmp_path / "resume-provider-preparation.db")
+    loop = AshLoop(
+        store,
+        active_provider,
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        provider_factory=provider_factory,
+        config=config,
+    )
+    current = await loop.start_session()
+    target = store.create_session(str(tmp_path), model="provider/broken")
+
+    with pytest.raises(ProviderCapabilityError, match="incompatible tool protocol"):
+        await loop.start_session(target.session_id)
+
+    assert loop.current_session is current
+    assert loop.provider is active_provider
+    assert loop._config is config
+    assert loop.active_model_id == "provider/default"
+    assert created[-1].closed is True
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_session_model_switch_is_durable_and_new_restores_default(tmp_path):
     from ash.providers.identifiers import parse_model_string
 
@@ -7216,6 +7378,40 @@ async def test_middleware_skip_persists_effect_boundary_without_tool_execution(
     skipped = [event for event in ui.events if event["type"] == "tool.skipped"]
     assert len(skipped) == 1
     assert skipped[0]["dispatched"] is True
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_is_rejected_before_requesting_approval(tmp_path):
+    approvals: list[str] = []
+
+    async def approve(tool_name, arguments):
+        del arguments
+        approvals.append(tool_name)
+        return True
+
+    store = SessionStore(tmp_path / "unknown-tool-approval.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={},
+        on_tool_approval=approve,
+    )
+    session = await loop.start_session()
+
+    result = await loop.execute_tool("hallucinated_tool", {"value": 1})
+
+    assert approvals == []
+    assert result["success"] is False
+    assert result["error"] == "Unknown tool: hallucinated_tool"
+    record = store.load_session(session.session_id).tool_calls[-1]
+    assert record.tool_name == "hallucinated_tool"
+    assert record.approved is False
+    assert record.executed is False
+    assert record.error == "Unknown tool: hallucinated_tool"
+    await loop.aclose()
 
 
 @pytest.mark.asyncio
