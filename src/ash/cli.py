@@ -1612,8 +1612,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 except (KeyError, ValueError) as exc:
                     _print_classified_error(exc)
                     continue
+                prompt_input.clear_visible_screen()
                 loop.ui.load_session_transcript(session)
-                print(f"Resumed session {session.session_id}", flush=True)
                 continue
             if command.name == "rename":
                 if not arguments or loop.current_session is None:

@@ -36,7 +36,6 @@ from prompt_toolkit.layout import (
     VSplit,
     Window,
 )
-from prompt_toolkit.layout.containers import WindowAlign
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.output.base import Output
@@ -70,6 +69,22 @@ def format_context_bar(used: int, maximum: int, *, cells: int = 8) -> FormattedT
             ("class:status", f" {percent:>3}% "),
         ]
     )
+
+
+def _truncate_status(value: str, width: int) -> str:
+    if get_cwidth(value) <= width:
+        return value
+    if width <= 0:
+        return ""
+    remaining = width - 1
+    visible: list[str] = []
+    for character in value:
+        character_width = get_cwidth(character)
+        if character_width > remaining:
+            break
+        visible.append(character)
+        remaining -= character_width
+    return "".join(visible) + "…"
 
 
 class InlinePromptSurface:
@@ -168,24 +183,11 @@ class InlinePromptSurface:
             ]
         )
         choice_active = Condition(lambda: self._choice_mode)
-        status_row = VSplit(
-            [
-                Window(
-                    FormattedTextControl(self._status_text),
-                    height=1,
-                    dont_extend_height=True,
-                    style="class:status",
-                ),
-                Window(
-                    FormattedTextControl(self._context_text),
-                    width=self._context_width,
-                    height=1,
-                    dont_extend_width=True,
-                    dont_extend_height=True,
-                    align=WindowAlign.RIGHT,
-                    style="class:status",
-                ),
-            ]
+        status_row = Window(
+            FormattedTextControl(self._status_text),
+            height=1,
+            dont_extend_height=True,
+            style="class:status",
         )
 
         body = HSplit(
@@ -332,9 +334,6 @@ class InlinePromptSurface:
             rows += max(1, (width + available - 1) // available)
         return min(8, max(1, rows))
 
-    def _context_width(self) -> int:
-        return 10 if self._output_width() < 48 else 14
-
     def _thinking_text(self) -> AnyFormattedText:
         width = self._output_width()
         revision, rendered = self.thinking_provider(width)
@@ -346,12 +345,23 @@ class InlinePromptSurface:
 
     def _status_text(self) -> FormattedText:
         value = terminal_safe_text(self.status_provider(), single_line=True)
-        return FormattedText([("class:status", f" {value}" if value else " ")])
-
-    def _context_text(self) -> FormattedText:
         used, maximum = self.context_provider()
-        cells = 4 if self._output_width() < 48 else 8
-        return format_context_bar(used, maximum, cells=cells)
+        width = self._output_width()
+        cells = 8 if width >= 48 else 4 if width >= 32 else 2
+        context = format_context_bar(used, maximum, cells=cells)
+        context_width = cells + 6
+        separator = "  " if value else " "
+        available_status_width = max(
+            0,
+            width - 1 - get_cwidth(separator) - context_width,
+        )
+        value = _truncate_status(value, available_status_width)
+        fragments: list[tuple[str, str]] = [
+            ("class:status", f" {value}" if value else " "),
+            ("class:status", separator),
+            *context,
+        ]
+        return FormattedText(fragments)
 
     def _choice_heading(self) -> FormattedText:
         return FormattedText(

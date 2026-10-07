@@ -47,6 +47,7 @@ MAX_EDIT_PREVIEW_LINES = 400
 DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
 MAX_LINEAR_HISTORY_ENTRIES = 12
 LIVE_AUX_PREVIEW_CHARS = 3_000
+ASSISTANT_MESSAGE_PREFIX = "· "
 _EDITOR_ENV_ALLOWLIST = (
     "COLORTERM",
     "DBUS_SESSION_BUS_ADDRESS",
@@ -99,6 +100,15 @@ def _append_preview_truncation(preview: str, truncated: bool) -> str:
     if truncated and not preview.endswith(DIFF_PREVIEW_TRUNCATED):
         return f"{preview}\n{DIFF_PREVIEW_TRUNCATED}"
     return preview
+
+
+def _user_message_text(content: str, style: str) -> Text:
+    """Format each user line with the same transcript marker."""
+
+    return Text(
+        "\n".join(f"> {line}" for line in content.split("\n")),
+        style=style,
+    )
 
 
 def _rich_diff_style(theme_name: str, line: str) -> str:
@@ -687,8 +697,9 @@ class TerminalUI:
             if self._assistant_prefix_pending:
                 self._seal_conversation()
                 self._write_conversation(
-                    Text("ASH  ", style=self.theme.assistant_prefix)
+                    Text("ASH", style=self.theme.assistant_prefix), end="\n"
                 )
+                self._write_conversation(ASSISTANT_MESSAGE_PREFIX)
                 self._assistant_prefix_pending = False
             self._write_conversation(text)
         self._refresh_live()
@@ -725,7 +736,10 @@ class TerminalUI:
         if self.screen_reader_mode and self._active_buffers is not None:
             response = self._active_buffers.response
             if response:
-                self.console.print(Markdown(response, hyperlinks=False))
+                self.console.print(Text("ASH", style=self.theme.assistant_prefix))
+                self.console.print(
+                    Markdown(ASSISTANT_MESSAGE_PREFIX + response, hyperlinks=False)
+                )
         if self._reasoning_entry_id is not None:
             self.transcript.finalize(self._reasoning_entry_id)
         if self._assistant_entry_id is not None:
@@ -1039,7 +1053,9 @@ class TerminalUI:
         self.transcript.append("user", safe, title="you")
         if self._prompt_invalidator is not None and not self.screen_reader_mode:
             self._reasoning_tail = ""
-            self._write_conversation(Text(safe, style=self.theme.user_prefix), end="\n")
+            self._write_conversation(
+                _user_message_text(safe, self.theme.user_prefix), end="\n"
+            )
             self._write_conversation("\n")
             self._refresh_live(force=True)
 
@@ -1075,21 +1091,24 @@ class TerminalUI:
         entries = self.transcript.snapshot()
         visible = entries[-MAX_LINEAR_HISTORY_ENTRIES:]
         omitted = len(entries) - len(visible)
-        heading = (
-            f"Recent conversation · {omitted} earlier entr"
-            f"{'y' if omitted == 1 else 'ies'} omitted"
-            if omitted
-            else "Recent conversation"
-        )
-        self.console.print(Text(heading, style="dim"))
+        if omitted:
+            self.console.print(Text(f"… {omitted} earlier entries omitted", style="dim"))
+            self.console.print()
+        previous_kind: str | None = None
         for entry in visible:
             if entry.kind == "user":
-                self.console.print(Text(entry.content, style=self.theme.user_prefix))
-            elif entry.kind == "assistant":
+                if previous_kind in {"assistant", "tool"}:
+                    self.console.print()
                 self.console.print(
-                    Group(
-                        Text("ASH", style=self.theme.assistant_prefix),
-                        Markdown(entry.content, hyperlinks=False),
+                    _user_message_text(entry.content, self.theme.user_prefix)
+                )
+                self.console.print()
+            elif entry.kind == "assistant":
+                self.console.print(Text("ASH", style=self.theme.assistant_prefix))
+                self.console.print(
+                    Markdown(
+                        ASSISTANT_MESSAGE_PREFIX + entry.content,
+                        hyperlinks=False,
                     )
                 )
             else:
@@ -1097,6 +1116,7 @@ class TerminalUI:
                 line = Text(f"{label}  ", style="dim bold")
                 line.append(entry.content, style="dim")
                 self.console.print(line)
+            previous_kind = entry.kind
 
     def _edit_preview(
         self,

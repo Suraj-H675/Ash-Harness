@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pty
+import re
 import select
 import shutil
 import subprocess
@@ -10,6 +11,12 @@ import time
 from pathlib import Path
 
 import pytest
+
+
+def _plain_terminal_output(raw: bytes) -> bytes:
+    return re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", raw).replace(
+        b"\r\n", b"\n"
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
@@ -169,6 +176,7 @@ asyncio.run(main())
         os.close(master_fd)
 
     raw = bytes(captured)
+    plain = _plain_terminal_output(raw).decode("utf-8")
     assert b"HYBRID_RESULT=continue" in raw
     for marker in (
         b"hello from user",
@@ -184,6 +192,11 @@ asyncio.run(main())
         b"I found the issue and I am applying the fix."
     )
     assert raw.count(b"I found the issue and I am applying the fix.") == 1
+    assert "> hello from user" in plain
+    assert plain.index("> hello from user") < plain.index("ASH")
+    assert plain.index("ASH") < plain.index("· I found the issue and I am applying the fix.")
+    assert "gpt-test · effort medium · ~/Ash-Harness" in plain
+    assert "50%" in plain
     assert b"YOU" not in raw
     assert b"STEER" not in raw
     assert b"\x1b[3J" not in raw
@@ -195,6 +208,119 @@ asyncio.run(main())
         b"\x1b[?1015h",
     ):
         assert sequence not in raw
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_resuming_replaces_visible_chat_and_preserves_scrollback(tmp_path: Path) -> None:
+    from datetime import datetime, timezone
+
+    from ash.core.session import Message, SessionStore
+
+    workspace = tmp_path / "workspace"
+    child_home = tmp_path / "home"
+    db_directory = tmp_path / "db"
+    workspace.mkdir()
+    child_home.mkdir()
+    db_directory.mkdir()
+    environment = {
+        "PATH": os.defpath,
+        "HOME": str(child_home),
+        "USERPROFILE": str(child_home),
+        "TMPDIR": str(tmp_path),
+        "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
+        "ASH_DB_DIRECTORY": str(db_directory),
+        "ASH_MODEL": "lmstudio/local-model",
+        "TERM": "xterm-256color",
+        "COLORTERM": "truecolor",
+    }
+    denied = subprocess.run(
+        [sys.executable, "-m", "ash", "trust", "remove", str(workspace)],
+        cwd=workspace,
+        env=environment,
+        capture_output=True,
+        timeout=30,
+    )
+    assert denied.returncode == 0, denied.stderr.decode("utf-8", errors="replace")
+
+    store = SessionStore(db_directory / "sessions.db")
+    active = store.create_session(str(workspace), model="lmstudio/local-model")
+    selected = store.create_session(str(workspace), model="lmstudio/local-model")
+    timestamp = datetime.now(timezone.utc)
+    store.save_message(
+        active.session_id,
+        Message(role="user", content="abandoned question", timestamp=timestamp),
+    )
+    store.save_message(
+        active.session_id,
+        Message(role="assistant", content="abandoned answer", timestamp=timestamp),
+    )
+    store.save_message(
+        selected.session_id,
+        Message(role="user", content="selected question", timestamp=timestamp),
+    )
+    store.save_message(
+        selected.session_id,
+        Message(role="assistant", content="selected answer", timestamp=timestamp),
+    )
+
+    master_fd, slave_fd = pty.openpty()
+    process = subprocess.Popen(
+        [sys.executable, "-m", "ash", "--session", active.session_id],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=workspace,
+        env=environment,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    captured = bytearray()
+
+    def expect(marker: bytes, *, after: int = 0) -> None:
+        deadline = time.monotonic() + 30
+        while marker not in captured[after:]:
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"terminal did not show {marker!r}: "
+                    + bytes(captured).decode("utf-8", errors="replace")[-3000:]
+                )
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(master_fd, 65_536)
+                except OSError as exc:
+                    raise AssertionError("terminal closed before expected output") from exc
+                if not chunk:
+                    raise AssertionError("terminal ended before expected output")
+                captured.extend(chunk)
+
+    try:
+        expect(b"abandoned answer")
+        expect("›".encode())
+        os.write(master_fd, f"/resume {selected.session_id}\r".encode())
+        expect(b"selected answer")
+        selected_answer_end = captured.index(b"selected answer") + len(
+            b"selected answer"
+        )
+        expect("›".encode(), after=selected_answer_end)
+        os.write(master_fd, b"/exit\r")
+        process.wait(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)
+
+    raw = bytes(captured)
+    plain = _plain_terminal_output(raw).decode("utf-8")
+    clear_position = raw.index(b"\x1b[2J", raw.index(b"abandoned answer"))
+    selected_position = raw.index(b"selected question", clear_position)
+    assert raw.index(b"abandoned answer") < clear_position < selected_position
+    assert b"\x1b[3J" not in raw
+    assert b"abandoned" not in raw[clear_position:]
+    assert "> abandoned question\n\nASH\n· abandoned answer" in plain
+    assert "> selected question\n\nASH\n· selected answer" in plain
+    assert "Recent conversation" not in plain
+    assert process.returncode == 0
 
 
 @pytest.mark.skipif(

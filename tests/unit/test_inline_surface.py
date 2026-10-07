@@ -45,7 +45,7 @@ async def test_composer_and_status_dock_to_bottom_without_fullscreen() -> None:
         surface = InlinePromptSurface(
             history=InMemoryHistory(),
             completer=None,
-            status_provider=lambda: "model · reasoning · ~/repo",
+            status_provider=lambda: "model · effort high · ~/repo",
             context_provider=lambda: (25, 100),
             thinking_provider=thinking_provider,
             input_mode="emacs",
@@ -71,9 +71,11 @@ async def test_composer_and_status_dock_to_bottom_without_fullscreen() -> None:
         }
         composer_row = next(y for y, text in rows.items() if "›" in text)
         status_row = next(y for y, text in rows.items() if "model" in text)
+        status_text = rows[status_row]
 
         assert composer_row == 18
         assert status_row == 19
+        assert status_text.index("model") < status_text.index("25%")
 
         thinking[0] = "thinking content"
         revision[0] += 1
@@ -131,13 +133,13 @@ def test_composer_height_counts_wrapped_rows() -> None:
     assert surface._composer_height() == 3
 
 
-def test_context_bar_compacts_on_narrow_terminal() -> None:
+def test_status_and_context_stay_inline_and_fit_narrow_terminals() -> None:
     output = SizedDummyOutput()
     output.columns = 40
     surface = InlinePromptSurface(
         history=InMemoryHistory(),
         completer=None,
-        status_provider=lambda: "model · reasoning · ~/very/long/project",
+        status_provider=lambda: "model · effort high · ~/very/long/project",
         context_provider=lambda: (50, 100),
         thinking_provider=lambda _width: (0, ""),
         input_mode="emacs",
@@ -147,7 +149,12 @@ def test_context_bar_compacts_on_narrow_terminal() -> None:
         output=output,
     )
 
-    assert surface._context_width() == 10
-    assert fragment_list_to_text(to_formatted_text(surface._context_text())) == (
-        "██░░  50% "
-    )
+    status = fragment_list_to_text(to_formatted_text(surface._status_text()))
+    assert status.startswith(" model · effort high · ~/ve…")
+    assert "  ██░░  50% " in status
+    assert len(status) == 40
+
+    output.columns = 20
+    narrow = fragment_list_to_text(to_formatted_text(surface._status_text()))
+    assert len(narrow) == 20
+    assert "█░  50% " in narrow
