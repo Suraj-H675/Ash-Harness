@@ -107,12 +107,13 @@ async def test_background_report_stays_pending_until_parent_acknowledges(tmp_pat
     state = SharedState(tmp_path / "agents.db", workspace=tmp_path)
     tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider)
     try:
-        started = await tool.run(
-            role="reviewer",
-            task="inspect tests",
-            agent_id="background-reviewer",
-            background=True,
-        )
+        with tool.event_context({"session_id": "session-a"}):
+            started = await tool.run(
+                role="reviewer",
+                task="inspect tests",
+                agent_id="background-reviewer",
+                background=True,
+            )
         assert started.success is True
         durable = state.tasks.list_tasks()[0]
         terminal = await asyncio.wait_for(
@@ -121,8 +122,10 @@ async def test_background_report_stays_pending_until_parent_acknowledges(tmp_pat
         )
         assert terminal[0].state == "succeeded"
 
-        pending = tool.pending_background_reports()
+        assert tool.pending_background_reports(session_id="session-b") == []
+        pending = tool.pending_background_reports(session_id="session-a")
         assert len(pending) == 1
+        assert pending[0]["origin_session_id"] == "session-a"
         assert pending[0]["agent_id"] == "background-reviewer"
         assert pending[0]["summary"] == "evidence: tests pass"
         assert pending[0]["durable_task_id"] == durable.task_id

@@ -844,21 +844,23 @@ async def test_background_graph_and_runtime_start_resume_persisted_work(
     tmp_path: Path,
 ) -> None:
     config, spawn, delegate = _tools(tmp_path)
-    submitted = await delegate.run(
-        goal="background",
-        background=True,
-        tasks=[
+    with delegate.event_context({"session_id": "session-graph"}):
+        submitted = await delegate.run(
+            goal="background",
+            background=True,
+            tasks=[
             {
                 "key": "queued",
                 "role": "reviewer",
                 "task": "background task",
                 "isolation": "shared",
             }
-        ],
-    )
+            ],
+        )
     task_id = json.loads(submitted.output)["tasks"][0]["task_id"]
     terminal = await spawn.wait_for_tasks([task_id])
     assert terminal[0].state == "succeeded"
+    assert terminal[0].metadata["origin_session_id"] == "session-graph"
     await delegate.aclose()
     await spawn.aclose()
 

@@ -141,6 +141,10 @@ class DelegateAgentsTool(BaseTool):
         graph_id = f"graph-{uuid.uuid4().hex[:12]}"
         task_ids = {key: f"{graph_id}-{key}" for key in keys}
         workspace = str(Path(self.safety_guard.project_root).resolve())
+        execution_context = self.event_context_data()
+        origin_session_id = execution_context.get("session_id")
+        if not isinstance(origin_session_id, str) or not origin_session_id:
+            origin_session_id = None
         definitions = [
             AgentTaskCreate(
                 description=spec.task,
@@ -164,6 +168,11 @@ class DelegateAgentsTool(BaseTool):
                     "spawn_depth": self._spawn_tool.child_spawn_depth,
                     "task_key": spec.key,
                     "workspace": workspace,
+                    **(
+                        {"origin_session_id": origin_session_id}
+                        if origin_session_id is not None
+                        else {}
+                    ),
                 },
                 graph_cost_budget_usd=args.graph_cost_budget_usd,
             )

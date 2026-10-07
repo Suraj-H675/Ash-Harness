@@ -1399,6 +1399,10 @@ class SpawnAgentTool(BaseTool):
                             f"{existing_children}/{self._max_children_per_task}."
                         ),
                     )
+            execution_context = self.event_context_data()
+            origin_session_id = execution_context.get("session_id")
+            if not isinstance(origin_session_id, str) or not origin_session_id:
+                origin_session_id = None
             try:
                 durable_task = self._shared_state.tasks.create_task(
                     args.task,
@@ -1414,6 +1418,11 @@ class SpawnAgentTool(BaseTool):
                         "spawn_depth": task_spawn_depth,
                         "workspace": str(
                             Path(self.safety_guard.project_root).resolve()
+                        ),
+                        **(
+                            {"origin_session_id": origin_session_id}
+                            if origin_session_id is not None
+                            else {}
                         ),
                     },
                 )
@@ -1873,6 +1882,13 @@ class SpawnAgentTool(BaseTool):
                     metadata={
                         "durable_task_id": durable_task.task_id,
                         "background": durable_task.metadata.get("background") is True,
+                        **(
+                            {"origin_session_id": durable_task.metadata["origin_session_id"]}
+                            if isinstance(
+                                durable_task.metadata.get("origin_session_id"), str
+                            )
+                            else {}
+                        ),
                         **(
                             {"graph_id": durable_task.metadata["graph_id"]}
                             if isinstance(durable_task.metadata.get("graph_id"), str)
@@ -2781,8 +2797,13 @@ class SpawnAgentTool(BaseTool):
                 current_task=failure[:200],
             )
 
-    def pending_background_reports(self, *, limit: int = 32) -> list[dict[str, Any]]:
-        """Return durable background reports awaiting parent-session delivery."""
+    def pending_background_reports(
+        self,
+        *,
+        limit: int = 32,
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return pending reports, optionally bound to one parent session."""
 
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("background report limit must be between 1 and 100")
@@ -2796,6 +2817,9 @@ class SpawnAgentTool(BaseTool):
             metadata = message.content.get("metadata")
             if not isinstance(metadata, dict) or metadata.get("background") is not True:
                 continue
+            origin_session_id = metadata.get("origin_session_id")
+            if session_id is not None and origin_session_id != session_id:
+                continue
             reports.append(
                 {
                     "message_id": message.message_id,
@@ -2807,6 +2831,7 @@ class SpawnAgentTool(BaseTool):
                     "artifacts": message.content.get("artifacts", {}),
                     "durable_task_id": metadata.get("durable_task_id"),
                     "graph_id": metadata.get("graph_id"),
+                    "origin_session_id": origin_session_id,
                 }
             )
             if len(reports) >= limit:

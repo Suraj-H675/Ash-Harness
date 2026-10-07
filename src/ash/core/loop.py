@@ -4363,7 +4363,10 @@ class AshLoop:
         if not callable(pending) or not callable(acknowledge):
             return 0
         try:
-            reports = pending(limit=MAX_BACKGROUND_AGENT_REPORTS_PER_BOUNDARY)
+            reports = pending(
+                limit=MAX_BACKGROUND_AGENT_REPORTS_PER_BOUNDARY,
+                session_id=session.session_id,
+            )
         except Exception as exc:  # noqa: BLE001 - background delivery is non-fatal
             _log.warning(
                 "could not inspect pending background agent reports: {}",
@@ -5729,7 +5732,16 @@ class AshLoop:
                 else:
                     self._emit_event({"type": "tool.started", **event_base})
                     with log_context(operation_id=record.call_id):
-                        with tool.event_context(event_base):
+                        tool_context = {
+                            **event_base,
+                            "session_id": session.session_id,
+                            **(
+                                {"turn_id": self.turn_context.turn_id}
+                                if self.turn_context is not None
+                                else {}
+                            ),
+                        }
+                        with tool.event_context(tool_context):
                             tool_started = True
                             result_dict = await _execute_tool_once(
                                 tool, deepcopy(arguments)
