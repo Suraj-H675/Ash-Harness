@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 import time
+import json
+import struct
 from pathlib import Path
 
 import pytest
@@ -211,6 +213,180 @@ asyncio.run(main())
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_activity_dock_animates_and_collapses_on_a_narrow_real_pty(
+    tmp_path: Path,
+) -> None:
+    import fcntl
+    import termios
+
+    ready_path = tmp_path / "dock-ready"
+    states_path = tmp_path / "dock-states.json"
+    code = r"""
+import asyncio
+import json
+from pathlib import Path
+from rich.console import Console
+from ash.ui.prompt import PromptInput
+from ash.ui.terminal import TerminalUI
+
+async def main():
+    ui = TerminalUI(
+        console=Console(force_terminal=True, color_system="truecolor", no_color=False),
+    )
+    prompt = PromptInput(
+        history_path=Path("__HISTORY__"),
+        status_provider=lambda: "gpt-test · effort medium · ~/Ash-Harness",
+        context_provider=lambda: (32, 64),
+        dock_provider=ui.prompt_dock_view,
+        no_color=False,
+    )
+    ui.bind_prompt_surface(prompt.invalidate, prompt.write_terminal)
+    ui.record_user_input("123456789012345678901234567890🙂\nsecond line")
+    snapshots = []
+
+    def capture(name):
+        surface = prompt._surface
+        assert surface is not None
+        screen = surface.application.renderer._last_screen
+        assert screen is not None
+        rows = []
+        for y in range(12):
+            cells = screen.data_buffer.get(y, {})
+            rows.append("".join(cell.char for _x, cell in sorted(cells.items())).rstrip())
+        snapshots.append({"name": name, "rows": rows})
+
+    with ui.begin_turn():
+        pending = asyncio.create_task(prompt.read("steer> "))
+        await asyncio.sleep(0.1)
+        ui.emit_event({"type": "turn.started"})
+        ui.emit_event({"type": "model.request.started", "operation_id": "r1"})
+        await asyncio.sleep(0.05)
+        capture("thinking-a")
+        await asyncio.sleep(0.5)
+        capture("thinking-b")
+        await asyncio.sleep(0.5)
+        capture("thinking-c")
+        ui.print_thought("checking the narrow terminal layout")
+        await asyncio.sleep(0.05)
+        capture("reasoning-with-activity")
+        ui.emit_event({"type": "model.request.completed", "operation_id": "r1"})
+        await asyncio.sleep(0.05)
+        capture("reasoning-only")
+        ui.emit_event({"type": "tool.requested", "tool": "read_file", "call_id": "f1"})
+        ui.emit_event({"type": "tool.started", "tool": "read_file", "call_id": "f1"})
+        await asyncio.sleep(0.05)
+        capture("inspecting")
+        ui.emit_event({"type": "tool.output", "tool": "read_file", "call_id": "f1", "delta": "tool output\n"})
+        await asyncio.sleep(0.05)
+        capture("tool-output-still-active")
+        ui.emit_event({"type": "tool.completed", "tool": "read_file", "call_id": "f1", "success": True})
+        await asyncio.sleep(0.05)
+        capture("tool-completed")
+        ui.emit_event({"type": "turn.completed"})
+        await asyncio.sleep(0.05)
+        capture("idle")
+        Path("__READY__").write_text("ready", encoding="utf-8")
+        value = await pending
+    ui.finalize_turn()
+    prompt.close()
+    Path("__STATES__").write_text(json.dumps(snapshots), encoding="utf-8")
+    print("DOCK_RESULT=" + value, flush=True)
+
+asyncio.run(main())
+"""
+    code = (
+        code.replace("__HISTORY__", str(tmp_path / "history"))
+        .replace("__READY__", str(ready_path))
+        .replace("__STATES__", str(states_path))
+    )
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 30, 0, 0))
+    environment = os.environ.copy()
+    environment.pop("NO_COLOR", None)
+    environment["TERM"] = "xterm-256color"
+    environment["COLORTERM"] = "truecolor"
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    captured = bytearray()
+    deadline = time.monotonic() + 8
+    sent = False
+    try:
+        while time.monotonic() < deadline:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(master_fd, 65_536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                captured.extend(chunk)
+            if ready_path.exists() and not sent:
+                os.write(master_fd, b"done\r")
+                sent = True
+            if b"DOCK_RESULT=done" in captured:
+                break
+        assert sent, bytes(captured).decode("utf-8", errors="replace")[-3000:]
+        assert b"DOCK_RESULT=done" in captured
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)
+
+    raw = bytes(captured)
+    plain = _plain_terminal_output(raw).decode("utf-8", errors="replace")
+    states = {
+        snapshot["name"]: snapshot["rows"]
+        for snapshot in json.loads(states_path.read_text())
+    }
+    thinking_frames = [
+        next(row for row in states[name] if row.startswith("Thinking"))
+        for name in ("thinking-a", "thinking-b", "thinking-c")
+    ]
+    assert len(set(thinking_frames)) == 3
+    assert any("Inspecting" in row for row in states["inspecting"])
+    assert any("checking the n" in row for row in states["reasoning-with-activity"])
+    assert any("Reasoning:" in row for row in states["reasoning-only"])
+    assert any("Inspecting" in row for row in states["tool-output-still-active"])
+    assert any("Reasoning:" in row for row in states["tool-completed"])
+    active_composer_row = next(
+        index for index, row in enumerate(states["inspecting"]) if "›" in row
+    )
+    idle_composer_row = next(
+        index for index, row in enumerate(states["idle"]) if "›" in row
+    )
+    assert idle_composer_row == active_composer_row
+    assert not any(
+        marker in row
+        for row in states["idle"]
+        for marker in ("Thinking", "Inspecting", "Reasoning:")
+    )
+    assert "1234567890123456789012345678" in plain
+    assert "90🙂" in plain
+    assert "second line" in plain
+    assert b"48;2;48;48;48" in raw
+    assert b"\x1b[?1049h" not in raw
+    for sequence in (
+        b"\x1b[?1000h",
+        b"\x1b[?1002h",
+        b"\x1b[?1003h",
+        b"\x1b[?1006h",
+        b"\x1b[?1015h",
+    ):
+        assert sequence not in raw
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
 def test_resuming_replaces_visible_chat_and_preserves_scrollback(tmp_path: Path) -> None:
     from datetime import datetime, timezone
 
@@ -317,8 +493,8 @@ def test_resuming_replaces_visible_chat_and_preserves_scrollback(tmp_path: Path)
     assert raw.index(b"abandoned answer") < clear_position < selected_position
     assert b"\x1b[3J" not in raw
     assert b"abandoned" not in raw[clear_position:]
-    assert "> abandoned question\n\nASH\n· abandoned answer" in plain
-    assert "> selected question\n\nASH\n· selected answer" in plain
+    assert re.search(r"> abandoned question *\n\nASH\n· abandoned answer", plain)
+    assert re.search(r"> selected question *\n\nASH\n· selected answer", plain)
     assert "Recent conversation" not in plain
     assert process.returncode == 0
 

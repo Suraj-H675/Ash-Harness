@@ -1,9 +1,10 @@
 # tests/unit/test_terminal_ui.py
 import os
+import re
 from pathlib import Path
 
 from ash.ui import terminal as terminal_module
-from ash.ui.terminal import TerminalUI
+from ash.ui.terminal import TerminalUI, _user_message_text
 from ash.ui.safe_text import terminal_safe_text
 from io import StringIO
 import pytest
@@ -218,9 +219,11 @@ def test_prompt_thinking_view_does_not_read_committed_history(
 
         monkeypatch.setattr(ui.transcript, "snapshot", fail_snapshot)
         _revision, rendered = ui.prompt_thinking_view(80)
+        dock_view = ui.prompt_dock_view()
 
     plain = fragment_list_to_text(to_formatted_text(rendered))
     assert "current reasoning" in plain
+    assert dock_view.reasoning == "current reasoning"
     assert "old answer" not in plain
 
 
@@ -237,7 +240,7 @@ def test_prompt_surface_streams_to_scrollback_without_final_reprint() -> None:
     ui.finalize_turn()
     ui.commit_completed_turn()
     rendered = output.getvalue()
-    assert "> question\n\nASH\n· first answer" in rendered
+    assert re.search(r"> question *\n\nASH\n· first answer", rendered)
     assert rendered.count("first answer") == 1
     assert "checking" not in rendered
     assert "THINK  checking" in fragment_list_to_text(
@@ -273,16 +276,104 @@ def test_hybrid_conversation_uses_blue_user_text_and_unboxed_assistant() -> None
 
     rendered = output.getvalue()
     assert "> hello from user" in rendered
-    assert "38;2;95;135;255" in rendered
+    assert "38;2;111;149;255" in rendered
+    assert "48;2;48;48;48" in rendered
     assert "YOU" not in rendered
-    assert "╭" not in rendered
-    assert "╰" not in rendered
     assert "ASH" in rendered
     assert rendered.count("hello from ash") == 1
     assert "THINK  " not in rendered
     assert "THINK  checking" in reasoning_text
     assert "╭" not in rendered
     assert "╰" not in rendered
+
+
+def test_user_message_band_wraps_by_terminal_cells_with_composer_gray() -> None:
+    console = Console(
+        file=StringIO(),
+        force_terminal=True,
+        color_system="truecolor",
+        no_color=False,
+        width=12,
+    )
+    band = _user_message_text(
+        "alpha🙂beta\nsecond",
+        theme_name="dark",
+        console=console,
+        width=12,
+    )
+
+    rows = band.plain.splitlines()
+    assert len(rows) == 3
+    assert all(Text(row).cell_len == 12 for row in rows)
+    assert rows[0].startswith("> alpha🙂be")
+    assert rows[1].startswith("  a")
+    assert rows[2].startswith("> second")
+    console.print(band, soft_wrap=True, highlight=False)
+    assert "48;2;48;48;48" in console.file.getvalue()
+
+
+def test_user_band_uses_light_composer_gray() -> None:
+    output = StringIO()
+    console = Console(
+        file=output,
+        force_terminal=True,
+        color_system="truecolor",
+        no_color=False,
+        width=24,
+    )
+    band = _user_message_text(
+        "light text",
+        theme_name="light",
+        console=console,
+        width=24,
+    )
+    console.print(band, soft_wrap=True, highlight=False)
+
+    assert "48;2;234;234;234" in output.getvalue()
+    assert "38;2;0;95;175" in output.getvalue()
+
+
+def test_no_color_user_band_keeps_markers_without_invisible_fill() -> None:
+    console = Console(file=StringIO(), force_terminal=False, no_color=True, width=24)
+    band = _user_message_text(
+        "plain text",
+        theme_name="dark",
+        console=console,
+        width=24,
+    )
+
+    assert band.plain == "> plain text"
+
+
+def test_live_user_band_width_is_chosen_when_queued_write_runs() -> None:
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=80)
+    ui = TerminalUI(console=console)
+    queued = []
+    ui.bind_prompt_surface(lambda: None, queued.append)
+
+    ui.record_user_input("🙂 this wraps at the live width")
+    console.width = 12
+    queued.pop(0)()
+
+    rows = output.getvalue().split("\n")
+    assert rows[0].startswith("> ")
+    assert len(rows) > 2
+    assert all(Text(row).cell_len <= 12 for row in rows if row)
+
+
+def test_inter_turn_spacing_adds_one_blank_line_before_the_next_user() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False, width=40))
+    ui.bind_prompt_surface(lambda: None)
+    ui.record_user_input("first question")
+    with ui.begin_turn():
+        ui.print_token("first answer")
+    ui.finalize_turn()
+
+    ui.record_user_input("second question")
+
+    assert "· first answer\n\n> second question" in output.getvalue()
 
 
 def test_prompt_surface_streams_long_response_once_without_preview_truncation() -> None:
@@ -341,7 +432,7 @@ def test_inline_long_tool_activity_remains_visible_after_reasoning() -> None:
         rendered = ui._render_active_turn()
         ui.console.print(rendered)
 
-    assert "Running read_file…" in output.getvalue()
+    assert "Inspecting…" in output.getvalue()
 
 
 def test_inline_tool_lifecycle_uses_shared_semantic_label() -> None:
@@ -360,8 +451,12 @@ def test_inline_tool_lifecycle_uses_shared_semantic_label() -> None:
     assert "TOOL  read_file [completed]" in output.getvalue()
 
 
-@pytest.mark.parametrize("terminal_event", ["turn.completed", "turn.cancelled", "turn.error"])
-def test_terminal_activity_clears_on_every_turn_terminal_event(terminal_event: str) -> None:
+@pytest.mark.parametrize(
+    "terminal_event", ["turn.completed", "turn.cancelled", "turn.error"]
+)
+def test_terminal_activity_clears_on_every_turn_terminal_event(
+    terminal_event: str,
+) -> None:
     ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
 
     ui.emit_event(
@@ -371,18 +466,37 @@ def test_terminal_activity_clears_on_every_turn_terminal_event(terminal_event: s
             "max_attempts": 3,
         }
     )
-    assert ui._activity_status == "Retrying model (2/3)…"
+    assert ui._activity_status == "Retrying…"
 
     ui.emit_event({"type": terminal_event})
 
     assert ui._activity_status == ""
 
 
-def test_tool_output_replaces_long_tool_activity_with_visible_output() -> None:
+@pytest.mark.parametrize(
+    "terminal_event", ["turn.completed", "turn.cancelled", "turn.error"]
+)
+def test_terminal_events_hide_busy_and_reasoning_dock(terminal_event: str) -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.bind_prompt_surface(lambda: None)
+    ui.emit_event({"type": "turn.started"})
+    ui.emit_event({"type": "model.request.started", "operation_id": "r1"})
+    with ui.begin_turn():
+        ui.print_thought("reasoning that must not look busy")
+        assert ui.prompt_dock_view().activity == "Thinking"
+        assert ui.prompt_dock_view().reasoning
+        ui.emit_event({"type": terminal_event})
+
+    view = ui.prompt_dock_view()
+    assert view.activity is None
+    assert view.reasoning == ""
+
+
+def test_tool_output_preserves_activity_while_rendering_output() -> None:
     ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
 
     ui.emit_event({"type": "tool.started", "tool": "run_command", "call_id": "c1"})
-    assert ui._activity_status == "Running run_command…"
+    assert ui._activity_status == "Running…"
 
     ui.emit_event(
         {
@@ -395,8 +509,113 @@ def test_tool_output_replaces_long_tool_activity_with_visible_output() -> None:
     )
 
     entries = ui.transcript.snapshot()
-    assert ui._activity_status == ""
+    assert ui._activity_status == "Running…"
     assert [entry.content for entry in entries] == ["building…\n"]
+
+
+def test_activity_dock_tracks_model_tools_retries_and_terminal_state() -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.bind_prompt_surface(lambda: None)
+
+    ui.emit_event({"type": "turn.started"})
+    assert ui.prompt_dock_view().activity is None
+
+    ui.emit_event({"type": "model.request.started", "operation_id": "request-1"})
+    assert ui.prompt_dock_view().activity == "Thinking"
+    ui.emit_event({"type": "assistant.delta", "text": "hello"})
+    assert ui.prompt_dock_view().activity == "Responding"
+    ui.emit_event({"type": "model.request.completed", "operation_id": "stale-request"})
+    assert ui.prompt_dock_view().activity == "Responding"
+    ui.emit_event({"type": "model.request.completed", "operation_id": "request-1"})
+    assert ui.prompt_dock_view().activity is None
+
+    ui.emit_event({"type": "tool.requested", "tool": "read_file"})
+    assert ui.prompt_dock_view().activity is None
+    ui.emit_event({"type": "tool.started", "tool": "read_file", "call_id": "read-1"})
+    assert ui.prompt_dock_view().activity == "Inspecting"
+    ui.emit_event({"type": "tool.started", "tool": "web_search", "call_id": "search-1"})
+    assert ui.prompt_dock_view().activity == "Working"
+    ui.emit_event(
+        {
+            "type": "tool.output",
+            "tool": "web_search",
+            "call_id": "search-1",
+            "delta": "still working",
+        }
+    )
+    assert ui.prompt_dock_view().activity == "Working"
+    ui.emit_event(
+        {
+            "type": "tool.completed",
+            "tool": "web_search",
+            "call_id": "search-1",
+            "success": True,
+        }
+    )
+    assert ui.prompt_dock_view().activity == "Inspecting"
+    ui.emit_event({"type": "tool.error", "tool": "read_file", "call_id": "read-1"})
+    assert ui.prompt_dock_view().activity is None
+
+    ui.emit_event({"type": "provider.retrying", "attempt": 2})
+    assert ui.prompt_dock_view().activity == "Retrying"
+    ui.emit_event({"type": "model.request.started", "operation_id": "request-2"})
+    assert ui.prompt_dock_view().activity == "Thinking"
+    with ui.begin_turn():
+        ui.print_thought("bounded provider reasoning")
+        assert ui.prompt_dock_view().reasoning == "bounded provider reasoning"
+        ui.emit_event({"type": "turn.cancelled"})
+
+    view = ui.prompt_dock_view()
+    assert view.activity is None
+    assert view.reasoning == ""
+    ui.emit_event({"type": "tool.started", "tool": "run_command", "call_id": "late"})
+    assert ui.prompt_dock_view().activity is None
+
+
+@pytest.mark.parametrize(
+    ("tool", "expected"),
+    [
+        ("read_file", "Inspecting"),
+        ("search_text", "Inspecting"),
+        ("web_search", "Researching"),
+        ("browser_snapshot", "Browsing"),
+        ("replace_file_content", "Coding"),
+        ("run_command", "Running"),
+        ("auto_commit", "Committing"),
+        ("activate_skill", "Loading"),
+        ("manage_automation", "Scheduling"),
+        ("update_goal", "Planning"),
+        ("ask_user", "Waiting"),
+        ("brave", "Researching"),
+        ("delegate_remote_agent", "Delegating"),
+        ("mcp__untrusted_server__magic", "Working"),
+    ],
+)
+def test_tool_activity_taxonomy_is_exact_and_safe(tool: str, expected: str) -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.emit_event({"type": "tool.started", "tool": tool, "call_id": "call-1"})
+
+    view = ui.prompt_dock_view()
+    assert view.activity == expected
+    assert tool not in view.activity
+
+
+def test_reduced_motion_keeps_semantic_activity_invalidation() -> None:
+    invalidations = 0
+
+    def invalidate() -> None:
+        nonlocal invalidations
+        invalidations += 1
+
+    ui = TerminalUI(
+        console=Console(file=StringIO(), force_terminal=False),
+        reduced_motion=True,
+    )
+    ui.bind_prompt_surface(invalidate)
+    ui.emit_event({"type": "model.request.started", "operation_id": "r1"})
+
+    assert invalidations == 1
+    assert ui.prompt_dock_view().activity == "Thinking"
 
 
 def test_multiple_tools_keep_only_terminal_lifecycle_rows() -> None:
@@ -442,10 +661,23 @@ def test_screen_reader_activity_is_linear_and_deduplicated() -> None:
             "max_attempts": 3,
         }
     )
+    ui.emit_event(
+        {"type": "tool.started", "tool": "read_file", "call_id": "reader-1"}
+    )
+    ui.emit_event(
+        {
+            "type": "tool.output",
+            "tool": "read_file",
+            "call_id": "reader-1",
+            "delta": "file bytes",
+        }
+    )
 
     rendered = output.getvalue()
-    assert rendered.count("Status: Thinking…") == 1
-    assert "Status: Retrying model (2/3)…" in rendered
+    assert rendered.count("Status: Thinking") == 1
+    assert "Status: Retrying" in rendered
+    assert rendered.count("Status: Inspecting") == 1
+    assert "Status: read_file" not in rendered
 
 
 def test_terminal_ui_hydrates_bounded_durable_session_transcript() -> None:
@@ -503,7 +735,7 @@ def test_inline_resume_renders_bounded_recent_conversation() -> None:
     assert "Recent conversation" not in rendered
     assert "… 3 earlier entries omitted" in rendered
     assert "question 0" not in rendered
-    assert "> question 3\n\n> question 4" in rendered
+    assert re.search(r"> question 3 *\n\n> question 4", rendered)
     assert "YOU" not in rendered
     assert "\nASH\n· latest answer" in rendered
     assert "╭" not in rendered

@@ -7,8 +7,13 @@ from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.utils import get_cwidth
 
-from ash.ui.inline_surface import InlinePromptSurface, format_context_bar
+from ash.ui.inline_surface import (
+    ActivityDockView,
+    InlinePromptSurface,
+    format_context_bar,
+)
 from ash.ui.theme import get_theme
 
 
@@ -92,7 +97,7 @@ async def test_composer_and_status_dock_to_bottom_without_fullscreen() -> None:
         )
         composer_row_after = next(y for y, text in rows.items() if "›" in text)
         assert composer_row_after == composer_row
-        assert reasoning_row + 2 == composer_row_after
+        assert reasoning_row + 1 == composer_row_after
 
         thinking[0] = ""
         revision[0] += 1
@@ -158,3 +163,116 @@ def test_status_and_context_stay_inline_and_fit_narrow_terminals() -> None:
     narrow = fragment_list_to_text(to_formatted_text(surface._status_text()))
     assert len(narrow) == 20
     assert "█░  50% " in narrow
+
+
+def test_dock_animation_is_width_stable_and_reduced_motion_is_static() -> None:
+    output = SizedDummyOutput()
+    view = ActivityDockView(
+        revision=1,
+        activity="Inspecting",
+        reasoning="checking the import path",
+    )
+    surface = InlinePromptSurface(
+        history=InMemoryHistory(),
+        completer=None,
+        status_provider=lambda: "",
+        context_provider=lambda: (0, 100),
+        dock_provider=lambda: view,
+        input_mode="emacs",
+        keybindings={"newline": ["c-j"], "open_editor": ["c-x c-e"]},
+        theme=get_theme("dark"),
+        no_color=True,
+        output=output,
+    )
+
+    frames = []
+    for phase in range(3):
+        surface._dot_phase = phase
+        rendered = fragment_list_to_text(
+            to_formatted_text(surface._format_dock(view, 60))
+        )
+        frames.append(rendered)
+    assert len({get_cwidth(frame) for frame in frames}) == 1
+    assert all("Inspecting" in frame for frame in frames)
+    assert all("checking the import path" in frame for frame in frames)
+
+    surface.reduced_motion = True
+    static = fragment_list_to_text(to_formatted_text(surface._format_dock(view, 60)))
+    assert static == "Inspecting  ·  checking the import path"
+
+    reasoning_only = ActivityDockView(
+        revision=2,
+        activity=None,
+        reasoning="provider reasoning",
+    )
+    narrow = fragment_list_to_text(
+        to_formatted_text(surface._format_dock(reasoning_only, 8))
+    )
+    assert narrow.startswith("Reason")
+    assert "provider" not in narrow
+
+
+@pytest.mark.asyncio
+async def test_dock_animates_without_events_and_collapses_when_idle() -> None:
+    with create_pipe_input() as pipe:
+        output = SizedDummyOutput()
+        state = [ActivityDockView(revision=0, activity=None, reasoning="")]
+        surface = InlinePromptSurface(
+            history=InMemoryHistory(),
+            completer=None,
+            status_provider=lambda: "model · effort high · ~/repo",
+            context_provider=lambda: (0, 100),
+            dock_provider=lambda: state[0],
+            input_mode="emacs",
+            keybindings={"newline": ["c-j"], "open_editor": ["c-x c-e"]},
+            theme=get_theme("dark"),
+            no_color=True,
+            input=pipe,
+            output=output,
+        )
+        pending = asyncio.create_task(surface.read())
+        await asyncio.sleep(0.05)
+
+        def capture_rows() -> dict[int, str]:
+            screen = surface.application.renderer._last_screen
+            assert screen is not None
+            return {
+                y: "".join(cell.char for _x, cell in sorted(cells.items())).rstrip()
+                for y, cells in screen.data_buffer.items()
+            }
+
+        initial = capture_rows()
+        composer_row = next(y for y, text in initial.items() if "›" in text)
+        assert composer_row == 18
+
+        state[0] = ActivityDockView(
+            revision=1,
+            activity="Inspecting",
+            reasoning="checking the import path",
+        )
+        surface.invalidate()
+        await asyncio.sleep(0.05)
+        first = capture_rows()
+        first_status_row = next(y for y, text in first.items() if "Inspecting" in text)
+        active_composer_row = next(y for y, text in first.items() if "›" in text)
+        assert first_status_row + 1 == active_composer_row
+        assert "checking the import path" in first[first_status_row]
+
+        await asyncio.sleep(0.5)
+        second = capture_rows()
+        second_status = next(text for text in second.values() if "Inspecting" in text)
+        await asyncio.sleep(0.5)
+        third = capture_rows()
+        third_status = next(text for text in third.values() if "Inspecting" in text)
+        assert first[first_status_row] != second_status
+        assert second_status != third_status
+
+        state[0] = ActivityDockView(revision=2, activity=None, reasoning="")
+        surface.invalidate()
+        await asyncio.sleep(0.05)
+        idle = capture_rows()
+        assert not any("Inspecting" in text for text in idle.values())
+        assert next(y for y, text in idle.items() if "›" in text) == composer_row
+
+        pipe.send_text("done\r")
+        assert await pending == "done"

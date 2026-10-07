@@ -1,8 +1,9 @@
 """Small retained prompt surface backed by native terminal scrollback.
 
-Only the fixed reasoning dock and composer are redrawn. Conversation output is
-appended to native scrollback, so render cost does not grow with session length
-and the terminal keeps ownership of mouse selection and scrolling.
+Only the conditional activity dock, composer, and status row are redrawn.
+Conversation output is appended to native scrollback, so render cost does not
+grow with session length and the terminal keeps ownership of selection and
+scrolling.
 """
 
 from __future__ import annotations
@@ -21,7 +22,9 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import (
     AnyFormattedText,
     FormattedText,
+    to_formatted_text,
 )
+from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 from prompt_toolkit.history import History
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
@@ -48,6 +51,16 @@ from ash.ui.theme import Theme, prompt_style, terminal_styles
 
 ThinkingViewProvider = Callable[[int], tuple[int, AnyFormattedText]]
 ContextUsageProvider = Callable[[], tuple[int, int]]
+DockViewProvider = Callable[[], "ActivityDockView"]
+
+
+@dataclass(frozen=True)
+class ActivityDockView:
+    """Bounded semantic state for the retained prompt's single-line dock."""
+
+    revision: int
+    activity: str | None
+    reasoning: str
 
 
 @dataclass(frozen=True)
@@ -87,6 +100,20 @@ def _truncate_status(value: str, width: int) -> str:
     return "".join(visible) + "…"
 
 
+def _take_cells(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    visible: list[str] = []
+    remaining = width
+    for character in value:
+        character_width = get_cwidth(character)
+        if character_width > remaining:
+            break
+        visible.append(character)
+        remaining -= character_width
+    return "".join(visible)
+
+
 class InlinePromptSurface:
     """One non-full-screen application for live turn state and composition."""
 
@@ -98,27 +125,36 @@ class InlinePromptSurface:
         status_provider: Callable[[], str],
         context_provider: ContextUsageProvider,
         thinking_provider: ThinkingViewProvider | None = None,
+        dock_provider: DockViewProvider | None = None,
         input_mode: str,
         keybindings: dict[str, list[str]],
         theme: Theme,
         no_color: bool,
         input: Input | None = None,
         output: Output | None = None,
+        reduced_motion: bool = False,
+        screen_reader_mode: bool = False,
     ) -> None:
         self.status_provider = status_provider
         self.context_provider = context_provider
         self.thinking_provider = thinking_provider or (lambda _width: (0, ""))
+        self.dock_provider = dock_provider
+        self.reduced_motion = reduced_motion or screen_reader_mode
         self._prompt = "> "
         self._running = False
         self._terminal_callbacks: deque[Callable[[], None]] = deque()
         self._terminal_wakeup: asyncio.Event | None = None
+        self._dock_wakeup: asyncio.Event | None = None
         self._terminal_loop: asyncio.AbstractEventLoop | None = None
         self._choice_mode = False
         self._choice_title = ""
         self._choice_options: tuple[PromptChoice, ...] = ()
         self._choice_selected = 0
-        self._thinking_cache_key: tuple[int, int] | None = None
+        self._thinking_cache_key: tuple[int, int, int] | None = None
         self._thinking_cache: AnyFormattedText = FormattedText([])
+        self._dock_view_cache: ActivityDockView | None = None
+        self._legacy_dock_visible = False
+        self._dot_phase = 0
         self._configured_keybindings = keybindings
 
         self.input_buffer = Buffer(
@@ -132,12 +168,15 @@ class InlinePromptSurface:
             self._thinking_text,
             show_cursor=False,
         )
-        thinking_window = Window(
-            self.thinking_control,
-            height=2,
-            wrap_lines=False,
-            always_hide_cursor=True,
-            dont_extend_height=True,
+        thinking_window = ConditionalContainer(
+            Window(
+                self.thinking_control,
+                height=1,
+                wrap_lines=False,
+                always_hide_cursor=True,
+                dont_extend_height=True,
+            ),
+            filter=Condition(self._dock_visible),
         )
 
         composer = VSplit(
@@ -237,7 +276,10 @@ class InlinePromptSurface:
     def _start_terminal_pump(self) -> None:
         self._terminal_loop = asyncio.get_running_loop()
         self._terminal_wakeup = asyncio.Event()
+        self._dock_wakeup = asyncio.Event()
         self.application.create_background_task(self._pump_terminal())
+        if not self.reduced_motion:
+            self.application.create_background_task(self._animate_dock())
 
     async def _pump_terminal(self) -> None:
         wakeup = self._terminal_wakeup
@@ -307,8 +349,13 @@ class InlinePromptSurface:
 
     def invalidate(self) -> None:
         self._thinking_cache_key = None
+        self._dock_view_cache = None
         if self._running:
             self.application.invalidate()
+        loop = self._terminal_loop
+        wakeup = self._dock_wakeup
+        if loop is not None and wakeup is not None:
+            loop.call_soon_threadsafe(wakeup.set)
 
     def clear_visible_screen(self) -> None:
         """Clear only the visible terminal viewport, preserving scrollback."""
@@ -321,9 +368,9 @@ class InlinePromptSurface:
     def _output_width(self) -> int:
         app = get_app_or_none()
         if app is self.application:
-            return max(20, app.output.get_size().columns)
+            return max(1, app.output.get_size().columns)
         if hasattr(self, "application"):
-            return max(20, self.application.output.get_size().columns)
+            return max(1, self.application.output.get_size().columns)
         return 80
 
     def _composer_height(self) -> int:
@@ -336,12 +383,118 @@ class InlinePromptSurface:
 
     def _thinking_text(self) -> AnyFormattedText:
         width = self._output_width()
-        revision, rendered = self.thinking_provider(width)
-        key = (revision, width)
+        view = self._dock_view()
+        if self.dock_provider is None:
+            revision, rendered = self.thinking_provider(width)
+            self._legacy_dock_visible = bool(
+                fragment_list_to_text(to_formatted_text(rendered)).strip()
+            )
+            key = (revision, width, -1)
+        else:
+            rendered = self._format_dock(view, width)
+            key = (view.revision, width, self._dot_phase if view.activity else -1)
         if key != self._thinking_cache_key:
             self._thinking_cache_key = key
             self._thinking_cache = rendered
         return self._thinking_cache
+
+    def _dock_view(self) -> ActivityDockView:
+        if self._dock_view_cache is not None:
+            return self._dock_view_cache
+        if self.dock_provider is not None:
+            view = self.dock_provider()
+        else:
+            width = self._output_width()
+            revision, rendered = self.thinking_provider(width)
+            reasoning = fragment_list_to_text(to_formatted_text(rendered))
+            view = ActivityDockView(
+                revision=revision,
+                activity=None,
+                reasoning=reasoning,
+            )
+            self._legacy_dock_visible = bool(reasoning.strip())
+        self._dock_view_cache = view
+        return view
+
+    def _dock_visible(self) -> bool:
+        view = self._dock_view()
+        return bool(view.activity or view.reasoning or self._legacy_dock_visible)
+
+    def _format_dock(self, view: ActivityDockView, width: int) -> FormattedText:
+        if width <= 0 or not (view.activity or view.reasoning):
+            return FormattedText([])
+
+        fragments: list[tuple[str, str]] = []
+        remaining = width
+        if view.activity:
+            dots = (".  ", ".. ", "...")[self._dot_phase % 3]
+            dots_width = get_cwidth(dots) if not self.reduced_motion else 0
+            if get_cwidth(view.activity) + dots_width <= remaining and dots_width:
+                fragments.append(("class:activity", view.activity))
+                fragments.append(("class:activity-dots", dots))
+                remaining -= get_cwidth(view.activity) + dots_width
+            else:
+                activity = _take_cells(view.activity, remaining)
+                fragments.append(("class:activity", activity))
+                remaining -= get_cwidth(activity)
+        elif view.reasoning:
+            prefix = "Reasoning: "
+            if get_cwidth(prefix) <= remaining:
+                fragments.append(("class:reasoning-prefix", prefix))
+                remaining -= get_cwidth(prefix)
+            elif remaining > 0:
+                label = (
+                    "R"
+                    if remaining == 1
+                    else _take_cells("Reasoning", remaining - 1) + "…"
+                )
+                fragments.append(("class:reasoning-prefix", label))
+                remaining = 0
+
+        if view.reasoning and remaining > 0:
+            separator = "  ·  " if view.activity else ""
+            separator_width = get_cwidth(separator)
+            if separator_width < remaining:
+                fragments.append(("class:muted", separator))
+                remaining -= separator_width
+                reasoning = _take_cells(view.reasoning, remaining)
+                if reasoning:
+                    fragments.append(("class:reasoning", reasoning))
+        return FormattedText(fragments)
+
+    async def _animate_dock(self) -> None:
+        """Advance only the dock row while semantic work remains active."""
+
+        wakeup = self._dock_wakeup
+        if wakeup is None:
+            return
+        loop = asyncio.get_running_loop()
+        interval = 0.45
+        next_tick = loop.time() + interval
+        active_label: str | None = None
+        while self.application.is_running:
+            wakeup.clear()
+            view = self._dock_view()
+            if not view.activity:
+                active_label = None
+                self._dot_phase = 0
+                await wakeup.wait()
+                next_tick = loop.time() + interval
+                continue
+
+            if view.activity != active_label:
+                active_label = view.activity
+                self._dot_phase = 0
+                next_tick = loop.time() + interval
+            delay = max(0.0, next_tick - loop.time())
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                self._dot_phase = (self._dot_phase + 1) % 3
+                self.application.invalidate()
+                next_tick += interval
+                if next_tick <= loop.time():
+                    next_tick = loop.time() + interval
 
     def _status_text(self) -> FormattedText:
         value = terminal_safe_text(self.status_provider(), single_line=True)

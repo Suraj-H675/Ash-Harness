@@ -19,7 +19,11 @@ from ash.commands.slash import COMMANDS
 from ash.provider_catalog import BUILTIN_PROVIDERS
 from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
 from ash.ui.history import PrivateFileHistory
-from ash.ui.inline_surface import InlinePromptSurface, PromptChoice
+from ash.ui.inline_surface import (
+    ActivityDockView,
+    InlinePromptSurface,
+    PromptChoice,
+)
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.theme import get_theme
 
@@ -480,6 +484,7 @@ class PromptInput:
         status_provider: Callable[[], str] | None = None,
         context_provider: Callable[[], tuple[int, int]] | None = None,
         thinking_provider: Callable[[int], tuple[int, Any]] | None = None,
+        dock_provider: Callable[[], ActivityDockView] | None = None,
         extra_commands: dict[str, str] | list[str] | None = None,
         model_choices: list[str] | None = None,
         input_mode: str = "emacs",
@@ -490,6 +495,7 @@ class PromptInput:
         repo_map: Any | None = None,
         mcp_runtime: Any | None = None,
         screen_reader_mode: bool = False,
+        reduced_motion: bool = False,
         input: Input | None = None,
         output: Output | None = None,
     ) -> None:
@@ -550,6 +556,7 @@ class PromptInput:
                     thinking_provider
                     or (lambda _width: (0, FormattedText([])))
                 ),
+                dock_provider=dock_provider,
                 input_mode=input_mode,
                 keybindings=(
                     keybindings
@@ -563,6 +570,8 @@ class PromptInput:
                 no_color=no_color,
                 input=input,
                 output=output,
+                reduced_motion=reduced_motion,
+                screen_reader_mode=screen_reader_mode,
             )
 
     async def choose(

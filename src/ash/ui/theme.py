@@ -46,6 +46,8 @@ class Theme:
     approval_prompt: str
     success: str
     error: str
+    user_message: str = ""
+    activity: str = ""
 
 
 DARK_THEME = Theme(
@@ -78,6 +80,8 @@ DARK_THEME = Theme(
     approval_prompt="bold yellow",
     success="green",
     error="red",
+    user_message="bold #6f95ff on #303030",
+    activity="bold #c8c8c8",
 )
 
 
@@ -111,6 +115,8 @@ LIGHT_THEME = Theme(
     approval_prompt="bold #96500a",
     success="#007000",
     error="#b42318",
+    user_message="bold #005faf on #eaeaea",
+    activity="bold #444444",
 )
 
 _THEMES: dict[str, Theme] = {
@@ -153,6 +159,8 @@ def terminal_styles(theme: Theme) -> dict[str, str]:
         "prompt": theme.prompt,
         "composer": theme.composer,
         "composer-label": theme.composer_label,
+        "activity": theme.activity,
+        "activity-dots": theme.muted,
         "separator": theme.separator,
         "header": theme.header,
         "header-brand": theme.header_brand,

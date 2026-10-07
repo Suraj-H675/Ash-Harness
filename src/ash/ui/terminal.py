@@ -21,6 +21,7 @@ import tempfile
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from rich.cells import cell_len
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -35,6 +36,7 @@ from rich.text import Text
 from ash.core.redaction import redact_value
 from ash.safe_io import read_bounded_bytes
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
+from ash.ui.inline_surface import ActivityDockView
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.transcript import Transcript
 from ash.ui.theme import get_theme
@@ -48,6 +50,103 @@ DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
 MAX_LINEAR_HISTORY_ENTRIES = 12
 LIVE_AUX_PREVIEW_CHARS = 3_000
 ASSISTANT_MESSAGE_PREFIX = "· "
+_MODEL_REQUEST_TERMINAL_EVENTS = {
+    "model.request.completed",
+    "model.request.error",
+    "model.request.cancelled",
+}
+_TURN_TERMINAL_EVENTS = {"turn.completed", "turn.cancelled", "turn.error"}
+_TOOL_TERMINAL_EVENTS = {
+    "tool.completed",
+    "tool.error",
+    "tool.denied",
+    "tool.skipped",
+}
+_TOOL_ACTIVITY: dict[str, str] = {
+    **dict.fromkeys(
+        {
+            "read_file",
+            "list_dir",
+            "glob_files",
+            "search_text",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "find_symbol",
+            "find_references",
+            "lsp",
+            "search_sessions",
+            "list_skills",
+            "read_skill_resource",
+            "list_automations",
+            "list_remote_agents",
+            "list_remote_agent_tasks",
+        },
+        "Inspecting",
+    ),
+    **dict.fromkeys(
+        {
+            "web_search",
+            "web_fetch",
+            "brave",
+            "tavily",
+            "search_tools",
+        },
+        "Researching",
+    ),
+    **dict.fromkeys(
+        {
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_tabs",
+            "browser_open_tab",
+            "browser_focus_tab",
+            "browser_close_tab",
+            "browser_click",
+            "browser_click_at",
+            "browser_type",
+            "browser_press",
+            "browser_hover",
+            "browser_select",
+            "browser_drag",
+            "browser_wait",
+            "browser_dialog",
+            "browser_scroll",
+            "browser_back",
+            "browser_screenshot",
+            "browser_upload",
+            "browser_download",
+        },
+        "Browsing",
+    ),
+    **dict.fromkeys(
+        {
+            "write_file",
+            "replace_file_content",
+            "replace_file_edits",
+            "whole_edit",
+            "apply_patch",
+        },
+        "Coding",
+    ),
+    **dict.fromkeys({"run_command", "background_process"}, "Running"),
+    **dict.fromkeys({"auto_commit"}, "Committing"),
+    **dict.fromkeys({"activate_skill"}, "Loading"),
+    **dict.fromkeys({"manage_automation"}, "Scheduling"),
+    **dict.fromkeys({"update_goal"}, "Planning"),
+    **dict.fromkeys({"ask_user"}, "Waiting"),
+    **dict.fromkeys(
+        {
+            "spawn_agent",
+            "delegate_agents",
+            "delegate_remote_agent",
+            "remote_agent_task_status",
+            "remote_agent_task_cancel",
+            "recover_remote_agent_task",
+        },
+        "Delegating",
+    ),
+}
 _EDITOR_ENV_ALLOWLIST = (
     "COLORTERM",
     "DBUS_SESSION_BUS_ADDRESS",
@@ -102,13 +201,47 @@ def _append_preview_truncation(preview: str, truncated: bool) -> str:
     return preview
 
 
-def _user_message_text(content: str, style: str) -> Text:
-    """Format each user line with the same transcript marker."""
+def _user_message_text(
+    content: str,
+    *,
+    theme_name: str,
+    console: Console,
+    width: int,
+) -> Text:
+    """Build cell-wrapped, full-width user bands for native scrollback."""
 
-    return Text(
-        "\n".join(f"> {line}" for line in content.split("\n")),
-        style=style,
-    )
+    width = max(1, width)
+    style = get_theme(theme_name).user_message
+    fill_background = console.color_system is not None and not console.no_color
+    rendered = Text()
+    physical_lines: list[Text] = []
+    for logical_line in content.split("\n"):
+        first_prefix = "> " if width >= 3 else ">" if width == 2 else ""
+        continuation_prefix = "  " if width >= 3 else ""
+        available = max(1, width - cell_len(first_prefix))
+        wrapped = list(
+            Text(logical_line).wrap(
+                console,
+                width=available,
+                overflow="fold",
+            )
+        )
+        if not wrapped:
+            wrapped = [Text("")]
+        for index, line in enumerate(wrapped):
+            prefix = first_prefix if index == 0 else continuation_prefix
+            row = Text(prefix, style=style)
+            row.append_text(line)
+            row.stylize(style, 0, len(row))
+            padding = max(0, width - row.cell_len) if fill_background else 0
+            if padding:
+                row.append(" " * padding, style=style)
+            physical_lines.append(row)
+    for index, line in enumerate(physical_lines):
+        if index:
+            rendered.append("\n")
+        rendered.append_text(line)
+    return rendered
 
 
 def _rich_diff_style(theme_name: str, line: str) -> str:
@@ -254,6 +387,7 @@ class TerminalUI:
         )
         self._conversation_line_open = False
         self._assistant_prefix_pending = True
+        self._conversation_needs_user_gap = False
         self._reasoning_tail = ""
         self._prompt_revision = 0
         self._thinking_render_cache: tuple[int, int, FormattedText] | None = None
@@ -265,6 +399,9 @@ class TerminalUI:
         self._assistant_entry_id: str | None = None
         self._reasoning_entry_id: str | None = None
         self._activity_status = ""
+        self._activity_turn_closed = False
+        self._model_activity: tuple[str | None, str] | None = None
+        self._active_tool_activity: dict[str, str] = {}
         self._tool_output_entries: dict[str, str] = {}
         self._token_progress = (
             Progress(
@@ -293,7 +430,7 @@ class TerminalUI:
         self._assistant_prefix_pending = True
 
     def prompt_thinking_view(self, width: int) -> tuple[int, FormattedText]:
-        """Return only bounded provider-exposed text for the fixed reasoning dock."""
+        """Return a bounded reasoning preview for legacy prompt hosts."""
 
         cached = self._thinking_render_cache
         if cached is not None and cached[:2] == (self._prompt_revision, width):
@@ -319,6 +456,102 @@ class TerminalUI:
             rendered = FormattedText(fragments)
         self._thinking_render_cache = (self._prompt_revision, width, rendered)
         return self._prompt_revision, rendered
+
+    def prompt_dock_view(self) -> ActivityDockView:
+        """Return current activity and a bounded provider-reasoning excerpt."""
+
+        reasoning_lines = self._reasoning_tail.splitlines()
+        reasoning = terminal_safe_text(
+            reasoning_lines[-1] if reasoning_lines else self._reasoning_tail,
+            single_line=True,
+        )[-LIVE_AUX_PREVIEW_CHARS:]
+        return ActivityDockView(
+            revision=self._prompt_revision,
+            activity=self._current_activity_label(),
+            reasoning=reasoning,
+        )
+
+    def _current_activity_label(self) -> str | None:
+        if self._active_tool_activity:
+            categories = set(self._active_tool_activity.values())
+            return categories.pop() if len(categories) == 1 else "Working"
+        if self._model_activity is not None:
+            return self._model_activity[1]
+        return None
+
+    def _apply_activity_event(self, payload: dict[str, Any]) -> bool:
+        """Reduce runtime lifecycle events to bounded, prompt-facing state."""
+
+        event_type = payload.get("type")
+        before = (
+            self._model_activity,
+            dict(self._active_tool_activity),
+            self._reasoning_tail,
+            self._activity_turn_closed,
+        )
+        if event_type == "turn.started":
+            self._activity_turn_closed = False
+            self._model_activity = None
+            self._active_tool_activity.clear()
+            self._reasoning_tail = ""
+        elif event_type in _TURN_TERMINAL_EVENTS:
+            self._activity_turn_closed = True
+            self._model_activity = None
+            self._active_tool_activity.clear()
+            self._reasoning_tail = ""
+        elif self._activity_turn_closed:
+            return False
+        elif event_type == "model.request.started":
+            operation_id = payload.get("operation_id")
+            self._model_activity = (
+                str(operation_id) if operation_id is not None else None,
+                "Thinking",
+            )
+            self._reasoning_tail = ""
+        elif event_type == "provider.retrying":
+            self._model_activity = (None, "Retrying")
+        elif event_type in _MODEL_REQUEST_TERMINAL_EVENTS:
+            operation_id = payload.get("operation_id")
+            current_id = self._model_activity[0] if self._model_activity else None
+            if (
+                self._model_activity is not None
+                and (
+                    operation_id is None
+                    or current_id is None
+                    or str(operation_id) == current_id
+                )
+            ):
+                self._model_activity = None
+        elif event_type == "assistant.delta":
+            if (
+                self._model_activity is not None
+                and self._model_activity[1] == "Thinking"
+            ):
+                self._model_activity = (self._model_activity[0], "Responding")
+        elif event_type == "tool.started":
+            call_id = payload.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                tool_name = payload.get("tool")
+                category = _TOOL_ACTIVITY.get(str(tool_name), "Working")
+                self._active_tool_activity[call_id] = category
+        elif event_type in _TOOL_TERMINAL_EVENTS:
+            call_id = payload.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                self._active_tool_activity.pop(call_id, None)
+
+        after = (
+            self._model_activity,
+            dict(self._active_tool_activity),
+            self._reasoning_tail,
+            self._activity_turn_closed,
+        )
+        return before != after
+
+    def _invalidate_prompt_state(self) -> None:
+        self._prompt_revision += 1
+        self._thinking_render_cache = None
+        if self._prompt_invalidator is not None:
+            self._prompt_invalidator()
 
     @property
     def has_approval_callback(self) -> bool:
@@ -702,6 +935,7 @@ class TerminalUI:
                 self._write_conversation(ASSISTANT_MESSAGE_PREFIX)
                 self._assistant_prefix_pending = False
             self._write_conversation(text)
+            self._conversation_needs_user_gap = True
         self._refresh_live()
 
     def print_thought(self, text: str) -> None:
@@ -710,9 +944,10 @@ class TerminalUI:
         text = terminal_safe_text(text)
         buffers = self._active_buffers_required()
         if self._prompt_invalidator is not None:
-            self._reasoning_tail = (
-                self._reasoning_tail + text
-            )[-LIVE_AUX_PREVIEW_CHARS:]
+            self._reasoning_tail = (self._reasoning_tail + text)[
+                -LIVE_AUX_PREVIEW_CHARS:
+            ]
+            self._invalidate_prompt_state()
         if self._reasoning_entry_id is None:
             self._reasoning_entry_id = self.transcript.begin(
                 "reasoning", title="reasoning"
@@ -725,7 +960,8 @@ class TerminalUI:
                 markup=False,
                 highlight=False,
             )
-        self._refresh_live()
+        if self._prompt_invalidator is None:
+            self._refresh_live()
 
     def finalize_turn(self) -> None:
         """Flush any pending live rendering."""
@@ -800,34 +1036,15 @@ class TerminalUI:
         """Render concise tool lifecycle state outside the assistant panel."""
 
         event_type = payload.get("type")
-        if event_type in {"turn.started", "model.request.started"}:
-            attempt = int(payload.get("attempt", 1) or 1)
-            maximum = int(payload.get("max_attempts", attempt) or attempt)
-            if attempt > 1:
-                self._set_activity_status(f"Retrying model ({attempt}/{maximum})…")
-            else:
-                self._set_activity_status("Thinking…")
-        elif event_type == "provider.retrying":
-            attempt = int(payload.get("attempt", 1) or 1)
-            maximum = int(payload.get("max_attempts", attempt) or attempt)
-            self._set_activity_status(f"Retrying model ({attempt}/{maximum})…")
-        elif event_type == "tool.started":
-            tool = terminal_safe_text(
-                str(payload.get("tool", "unknown")), single_line=True
+        previous_activity = self._current_activity_label()
+        changed = self._apply_activity_event(payload)
+        current_activity = self._current_activity_label()
+        if current_activity != previous_activity:
+            self._set_activity_status(
+                f"{current_activity}…" if current_activity else ""
             )
-            self._set_activity_status(f"Running {tool}…")
-        elif event_type in {
-            "assistant.delta",
-            "reasoning.delta",
-            "tool.output",
-            "tool.completed",
-            "tool.denied",
-            "tool.error",
-            "turn.completed",
-            "turn.cancelled",
-            "turn.error",
-        }:
-            self._set_activity_status("")
+        elif changed:
+            self._invalidate_prompt_state()
 
         if event_type not in {
             "tool.started",
@@ -837,9 +1054,7 @@ class TerminalUI:
             "tool.error",
         }:
             return
-        tool = terminal_safe_text(
-            str(payload.get("tool", "unknown")), single_line=True
-        )
+        tool = terminal_safe_text(str(payload.get("tool", "unknown")), single_line=True)
         # Keep the provider/runtime call identity exact for internal lookup and
         # metadata.  Only the human-facing title/content is sanitized.
         call_id = str(payload.get("call_id", ""))
@@ -863,6 +1078,7 @@ class TerminalUI:
             if self._prompt_invalidator is not None:
                 self._seal_conversation()
                 self._write_conversation(delta, style=style)
+                self._conversation_needs_user_gap = True
             elif self._active_buffers is not None:
                 self._active_buffers.tool_output.append(delta, style=style)
                 self._refresh_live()
@@ -908,6 +1124,7 @@ class TerminalUI:
             self._write_conversation(line, end="\n")
         else:
             self.console.print(line)
+        self._conversation_needs_user_gap = True
 
     def _set_activity_status(self, text: str) -> None:
         """Update one ephemeral turn-status surface without polluting history."""
@@ -918,11 +1135,13 @@ class TerminalUI:
         self._activity_status = text
         if self.screen_reader_mode and text:
             self.console.print(
-                f"Status: {text}",
+                f"Status: {text.removesuffix('…')}",
                 markup=False,
                 highlight=False,
             )
-        if self._active_buffers is not None and self._prompt_invalidator is None:
+        if self._prompt_invalidator is not None:
+            self._invalidate_prompt_state()
+        elif self._active_buffers is not None:
             self._refresh_live()
 
     # --- approval surface -------------------------------------------------
@@ -1052,10 +1271,27 @@ class TerminalUI:
         safe = terminal_safe_text(text)
         self.transcript.append("user", safe, title="you")
         if self._prompt_invalidator is not None and not self.screen_reader_mode:
-            self._reasoning_tail = ""
-            self._write_conversation(
-                _user_message_text(safe, self.theme.user_prefix), end="\n"
-            )
+            if self._conversation_needs_user_gap:
+                self._write_conversation("\n")
+
+            def write_user_band() -> None:
+                self.console.print(
+                    _user_message_text(
+                        safe,
+                        theme_name=self.theme.name,
+                        console=self.console,
+                        width=self.console.size.width,
+                    ),
+                    end="\n",
+                    soft_wrap=True,
+                    highlight=False,
+                )
+
+            self._terminal_writer(write_user_band)
+            self._conversation_line_open = False
+            self._conversation_needs_user_gap = False
+            if self._reasoning_tail:
+                self._reasoning_tail = ""
             self._write_conversation("\n")
             self._refresh_live(force=True)
 
@@ -1063,6 +1299,12 @@ class TerminalUI:
         """Replace interactive history from a durable session snapshot."""
 
         self._activity_status = ""
+        self._activity_turn_closed = False
+        self._model_activity = None
+        self._active_tool_activity.clear()
+        self._reasoning_tail = ""
+        self._conversation_needs_user_gap = False
+        self._invalidate_prompt_state()
         self.transcript.clear()
         if session is None:
             return
@@ -1100,7 +1342,12 @@ class TerminalUI:
                 if previous_kind in {"assistant", "tool"}:
                     self.console.print()
                 self.console.print(
-                    _user_message_text(entry.content, self.theme.user_prefix)
+                    _user_message_text(
+                        entry.content,
+                        theme_name=self.theme.name,
+                        console=self.console,
+                        width=self.console.size.width,
+                    )
                 )
                 self.console.print()
             elif entry.kind == "assistant":

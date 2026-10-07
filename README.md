@@ -360,6 +360,9 @@ The interactive interface is built for sustained terminal work:
 - Ash keeps one bounded retained surface for the active turn plus a bottom-docked
   composer and compact status row; completed turns are committed once to native
   scrollback instead of being redrawn with session history;
+- blue user messages sit on a subtle theme-matched gray band with cell-aware
+  wrapping; a one-row dock above the composer names active work and keeps
+  provider reasoning separate, with motion only while work is active;
 - Rich Markdown and fenced-code rendering with bounded live previews, chunked
   token accumulation, cached frames, and bounded repaint frequency;
 - streaming user, assistant, reasoning, tool, approval, status, error, and

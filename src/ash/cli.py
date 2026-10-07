@@ -835,11 +835,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         "prompt_thinking_view",
         lambda _width: (0, ""),
     )
+    dock_provider = getattr(loop.ui, "prompt_dock_view", None)
 
     prompt_input = PromptInput(
         status_provider=status_line.left,
         context_provider=status_line.context_usage,
         thinking_provider=thinking_provider,
+        dock_provider=dock_provider,
         extra_commands={
             command.name: command.description for command in discovered_commands
         },
@@ -852,6 +854,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         repo_map=getattr(loop, "repo_map", None),
         mcp_runtime=getattr(loop, "_mcp_runtime", None),
         screen_reader_mode=config.screen_reader_mode,
+        reduced_motion=bool(getattr(config, "reduced_motion", False)),
     )
     if not isinstance(loop.ui, TerminalUI):
         raise TypeError("interactive REPL requires TerminalUI")
