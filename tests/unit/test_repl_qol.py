@@ -150,6 +150,7 @@ async def _run_repl(
     turn_inputs: list[str] | None = None,
     turn_metadata: list[dict | None] | None = None,
     session_loads: list | None = None,
+    session_starts: list[str | None] | None = None,
 ) -> int:
     ui_type = _install_frontend(
         monkeypatch,
@@ -183,6 +184,8 @@ async def _run_repl(
     )
 
     async def start_session(session_id: str | None = None):
+        if session_starts is not None:
+            session_starts.append(session_id)
         session = (
             store.create_session(str(tmp_path), model=active_model_id)
             if session_id is None
@@ -227,6 +230,7 @@ async def test_session_switch_commands_all_load_the_selected_transcript_snapshot
     export_path = tmp_path / "selected.jsonl"
     export_path.write_text(store.export_session(active.session_id), encoding="utf-8")
     loaded: list = []
+    started: list[str | None] = []
 
     assert await _run_repl(
         tmp_path,
@@ -247,6 +251,7 @@ async def test_session_switch_commands_all_load_the_selected_transcript_snapshot
         session_store=store,
         current_session=store.load_session(active.session_id),
         session_loads=loaded,
+        session_starts=started,
     ) == 0
 
     assert len(loaded) == 9  # initial hydration plus all eight view replacements
@@ -260,6 +265,14 @@ async def test_session_switch_commands_all_load_the_selected_transcript_snapshot
     assert loaded[7][0] != active.session_id
     assert loaded[7][1] == ["active question", "active answer"]
     assert loaded[8][1] == []
+    assert started == [
+        None,
+        None,
+        None,
+        active.session_id,
+        loaded[5][0],
+        loaded[7][0],
+    ]
 
 
 @pytest.mark.asyncio

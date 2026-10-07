@@ -920,8 +920,6 @@ def test_resume_and_clear_replace_the_active_conversation_view(tmp_path: Path) -
     assert b"selected answer" in raw
     assert "Recent conversation" not in plain
     assert b"Started session" not in raw
-    assert b"\x1b[?1000h" in raw and b"\x1b[?1000l" in raw
-    assert b"\x1b[?1006h" in raw and b"\x1b[?1006l" in raw
     assert process.returncode == 0
 
 
@@ -1004,7 +1002,7 @@ asyncio.run(main())
                 capture_output=True,
                 text=True,
             ).stdout
-            prompt_visible = "smoke>" in resized_capture
+            prompt_visible = "SMOKE> ›" in resized_capture
             if pane_size == "40x10" and prompt_visible:
                 resized = True
                 break

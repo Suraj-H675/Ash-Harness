@@ -1694,15 +1694,15 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             pass
                         else:
                             name_parts = arguments[1:]
-                    session = loop.session_store.fork_session(
+                    forked = loop.session_store.fork_session(
                         loop.current_session.session_id,
                         message_count=count,
                         branch_name=" ".join(name_parts),
                     )
+                    session = await loop.start_session(forked.session_id)
                 except ValueError as exc:
                     _print_classified_error(exc)
                     continue
-                loop.current_session = session
                 loop.ui.load_session_transcript(session)
                 transition_feedback(
                     f"Forked {session.branch_name or session.session_id[:8]}"
@@ -1848,7 +1848,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     continue
                 try:
                     input_path = loop.safety_guard.validate_path(arguments[0])
-                    session = loop.session_store.import_session_jsonl(
+                    imported = loop.session_store.import_session_jsonl(
                         read_bounded_bytes(
                             input_path,
                             MAX_SESSION_IMPORT_BYTES,
@@ -1856,10 +1856,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         ).decode("utf-8"),
                         project_path=str(loop.project_root),
                     )
+                    session = await loop.start_session(imported.session_id)
                 except (OSError, ValueError) as exc:
                     _print_classified_error(exc)
                     continue
-                loop.current_session = session
                 loop.ui.load_session_transcript(session)
                 transition_feedback("Imported and resumed chat.")
                 continue
