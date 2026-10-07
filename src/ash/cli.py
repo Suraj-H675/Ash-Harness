@@ -543,6 +543,16 @@ def render_model_catalog_refresh(
     return "\n".join(lines)
 
 
+def _sync_repl_model_config(config: AshConfig, loop: AshLoop) -> None:
+    """Mirror the loop's active requested route into the REPL view config."""
+
+    runtime_config = getattr(loop, "_config", None)
+    if runtime_config is None:
+        return
+    config.model = runtime_config.model
+    config.fallback_models = list(runtime_config.fallback_models)
+
+
 async def _interactive_model_picker(
     config: AshConfig,
     loop: AshLoop,
@@ -645,10 +655,7 @@ async def _interactive_model_picker(
 
     try:
         loop.switch_model(model_str)
-        config.model = model_str
-        config.fallback_models = [
-            fallback for fallback in config.fallback_models if fallback != model_str
-        ]
+        _sync_repl_model_config(config, loop)
         write_output(
             "Switched to "
             + terminal_safe_text(model_str, single_line=True)
@@ -809,6 +816,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     from ash.ui.notifications import TerminalNotifier
     from ash.ui.help_overlay import show_help_overlay
 
+    _sync_repl_model_config(config, loop)
     command_roots = [(Path.home() / ".ash" / "commands", "user")]
     plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
     if is_workspace_trusted(loop.project_root):
@@ -1154,6 +1162,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             if loop.current_session is None:
                 await loop.start_session()
+                _sync_repl_model_config(config, loop)
             assert loop.current_session is not None
             from uuid import uuid4
 
@@ -1563,6 +1572,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             if command.name == "new":
                 session = await loop.start_session()
+                _sync_repl_model_config(config, loop)
                 loop.ui.load_session_transcript(session)
                 if not has_live_surface:
                     print("New chat started.", flush=True)
@@ -1661,6 +1671,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             print("Resume cancelled.", flush=True)
                             continue
                     session = await loop.start_session(selected_session_id)
+                    _sync_repl_model_config(config, loop)
                 except (KeyError, ValueError) as exc:
                     _print_classified_error(exc)
                     continue
@@ -1700,6 +1711,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         branch_name=" ".join(name_parts),
                     )
                     session = await loop.start_session(forked.session_id)
+                    _sync_repl_model_config(config, loop)
                 except ValueError as exc:
                     _print_classified_error(exc)
                     continue
@@ -1857,6 +1869,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         project_path=str(loop.project_root),
                     )
                     session = await loop.start_session(imported.session_id)
+                    _sync_repl_model_config(config, loop)
                 except (OSError, ValueError) as exc:
                     _print_classified_error(exc)
                     continue
@@ -1926,6 +1939,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             if command.name == "goal":
                 if loop.current_session is None:
                     await loop.start_session()
+                    _sync_repl_model_config(config, loop)
                 if not arguments:
                     print(loop.render_goal_status(), flush=True)
                     continue
@@ -2811,12 +2825,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 continue
             try:
                 loop.switch_model(model_str)
-                config.model = model_str
-                config.fallback_models = [
-                    fallback
-                    for fallback in config.fallback_models
-                    if fallback != model_str
-                ]
+                _sync_repl_model_config(config, loop)
                 print(_render_model_capabilities(model_str, config))
                 print(
                     "Switched to "

@@ -2332,6 +2332,33 @@ class SessionStore:
         if str(row["project_key"]) != project_key:
             raise ValueError("session belongs to a different workspace")
 
+    def session_model(self, session_id: str) -> str:
+        """Return the durable requested model route for one session."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT model FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Session not found: {session_id}")
+        try:
+            return _validate_session_model(str(row["model"] or ""))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
+
+    def update_session_model(self, session_id: str, model: str) -> None:
+        """Persist the requested model route selected for one session."""
+
+        validated = _validate_session_model(model)
+        with closing(self._connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE sessions SET model = ? WHERE session_id = ?",
+                (validated, session_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Session not found: {session_id}")
+
     def save_message(
         self,
         session_id: str,

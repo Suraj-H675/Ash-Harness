@@ -35,6 +35,7 @@ from ash.core.session import (
     get_db_connection,
 )
 from ash.hooks.registry import HookRegistry, LifecycleHook, SessionStartHook
+from ash.logging import current_log_context, replace_log_context, set_log_context
 from ash.providers.base import ProviderABC, ProviderCompletionError, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.failover import FailoverProvider
@@ -2354,6 +2355,106 @@ async def test_session_switch_is_rejected_while_turn_is_running(tmp_path):
     assert loop.current_session.session_id == session.session_id
     assert len(store.list_sessions(project_path=str(tmp_path), limit=10)) == 1
     await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_session_switch_clears_previous_conversation_runtime_state(tmp_path):
+    previous_log_context = current_log_context()
+    replace_log_context({})
+    config = AshConfig(
+        workspace_root=tmp_path,
+        max_context_tokens=1_000,
+        max_completion_tokens=100,
+    )
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "session-state-isolation.db"),
+        BudgetProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+        config=config,
+    )
+    try:
+        first = await loop.start_session()
+        old_file = tmp_path / "old-session.py"
+        nested_scope = tmp_path / "nested"
+        loop._last_context_tokens = 321
+        loop._last_context_maximum = 654
+        loop._last_context_budget = object()
+        loop._last_turn_prompt_tokens = 123
+        loop._last_turn_completion_tokens = 45
+        loop._last_turn_budget_exhausted = True
+        loop._last_cache_read_tokens = 67
+        loop._last_cache_write_tokens = 8
+        loop._last_estimated_prompt_tokens = 90
+        loop._last_estimated_completion_tokens = 12
+        loop._last_usage_source = "provider"
+        loop._last_turn_cost_usd = 1.25
+        loop._last_estimated_cost_usd = 1.5
+        loop._last_cost_known = False
+        loop._turns_since_nudge = 4
+        loop._iterations_since_skill_use = 5
+        loop._continuous_turns = 6
+        loop._last_turn_non_goal_tool_calls = 7
+        loop._pending_memory_context = "old memory"
+        loop._pending_plan_context = "old plan"
+        loop._pending_goal_context = "old goal"
+        loop._remember_repo_file(old_file)
+        loop._instruction_scope_directories = [nested_scope]
+        loop.recovered_turns = 2
+        loop.recovery_summary = SimpleNamespace(needs_attention=True)
+        loop.turn_context = TurnContext(
+            session_id=first.session_id,
+            turn_id="old-turn",
+        )
+        set_log_context(
+            session_id=first.session_id,
+            turn_id="old-turn",
+            operation_id="old-operation",
+        )
+
+        second = await loop.start_session()
+
+        assert second.session_id != first.session_id
+        assert loop.turn_context is None
+        assert loop._last_context_tokens == 0
+        assert loop._last_context_maximum == 900
+        assert loop._last_context_budget is None
+        assert loop.last_turn_usage == {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "usage_source": "unavailable",
+            "estimated_prompt_tokens": 0,
+            "estimated_completion_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "cost_usd": 0.0,
+            "estimated_cost_usd": 0.0,
+            "cost_known": True,
+            "cost_is_estimated": False,
+            "has_estimates": False,
+        }
+        assert loop._last_turn_budget_exhausted is False
+        assert loop._turns_since_nudge == 0
+        assert loop._iterations_since_skill_use == 0
+        assert loop._continuous_turns == 0
+        assert loop._last_turn_non_goal_tool_calls == 0
+        assert loop._pending_memory_context == ""
+        assert loop._pending_plan_context == ""
+        assert loop._pending_goal_context == ""
+        assert loop._repo_map_active_files == []
+        assert loop._instruction_scope_directories == [tmp_path]
+        assert loop.recovered_turns == 0
+        assert loop.recovery_summary is None
+        assert current_log_context() == {"session_id": second.session_id}
+        event = loop._envelope_event({"type": "session.state.test"})
+        assert event["session_id"] == second.session_id
+        assert event["turn_id"] is None
+    finally:
+        await loop.aclose()
+        replace_log_context(previous_log_context)
 
 
 @pytest.mark.asyncio
@@ -5499,6 +5600,109 @@ async def test_switch_model_removes_new_primary_from_fallback_chain(tmp_path):
     assert built_configs[-1].model == "ollama/backup"
     assert built_configs[-1].fallback_models == ["openai/secondary"]
     assert loop._config is built_configs[-1]
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_session_model_switch_is_durable_and_new_restores_default(tmp_path):
+    from ash.providers.identifiers import parse_model_string
+
+    class RoutedProvider(ProviderABC):
+        def __init__(self, route: str) -> None:
+            provider, model = parse_model_string(route)
+            self.provider_family = provider
+            self._model_name = model
+
+        @property
+        def model_name(self) -> str:
+            return self._model_name
+
+        def count_tokens(self, text):
+            return len(str(text).split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            yield StreamChunk(content="done", is_done=True)
+
+    config = AshConfig(
+        model="provider/default",
+        fallback_models=["provider/backup", "provider/secondary"],
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(tmp_path / "durable-session-model.db")
+    loop = AshLoop(
+        store,
+        RoutedProvider(config.model),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        provider_factory=lambda next_config: RoutedProvider(next_config.model),
+        config=config,
+    )
+
+    first = await loop.start_session()
+    loop.switch_model("provider/backup")
+
+    assert first.model == "provider/backup"
+    assert store.session_model(first.session_id) == "provider/backup"
+    assert store.list_sessions(project_path=str(tmp_path))[0].model == "provider/backup"
+    assert loop._config is not None
+    assert loop._config.fallback_models == ["provider/secondary"]
+
+    await asyncio.sleep(0)
+    second = await loop.start_session()
+
+    assert second.session_id != first.session_id
+    assert second.model == "provider/default"
+    assert loop._config is not None
+    assert loop._config.model == "provider/default"
+    assert loop._config.fallback_models == ["provider/backup", "provider/secondary"]
+
+    await asyncio.sleep(0)
+    resumed = await loop.start_session(first.session_id)
+
+    assert resumed.session_id == first.session_id
+    assert resumed.model == "provider/backup"
+    assert loop._config is not None
+    assert loop._config.model == "provider/backup"
+    assert loop._config.fallback_models == ["provider/secondary"]
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_model_switch_rolls_back_durable_session_model(tmp_path):
+    class BrokenCapabilitiesProvider(MockProvider):
+        @property
+        def capabilities(self):
+            raise RuntimeError("capability sync failed")
+
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(tmp_path / "durable-model-rollback.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        provider_factory=lambda _config: BrokenCapabilitiesProvider(),
+        config=config,
+    )
+    session = await loop.start_session()
+
+    with pytest.raises(RuntimeError, match="capability sync failed"):
+        loop.switch_model("ollama/broken")
+
+    assert session.model == "ollama/test"
+    assert store.session_model(session.session_id) == "ollama/test"
+    assert loop._config is config
+    await asyncio.sleep(0)
     await loop.aclose()
 
 

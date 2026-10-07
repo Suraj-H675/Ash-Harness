@@ -1287,6 +1287,9 @@ class AshLoop:
         self._instruction_scope_directories = list(
             instruction_scope_directories or (project_root,)
         )
+        self._base_instruction_scope_directories = tuple(
+            self._instruction_scope_directories
+        )
         self._core_system_prompt = system_prompt or _default_system_prompt(
             project_root,
             native_tools=_provider_capabilities(provider).native_tools,
@@ -1316,6 +1319,7 @@ class AshLoop:
         for path in self.auto_commit_paths:
             candidate = path if path.is_absolute() else self.project_root / path
             self._remember_repo_file(candidate)
+        self._base_repo_map_active_files = tuple(self._repo_map_active_files)
         self._repo_map_dirty = False
         self.planner = planner
         self.enable_sprint_planning = enable_sprint_planning
@@ -1329,6 +1333,12 @@ class AshLoop:
         self._turns_since_nudge = 0
         self.tools_registry = tools_registry
         self._config = config
+        self._default_session_model = (
+            config.model if config is not None else _provider_model_id(provider)
+        )
+        self._default_session_fallback_models = tuple(
+            config.fallback_models if config is not None else ()
+        )
         self.provider_circuit_breaker = (
             provider_circuit_breaker
             or ProviderCircuitBreaker(
@@ -1931,6 +1941,26 @@ class AshLoop:
         if self._closing or self._closed:
             raise RuntimeError("Ash runtime is closed")
         self._verify_project_root_identity()
+        pending_session_id = self._pending_session_tool_start_id
+        pending_tool_start = (
+            self.current_session is not None
+            and pending_session_id == self.current_session.session_id
+            and session_id in {None, pending_session_id}
+        )
+        if pending_tool_start:
+            assert self.current_session is not None
+            target_model = self.current_session.model or (
+                self._config.model if self._config is not None else self.active_model_id
+            )
+        elif session_id is not None:
+            self.session_store.require_session_project(session_id, self.project_root)
+            target_model = (
+                self.session_store.session_model(session_id)
+                or self._default_session_model
+            )
+        else:
+            target_model = self._default_session_model
+        self._activate_session_model(target_model)
         await self._negotiate_provider_capabilities()
         if self._mcp_configs and self._mcp_runtime is None:
             await self._start_mcp_runtime()
@@ -1939,23 +1969,23 @@ class AshLoop:
         if callable(reset_activations):
             reset_activations()
 
-        pending_session_id = self._pending_session_tool_start_id
-        if (
-            self.current_session is not None
-            and pending_session_id == self.current_session.session_id
-            and session_id in {None, pending_session_id}
-        ):
+        if pending_tool_start:
             await self._finish_pending_session_tool_start()
+            assert self.current_session is not None
             return self.current_session
         if pending_session_id is not None:
             self._pending_session_tool_start_id = None
 
-        if self.current_session is not None and self._hook_session_open:
-            reason = (
-                "reload" if session_id == self.current_session.session_id else "switch"
-            )
-            await self._fire_session_end(reason)
+        if self.current_session is not None:
+            if self._hook_session_open:
+                reason = (
+                    "reload"
+                    if session_id == self.current_session.session_id
+                    else "switch"
+                )
+                await self._fire_session_end(reason)
             self.current_session = None
+        self._reset_session_runtime_state()
         self.system_prompt = self._base_system_prompt
 
         if session_id is not None:
@@ -1985,6 +2015,11 @@ class AshLoop:
             finally:
                 session_lease.close()
             self.current_session = restored_session
+            set_log_context(
+                session_id=restored_session.session_id,
+                turn_id=None,
+                operation_id=None,
+            )
             self.recovered_turns = self.recovery_summary.interrupted_turns
             if self.recovered_turns:
                 self._emit_recovered_tool_events(self.recovery_summary)
@@ -2023,10 +2058,18 @@ class AshLoop:
                     f"{self.system_prompt}\n\n## Recent Context\n{memory_context}"
                 )
 
+        requested_model = (
+            self._config.model if self._config is not None else self.active_model_id
+        )
         session = self.session_store.create_session(
-            str(self.project_root), model=self.active_model_id
+            str(self.project_root), model=requested_model
         )
         self.current_session = session
+        set_log_context(
+            session_id=session.session_id,
+            turn_id=None,
+            operation_id=None,
+        )
         hooks = self._active_hooks()
         self._hook_session_open = hooks is not None
         if hooks is not None:
@@ -2044,6 +2087,47 @@ class AshLoop:
         self._pending_session_tool_start_id = session.session_id
         await self._finish_pending_session_tool_start()
         return session
+
+    def _reset_session_runtime_state(self) -> None:
+        """Clear state derived from the previously active conversation session."""
+
+        self.turn_context = None
+        set_log_context(session_id=None, turn_id=None, operation_id=None)
+        self._steering_messages.clear()
+        self._last_context_tokens = 0
+        self._last_context_maximum = max(
+            1,
+            (
+                getattr(self._config, "max_context_tokens", 1)
+                - getattr(self._config, "max_completion_tokens", 0)
+            ),
+        )
+        self._last_context_budget = None
+        self._last_turn_prompt_tokens = 0
+        self._last_turn_completion_tokens = 0
+        self._last_turn_budget_exhausted = False
+        self._last_cache_read_tokens = 0
+        self._last_cache_write_tokens = 0
+        self._last_estimated_prompt_tokens = 0
+        self._last_estimated_completion_tokens = 0
+        self._last_usage_source = "unavailable"
+        self._last_turn_cost_usd = 0.0
+        self._last_estimated_cost_usd = 0.0
+        self._last_cost_known = True
+        self._turns_since_nudge = 0
+        self._iterations_since_skill_use = 0
+        self._continuous_turns = 0
+        self._last_turn_non_goal_tool_calls = 0
+        self._active_turn_user_message = None
+        self._pending_memory_context = ""
+        self._pending_plan_context = ""
+        self._pending_goal_context = ""
+        self._repo_map_active_files = list(self._base_repo_map_active_files)
+        self._instruction_scope_directories = list(
+            self._base_instruction_scope_directories
+        )
+        self.recovered_turns = 0
+        self.recovery_summary = None
 
     async def _finish_pending_session_tool_start(self) -> None:
         session = self.current_session
@@ -6722,11 +6806,47 @@ class AshLoop:
             or self._retired_provider_cleanup_failures
         )
 
+    def _session_model_config(self, model: str) -> "AshConfig":
+        if self._config is None:
+            raise RuntimeError("AshLoop was not constructed with a config object")
+        provider_name, model_name = parse_model_string(model)
+        canonical = f"{provider_name}/{model_name}"
+        return self._config.model_copy(
+            update={
+                "model": canonical,
+                "fallback_models": [
+                    fallback
+                    for fallback in self._default_session_fallback_models
+                    if fallback != canonical
+                ],
+            }
+        )
+
+    def _activate_session_model(self, model: str) -> None:
+        """Activate one session's requested route without mutating another session."""
+
+        if self._config is None or self._provider_factory is None or not model:
+            return
+        new_config = self._session_model_config(model)
+        if (
+            new_config.model == self._config.model
+            and new_config.fallback_models == self._config.fallback_models
+        ):
+            return
+        self._commit_provider_switch(
+            new_config,
+            reason="session_model_restore",
+            persist_session_model=False,
+            emit_config_changed=False,
+        )
+
     def _commit_provider_switch(
         self,
         new_config: "AshConfig",
         *,
         reason: str,
+        persist_session_model: bool,
+        emit_config_changed: bool = True,
     ) -> None:
         if self._provider_factory is None:
             raise RuntimeError(
@@ -6753,17 +6873,32 @@ class AshLoop:
         old_system_prompt = self.system_prompt
         replacement = self._provider_factory(new_config)
         effort = self.reasoning_effort
+        session = self.current_session if persist_session_model else None
+        session_lease = None
+        old_session_model = ""
+        model_persisted = False
         try:
             support = replacement.capabilities.reasoning_effort
             if support is None or effort not in support.supported:
                 effort = None
             replacement.configure_reasoning_effort(effort)
+            if session is not None:
+                session_lease = self.session_store.acquire_session_runtime_lease(
+                    session.session_id
+                )
+                old_session_model = self.session_store.session_model(session.session_id)
+                self.session_store.update_session_model(
+                    session.session_id,
+                    new_config.model,
+                )
+                session.model = new_config.model
+                model_persisted = True
             self.provider = replacement
             self._provider_closed = False
             self._config = new_config
             self._provider_circuit_key = _provider_circuit_key(replacement)
             self._sync_generated_tool_protocol()
-        except BaseException:
+        except BaseException as primary_error:
             self.provider = old_provider
             self._provider_closed = old_provider_closed
             self._config = old_config
@@ -6771,62 +6906,62 @@ class AshLoop:
             self._core_system_prompt = old_core_prompt
             self._base_system_prompt = old_base_prompt
             self.system_prompt = old_system_prompt
+            if model_persisted and session is not None:
+                try:
+                    self.session_store.update_session_model(
+                        session.session_id,
+                        old_session_model,
+                    )
+                except BaseException as rollback_error:
+                    primary_error.add_note(
+                        "session model rollback failed after provider switch failure: "
+                        + redact_text(str(rollback_error))[:500]
+                    )
+                session.model = old_session_model
             if replacement is not old_provider and isinstance(replacement, ProviderABC):
                 self._retire_provider(replacement)
             raise
-
-        self.reasoning_effort = effort
-        self._fire_config_changed(reason, {"model": new_config.model})
-        if replacement is not old_provider and isinstance(old_provider, ProviderABC):
-            self._retire_provider(old_provider)
+        else:
+            self.reasoning_effort = effort
+            if emit_config_changed:
+                self._fire_config_changed(reason, {"model": new_config.model})
+            if replacement is not old_provider and isinstance(old_provider, ProviderABC):
+                self._retire_provider(old_provider)
+        finally:
+            if session_lease is not None:
+                session_lease.close()
 
     def switch_provider(self, provider: str, model: str) -> None:
-        """Switch to a different provider and model. Rebuilds provider instance."""
+        """Switch the active session to a different provider and model."""
+
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")
         provider_name, model_name = parse_model_string(f"{provider}/{model}")
         model_str = f"{provider_name}/{model_name}"
-        new_config = self._config.model_copy(
-            update={
-                "model": model_str,
-                "fallback_models": [
-                    fallback
-                    for fallback in self._config.fallback_models
-                    if fallback != model_str
-                ],
-            }
-        )
         self._commit_provider_switch(
-            new_config,
+            self._session_model_config(model_str),
             reason="switch_provider",
+            persist_session_model=True,
         )
 
     def switch_model(self, model: str) -> None:
-        """Switch to a model string. If model contains '/', treat as provider/model.
-        Otherwise, prepend the current provider."""
+        """Switch the active session's requested model route."""
+
         if self._config is None:
             raise RuntimeError("AshLoop was not constructed with a config object")
         if "/" in model:
-            # Full provider/model string
             provider_name, model_name = parse_model_string(model)
         else:
-            # Model-only — prepend current provider
             current_provider = self._config.model.split("/", 1)[0]
             provider_name, model_name = parse_model_string(
                 f"{current_provider}/{model}"
             )
         model_str = f"{provider_name}/{model_name}"
-        new_config = self._config.model_copy(
-            update={
-                "model": model_str,
-                "fallback_models": [
-                    fallback
-                    for fallback in self._config.fallback_models
-                    if fallback != model_str
-                ],
-            }
+        self._commit_provider_switch(
+            self._session_model_config(model_str),
+            reason="switch_model",
+            persist_session_model=True,
         )
-        self._commit_provider_switch(new_config, reason="switch_model")
 
     def _fire_config_changed(self, reason: str, changes: dict[str, Any]) -> None:
         if not changes:
