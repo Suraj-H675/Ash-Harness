@@ -22,7 +22,9 @@ def _plain_terminal_output(raw: bytes) -> bytes:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
-def test_default_interface_does_not_enable_mouse_reporting(tmp_path: Path) -> None:
+def test_fullscreen_prompt_limits_mouse_modes_and_restores_terminal(
+    tmp_path: Path,
+) -> None:
     code = """
 import asyncio
 from pathlib import Path
@@ -34,7 +36,7 @@ async def main():
         prompt.clear_visible_screen()
         value = await prompt.read("native> ")
     finally:
-        prompt.close()
+        await prompt.aclose()
     print("ASH_RESULT=" + value, flush=True)
 
 asyncio.run(main())
@@ -82,20 +84,435 @@ asyncio.run(main())
 
     raw = bytes(captured)
     assert b"ASH_RESULT=hello" in raw
-    assert b"\x1b[2J" in raw
     assert b"\x1b[3J" not in raw
+    assert b"\x1b[?1049h" in raw
+    assert b"\x1b[?1049l" in raw
+    assert b"\x1b[?1000h" in raw and b"\x1b[?1000l" in raw
+    assert b"\x1b[?1006h" in raw and b"\x1b[?1006l" in raw
     for sequence in (
-        b"\x1b[?1000h",
         b"\x1b[?1002h",
         b"\x1b[?1003h",
-        b"\x1b[?1006h",
         b"\x1b[?1015h",
     ):
         assert sequence not in raw
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
-def test_hybrid_surface_renders_live_turn_and_composer_without_mouse_capture(
+def test_pty_wheel_scrolls_history_without_changing_composer_or_prompt_history(
+    tmp_path: Path,
+) -> None:
+    code = r"""
+import asyncio
+import json
+from pathlib import Path
+from ash.ui.prompt import PromptInput
+from ash.ui.transcript import Transcript
+
+async def main():
+    transcript = Transcript()
+    for index in range(40):
+        transcript.append("user", f"question {index}", title="you")
+        transcript.append("assistant", f"answer {index}", title="ash")
+    prompt = PromptInput(
+        history_path=Path("__HISTORY__"),
+        status_provider=lambda: "pty-model · repo",
+        context_provider=lambda: (50, 100),
+        transcript=transcript,
+    )
+    surface = prompt._surface
+    assert surface is not None
+    history = surface.input_buffer.history
+    history.append_string("previous prompt")
+    pending = asyncio.create_task(prompt.read())
+    await asyncio.sleep(0.15)
+
+    def capture():
+        screen = surface.application.renderer._last_screen
+        assert screen is not None
+        rows = {
+            row: "".join(cell.char for _column, cell in sorted(cells.items())).rstrip()
+            for row, cells in screen.data_buffer.items()
+        }
+        composer = next(row for row, value in rows.items() if "›" in value)
+        status = next(row for row, value in rows.items() if "50%" in value)
+        return {"rows": rows, "composer": composer, "status": status}
+
+    before = capture()
+    Path("__READY__").write_text("ready", encoding="utf-8")
+    deadline = asyncio.get_running_loop().time() + 4
+    while not surface.transcript_view.detached:
+        if asyncio.get_running_loop().time() > deadline:
+            raise TimeoutError("SGR wheel event did not detach transcript view")
+        await asyncio.sleep(0.02)
+    after = capture()
+    Path("__STATES__").write_text(json.dumps({
+        "before": before,
+        "after": after,
+        "input": surface.input_buffer.text,
+        "history": history.get_strings(),
+    }), encoding="utf-8")
+    value = await pending
+    await prompt.aclose()
+    print("WHEEL_RESULT=" + value, flush=True)
+
+asyncio.run(main())
+""".replace("__HISTORY__", str(tmp_path / "history")).replace(
+        "__READY__", str(tmp_path / "wheel-ready")
+    ).replace("__STATES__", str(tmp_path / "wheel-states.json"))
+    master_fd, slave_fd = pty.openpty()
+    import fcntl
+    import termios
+
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 40, 0, 0))
+    environment = os.environ.copy()
+    environment["TERM"] = "xterm-256color"
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    captured = bytearray()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(master_fd, 65_536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                captured.extend(chunk)
+            if (tmp_path / "wheel-ready").exists():
+                os.write(master_fd, b"draft")
+                time.sleep(0.1)
+                os.write(master_fd, b"\x1b[<64;10;3M")
+                break
+        else:
+            raise AssertionError(bytes(captured).decode("utf-8", errors="replace")[-3000:])
+
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "wheel-states.json").exists() and time.monotonic() < deadline:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master_fd, 65_536))
+                except OSError:
+                    break
+        states = json.loads((tmp_path / "wheel-states.json").read_text())
+        assert states["after"]["composer"] == states["before"]["composer"]
+        assert states["after"]["status"] == states["before"]["status"]
+        assert states["input"] == "draft"
+        assert states["history"] == ["previous prompt"]
+        os.write(master_fd, b"\r")
+        deadline = time.monotonic() + 5
+        while b"WHEEL_RESULT=draft" not in captured and time.monotonic() < deadline:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master_fd, 65_536))
+                except OSError:
+                    break
+        assert b"WHEEL_RESULT=draft" in captured
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)
+
+    raw = bytes(captured)
+    assert b"\x1b[?1000h" in raw and b"\x1b[?1000l" in raw
+    assert b"\x1b[?1006h" in raw and b"\x1b[?1006l" in raw
+    assert b"\x1b[3J" not in raw
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_fullscreen_prompt_keeps_composer_at_bottom_after_live_resize(
+    tmp_path: Path,
+) -> None:
+    import fcntl
+    import termios
+
+    ready_path = tmp_path / "resize-ready"
+    state_path = tmp_path / "resize-state.json"
+    code = r"""
+import asyncio
+import json
+from pathlib import Path
+from ash.ui.prompt import PromptInput
+
+async def main():
+    prompt = PromptInput(history_path=Path("__HISTORY__"), context_provider=lambda: (25, 100))
+    surface = prompt._surface
+    assert surface is not None
+    pending = asyncio.create_task(prompt.read())
+    await asyncio.sleep(0.15)
+
+    def capture():
+        size = surface.application.output.get_size()
+        composer_info = surface.composer_input_window.render_info
+        status_info = surface.status_window.render_info
+        composer = None if composer_info is None else composer_info._y_offset
+        status = None if status_info is None else status_info._y_offset
+        return {
+            "size": [size.rows, size.columns],
+            "composer": composer,
+            "status": status,
+            "input": surface.input_buffer.text,
+            "completion_open": surface.input_buffer.complete_state is not None,
+        }
+
+    before = capture()
+    Path("__READY__").write_text("ready", encoding="utf-8")
+    deadline = asyncio.get_running_loop().time() + 5
+    while True:
+        after = capture()
+        if (
+            after["size"] != before["size"]
+            and after["composer"] == after["size"][0] - 2
+            and after["status"] == after["size"][0] - 1
+        ):
+            break
+        if asyncio.get_running_loop().time() > deadline:
+            raise TimeoutError("fullscreen layout did not settle at resized dimensions")
+        await asyncio.sleep(0.05)
+    Path("__STATES__").write_text(json.dumps({"before": before, "after": after}), encoding="utf-8")
+    value = await pending
+    await prompt.aclose()
+    print("RESIZE_RESULT=" + value, flush=True)
+
+asyncio.run(main())
+""".replace("__HISTORY__", str(tmp_path / "resize-history")).replace(
+        "__READY__", str(ready_path)
+    ).replace("__STATES__", str(state_path))
+    environment = os.environ.copy()
+    environment["TERM"] = "xterm-256color"
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 14, 60, 0, 0))
+        os.chdir(Path(__file__).parents[2])
+        os.execvpe(sys.executable, [sys.executable, "-c", code], environment)
+    captured = bytearray()
+    child_status = None
+    try:
+        deadline = time.monotonic() + 5
+        while not ready_path.exists() and time.monotonic() < deadline:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master_fd, 65_536))
+                except OSError:
+                    break
+        assert ready_path.exists(), bytes(captured).decode("utf-8", errors="replace")[-2000:]
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 8, 32, 0, 0))
+        deadline = time.monotonic() + 6
+        while not state_path.exists() and time.monotonic() < deadline:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master_fd, 65_536))
+                except OSError:
+                    break
+        assert state_path.exists(), bytes(captured).decode("utf-8", errors="replace")[-2000:]
+        states = json.loads(state_path.read_text())
+        assert states["before"]["size"][0] == 14
+        assert states["after"]["size"] == [8, 32]
+        assert states["before"]["composer"] is not None, states
+        assert states["before"]["status"] is not None, states
+        assert states["before"]["composer"] == 12
+        assert states["before"]["status"] == 13
+        assert states["after"]["composer"] is not None, states
+        assert states["after"]["status"] is not None, states
+        assert states["after"]["composer"] == 6
+        assert states["after"]["status"] == 7
+        assert states["after"]["input"] == ""
+        assert states["after"]["completion_open"] is False
+        os.write(master_fd, b"ok\r")
+        deadline = time.monotonic() + 5
+        while b"RESIZE_RESULT=ok" not in captured and time.monotonic() < deadline:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master_fd, 65_536))
+                except OSError:
+                    break
+        assert b"RESIZE_RESULT=ok" in captured
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            finished, child_status = os.waitpid(pid, os.WNOHANG)
+            if finished:
+                break
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master_fd, 65_536))
+                except OSError:
+                    break
+        assert child_status is not None
+    finally:
+        if child_status is None:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+        os.close(master_fd)
+
+    raw = bytes(captured)
+    assert b"\x1b[?1049h" in raw and b"\x1b[?1049l" in raw
+    assert b"\x1b[?1000h" in raw and b"\x1b[?1000l" in raw
+    assert b"\x1b[?1006h" in raw and b"\x1b[?1006l" in raw
+    assert b"\x1b[3J" not in raw
+    assert os.waitstatus_to_exitcode(child_status) == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_fullscreen_prompt_restores_terminal_after_interruption(
+    tmp_path: Path,
+) -> None:
+    code = """
+import asyncio
+from pathlib import Path
+from ash.ui.prompt import PromptInput
+
+async def main():
+    prompt = PromptInput(history_path=Path(%r))
+    pending = asyncio.create_task(prompt.read())
+    await asyncio.sleep(0.15)
+    pending.cancel()
+    try:
+        await pending
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await prompt.aclose()
+    print("CANCELLED_CLEANLY", flush=True)
+
+asyncio.run(main())
+""" % str(tmp_path / "cancel-history")
+    master_fd, slave_fd = pty.openpty()
+    environment = os.environ.copy()
+    environment["TERM"] = "xterm-256color"
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    captured = bytearray()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and b"CANCELLED_CLEANLY" not in captured:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master_fd, 65_536))
+                except OSError:
+                    break
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)
+
+    raw = bytes(captured)
+    assert b"CANCELLED_CLEANLY" in raw
+    assert b"\x1b[?1000h" in raw and b"\x1b[?1000l" in raw
+    assert b"\x1b[?1006h" in raw and b"\x1b[?1006l" in raw
+    assert b"\x1b[?1049h" in raw and b"\x1b[?1049l" in raw
+    assert b"\x1b[3J" not in raw
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_repl_failure_restores_fullscreen_terminal_modes(tmp_path: Path) -> None:
+    code = """
+import asyncio
+from pathlib import Path
+import ash.cli as cli
+from ash.ui.prompt import PromptInput
+from ash.ui.terminal import TerminalUI
+
+class Loop:
+    def __init__(self, ui):
+        self.ui = ui
+
+    async def start_session(self, session_id):
+        return None
+
+    async def aclose(self):
+        return None
+
+async def main():
+    ui = TerminalUI()
+    prompt = PromptInput(history_path=Path(%r))
+    ui.bind_prompt_surface(prompt.invalidate, prompt.write_terminal, prompt.aclose)
+
+    async def failed_repl(loop, config, sandbox_manager):
+        del loop, config, sandbox_manager
+        pending = asyncio.create_task(prompt.read())
+        await asyncio.sleep(0.15)
+        pending.cancel()
+        try:
+            await pending
+        except asyncio.CancelledError:
+            pass
+        raise RuntimeError("injected REPL failure")
+
+    cli._repl = failed_repl
+    result = await cli._bootstrap_and_repl(Loop(ui), object(), object(), session_id=None)
+    print(f"REPL_EXIT={result}", flush=True)
+
+asyncio.run(main())
+""" % str(tmp_path / "failure-history")
+    master_fd, slave_fd = pty.openpty()
+    environment = os.environ.copy()
+    environment["TERM"] = "xterm-256color"
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    captured = bytearray()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and b"REPL_EXIT=" not in captured:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master_fd, 65_536))
+                except OSError:
+                    break
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)
+
+    raw = bytes(captured)
+    assert b"REPL_EXIT=" in raw
+    assert b"\x1b[?1049h" in raw and b"\x1b[?1049l" in raw
+    assert b"\x1b[?1000h" in raw and b"\x1b[?1000l" in raw
+    assert b"\x1b[?1006h" in raw and b"\x1b[?1006l" in raw
+    assert b"\x1b[3J" not in raw
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_fullscreen_surface_renders_live_turn_with_wheel_mouse_modes(
     tmp_path: Path,
 ) -> None:
     code = """
@@ -111,6 +528,7 @@ async def main():
         status_provider=lambda: "gpt-test · effort medium · ~/Ash-Harness",
         context_provider=lambda: (32_000, 64_000),
         thinking_provider=ui.prompt_thinking_view,
+        transcript=ui.transcript,
     )
     ui.bind_prompt_surface(prompt.invalidate, prompt.write_terminal)
     ui.record_user_input("hello from user")
@@ -125,7 +543,7 @@ async def main():
         stream_task = asyncio.create_task(stream_response())
         value = await prompt.read("steer> ")
         await stream_task
-        prompt.close()
+        await prompt.aclose()
     ui.finalize_turn()
     ui.commit_completed_turn()
     print("HYBRID_RESULT=" + value, flush=True)
@@ -161,7 +579,11 @@ asyncio.run(main())
                 if not chunk:
                     break
                 captured.extend(chunk)
-            if not sent and b"I found the issue and I am applying the fix." in captured:
+            if (
+                not sent
+                and b"I found the issue" in captured
+                and b"and I am applying the fix." in captured
+            ):
                 os.write(master_fd, b"continue\r")
                 sent = True
             if b"HYBRID_RESULT=continue" in captured:
@@ -178,37 +600,32 @@ asyncio.run(main())
         os.close(master_fd)
 
     raw = bytes(captured)
-    plain = _plain_terminal_output(raw).decode("utf-8")
+    plain = _plain_terminal_output(raw).decode("utf-8").replace("\r", "")
     assert b"HYBRID_RESULT=continue" in raw
     for marker in (
         b"hello from user",
         b"ASH",
         b"Inspecting the repository",
-        b"I found the issue and I am applying the fix.",
+        b"I found the issue",
+        b"and I am applying the fix.",
         b"gpt-test",
         b"effort medium",
         b"50%",
     ):
         assert marker in raw
-    assert raw.index(b"hello from user") < raw.index(
-        b"I found the issue and I am applying the fix."
-    )
-    assert raw.count(b"I found the issue and I am applying the fix.") == 1
+    assert raw.index(b"hello from user") < raw.index(b"ASH")
+    assert raw.index(b"ASH") < raw.index(b"I found the issue")
+    assert raw.index(b"I found the issue") < raw.index(b"and I am applying the fix.")
     assert "> hello from user" in plain
     assert plain.index("> hello from user") < plain.index("ASH")
-    assert plain.index("ASH") < plain.index("· I found the issue and I am applying the fix.")
+    assert plain.index("ASH") < plain.index("I found the issue")
     assert "gpt-test · effort medium · ~/Ash-Harness" in plain
     assert "50%" in plain
     assert b"YOU" not in raw
-    assert b"STEER" not in raw
     assert b"\x1b[3J" not in raw
-    for sequence in (
-        b"\x1b[?1000h",
-        b"\x1b[?1002h",
-        b"\x1b[?1003h",
-        b"\x1b[?1006h",
-        b"\x1b[?1015h",
-    ):
+    assert b"\x1b[?1000h" in raw and b"\x1b[?1000l" in raw
+    assert b"\x1b[?1006h" in raw and b"\x1b[?1006l" in raw
+    for sequence in (b"\x1b[?1002h", b"\x1b[?1003h", b"\x1b[?1015h"):
         assert sequence not in raw
 
 
@@ -238,6 +655,7 @@ async def main():
         status_provider=lambda: "gpt-test · effort medium · ~/Ash-Harness",
         context_provider=lambda: (32, 64),
         dock_provider=ui.prompt_dock_view,
+        transcript=ui.transcript,
         no_color=False,
     )
     ui.bind_prompt_surface(prompt.invalidate, prompt.write_terminal)
@@ -288,7 +706,7 @@ async def main():
         Path("__READY__").write_text("ready", encoding="utf-8")
         value = await pending
     ui.finalize_turn()
-    prompt.close()
+    await prompt.aclose()
     Path("__STATES__").write_text(json.dumps(snapshots), encoding="utf-8")
     print("DOCK_RESULT=" + value, flush=True)
 
@@ -344,7 +762,6 @@ asyncio.run(main())
         os.close(master_fd)
 
     raw = bytes(captured)
-    plain = _plain_terminal_output(raw).decode("utf-8", errors="replace")
     states = {
         snapshot["name"]: snapshot["rows"]
         for snapshot in json.loads(states_path.read_text())
@@ -371,23 +788,19 @@ asyncio.run(main())
         for row in states["idle"]
         for marker in ("Thinking", "Inspecting", "Reasoning:")
     )
-    assert "1234567890123456789012345678" in plain
-    assert "90🙂" in plain
-    assert "second line" in plain
-    assert b"48;2;48;48;48" in raw
-    assert b"\x1b[?1049h" not in raw
-    for sequence in (
-        b"\x1b[?1000h",
-        b"\x1b[?1002h",
-        b"\x1b[?1003h",
-        b"\x1b[?1006h",
-        b"\x1b[?1015h",
-    ):
+    assert any(row.startswith("> 123456789012345678") for row in states["idle"])
+    assert any("🙂" in row for row in states["idle"])
+    assert any("> second line" in row for row in states["idle"])
+    assert b"48;5;236" in raw
+    assert b"\x1b[?1049h" in raw and b"\x1b[?1049l" in raw
+    assert b"\x1b[?1000h" in raw and b"\x1b[?1000l" in raw
+    assert b"\x1b[?1006h" in raw and b"\x1b[?1006l" in raw
+    for sequence in (b"\x1b[?1002h", b"\x1b[?1003h", b"\x1b[?1015h"):
         assert sequence not in raw
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
-def test_resuming_replaces_visible_chat_and_preserves_scrollback(tmp_path: Path) -> None:
+def test_resume_and_clear_replace_the_active_conversation_view(tmp_path: Path) -> None:
     from datetime import datetime, timezone
 
     from ash.core.session import Message, SessionStore
@@ -477,9 +890,20 @@ def test_resuming_replaces_visible_chat_and_preserves_scrollback(tmp_path: Path)
         selected_answer_end = captured.index(b"selected answer") + len(
             b"selected answer"
         )
-        expect("›".encode(), after=selected_answer_end)
+        time.sleep(0.2)
+        os.write(master_fd, b"/clear\r")
+        expect(b"Ready", after=selected_answer_end)
+        time.sleep(0.1)
         os.write(master_fd, b"/exit\r")
         process.wait(timeout=10)
+        while select.select([master_fd], [], [], 0.1)[0]:
+            try:
+                chunk = os.read(master_fd, 65_536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            captured.extend(chunk)
     finally:
         if process.poll() is None:
             process.kill()
@@ -487,15 +911,17 @@ def test_resuming_replaces_visible_chat_and_preserves_scrollback(tmp_path: Path)
         os.close(master_fd)
 
     raw = bytes(captured)
-    plain = _plain_terminal_output(raw).decode("utf-8")
-    clear_position = raw.index(b"\x1b[2J", raw.index(b"abandoned answer"))
-    selected_position = raw.index(b"selected question", clear_position)
-    assert raw.index(b"abandoned answer") < clear_position < selected_position
+    plain = _plain_terminal_output(raw).decode("utf-8").replace("\r", "")
+    selected_position = raw.index(b"selected question", raw.index(b"abandoned answer"))
+    assert raw.index(b"abandoned answer") < selected_position
     assert b"\x1b[3J" not in raw
-    assert b"abandoned" not in raw[clear_position:]
-    assert re.search(r"> abandoned question *\n\nASH\n· abandoned answer", plain)
-    assert re.search(r"> selected question *\n\nASH\n· selected answer", plain)
+    assert re.search(r"> abandoned question *\n *\nASH\n· abandoned answer", plain)
+    assert b"selected question" in raw
+    assert b"selected answer" in raw
     assert "Recent conversation" not in plain
+    assert b"Started session" not in raw
+    assert b"\x1b[?1000h" in raw and b"\x1b[?1000l" in raw
+    assert b"\x1b[?1006h" in raw and b"\x1b[?1006l" in raw
     assert process.returncode == 0
 
 

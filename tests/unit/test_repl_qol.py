@@ -21,6 +21,7 @@ def _install_frontend(
     *,
     turn_inputs: list[str] | None = None,
     turn_metadata: list[dict | None] | None = None,
+    session_loads: list | None = None,
 ):
     class FakeTerminalUI:
         transcript = None
@@ -36,7 +37,15 @@ def _install_frontend(
             )
 
         def load_session_transcript(self, session) -> None:
-            del session
+            if session_loads is not None:
+                session_loads.append(
+                    None
+                    if session is None
+                    else (
+                        session.session_id,
+                        [message.content for message in session.messages],
+                    )
+                )
 
     class FakePromptInput:
         interactive = False
@@ -140,12 +149,14 @@ async def _run_repl(
     config_overrides: dict | None = None,
     turn_inputs: list[str] | None = None,
     turn_metadata: list[dict | None] | None = None,
+    session_loads: list | None = None,
 ) -> int:
     ui_type = _install_frontend(
         monkeypatch,
         commands,
         turn_inputs=turn_inputs,
         turn_metadata=turn_metadata,
+        session_loads=session_loads,
     )
     monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -170,6 +181,17 @@ async def _run_repl(
         permission_policy=PermissionPolicy(safety_tier),
         safety_tier=safety_tier,
     )
+
+    async def start_session(session_id: str | None = None):
+        session = (
+            store.create_session(str(tmp_path), model=active_model_id)
+            if session_id is None
+            else store.load_session(session_id)
+        )
+        loop.current_session = session
+        return session
+
+    loop.start_session = start_session
     config = _config(tmp_path, **(config_overrides or {}))
     return await _repl(loop, config, SimpleNamespace())
 
@@ -183,6 +205,61 @@ def _persist_turn(
     for message in messages:
         store.save_message(session.session_id, message, turn_id=turn_id)
         session.messages.append(message)
+
+
+@pytest.mark.asyncio
+async def test_session_switch_commands_all_load_the_selected_transcript_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    active = store.create_session(str(tmp_path), model="ollama/test-model")
+    now = datetime.now(timezone.utc)
+    _persist_turn(
+        store,
+        active,
+        "active-turn",
+        (
+            Message(role="user", content="active question", timestamp=now),
+            Message(role="assistant", content="active answer", timestamp=now),
+        ),
+    )
+    export_path = tmp_path / "selected.jsonl"
+    export_path.write_text(store.export_session(active.session_id), encoding="utf-8")
+    loaded: list = []
+
+    assert await _run_repl(
+        tmp_path,
+        monkeypatch,
+        iter(
+            (
+                "/new",
+                "/clear",
+                "/reset",
+                f"/resume {active.session_id}",
+                "/fork",
+                "/rewind 1",
+                f"/import {export_path}",
+                "/retry",
+                "exit",
+            )
+        ),
+        session_store=store,
+        current_session=store.load_session(active.session_id),
+        session_loads=loaded,
+    ) == 0
+
+    assert len(loaded) == 9  # initial hydration plus all eight view replacements
+    assert loaded[0][0] == active.session_id
+    assert loaded[1][0] != active.session_id and loaded[1][1] == []
+    assert loaded[2][0] != loaded[1][0] and loaded[2][1] == []
+    assert loaded[3][0] != loaded[2][0] and loaded[3][1] == []
+    assert loaded[4] == (active.session_id, ["active question", "active answer"])
+    assert loaded[5][1] == ["active question", "active answer"]
+    assert loaded[6][1] == ["active question"]
+    assert loaded[7][0] != active.session_id
+    assert loaded[7][1] == ["active question", "active answer"]
+    assert loaded[8][1] == []
 
 
 @pytest.mark.asyncio

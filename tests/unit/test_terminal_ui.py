@@ -1,4 +1,5 @@
 # tests/unit/test_terminal_ui.py
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -227,7 +228,7 @@ def test_prompt_thinking_view_does_not_read_committed_history(
     assert "old answer" not in plain
 
 
-def test_prompt_surface_streams_to_scrollback_without_final_reprint() -> None:
+def test_prompt_surface_streams_to_app_owned_transcript_without_console_output() -> None:
     output = StringIO()
     ui = TerminalUI(console=Console(file=output, force_terminal=False, width=80))
     ui.bind_prompt_surface(lambda: None)
@@ -240,9 +241,14 @@ def test_prompt_surface_streams_to_scrollback_without_final_reprint() -> None:
     ui.finalize_turn()
     ui.commit_completed_turn()
     rendered = output.getvalue()
-    assert re.search(r"> question *\n\nASH\n· first answer", rendered)
-    assert rendered.count("first answer") == 1
-    assert "checking" not in rendered
+    assert rendered == ""
+    entries = ui.transcript.snapshot()
+    assert [(entry.kind, entry.finalized) for entry in entries] == [
+        ("user", True),
+        ("reasoning", True),
+        ("assistant", True),
+    ]
+    assert entries[-1].content == "first answer"
     assert "THINK  checking" in fragment_list_to_text(
         to_formatted_text(ui.prompt_thinking_view(80)[1])
     )
@@ -251,7 +257,7 @@ def test_prompt_surface_streams_to_scrollback_without_final_reprint() -> None:
     assert output.getvalue() == rendered
 
 
-def test_hybrid_conversation_uses_blue_user_text_and_unboxed_assistant() -> None:
+def test_app_owned_conversation_keeps_gray_user_band_in_semantic_transcript() -> None:
     output = StringIO()
     ui = TerminalUI(
         console=Console(
@@ -275,12 +281,11 @@ def test_hybrid_conversation_uses_blue_user_text_and_unboxed_assistant() -> None
     ui.commit_completed_turn()
 
     rendered = output.getvalue()
-    assert "> hello from user" in rendered
-    assert "38;2;111;149;255" in rendered
-    assert "48;2;48;48;48" in rendered
-    assert "YOU" not in rendered
-    assert "ASH" in rendered
-    assert rendered.count("hello from ash") == 1
+    assert rendered == ""
+    entries = ui.transcript.snapshot()
+    assert [entry.kind for entry in entries] == ["user", "reasoning", "assistant"]
+    assert entries[0].content == "hello from user"
+    assert entries[-1].content == "hello from ash"
     assert "THINK  " not in rendered
     assert "THINK  checking" in reasoning_text
     assert "╭" not in rendered
@@ -345,41 +350,47 @@ def test_no_color_user_band_keeps_markers_without_invisible_fill() -> None:
     assert band.plain == "> plain text"
 
 
-def test_live_user_band_width_is_chosen_when_queued_write_runs() -> None:
+def test_live_user_band_is_preserved_for_the_app_owned_renderer() -> None:
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=80)
     ui = TerminalUI(console=console)
-    queued = []
-    ui.bind_prompt_surface(lambda: None, queued.append)
-
     ui.record_user_input("🙂 this wraps at the live width")
-    console.width = 12
-    queued.pop(0)()
+    entry = ui.transcript.snapshot()[0]
 
-    rows = output.getvalue().split("\n")
-    assert rows[0].startswith("> ")
-    assert len(rows) > 2
-    assert all(Text(row).cell_len <= 12 for row in rows if row)
+    assert entry.kind == "user"
+    assert entry.content == "🙂 this wraps at the live width"
+    assert output.getvalue() == ""
 
 
 def test_inter_turn_spacing_adds_one_blank_line_before_the_next_user() -> None:
-    output = StringIO()
-    ui = TerminalUI(console=Console(file=output, force_terminal=False, width=40))
-    ui.bind_prompt_surface(lambda: None)
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False, width=40))
     ui.record_user_input("first question")
     with ui.begin_turn():
         ui.print_token("first answer")
     ui.finalize_turn()
 
     ui.record_user_input("second question")
+    from ash.ui.transcript_view import TranscriptView
 
-    assert "· first answer\n\n> second question" in output.getvalue()
+    view = TranscriptView(ui.transcript)
+    content = view.create_content(40, 20)
+    rows = [
+        "".join(text for _style, text in content.get_line(index)).rstrip()
+        for index in range(content.line_count)
+    ]
+    assert rows[:6] == [
+        "> first question",
+        "",
+        "ASH",
+        "· first answer",
+        "",
+        "> second question",
+    ]
+    view.close()
 
 
 def test_prompt_surface_streams_long_response_once_without_preview_truncation() -> None:
-    output = StringIO()
-    ui = TerminalUI(console=Console(file=output, force_terminal=False, width=80))
-    ui.bind_prompt_surface(lambda: None)
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False, width=80))
     response = "START-" + ("x" * 5_000) + "-END"
 
     with ui.begin_turn():
@@ -388,10 +399,9 @@ def test_prompt_surface_streams_long_response_once_without_preview_truncation() 
 
     ui.finalize_turn()
     ui.commit_completed_turn()
-    rendered = output.getvalue()
-    assert "START-" in rendered
-    assert "-END" in rendered
-    assert rendered.count("x" * 100) == 50
+    entry = ui.transcript.snapshot()[0]
+    assert entry.content == response
+    assert entry.finalized
 
 
 def test_suspend_live_render_pauses_and_resumes_same_live_instance() -> None:
@@ -704,6 +714,75 @@ def test_terminal_ui_hydrates_bounded_durable_session_transcript() -> None:
     assert entries[1].content == "answer"
     assert len(entries[2].content) < 4100
     assert entries[2].metadata == {"call_id": "c1"}
+
+
+
+
+@pytest.mark.asyncio
+async def test_prompt_notice_expires_without_replacing_status_indefinitely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invalidations = 0
+
+    def invalidate() -> None:
+        nonlocal invalidations
+        invalidations += 1
+
+    monkeypatch.setattr(terminal_module, "PROMPT_NOTICE_SECONDS", 0.01)
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.bind_prompt_surface(invalidate)
+
+    ui.set_prompt_notice("Resumed chat.")
+    assert ui.prompt_status_notice() == "Resumed chat."
+
+    await asyncio.sleep(0.03)
+
+    assert ui.prompt_status_notice() is None
+    assert invalidations >= 2
+
+def test_session_view_replacement_drops_old_and_ephemeral_transcript_entries() -> None:
+    from ash.ui.transcript_view import TranscriptView
+
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.bind_prompt_surface(lambda: None)
+    ui.transcript.append("user", "old session question", title="you")
+    ui.transcript.append("status", "old transient output", title="output")
+    view = TranscriptView(ui.transcript)
+    ui.set_prompt_notice("Forked branch")
+    assert ui.prompt_status_notice() == "Forked branch"
+
+    selected = SimpleNamespace(
+        resident_message_offset=3,
+        messages=[
+            SimpleNamespace(role="user", content="selected question", metadata={}),
+            SimpleNamespace(role="assistant", content="selected answer", metadata={}),
+        ],
+    )
+    ui.load_session_transcript(selected)
+    selected_entries = ui.transcript.snapshot()
+    assert [entry.content for entry in selected_entries] == [
+        "Earlier session history is outside the resident snapshot: 3 message(s).",
+        "selected question",
+        "selected answer",
+    ]
+    assert all("old " not in entry.content for entry in selected_entries)
+    assert view.follow_latest is True
+    assert ui.prompt_status_notice() is None
+
+    ui.set_prompt_notice("Rewound chat")
+    ui.record_user_input("continue here")
+    assert ui.prompt_status_notice() is None
+
+    ui.load_session_transcript(None)
+    empty = view.create_content(40, 8)
+    visible = "\n".join(
+        "".join(text for _style, text in empty.get_line(index))
+        for index in range(empty.line_count)
+    )
+    assert ui.transcript.snapshot() == ()
+    assert "Ready" in visible
+    assert "selected" not in visible
+    view.close()
 
 
 def test_inline_resume_renders_bounded_recent_conversation() -> None:

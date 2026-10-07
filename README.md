@@ -354,15 +354,22 @@ foreground work; use durable automation for scheduled or unattended jobs.
 
 The interactive interface is built for sustained terminal work:
 
-- conversation output lives in the terminal's normal scrollback, so wheel
-  scrolling, selection, copy, links, and context-menu behavior remain
-  terminal-native and do not depend on Ash repainting the transcript;
-- Ash keeps one bounded retained surface for the active turn plus a bottom-docked
-  composer and compact status row; completed turns are committed once to native
-  scrollback instead of being redrawn with session history;
+- the transcript has its own bounded scroll view, while the activity dock,
+  multiline composer, and status row stay pinned at the bottom;
+- mouse wheel and trackpad reports scroll the transcript without changing the
+  composer or prompt history; Page Up/Down and Ctrl+End provide keyboard
+  navigation and return-to-latest;
+- the live view retains up to 1,000 entries and 2 MB of text, and indicates when
+  earlier entries were omitted; session replacement shows only the selected
+  transcript, while a new chat opens empty;
+- Shift can pass mouse selection through to terminals that support the
+  application override; `/copy` copies the latest assistant response;
 - blue user messages sit on a subtle theme-matched gray band with cell-aware
   wrapping; a one-row dock above the composer names active work and keeps
   provider reasoning separate, with motion only while work is active;
+- a thin context-usage line keeps its percentage visible in narrow terminals;
+  session-transition feedback uses the pinned status row rather than becoming a
+  transcript entry;
 - Rich Markdown and fenced-code rendering with bounded live previews, chunked
   token accumulation, cached frames, and bounded repaint frequency;
 - streaming user, assistant, reasoning, tool, approval, status, error, and

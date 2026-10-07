@@ -15,6 +15,7 @@ import ash.ui.history as history_module
 import ash.ui.prompt as prompt_module
 from ash.repo.parser import Symbol
 from ash.ui.prompt import AshCompleter, PromptChoice, PromptInput
+from ash.ui.transcript import Transcript
 
 
 class TtyStringIO(io.StringIO):
@@ -26,9 +27,13 @@ class TrackingMouseOutput(DummyOutput):
     def __init__(self) -> None:
         super().__init__()
         self.mouse_enabled = 0
+        self.mouse_disabled = 0
 
     def enable_mouse_support(self) -> None:
         self.mouse_enabled += 1
+
+    def disable_mouse_support(self) -> None:
+        self.mouse_disabled += 1
 
 
 @pytest.fixture
@@ -149,7 +154,7 @@ async def test_prompt_bracketed_paste_preserves_multiline_input(
 
 
 @pytest.mark.asyncio
-async def test_default_prompt_does_not_capture_terminal_mouse(
+async def test_prompt_uses_mouse_reporting_for_scrollable_transcript(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor_ui: None,
@@ -166,7 +171,80 @@ async def test_default_prompt_does_not_capture_terminal_mouse(
         pipe.send_text("hello\r")
 
         assert await pending == "hello"
-        assert output.mouse_enabled == 0
+        assert output.mouse_enabled == 1
+        await prompt.aclose()
+        assert output.mouse_disabled == 1
+
+
+@pytest.mark.asyncio
+async def test_enter_submits_slash_arguments_while_completion_menu_is_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cursor_ui: None,
+) -> None:
+    with create_pipe_input() as pipe:
+        prompt = PromptInput(
+            input_stream=TtyStringIO(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = asyncio.create_task(prompt.read())
+        await asyncio.sleep(0.05)
+        pipe.send_text("/res")
+        assert prompt._surface is not None
+        for _attempt in range(20):
+            if prompt._surface.input_buffer.text == "/res":
+                break
+            await asyncio.sleep(0.01)
+        for _attempt in range(20):
+            if prompt._surface.input_buffer.complete_state is not None:
+                break
+            await asyncio.sleep(0.01)
+        state = prompt._surface.input_buffer.complete_state
+        assert state is not None and state.completions
+
+        pipe.send_text("\r")
+        assert await pending == "/res"
+        await prompt.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sgr_wheel_scrolls_transcript_without_editing_input_or_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cursor_ui: None,
+) -> None:
+    with create_pipe_input() as pipe:
+        transcript = Transcript()
+        for index in range(40):
+            transcript.append("user", f"question {index}", title="you")
+            transcript.append("assistant", f"answer {index}", title="ash")
+        prompt = PromptInput(
+            input_stream=TtyStringIO(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=DummyOutput(),
+            transcript=transcript,
+        )
+        assert prompt._surface is not None
+        history = prompt._surface.input_buffer.history
+        history.append_string("previous prompt")
+        pending = asyncio.create_task(prompt.read())
+        await asyncio.sleep(0.05)
+
+        pipe.send_bytes(b"\x1b[<66;10;5M")
+        await asyncio.sleep(0.05)
+        assert prompt._surface.transcript_view.follow_latest is True
+        pipe.send_bytes(b"\x1b[<64;10;5M")
+        await asyncio.sleep(0.05)
+
+        assert prompt._surface.transcript_view.detached is True
+        assert prompt._surface.input_buffer.text == ""
+        assert history.get_strings() == ["previous prompt"]
+        pipe.send_text("hello\r")
+        assert await pending == "hello"
+        await prompt.aclose()
 
 
 @pytest.mark.asyncio

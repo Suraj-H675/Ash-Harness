@@ -611,7 +611,11 @@ async def _interactive_model_picker(
 
         refresh_task = asyncio.create_task(refresh_picker())
         try:
-            model_str = await picker.run_async()
+            suspend_for_overlay = getattr(prompt_input, "suspend_for_overlay", None)
+            if callable(suspend_for_overlay):
+                model_str = await suspend_for_overlay(picker.run_async)
+            else:
+                model_str = await picker.run_async()
         finally:
             if not refresh_task.done():
                 refresh_task.cancel()
@@ -830,6 +834,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     discovered_commands = custom_commands.discover()
 
     status_line = StatusLine(loop, config, sandbox_manager)
+
+    def prompt_status() -> str:
+        notice = getattr(loop.ui, "prompt_status_notice", lambda: None)()
+        return notice or status_line.left()
+
     thinking_provider = getattr(
         loop.ui,
         "prompt_thinking_view",
@@ -838,7 +847,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     dock_provider = getattr(loop.ui, "prompt_dock_view", None)
 
     prompt_input = PromptInput(
-        status_provider=status_line.left,
+        status_provider=prompt_status,
         context_provider=status_line.context_usage,
         thinking_provider=thinking_provider,
         dock_provider=dock_provider,
@@ -851,16 +860,22 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         workspace_root=loop.project_root,
         theme=config.theme,
         no_color=config.no_color,
+        transcript=getattr(loop.ui, "transcript", None),
         repo_map=getattr(loop, "repo_map", None),
         mcp_runtime=getattr(loop, "_mcp_runtime", None),
         screen_reader_mode=config.screen_reader_mode,
         reduced_motion=bool(getattr(config, "reduced_motion", False)),
     )
+    has_live_surface = bool(getattr(prompt_input, "supports_live_surface", False))
     if not isinstance(loop.ui, TerminalUI):
         raise TypeError("interactive REPL requires TerminalUI")
     bind_prompt_surface = getattr(loop.ui, "bind_prompt_surface", None)
-    if callable(bind_prompt_surface) and prompt_input.supports_live_surface:
-        bind_prompt_surface(prompt_input.invalidate, prompt_input.write_terminal)
+    if callable(bind_prompt_surface) and has_live_surface:
+        bind_prompt_surface(
+            prompt_input.invalidate,
+            prompt_input.write_terminal,
+            prompt_input.aclose,
+        )
         prompt_input.set_effort_provider(
             lambda: tuple(
                 loop.provider.capabilities.reasoning_effort.supported
@@ -868,9 +883,37 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 else ()
             )
         )
-        prompt_input.clear_visible_screen()
     loop.ui.load_session_transcript(loop.current_session)
-    print = ReplPrinter()  # noqa: A001
+    print = ReplPrinter(  # noqa: A001
+        loop.ui.write_output
+        if has_live_surface
+        else None
+    )
+
+    def transition_feedback(text: str) -> None:
+        set_notice = getattr(loop.ui, "set_prompt_notice", None)
+        if has_live_surface and callable(set_notice):
+            set_notice(text)
+        else:
+            print(text, flush=True)
+
+    recovery_summary = getattr(loop, "recovery_summary", None)
+    if recovery_summary is not None and getattr(loop, "recovered_turns", False):
+        summary = recovery_summary
+        loop.ui.write_status(
+            "Recovered "
+            f"{summary.interrupted_turns} interrupted turn(s): "
+            f"{summary.compensated_calls} tool call(s) compensated; "
+            f"{len(summary.unknown_calls)} unknown tool outcome(s); "
+            f"{len(summary.unresolved_files)} unresolved file(s).",
+            error=summary.needs_attention,
+        )
+        if summary.needs_attention:
+            loop.ui.write_status(
+                "Run /recovery to inspect unresolved files and ambiguous external "
+                "outcomes before retrying side effects.",
+                error=True,
+            )
 
     def _print_classified_error(exc: BaseException) -> None:
         """Route interactive classified failures through the active UI surface."""
@@ -1073,10 +1116,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             ),
         )
 
-    print(
-        "ASH · type /help for commands",
-        flush=True,
-    )
+    if not has_live_surface:
+        print(
+            "ASH · type /help for commands",
+            flush=True,
+        )
     no_argument_commands = frozenset(
         {
             "exit",
@@ -1194,11 +1238,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     ),
                 )
                 if prompt_input.supports_full_screen_ui:
-                    await show_help_overlay(
-                        commands=help_commands,
-                        initial_query=help_query,
-                        theme=config.theme,
-                        no_color=config.no_color,
+                    await prompt_input.suspend_for_overlay(
+                        lambda: show_help_overlay(
+                            commands=help_commands,
+                            initial_query=help_query,
+                            theme=config.theme,
+                            no_color=config.no_color,
+                        )
                     )
                 else:
                     print(
@@ -1518,7 +1564,8 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             if command.name == "new":
                 session = await loop.start_session()
                 loop.ui.load_session_transcript(session)
-                print(f"Started session {session.session_id}", flush=True)
+                if not has_live_surface:
+                    print("New chat started.", flush=True)
                 continue
             if command.name == "sessions":
                 if arguments[:1] == ["prune"]:
@@ -1602,11 +1649,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             continue
                         from ash.commands.sessions import pick_session
 
-                        selected_session_id = await pick_session(
-                            loop.session_store,
-                            project_path=str(loop.project_root),
-                            theme=config.theme,
-                            no_color=config.no_color,
+                        selected_session_id = await prompt_input.suspend_for_overlay(
+                            lambda: pick_session(
+                                loop.session_store,
+                                project_path=str(loop.project_root),
+                                theme=config.theme,
+                                no_color=config.no_color,
+                            )
                         )
                         if selected_session_id is None:
                             print("Resume cancelled.", flush=True)
@@ -1615,8 +1664,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 except (KeyError, ValueError) as exc:
                     _print_classified_error(exc)
                     continue
-                prompt_input.clear_visible_screen()
                 loop.ui.load_session_transcript(session)
+                if has_live_surface:
+                    transition_feedback("Resumed chat.")
                 continue
             if command.name == "rename":
                 if not arguments or loop.current_session is None:
@@ -1654,7 +1704,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     continue
                 loop.current_session = session
                 loop.ui.load_session_transcript(session)
-                print(f"Forked session {session.session_id}", flush=True)
+                transition_feedback(
+                    f"Forked {session.branch_name or session.session_id[:8]}"
+                )
                 continue
             if command.name == "tree":
                 if loop.current_session is None or arguments:
@@ -1707,7 +1759,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 loop.current_session = session
                 loop.ui.load_session_transcript(session)
                 suffix = f" and restored {len(restored)} file(s)" if with_files else ""
-                print(
+                transition_feedback(
                     f"Rewound transcript to {len(session.messages)} messages{suffix}."
                 )
                 continue
@@ -1809,7 +1861,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     continue
                 loop.current_session = session
                 loop.ui.load_session_transcript(session)
-                print(f"Imported and resumed session {session.session_id}")
+                transition_feedback("Imported and resumed chat.")
                 continue
             if command.name == "context":
                 maximum = config.max_context_tokens - config.max_completion_tokens
@@ -6046,24 +6098,6 @@ async def _bootstrap_and_repl(
     result_code = 0
     try:
         await loop.start_session(session_id)
-        if loop.recovery_summary is not None and loop.recovered_turns:
-            summary = loop.recovery_summary
-            print(
-                "Recovered "
-                f"{summary.interrupted_turns} interrupted turn(s): "
-                f"{summary.compensated_calls} tool call(s) compensated; "
-                f"{len(summary.unknown_calls)} unknown tool outcome(s); "
-                f"{len(summary.unresolved_files)} unresolved file(s).",
-                file=sys.stderr if summary.needs_attention else sys.stdout,
-                flush=True,
-            )
-            if summary.needs_attention:
-                print(
-                    "Run /recovery to inspect unresolved files and ambiguous "
-                    "external outcomes before retrying side effects.",
-                    file=sys.stderr,
-                    flush=True,
-                )
         result_code = await _repl(loop, config, sandbox_manager)
     except asyncio.CancelledError as exc:
         primary_error = exc
@@ -6074,6 +6108,22 @@ async def _bootstrap_and_repl(
         print(format_error(error), file=sys.stderr)
         result_code = error.exit_code
     finally:
+        try:
+            close_prompt_surface = getattr(loop.ui, "aclose_prompt_surface", None)
+            if callable(close_prompt_surface):
+                await close_prompt_surface()
+        except BaseException as cleanup_error:
+            if primary_error is not None:
+                get_logger(__name__).warning(
+                    "Terminal UI cleanup failed after an earlier REPL failure: {}",
+                    cleanup_error,
+                )
+            elif isinstance(cleanup_error, asyncio.CancelledError):
+                raise
+            else:
+                error = classify_exception(cleanup_error)
+                print(format_error(error), file=sys.stderr)
+                result_code = error.exit_code
         try:
             await loop.aclose()
         except BaseException as cleanup_error:

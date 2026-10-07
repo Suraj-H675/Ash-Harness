@@ -146,9 +146,18 @@ def get_theme(name: str | None) -> Theme:
 def terminal_styles(theme: Theme) -> dict[str, str]:
     """Return the prompt-toolkit style mapping for Ash's retained surface."""
 
+    user_band = (
+        "bold #6f95ff bg:#303030"
+        if theme.name == "dark"
+        else "bold #005faf bg:#eaeaea"
+    )
     return {
         "user-prefix": theme.user_prefix,
+        "user-band": user_band,
         "assistant-prefix": theme.assistant_prefix,
+        "assistant-body": "",
+        "transcript-body": theme.muted,
+        "decision-context": theme.composer,
         "reasoning-prefix": theme.reasoning_prefix,
         "reasoning": theme.reasoning_body,
         "tool-prefix": theme.tool_prefix,

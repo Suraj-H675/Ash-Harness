@@ -310,14 +310,17 @@ class InteractiveTurnController:
             self.write_status(f"{requester} requests approval for {tool_name}.")
         try:
             with self.ui.suspend_live_render():
-                self.ui.show_tool_approval(
+                approval_details = self.ui.show_tool_approval(
                     tool_name,
                     arguments,
                     auto=False,
                     diff_mode=self.diff_mode,
                 )
                 if getattr(self.prompt_input, "supports_choice_ui", False):
-                    answer = await self._select_approval(tool_name)
+                    answer = await self._select_approval(
+                        tool_name,
+                        approval_details,
+                    )
                 else:
                     choices = (
                         "Approve [y] once, [s] scope/session, [a] tool/session, "
@@ -426,7 +429,11 @@ class InteractiveTurnController:
             self._approval_active = False
             self._approval_complete.set()
 
-    async def _select_approval(self, tool_name: str) -> str | None:
+    async def _select_approval(
+        self,
+        tool_name: str,
+        approval_details: str,
+    ) -> str | None:
         primary = (
             PromptChoice(
                 "y",
@@ -497,6 +504,7 @@ class InteractiveTurnController:
                 f"{tool_name} permission",
                 primary,
                 default_value="n",
+                context=approval_details,
             )
             if selected != "more":
                 return selected
@@ -504,6 +512,7 @@ class InteractiveTurnController:
                 f"{tool_name} permission · advanced",
                 tuple(advanced),
                 default_value="back",
+                context=approval_details,
             )
             if selected == "back":
                 continue
@@ -609,10 +618,15 @@ class InteractiveTurnController:
         )
         try:
             while True:
-                self.ui.show_plan_review(execution)
+                plan_details = self.ui.show_plan_review(execution)
                 try:
                     answer = (
-                        (await self.prompt_input.read("Plan [y/e/N]? "))
+                        (
+                            await self.prompt_input.read(
+                                "Plan [y/e/N]? ",
+                                context=plan_details,
+                            )
+                        )
                         .strip()
                         .casefold()
                     )
@@ -623,7 +637,9 @@ class InteractiveTurnController:
                 if answer not in {"e", "edit"}:
                     return False
                 try:
-                    self.ui.edit_plan(execution)
+                    await self.prompt_input.suspend_for_overlay(
+                        lambda: self.ui.edit_plan(execution)
+                    )
                 except Exception as exc:  # noqa: BLE001 - editor errors deny safely
                     self.write_status(f"Plan edit failed: {exc}")
                     return False

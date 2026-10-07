@@ -26,6 +26,7 @@ from ash.ui.inline_surface import (
 )
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.theme import get_theme
+from ash.ui.transcript import Transcript
 
 
 MAX_PATH_COMPLETION_SCAN_ENTRIES = 10_000
@@ -498,6 +499,7 @@ class PromptInput:
         reduced_motion: bool = False,
         input: Input | None = None,
         output: Output | None = None,
+        transcript: Transcript | None = None,
     ) -> None:
         if input_mode not in {"emacs", "vi"}:
             raise ValueError("input_mode must be emacs or vi")
@@ -570,6 +572,7 @@ class PromptInput:
                 no_color=no_color,
                 input=input,
                 output=output,
+                transcript=transcript,
                 reduced_motion=reduced_motion,
                 screen_reader_mode=screen_reader_mode,
             )
@@ -580,12 +583,14 @@ class PromptInput:
         options: tuple[PromptChoice, ...],
         *,
         default_value: str | None = None,
+        context: str = "",
     ) -> str | None:
         if self._surface is not None:
             return await self._surface.choose(
                 title,
                 options,
                 default_value=default_value,
+                context=context,
             )
         raise RuntimeError("choice UI requires an interactive cursor terminal")
 
@@ -635,11 +640,11 @@ class PromptInput:
         if self._completer is not None:
             self._completer.set_model_choices(model_choices)
 
-    async def read(self, prompt: str = "> ") -> str:
+    async def read(self, prompt: str = "> ", *, context: str = "") -> str:
         if self.linear_mode:
             return await self._read_linear(prompt)
         if self._surface is not None:
-            return await self._surface.read(prompt)
+            return await self._surface.read(prompt, context=context)
         line = self.input_stream.readline()
         if line == "":
             raise EOFError
@@ -700,4 +705,17 @@ class PromptInput:
             loop.remove_reader(fd)
 
     def close(self) -> None:
-        return None
+        if self._surface is not None:
+            self._surface.close()
+
+    async def aclose(self) -> None:
+        if self._surface is not None:
+            await self._surface.aclose()
+
+    async def suspend_for_overlay(self, callback):
+        if self._surface is None:
+            result = callback()
+            if hasattr(result, "__await__"):
+                return await result
+            return result
+        return await self._surface.suspend_for_overlay(callback)

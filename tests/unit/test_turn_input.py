@@ -37,7 +37,8 @@ class RoutedPrompt:
         self.approvals: asyncio.Queue[str] = asyncio.Queue()
         self.prompts: list[str] = []
 
-    async def read(self, prompt: str = "> ") -> str:
+    async def read(self, prompt: str = "> ", *, context: str = "") -> str:
+        del context
         self.prompts.append(prompt)
         if prompt.startswith(("Approve", "Plan", "Denial feedback")):
             return await self.approvals.get()
@@ -53,7 +54,8 @@ class SelectorApprovalPrompt(RoutedPrompt):
         self.choice_calls: list[tuple[str, tuple[str, ...]]] = []
         self.choice_defaults: list[str | None] = []
 
-    async def choose(self, title, options, *, default_value=None):
+    async def choose(self, title, options, *, default_value=None, context=""):
+        del context
         self.choice_calls.append((title, tuple(option.label for option in options)))
         self.choice_defaults.append(default_value)
         return await self.selections.get()
@@ -401,7 +403,7 @@ async def test_selector_approval_keeps_broader_rules_behind_more_options(
         ui,
     )
 
-    selected = await controller._select_approval("write_file")
+    selected = await controller._select_approval("write_file", "tool details")
 
     assert selected == "a"
     assert prompt.choice_defaults == ["n", "back"]

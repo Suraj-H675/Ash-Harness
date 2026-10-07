@@ -10,6 +10,7 @@ automated tests and CI can drive the loop.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import json
 import math
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from uuid import uuid4
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from rich.cells import cell_len
@@ -38,7 +40,7 @@ from ash.safe_io import read_bounded_bytes
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.ui.inline_surface import ActivityDockView
 from ash.ui.safe_text import terminal_safe_text
-from ash.ui.transcript import Transcript
+from ash.ui.transcript import Transcript, TranscriptEntry
 from ash.ui.theme import get_theme
 
 
@@ -49,6 +51,7 @@ MAX_EDIT_PREVIEW_LINES = 400
 DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
 MAX_LINEAR_HISTORY_ENTRIES = 12
 LIVE_AUX_PREVIEW_CHARS = 3_000
+PROMPT_NOTICE_SECONDS = 2.0
 ASSISTANT_MESSAGE_PREFIX = "· "
 _MODEL_REQUEST_TERMINAL_EVENTS = {
     "model.request.completed",
@@ -208,7 +211,7 @@ def _user_message_text(
     console: Console,
     width: int,
 ) -> Text:
-    """Build cell-wrapped, full-width user bands for native scrollback."""
+    """Build cell-wrapped gray user bands for the linear terminal renderer."""
 
     width = max(1, width)
     style = get_theme(theme_name).user_message
@@ -382,6 +385,9 @@ class TerminalUI:
         self._active_buffers: _LiveBuffers | None = None
         self._active_live: Live | None = None
         self._prompt_invalidator: Callable[[], None] | None = None
+        self._prompt_closer: Callable[[], Any] | None = None
+        self._prompt_notice: str | None = None
+        self._prompt_notice_handle: asyncio.TimerHandle | None = None
         self._terminal_writer: Callable[[Callable[[], None]], None] = (
             lambda callback: callback()
         )
@@ -421,13 +427,84 @@ class TerminalUI:
         self,
         invalidator: Callable[[], None],
         terminal_writer: Callable[[Callable[[], None]], None] | None = None,
+        closer: Callable[[], Any] | None = None,
     ) -> None:
         """Route interactive live updates through the bounded prompt surface."""
 
         self._prompt_invalidator = invalidator
         self._terminal_writer = terminal_writer or (lambda callback: callback())
+        self._prompt_closer = closer
         self._conversation_line_open = False
         self._assistant_prefix_pending = True
+
+    async def aclose_prompt_surface(self) -> None:
+        """Restore terminal modes before the runtime closes its event loop."""
+
+        if self._prompt_closer is not None:
+            result = self._prompt_closer()
+            if hasattr(result, "__await__"):
+                await result
+
+    def write_output(self, text: str, *, error: bool = False) -> None:
+        """Keep interactive command output inside the selected transcript view."""
+
+        safe = terminal_safe_text(text)
+        if not safe:
+            return
+        if error:
+            self.transcript.append("error", safe, title="error")
+        else:
+            self.transcript.append("status", safe, title="output")
+        if self._prompt_invalidator is not None and not self.screen_reader_mode:
+            self._prompt_invalidator()
+        else:
+            self.console.print(
+                safe,
+                style=self.theme.error if error else None,
+                markup=False,
+                highlight=False,
+                end="" if safe.endswith("\n") else "\n",
+            )
+
+    def prompt_status_notice(self) -> str | None:
+        """Return transient feedback for the pinned status row, if present."""
+
+        return self._prompt_notice
+
+    def set_prompt_notice(self, text: str) -> None:
+        """Show brief command feedback without adding it to conversation history."""
+
+        self._clear_prompt_notice()
+        notice = terminal_safe_text(text, single_line=True)[:160] or None
+        self._prompt_notice = notice
+        if notice is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                self._prompt_notice_handle = loop.call_later(
+                    PROMPT_NOTICE_SECONDS,
+                    self._expire_prompt_notice,
+                    notice,
+                )
+        if self._prompt_invalidator is not None and not self.screen_reader_mode:
+            self._prompt_invalidator()
+
+    def _expire_prompt_notice(self, notice: str) -> None:
+        if self._prompt_notice != notice:
+            return
+        self._prompt_notice = None
+        self._prompt_notice_handle = None
+        if self._prompt_invalidator is not None and not self.screen_reader_mode:
+            self._prompt_invalidator()
+
+    def _clear_prompt_notice(self) -> None:
+        handle = self._prompt_notice_handle
+        if handle is not None:
+            handle.cancel()
+            self._prompt_notice_handle = None
+        self._prompt_notice = None
 
     def prompt_thinking_view(self, width: int) -> tuple[int, FormattedText]:
         """Return a bounded reasoning preview for legacy prompt hosts."""
@@ -902,6 +979,10 @@ class TerminalUI:
         renderable = Text(content, style=style) if isinstance(content, str) else content
         plain = renderable.plain + end
 
+        if self._prompt_invalidator is not None and not self.screen_reader_mode:
+            self._conversation_line_open = not plain.endswith("\n")
+            return
+
         def write() -> None:
             self.console.print(
                 renderable,
@@ -927,14 +1008,7 @@ class TerminalUI:
             self._assistant_entry_id = self.transcript.begin("assistant", title="ash")
         self.transcript.append_delta(self._assistant_entry_id, text)
         if self._prompt_invalidator is not None:
-            if self._assistant_prefix_pending:
-                self._seal_conversation()
-                self._write_conversation(
-                    Text("ASH", style=self.theme.assistant_prefix), end="\n"
-                )
-                self._write_conversation(ASSISTANT_MESSAGE_PREFIX)
-                self._assistant_prefix_pending = False
-            self._write_conversation(text)
+            self._assistant_prefix_pending = False
             self._conversation_needs_user_gap = True
         self._refresh_live()
 
@@ -993,7 +1067,7 @@ class TerminalUI:
             self._refresh_live(force=True)
 
     def commit_completed_turn(self) -> None:
-        """Retained for callers; prompt-bound output is already in scrollback."""
+        """Retained for callers; prompt-bound output is already in its transcript."""
 
         return
 
@@ -1012,8 +1086,6 @@ class TerminalUI:
 
     def _refresh_live(self, *, force: bool = False) -> None:
         if self._prompt_invalidator is not None:
-            if self.reduced_motion and not force:
-                return
             now = time.monotonic()
             repaint = force or now - self._last_refresh >= 0.05
             if not repaint:
@@ -1076,8 +1148,6 @@ class TerminalUI:
             stream = str(payload.get("stream", "stdout"))
             style = "red" if stream == "stderr" else ""
             if self._prompt_invalidator is not None:
-                self._seal_conversation()
-                self._write_conversation(delta, style=style)
                 self._conversation_needs_user_gap = True
             elif self._active_buffers is not None:
                 self._active_buffers.tool_output.append(delta, style=style)
@@ -1120,8 +1190,7 @@ class TerminalUI:
         line.append(tool, style="bold")
         line.append(f" [{label}]", style=style)
         if self._prompt_invalidator is not None:
-            self._seal_conversation()
-            self._write_conversation(line, end="\n")
+            self._conversation_needs_user_gap = True
         else:
             self.console.print(line)
         self._conversation_needs_user_gap = True
@@ -1254,7 +1323,7 @@ class TerminalUI:
         if self.screen_reader_mode:
             self.console.print("Approval:", markup=False, highlight=False)
             self.console.print(body.plain, markup=False, highlight=False)
-        else:
+        elif self._prompt_invalidator is None:
             self.console.print(
                 Panel(
                     body,
@@ -1269,70 +1338,79 @@ class TerminalUI:
         """Commit submitted user input to the interactive transcript."""
 
         safe = terminal_safe_text(text)
+        self._clear_prompt_notice()
         self.transcript.append("user", safe, title="you")
         if self._prompt_invalidator is not None and not self.screen_reader_mode:
-            if self._conversation_needs_user_gap:
-                self._write_conversation("\n")
-
-            def write_user_band() -> None:
-                self.console.print(
-                    _user_message_text(
-                        safe,
-                        theme_name=self.theme.name,
-                        console=self.console,
-                        width=self.console.size.width,
-                    ),
-                    end="\n",
-                    soft_wrap=True,
-                    highlight=False,
-                )
-
-            self._terminal_writer(write_user_band)
             self._conversation_line_open = False
             self._conversation_needs_user_gap = False
             if self._reasoning_tail:
                 self._reasoning_tail = ""
-            self._write_conversation("\n")
             self._refresh_live(force=True)
 
     def load_session_transcript(self, session: Any | None) -> None:
         """Replace interactive history from a durable session snapshot."""
 
         self._activity_status = ""
+        self._clear_prompt_notice()
         self._activity_turn_closed = False
         self._model_activity = None
         self._active_tool_activity.clear()
         self._reasoning_tail = ""
         self._conversation_needs_user_gap = False
         self._invalidate_prompt_state()
-        self.transcript.clear()
+        entries: list[TranscriptEntry] = []
         if session is None:
+            self.transcript.replace(entries)
             return
+        omitted_messages = int(getattr(session, "resident_message_offset", 0) or 0)
+        if omitted_messages:
+            entries.append(
+                TranscriptEntry(
+                    entry_id=str(uuid4()),
+                    kind="status",
+                    content=(
+                        "Earlier session history is outside the resident snapshot: "
+                        f"{omitted_messages} message(s)."
+                    ),
+                    title="history",
+                )
+            )
         for message in session.messages:
             content = terminal_safe_text(str(message.content))
             if message.role == "user":
-                self.transcript.append("user", content, title="you")
+                entries.append(
+                    TranscriptEntry(str(uuid4()), "user", content, title="you")
+                )
             elif message.role == "assistant" and content:
-                self.transcript.append("assistant", content, title="ash")
+                entries.append(
+                    TranscriptEntry(str(uuid4()), "assistant", content, title="ash")
+                )
             elif message.role == "tool":
                 bounded = content[:4000]
                 if len(content) > len(bounded):
                     bounded += "\n[tool result truncated in transcript]"
-                self.transcript.append(
-                    "tool",
-                    bounded,
-                    title="tool result",
-                    metadata=dict(message.metadata),
+                entries.append(
+                    TranscriptEntry(
+                        str(uuid4()),
+                        "tool",
+                        bounded,
+                        title="tool result",
+                        metadata=dict(message.metadata),
+                    )
                 )
-        if self.transcript.snapshot():
-            self._render_linear_history()
+        self.transcript.replace(entries)
+        if self._prompt_invalidator is None or self.screen_reader_mode:
+            if entries:
+                self._render_linear_history()
+        else:
+            self._prompt_invalidator()
 
     def _render_linear_history(self) -> None:
-        """Render bounded committed history using the same semantic cards as live turns."""
+        """Render the selected session as bounded line-oriented history."""
 
         entries = self.transcript.snapshot()
         visible = entries[-MAX_LINEAR_HISTORY_ENTRIES:]
-        omitted = len(entries) - len(visible)
+        omitted = self.transcript.omitted_entries + len(entries) - len(visible)
         if omitted:
             self.console.print(Text(f"… {omitted} earlier entries omitted", style="dim"))
             self.console.print()
@@ -1359,8 +1437,8 @@ class TerminalUI:
                     )
                 )
             else:
-                label = entry.kind.upper()
-                line = Text(f"{label}  ", style="dim bold")
+                label = entry.title or entry.kind.upper()
+                line = Text(f"{label.upper()}  ", style="dim bold")
                 line.append(entry.content, style="dim")
                 self.console.print(line)
             previous_kind = entry.kind
@@ -1578,17 +1656,17 @@ class TerminalUI:
             if live is not None:
                 live.start()
 
-    def show_plan_review(self, execution: Any) -> None:
+    def show_plan_review(self, execution: Any) -> str:
         """Render a plan without reading input from the terminal."""
 
-        self._render_plan(execution)
+        return self._render_plan(execution)
 
     def edit_plan(self, execution: Any) -> None:
         """Open and validate a plan in the configured external editor."""
 
         self._edit_plan(execution)
 
-    def _render_plan(self, execution: Any) -> None:
+    def _render_plan(self, execution: Any) -> str:
         body = Text()
         body.append("Goal: ", style="bold")
         body.append(terminal_safe_text(execution.contract.goal))
@@ -1633,7 +1711,7 @@ class TerminalUI:
                 highlight=False,
             )
             self.console.print(body.plain, markup=False, highlight=False)
-        else:
+        elif self._prompt_invalidator is None:
             self.console.print(
                 Panel(
                     body,
@@ -1641,6 +1719,9 @@ class TerminalUI:
                     title=f"sprint {execution.contract.contract_id[:8]}",
                 )
             )
+        elif self._prompt_invalidator is not None:
+            self._prompt_invalidator()
+        return body.plain
 
     def write_status(self, text: str, *, error: bool = False) -> None:
         text = terminal_safe_text(text)
@@ -1648,14 +1729,7 @@ class TerminalUI:
             self.transcript.append("error", text, title="error")
         else:
             self.transcript.append("status", text, title="status")
-        if self._prompt_invalidator is not None and self._active_buffers is not None:
-            if self._active_buffers.tool_output:
-                self._active_buffers.tool_output.append("\n")
-            prefix = "ERROR  " if error else "STATUS  "
-            self._active_buffers.tool_output.append(
-                prefix + text,
-                style=self.theme.error if error else "dim",
-            )
+        if self._prompt_invalidator is not None and not self.screen_reader_mode:
             self._refresh_live(force=True)
             return
         self.console.print(

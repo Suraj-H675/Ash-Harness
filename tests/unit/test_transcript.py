@@ -1,4 +1,4 @@
-from ash.ui.transcript import Transcript
+from ash.ui.transcript import Transcript, TranscriptEntry
 
 
 def test_transcript_streaming_replaces_immutable_snapshots() -> None:
@@ -57,6 +57,17 @@ def test_transcript_can_replace_and_remove_ephemeral_entry() -> None:
     assert removed.entry_id == entry_id
     assert transcript.snapshot() == ()
     assert [event.action for event in events] == ["added", "updated", "removed"]
+
+
+def test_transcript_replacement_applies_bounds_and_reports_omitted_entries() -> None:
+    transcript = Transcript(max_entries=2, max_characters=8)
+    transcript.replace(
+        TranscriptEntry(str(index), "user", content, title="you")
+        for index, content in enumerate(("aa", "bb", "cc"))
+    )
+
+    assert [entry.content for entry in transcript.snapshot()] == ["bb", "cc"]
+    assert transcript.omitted_entries == 1
 
 
 def test_transcript_rejects_invalid_limits_and_finalized_updates() -> None:

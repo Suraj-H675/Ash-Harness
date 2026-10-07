@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 from uuid import uuid4
@@ -17,7 +17,9 @@ TranscriptKind = Literal[
     "status",
     "error",
 ]
-TranscriptAction = Literal["added", "updated", "finalized", "removed", "reset"]
+TranscriptAction = Literal[
+    "added", "updated", "finalized", "removed", "reset", "replaced", "pruned"
+]
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class Transcript:
         self._entries: list[TranscriptEntry] = []
         self._listeners: set[TranscriptListener] = set()
         self._revision = 0
+        self._omitted_entries = 0
 
     @property
     def revision(self) -> int:
@@ -65,6 +68,40 @@ class Transcript:
 
     def snapshot(self) -> tuple[TranscriptEntry, ...]:
         return tuple(self._entries)
+
+    @property
+    def omitted_entries(self) -> int:
+        """Number of finalized entries evicted by this transcript's bounds."""
+
+        return self._omitted_entries
+
+    def replace(self, entries: Iterable[TranscriptEntry]) -> None:
+        """Atomically replace the selected conversation's presentation state."""
+
+        replacement = list(entries)
+        remaining_count = len(replacement)
+        remaining_characters = sum(len(entry.content) for entry in replacement)
+        removed_indices: set[int] = set()
+        for index, entry in enumerate(replacement):
+            if (
+                remaining_count <= self.max_entries
+                and remaining_characters <= self.max_characters
+            ):
+                break
+            if entry.finalized:
+                removed_indices.add(index)
+                remaining_count -= 1
+                remaining_characters -= len(entry.content)
+        omitted = len(removed_indices)
+        if omitted:
+            replacement = [
+                entry
+                for index, entry in enumerate(replacement)
+                if index not in removed_indices
+            ]
+        self._entries = replacement
+        self._omitted_entries = omitted
+        self._emit("replaced", None)
 
     def append(
         self,
@@ -136,6 +173,7 @@ class Transcript:
 
     def clear(self) -> None:
         self._entries.clear()
+        self._omitted_entries = 0
         self._emit("reset", None)
 
     def remove(self, entry_id: str) -> TranscriptEntry:
@@ -168,14 +206,17 @@ class Transcript:
             if removable is None:
                 break
             del self._entries[removable]
+            self._omitted_entries += 1
             changed = True
         if changed:
-            self._emit("reset", None)
+            self._emit("pruned", None)
 
-    def _over_limit(self) -> bool:
+    def _over_limit(self, entries: list[TranscriptEntry] | None = None) -> bool:
+        bounded_entries = self._entries if entries is None else entries
         return (
-            len(self._entries) > self.max_entries
-            or sum(len(entry.content) for entry in self._entries) > self.max_characters
+            len(bounded_entries) > self.max_entries
+            or sum(len(entry.content) for entry in bounded_entries)
+            > self.max_characters
         )
 
     def _emit(
