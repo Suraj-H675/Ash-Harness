@@ -3339,7 +3339,10 @@ class AshLoop:
         session_lease = self.session_store.acquire_session_runtime_lease(
             self.current_session.session_id
         )
-        previous_turn_id = self.turn_context.turn_id if self.turn_context else None
+        previous_turn_context = self.turn_context
+        previous_turn_id = (
+            previous_turn_context.turn_id if previous_turn_context is not None else None
+        )
         previous_log_context = current_log_context()
         self._turn_running = True
         try:
@@ -3479,6 +3482,7 @@ class AshLoop:
             finally:
                 try:
                     replace_log_context(previous_log_context)
+                    self.turn_context = previous_turn_context
                 finally:
                     session_lease.close()
 
@@ -5480,6 +5484,62 @@ class AshLoop:
                         "success": False,
                         "output": "",
                         "error": f"Unknown tool: {tool_name}",
+                    },
+                    record,
+                    defer_terminal_persistence=defer_terminal_persistence,
+                )
+                if persist_tool_messages:
+                    self._persist_deferred_tool_result(
+                        session=session,
+                        call=call,
+                        result=result_payload,
+                    )
+                results.append(result_payload)
+                continue
+
+            try:
+                if tool.args_schema is not None:
+                    tool.validate_args(**deepcopy(arguments))
+            except (TypeError, ValueError) as exc:
+                record.error = _bounded_durable_tool_error(
+                    f"Invalid tool arguments: {exc}",
+                    fallback="Invalid tool arguments",
+                )
+                if not defer_terminal_persistence:
+                    self.session_store.save_tool_call(
+                        session.session_id,
+                        record,
+                        turn_id=(
+                            self.turn_context.turn_id if self.turn_context else None
+                        ),
+                    )
+                self._append_tool_audit(
+                    session,
+                    action_type="tool_call",
+                    target_resource=tool_name,
+                    details={
+                        "call_id": record.call_id,
+                        "arguments": record.arguments,
+                        "error": record.error,
+                    },
+                    result="FAILURE",
+                )
+                self.circuit_breaker.record_failure(tool_name)
+                self._emit_event(
+                    {"type": "tool.error", **event_base, "error": record.error}
+                )
+                await self._fire_tool_error_hook(
+                    session,
+                    call_id=record.call_id,
+                    tool_name=tool_name,
+                    arguments=record.arguments,
+                    error=record.error,
+                )
+                result_payload = self._tool_result_payload(
+                    {
+                        "success": False,
+                        "output": "",
+                        "error": record.error,
                     },
                     record,
                     defer_terminal_persistence=defer_terminal_persistence,

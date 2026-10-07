@@ -3913,6 +3913,31 @@ async def test_tool_schema_byte_ceiling_fails_before_tokenization_or_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_completed_turn_does_not_leak_turn_id_into_later_runtime_events(tmp_path):
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "turn-context-boundary.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+
+    await loop.run_turn("hello")
+
+    completed = next(event for event in ui.events if event["type"] == "turn.completed")
+    assert completed["turn_id"]
+    assert loop.turn_context is None
+
+    loop._emit_event({"type": "runtime.after_turn"})
+    after = next(event for event in ui.events if event["type"] == "runtime.after_turn")
+    assert after["session_id"] == loop.current_session.session_id
+    assert after["turn_id"] is None
+
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_turn_running_state_resets_after_cancellation(tmp_path):
     provider = SteeringProvider()
     ui = EventUI()
@@ -3954,6 +3979,7 @@ async def test_approved_tool_intent_is_durable_before_execution_finishes(tmp_pat
         EventUI(),
         tmp_path,
         tools={tool.name: tool},
+        safety_tier="auto_approve",
     )
 
     turn = asyncio.create_task(loop.run_turn("use the capture tool"))
@@ -4015,6 +4041,7 @@ async def test_cancellation_after_pre_middleware_effect_recovers_as_ambiguous(
         tmp_path,
         tools={tool.name: tool},
         tool_middlewares=[middleware],
+        safety_tier="auto_approve",
     )
 
     turn = asyncio.create_task(loop.run_turn("use the capture tool"))
@@ -7592,6 +7619,48 @@ async def test_middleware_skip_persists_effect_boundary_without_tool_execution(
     skipped = [event for event in ui.events if event["type"] == "tool.skipped"]
     assert len(skipped) == 1
     assert skipped[0]["dispatched"] is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_known_tool_arguments_are_rejected_before_approval(tmp_path):
+    approvals: list[str] = []
+
+    async def approve(tool_name, arguments):
+        del arguments
+        approvals.append(tool_name)
+        return True
+
+    from ash.tools.filesystem import WriteFileTool
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "invalid-tool-args.db")
+    tool = WriteFileTool(guard)
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={tool.name: tool},
+        on_tool_approval=approve,
+    )
+    session = await loop.start_session()
+
+    result = await loop.execute_tool(
+        "write_file",
+        {"content": "missing required path"},
+    )
+
+    assert approvals == []
+    assert result["success"] is False
+    assert "Invalid tool arguments" in result["error"]
+    record = store.load_session(session.session_id).tool_calls[-1]
+    assert record.tool_name == "write_file"
+    assert record.approved is False
+    assert record.executed is False
+    assert "Invalid tool arguments" in (record.error or "")
+    assert list(tmp_path.glob("missing*")) == []
+    await loop.aclose()
 
 
 @pytest.mark.asyncio
