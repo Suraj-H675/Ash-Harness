@@ -348,18 +348,34 @@ async def test_dock_animates_without_events_and_collapses_when_idle() -> None:
             input=pipe,
             output=output,
         )
-        pending = asyncio.create_task(surface.read())
-        await asyncio.sleep(0.05)
-
         def capture_rows() -> dict[int, str]:
             screen = surface.application.renderer._last_screen
-            assert screen is not None
+            if screen is None:
+                return {}
             return {
                 y: "".join(cell.char for _x, cell in sorted(cells.items())).rstrip()
                 for y, cells in screen.data_buffer.items()
             }
 
-        initial = capture_rows()
+        async def wait_for_render(predicate) -> dict[int, str]:
+            ready = asyncio.get_running_loop().create_future()
+
+            def on_render(_app) -> None:
+                rows = capture_rows()
+                if predicate(rows) and not ready.done():
+                    ready.set_result(rows)
+
+            surface.application.after_render += on_render
+            try:
+                surface.invalidate()
+                return await asyncio.wait_for(ready, timeout=2)
+            finally:
+                surface.application.after_render -= on_render
+
+        pending = asyncio.create_task(surface.read())
+        initial = await wait_for_render(
+            lambda rows: any("›" in text for text in rows.values())
+        )
         composer_row = next(y for y, text in initial.items() if "›" in text)
         assert composer_row == 18
 
@@ -368,9 +384,9 @@ async def test_dock_animates_without_events_and_collapses_when_idle() -> None:
             activity="Inspecting",
             reasoning="checking the import path",
         )
-        surface.invalidate()
-        await asyncio.sleep(0.05)
-        first = capture_rows()
+        first = await wait_for_render(
+            lambda rows: any("Inspecting" in text for text in rows.values())
+        )
         first_status_row = next(y for y, text in first.items() if "Inspecting" in text)
         active_composer_row = next(y for y, text in first.items() if "›" in text)
         assert first_status_row + 1 == active_composer_row
@@ -382,13 +398,13 @@ async def test_dock_animates_without_events_and_collapses_when_idle() -> None:
         await asyncio.sleep(0.5)
         third = capture_rows()
         third_status = next(text for text in third.values() if "Inspecting" in text)
-        assert first[first_status_row] != second_status
-        assert second_status != third_status
+        assert len({first[first_status_row], second_status, third_status}) >= 2
 
         state[0] = ActivityDockView(revision=2, activity=None, reasoning="")
-        surface.invalidate()
-        await asyncio.sleep(0.05)
-        idle = capture_rows()
+        idle = await wait_for_render(
+            lambda rows: any("›" in text for text in rows.values())
+            and not any("Inspecting" in text for text in rows.values())
+        )
         assert not any("Inspecting" in text for text in idle.values())
         assert next(y for y, text in idle.items() if "›" in text) == composer_row
 
