@@ -3542,6 +3542,29 @@ class AshLoop:
                 }
             )
 
+    def _persist_turn_usage(self, session: Session) -> None:
+        """Journal usage and accumulate session totals at a turn boundary."""
+
+        if self.turn_context is None:
+            raise RuntimeError("cannot persist usage outside a turn")
+        usage = self.last_turn_usage
+        self.turn_context.set("usage", usage)
+        self.session_store.save_turn_usage(self.turn_context.turn_id, usage)
+        if self._last_turn_prompt_tokens or self._last_turn_completion_tokens:
+            self._emit_event({"type": "turn.usage", **usage})
+            self.session_store.save_session_token_stats(
+                session.session_id,
+                self._last_turn_prompt_tokens,
+                self._last_turn_completion_tokens,
+                self._last_turn_cost_usd,
+                cache_read_tokens=self._last_cache_read_tokens,
+                cache_write_tokens=self._last_cache_write_tokens,
+                estimated_prompt_tokens=self._last_estimated_prompt_tokens,
+                estimated_completion_tokens=self._last_estimated_completion_tokens,
+                estimated_cost_usd=self._last_estimated_cost_usd,
+                cost_known=self._last_cost_known,
+            )
+
     async def _run_turn(
         self,
         user_input: str,
@@ -3597,6 +3620,9 @@ class AshLoop:
         # persisted to SQLite and the contract's goal replaces the raw
         # user input for the execution turn. On rejection, the turn
         # short-circuits with a polite "plan rejected" message.
+        planning_usage: CompletionOutcome | None = None
+        planning_cost = 0.0
+        planning_cost_known = True
         goal_continuation = bool(
             isinstance(user_metadata, dict) and user_metadata.get("goal_continuation")
         )
@@ -3610,7 +3636,16 @@ class AshLoop:
             )
 
             if looks_like_sprint_request(user_input):
-                execution = await self._planning_phase(user_input)
+                execution, planning_usage = await self._planning_phase(user_input)
+                planning_pricing = self._active_model_pricing()
+                planning_cost_known = bool(planning_pricing)
+                planning_cost = _calculate_turn_cost(
+                    prompt_tokens=planning_usage.prompt_tokens,
+                    completion_tokens=planning_usage.completion_tokens,
+                    cache_read_tokens=planning_usage.cache_read_tokens,
+                    cache_write_tokens=planning_usage.cache_write_tokens,
+                    pricing=planning_pricing,
+                )
                 self.session_store.save_sprint(session.session_id, execution)
                 approved = (
                     await self.on_plan_approval(execution)
@@ -3620,6 +3655,26 @@ class AshLoop:
                 if not approved:
                     execution.abort("rejected by user")
                     self.session_store.save_sprint(session.session_id, execution)
+                    self._last_turn_prompt_tokens = planning_usage.prompt_tokens
+                    self._last_turn_completion_tokens = planning_usage.completion_tokens
+                    self._last_cache_read_tokens = planning_usage.cache_read_tokens
+                    self._last_cache_write_tokens = planning_usage.cache_write_tokens
+                    self._last_usage_source = planning_usage.usage_source
+                    self._last_estimated_prompt_tokens = (
+                        planning_usage.prompt_tokens
+                        if planning_usage.usage_source == "estimated" else 0
+                    )
+                    self._last_estimated_completion_tokens = (
+                        planning_usage.completion_tokens
+                        if planning_usage.usage_source == "estimated" else 0
+                    )
+                    self._last_turn_cost_usd = planning_cost
+                    self._last_estimated_cost_usd = (
+                        planning_cost if planning_usage.usage_source == "estimated" else 0.0
+                    )
+                    self._last_cost_known = planning_cost_known
+                    self._last_turn_budget_exhausted = False
+                    self._persist_turn_usage(session)
                     self.session_store.complete_turn(self.turn_context.turn_id)
                     response = (
                         f"Plan rejected. Sprint {execution.contract.contract_id[:8]} aborted; "
@@ -3677,17 +3732,20 @@ class AshLoop:
 
         # 2. Stream/execute loop bounded by max_turn_iterations.
         final_text = ""
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-        total_cache_read_tokens = 0
-        total_cache_write_tokens = 0
-        total_estimated_prompt_tokens = 0
-        total_estimated_completion_tokens = 0
-        total_turn_cost_usd = 0.0
-        total_estimated_cost_usd = 0.0
-        turn_cost_known = True
+        total_prompt_tokens = planning_usage.prompt_tokens if planning_usage else 0
+        total_completion_tokens = planning_usage.completion_tokens if planning_usage else 0
+        total_cache_read_tokens = planning_usage.cache_read_tokens if planning_usage else 0
+        total_cache_write_tokens = planning_usage.cache_write_tokens if planning_usage else 0
+        planning_estimated = planning_usage is not None and planning_usage.usage_source == "estimated"
+        total_estimated_prompt_tokens = total_prompt_tokens if planning_estimated else 0
+        total_estimated_completion_tokens = total_completion_tokens if planning_estimated else 0
+        total_turn_cost_usd = planning_cost
+        total_estimated_cost_usd = planning_cost if planning_estimated else 0.0
+        turn_cost_known = planning_cost_known
         turn_budget_exhausted = False
-        usage_sources: set[str] = set()
+        usage_sources: set[str] = (
+            {planning_usage.usage_source} if planning_usage is not None else set()
+        )
         turn_token_budget = int(getattr(self._config, "max_turn_total_tokens", 0))
         from ash.context.history import ContextBudgetExceededError
 
@@ -4071,23 +4129,7 @@ class AshLoop:
         self._last_turn_cost_usd = turn_cost_usd
         self._last_estimated_cost_usd = estimated_cost_usd
         self._last_cost_known = turn_cost_known
-        usage_payload = self.last_turn_usage
-        self.turn_context.set("usage", usage_payload)
-        self.session_store.save_turn_usage(self.turn_context.turn_id, usage_payload)
-        if prompt > 0 or completion > 0:
-            self._emit_event({"type": "turn.usage", **usage_payload})
-            self.session_store.save_session_token_stats(
-                session.session_id,
-                prompt,
-                completion,
-                turn_cost_usd,
-                cache_read_tokens=cache_read,
-                cache_write_tokens=cache_write,
-                estimated_prompt_tokens=estimated_prompt,
-                estimated_completion_tokens=estimated_completion,
-                estimated_cost_usd=estimated_cost_usd,
-                cost_known=turn_cost_known,
-            )
+        self._persist_turn_usage(session)
 
         if self.auto_commit:
             commit_paths = sorted(self._turn_modified_paths)
@@ -4501,7 +4543,9 @@ class AshLoop:
 
     # --- sprint planning helpers (Sprint 12 / V5) ---------------------
 
-    async def _planning_phase(self, user_input: str) -> "SprintExecution":
+    async def _planning_phase(
+        self, user_input: str
+    ) -> tuple["SprintExecution", CompletionOutcome]:
         """Call the planner to decompose ``user_input`` into a contract."""
 
         from ash.core.planner import Planner
@@ -4520,10 +4564,20 @@ class AshLoop:
         if not isinstance(self.planner, Planner):
             # Defensive: only Planner is supported in V5.
             raise TypeError(f"Unsupported planner type: {type(self.planner).__name__}")
-        return await self.planner.decompose(
+        return await self.planner.decompose_with_usage(
             user_input,
             project_root=self.project_root,
             repo_map_excerpt=repo_excerpt,
+            timeout_seconds=float(
+                getattr(self._config, "provider_request_timeout_seconds", 1800.0)
+            ),
+            total_token_budget=int(
+                getattr(self._config, "max_turn_total_tokens", 0)
+            ),
+            max_completion_tokens=(
+                self._config.max_completion_tokens
+                if self._config is not None else None
+            ),
         )
 
     # --- streaming & parsing ---------------------------------------------

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from ash.config import AshConfig
 from ash.core.planner import (
     Planner,
     PlannerError,
@@ -279,7 +280,9 @@ async def test_planner_bounds_streamed_output_and_closes_stream(tmp_path: Path) 
                 closed = True
 
     with pytest.raises(PlannerError, match="exceeds 256 KiB"):
-        await Planner(OversizedProvider([])).decompose("Build a new feature", project_root=tmp_path)
+        await Planner(OversizedProvider([])).decompose(
+            "Build a new feature", project_root=tmp_path
+        )
     assert closed is True
 
 
@@ -288,6 +291,147 @@ def test_planner_decompose_rejects_empty_request(tmp_path: Path) -> None:
     planner = Planner(provider)
     with pytest.raises(Exception):
         asyncio.run(planner.decompose("   ", project_root=tmp_path))
+
+
+@pytest.mark.parametrize("approved", [False, True])
+def test_planner_usage_is_included_in_approved_and_rejected_turns(
+    tmp_path: Path, approved: bool
+) -> None:
+    class UsageProvider(FakeProvider):
+        def configure_max_tokens(self, max_tokens: int) -> None:
+            self.max_tokens = max_tokens
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            async for chunk in super().stream_chat(messages, temperature, tools):
+                if chunk.is_done:
+                    counts = (11, 7) if self._call_count == 1 else (5, 3)
+                    yield chunk.model_copy(
+                        update={
+                            "prompt_tokens": counts[0],
+                            "completion_tokens": counts[1],
+                            "usage_source": "provider",
+                        }
+                    )
+                else:
+                    yield chunk
+
+    provider = UsageProvider(
+        scripts=[
+            [
+                "## Goal\nImplement login\n\n## Test Command\npytest\n\n"
+                "## Checklist\n### Work\n- [ ] Add login endpoint\n"
+            ],
+            ["<response>implemented</response>"],
+        ]
+    )
+    store = SessionStore(tmp_path / "sessions.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/fake-planner",
+        model_pricing_usd_per_million={
+            "fake-planner": {"input": 1_000_000.0, "output": 2_000_000.0}
+        },
+    )
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(tmp_path),
+        _make_ui(input_text="y\n" if approved else "n\n"),
+        tmp_path,
+        planner=Planner(provider),
+        enable_sprint_planning=True,
+        config=config,
+    )
+    session = asyncio.run(loop.start_session())
+    if not approved:
+        loop._last_turn_budget_exhausted = True
+    response = asyncio.run(loop.run_turn("Implement user authentication for the API"))
+    if approved:
+        assert response == "implemented"
+    else:
+        assert "Plan rejected" in response
+    assert provider._call_count == (2 if approved else 1)
+    assert store.started_turns(session.session_id) == []
+    usage = store.get_session_usage(session.session_id)
+    assert usage.prompt_tokens == (16 if approved else 11)
+    assert usage.completion_tokens == (10 if approved else 7)
+    assert usage.cost_usd == pytest.approx(36 if approved else 25)
+    assert loop.last_turn_usage["usage_source"] == "provider"
+    assert loop.last_turn_usage["cost_known"] is True
+    assert loop._last_turn_budget_exhausted is False
+
+
+def test_sprint_planning_respects_turn_token_budget_before_provider_call(
+    tmp_path: Path,
+) -> None:
+    provider = FakeProvider(scripts=[["## Goal\nShould never be generated\n"]])
+    store = SessionStore(tmp_path / "sessions.db")
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/fake-planner",
+        max_turn_total_tokens=1,
+    )
+    loop = AshLoop(
+        store, provider, SafetyGuard(tmp_path), _make_ui(input_text="y\n"),
+        tmp_path, planner=Planner(provider), enable_sprint_planning=True, config=config,
+    )
+    asyncio.run(loop.start_session())
+    with pytest.raises(PlannerError, match="exceeds turn token budget"):
+        asyncio.run(loop.run_turn("Implement user authentication for the API"))
+    assert provider._call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_planner_provider_timeout_closes_stream(tmp_path: Path) -> None:
+    closed = False
+
+    class HangingProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            nonlocal closed
+            try:
+                yield StreamChunk(content="## Goal\nPartial\n")
+                await asyncio.sleep(60)
+            finally:
+                closed = True
+
+    with pytest.raises(PlannerError, match="timed out"):
+        await Planner(HangingProvider([])).decompose_with_usage(
+            "Build a feature", project_root=tmp_path, timeout_seconds=0.01
+        )
+    assert closed is True
+
+
+@pytest.mark.parametrize("stop_reason", ["length", "content_filter", "error"])
+def test_planner_rejects_noncomplete_terminal_outcome(
+    tmp_path: Path, stop_reason: str
+) -> None:
+    class TerminatedProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                content="## Goal\nComplete\n", is_done=True, stop_reason=stop_reason
+            )
+
+    with pytest.raises(PlannerError, match="incomplete or unsuccessful"):
+        asyncio.run(
+            Planner(TerminatedProvider([])).decompose(
+                "Build a feature", project_root=tmp_path
+            )
+        )
+
+
+def test_planner_rejects_stream_without_terminal_chunk(tmp_path: Path) -> None:
+    class IncompleteProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="## Goal\nPartial\n")
+
+    with pytest.raises(PlannerError, match="without completion"):
+        asyncio.run(
+            Planner(IncompleteProvider([])).decompose(
+                "Build a feature", project_root=tmp_path
+            )
+        )
 
 
 def test_loop_runs_editable_planning_phase_before_execution(tmp_path: Path) -> None:
@@ -367,8 +511,9 @@ def test_loop_injects_live_persisted_plan_state_into_provider(tmp_path: Path) ->
     ]
     assert len(execution_messages) == 2
     assert "progress=0/1" in execution_messages[-1][0]["content"]
-    assert "[>] 1. (Implementation) Add login endpoint" in (
-        execution_messages[-1][0]["content"]
+    assert (
+        "[>] 1. (Implementation) Add login endpoint"
+        in (execution_messages[-1][0]["content"])
     )
 
 

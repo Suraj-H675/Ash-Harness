@@ -14,12 +14,13 @@ approve, persist, and execute.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from contextlib import aclosing
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from ash.core.sprint import (
     ChecklistItem,
@@ -28,7 +29,13 @@ from ash.core.sprint import (
     SprintExecution,
     SprintState,
 )
-from ash.providers.base import ProviderABC, TokenCounterLike
+from ash.providers.base import (
+    CompletionOutcome,
+    CompletionStopCategory,
+    ProviderABC,
+    TokenCounterLike,
+    completion_stop_category,
+)
 
 
 # --- architect mode system prompt (Section 2.1 of the spec) --------------
@@ -159,6 +166,23 @@ class Planner:
         and asking for approval.
         """
 
+        execution, _ = await self.decompose_with_usage(
+            user_request, project_root=project_root, repo_map_excerpt=repo_map_excerpt
+        )
+        return execution
+
+    async def decompose_with_usage(
+        self,
+        user_request: str,
+        *,
+        project_root: Path | None = None,
+        repo_map_excerpt: str = "",
+        timeout_seconds: float = 1800.0,
+        total_token_budget: int = 0,
+        max_completion_tokens: int | None = None,
+    ) -> tuple[SprintExecution, CompletionOutcome]:
+        """Return a sprint and its architect request usage for turn accounting."""
+
         if not user_request.strip():
             raise PlannerError("user_request is empty")
 
@@ -171,30 +195,129 @@ class Planner:
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": prompt},
         ]
+        if total_token_budget > 0:
+            counter = (
+                self._token_counter.count
+                if self._token_counter is not None
+                else self._provider.count_tokens
+            )
+            estimated_input = max(
+                1, int(counter(json.dumps(messages, ensure_ascii=False)))
+            )
+            if estimated_input >= total_token_budget:
+                raise PlannerError("planner input exceeds turn token budget")
+            output_limit = total_token_budget - estimated_input
+            if max_completion_tokens is not None:
+                output_limit = min(output_limit, max_completion_tokens)
+            self._provider.configure_max_tokens(max(1, output_limit))
 
-        raw = await self._collect_stream(messages)
-        return parse_sprint_response(raw, fallback_goal=user_request.strip())
+        completion = await self._collect_stream(
+            messages, timeout_seconds=timeout_seconds
+        )
+        return (
+            parse_sprint_response(completion.text, fallback_goal=user_request.strip()),
+            completion,
+        )
 
-    async def _collect_stream(self, messages: list[dict[str, Any]]) -> str:
+    async def _collect_stream(
+        self, messages: list[dict[str, Any]], *, timeout_seconds: float
+    ) -> CompletionOutcome:
         chunks: list[str] = []
         total_bytes = 0
-        async with aclosing(self._provider.stream_chat(messages)) as stream:
-            async for chunk in stream:
-                fragment = chunk.content
-                if not isinstance(fragment, str):
-                    raise PlannerError("planner response must be text")
-                remaining = MAX_PLANNER_RESPONSE_BYTES - total_bytes
-                if len(fragment) > remaining:
-                    raise PlannerError("planner response exceeds 256 KiB")
-                try:
-                    fragment_bytes = len(fragment.encode("utf-8"))
-                except UnicodeEncodeError as exc:
-                    raise PlannerError("planner response must be valid UTF-8") from exc
-                if fragment_bytes > remaining:
-                    raise PlannerError("planner response exceeds 256 KiB")
-                total_bytes += fragment_bytes
-                chunks.append(fragment)
-        return "".join(chunks)
+        terminal = False
+        stop_reason: str | None = None
+        usage = (0, 0, 0, 0)
+        usage_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                async with aclosing(self._provider.stream_chat(messages)) as stream:
+                    chunk_count = 0
+                    async for chunk in stream:
+                        chunk_count += 1
+                        if chunk_count > 100_000:
+                            raise PlannerError("planner stream exceeded 100000 chunks")
+                        fragment = chunk.content
+                        if not isinstance(fragment, str):
+                            raise PlannerError("planner response must be text")
+                        if terminal and (
+                            fragment or chunk.tool_call_delta or chunk.native_tool_calls
+                        ):
+                            raise PlannerError(
+                                "planner returned output after completion"
+                            )
+                        if chunk.tool_call_delta or chunk.native_tool_calls:
+                            raise PlannerError(
+                                "planner response cannot contain tool calls"
+                            )
+                        remaining = MAX_PLANNER_RESPONSE_BYTES - total_bytes
+                        if len(fragment) > remaining:
+                            raise PlannerError("planner response exceeds 256 KiB")
+                        try:
+                            fragment_bytes = len(fragment.encode("utf-8"))
+                        except UnicodeEncodeError as exc:
+                            raise PlannerError(
+                                "planner response must be valid UTF-8"
+                            ) from exc
+                        if fragment_bytes > remaining:
+                            raise PlannerError("planner response exceeds 256 KiB")
+                        total_bytes += fragment_bytes
+                        chunks.append(fragment)
+                        if chunk.is_done:
+                            terminal = True
+                            if chunk.stop_reason is not None:
+                                if (
+                                    stop_reason is not None
+                                    and chunk.stop_reason != stop_reason
+                                ):
+                                    raise PlannerError(
+                                        "planner returned conflicting stop reasons"
+                                    )
+                                stop_reason = chunk.stop_reason
+                            next_usage = (
+                                chunk.prompt_tokens,
+                                chunk.completion_tokens,
+                                chunk.cache_read_tokens,
+                                chunk.cache_write_tokens,
+                            )
+                            if (
+                                usage_source == "unavailable"
+                                or any(next_usage)
+                                or chunk.usage_source != "unavailable"
+                            ):
+                                usage = next_usage
+                                usage_source = chunk.usage_source
+        except TimeoutError as exc:
+            raise PlannerError("planner provider request timed out") from exc
+        if not terminal:
+            raise PlannerError("planner provider stream ended without completion")
+        if completion_stop_category(stop_reason) is not CompletionStopCategory.COMPLETE:
+            raise PlannerError(
+                "planner provider response was incomplete or unsuccessful"
+            )
+        if usage_source == "unavailable" and any(usage):
+            usage_source = "provider"
+        if usage_source == "unavailable":
+            counter = (
+                self._token_counter.count
+                if self._token_counter is not None
+                else self._provider.count_tokens
+            )
+            usage = (
+                max(0, int(counter(json.dumps(messages, ensure_ascii=False)))),
+                max(0, int(counter("".join(chunks)))),
+                0,
+                0,
+            )
+            usage_source = "estimated"
+        return CompletionOutcome(
+            text="".join(chunks),
+            prompt_tokens=usage[0],
+            completion_tokens=usage[1],
+            cache_read_tokens=usage[2],
+            cache_write_tokens=usage[3],
+            usage_source=usage_source,
+            stop_reason=stop_reason,
+        )
 
 
 # --- public parser --------------------------------------------------------
