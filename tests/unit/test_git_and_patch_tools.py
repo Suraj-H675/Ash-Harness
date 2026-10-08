@@ -1,5 +1,7 @@
 import asyncio
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -9,8 +11,9 @@ import pytest
 from ash.safety.guard import SafetyGuard
 from ash.safety.git import read_only_git_args
 from ash.safety.scoped_io import workspace_mutation_lock
-from ash.sandbox import SandboxManager, SandboxResult
+from ash.sandbox import SandboxManager, SandboxResult, SandboxTier
 from ash.sandbox.process_utils import ProcessOutputLimitExceeded, communicate_process
+from ash.tools.base import ToolExecutionOutcome
 from ash.tools.git import (
     GIT_OUTPUT_LIMIT_EXIT,
     AutoCommitArgs,
@@ -20,6 +23,7 @@ from ash.tools.git import (
     GitStatusTool,
     _git_result,
     _run_git,
+    _run_git_result,
     git_dirty_paths,
 )
 from ash.tools.patch import ApplyPatchTool
@@ -466,6 +470,109 @@ async def test_git_inspection_reports_process_timeout(tmp_path: Path) -> None:
     assert result.success is False
     assert result.output == ""
     assert "timed out after 30 seconds" in (result.error or "")
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Git process timeout regression")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_stage", ["update-ref", "post-commit"])
+async def test_auto_commit_reports_ambiguous_timeout_after_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_stage: str,
+) -> None:
+    import ash.tools.git as git_module
+
+    await _init_repo(tmp_path)
+    target = tmp_path / "owned.txt"
+    target.write_text("before\n", encoding="utf-8")
+    await _git(tmp_path, "add", "owned.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    target.write_text("after\n", encoding="utf-8")
+    post_commit = tmp_path / ".git" / "hooks" / "post-commit"
+    post_commit.write_text(
+        "#!/bin/sh\nsleep 2\nprintf ran > post-commit-ran\n",
+        encoding="utf-8",
+    )
+    post_commit.chmod(0o755)
+
+    real_git = shutil.which("git")
+    assert real_git is not None
+    git_wrapper = tmp_path / "git-wrapper"
+    git_wrapper.write_text(
+        "#!/bin/sh\n"
+        f"'{real_git}' \"$@\"\n"
+        "status=$?\n"
+        f"if [ \"{int(timeout_stage == 'update-ref')}\" -eq 1 ] "
+        "&& [ \"$1\" = update-ref ] && [ \"$status\" -eq 0 ]; then sleep 2; fi\n"
+        "exit \"$status\"\n",
+        encoding="utf-8",
+    )
+    git_wrapper.chmod(0o755)
+    monkeypatch.setattr(
+        git_module,
+        "resolve_host_executable",
+        lambda *_args, **_kwargs: str(git_wrapper),
+    )
+    real_wait_for = asyncio.wait_for
+
+    async def shortened_wait_for(awaitable, *, timeout):
+        del timeout
+        return await real_wait_for(awaitable, timeout=0.25)
+
+    monkeypatch.setattr(git_module.asyncio, "wait_for", shortened_wait_for)
+
+    result = await AutoCommitTool(SafetyGuard(tmp_path)).run(
+        message="capture owned change",
+        paths=["owned.txt"],
+    )
+
+    assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
+    assert "inspect" in (result.error or "").lower()
+    if timeout_stage == "update-ref":
+        assert "update-ref" in (result.error or "")
+        assert "HEAD may have changed" in (result.error or "")
+    else:
+        assert "post-commit hook" in (result.error or "")
+        assert "side effects may be incomplete" in (result.error or "")
+        assert "Commit " in result.output
+        assert "created." in result.output
+    head_subject = subprocess.run(
+        [real_git, "log", "-1", "--format=%s"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_subject == "capture owned change"
+    assert not (tmp_path / "post-commit-ran").exists()
+
+
+@pytest.mark.asyncio
+async def test_git_runner_preserves_sandbox_timeout_signal(tmp_path: Path) -> None:
+    class TimedOutSandbox:
+        backend_name = "test"
+
+        async def run(self, *_args, **_kwargs) -> SandboxResult:
+            return SandboxResult(
+                exit_code=-1,
+                stdout="",
+                stderr="Command timed out after 30 seconds.",
+                tier=SandboxTier(0),
+                backend_name=self.backend_name,
+                timed_out=True,
+            )
+
+    result = await _run_git_result(
+        tmp_path,
+        ["update-ref", "HEAD", "new", "old"],
+        sandbox_manager=TimedOutSandbox(),  # type: ignore[arg-type]
+    )
+
+    assert result.returncode == -1
+    assert result.timed_out is True
+    assert result.interrupted is True
 
 
 @pytest.mark.asyncio
@@ -1222,7 +1329,7 @@ async def test_owned_auto_commit_refuses_change_racing_with_git_add(
     await _git(tmp_path, "commit", "-qm", "initial")
     target.write_text("ash edit\n")
     expected = hashlib.sha256(target.read_bytes()).hexdigest()
-    original_run_git = git_tools._run_git
+    original_run_git = git_tools._run_git_result
     changed = False
 
     async def mutate_before_add(cwd, args, *positional, **kwargs):
@@ -1232,7 +1339,7 @@ async def test_owned_auto_commit_refuses_change_racing_with_git_add(
             target.write_text("late user edit\n")
         return await original_run_git(cwd, args, *positional, **kwargs)
 
-    monkeypatch.setattr(git_tools, "_run_git", mutate_before_add)
+    monkeypatch.setattr(git_tools, "_run_git_result", mutate_before_add)
     result = await AutoCommitTool(SafetyGuard(tmp_path)).run_owned(
         message="owned edit",
         paths=["tracked.txt"],
@@ -1463,7 +1570,7 @@ async def test_owned_auto_commit_refuses_concurrent_head_move(
     await _git(tmp_path, "commit", "-qm", "initial")
     target.write_text("ash owned\n")
     expected = hashlib.sha256(target.read_bytes()).hexdigest()
-    original_run_git = git_tools._run_git
+    original_run_git = git_tools._run_git_result
     moved = False
 
     async def move_head_before_update(cwd, args, *positional, **kwargs):
@@ -1473,7 +1580,7 @@ async def test_owned_auto_commit_refuses_concurrent_head_move(
             await _git(tmp_path, "commit", "--allow-empty", "-qm", "concurrent user")
         return await original_run_git(cwd, args, *positional, **kwargs)
 
-    monkeypatch.setattr(git_tools, "_run_git", move_head_before_update)
+    monkeypatch.setattr(git_tools, "_run_git_result", move_head_before_update)
     result = await AutoCommitTool(SafetyGuard(tmp_path)).run_owned(
         message="owned edit",
         paths=["tracked.txt"],

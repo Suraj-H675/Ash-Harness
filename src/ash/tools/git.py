@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Iterable, Mapping, Sequence
@@ -39,7 +40,13 @@ from ash.sandbox.process_utils import (
     settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
-from ash.tools.base import BaseTool, ToolExecutionContract, ToolResult, count_output_tokens
+from ash.tools.base import (
+    BaseTool,
+    ToolExecutionContract,
+    ToolExecutionOutcome,
+    ToolResult,
+    count_output_tokens,
+)
 
 
 DEFAULT_COMMIT_AUTHOR = "ash <ash@local>"
@@ -59,6 +66,19 @@ _FILTER_CONFIG_KEY = re.compile(
     r"^filter\.(?P<driver>.+)\.(?:clean|smudge|process|required)$",
     re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True)
+class _GitCommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    output_truncated: bool = False
+
+    @property
+    def interrupted(self) -> bool:
+        return self.timed_out or self.output_truncated
 
 
 class GitStatusArgs(BaseModel):
@@ -256,12 +276,18 @@ class AutoCommitTool(BaseTool):
             )
         stage_cmd = ["add", "--", *resolved_paths]
 
-        stage_code, stage_stdout, stage_stderr = await _run_git(
+        stage_result = await _run_git_result(
             workspace_root,
             stage_cmd,
             self.environment_allowlist,
             sandbox_manager=self.sandbox_manager,
         )
+        interrupted = _unknown_git_mutation_result(stage_result, "git add")
+        if interrupted is not None:
+            return interrupted
+        stage_code = stage_result.returncode
+        stage_stdout = stage_result.stdout
+        stage_stderr = stage_result.stderr
         if stage_code != 0:
             return ToolResult(
                 success=False,
@@ -415,12 +441,18 @@ class AutoCommitTool(BaseTool):
                     token_count=0,
                 )
 
-        tree_code, tree_stdout, tree_stderr = await _run_git(
+        tree_result = await _run_git_result(
             workspace_root,
             ["write-tree"],
             self.environment_allowlist,
             sandbox_manager=self.sandbox_manager,
         )
+        interrupted = _unknown_git_mutation_result(tree_result, "git write-tree")
+        if interrupted is not None:
+            return interrupted
+        tree_code = tree_result.returncode
+        tree_stdout = tree_result.stdout
+        tree_stderr = tree_result.stderr
         if tree_code != 0:
             return ToolResult(
                 success=False,
@@ -522,12 +554,18 @@ class AutoCommitTool(BaseTool):
             commit_args.extend(["-m", args.message])
         else:
             commit_args.extend(["-F", str(message_file)])
-        commit_code, commit_stdout, commit_stderr = await _run_git(
+        commit_result = await _run_git_result(
             workspace_root,
             commit_args,
             self.environment_allowlist,
             sandbox_manager=self.sandbox_manager,
         )
+        interrupted = _unknown_git_mutation_result(commit_result, "git commit-tree")
+        if interrupted is not None:
+            return interrupted
+        commit_code = commit_result.returncode
+        commit_stdout = commit_result.stdout
+        commit_stderr = commit_result.stderr
         if commit_code != 0:
             return ToolResult(
                 success=False,
@@ -607,12 +645,27 @@ class AutoCommitTool(BaseTool):
             return _secret_scan_failure(secret_findings)
 
         expected_head = parent or ("0" * len(commit))
-        update_code, update_stdout, update_stderr = await _run_git(
+        update_result = await _run_git_result(
             workspace_root,
             ["update-ref", "HEAD", commit, expected_head],
             self.environment_allowlist,
             sandbox_manager=self.sandbox_manager,
         )
+        interrupted = _unknown_git_mutation_result(
+            update_result,
+            "git update-ref",
+            effect="HEAD may have changed",
+        )
+        if interrupted is not None:
+            return ToolResult(
+                success=False,
+                output=update_result.stdout,
+                error=interrupted.error,
+                outcome=ToolExecutionOutcome.UNKNOWN,
+            )
+        update_code = update_result.returncode
+        update_stdout = update_result.stdout
+        update_stderr = update_result.stderr
         if update_code != 0:
             return ToolResult(
                 success=False,
@@ -623,17 +676,32 @@ class AutoCommitTool(BaseTool):
             )
         output = f"Commit {commit} created."
         if run_hooks:
-            post_code, post_stdout, post_stderr = await _run_git(
+            post_result = await _run_git_result(
                 workspace_root,
                 ["hook", "run", "--ignore-missing", "post-commit"],
                 self.environment_allowlist,
                 sandbox_manager=self.sandbox_manager,
             )
+            post_code = post_result.returncode
+            post_stdout = post_result.stdout
+            post_stderr = post_result.stderr
             hook_output = "\n".join(
                 part.strip() for part in (post_stdout, post_stderr) if part.strip()
             )
             if hook_output:
                 output += f"\n{hook_output}"
+            interrupted = _unknown_git_mutation_result(
+                post_result,
+                "git post-commit hook",
+                effect="the hook's side effects may be incomplete",
+            )
+            if interrupted is not None:
+                return ToolResult(
+                    success=False,
+                    output=output,
+                    error=interrupted.error,
+                    outcome=ToolExecutionOutcome.UNKNOWN,
+                )
             if post_code != 0:
                 output += f"\npost-commit hook exited with code {post_code}."
         return ToolResult(success=True, output=output)
@@ -643,12 +711,22 @@ class AutoCommitTool(BaseTool):
         workspace_root: Path,
         message: str,
     ) -> tuple[ToolResult | None, Path | None]:
-        pre_code, pre_stdout, pre_stderr = await _run_git(
+        pre_result = await _run_git_result(
             workspace_root,
             ["hook", "run", "--ignore-missing", "pre-commit"],
             self.environment_allowlist,
             sandbox_manager=self.sandbox_manager,
         )
+        interrupted = _unknown_git_mutation_result(
+            pre_result,
+            "git pre-commit hook",
+            effect="hook side effects may already have occurred",
+        )
+        if interrupted is not None:
+            return interrupted, None
+        pre_code = pre_result.returncode
+        pre_stdout = pre_result.stdout
+        pre_stderr = pre_result.stderr
         if pre_code != 0:
             return (
                 ToolResult(
@@ -704,12 +782,22 @@ class AutoCommitTool(BaseTool):
             ("prepare-commit-msg", [str(message_path), "message"]),
             ("commit-msg", [str(message_path)]),
         ):
-            hook_code, hook_stdout, hook_stderr = await _run_git(
+            hook_result = await _run_git_result(
                 workspace_root,
                 ["hook", "run", "--ignore-missing", hook_name, "--", *hook_args],
                 self.environment_allowlist,
                 sandbox_manager=self.sandbox_manager,
             )
+            interrupted = _unknown_git_mutation_result(
+                hook_result,
+                f"git {hook_name} hook",
+                effect="hook side effects may already have occurred",
+            )
+            if interrupted is not None:
+                return interrupted, None
+            hook_code = hook_result.returncode
+            hook_stdout = hook_result.stdout
+            hook_stderr = hook_result.stderr
             if hook_code != 0:
                 return (
                     ToolResult(
@@ -749,6 +837,26 @@ async def _run_git(
 ) -> tuple[int, str, str]:
     """Run ``git <args>`` in ``cwd`` and return (exit, stdout, stderr)."""
 
+    result = await _run_git_result(
+        cwd,
+        args,
+        environment_allowlist,
+        sandbox_manager=sandbox_manager,
+        read_only=read_only,
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+async def _run_git_result(
+    cwd: Path,
+    args: Sequence[str],
+    environment_allowlist: Iterable[str] = (),
+    *,
+    sandbox_manager: SandboxManager | None = None,
+    read_only: bool = False,
+) -> _GitCommandResult:
+    """Run Git while retaining whether Ash interrupted the child process."""
+
     expected_cwd_identity: tuple[int, int] | None = None
     try:
         metadata = os.stat(cwd)
@@ -758,7 +866,7 @@ async def _run_git(
         expected_cwd_identity = (metadata.st_dev, metadata.st_ino)
     git = resolve_host_executable("git", workspace_root=cwd, cwd=cwd)
     if git is None:
-        return 127, "", "git is unavailable outside the workspace"
+        return _GitCommandResult(127, "", "git is unavailable outside the workspace")
     allowlist = tuple(environment_allowlist)
     environment = (
         read_only_git_environment(allowlist)
@@ -777,11 +885,11 @@ async def _run_git(
             sandbox_manager=sandbox_manager,
         )
         if config_error is not None:
-            return 126, "", config_error
+            return _GitCommandResult(126, "", config_error)
         if untrusted_keys:
             rendered = ", ".join(untrusted_keys[:8])
             suffix = ", ..." if len(untrusted_keys) > 8 else ""
-            return (
+            return _GitCommandResult(
                 126,
                 "",
                 "read-only Git refused untrusted repository Git config: "
@@ -796,13 +904,13 @@ async def _run_git(
             sandbox_manager=sandbox_manager,
         )
         if discovery_error is not None:
-            return 126, "", discovery_error
+            return _GitCommandResult(126, "", discovery_error)
     git_args = (
         read_only_git_args(args, filter_drivers=filter_drivers)
         if read_only
         else list(args)
     )
-    return await _run_prepared_git(
+    return await _run_prepared_git_result(
         cwd,
         git,
         git_args,
@@ -913,6 +1021,28 @@ async def _run_prepared_git(
     expected_cwd_identity: tuple[int, int] | None,
     sandbox_manager: SandboxManager | None,
 ) -> tuple[int, str, str]:
+    result = await _run_prepared_git_result(
+        cwd,
+        git,
+        git_args,
+        environment,
+        allowlist,
+        expected_cwd_identity=expected_cwd_identity,
+        sandbox_manager=sandbox_manager,
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+async def _run_prepared_git_result(
+    cwd: Path,
+    git: str,
+    git_args: Sequence[str],
+    environment: dict[str, str],
+    allowlist: tuple[str, ...],
+    *,
+    expected_cwd_identity: tuple[int, int] | None,
+    sandbox_manager: SandboxManager | None,
+) -> _GitCommandResult:
     """Execute one already-policy-prepared Git command."""
 
     cmd = [git, *git_args]
@@ -930,14 +1060,23 @@ async def _run_prepared_git(
                 expected_cwd_identity=expected_cwd_identity,
             )
         except SandboxBackendUnavailable as exc:
-            return 126, "", f"sandbox unavailable for git command: {exc}"
+            return _GitCommandResult(
+                126, "", f"sandbox unavailable for git command: {exc}"
+            )
         if result.output_truncated:
-            return (
+            return _GitCommandResult(
                 GIT_OUTPUT_LIMIT_EXIT,
                 result.stdout,
                 result.stderr or f"git output exceeded {DEFAULT_GIT_OUTPUT_LIMIT} bytes",
+                timed_out=result.timed_out,
+                output_truncated=True,
             )
-        return result.exit_code, result.stdout, result.stderr
+        return _GitCommandResult(
+            result.exit_code,
+            result.stdout,
+            result.stderr,
+            timed_out=result.timed_out,
+        )
     cwd_guard = SafetyGuard(cwd)
     try:
         with prepare_scoped_process_launch(
@@ -952,7 +1091,7 @@ async def _run_prepared_git(
                     workspace_root=cwd_guard.project_root
                 )
             except ProcessTreeUnavailable as exc:
-                return 126, "", f"git command was not started: {exc}"
+                return _GitCommandResult(126, "", f"git command was not started: {exc}")
             spawn_options = dict(process_tree_plan.spawn_options)
             if launch.pass_fds:
                 spawn_options["pass_fds"] = launch.pass_fds
@@ -965,7 +1104,7 @@ async def _run_prepared_git(
                 **spawn_options,
             )
     except (ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
-        return 126, "", f"git command was not started: {exc}"
+        return _GitCommandResult(126, "", f"git command was not started: {exc}")
     try:
         stdout, stderr = await asyncio.wait_for(
             communicate_process(
@@ -977,7 +1116,7 @@ async def _run_prepared_git(
         )
     except ProcessOutputLimitExceeded as exc:
         detail = exc.stderr.decode("utf-8", errors="replace").strip()
-        return (
+        return _GitCommandResult(
             GIT_OUTPUT_LIMIT_EXIT,
             exc.stdout.decode("utf-8", errors="replace"),
             (
@@ -988,21 +1127,24 @@ async def _run_prepared_git(
                 if exc.cleanup_error is not None
                 else ""
             ),
+            output_truncated=True,
         )
     except asyncio.TimeoutError:
         try:
             await terminate_process_tree(process, plan=process_tree_plan)
         except ProcessTreeError as exc:
-            return (
+            return _GitCommandResult(
                 125,
                 "",
                 "git command timed out after 30 seconds; "
                 f"process-tree cleanup failed: {exc}",
+                timed_out=True,
             )
-        return (
+        return _GitCommandResult(
             124,
             "",
             "git command timed out after 30 seconds",
+            timed_out=True,
         )
     except asyncio.CancelledError as cancellation:
         cleanup_error, cleanup_cancelled = (
@@ -1032,7 +1174,7 @@ async def _run_prepared_git(
                 cleanup_cancellation.add_note("Process-tree cleanup also failed")
             raise cleanup_cancellation from primary_error
         raise
-    return (
+    return _GitCommandResult(
         process.returncode if process.returncode is not None else -1,
         stdout.decode("utf-8", errors="replace"),
         stderr.decode("utf-8", errors="replace"),
@@ -1098,6 +1240,31 @@ def _path_in_scope(path: str, scope: str) -> bool:
     if normalized_scope == ".":
         return True
     return path == normalized_scope or path.startswith(f"{normalized_scope}/")
+
+
+def _unknown_git_mutation_result(
+    result: _GitCommandResult,
+    operation: str,
+    *,
+    effect: str = "Git state may have changed",
+) -> ToolResult | None:
+    if not result.interrupted:
+        return None
+    reason = (
+        "timed out after 30 seconds"
+        if result.timed_out
+        else "was stopped after exceeding the Git output limit"
+    )
+    error = f"{operation} {reason}; {effect}."
+    if "process-tree cleanup failed:" in result.stderr.casefold():
+        error += f" {result.stderr.strip()}"
+    error += " Inspect Git state before retrying."
+    return ToolResult(
+        success=False,
+        output=result.stdout,
+        error=error,
+        outcome=ToolExecutionOutcome.UNKNOWN,
+    )
 
 
 def _format_git_failure(

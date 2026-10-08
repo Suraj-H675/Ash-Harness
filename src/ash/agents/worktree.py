@@ -34,6 +34,10 @@ from ash.sandbox.process_utils import (
 class WorktreeError(RuntimeError):
     """A managed worktree operation could not be completed safely."""
 
+    def __init__(self, message: str, *, outcome_unknown: bool = False) -> None:
+        super().__init__(message)
+        self.outcome_unknown = outcome_unknown
+
 
 MAX_WORKTREE_GIT_OUTPUT_BYTES = 100_000
 WORKTREE_GIT_OUTPUT_LIMIT_EXIT = -2
@@ -98,7 +102,7 @@ class WorktreeManager:
         # branch ambiguous: Git may have created either partially, or another
         # process may have claimed the previously-free name before the failure
         # returned. Do not guess ownership and destructively clean up here.
-        await self._git(
+        await self._git_mutation(
             "worktree",
             "add",
             "--lock",
@@ -150,8 +154,8 @@ class WorktreeManager:
         if not status.stdout:
             head = (await self._git_at(lease.path, "rev-parse", "HEAD")).stdout.strip()
             return head if head != baseline else None
-        await self._git_at(lease.path, "add", "-A", "--", ".")
-        await self._git_at(
+        await self._git_at_mutation(lease.path, "add", "-A", "--", ".")
+        await self._git_at_mutation(
             lease.path,
             "-c",
             "user.name=Ash Agent",
@@ -218,7 +222,7 @@ class WorktreeManager:
                     ancestor.stderr.strip()
                     or f"could not compare artifact commit {commit}"
                 )
-            result = await self._git_at(
+            result = await self._git_at_mutation(
                 lease.path,
                 "-c",
                 "user.name=Ash Agent",
@@ -233,8 +237,10 @@ class WorktreeManager:
                 check=False,
             )
             if result.returncode != 0:
-                await self._git_at(lease.path, "merge", "--abort", check=False)
-                rollback = await self._git_at(
+                await self._git_at_mutation(
+                    lease.path, "merge", "--abort", check=False
+                )
+                rollback = await self._git_at_mutation(
                     lease.path,
                     "reset",
                     "--hard",
@@ -284,8 +290,8 @@ class WorktreeManager:
                 raise WorktreeError(
                     "refusing to remove agent worktree with unretained commits"
                 )
-        await self._git("worktree", "unlock", str(lease.path), check=False)
-        result = await self._git(
+        await self._git_mutation("worktree", "unlock", str(lease.path), check=False)
+        result = await self._git_mutation(
             "worktree",
             "remove",
             str(lease.path),
@@ -307,12 +313,14 @@ class WorktreeManager:
                 raise WorktreeError(
                     "agent branch changed during cleanup; preserved updated branch"
                 )
-            deleted = await self._git("branch", "-D", lease.branch, check=False)
+            deleted = await self._git_mutation(
+                "branch", "-D", lease.branch, check=False
+            )
             if deleted.returncode != 0:
                 raise WorktreeError(
                     deleted.stderr.strip() or f"could not delete agent branch {lease.branch}"
                 )
-        await self._git("worktree", "prune", "--expire", "now", check=False)
+        await self._git_mutation("worktree", "prune", "--expire", "now", check=False)
 
     async def list_agent_branches(self) -> list[tuple[str, str]]:
         result = await self._git(
@@ -337,7 +345,7 @@ class WorktreeManager:
         if status.stdout:
             raise WorktreeError("applying agent changes requires a clean lead worktree")
         commit = (await self._git("rev-parse", "--verify", branch)).stdout.strip()
-        result = await self._git(
+        result = await self._git_mutation(
             "-c",
             "commit.gpgsign=false",
             "merge",
@@ -347,13 +355,13 @@ class WorktreeManager:
             check=False,
         )
         if result.returncode != 0:
-            await self._git("reset", "--merge", "HEAD", check=False)
+            await self._git_mutation("reset", "--merge", "HEAD", check=False)
             raise WorktreeError(
                 result.stderr.strip() or f"agent branch {branch} conflicts with HEAD"
             )
         changed = await self._git("diff", "--cached", "--quiet", check=False)
         if changed.returncode == 1:
-            committed = await self._git(
+            committed = await self._git_mutation(
                 "-c",
                 "user.name=Ash Agent",
                 "-c",
@@ -367,23 +375,23 @@ class WorktreeManager:
                 check=False,
             )
             if committed.returncode != 0:
-                await self._git("reset", "--merge", "HEAD", check=False)
+                await self._git_mutation("reset", "--merge", "HEAD", check=False)
                 raise WorktreeError(
                     committed.stderr.strip()
                     or f"could not commit agent branch {branch}"
                 )
         elif changed.returncode != 0:
-            await self._git("reset", "--merge", "HEAD", check=False)
+            await self._git_mutation("reset", "--merge", "HEAD", check=False)
             raise WorktreeError(
                 changed.stderr.strip() or f"could not inspect agent branch {branch}"
             )
         if delete_branch:
-            await self._git("branch", "-D", branch)
+            await self._git_mutation("branch", "-D", branch)
         return commit
 
     async def discard_branch(self, branch: str) -> None:
         _validate_agent_branch(branch)
-        result = await self._git("branch", "-D", branch, check=False)
+        result = await self._git_mutation("branch", "-D", branch, check=False)
         if result.returncode != 0:
             raise WorktreeError(
                 result.stderr.strip() or f"could not delete agent branch {branch}"
@@ -466,6 +474,20 @@ class WorktreeManager:
             hooks_path=self._empty_hooks_path(),
         )
 
+    async def _git_mutation(
+        self,
+        *args: str,
+        check: bool = True,
+    ) -> "GitResult":
+        return await _run_git(
+            self.repository,
+            args,
+            check=check,
+            expected_cwd_identity=self._repository_identity,
+            hooks_path=self._empty_hooks_path(),
+            mutating=True,
+        )
+
     async def _git_at(
         self,
         cwd: Path,
@@ -477,6 +499,20 @@ class WorktreeManager:
             args,
             check=check,
             hooks_path=self._empty_hooks_path(),
+        )
+
+    async def _git_at_mutation(
+        self,
+        cwd: Path,
+        *args: str,
+        check: bool = True,
+    ) -> "GitResult":
+        return await _run_git(
+            cwd,
+            args,
+            check=check,
+            hooks_path=self._empty_hooks_path(),
+            mutating=True,
         )
 
     def _empty_hooks_path(self) -> Path:
@@ -502,6 +538,12 @@ class GitResult:
     returncode: int
     stdout: str
     stderr: str
+    timed_out: bool = False
+    output_truncated: bool = False
+
+    @property
+    def interrupted(self) -> bool:
+        return self.timed_out or self.output_truncated
 
 
 async def _run_git(
@@ -511,6 +553,7 @@ async def _run_git(
     check: bool,
     expected_cwd_identity: tuple[int, int] | None = None,
     hooks_path: Path | None = None,
+    mutating: bool = False,
 ) -> GitResult:
     if expected_cwd_identity is None:
         try:
@@ -578,6 +621,23 @@ async def _run_git(
         environment,
         expected_cwd_identity=expected_cwd_identity,
     )
+    if mutating and result.interrupted:
+        operation = _worktree_git_operation(args)
+        detail = (
+            "timed out after 30 seconds"
+            if result.timed_out
+            else "was stopped after exceeding the Git output limit"
+        )
+        cleanup_detail = (
+            f" {result.stderr.strip()}"
+            if "process-tree cleanup failed:" in result.stderr.casefold()
+            else ""
+        )
+        raise WorktreeError(
+            f"{operation} {detail}; its outcome is unknown.{cleanup_detail} "
+            "Inspect the worktree and branch before retrying.",
+            outcome_unknown=True,
+        )
     if check and result.returncode != 0:
         raise WorktreeError(
             result.stderr.strip()
@@ -639,6 +699,7 @@ async def _run_git_process(
             exc.stdout.decode("utf-8", errors="replace"),
             detail
             or f"git output exceeded {MAX_WORKTREE_GIT_OUTPUT_BYTES} bytes",
+            output_truncated=True,
         )
         if exc.cleanup_error is not None:
             result = GitResult(
@@ -646,6 +707,7 @@ async def _run_git_process(
                 result.stdout,
                 result.stderr
                 + f"; process-tree cleanup failed: {exc.cleanup_error}",
+                output_truncated=True,
             )
         return result
     except asyncio.TimeoutError as timeout_error:
@@ -653,7 +715,19 @@ async def _run_git_process(
             await terminate_process_tree(process, plan=process_tree_plan)
         except ProcessTreeError as exc:
             timeout_error.add_note(f"Process-tree cleanup failed: {exc}")
-        raise
+            return GitResult(
+                125,
+                "",
+                "git command timed out after 30 seconds; "
+                f"process-tree cleanup failed: {exc}",
+                timed_out=True,
+            )
+        return GitResult(
+            124,
+            "",
+            "git command timed out after 30 seconds",
+            timed_out=True,
+        )
     except asyncio.CancelledError as cancellation:
         cleanup_error, cleanup_cancelled = (
             await settle_process_tree_after_cancellation(
@@ -687,6 +761,25 @@ async def _run_git_process(
         stdout.decode("utf-8", errors="replace"),
         stderr.decode("utf-8", errors="replace"),
     )
+
+
+def _worktree_git_operation(args: Sequence[str]) -> str:
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument in {"-c", "-C", "--git-dir", "--work-tree"}:
+            index += 2
+            continue
+        if argument.startswith(("--git-dir=", "--work-tree=")):
+            index += 1
+            continue
+        if argument.startswith("-"):
+            index += 1
+            continue
+        if argument == "worktree" and index + 1 < len(args):
+            return f"git worktree {args[index + 1]}"
+        return f"git {argument}"
+    return "git command"
 
 
 def _safe_agent_id(agent_id: str) -> str:

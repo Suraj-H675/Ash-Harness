@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -59,6 +60,59 @@ def test_worktree_agent_commits_branch_without_mutating_lead(
     assert repository.joinpath("file.txt").read_text(encoding="utf-8") == "base\n"
     assert not lease.path.exists()
     assert _git(repository, "show", f"{lease.branch}:file.txt") == "worker"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Git process timeout regression")
+def test_worktree_commit_timeout_preserves_unknown_outcome(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.worktree as worktree_module
+
+    manager = WorktreeManager(repository, tmp_path / "agents")
+    lease = asyncio.run(manager.create("coder-timeout"))
+    (lease.path / "file.txt").write_text("worker\n", encoding="utf-8")
+
+    real_git = shutil.which("git")
+    assert real_git is not None
+    git_wrapper = tmp_path / "git-wrapper"
+    git_wrapper.write_text(
+        "#!/bin/sh\n"
+        "is_commit=0\n"
+        "for arg in \"$@\"; do\n"
+        "  [ \"$arg\" = commit ] && is_commit=1\n"
+        "done\n"
+        f"'{real_git}' \"$@\"\n"
+        "status=$?\n"
+        "if [ \"$status\" -eq 0 ] && [ \"$is_commit\" -eq 1 ]; then sleep 3; fi\n"
+        "exit \"$status\"\n",
+        encoding="utf-8",
+    )
+    git_wrapper.chmod(0o755)
+    monkeypatch.setattr(
+        worktree_module,
+        "resolve_host_executable",
+        lambda *_args, **_kwargs: str(git_wrapper),
+    )
+    real_wait_for = asyncio.wait_for
+
+    async def shortened_wait_for(awaitable, *, timeout):
+        if (
+            getattr(awaitable, "cr_code", None)
+            is worktree_module.communicate_process.__code__
+        ):
+            timeout = 1.0
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(worktree_module.asyncio, "wait_for", shortened_wait_for)
+
+    with pytest.raises(WorktreeError) as commit_error:
+        asyncio.run(manager.commit_changes(lease, message="worker commit"))
+
+    assert commit_error.value.outcome_unknown is True
+    assert "outcome is unknown" in str(commit_error.value)
+    assert _git(lease.path, "log", "-1", "--format=%s") == "worker commit"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="descriptor-anchored POSIX regression")
@@ -513,6 +567,73 @@ def test_worktree_agent_branch_can_be_applied_and_removed(
     assert result.returncode != 0
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Git process timeout regression")
+def test_apply_branch_does_not_reset_after_merge_timeout(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.agents.worktree as worktree_module
+
+    manager = WorktreeManager(repository, tmp_path / "agents")
+    lease = asyncio.run(manager.create("coder-apply-timeout"))
+    (lease.path / "file.txt").write_text("applied\n", encoding="utf-8")
+    asyncio.run(manager.commit_changes(lease, message="agent change"))
+    asyncio.run(manager.remove(lease, keep_branch=True))
+    lead_head = _git(repository, "rev-parse", "HEAD")
+
+    real_git = shutil.which("git")
+    assert real_git is not None
+    reset_marker = tmp_path / "reset-ran"
+    git_wrapper = tmp_path / "git-wrapper"
+    git_wrapper.write_text(
+        "#!/bin/sh\n"
+        "is_merge=0\n"
+        "is_reset=0\n"
+        "for arg in \"$@\"; do\n"
+        "  [ \"$arg\" = merge ] && is_merge=1\n"
+        "  [ \"$arg\" = reset ] && is_reset=1\n"
+        "done\n"
+        f"if [ \"$is_reset\" -eq 1 ]; then printf reset >> '{reset_marker}'; fi\n"
+        f"'{real_git}' \"$@\"\n"
+        "status=$?\n"
+        "if [ \"$status\" -eq 0 ] && [ \"$is_merge\" -eq 1 ]; then sleep 3; fi\n"
+        "exit \"$status\"\n",
+        encoding="utf-8",
+    )
+    git_wrapper.chmod(0o755)
+    monkeypatch.setattr(
+        worktree_module,
+        "resolve_host_executable",
+        lambda *_args, **_kwargs: str(git_wrapper),
+    )
+    real_wait_for = asyncio.wait_for
+
+    async def shortened_wait_for(awaitable, *, timeout):
+        if (
+            getattr(awaitable, "cr_code", None)
+            is worktree_module.communicate_process.__code__
+        ):
+            timeout = 1.0
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(worktree_module.asyncio, "wait_for", shortened_wait_for)
+
+    with pytest.raises(WorktreeError) as merge_error:
+        asyncio.run(manager.apply_branch(lease.branch))
+
+    assert merge_error.value.outcome_unknown is True
+    assert "git merge timed out" in str(merge_error.value)
+    assert _git(repository, "rev-parse", "HEAD") == lead_head
+    assert not reset_marker.exists()
+    staged = subprocess.run(
+        [real_git, "diff", "--cached", "--quiet"],
+        cwd=repository,
+        check=False,
+    )
+    assert staged.returncode == 1
+
+
 def test_worktree_without_changes_removes_branch(
     repository: Path,
     tmp_path: Path,
@@ -892,7 +1013,7 @@ def test_worktree_add_failure_does_not_delete_replacement_directory(
     victim.mkdir()
     sentinel = victim / "sentinel.txt"
     sentinel.write_text("DO NOT DELETE\n", encoding="utf-8")
-    real_git = manager._git
+    real_git = manager._git_mutation
 
     async def fail_after_replacement(*args: str, check: bool = True):
         if args[:2] == ("worktree", "add"):
@@ -904,7 +1025,7 @@ def test_worktree_add_failure_does_not_delete_replacement_directory(
             raise WorktreeError("simulated worktree add failure")
         return await real_git(*args, check=check)
 
-    monkeypatch.setattr(manager, "_git", fail_after_replacement)
+    monkeypatch.setattr(manager, "_git_mutation", fail_after_replacement)
 
     with pytest.raises(WorktreeError, match="simulated worktree add failure"):
         asyncio.run(manager.create("coder-replaced"))
@@ -924,7 +1045,7 @@ def test_worktree_add_failure_does_not_delete_replacement_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = WorktreeManager(repository, tmp_path / "agents")
-    real_git = manager._git
+    real_git = manager._git_mutation
     replacement_branch = "ash-agent/coder-branch-replaced"
 
     async def fail_after_branch_replacement(*args: str, check: bool = True):
@@ -933,7 +1054,7 @@ def test_worktree_add_failure_does_not_delete_replacement_branch(
             raise WorktreeError("simulated worktree add failure")
         return await real_git(*args, check=check)
 
-    monkeypatch.setattr(manager, "_git", fail_after_branch_replacement)
+    monkeypatch.setattr(manager, "_git_mutation", fail_after_branch_replacement)
 
     with pytest.raises(WorktreeError, match="simulated worktree add failure"):
         asyncio.run(manager.create("coder-branch-replaced"))

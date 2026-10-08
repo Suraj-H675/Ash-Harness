@@ -13,7 +13,7 @@ import pytest
 
 from ash.agents.shared_state import SharedState
 from ash.agents.tasks import AgentTaskError
-from ash.agents.worktree import WorktreeLease
+from ash.agents.worktree import WorktreeError, WorktreeLease, WorktreeManager
 from ash.config import AshConfig
 from ash.core.loop import AshLoop
 from ash.providers.base import ProviderABC, StreamChunk
@@ -101,6 +101,76 @@ async def test_spawn_agent_uses_provider_and_persists_report(tmp_path) -> None:
     assert reports[0].delivered is True
     assert reports[0].content["metadata"]["background"] is False
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unknown_worktree_commit_is_not_retried_or_cleaned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    (repository / "file.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    managers: list["UnknownCommitManager"] = []
+
+    class UnknownCommitManager(WorktreeManager):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.remove_calls = 0
+            managers.append(self)
+
+        async def commit_changes(self, lease, *, message, baseline_commit=None):
+            del lease, message, baseline_commit
+            raise WorktreeError(
+                "git commit timed out; its outcome is unknown",
+                outcome_unknown=True,
+            )
+
+        async def remove(self, lease, *, keep_branch, expected_head=None):
+            self.remove_calls += 1
+            await super().remove(
+                lease,
+                keep_branch=keep_branch,
+                expected_head=expected_head,
+            )
+
+    monkeypatch.setattr("ash.tools.agent.WorktreeManager", UnknownCommitManager)
+    state = SharedState(tmp_path / "state" / "agents.db")
+    tool = SpawnAgentTool(SafetyGuard(repository), state, FakeProvider)
+
+    try:
+        result = await tool.run(
+            role="reviewer",
+            task="inspect tests",
+            agent_id="unknown-commit-worker",
+            isolation="worktree",
+        )
+
+        assert result.success is False
+        durable = state.tasks.list_tasks()[0]
+        assert durable.state == "failed"
+        assert "outcome is unknown" in (durable.error or "")
+        assert managers[0].remove_calls == 0
+        assert (managers[0].storage_root / "unknown-commit-worker").exists()
+    finally:
+        await tool.aclose()
 
 
 @pytest.mark.asyncio

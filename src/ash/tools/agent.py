@@ -1637,23 +1637,38 @@ class SpawnAgentTool(BaseTool):
                     )
                 raise cancellation
             except WorktreeError as exc:
-                failure_reason = f"worktree preparation failed: {exc}"
+                failure_prefix = (
+                    "worktree preparation outcome unknown"
+                    if exc.outcome_unknown
+                    else "worktree preparation failed"
+                )
+                failure_reason = f"{failure_prefix}: {exc}"
                 cleanup_interrupted = False
-                if lease is not None:
-                    _cleanup_error, cleanup_interrupted = await _settle_worktree_remove(
-                        worktree_manager,
-                        lease,
-                        keep_branch=False,
-                        expected_head=accepted_commit or lease.base_commit,
-                        name=f"ash-subagent-worktree-error-cleanup-{agent_id}",
+                git_mutation_unknown = exc.outcome_unknown
+                if lease is not None and not git_mutation_unknown:
+                    worktree_cleanup_error, cleanup_interrupted = (
+                        await _settle_worktree_remove(
+                            worktree_manager,
+                            lease,
+                            keep_branch=False,
+                            expected_head=accepted_commit or lease.base_commit,
+                            name=f"ash-subagent-worktree-error-cleanup-{agent_id}",
+                        )
                     )
+                    if isinstance(worktree_cleanup_error, WorktreeError):
+                        git_mutation_unknown |= worktree_cleanup_error.outcome_unknown
+                        if worktree_cleanup_error.outcome_unknown:
+                            failure_reason += (
+                                "\nworktree cleanup outcome is unknown: "
+                                f"{worktree_cleanup_error}"
+                            )
                 try:
                     failed = lease_heartbeat.finalize(
                         lambda: self._shared_state.tasks.fail_task(
                             durable_task.task_id,
                             durable_lease.token,
                             failure_reason,
-                            retryable=lease is None,
+                            retryable=lease is None and not git_mutation_unknown,
                         )
                     )
                 finally:
@@ -1683,7 +1698,10 @@ class SpawnAgentTool(BaseTool):
             worker_workspace_identity = lease.path_identity
 
         branch_state: dict[str, str | None] = {"commit": None}
-        attempt_state = {"side_effect_dispatched": False}
+        attempt_state = {
+            "side_effect_dispatched": False,
+            "git_mutation_unknown": False,
+        }
         cleanup_state = {"done": False}
         if approval_mode == "live":
             foreground_approval_broker = self._foreground_approval_broker
@@ -1766,8 +1784,20 @@ class SpawnAgentTool(BaseTool):
                         baseline_commit=accepted_commit or lease.base_commit,
                     )
                 except WorktreeError as exc:
-                    summary = f"{summary}\nWorktree commit failed: {exc}"
                     success = False
+                    if exc.outcome_unknown:
+                        summary = f"{summary}\nWorktree commit outcome unknown: {exc}"
+                        attempt_state["git_mutation_unknown"] = True
+                        artifacts.update(
+                            {
+                                "branch": lease.branch,
+                                "base_commit": lease.base_commit,
+                                "worktree_path": str(lease.path),
+                                "git_outcome": "unknown",
+                            }
+                        )
+                    else:
+                        summary = f"{summary}\nWorktree commit failed: {exc}"
                 else:
                     final_commit = commit or (accepted_commit if success else None)
                     branch_state["commit"] = final_commit
@@ -1779,17 +1809,32 @@ class SpawnAgentTool(BaseTool):
                                 "base_commit": lease.base_commit,
                             }
                         )
-                try:
-                    await worktree_manager.remove(
-                        lease,
-                        keep_branch=branch_state["commit"] is not None,
-                        expected_head=accepted_commit or lease.base_commit,
-                    )
-                except WorktreeError as exc:
-                    summary = f"{summary}\nWorktree cleanup failed: {exc}"
-                    success = False
-                else:
-                    cleanup_state["done"] = True
+                if not attempt_state["git_mutation_unknown"]:
+                    try:
+                        await worktree_manager.remove(
+                            lease,
+                            keep_branch=branch_state["commit"] is not None,
+                            expected_head=accepted_commit or lease.base_commit,
+                        )
+                    except WorktreeError as exc:
+                        success = False
+                        if exc.outcome_unknown:
+                            summary = (
+                                f"{summary}\nWorktree cleanup outcome unknown: {exc}"
+                            )
+                            attempt_state["git_mutation_unknown"] = True
+                            artifacts.update(
+                                {
+                                    "branch": lease.branch,
+                                    "base_commit": lease.base_commit,
+                                    "worktree_path": str(lease.path),
+                                    "git_outcome": "unknown",
+                                }
+                            )
+                        else:
+                            summary = f"{summary}\nWorktree cleanup failed: {exc}"
+                    else:
+                        cleanup_state["done"] = True
             finished = datetime.now(timezone.utc)
             return AgentReport(
                 agent_id=context["agent_id"],
@@ -1863,6 +1908,7 @@ class SpawnAgentTool(BaseTool):
                             retryable=(
                                 branch_state["commit"] is None
                                 and not attempt_state["side_effect_dispatched"]
+                                and not attempt_state["git_mutation_unknown"]
                             ),
                         )
                     )
@@ -1976,6 +2022,7 @@ class SpawnAgentTool(BaseTool):
                                 retryable=(
                                     branch_state["commit"] is None
                                     and not attempt_state["side_effect_dispatched"]
+                                    and not attempt_state["git_mutation_unknown"]
                                 ),
                             )
                         )
@@ -1999,6 +2046,7 @@ class SpawnAgentTool(BaseTool):
                     lease is not None
                     and worktree_manager is not None
                     and not cleanup_state["done"]
+                    and not attempt_state["git_mutation_unknown"]
                 ):
                     cleanup_error, cleanup_interrupted = await _settle_worktree_remove(
                         worktree_manager,
