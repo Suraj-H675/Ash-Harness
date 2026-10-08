@@ -15,6 +15,7 @@ from ash.providers.base import (
     ProviderTerminalError,
     StreamChunk,
     completion_stop_category,
+    managed_async_stream,
     stream_chunk_commits_provider,
 )
 from ash.providers.capabilities import ProviderCapabilities
@@ -151,22 +152,26 @@ class FailoverProvider(ProviderABC):
             exposed_terminal = False
             saw_terminal = False
             try:
-                async for chunk in provider.stream_chat(
-                    messages, temperature=temperature, tools=tools
-                ):
-                    has_output = stream_chunk_commits_provider(chunk)
-                    if (
-                        chunk.is_done
-                        and completion_stop_category(chunk.stop_reason)
-                        == CompletionStopCategory.ERROR
-                        and not emitted_output
-                        and not has_output
-                    ):
-                        raise ProviderTerminalError(chunk.stop_reason)
-                    emitted_output = emitted_output or has_output
-                    saw_terminal = saw_terminal or chunk.is_done
-                    exposed_terminal = exposed_terminal or chunk.is_done
-                    yield chunk
+                async with managed_async_stream(
+                    provider.stream_chat(
+                        messages, temperature=temperature, tools=tools
+                    ),
+                    label="failover child",
+                ) as child_stream:
+                    async for chunk in child_stream:
+                        has_output = stream_chunk_commits_provider(chunk)
+                        if (
+                            chunk.is_done
+                            and completion_stop_category(chunk.stop_reason)
+                            == CompletionStopCategory.ERROR
+                            and not emitted_output
+                            and not has_output
+                        ):
+                            raise ProviderTerminalError(chunk.stop_reason)
+                        emitted_output = emitted_output or has_output
+                        saw_terminal = saw_terminal or chunk.is_done
+                        exposed_terminal = exposed_terminal or chunk.is_done
+                        yield chunk
                 if not saw_terminal:
                     raise ProviderIncompleteStreamError(
                         f"provider {provider.model_name!r} ended before a terminal chunk"

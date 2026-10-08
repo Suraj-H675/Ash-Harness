@@ -1170,6 +1170,86 @@ async def test_provider_streams_close_before_retry_and_after_success(tmp_path) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_before_close", [False, True])
+async def test_cancellation_during_provider_close_stops_retry_and_finishes_close(
+    tmp_path, failure_before_close: bool
+) -> None:
+    class AttemptStream:
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+            self.started_close = asyncio.Event()
+            self.release_close = asyncio.Event()
+            self.closed = False
+            self.sent_terminal = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if failure_before_close and self.attempt == 1:
+                raise TimeoutError("transient provider timeout")
+            if self.sent_terminal:
+                raise StopAsyncIteration
+            self.sent_terminal = True
+            return StreamChunk(content="complete", is_done=True, stop_reason="stop")
+
+        async def aclose(self) -> None:
+            self.started_close.set()
+            if self.attempt == 1:
+                await self.release_close.wait()
+            self.closed = True
+
+    class ClosingProvider(ProviderABC):
+        model_name = "closing-provider"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.attempts = 0
+            self.streams: list[AttemptStream] = []
+            self.started = asyncio.Event()
+
+        def count_tokens(self, text):
+            return len(str(text))
+
+        def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.attempts += 1
+            stream = AttemptStream(self.attempts)
+            self.streams.append(stream)
+            self.started.set()
+            return stream
+
+    provider = ClosingProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "cancelled-provider-close.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(
+            model="openai/test",
+            provider_max_attempts=2,
+            provider_retry_base_delay=0,
+            provider_retry_max_delay=0,
+        ),
+    )
+    task = asyncio.create_task(loop._stream_one_completion([]))
+    await asyncio.wait_for(provider.started.wait(), timeout=1)
+    await asyncio.wait_for(provider.streams[0].started_close.wait(), timeout=1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    provider.streams[0].release_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert provider.attempts == 1
+    assert provider.streams[0].closed is True
+
+
+@pytest.mark.asyncio
 async def test_cancelled_request_closes_active_provider_stream(tmp_path) -> None:
     class BlockingStream:
         def __init__(self) -> None:

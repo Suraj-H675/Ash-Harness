@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -31,25 +32,70 @@ async def close_async_stream(
 ) -> None:
     """Close an async provider/SDK stream without replacing a primary failure."""
 
-    close = getattr(stream, "aclose", None)
-    if not callable(close):
-        close = getattr(stream, "close", None)
-    if not callable(close):
-        return
-    try:
+    async def invoke_close() -> None:
+        close = getattr(stream, "aclose", None)
+        if not callable(close):
+            close = getattr(stream, "close", None)
+        if not callable(close):
+            return
         result = close()
         if inspect.isawaitable(result):
             await result
-    except BaseException as cleanup_error:
-        if primary_error is not None:
+
+    close_task = asyncio.create_task(invoke_close())
+    owner = asyncio.current_task()
+    initial_cancellations = owner.cancelling() if owner is not None else 0
+    caller_cancellation: asyncio.CancelledError | None = None
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError as cancellation:
+            if (
+                owner is not None
+                and owner.cancelling() > initial_cancellations
+                and caller_cancellation is None
+            ):
+                caller_cancellation = cancellation
+            if close_task.done():
+                break
+        except BaseException:
+            # Inspect the task's final exception below so cleanup precedence is
+            # the same whether close completed or raised through shield().
+            break
+
+    cleanup_error: BaseException | None = None
+    try:
+        close_task.result()
+    except BaseException as exc:
+        cleanup_error = exc
+
+    if isinstance(primary_error, asyncio.CancelledError):
+        if cleanup_error is not None:
             primary_error.add_note(
                 f"{label} stream cleanup also failed "
                 f"({type(cleanup_error).__name__})"
             )
-            return
-        raise RuntimeError(
-            f"{label} stream cleanup failed ({type(cleanup_error).__name__})"
-        ) from cleanup_error
+        return
+
+    if caller_cancellation is not None:
+        if cleanup_error is not None:
+            caller_cancellation.add_note(
+                f"{label} stream cleanup also failed "
+                f"({type(cleanup_error).__name__})"
+            )
+        raise caller_cancellation
+
+    if cleanup_error is None:
+        return
+    if primary_error is not None:
+        primary_error.add_note(
+            f"{label} stream cleanup also failed "
+            f"({type(cleanup_error).__name__})"
+        )
+        return
+    raise RuntimeError(
+        f"{label} stream cleanup failed ({type(cleanup_error).__name__})"
+    ) from cleanup_error
 
 
 @asynccontextmanager
