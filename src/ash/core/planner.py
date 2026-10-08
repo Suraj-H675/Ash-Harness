@@ -133,6 +133,11 @@ class Planner:
         self._system_prompt = system_prompt or ARCHITECT_MODE_PROMPT
         self._token_counter = token_counter
 
+    def set_provider(self, provider: ProviderABC) -> None:
+        """Follow the runtime's active provider after an atomic route switch."""
+
+        self._provider = provider
+
     async def decompose(
         self,
         user_request: str,

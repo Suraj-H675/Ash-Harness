@@ -5986,13 +5986,18 @@ async def test_switch_model_closes_previous_provider(tmp_path):
             closed.append(True)
             await super().aclose()
 
+    from ash.core.planner import Planner
+
+    original = ClosableProvider()
+    planner = Planner(original)
     loop = AshLoop(
         SessionStore(tmp_path / "model-switch.db"),
-        ClosableProvider(),
+        original,
         SafetyGuard(tmp_path),
         EventUI(),
         tmp_path,
         provider_factory=lambda _config: replacement,
+        planner=planner,
         config=AshConfig(
             model="ollama/test",
             workspace_root=tmp_path,
@@ -6006,6 +6011,7 @@ async def test_switch_model_closes_previous_provider(tmp_path):
     loop.switch_model("next")
 
     assert loop.provider is not old_provider
+    assert planner._provider is replacement
     await asyncio.sleep(0)
     assert closed == [True]
     await loop.aclose()
@@ -6237,8 +6243,11 @@ async def test_switch_model_rolls_back_if_protocol_sync_fails(tmp_path):
             replacement_closed.append(True)
             await super().aclose()
 
+    from ash.core.planner import Planner
+
     original = MockProvider()
     replacement = BrokenCapabilitiesProvider()
+    planner = Planner(original)
     config = AshConfig(
         model="ollama/test",
         workspace_root=tmp_path,
@@ -6253,6 +6262,7 @@ async def test_switch_model_rolls_back_if_protocol_sync_fails(tmp_path):
         tmp_path,
         provider_factory=lambda _config: replacement,
         config=config,
+        planner=planner,
     )
     await loop.start_session()
     original_prompt = loop.system_prompt
@@ -6266,6 +6276,7 @@ async def test_switch_model_rolls_back_if_protocol_sync_fails(tmp_path):
     assert loop._config.model == "ollama/test"
     assert loop.system_prompt == original_prompt
     assert loop._provider_circuit_key == original_circuit_key
+    assert planner._provider is original
     await asyncio.sleep(0)
     assert replacement_closed == [True]
     await loop.aclose()

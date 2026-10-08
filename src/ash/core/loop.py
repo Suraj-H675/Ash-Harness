@@ -7182,6 +7182,8 @@ class AshLoop:
             self._config = new_config
             self._provider_circuit_key = _provider_circuit_key(replacement)
             self._sync_generated_tool_protocol()
+            if self.planner is not None:
+                self.planner.set_provider(replacement)
         except BaseException as primary_error:
             self.provider = old_provider
             self._provider_closed = old_provider_closed
@@ -7190,6 +7192,8 @@ class AshLoop:
             self._core_system_prompt = old_core_prompt
             self._base_system_prompt = old_base_prompt
             self.system_prompt = old_system_prompt
+            if self.planner is not None:
+                self.planner.set_provider(old_provider)
             if model_persisted and session is not None:
                 try:
                     self.session_store.update_session_model(
