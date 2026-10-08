@@ -433,12 +433,31 @@ async def test_http_unstarted_stream_response_does_not_consume_turn_capacity() -
 @pytest.mark.asyncio
 async def test_http_stream_disconnect_releases_turn_capacity() -> None:
     started = asyncio.Event()
+    stream_closed = asyncio.Event()
+
+    class BlockingStream:
+        def __init__(self) -> None:
+            self._started = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._started:
+                self._started = True
+                started.set()
+                return AshEvent("turn.started", {})
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            stream_closed.set()
 
     class BlockingStreamClient(FakeClient):
-        async def stream_prompt(self, text):
-            started.set()
-            yield AshEvent("turn.started", {})
-            await asyncio.Event().wait()
+        def stream_prompt(self, text):
+            del text
+            self.stream = BlockingStream()
+            return self.stream
 
     client = BlockingStreamClient()
     app = create_app(
@@ -483,6 +502,7 @@ async def test_http_stream_disconnect_releases_turn_capacity() -> None:
 
     await asyncio.wait_for(response(scope, receive, send), timeout=1)
     assert started.is_set()
+    assert stream_closed.is_set()
 
     result = await turn_endpoint(TurnRequest(input="after-disconnect"))
 

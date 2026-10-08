@@ -571,11 +571,16 @@ def create_app(
                 if payload.session_id is not None
                 else client.stream_prompt(payload.input)
             )
-            async for event in stream:
-                yield _sse(
-                    event.type,
-                    redact_value(event.to_wire(include_type=False)),
-                )
+            try:
+                async for event in stream:
+                    yield _sse(
+                        event.type,
+                        redact_value(event.to_wire(include_type=False)),
+                    )
+            finally:
+                close = getattr(stream, "aclose", None)
+                if callable(close):
+                    await close()
 
         return AdmittedTurnStreamingResponse(events(), media_type="text/event-stream")
 
