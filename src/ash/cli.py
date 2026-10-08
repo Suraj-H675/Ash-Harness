@@ -640,16 +640,20 @@ async def _interactive_model_picker(
         for index, model in enumerate(catalog, 1):
             marker = " (current)" if model == config.model else ""
             lines.append(
-                f"  [{index}] {_parse_model_string(model)[1]}{marker}"
+                f"  [{index}] "
+                f"{terminal_safe_text(_parse_model_string(model)[1], single_line=True)}"
+                f"{marker}"
             )
         write_output("\n".join(lines))
         choice = (await prompt_input.read("Pick a number (or 'c' to cancel)> ")).strip()
         if choice.lower() == "c":
             return
         try:
-            idx = int(choice) - 1
-            model_str = catalog[idx]
-        except (ValueError, IndexError):
+            number = int(choice)
+            if not 1 <= number <= len(catalog):
+                raise ValueError("selection outside catalog")
+            model_str = catalog[number - 1]
+        except ValueError:
             write_output("Invalid selection.", file=sys.stderr)
             return
 
@@ -663,7 +667,9 @@ async def _interactive_model_picker(
             "Run 'ash setup model' to save a default model."
         )
     except Exception as exc:
-        write_output(f"Error: {exc}", file=sys.stderr)
+        from ash.exceptions import classify_exception, format_error
+
+        write_output(format_error(classify_exception(exc)), file=sys.stderr)
 
 
 def _render_browser_runtime_status(status: dict[str, Any]) -> str:
@@ -1619,9 +1625,12 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 if not sessions:
                     print("No matching sessions.", flush=True)
                 for item in sessions:
-                    title = item.title or "(untitled)"
+                    title = terminal_safe_text(
+                        item.title or "(untitled)", single_line=True
+                    )
+                    session_id = terminal_safe_text(item.session_id, single_line=True)
                     print(
-                        f"{item.session_id}  {title}  "
+                        f"{session_id}  {title}  "
                         f"{item.message_count} messages  {item.updated_at.isoformat()}",
                         flush=True,
                     )
@@ -1684,12 +1693,27 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
                     continue
                 title = " ".join(arguments)
-                loop.session_store.rename_session(
-                    loop.current_session.session_id,
-                    title,
-                )
+                try:
+                    loop.session_store.rename_session(
+                        loop.current_session.session_id,
+                        title,
+                    )
+                except ValueError as exc:
+                    print(
+                        f"Error: {terminal_safe_text(str(exc), single_line=True)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                except KeyError as exc:
+                    _print_classified_error(exc)
+                    continue
                 loop.current_session.title = " ".join(title.split())
-                print(f"Renamed session to {loop.current_session.title}", flush=True)
+                print(
+                    "Renamed session to "
+                    + terminal_safe_text(loop.current_session.title, single_line=True),
+                    flush=True,
+                )
                 continue
             if command.name == "fork":
                 if loop.current_session is None:
@@ -1717,7 +1741,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     continue
                 loop.ui.load_session_transcript(session)
                 transition_feedback(
-                    f"Forked {session.branch_name or session.session_id[:8]}"
+                    "Forked "
+                    + terminal_safe_text(
+                        session.branch_name or session.session_id[:8], single_line=True
+                    )
                 )
                 continue
             if command.name == "tree":
@@ -1736,7 +1763,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         "root" if node.parent_session_id is None else "branch"
                     )
                     print(
-                        f"{marker} {'  ' * node.depth}{node.session_id}  {label}",
+                        f"{marker} {'  ' * node.depth}"
+                        f"{terminal_safe_text(node.session_id, single_line=True)}  "
+                        f"{terminal_safe_text(label, single_line=True)}",
                         flush=True,
                     )
                 continue

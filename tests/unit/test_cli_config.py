@@ -1194,6 +1194,76 @@ def test_model_catalog_rendering_and_shared_input_picker() -> None:
     )
 
 
+@pytest.mark.parametrize("choice", ["0", "-1", "999", "not-a-number"])
+def test_model_picker_rejects_invalid_numeric_choices(choice: str) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from ash.cli import _interactive_model_picker
+    from ash.config import AshConfig
+
+    config = AshConfig(model="openai/gpt-6-astra")
+    output = []
+
+    class Prompt:
+        async def read(self, _prompt: str) -> str:
+            return choice
+
+    def unexpected_switch(_model: str) -> None:
+        raise AssertionError("invalid choice must not switch models")
+
+    asyncio.run(
+        _interactive_model_picker(
+            config,
+            SimpleNamespace(switch_model=unexpected_switch),
+            Prompt(),
+            lambda message, **_kwargs: output.append(message),
+        )
+    )
+    assert output[-1] == "Invalid selection."
+    assert config.model == "openai/gpt-6-astra"
+
+
+def test_model_picker_fallback_escapes_untrusted_model_names() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from ash.cli import _interactive_model_picker
+    from ash.config import AshConfig
+
+    injected = "model\x1b[2J\u202eforged\u202c\nsecond line"
+    config = AshConfig(
+        model="custom/normal",
+        custom_providers={
+            "custom": {
+                "base_url": "https://example.test/v1",
+                "models": ["normal", injected],
+            }
+        },
+    )
+    output = []
+
+    class Prompt:
+        async def read(self, _prompt: str) -> str:
+            return "c"
+
+    def unexpected_switch(_model: str) -> None:
+        raise AssertionError("cancelled selection must not switch models")
+
+    asyncio.run(
+        _interactive_model_picker(
+            config,
+            SimpleNamespace(switch_model=unexpected_switch),
+            Prompt(),
+            output.append,
+        )
+    )
+    assert "model\\x1b[2J\\u202eforged\\u202c\\x0asecond line" in output[0]
+    assert "\x1b" not in output[0]
+    assert "\u202e" not in output[0]
+    assert output[0].count("\n") == 2
+
+
 def test_model_catalog_advertises_current_deepseek_models_only() -> None:
     from ash.cli import AVAILABLE_MODELS
 

@@ -241,6 +241,51 @@ def _persist_turn(
 
 
 @pytest.mark.asyncio
+async def test_repl_session_commands_escape_metadata_and_recover_from_invalid_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path), model="ollama/test-model")
+    store.rename_session(session.session_id, "original\x1b[2J\u202eforged\u202c")
+    store.fork_session(
+        session.session_id,
+        branch_name="branch\x1b[3J\u202ehidden\u202c",
+    )
+
+    commands = iter(
+        (
+            "/sessions",
+            "/tree",
+            "/rename new\x1b[2J\u202elabel\u202c",
+            "/rename " + "x" * 257,
+            "/rename Safe title",
+            "/fork next\x1b[2J\u202ebranch\u202c",
+            "/exit",
+        )
+    )
+    assert await _run_repl(
+        tmp_path,
+        monkeypatch,
+        commands,
+        session_store=store,
+        current_session=session,
+    ) == 0
+
+    capture = capsys.readouterr()
+    assert "\x1b" not in capture.out
+    assert "\u202e" not in capture.out
+    assert "original\\x1b[2J\\u202eforged\\u202c" in capture.out
+    assert "branch\\x1b[3J\\u202ehidden\\u202c" in capture.out
+    assert "Renamed session to new\\x1b[2J\\u202elabel\\u202c" in capture.out
+    assert "Forked next\\x1b[2J\\u202ebranch\\u202c" in capture.out
+    assert "session title cannot exceed 256 characters" in capture.err
+    assert "Renamed session to Safe title" in capture.out
+    assert store.load_session(session.session_id).title == "Safe title"
+
+
+@pytest.mark.asyncio
 async def test_session_switch_commands_all_load_the_selected_transcript_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
