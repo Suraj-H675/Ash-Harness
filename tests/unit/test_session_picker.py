@@ -213,3 +213,45 @@ def test_session_picker_uses_ash_identity_and_cell_safe_narrow_rows(
     assert title.startswith("ASH  ·  Resume session")
     assert cell_len(row) <= 34
     assert "会議" in row or "👨‍💻" in row
+
+
+@pytest.mark.parametrize("columns", [1, 2, 3, 4, 6, 8, 12, 18, 28, 34])
+def test_session_picker_prioritizes_titles_and_fits_tiny_terminals(
+    monkeypatch, columns
+) -> None:
+    picker = SessionPicker(
+        [_summary("first-id", "Frontend work")],
+        output=SizedDummyOutput(columns=columns),
+    )
+    monkeypatch.setattr(
+        "ash.ui.session_picker.get_app_or_none",
+        lambda: picker.application,
+    )
+
+    row = _plain(picker._render_list()).rstrip("\n")
+    assert cell_len(row) <= columns
+    assert row.startswith(">")
+    if 4 <= columns <= 12:
+        assert "F" in row
+        assert "msg" not in row
+
+
+def test_session_picker_redacts_and_bounds_preview_load_errors() -> None:
+    secret = "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz"
+
+    def fail_preview(_session_id: str) -> Session:
+        raise RuntimeError("backend failed \x1b[2J " + secret + " X" * 500)
+
+    picker = SessionPicker(
+        [_summary("first-id", "Frontend work")],
+        load_session=fail_preview,
+        output=DummyOutput(),
+    )
+    picker._toggle_preview()
+
+    rendered = _plain(picker._render_preview())
+    assert rendered.startswith("Could not load preview: backend failed")
+    assert "sk-proj-" not in rendered
+    assert "\x1b[2J" not in rendered
+    assert "\\x1b[2J" in rendered
+    assert len(rendered) <= 350

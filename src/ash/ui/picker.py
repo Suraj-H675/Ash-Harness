@@ -186,21 +186,21 @@ class FilterPicker:
         for index, option in enumerate(self._filtered[start:end], start=start):
             selected = index == self._selected
             style = "class:selected" if selected else ""
-            marker = "> " if selected else "  "
+            marker = ("> " if selected else "  ")[:columns]
             current = option.value == self._current_value
             state = option.state or ("current" if current else "")
             label = terminal_safe_text(option.label, single_line=True)
             state = terminal_safe_text(state, single_line=True)
-            row_budget = max(1, columns - cell_len(marker))
+            row_budget = max(0, columns - cell_len(marker))
             suffix = ""
-            if state and row_budget > 4:
+            if state and row_budget >= 12:
                 state_budget = min(
                     cell_len(state),
                     max(3, row_budget // 3),
                     max(1, row_budget - 4),
                 )
                 suffix = "  " + _fit_cell_text(state, state_budget)
-            label_budget = max(1, row_budget - cell_len(suffix))
+            label_budget = max(0, row_budget - cell_len(suffix))
             label = _fit_cell_text(label, label_budget)
             fragments.append((style, marker))
             fragments.append(

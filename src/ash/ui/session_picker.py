@@ -23,6 +23,7 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.output.base import Output
 from rich.cells import cell_len, set_cell_size
 from ash.core.session import Session, SessionSummary
+from ash.core.redaction import redact_text
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.theme import get_theme, overlay_styles, prompt_style
 
@@ -185,7 +186,7 @@ class SessionPicker:
         start, end = self._page()
         for index, session in enumerate(self._filtered[start:end], start=start):
             style = "class:selected" if index == self._selected else ""
-            marker = "> " if index == self._selected else "  "
+            marker = ("> " if index == self._selected else "  ")[:columns]
             title = terminal_safe_text(session.title or "(untitled)", single_line=True)
             model = terminal_safe_text(
                 session.model or "unknown model", single_line=True
@@ -195,18 +196,18 @@ class SessionPicker:
                 f"{session.message_count} msg  {_relative_time(session.updated_at)}  "
                 f"{model}  {session_id}"
             )
-            row_budget = max(1, columns - cell_len(marker))
-            metadata_budget = min(
-                cell_len(metadata),
-                max(8, row_budget // 2),
-                max(1, row_budget - 4),
-            )
-            metadata = _fit_cell_text(metadata, metadata_budget)
+            row_budget = max(0, columns - cell_len(marker))
+            if row_budget >= 16:
+                metadata_budget = min(
+                    cell_len(metadata),
+                    max(8, row_budget // 2),
+                    row_budget - 6,
+                )
+                metadata = _fit_cell_text(metadata, metadata_budget)
+            else:
+                metadata = ""
             separator = "  " if metadata else ""
-            title_budget = max(
-                1,
-                row_budget - cell_len(separator) - cell_len(metadata),
-            )
+            title_budget = max(0, row_budget - cell_len(separator) - cell_len(metadata))
             title = _fit_cell_text(title, title_budget)
             fragments.extend(
                 [
@@ -244,7 +245,9 @@ class SessionPicker:
         try:
             session = self._load_session(session_id)
         except Exception as exc:  # noqa: BLE001
-            self._preview_text = "Could not load preview: " + terminal_safe_text(str(exc))
+            self._preview_text = "Could not load preview: " + terminal_safe_text(
+                redact_text(str(exc))[:300], single_line=True
+            )
             return
         messages = [
             f"{terminal_safe_text(str(message.role), single_line=True)}: "

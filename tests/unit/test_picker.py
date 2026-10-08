@@ -131,3 +131,19 @@ def test_filter_picker_uses_ash_identity_and_cell_safe_narrow_rows(monkeypatch) 
     assert title.startswith("ASH  ·  Model")
     assert cell_len(row) <= 28
     assert "模型" in row or "👨‍💻" in row
+
+
+@pytest.mark.parametrize("columns", [1, 2, 3, 4, 6, 8, 12, 18, 28])
+def test_filter_picker_never_overflows_tiny_terminal_rows(monkeypatch, columns) -> None:
+    picker = FilterPicker(
+        "Model",
+        [PickerOption("long", "Example model", state="current")],
+        output=SizedDummyOutput(columns=columns),
+    )
+    monkeypatch.setattr("ash.ui.picker.get_app_or_none", lambda: picker.application)
+
+    row = _plain(picker._render_list()).rstrip("\n")
+    assert cell_len(row) <= columns
+    assert row.startswith(">")
+    if 4 <= columns <= 12:
+        assert "E" in row
