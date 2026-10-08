@@ -873,7 +873,7 @@ class BudgetExhaustingToolProvider(ProviderABC):
                     "arguments": '{"text":"must not run"}',
                 }
             ],
-            prompt_tokens=16,
+            prompt_tokens=76,
             completion_tokens=4,
         )
 
@@ -905,7 +905,7 @@ class MultiStepBudgetProvider(ProviderABC):
                     "arguments": '{"text":"first step"}',
                 }
             ],
-            prompt_tokens=10,
+            prompt_tokens=65,
             completion_tokens=2,
         )
 
@@ -5095,9 +5095,9 @@ async def test_turn_token_budget_stops_before_tool_side_effects(tmp_path):
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
         model="openai/budget-exhausting-tool-test",
-        max_context_tokens=20,
+        max_context_tokens=200,
         max_completion_tokens=4,
-        max_turn_total_tokens=20,
+        max_turn_total_tokens=80,
     )
     loop = AshLoop(
         SessionStore(tmp_path / "turn-budget.db"),
@@ -5107,16 +5107,18 @@ async def test_turn_token_budget_stops_before_tool_side_effects(tmp_path):
         tmp_path,
         tools={tool.name: tool},
         config=config,
+        system_prompt="Compact testing prompt",
+        safety_tier="auto_approve",
     )
 
     await loop.start_session()
     response = await loop.run_turn("use the capture tool")
 
-    assert "Turn token budget exhausted: used 20 of 20 tokens" in response
+    assert "Turn token budget exhausted: used 80 of 80 tokens" in response
     assert tool.arguments is None
     assert provider.calls == 1
     assert loop._last_turn_budget_exhausted is True
-    assert loop._last_turn_prompt_tokens + loop._last_turn_completion_tokens == 20
+    assert loop._last_turn_prompt_tokens + loop._last_turn_completion_tokens == 80
     assert loop.current_session is not None
     loaded = loop.session_store.load_session(loop.current_session.session_id)
     assert len(loaded.tool_calls) == 1
@@ -5141,9 +5143,9 @@ async def test_turn_token_budget_blocks_next_provider_request(tmp_path):
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
         model="openai/multi-step-budget-test",
-        max_context_tokens=20,
+        max_context_tokens=200,
         max_completion_tokens=4,
-        max_turn_total_tokens=20,
+        max_turn_total_tokens=80,
     )
     loop = AshLoop(
         SessionStore(tmp_path / "multi-turn-budget.db"),
@@ -5153,6 +5155,8 @@ async def test_turn_token_budget_blocks_next_provider_request(tmp_path):
         tmp_path,
         tools={tool.name: tool},
         config=config,
+        system_prompt="Compact testing prompt",
+        safety_tier="auto_approve",
     )
 
     await loop.start_session()
@@ -6984,12 +6988,12 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     assert loop._last_cache_read_tokens == 60
     assert loop._last_cache_write_tokens == 20
     assert loop._last_turn_cost_usd == pytest.approx(0.000152)
-    assert loop.turn_context is not None
-    assert loop.turn_context.get("usage")["cache_hit_rate"] == 0.6
+    assert loop.turn_context is None
     usage_event = next(event for event in ui.events if event["type"] == "turn.usage")
+    assert usage_event["cache_hit_rate"] == 0.6
     assert usage_event["schema_version"] == 1
     assert usage_event["session_id"] == session.session_id
-    assert usage_event["turn_id"] == loop.turn_context.turn_id
+    assert usage_event["turn_id"]
     assert {
         key: value
         for key, value in usage_event.items()
@@ -7041,12 +7045,12 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
     assert usage.cache_write_tokens == 20
     assert usage.cost_usd == pytest.approx(0.000152)
     assert usage.cost_known is True
-    assert loop.turn_context is not None
-    assert store.rewind_turn_ids(session.session_id, 0) == [loop.turn_context.turn_id]
+    assert loop.turn_context is None
+    assert store.rewind_turn_ids(session.session_id, 0) == [usage_event["turn_id"]]
     with get_db_connection(store.db_path) as connection:
         persisted_turn = connection.execute(
             "SELECT usage_json FROM turn_journal WHERE turn_id = ?",
-            (loop.turn_context.turn_id,),
+            (usage_event["turn_id"],),
         ).fetchone()
     assert '"prompt_tokens": 100' in persisted_turn["usage_json"]
 

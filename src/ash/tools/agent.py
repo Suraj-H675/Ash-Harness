@@ -2319,7 +2319,6 @@ class SpawnAgentTool(BaseTool):
                     )
                 raise cancellation from primary_error
             raise
-        loop.permission_policy = worker_policy
         if approval_broker is not None:
 
             async def approve_worker_tool(
@@ -2394,6 +2393,9 @@ class SpawnAgentTool(BaseTool):
                 durable_lease_token,
             )
             await loop.start_session()
+            # New-session initialization clears session grants. Apply only the
+            # freshly inherited worker snapshot after that reset.
+            loop.permission_policy = worker_policy
             turn = asyncio.create_task(loop.run_turn(task))
             inbox = asyncio.create_task(
                 self._consume_worker_messages(

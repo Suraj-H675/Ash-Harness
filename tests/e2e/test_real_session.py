@@ -137,14 +137,16 @@ def _make_loop(
             guard, sandbox_manager=manager
         ),
     }
+    active_ui = ui if ui is not None else _make_ui()
     return AshLoop(
         session_store=store,
         provider=provider,
         safety_guard=guard,
-        ui=ui if ui is not None else _make_ui(),
+        ui=active_ui,
         project_root=workspace,
         tools=tools,
         auto_commit=auto_commit,
+        safety_tier=active_ui.safety_tier,
     )
 
 
@@ -312,7 +314,7 @@ def test_e2e_session_respects_safety_tier_dry_run(tmp_path: Path) -> None:
     assert write_record is not None
     assert write_record.approved is False
     assert write_record.executed is False
-    assert write_record.error == "Denied by user"
+    assert write_record.error == "dry-run mode forbids side effects"
 
 
 def test_e2e_session_persists_through_db_restore(tmp_path: Path) -> None:

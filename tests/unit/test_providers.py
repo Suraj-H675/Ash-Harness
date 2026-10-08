@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Callable
 
 import pytest
+from pydantic import BaseModel
 from pathlib import Path
 
 from ash.providers.base import (
@@ -437,14 +438,13 @@ def test_loop_drives_provider_through_tool_callbacks() -> None:
     from ash.tools.base import BaseTool, ToolResult
     from ash.ui.terminal import TerminalUI
 
+    class EchoArgs(BaseModel):
+        text: str
+
     class _EchoTool(BaseTool):
         name = "echo"
         description = "returns the input verbatim"
-        args_schema = type(
-            "Args",
-            (),
-            {"model_fields": {"text": ()}},
-        )
+        args_schema = EchoArgs
 
         async def run(self, **kwargs: Any) -> ToolResult:
             return ToolResult(success=True, output=kwargs.get("text", ""))
@@ -477,6 +477,7 @@ def test_loop_drives_provider_through_tool_callbacks() -> None:
             ui=ui,
             project_root=workspace,
             tools={echo.name: echo},
+            safety_tier="auto_approve",
         )
         await loop.start_session()
         await loop.run_turn("say hello")
