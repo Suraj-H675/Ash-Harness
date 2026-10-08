@@ -145,6 +145,48 @@ def test_transcript_resize_preserves_the_detached_reading_anchor() -> None:
     view.close()
 
 
+def test_transcript_reader_anchor_stays_inside_shrinking_history() -> None:
+    from ash.ui.transcript_view import TranscriptView
+
+    transcript = Transcript()
+    entry_id = transcript.begin("user")
+    transcript.append_delta(entry_id, "\n".join(str(i) for i in range(25)))
+    view = TranscriptView(transcript)
+    view.create_content(10, 10)
+    view.scroll(-5)
+    assert view.detached
+
+    transcript.replace_content(entry_id, "\n".join(str(i) for i in range(12)))
+    view.create_content(10, 10)
+    assert view.top_row(10) == 2
+    assert view.detached
+    view.close()
+
+
+def test_transcript_wrap_preserves_graphemes_and_narrow_cell_width() -> None:
+    from rich.cells import cell_len
+    from ash.ui.transcript_view import TranscriptView, _wrap_line_spans
+
+    samples = ("中文字符", "a👨‍💻b", "👩🏾‍🔧", "⚙️", "e\u0301e\u0301")
+    for sample in samples:
+        for width in (1, 2, 3, 4):
+            wrapped = _wrap_line_spans(sample, width)
+            assert all(cell_len(chunk) <= width for chunk, _offset in wrapped)
+            if width >= 2:
+                assert "".join(chunk for chunk, _offset in wrapped) == sample
+            for kind in ("user", "assistant", "tool"):
+                transcript = Transcript()
+                transcript.append(kind, sample)
+                view = TranscriptView(transcript)
+                content = view.create_content(width, 10)
+                rows = [
+                    "".join(part for _style, part in content.get_line(i))
+                    for i in range(content.line_count)
+                ]
+                assert all(cell_len(row) <= width for row in rows)
+                view.close()
+
+
 def test_long_transcript_line_wraps_without_reprocessing_each_suffix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

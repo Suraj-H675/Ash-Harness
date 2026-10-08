@@ -8,6 +8,7 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.utils import get_cwidth
+from rich.cells import cell_len, split_graphemes
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.style import Style as RichStyle
@@ -105,7 +106,7 @@ class TranscriptView(UIControl):
         self._ensure_layout(self._layout_width or 80)
         if self.follow_latest:
             return max(0, len(self._rows) - self._height)
-        return min(self._anchor_row(), max(0, len(self._rows) - 1))
+        return min(self._anchor_row(), max(0, len(self._rows) - self._height))
 
     def _anchor_row(self) -> int:
         if self._anchor_id is None:
@@ -283,9 +284,10 @@ def _render_final_assistant(
 
     width = max(1, width)
     rows: list[_DisplayRow] = [
-        _DisplayRow(entry.entry_id, -1, (("class:assistant-prefix", "ASH"),))
+        _DisplayRow(entry.entry_id, -1, (("class:assistant-prefix", "ASH"[:width]),))
     ]
-    body_width = max(1, width - 2)
+    prefix_width = 2 if width >= 3 else 0
+    body_width = width - prefix_width
     console = Console(
         force_terminal=False,
         color_system="truecolor",
@@ -303,7 +305,7 @@ def _render_final_assistant(
 
     offset = 0
     for index, line in enumerate(rendered_lines):
-        prefix = "· " if index == 0 else "  "
+        prefix = ("· " if index == 0 else "  ") if prefix_width else ""
         fragments: list[tuple[str, str]] = [
             ("class:assistant-body", _take_cells(prefix, width))
         ]
@@ -391,10 +393,12 @@ def _wrap_styled_rows(
                 prefix = "> " if index == 0 else "  "
                 prefix = _take_cells(prefix, user_prefix_width)
                 rendered = prefix + chunk
-                padding = max(0, width - get_cwidth(rendered))
+                padding = max(0, width - cell_len(rendered))
                 styles = (("class:user-band", rendered + " " * padding),)
             else:
                 styles = _slice_fragments(fragments, start, start + len(chunk))
+                if chunk != text[start : start + len(chunk)]:
+                    styles = ((styles[0][0], chunk),)
             result.append(_DisplayRow(entry_id, chunk_offset, tuple(styles)))
     return result or [_DisplayRow(entry_id, 0, (("", ""),))]
 
@@ -457,33 +461,37 @@ def _wrap_line_spans(value: str, width: int) -> list[tuple[str, int]]:
                 start += 1
         return ascii_chunks
 
+    spans, _ = split_graphemes(value)
     chunks: list[tuple[str, int]] = []
-    start = 0
-    while start < len(value):
+    index = 0
+    while index < len(spans):
+        start = spans[index][0]
         used = 0
-        end = start
-        while end < len(value):
-            char_width = get_cwidth(value[end])
-            if used + char_width > width:
-                break
-            used += char_width
-            end += 1
-        if end == len(value):
+        last = index
+        while last < len(spans) and used + spans[last][2] <= width:
+            used += spans[last][2]
+            last += 1
+        if last == index:
+            # A two-cell glyph cannot fit in a one-cell viewport.
+            chunks.append(("…", start))
+            index += 1
+            continue
+        if last == len(spans):
             chunks.append((value[start:], start))
             break
-        if end == start:
-            end += 1
-        split_at = value.rfind(" ", start, end + 1)
-        if split_at > start:
-            end = split_at
+        end = spans[last - 1][1]
+        space = value.rfind(" ", start, end + 1)
+        if space > start:
+            end = space
         chunk = value[start:end].rstrip(" ")
         if not chunk:
-            end = max(start + 1, end)
+            end = spans[last - 1][1]
             chunk = value[start:end]
         chunks.append((chunk, start))
-        start = end
-        while start < len(value) and value[start] == " ":
-            start += 1
+        while index < len(spans) and spans[index][0] < end:
+            index += 1
+        while index < len(spans) and value[spans[index][0]:spans[index][1]] == " ":
+            index += 1
     return chunks
 
 
