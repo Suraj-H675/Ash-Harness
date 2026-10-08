@@ -1108,6 +1108,10 @@ class TerminalUI:
         """Render concise tool lifecycle state outside the assistant panel."""
 
         event_type = payload.get("type")
+        if event_type == "tool.output" and self._activity_turn_closed:
+            return
+        if event_type in _TURN_TERMINAL_EVENTS or event_type == "turn.started":
+            self._finalize_pending_tool_output()
         previous_activity = self._current_activity_label()
         changed = self._apply_activity_event(payload)
         current_activity = self._current_activity_label()
@@ -1194,6 +1198,14 @@ class TerminalUI:
         else:
             self.console.print(line)
         self._conversation_needs_user_gap = True
+
+    def _finalize_pending_tool_output(self) -> None:
+        for entry_id in self._tool_output_entries.values():
+            try:
+                self.transcript.finalize(entry_id)
+            except KeyError:
+                pass  # A session reset may have replaced the presentation history.
+        self._tool_output_entries.clear()
 
     def _set_activity_status(self, text: str) -> None:
         """Update one ephemeral turn-status surface without polluting history."""
@@ -1356,6 +1368,7 @@ class TerminalUI:
         """Replace interactive history from a durable session snapshot."""
 
         self._activity_status = ""
+        self._tool_output_entries.clear()
         self._clear_prompt_notice()
         self._activity_turn_closed = False
         self._model_activity = None

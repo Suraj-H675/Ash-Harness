@@ -523,6 +523,59 @@ def test_tool_output_preserves_activity_while_rendering_output() -> None:
     assert [entry.content for entry in entries] == ["building…\n"]
 
 
+@pytest.mark.parametrize(
+    "terminal_event", ["turn.completed", "turn.cancelled", "turn.error"]
+)
+def test_turn_terminal_events_finalize_orphaned_tool_output(
+    terminal_event: str,
+) -> None:
+    from ash.ui.transcript import Transcript
+
+    transcript = Transcript(max_entries=1)
+    ui = TerminalUI(
+        console=Console(file=StringIO(), force_terminal=False),
+        transcript=transcript,
+    )
+    ui.emit_event({"type": "turn.started"})
+    ui.emit_event(
+        {
+            "type": "tool.output",
+            "tool": "run_command",
+            "call_id": "unfinished",
+            "delta": "partial output",
+        }
+    )
+    ui.emit_event({"type": terminal_event})
+    assert transcript.snapshot()[0].finalized
+    assert ui._tool_output_entries == {}
+
+    ui.emit_event(
+        {
+            "type": "tool.output",
+            "tool": "run_command",
+            "call_id": "unfinished",
+            "delta": "late output",
+        }
+    )
+    ui.write_output("new response")
+    assert [entry.content for entry in transcript.snapshot()] == ["new response"]
+
+
+def test_session_reset_discards_pending_tool_output_entry_ids() -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.emit_event(
+        {"type": "tool.output", "tool": "run_command", "call_id": "old", "delta": "old"}
+    )
+    assert ui._tool_output_entries
+
+    ui.load_session_transcript(None)
+    assert ui._tool_output_entries == {}
+    ui.emit_event(
+        {"type": "tool.output", "tool": "run_command", "call_id": "old", "delta": "new"}
+    )
+    assert [entry.content for entry in ui.transcript.snapshot()] == ["new"]
+
+
 def test_activity_dock_tracks_model_tools_retries_and_terminal_state() -> None:
     ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
     ui.bind_prompt_surface(lambda: None)

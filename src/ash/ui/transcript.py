@@ -58,6 +58,7 @@ class Transcript:
         self.max_entries = max_entries
         self.max_characters = max_characters
         self._entries: list[TranscriptEntry] = []
+        self._characters = 0
         self._listeners: set[TranscriptListener] = set()
         self._revision = 0
         self._omitted_entries = 0
@@ -100,6 +101,7 @@ class Transcript:
                 if index not in removed_indices
             ]
         self._entries = replacement
+        self._characters = remaining_characters
         self._omitted_entries = omitted
         self._emit("replaced", None)
 
@@ -121,6 +123,7 @@ class Transcript:
             metadata=dict(metadata) if metadata is not None else None,
         )
         self._entries.append(entry)
+        self._characters += len(content)
         self._emit("added", entry)
         self._prune()
         return entry.entry_id
@@ -147,7 +150,9 @@ class Transcript:
             raise ValueError(f"transcript entry is already finalized: {entry_id}")
         updated = replace(current, content=current.content + text)
         self._entries[index] = updated
+        self._characters += len(text)
         self._emit("updated", updated)
+        self._prune()
         return updated
 
     def replace_content(self, entry_id: str, text: str) -> TranscriptEntry:
@@ -157,7 +162,9 @@ class Transcript:
             raise ValueError(f"transcript entry is already finalized: {entry_id}")
         updated = replace(current, content=text)
         self._entries[index] = updated
+        self._characters += len(text) - len(current.content)
         self._emit("updated", updated)
+        self._prune()
         return updated
 
     def finalize(self, entry_id: str) -> TranscriptEntry:
@@ -173,12 +180,14 @@ class Transcript:
 
     def clear(self) -> None:
         self._entries.clear()
+        self._characters = 0
         self._omitted_entries = 0
         self._emit("reset", None)
 
     def remove(self, entry_id: str) -> TranscriptEntry:
         index = self._entry_index(entry_id)
         removed = self._entries.pop(index)
+        self._characters -= len(removed.content)
         self._emit("removed", removed)
         return removed
 
@@ -191,6 +200,8 @@ class Transcript:
         return unsubscribe
 
     def _entry_index(self, entry_id: str) -> int:
+        if self._entries and self._entries[-1].entry_id == entry_id:
+            return len(self._entries) - 1
         for index, entry in enumerate(self._entries):
             if entry.entry_id == entry_id:
                 return index
@@ -205,18 +216,17 @@ class Transcript:
             )
             if removable is None:
                 break
-            del self._entries[removable]
+            removed = self._entries.pop(removable)
+            self._characters -= len(removed.content)
             self._omitted_entries += 1
             changed = True
         if changed:
             self._emit("pruned", None)
 
-    def _over_limit(self, entries: list[TranscriptEntry] | None = None) -> bool:
-        bounded_entries = self._entries if entries is None else entries
+    def _over_limit(self) -> bool:
         return (
-            len(bounded_entries) > self.max_entries
-            or sum(len(entry.content) for entry in bounded_entries)
-            > self.max_characters
+            len(self._entries) > self.max_entries
+            or self._characters > self.max_characters
         )
 
     def _emit(
