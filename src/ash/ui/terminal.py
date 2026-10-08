@@ -694,7 +694,7 @@ class TerminalUI:
             if raw == "":
                 return False
             return raw.strip().casefold() in {"y", "yes"}
-        except (EOFError, KeyboardInterrupt, ValueError, TypeError):
+        except (EOFError, KeyboardInterrupt, OSError, ValueError, TypeError):
             return False
         finally:
             if live is not None:
@@ -859,7 +859,7 @@ class TerminalUI:
                 if action in {"c", "cancel", ""}:
                     return {"action": "cancel"}
                 self.console.print("Choose y, e, n, or c.", style=self.theme.error)
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, OSError, ValueError):
             return {"action": "cancel"}
         finally:
             if live is not None:
@@ -1243,7 +1243,7 @@ class TerminalUI:
         )
         try:
             answer = self._input_stream.readline().strip().lower()
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, OSError, ValueError):
             return False
         if answer in {"a", "always", "session"}:
             self._session_approvals.add(tool_name)
@@ -1641,7 +1641,7 @@ class TerminalUI:
                 self._render_plan(execution)
                 try:
                     answer = self._input_stream.readline().strip().lower()
-                except (EOFError, KeyboardInterrupt):
+                except (EOFError, KeyboardInterrupt, OSError, ValueError):
                     answer = ""
                 if answer in {"y", "yes"}:
                     return True

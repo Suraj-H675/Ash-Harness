@@ -858,6 +858,32 @@ def test_terminal_ui_approval_redacts_signed_url_arguments() -> None:
     assert "view=complete" in rendered
 
 
+@pytest.mark.parametrize("surface", ["tool", "sampling", "form", "plan"])
+def test_terminal_interactive_decisions_fail_closed_on_unreadable_input(surface: str) -> None:
+    from ash.core.planner import parse_sprint_response
+
+    class UnreadableInput(StringIO):
+        def readline(self, *args, **kwargs):
+            raise OSError("terminal input disconnected")
+
+    ui = TerminalUI(
+        input_stream=UnreadableInput(),
+        console=Console(file=StringIO(), force_terminal=False, width=100),
+    )
+    if surface == "tool":
+        assert ui.request_tool_approval("write_file", {"file_path": "x"}) is False
+    elif surface == "sampling":
+        assert ui.review_mcp_sampling("server", "request", {"messages": []}) is False
+    elif surface == "form":
+        schema = {"type": "object", "properties": {"name": {"type": "string"}}}
+        assert ui.request_mcp_elicitation("server", "Please respond", schema) == {
+            "action": "cancel"
+        }
+    else:
+        execution = parse_sprint_response("## Goal\nBuild feature", fallback_goal="Feature")
+        assert ui.show_plan(execution) is False
+
+
 def test_terminal_ui_can_approve_tool_for_session():
     stream = StringIO("a\n")
     ui = TerminalUI(safety_tier="interactive", input_stream=stream)
