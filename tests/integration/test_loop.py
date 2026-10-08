@@ -150,6 +150,61 @@ def test_text_only_turn_persists_user_and_assistant_messages(
     assert session.messages[1].content == "Hello, world!"
 
 
+def test_continuous_turns_finalize_each_step_usage_before_follow_up(
+    tmp_workspace: Path,
+    safety_guard: SafetyGuard,
+    session_store: SessionStore,
+) -> None:
+    class UsageProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            async for chunk in super().stream_chat(messages, temperature, tools):
+                if chunk.is_done:
+                    yield chunk.model_copy(
+                        update={
+                            "prompt_tokens": 7,
+                            "completion_tokens": 3,
+                            "usage_source": "provider",
+                        }
+                    )
+                else:
+                    yield chunk
+
+    provider = UsageProvider(scripts=[["initial answer"], ["follow-up answer"]])
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=tmp_workspace,
+        continuous_mode=True,
+        max_continuous_turns=1,
+    )
+    events: list[dict[str, Any]] = []
+    old_emit = loop._emit_event
+
+    def capture(event: dict[str, Any]) -> None:
+        events.append(event.copy())
+        old_emit(event)
+
+    loop._emit_event = capture  # type: ignore[method-assign]
+    assert asyncio.run(loop.run_turn("Start work")) == "follow-up answer"
+
+    session = loop.current_session
+    assert session is not None
+    assert provider._call_count == 2
+    usage = session_store.get_session_usage(session.session_id)
+    assert usage.prompt_tokens == 14
+    assert usage.completion_tokens == 6
+    assert session_store.started_turns(session.session_id) == []
+    assert [event["type"] for event in events].count("turn.completed") == 2
+    assert [message.content for message in session_store.load_session(session.session_id).messages] == [
+        "Start work",
+        "initial answer",
+        "Continue the previous task. What is the next step?",
+        "follow-up answer",
+    ]
+
+
 def test_tool_call_turn_executes_and_loops_back_to_provider(
     tmp_workspace: Path,
     safety_guard: SafetyGuard,

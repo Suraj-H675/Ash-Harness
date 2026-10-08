@@ -3694,6 +3694,7 @@ class AshLoop:
         iteration = 0
         iteration_budget = self.max_turn_iterations
         maximum_iteration_budget = self.max_turn_iterations + self.max_steering_messages
+        continue_follow_up = False
         while iteration < iteration_budget:
             iteration += 1
             self._drain_steering_messages(session)
@@ -3987,24 +3988,11 @@ class AshLoop:
                         iteration_budget + 1,
                     )
                     continue
-                if (
+                continue_follow_up = (
                     self.continuous_mode
                     and self._continuous_turns < self.max_continuous_turns
                     and self.current_goal is None
-                ):
-                    self._continuous_turns += 1
-                    follow_up = "Continue the previous task. What is the next step?"
-                    self.session_store.complete_turn(self.turn_context.turn_id)
-                    await self._fire_hook_lifecycle(
-                        "turn_end",
-                        {
-                            "session_id": session.session_id,
-                            "turn_id": self.turn_context.turn_id,
-                            "status": "continued",
-                            "response": redact_text(assistant_text),
-                        },
-                    )
-                    return await self._run_turn(follow_up)
+                )
                 break
 
             # Independent read-only calls may execute concurrently; all other
@@ -4214,6 +4202,11 @@ class AshLoop:
                 "usage": self.last_turn_usage,
             },
         )
+        if continue_follow_up:
+            self._continuous_turns += 1
+            return await self._run_turn(
+                "Continue the previous task. What is the next step?"
+            )
         return final_text
 
     @property
