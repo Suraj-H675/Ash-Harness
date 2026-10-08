@@ -233,9 +233,9 @@ async def test_ash_loop_structured_logs_carry_actual_turn_context(
         )
         assert await loop.run_turn("hello") == "done"
         assert loop.current_session is not None
-        assert loop.turn_context is not None
+        assert loop.turn_context is None
         session_id = loop.current_session.session_id
-        turn_id = loop.turn_context.turn_id
+        turn_id = loop.session_store.rewind_turn_ids(session_id, 0)[0]
         await loop.aclose()
 
         records = [
@@ -326,7 +326,8 @@ async def test_ash_loop_tool_logs_carry_actual_operation_id(tmp_path: Path) -> N
         )
         assert await loop.run_turn("use the tool") == "done"
         assert loop.current_session is not None
-        assert loop.turn_context is not None
+        assert loop.turn_context is None
+        turn_id = store.rewind_turn_ids(loop.current_session.session_id, 0)[0]
         stored = store.load_session(loop.current_session.session_id)
         assert len(stored.tool_calls) == 1
         operation_id = stored.tool_calls[0].call_id
@@ -344,7 +345,7 @@ async def test_ash_loop_tool_logs_carry_actual_operation_id(tmp_path: Path) -> N
             and item["message"] == "inside tool"
         )
         assert record["session_id"] == loop.current_session.session_id
-        assert record["turn_id"] == loop.turn_context.turn_id
+        assert record["turn_id"] == turn_id
         assert record["operation_id"] == operation_id
     finally:
         await loop.aclose()

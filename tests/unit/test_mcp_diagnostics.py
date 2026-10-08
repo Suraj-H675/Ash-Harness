@@ -445,6 +445,18 @@ async def test_repl_permission_mode_audit_records_actual_previous_mode(
         safety_tier="interactive",
     )
 
+    def set_permission_mode(mode):
+        from ash.safety.policy import PermissionMode
+
+        resolved = PermissionMode(mode)
+        store.update_session_permission_mode(session.session_id, resolved.value)
+        loop.permission_policy.mode = resolved
+        loop.safety_tier = resolved.value
+        config.safety_tier = resolved.value
+        return resolved
+
+    loop.set_permission_mode = set_permission_mode
+
     assert await _repl(loop, config, SimpleNamespace()) == 0
 
     audit = store.list_audit_logs(session.session_id)

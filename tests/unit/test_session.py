@@ -2666,7 +2666,7 @@ def test_session_message_search_rebuilds_existing_messages_on_v18_migration(
     with get_db_connection(database) as conn:
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 18
+            == CURRENT_SCHEMA_VERSION
         )
 
 

@@ -1177,7 +1177,13 @@ def test_model_catalog_rendering_and_shared_input_picker() -> None:
 
     selected = []
     output = []
-    loop = SimpleNamespace(switch_model=selected.append)
+    runtime_config = config.model_copy(deep=True)
+
+    def switch_model(model: str) -> None:
+        selected.append(model)
+        runtime_config.model = model
+
+    loop = SimpleNamespace(switch_model=switch_model, _config=runtime_config)
     asyncio.run(_interactive_model_picker(config, loop, Prompt(), output.append))
 
     assert selected == [AVAILABLE_MODELS[1]]
@@ -1223,21 +1229,16 @@ def test_model_picker_can_switch_to_cached_live_discovery() -> None:
     from types import SimpleNamespace
 
     from ash.cli import (
-        AVAILABLE_MODELS,
         _interactive_model_picker,
+        _model_catalog,
     )
     from ash.config import AshConfig
 
     config = AshConfig(model="openai/gpt-6-astra")
     discovered = ["openai/live-model"]
     rendered_order = [
-        model
-        for model in [
-            item
-            for item in AVAILABLE_MODELS
-            if item.startswith("openai/")
-        ]
-        + discovered
+        model for model in _model_catalog(config, discovered)
+        if model.startswith("openai/")
     ]
     live_index = rendered_order.index("openai/live-model") + 1
 
@@ -1248,7 +1249,13 @@ def test_model_picker_can_switch_to_cached_live_discovery() -> None:
 
     selected = []
     output = []
-    loop = SimpleNamespace(switch_model=selected.append)
+    runtime_config = config.model_copy(deep=True)
+
+    def switch_model(model: str) -> None:
+        selected.append(model)
+        runtime_config.model = model
+
+    loop = SimpleNamespace(switch_model=switch_model, _config=runtime_config)
 
     asyncio.run(
         _interactive_model_picker(

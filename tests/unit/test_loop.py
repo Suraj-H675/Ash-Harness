@@ -3255,8 +3255,10 @@ async def test_dry_run_suppresses_all_hook_side_effects_and_can_be_reenabled(tmp
     await loop.run_turn("inspect")
     assert observed == []
 
-    loop.permission_policy.mode = PermissionMode.INTERACTIVE
-    await loop.start_session()
+    assert loop.current_session is not None
+    session_id = loop.current_session.session_id
+    loop.set_permission_mode(PermissionMode.INTERACTIVE)
+    await loop.start_session(session_id)
     assert observed == ["session_start"]
 
 
@@ -4196,6 +4198,7 @@ async def test_after_middleware_failure_preserves_known_tool_result(tmp_path) ->
         tmp_path,
         tools={tool.name: tool},
         tool_middlewares=[RaiseAfterMiddleware()],
+        safety_tier="auto_approve",
     )
     session = await loop.start_session()
 
@@ -4245,6 +4248,7 @@ async def test_invalid_post_middleware_mutation_restores_safe_tool_result(tmp_pa
         tmp_path,
         tools={tool.name: tool},
         tool_middlewares=[OversizeStructuredMiddleware()],
+        safety_tier="auto_approve",
     )
     session = await loop.start_session()
 
@@ -4334,6 +4338,7 @@ async def test_unexpected_tool_exception_is_bounded_before_durable_record(
         EventUI(),
         tmp_path,
         tools={tool.name: tool},
+        safety_tier="auto_approve",
     )
     session = await loop.start_session()
 
@@ -4365,6 +4370,7 @@ async def test_large_tool_audit_uses_bounded_projection_without_losing_tool_reco
         EventUI(),
         tmp_path,
         tools={tool.name: tool},
+        safety_tier="auto_approve",
     )
     session = await loop.start_session()
     payload = "x" * 500
@@ -4407,6 +4413,7 @@ async def test_structured_tool_result_survives_execution_and_redaction(tmp_path)
         tmp_path,
         tools={tool.name: tool},
         tool_middlewares=[SecretRedactionMiddleware()],
+        safety_tier="auto_approve",
     )
     session = await loop.start_session()
 
@@ -4541,6 +4548,7 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
         ui,
         tmp_path,
         tools={tool.name: tool},
+        safety_tier="auto_approve",
     )
 
     await loop.start_session()
@@ -4577,13 +4585,15 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
         event for event in ui.events if event["type"] == "tool.completed"
     )
     assert completed_tool["output"] == "hello"
-    assert loop.turn_context is not None
+    assert loop.turn_context is None
+    assert loop.current_session is not None
     with get_db_connection(store.db_path) as connection:
         tool_turn = connection.execute(
             "SELECT turn_id FROM tool_calls WHERE session_id = ?",
             (loop.current_session.session_id,),
         ).fetchone()
-    assert tool_turn["turn_id"] == loop.turn_context.turn_id
+    completed = next(event for event in ui.events if event["type"] == "turn.completed")
+    assert tool_turn["turn_id"] == completed["turn_id"]
 
 
 @pytest.mark.asyncio
@@ -4736,6 +4746,7 @@ async def test_native_tool_call_id_reuse_across_completions_is_rejected(tmp_path
         EventUI(),
         tmp_path,
         tools={tool.name: tool},
+        safety_tier="auto_approve",
     )
 
     with pytest.raises(ProviderCompletionError, match="reused tool call ID"):
@@ -4761,6 +4772,7 @@ async def test_native_tool_call_id_reuse_across_turns_is_rejected(tmp_path):
         EventUI(),
         tmp_path,
         tools={tool.name: tool},
+        safety_tier="auto_approve",
     )
 
     assert await loop.run_turn("first turn") == "done"
@@ -4823,6 +4835,7 @@ async def test_before_middleware_cannot_mutate_dispatched_arguments(tmp_path):
         tmp_path,
         tools={tool.name: tool},
         tool_middlewares=[MutatingMiddleware()],
+        safety_tier="auto_approve",
     )
 
     response = await loop.run_turn("use capture")
@@ -4846,6 +4859,7 @@ async def test_tool_result_message_failure_rolls_back_terminal_tool_state(tmp_pa
         EventUI(),
         tmp_path,
         tools={tool.name: tool},
+        safety_tier="auto_approve",
     )
     session = await loop.start_session()
     with get_db_connection(store.db_path) as connection:
@@ -5181,6 +5195,7 @@ async def test_tool_execution_writes_tamper_evident_audit_log(tmp_path):
         EventUI(),
         tmp_path,
         tools={tool.name: tool},
+        safety_tier="auto_approve",
     )
 
     session = await loop.start_session()
@@ -5231,6 +5246,7 @@ async def test_sensitive_tool_arguments_are_redacted_before_durable_persistence(
         ui,
         tmp_path,
         tools={tool.name: tool},
+        safety_tier="auto_approve",
     )
     session = await loop.start_session()
 
@@ -5333,6 +5349,7 @@ async def test_model_tool_call_sensitive_arguments_are_redacted_in_session_histo
         ui,
         tmp_path,
         tools={tool.name: tool},
+        safety_tier="auto_approve",
     )
     session = await loop.start_session()
 
@@ -7169,6 +7186,7 @@ async def test_failover_turn_prices_each_completion_by_serving_model(tmp_path) -
         tmp_path,
         tools={tool.name: tool},
         config=config,
+        safety_tier="auto_approve",
     )
 
     session = await loop.start_session()
@@ -7718,6 +7736,7 @@ async def test_middleware_skip_persists_effect_boundary_without_tool_execution(
         tmp_path,
         tools={tool.name: tool},
         tool_middlewares=[skip],
+        safety_tier="auto_approve",
     )
     session = await loop.start_session()
 
@@ -7991,6 +8010,7 @@ async def test_tool_exception_after_dispatch_is_not_replayed(tmp_path):
             tmp_path,
             tools={"flaky": FlakyTool(guard)},
             max_turn_iterations=1,
+            safety_tier="auto_approve",
         )
         await loop.start_session()
         await loop.run_turn("test")
