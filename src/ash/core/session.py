@@ -4074,7 +4074,9 @@ class SessionStore:
             ):
                 raise ValueError("unsupported imported message schema")
             role = record.get("role")
-            if role not in {"system", "user", "assistant", "tool"}:
+            if role == "system":
+                raise ValueError("imported transcripts cannot supply system instructions")
+            if role not in {"user", "assistant", "tool"}:
                 raise ValueError(f"invalid imported message role: {role!r}")
             message_content = record.get("content")
             if not isinstance(message_content, str):

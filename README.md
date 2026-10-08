@@ -320,7 +320,8 @@ versioned SQLite storage. Ash supports:
 - complete-turn transcript rewind;
 - optional conflict-aware restoration of checkpointed file edits;
 - per-turn file checkpoints, hashes, and undo protection;
-- redacted JSONL and Markdown session export and validated JSONL import;
+- redacted JSONL and Markdown session export; validated JSONL import treats exported
+  model metadata as non-authoritative and rejects system-role instructions;
 - configurable retention, pruning, vacuum, backups, restore, and integrity
   checks;
 - crash recovery based on persisted tool intent and hash-proven file state;

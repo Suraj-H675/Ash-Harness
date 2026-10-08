@@ -263,6 +263,26 @@ def test_planner_decompose_calls_provider_and_parses(tmp_path: Path) -> None:
     assert provider.received_messages[0][-1]["role"] == "user"
 
 
+@pytest.mark.asyncio
+async def test_planner_bounds_streamed_output_and_closes_stream(tmp_path: Path) -> None:
+    from ash.core.planner import MAX_PLANNER_RESPONSE_BYTES
+
+    closed = False
+
+    class OversizedProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            nonlocal closed
+            try:
+                yield StreamChunk(content="x" * MAX_PLANNER_RESPONSE_BYTES)
+                yield StreamChunk(content="unexpected overflow")
+            finally:
+                closed = True
+
+    with pytest.raises(PlannerError, match="exceeds 256 KiB"):
+        await Planner(OversizedProvider([])).decompose("Build a new feature", project_root=tmp_path)
+    assert closed is True
+
+
 def test_planner_decompose_rejects_empty_request(tmp_path: Path) -> None:
     provider = FakeProvider(scripts=[])
     planner = Planner(provider)

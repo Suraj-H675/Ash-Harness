@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import pytest
+from pydantic import BaseModel
 
 from ash.core.goals import GoalState
 from ash.core.loop import AshLoop
@@ -61,10 +62,14 @@ class FakeProvider:
         yield StreamChunk(content="", is_done=True)
 
 
+class ReadArgs(BaseModel):
+    file_path: str
+
+
 class CountingReadTool(BaseTool):
     name = "read_file"
     description = "Fake read_file that returns a fixed string."
-    args_schema = type("Args", (), {"__call__": lambda self, **kw: None})
+    args_schema = ReadArgs
 
     def __init__(
         self, safety_guard: SafetyGuard, output: str = "hello world", fail: bool = False

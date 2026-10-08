@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import aclosing
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
@@ -106,6 +107,9 @@ _FIELD_PATTERN = re.compile(
 )
 
 
+MAX_PLANNER_RESPONSE_BYTES = 256 * 1024
+
+
 class PlannerError(RuntimeError):
     """Raised when the LLM response cannot be parsed into a sprint."""
 
@@ -173,8 +177,23 @@ class Planner:
 
     async def _collect_stream(self, messages: list[dict[str, Any]]) -> str:
         chunks: list[str] = []
-        async for chunk in self._provider.stream_chat(messages):
-            chunks.append(chunk.content)
+        total_bytes = 0
+        async with aclosing(self._provider.stream_chat(messages)) as stream:
+            async for chunk in stream:
+                fragment = chunk.content
+                if not isinstance(fragment, str):
+                    raise PlannerError("planner response must be text")
+                remaining = MAX_PLANNER_RESPONSE_BYTES - total_bytes
+                if len(fragment) > remaining:
+                    raise PlannerError("planner response exceeds 256 KiB")
+                try:
+                    fragment_bytes = len(fragment.encode("utf-8"))
+                except UnicodeEncodeError as exc:
+                    raise PlannerError("planner response must be valid UTF-8") from exc
+                if fragment_bytes > remaining:
+                    raise PlannerError("planner response exceeds 256 KiB")
+                total_bytes += fragment_bytes
+                chunks.append(fragment)
         return "".join(chunks)
 
 
