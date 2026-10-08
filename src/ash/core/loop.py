@@ -1995,15 +1995,26 @@ class AshLoop:
             self._pending_session_tool_start_id = None
 
         if self.current_session is not None:
+            current_session_id = self.current_session.session_id
+            session_is_changing = session_id is None or session_id != current_session_id
+            ended_hook = False
             if self._hook_session_open:
-                reason = (
-                    "reload"
-                    if session_id == self.current_session.session_id
-                    else "switch"
-                )
+                reason = "switch" if session_is_changing else "reload"
                 try:
                     await self._fire_session_end(reason)
                 except BaseException as primary_error:
+                    if prepared_provider is not None:
+                        await self._close_prepared_provider(
+                            prepared_provider[1], primary_error
+                        )
+                    raise
+                ended_hook = True
+            if session_is_changing:
+                try:
+                    await self._reset_session_live_tool_state()
+                except BaseException as primary_error:
+                    if ended_hook:
+                        self._hook_session_open = True
                     if prepared_provider is not None:
                         await self._close_prepared_provider(
                             prepared_provider[1], primary_error
@@ -2019,7 +2030,7 @@ class AshLoop:
                         replacement=prepared_provider[1],
                     )
                 except BaseException:
-                    if self.hooks is not None:
+                    if ended_hook:
                         self._hook_session_open = True
                     raise
             self.current_session = None
@@ -2132,6 +2143,17 @@ class AshLoop:
         self._pending_session_tool_start_id = session.session_id
         await self._finish_pending_session_tool_start()
         return session
+
+    async def _reset_session_live_tool_state(self) -> None:
+        """Clear live tool state that belongs to one conversation session."""
+
+        from ash.tools.browser import browser_session_from_tools
+
+        browser_session = browser_session_from_tools(self.tools)
+        if browser_session is not None:
+            await browser_session.reset_for_session()
+        if self._mcp_runtime is not None:
+            await self._mcp_runtime.clear_resource_watches()
 
     def _reset_session_runtime_state(self) -> None:
         """Clear state derived from the previously active conversation session."""

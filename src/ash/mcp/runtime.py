@@ -1599,6 +1599,12 @@ class MCPRuntime:
                     }
                 )
 
+    async def clear_resource_watches(self) -> None:
+        """Clear subscriptions owned by the active Ash conversation session."""
+
+        for watch in tuple(self.resource_watches()):
+            await self.unwatch_resource(watch["server"], watch["uri"])
+
     def resource_watches(self, server_name: str | None = None) -> list[dict[str, str]]:
         if server_name is not None and server_name not in self.configs:
             raise ValueError(f"unknown MCP server: {server_name}")

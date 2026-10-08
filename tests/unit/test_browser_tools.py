@@ -1192,6 +1192,30 @@ async def test_browser_open_tab_preserves_navigation_error_when_cleanup_fails(
     assert session._context is None
 
 
+@pytest.mark.asyncio
+async def test_browser_session_reset_clears_live_context_but_remains_reusable() -> None:
+    class FakePage:
+        def is_closed(self) -> bool:
+            return False
+
+    page = FakePage()
+    session = BrowserSession(timeout_seconds=1)
+    session._session_token = "deadbeef"
+    session._page = page
+    old_tab_id = session._remember_tab(page)
+
+    await session.reset_for_session()
+
+    assert session._closed is False
+    assert session._page is None
+    assert session._tab_pages == {}
+    assert session._snapshot_versions == {}
+    assert session._session_token != "deadbeef"
+    assert session._next_tab_id == 1
+    with pytest.raises(ValueError, match="stale or missing"):
+        session._resolve_tab(old_tab_id)
+
+
 def test_browser_tab_ids_do_not_alias_across_sessions() -> None:
     class FakePage:
         def is_closed(self) -> bool:

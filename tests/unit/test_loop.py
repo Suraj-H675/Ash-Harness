@@ -2605,6 +2605,61 @@ async def test_session_switch_clears_ephemeral_tool_approvals(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_real_session_switch_clears_session_owned_live_tool_state(tmp_path) -> None:
+    loop = AshLoop(
+        SessionStore(tmp_path / "live-tool-session-boundary.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+    calls: list[str] = []
+
+    async def reset_live_state() -> None:
+        calls.append("reset")
+
+    loop._reset_session_live_tool_state = reset_live_state  # type: ignore[method-assign]
+    first = await loop.start_session()
+    assert calls == []
+
+    same = await loop.start_session(first.session_id)
+    assert same.session_id == first.session_id
+    assert calls == []
+
+    second = await loop.start_session()
+    assert second.session_id != first.session_id
+    assert calls == ["reset"]
+
+    await loop.start_session(first.session_id)
+    assert calls == ["reset", "reset"]
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_live_tool_reset_aborts_session_switch(tmp_path) -> None:
+    loop = AshLoop(
+        SessionStore(tmp_path / "live-tool-reset-failure.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+    first = await loop.start_session()
+
+    async def fail_reset() -> None:
+        raise RuntimeError("browser cleanup failed")
+
+    loop._reset_session_live_tool_state = fail_reset  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="browser cleanup failed"):
+        await loop.start_session()
+
+    assert loop.current_session is first
+    assert loop.current_session.session_id == first.session_id
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_waits_for_in_progress_session_start(tmp_path):
     negotiate_started = asyncio.Event()
     allow_negotiate = asyncio.Event()

@@ -1445,6 +1445,35 @@ class BrowserSession:
                 raise cleanup_error
             self._cleanup_failed = False
 
+    async def reset_for_session(self) -> None:
+        """Drop live browsing state while preserving configured persistence policy."""
+
+        async with self._lock:
+            if self._closed:
+                raise BrowserUnavailableError("browser session is closed")
+            cleanup_task = asyncio.create_task(
+                self._close_unlocked(),
+                name="ash-browser-session-reset",
+            )
+            cleanup_error, interrupted = await _settle_browser_cleanup_task(
+                cleanup_task
+            )
+            if interrupted:
+                cancellation = asyncio.CancelledError()
+                if cleanup_error is not None:
+                    cancellation.add_note(
+                        "browser session reset cleanup failed while cancellation was "
+                        "pending: "
+                        + _redact_browser_text(str(cleanup_error))[:500]
+                    )
+                raise cancellation from cleanup_error
+            if cleanup_error is not None:
+                self._cleanup_failed = True
+                raise cleanup_error
+            self._cleanup_failed = False
+            self._session_token = secrets.token_hex(4)
+            self._next_tab_id = 1
+
     async def reset_persistent_profile(self) -> bool:
         if self.profile_path is None:
             raise ValueError("browser session does not use an Ash persistent profile")

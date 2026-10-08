@@ -2238,6 +2238,39 @@ async def test_deferred_runtime_buffers_resource_updates_until_publication(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_runtime_clear_resource_watches_unsubscribes_session_state(tmp_path) -> None:
+    events: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self._watched = {"file:///a.txt", "file:///b.txt"}
+
+        @property
+        def watched_resources(self) -> tuple[str, ...]:
+            return tuple(sorted(self._watched))
+
+        async def unwatch_resource(self, uri: str) -> None:
+            self._watched.discard(uri)
+
+    runtime = MCPRuntime(
+        {"server": MCPServerConfig(name="server", command="fake", args=[], env={})},
+        SafetyGuard(tmp_path),
+        event_sink=events.append,
+    )
+    client = FakeClient()
+    runtime.clients["server"] = client
+    runtime._refresh_locks["server"] = asyncio.Lock()
+
+    await runtime.clear_resource_watches()
+
+    assert runtime.resource_watches() == []
+    assert [event["type"] for event in events] == [
+        "mcp.resource.watch_stopped",
+        "mcp.resource.watch_stopped",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runtime_watch_resource_emits_started_event_only_once(tmp_path) -> None:
     events: list[dict[str, object]] = []
 
