@@ -1867,6 +1867,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             label="session import",
                         ).decode("utf-8"),
                         project_path=str(loop.project_root),
+                        session_model=config.model,
                     )
                     session = await loop.start_session(imported.session_id)
                     _sync_repl_model_config(config, loop)

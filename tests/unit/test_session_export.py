@@ -184,6 +184,29 @@ def test_session_jsonl_import_suffix_keeps_title_within_limit(tmp_path) -> None:
     assert len(imported.title) <= 256
 
 
+def test_session_jsonl_import_does_not_trust_exported_model_as_runtime_route(tmp_path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    content = (
+        '{"schema_version":1,"type":"session","title":"Imported",'
+        '"model":"untrusted-provider/expensive-model"}\n'
+        '{"schema_version":1,"type":"message","role":"user",'
+        '"content":"hello","timestamp":"2026-01-01T00:00:00+00:00",'
+        '"metadata":{}}\n'
+    )
+
+    default_import = store.import_session_jsonl(
+        content, project_path=str(tmp_path / "default")
+    )
+    trusted_import = store.import_session_jsonl(
+        content,
+        project_path=str(tmp_path / "trusted"),
+        session_model="ollama/current",
+    )
+
+    assert default_import.model == ""
+    assert trusted_import.model == "ollama/current"
+
+
 def test_session_jsonl_import_rejects_oversized_model_atomically(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     model = "x" * 513

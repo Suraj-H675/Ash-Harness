@@ -306,6 +306,36 @@ async def test_session_switch_commands_all_load_the_selected_transcript_snapshot
 
 
 @pytest.mark.asyncio
+async def test_import_uses_current_runtime_model_not_exported_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path / "import-model.db")
+    import_path = tmp_path / "foreign.jsonl"
+    import_path.write_text(
+        '{"schema_version":1,"type":"session","title":"Foreign",'
+        '"model":"untrusted-provider/expensive-model"}\n'
+        '{"schema_version":1,"type":"message","role":"user",'
+        '"content":"hello","timestamp":"2026-01-01T00:00:00+00:00",'
+        '"metadata":{}}\n',
+        encoding="utf-8",
+    )
+    loads: list = []
+
+    assert await _run_repl(
+        tmp_path,
+        monkeypatch,
+        iter((f"/import {import_path}", "exit")),
+        session_store=store,
+        active_model_id="ollama/test-model",
+        session_loads=loads,
+    ) == 0
+
+    imported_id = loads[-1][0]
+    assert store.load_session(imported_id).model == "ollama/test-model"
+
+
+@pytest.mark.asyncio
 async def test_retry_rewinds_old_answer_and_replays_primary_user_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -4010,8 +4010,14 @@ class SessionStore:
             if format == "markdown":
                 yield "\n"
 
-    def import_session_jsonl(self, content: str, *, project_path: str) -> Session:
-        """Import Ash's versioned JSONL format into the current project."""
+    def import_session_jsonl(
+        self,
+        content: str,
+        *,
+        project_path: str,
+        session_model: str = "",
+    ) -> Session:
+        """Import transcript data without trusting exported runtime authority."""
         from ash.providers.messages import MAX_CANONICAL_MESSAGES
 
         total_bytes = 0
@@ -4050,6 +4056,8 @@ class SessionStore:
             raise ValueError("imported session title must be a string")
         if not isinstance(raw_model, str):
             raise ValueError("imported session model must be a string")
+        _validate_session_model(raw_model)
+        trusted_session_model = _validate_session_model(session_model)
         title = _normalize_session_title(raw_title, allow_empty=True)
         imported_messages: list[Message] = []
         for record in record_iter:
@@ -4094,7 +4102,7 @@ class SessionStore:
             session = self._create_session_record(
                 conn,
                 project_path,
-                model=raw_model,
+                model=trusted_session_model,
             )
             if title:
                 conn.execute(
