@@ -2535,12 +2535,55 @@ class SpawnAgentTool(BaseTool):
             "arguments_preview": preview,
             "requested_at": datetime.now(timezone.utc).isoformat(),
         }
-        request_message_id = await self._shared_state.send_message_async(
-            agent_id,
-            "lead",
-            "approval_request",
-            request_payload,
+        request_send = asyncio.create_task(
+            self._shared_state.send_message_async(
+                agent_id,
+                "lead",
+                "approval_request",
+                request_payload,
+            ),
+            name=f"ash-subagent-approval-request-{agent_id}",
         )
+        try:
+            request_message_id = await asyncio.shield(request_send)
+        except asyncio.CancelledError as cancellation:
+            send_error, interrupted = await _settle_spawn_cleanup_task(request_send)
+            if send_error is None:
+                request_message_id = request_send.result()
+                self._emit_task_lifecycle(
+                    "agent.approval.requested",
+                    durable_task_id,
+                    agent_id=agent_id,
+                    attempt=attempt,
+                    request_message_id=request_message_id,
+                    tool=tool_name,
+                )
+                try:
+                    self._shared_state.mark_delivered([request_message_id])
+                except Exception as cleanup_error:
+                    cancellation.add_note(
+                        "subagent approval cancellation cleanup failed: "
+                        + redact_text(str(cleanup_error))[:500]
+                    )
+                else:
+                    self._emit_task_lifecycle(
+                        "agent.approval.cancelled",
+                        durable_task_id,
+                        agent_id=agent_id,
+                        attempt=attempt,
+                        request_message_id=request_message_id,
+                    )
+            elif not isinstance(send_error, asyncio.CancelledError):
+                cancellation.add_note(
+                    "subagent approval request persistence failed during "
+                    "cancellation: "
+                    + redact_text(str(send_error))[:500]
+                )
+            if interrupted:
+                cancellation.add_note(
+                    "subagent approval request cleanup was interrupted by cancellation"
+                )
+            raise cancellation
         self._emit_task_lifecycle(
             "agent.approval.requested",
             durable_task_id,

@@ -66,18 +66,37 @@ async def test_composer_and_status_dock_to_bottom_in_fullscreen_app() -> None:
             input=pipe,
             output=SizedDummyOutput(),
         )
-        pending = asyncio.create_task(surface.read())
-        await asyncio.sleep(0.05)
 
+        def capture_rows() -> dict[int, str]:
+            screen = surface.application.renderer._last_screen
+            if screen is None:
+                return {}
+            return {
+                y: "".join(cell.char for _x, cell in sorted(cells.items())).rstrip()
+                for y, cells in screen.data_buffer.items()
+            }
+
+        async def wait_for_render(predicate) -> dict[int, str]:
+            ready = asyncio.get_running_loop().create_future()
+
+            def on_render(_app) -> None:
+                rows = capture_rows()
+                if predicate(rows) and not ready.done():
+                    ready.set_result(rows)
+
+            surface.application.after_render += on_render
+            try:
+                surface.invalidate()
+                return await asyncio.wait_for(ready, timeout=2)
+            finally:
+                surface.application.after_render -= on_render
+
+        pending = asyncio.create_task(surface.read())
         assert surface.application.full_screen is True
-        screen = surface.application.renderer._last_screen
-        assert screen is not None
-        rows = {
-            y: "".join(
-                cell.char for _x, cell in sorted(cells.items())
-            ).rstrip()
-            for y, cells in screen.data_buffer.items()
-        }
+        rows = await wait_for_render(
+            lambda current: any("›" in text for text in current.values())
+            and any("model" in text for text in current.values())
+        )
         composer_row = next(y for y, text in rows.items() if "›" in text)
         status_row = next(y for y, text in rows.items() if "model" in text)
         status_text = rows[status_row]
@@ -88,14 +107,10 @@ async def test_composer_and_status_dock_to_bottom_in_fullscreen_app() -> None:
 
         thinking[0] = "thinking content"
         revision[0] += 1
-        surface.invalidate()
-        await asyncio.sleep(0.05)
-        screen = surface.application.renderer._last_screen
-        assert screen is not None
-        rows = {
-            y: "".join(cell.char for _x, cell in sorted(cells.items())).rstrip()
-            for y, cells in screen.data_buffer.items()
-        }
+        rows = await wait_for_render(
+            lambda current: any("thinking content" in text for text in current.values())
+            and any("›" in text for text in current.values())
+        )
         reasoning_row = next(
             y for y, text in rows.items() if "thinking content" in text
         )
@@ -105,14 +120,10 @@ async def test_composer_and_status_dock_to_bottom_in_fullscreen_app() -> None:
 
         thinking[0] = ""
         revision[0] += 1
-        surface.invalidate()
-        await asyncio.sleep(0.05)
-        screen = surface.application.renderer._last_screen
-        assert screen is not None
-        rows = {
-            y: "".join(cell.char for _x, cell in sorted(cells.items())).rstrip()
-            for y, cells in screen.data_buffer.items()
-        }
+        rows = await wait_for_render(
+            lambda current: any("›" in text for text in current.values())
+            and not any("thinking content" in text for text in current.values())
+        )
         assert next(y for y, text in rows.items() if "›" in text) == composer_row
 
         pipe.send_text("done\r")

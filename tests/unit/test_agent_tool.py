@@ -6,6 +6,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -2820,6 +2821,93 @@ async def test_background_approval_response_mismatch_fails_closed(tmp_path) -> N
     assert report.summary == "mismatch denied"
     assert not (tmp_path / "mismatch.txt").exists()
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_approval_send_retires_committed_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = SharedState(tmp_path / "cancelled-approval-send" / "agents.db")
+    agent_id = "approval-send-worker"
+    durable_task_id = "approval-send-task"
+    task = state.tasks.create_task(
+        "wait for approval",
+        task_id=durable_task_id,
+        metadata={"workspace": str(tmp_path.resolve())},
+    )
+    lease = state.tasks.claim_task(agent_id, task_id=task.task_id)
+    assert lease is not None
+    state.tasks.start_task(durable_task_id, lease.token)
+    tool = SpawnAgentTool(SafetyGuard(tmp_path), state, FakeProvider)
+
+    request_committed = asyncio.Event()
+    allow_send_result = asyncio.Event()
+    cancellation_requested = asyncio.Event()
+
+    async def hold_result_until_cancelled(
+        sender_id: str,
+        recipient_id: str,
+        message_type: str,
+        content: dict[str, Any],
+    ) -> int:
+        message_id = state.send_message(
+            sender_id,
+            recipient_id,
+            message_type,
+            content,
+        )
+        if message_type == "approval_request":
+            request_committed.set()
+            await allow_send_result.wait()
+        return message_id
+
+    monkeypatch.setattr(state, "send_message_async", hold_result_until_cancelled)
+    approval = asyncio.create_task(
+        tool._await_durable_approval(
+            agent_id=agent_id,
+            durable_task_id=durable_task_id,
+            attempt=lease.task.attempt,
+            tool_name="write_file",
+            arguments={"file_path": "never-written.txt", "content": "no\n"},
+        )
+    )
+
+    try:
+        await asyncio.wait_for(request_committed.wait(), timeout=5)
+        requests = state.fetch_messages(
+            "lead", undelivered_only=True, message_type="approval_request"
+        )
+        assert len(requests) == 1
+        request_id = requests[0].message_id
+
+        async def cancel_approval() -> None:
+            approval.cancel()
+            cancellation_requested.set()
+
+        cancellation = asyncio.create_task(cancel_approval())
+        await asyncio.wait_for(cancellation_requested.wait(), timeout=5)
+        allow_send_result.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(approval, timeout=5)
+        await cancellation
+
+        persisted = state.fetch_messages(
+            "lead", undelivered_only=False, message_type="approval_request"
+        )
+        request = next(
+            message for message in persisted if message.message_id == request_id
+        )
+        assert request.delivered is True
+    finally:
+        allow_send_result.set()
+        if not approval.done():
+            approval.cancel()
+            await asyncio.gather(approval, return_exceptions=True)
+        current = state.tasks.get_task(durable_task_id)
+        if current is not None and current.state in {"leased", "running"}:
+            state.tasks.cancel_task(durable_task_id, reason="test cleanup")
+        await tool.aclose()
 
 
 @pytest.mark.asyncio
