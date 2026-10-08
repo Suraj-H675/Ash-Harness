@@ -197,7 +197,8 @@ used for code the user fully trusts.
 Isolation does not replace Ash policy. Each namespaced plugin tool follows the
 same permission decision, user approval, hook lifecycle, middleware, audit log,
 runtime event, dry-run denial, and session persistence path as a built-in tool.
-Unknown tools require approval outside full-auto mode.
+Unknown tool names are rejected before approval; Ash never asks the user to
+approve a tool that is not present in the active runtime registry.
 
 ## Failure semantics
 

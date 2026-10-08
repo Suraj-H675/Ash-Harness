@@ -520,10 +520,10 @@ class OpenTelemetryEventObserver:
             "turn.cancelled": "cancelled",
         }[event_type]
         attrs = {"outcome": outcome}
-        self._turns.add(1, attributes=attrs)
         state = self._turn_spans.pop(turn_id, None)
         if state is None:
             return
+        self._turns.add(1, attributes=attrs)
         state.span.set_attribute("ash.outcome", outcome)
         if outcome == "error":
             state.span.set_status(self._trace.Status(self._trace.StatusCode.ERROR))

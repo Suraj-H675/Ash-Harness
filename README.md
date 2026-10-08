@@ -92,10 +92,11 @@ model request. After setup:
     ash providers test     # one bounded real model completion
     ash                    # start the interactive coding session
 
-Inside a session, /model changes only that running session. Use
-ash setup model to save a new default model and ash setup fallbacks to
-manage the ordered fallback chain (ash setup providers remains a compatibility
-alias). Use `/effort` to choose a model's supported reasoning effort for
+Inside a conversation, `/model` changes that session's durable model route;
+resuming the session restores the choice, while `/new` starts from the configured
+default. Use `ash setup model` to save a new default model and `ash setup
+fallbacks` to manage the ordered fallback chain (`ash setup providers` remains a
+compatibility alias). Use `/effort` to choose a model's supported reasoning effort for
 subsequent requests; `/effort default` restores the provider default. The status
 bar shows the effective selection. Unsupported models do not offer effort
 choices. Reasoning effort controls generation behavior; it does not control

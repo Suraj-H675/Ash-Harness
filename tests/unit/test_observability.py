@@ -378,7 +378,7 @@ def test_observer_retry_metric_uses_secret_free_profile_and_category() -> None:
     ]
 
 
-def test_goal_step_completion_closes_its_turn_span() -> None:
+def test_goal_step_completion_closes_its_turn_span_without_double_counting_aggregate() -> None:
     tracer_provider = _TracerProvider()
     meter_provider = _MeterProvider()
     observer = OpenTelemetryEventObserver(
@@ -389,6 +389,7 @@ def test_goal_step_completion_closes_its_turn_span() -> None:
 
     observer.on_event(_event("turn.started"))
     observer.on_event(_event("goal.step.completed"))
+    observer.on_event(_event("turn.completed"))
 
     (turn,) = tracer_provider.tracer.spans
     assert turn.ended is True
