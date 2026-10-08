@@ -37,7 +37,12 @@ from ash.sandbox.process_utils import (
     settle_process_tree_after_cancellation,
     terminate_process_tree,
 )
-from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from ash.tools.base import (
+    BaseTool,
+    ToolExecutionOutcome,
+    ToolResult,
+    count_output_tokens,
+)
 
 
 def _directory_identity(path: Path) -> tuple[int, int] | None:
@@ -378,7 +383,8 @@ class RunCommandTool(BaseTool):
                     timeout=timeout_seconds,
                 )
         except asyncio.TimeoutError:
-            if "process" in locals():
+            process_started = "process" in locals()
+            if process_started:
                 try:
                     await terminate_process_tree(process, plan=process_tree_plan)
                 except ProcessTreeError as exc:
@@ -390,6 +396,11 @@ class RunCommandTool(BaseTool):
             return ToolResult(
                 success=False,
                 output="",
+                outcome=(
+                    ToolExecutionOutcome.UNKNOWN
+                    if process_started
+                    else ToolExecutionOutcome.COMPLETED
+                ),
                 error=(
                     f"Error: Command timed out after {timeout_seconds} seconds."
                     f"{cleanup}"
@@ -526,6 +537,11 @@ class RunCommandTool(BaseTool):
             success=result.exit_code == 0,
             output=output,
             error=error or None,
+            outcome=(
+                ToolExecutionOutcome.UNKNOWN
+                if result.timed_out
+                else ToolExecutionOutcome.COMPLETED
+            ),
             token_count=count_output_tokens(output),
             truncated=truncated,
             diagnostics=extract_diagnostics(result.stdout, result.stderr),
@@ -591,7 +607,8 @@ class RunCommandTool(BaseTool):
                 timeout=timeout_seconds,
             )
         except asyncio.TimeoutError:
-            if "process" in locals():
+            process_started = "process" in locals()
+            if process_started:
                 try:
                     await terminate_process_tree(process, plan=process_tree_plan)
                 except ProcessTreeError as exc:
@@ -603,6 +620,11 @@ class RunCommandTool(BaseTool):
             return ToolResult(
                 success=False,
                 output="",
+                outcome=(
+                    ToolExecutionOutcome.UNKNOWN
+                    if process_started
+                    else ToolExecutionOutcome.COMPLETED
+                ),
                 error=(
                     f"Error: Command timed out after {timeout_seconds} seconds."
                     f"{cleanup}"

@@ -8168,6 +8168,54 @@ async def test_lost_result_after_real_command_effect_is_not_replayed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_timed_out_command_after_effect_is_durably_ambiguous(tmp_path):
+    marker = tmp_path / "timed-out-command-effect.txt"
+    script = (
+        "from pathlib import Path; import time; "
+        f"Path({str(marker)!r}).write_text('effect'); time.sleep(30)"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "timed-out-command.db")
+    ui = EventUI(safety_tier="auto_approve")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={"run_command": RunCommandTool(guard, project_root=tmp_path)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+
+    result = await loop._execute_tool_calls(
+        [
+            {
+                "call_id": "timed-out-command",
+                "name": "run_command",
+                "arguments": {"command_line": command, "timeout_seconds": 1},
+            }
+        ],
+        session,
+    )
+
+    assert marker.read_text(encoding="utf-8") == "effect"
+    assert result[0]["success"] is False
+    assert "Tool outcome is ambiguous" in result[0]["error"]
+    failed = [event for event in ui.events if event["type"] == "tool.error"]
+    assert len(failed) == 1
+    assert failed[0]["ambiguous"] is True
+    assert failed[0]["replayed"] is False
+    record = store.load_session(session.session_id).tool_calls[-1]
+    assert record.dispatched is True
+    assert record.executed is True
+    audit = store.list_audit_logs(session.session_id)[-1]
+    assert audit.result == "FAILURE"
+    assert audit.details["ambiguous"] is True
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_outcome_is_a_durable_ambiguous_failure(tmp_path):
     class TransportLostTool(BaseTool):
         name = "remote_write"

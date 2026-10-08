@@ -807,6 +807,7 @@ class MCPTool(BaseTool):
                 output=safe_result,
                 error="invalid MCP tool result: result must be an object",
                 token_count=count_output_tokens(safe_result),
+                outcome=ToolExecutionOutcome.UNKNOWN,
             )
         try:
             raw_result = redact_text(_json_dump(self._redact_remote_output(result)))
@@ -817,6 +818,7 @@ class MCPTool(BaseTool):
                 error=safe_mcp_diagnostic(
                     f"invalid MCP tool result: not JSON-serializable: {exc}"
                 ),
+                outcome=ToolExecutionOutcome.UNKNOWN,
             )
         safe_raw_result = safe_mcp_diagnostic(raw_result)
         if "content" not in result:
@@ -825,6 +827,7 @@ class MCPTool(BaseTool):
                 output=safe_raw_result,
                 error="invalid MCP tool result: content is required",
                 token_count=count_output_tokens(safe_raw_result),
+                outcome=ToolExecutionOutcome.UNKNOWN,
             )
         raw_content = result["content"]
         if not isinstance(raw_content, list) or not all(
@@ -835,6 +838,7 @@ class MCPTool(BaseTool):
                 output=safe_raw_result,
                 error="invalid MCP tool result: content must be an array of objects",
                 token_count=count_output_tokens(safe_raw_result),
+                outcome=ToolExecutionOutcome.UNKNOWN,
             )
         content = [dict(item) for item in raw_content]
         for index, item in enumerate(content):
@@ -847,6 +851,7 @@ class MCPTool(BaseTool):
                         f"invalid MCP tool result: content[{index}] {content_error}"
                     ),
                     token_count=count_output_tokens(safe_raw_result),
+                    outcome=ToolExecutionOutcome.UNKNOWN,
                 )
         has_structured_content = "structuredContent" in result
         if (
@@ -859,6 +864,7 @@ class MCPTool(BaseTool):
                 output=safe_raw_result,
                 error="invalid MCP tool result: structuredContent must be an object",
                 token_count=count_output_tokens(safe_raw_result),
+                outcome=ToolExecutionOutcome.UNKNOWN,
             )
         structured_content = result.get("structuredContent")
         if "_meta" in result and not isinstance(result["_meta"], dict):
@@ -867,6 +873,7 @@ class MCPTool(BaseTool):
                 output=safe_raw_result,
                 error="invalid MCP tool result: _meta must be an object",
                 token_count=count_output_tokens(safe_raw_result),
+                outcome=ToolExecutionOutcome.UNKNOWN,
             )
         raw_is_error = result.get("isError", False)
         if not isinstance(raw_is_error, bool):
@@ -875,6 +882,7 @@ class MCPTool(BaseTool):
                 output=safe_raw_result,
                 error="invalid MCP tool result: isError must be a boolean",
                 token_count=count_output_tokens(safe_raw_result),
+                outcome=ToolExecutionOutcome.UNKNOWN,
             )
         is_error = raw_is_error
         normalized_result = deepcopy(result)
@@ -901,6 +909,7 @@ class MCPTool(BaseTool):
                         "structuredContent"
                     ),
                     token_count=count_output_tokens(output),
+                    outcome=ToolExecutionOutcome.UNKNOWN,
                 )
             assert self._output_dialect is not None
             try:
@@ -917,6 +926,7 @@ class MCPTool(BaseTool):
                         f"invalid MCP structured result: {exc}"
                     ),
                     token_count=count_output_tokens(output),
+                    outcome=ToolExecutionOutcome.UNKNOWN,
                 )
             if not output_validation["valid"]:
                 message = str(output_validation.get("message", "validation failed"))
@@ -935,6 +945,7 @@ class MCPTool(BaseTool):
                     output=safe_mcp_diagnostic(output),
                     error=safe_mcp_diagnostic(error),
                     token_count=count_output_tokens(output),
+                    outcome=ToolExecutionOutcome.UNKNOWN,
                 )
 
         return ToolResult(

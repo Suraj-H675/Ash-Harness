@@ -120,6 +120,7 @@ class SandboxResult:
     fallback_used: bool = False
     duration_seconds: float = 0.0
     output_truncated: bool = False
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -1111,6 +1112,7 @@ async def _run_scoped(
             backend_name=backend.name,
             fallback_used=fallback,
             duration_seconds=time.monotonic() - start,
+            timed_out=True,
         )
     except asyncio.CancelledError as cancellation:
         cleanup_error, cleanup_cancelled = (
@@ -1243,6 +1245,7 @@ async def _run_subprocess(
             backend_name=backend_name,
             fallback_used=False,
             duration_seconds=time.monotonic() - start,
+            timed_out=True,
         )
     except asyncio.CancelledError as cancellation:
         cleanup_error, cleanup_cancelled = (

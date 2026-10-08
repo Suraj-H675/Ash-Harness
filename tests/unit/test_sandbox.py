@@ -24,6 +24,7 @@ from ash.sandbox import (
     SANDBOX_TIER_SCOPED,
     SandboxBackendUnavailable,
     SandboxManager,
+    SandboxResult,
     auto_approve_safety_error,
     has_bwrap,
     has_docker,
@@ -37,6 +38,7 @@ from ash.sandbox.docker import (
     run_docker_cli_sync,
 )
 from ash.safety.environment import resolve_host_executable
+from ash.tools.base import ToolExecutionOutcome
 from ash.tools.command import RunCommandTool
 
 
@@ -1942,6 +1944,92 @@ def test_sandbox_manager_forwards_streaming_output(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert observed == [("stdout", "sandbox-stream\n")]
+
+
+@pytest.mark.asyncio
+async def test_sandbox_manager_marks_scoped_timeout_after_effect(tmp_path: Path) -> None:
+    marker = tmp_path / "scoped-timeout-effect.txt"
+    script = (
+        "from pathlib import Path; import time; "
+        f"Path({str(marker)!r}).write_text('effect'); time.sleep(30)"
+    )
+    manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
+
+    result = await manager.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        timeout=1,
+    )
+
+    assert marker.read_text(encoding="utf-8") == "effect"
+    assert result.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_sandbox_subprocess_marks_timeout_after_effect(tmp_path: Path) -> None:
+    from ash.sandbox.manager import _run_subprocess
+
+    marker = tmp_path / "subprocess-timeout-effect.txt"
+    script = (
+        "from pathlib import Path; import time; "
+        f"Path({str(marker)!r}).write_text('effect'); time.sleep(30)"
+    )
+
+    result = await _run_subprocess(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        deadline=1,
+        tier=SANDBOX_TIER_BWRAP,
+        backend_name="test",
+        workspace_root=tmp_path,
+    )
+
+    assert marker.read_text(encoding="utf-8") == "effect"
+    assert result.timed_out is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_code", "timed_out", "expected_outcome"),
+    [
+        (-1, True, ToolExecutionOutcome.UNKNOWN),
+        (-15, False, ToolExecutionOutcome.COMPLETED),
+    ],
+)
+async def test_run_command_maps_sandbox_outcome(
+    tmp_path: Path,
+    exit_code: int,
+    timed_out: bool,
+    expected_outcome: ToolExecutionOutcome,
+) -> None:
+    class FakeSandboxManager:
+        tier = SANDBOX_TIER_BWRAP
+
+        async def run(self, *args: object, **kwargs: object) -> SandboxResult:
+            return SandboxResult(
+                exit_code=exit_code,
+                stdout="",
+                stderr=(
+                    "Command timed out after 1 seconds."
+                    if timed_out
+                    else "process exited by signal"
+                ),
+                tier=SANDBOX_TIER_BWRAP,
+                backend_name="test",
+                timed_out=timed_out,
+            )
+
+    from ash.safety.guard import SafetyGuard
+
+    tool = RunCommandTool(
+        SafetyGuard(project_root=tmp_path),
+        project_root=tmp_path,
+        sandbox_manager=FakeSandboxManager(),  # type: ignore[arg-type]
+    )
+
+    result = await tool.run(command_line="true", timeout_seconds=1)
+
+    assert result.outcome is expected_outcome
 
 
 def test_run_command_with_sandbox_annotates_output(tmp_path: Path) -> None:

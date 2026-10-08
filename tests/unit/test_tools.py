@@ -17,7 +17,7 @@ from ash.tools.command import (
     RunCommandTool,
     decode_stream,
 )
-from ash.tools.base import ToolResult
+from ash.tools.base import ToolExecutionOutcome, ToolResult
 from ash.tools.filesystem import (
     BINARY_FILE_ERROR,
     EXISTS_ERROR,
@@ -263,20 +263,30 @@ async def test_run_command_pty_has_real_controlling_terminal(
 
 @pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
 @pytest.mark.asyncio
-async def test_run_command_pty_enforces_timeout(guard: SafetyGuard) -> None:
+async def test_run_command_pty_timeout_after_effect_is_unknown(
+    guard: SafetyGuard,
+    project_root: Path,
+) -> None:
+    marker = project_root / "pty-timeout-effect.txt"
+    script = (
+        "from pathlib import Path; import time; "
+        f"Path({str(marker)!r}).write_text('effect'); time.sleep(30)"
+    )
     command = (
         f"{shlex.quote(sys.executable)} -c "
-        f"{shlex.quote('import time; print(\"ready\", flush=True); time.sleep(30)')}"
+        f"{shlex.quote(script)}"
     )
 
-    result = await RunCommandTool(guard).run(
+    result = await RunCommandTool(guard, project_root=project_root).run(
         command_line=command,
         timeout_seconds=1,
         pty=True,
     )
 
+    assert marker.read_text(encoding="utf-8") == "effect"
     assert result.success is False
     assert result.error == "Error: Command timed out after 1 seconds."
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
 
 
 @pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
@@ -1086,15 +1096,28 @@ async def test_run_command_workspace_path_requires_explicit_opt_in(
 
 
 @pytest.mark.asyncio
-async def test_run_command_enforces_timeout(guard: SafetyGuard) -> None:
+async def test_run_command_timeout_after_effect_is_unknown(
+    guard: SafetyGuard,
+    project_root: Path,
+) -> None:
+    marker = project_root / "scoped-timeout-effect.txt"
+    script = (
+        "from pathlib import Path; import time; "
+        f"Path({str(marker)!r}).write_text('effect'); time.sleep(30)"
+    )
     command = (
-        f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(2)')}"
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
     )
 
-    result = await RunCommandTool(guard).run(command_line=command, timeout_seconds=1)
+    result = await RunCommandTool(guard, project_root=project_root).run(
+        command_line=command,
+        timeout_seconds=1,
+    )
 
+    assert marker.read_text(encoding="utf-8") == "effect"
     assert result.success is False
     assert result.error == "Error: Command timed out after 1 seconds."
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
 
 
 @pytest.mark.asyncio

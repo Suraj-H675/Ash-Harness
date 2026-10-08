@@ -36,6 +36,7 @@ from ash.mcp.server import (
 from ash.logging import current_log_context, replace_log_context
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.safety.guard import SafetyGuard
+from ash.tools.base import ToolExecutionOutcome
 from ash.ui.headless import HeadlessUI
 
 from .mcp_test_fixtures import DYNAMIC_MCP_SERVER, FAKE_MCP_SERVER
@@ -714,6 +715,7 @@ async def test_modern_mcp_tool_validates_non_object_structured_content_schema(
     result = await tool.run()
 
     assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
     assert result.error is not None and "invalid MCP structured result" in result.error
     assert json.loads(result.output)["structuredContent"] == [1, "two"]
 
@@ -767,6 +769,7 @@ async def test_mcp_tool_keeps_structured_only_and_application_error_envelopes(
         input_schema={"type": "object"},
     )
     structured = await structured_tool.run()
+    assert structured.outcome is ToolExecutionOutcome.COMPLETED
     assert json.loads(structured.output) == {
         "content": [],
         "structuredContent": {"items": [1, 2]},
@@ -788,6 +791,7 @@ async def test_mcp_tool_keeps_structured_only_and_application_error_envelopes(
     )
     failed = await error_tool.run()
     assert failed.success is False
+    assert failed.outcome is ToolExecutionOutcome.COMPLETED
     assert failed.error == "retry with another date"
     assert json.loads(failed.output) == {
         "content": [{"type": "text", "text": "retry with another date"}],
@@ -873,6 +877,7 @@ async def test_mcp_tool_rejects_malformed_results_without_losing_wire_payload(
     result = await tool.run()
 
     assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
     assert result.error is not None and message in result.error
     assert json.loads(result.output) == remote_result
 
@@ -901,6 +906,7 @@ async def test_mcp_tool_rejects_malformed_content_blocks(
     result = await tool.run()
 
     assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
     assert result.error is not None and "content[0]" in result.error
     assert json.loads(result.output) == remote_result
 
@@ -927,6 +933,7 @@ async def test_mcp_tool_preserves_invalid_structured_output_for_recovery(
     result = await tool.run()
 
     assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
     assert result.error is not None and "invalid MCP structured result" in result.error
     assert json.loads(result.output)["structuredContent"] == {"count": "two"}
 
@@ -945,6 +952,7 @@ async def test_mcp_tool_requires_structured_content_for_declared_output_schema(
     result = await tool.run()
 
     assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
     assert result.output == "summary"
     assert result.error is not None and "requires structuredContent" in result.error
 
@@ -960,6 +968,7 @@ async def test_mcp_tool_rejects_non_json_wire_values(tmp_path: Path) -> None:
     result = await tool.run()
 
     assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
     assert result.output == ""
     assert result.error is not None and "not JSON-serializable" in result.error
 
