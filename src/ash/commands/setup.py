@@ -375,7 +375,6 @@ def _render_setup_status(
     provider = payload["provider"]
     provider_name = str(provider["name"] or "Not configured")
     if payload["model"] is None and not provider["ready"]:
-        provider_name = "Not connected"
         model = "Not selected"
     provider_state = "ready to test" if provider["ready"] else "needs setup"
     fallback_count = len(payload["fallback_models"])

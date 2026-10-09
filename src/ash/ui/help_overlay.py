@@ -84,13 +84,13 @@ class HelpOverlay:
                 Window(self._list_control, wrap_lines=False),
                 Window(
                     self._detail_control,
-                    height=Dimension(min=4, max=8),
+                    height=Dimension(min=1, max=8),
                     wrap_lines=True,
                     style="class:detail",
                 ),
                 Window(
                     FormattedTextControl(
-                        " Up/Down navigate  Enter/Esc close  Ctrl-C cancel "
+                        " Up/Down move  Enter/Esc/Ctrl-C close "
                     ),
                     height=1,
                     style="class:footer",

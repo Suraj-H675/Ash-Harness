@@ -24,6 +24,77 @@ def _plain_terminal_output(raw: bytes) -> bytes:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_help_overlay_renders_and_closes_in_six_row_pty() -> None:
+    import fcntl
+    import termios
+
+    code = """
+import asyncio
+from ash.ui.help_overlay import HelpOverlay
+
+async def main():
+    await HelpOverlay().run()
+
+asyncio.run(main())
+"""
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 6, 40, 0, 0))
+    environment = os.environ.copy()
+    environment["TERM"] = "xterm-256color"
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    screen = pyte.Screen(columns=40, lines=6)
+    stream = pyte.Stream(screen)
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    visible_screen = ""
+    sent_escape = False
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(master_fd, 65_536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                stream.feed(decoder.decode(chunk))
+            visible_screen = "\n".join(screen.display)
+            if all(
+                text in visible_screen
+                for text in (
+                    "Slash commands",
+                    "Search",
+                    "/help",
+                    "/help [query]",
+                    "Up/Down move  Enter/Esc/Ctrl-C close",
+                )
+            ):
+                assert "Window too small" not in visible_screen
+                os.write(master_fd, b"\x1b")
+                sent_escape = True
+                break
+        assert sent_escape, visible_screen
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)
+
+    assert process.returncode == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
 def test_fullscreen_prompt_limits_mouse_modes_and_restores_terminal(
     tmp_path: Path,
 ) -> None:

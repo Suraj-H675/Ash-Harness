@@ -26,13 +26,11 @@ def test_cli_sigterm_cleans_running_command_and_records_unknown_outcome(
     for directory in (workspace, home, db_directory):
         directory.mkdir()
 
-    # The child self-exits after eight seconds even if Ash fails to terminate it.
+    # A child that survives Ash's shutdown would leave a delayed marker.
+    # Ignore the soft signal so process-tree cleanup must finish its escalation.
     command = (
-        "python3 -c 'import pathlib,signal,sys,time;"
-        "signal.signal(signal.SIGTERM,lambda *_:("
-        "pathlib.Path(\"stopped.marker\").write_text(\"terminated\"),sys.exit(0)));"
-        "pathlib.Path(\"started.marker\").write_text(\"running\");"
-        "time.sleep(8)'"
+        "trap '' TERM; printf running > started.marker; "
+        "sleep 3; printf survived > survived.marker"
     )
     tool_request = (
         '<call_tool name="run_command">'
@@ -113,12 +111,19 @@ def test_cli_sigterm_cleans_running_command_and_records_unknown_outcome(
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and not started.exists() and process.poll() is None:
             time.sleep(0.05)
+        if not started.exists():
+            detail = "CLI did not start the fixture command before its deadline"
+            if process.poll() is not None:
+                stdout, stderr = process.communicate(timeout=2)
+                detail = f"CLI exited {process.returncode}: {stdout[-500:]} {stderr[-500:]}"
+            pytest.fail(detail)
         assert started.read_text() == "running"
 
         process.terminate()
         _, stderr = process.communicate(timeout=7)
         assert process.returncode == 143, stderr
-        assert (workspace / "stopped.marker").read_text() == "terminated"
+        time.sleep(3.3)
+        assert not (workspace / "survived.marker").exists()
 
         store = SessionStore(db_directory / "sessions.db")
         sessions = store.list_sessions(project_path=str(workspace), limit=5)

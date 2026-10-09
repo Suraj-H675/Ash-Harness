@@ -1534,7 +1534,7 @@ def test_fresh_setup_status_does_not_present_default_model_as_user_choice(
 
     output = stream.getvalue()
     assert "Provider" in output
-    assert "Not connected" in output
+    assert "Not configured" in output
     assert "Not selected" in output
     assert "Anthropic" not in output
     assert "Web search" not in output
