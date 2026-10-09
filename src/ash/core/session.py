@@ -2787,12 +2787,17 @@ class SessionStore:
 
     def start_turn(self, session_id: str, turn_id: str, user_input: str) -> None:
         """Persist intent before provider or tool work starts."""
+        started_at = _serialize_datetime(_utc_now())
         with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO turn_journal "
                 "(turn_id, session_id, status, user_input, started_at) "
                 "VALUES (?, ?, 'started', ?, ?)",
-                (turn_id, session_id, user_input, _serialize_datetime(_utc_now())),
+                (turn_id, session_id, user_input, started_at),
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                (started_at, session_id),
             )
 
     def complete_turn(self, turn_id: str) -> None:

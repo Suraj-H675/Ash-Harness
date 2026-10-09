@@ -1252,6 +1252,35 @@ def test_session_cleanup_deletes_only_complete_inactive_trees(tmp_path: Path) ->
         store.load_session(child.session_id)
 
 
+def test_session_retention_does_not_delete_old_session_during_a_new_turn(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "retention.db")
+    root = store.create_session(str(tmp_path))
+    active = store.fork_session(root.session_id, branch_name="in-progress")
+    expired = store.create_session(str(tmp_path))
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?",
+            ("2020-01-01T00:00:00+00:00",),
+        )
+
+    # A different Ash process may apply retention while this turn is planning
+    # or running a turn-start hook, before its first user message is persisted.
+    lease = store.acquire_session_runtime_lease(active.session_id)
+    try:
+        store.start_turn(active.session_id, "active-turn", "Investigate the bug")
+        other_store = SessionStore(store.db_path)
+        assert other_store.cleanup_sessions(30, project_path=str(tmp_path)) == 1
+    finally:
+        lease.close()
+    assert store.load_session(active.session_id).session_id == active.session_id
+    assert store.load_session(root.session_id).session_id == root.session_id
+    assert len(store.started_turns(active.session_id)) == 1
+    with pytest.raises(KeyError, match="Session not found"):
+        store.load_session(expired.session_id)
+
+
 def test_session_cleanup_treats_unrepresentable_retention_as_noop(
     tmp_path: Path,
 ) -> None:
