@@ -136,6 +136,8 @@ dev = [
     "types-protobuf>=6.30",
     "types-pyyaml>=6.0",
     "uvicorn>=0.34",
+    "hypothesis>=6.168.5",
+    "pyte>=0.8.2",
 ]
 
 [tool.pytest.ini_options]

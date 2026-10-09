@@ -41,6 +41,21 @@ wheel into a clean environment and running
 involving optional external services must remain explicitly opt-in and
 document their prerequisites.
 
+The development test group includes Hypothesis for generated durable-state
+sequences and pyte for real-terminal screen assertions. The Toxiproxy OpenAI
+transport test uses only a synthetic loopback server and is opt-in. Install an
+official Toxiproxy server binary separately, verify its release checksum, then
+run:
+
+```bash
+ASH_RUN_TOXIPROXY_TESTS=1 \
+ASH_TOXIPROXY_SERVER=/absolute/path/to/toxiproxy-server \
+uv run --locked pytest -q tests/e2e/test_toxiproxy_openai_provider.py
+```
+
+This test starts and stops its own proxy; it does not require Docker or a paid
+model provider. It is skipped in ordinary test runs.
+
 ## Change Standards
 
 - Keep changes scoped and preserve established public `ash.*` APIs.

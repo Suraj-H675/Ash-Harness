@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import os
 import pty
 import re
@@ -12,6 +13,7 @@ import json
 import struct
 from pathlib import Path
 
+import pyte
 import pytest
 
 
@@ -25,6 +27,9 @@ def _plain_terminal_output(raw: bytes) -> bytes:
 def test_fullscreen_prompt_limits_mouse_modes_and_restores_terminal(
     tmp_path: Path,
 ) -> None:
+    import fcntl
+    import termios
+
     code = """
 import asyncio
 from pathlib import Path
@@ -42,6 +47,7 @@ async def main():
 asyncio.run(main())
 """ % str(tmp_path / "history")
     master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     environment = os.environ.copy()
     environment.pop("NO_COLOR", None)
     environment["TERM"] = "xterm-256color"
@@ -57,7 +63,11 @@ asyncio.run(main())
     )
     os.close(slave_fd)
     captured = bytearray()
-    sent = False
+    screen = pyte.Screen(columns=80, lines=24)
+    stream = pyte.Stream(screen)
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    sent_draft = False
+    draft_visible = False
     deadline = time.monotonic() + 5
     try:
         while time.monotonic() < deadline:
@@ -70,11 +80,30 @@ asyncio.run(main())
                 if not chunk:
                     break
                 captured.extend(chunk)
-            if not sent and "›".encode() in captured:
-                os.write(master_fd, b"hello\r")
-                sent = True
+                stream.feed(decoder.decode(chunk))
+            composer_lines = [line for line in screen.display if "›" in line]
+            if not sent_draft and composer_lines:
+                os.write(master_fd, b"hello")
+                sent_draft = True
+            if sent_draft and any("hello" in line for line in composer_lines):
+                draft_visible = True
+                assert any("›" in line and "hello" in line for line in composer_lines)
+                os.write(master_fd, b"\r")
+                break
             if b"ASH_RESULT=hello" in captured:
                 break
+        assert sent_draft and draft_visible, screen.display
+        while time.monotonic() < deadline and b"ASH_RESULT=hello" not in captured:
+            ready, _, _ = select.select([master_fd], [], [], 0.05)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 65_536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                captured.extend(chunk)
+                stream.feed(decoder.decode(chunk))
         process.wait(timeout=5)
     finally:
         if process.poll() is None:
