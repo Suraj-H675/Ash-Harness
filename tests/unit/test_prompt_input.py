@@ -456,6 +456,19 @@ def test_bare_slash_completion_keeps_curated_builtin_order(tmp_path) -> None:
     assert completions[-1].text == "/custom:review"
 
 
+def test_empty_composer_only_suggests_commands_on_explicit_completion(tmp_path) -> None:
+    completer = AshCompleter(["/help", "/status"], tmp_path)
+    empty = Document("")
+
+    assert list(completer.get_completions(empty, CompleteEvent())) == []
+    assert [
+        completion.text
+        for completion in completer.get_completions(
+            empty, CompleteEvent(completion_requested=True)
+        )
+    ] == ["/help", "/status"]
+
+
 def test_slash_argument_completion_and_builtin_metadata_are_contextual(
     tmp_path,
 ) -> None:

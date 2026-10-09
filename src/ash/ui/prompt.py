@@ -200,6 +200,8 @@ class AshCompleter(Completer):
         self._model_choices = list(dict.fromkeys(model_choices))
 
     def get_completions(self, document: Document, complete_event):
+        if not document.text_before_cursor and not complete_event.completion_requested:
+            return
         word = document.get_word_before_cursor(WORD=True)
         if not word.startswith("@"):
             if document.text_before_cursor.startswith("/") and any(

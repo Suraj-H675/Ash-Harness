@@ -95,6 +95,79 @@ asyncio.run(main())
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_real_repl_help_returns_to_clean_composer_in_six_row_pty(tmp_path: Path) -> None:
+    import fcntl
+    import termios
+
+    workspace = tmp_path / "workspace"
+    home = tmp_path / "home"
+    workspace.mkdir()
+    home.mkdir()
+    environment = {
+        "PATH": os.defpath,
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "TMPDIR": str(tmp_path),
+        "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
+        "ASH_DB_DIRECTORY": str(tmp_path / "db"),
+        "ASH_MODEL": "lmstudio/local-model",
+        "TERM": "xterm-256color",
+        "NO_COLOR": "1",
+    }
+    trust = subprocess.run(
+        [sys.executable, "-m", "ash", "trust", "remove", str(workspace)],
+        cwd=workspace, env=environment, capture_output=True, timeout=12,
+    )
+    assert trust.returncode == 0, trust.stderr
+
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 6, 40, 0, 0))
+    process = subprocess.Popen(
+        [sys.executable, "-m", "ash"], cwd=workspace, env=environment,
+        stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, close_fds=True,
+    )
+    os.close(slave_fd)
+    screen = pyte.Screen(columns=40, lines=6)
+    stream = pyte.Stream(screen)
+    decoder = codecs.getincrementaldecoder("utf-8")()
+
+    def wait_for(*markers: str, timeout: float = 12) -> str:
+        deadline = time.monotonic() + timeout
+        visible = ""
+        while time.monotonic() < deadline:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(master_fd, 65_536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                stream.feed(decoder.decode(chunk))
+            visible = "\n".join(screen.display)
+            if all(marker in visible for marker in markers):
+                return visible
+            if process.poll() is not None:
+                break
+        pytest.fail(f"real REPL did not render {markers}: {visible!r}; exit={process.poll()}")
+
+    try:
+        wait_for("Ready", "local-model")
+        os.write(master_fd, b"/help\r")
+        wait_for("Slash commands", "Enter/Esc/Ctrl-C close")
+        os.write(master_fd, b"\x1b")
+        visible = wait_for("Ready", "local-model")
+        assert "Slash commands" not in visible
+        # No autocomplete popup should cover the returned empty composer.
+        assert "/status" not in visible
+        assert "Show available commands" not in visible
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
 def test_fullscreen_prompt_limits_mouse_modes_and_restores_terminal(
     tmp_path: Path,
 ) -> None:
