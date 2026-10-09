@@ -17,7 +17,7 @@ from ash.commands.sessions import (
     select_startup_session,
 )
 from ash.core.checkpoints import recover_interrupted_turns
-from ash.core.session import Message, SessionStore, ToolCallRecord
+from ash.core.session import Message, SessionStore, ToolCallRecord, get_db_connection
 from ash.safety.guard import SafetyGuard
 
 
@@ -398,6 +398,112 @@ def test_startup_continue_selects_latest_project_session(tmp_path: Path) -> None
 
     assert selection.session_id == first.session_id
     assert selection.cancelled is False
+
+
+@pytest.mark.parametrize(
+    ("selection_args", "protect_target"),
+    [
+        (["--session"], True),
+        (["--resume"], True),
+        (["--continue"], False),
+    ],
+)
+def test_startup_retention_preserves_explicit_target_tree_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    selection_args: list[str],
+    protect_target: bool,
+) -> None:
+    home = tmp_path / "home"
+    db_dir = tmp_path / "db"
+    workspace = tmp_path / "workspace"
+    other_workspace = tmp_path / "other-workspace"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    store = SessionStore(db_dir / "sessions.db")
+    target = store.create_session(str(workspace), model="lmstudio/local-model")
+    store.rename_session(target.session_id, "Explicit target")
+    branch = store.fork_session(target.session_id, branch_name="work branch")
+    unrelated = store.create_session(str(workspace), model="lmstudio/local-model")
+    foreign = store.create_session(str(other_workspace), model="lmstudio/local-model")
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?",
+            ("2000-01-01T00:00:00+00:00",),
+        )
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("ASH_MODEL", "lmstudio/local-model")
+    monkeypatch.setenv("ASH_SESSION_RETENTION_DAYS", "1")
+
+    class RuntimeReached(RuntimeError):
+        pass
+
+    def stop_after_selection(*args, **kwargs) -> None:
+        raise RuntimeReached("startup selection completed")
+
+    monkeypatch.setattr("ash.runtime.build_runtime", stop_after_selection)
+    arguments = ["--db-directory", str(db_dir), *selection_args]
+    if selection_args == ["--session"]:
+        arguments.append(target.session_id)
+    elif selection_args == ["--resume"]:
+        arguments.append("Explicit target")
+
+    if protect_target:
+        with pytest.raises(RuntimeReached, match="startup selection completed"):
+            main(arguments)
+        assert store.load_session(target.session_id).session_id == target.session_id
+        assert store.load_session(branch.session_id).session_id == branch.session_id
+        with pytest.raises(KeyError, match="Session not found"):
+            store.load_session(unrelated.session_id)
+    else:
+        assert main(arguments) == 1
+        assert "no session found to continue" in capsys.readouterr().err
+        with pytest.raises(KeyError, match="Session not found"):
+            store.load_session(target.session_id)
+        with pytest.raises(KeyError, match="Session not found"):
+            store.load_session(branch.session_id)
+        with pytest.raises(KeyError, match="Session not found"):
+            store.load_session(unrelated.session_id)
+
+    assert store.load_session(foreign.session_id).session_id == foreign.session_id
+
+
+@pytest.mark.parametrize(
+    "selection_args",
+    [
+        ["--session", "missing-session-id"],
+        ["--resume", "missing title"],
+        ["--resume", "Duplicate title"],
+    ],
+)
+def test_invalid_explicit_resume_does_not_delete_expired_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selection_args: list[str],
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = SessionStore(tmp_path / "db" / "sessions.db")
+    sessions = [store.create_session(str(workspace)) for _ in range(2)]
+    if selection_args[-1] == "Duplicate title":
+        for session in sessions:
+            store.rename_session(session.session_id, "Duplicate title")
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?",
+            ("2000-01-01T00:00:00+00:00",),
+        )
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("ASH_MODEL", "lmstudio/local-model")
+    monkeypatch.setenv("ASH_SESSION_RETENTION_DAYS", "1")
+
+    assert main(["--db-directory", str(tmp_path / "db"), *selection_args]) != 0
+    assert all(store.session_exists(session.session_id) for session in sessions)
 
 
 def test_startup_resume_supports_name_and_fork(tmp_path: Path) -> None:

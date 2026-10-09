@@ -5981,9 +5981,20 @@ def _main_impl(argv: list[str] | None = None) -> int:
     try:
         session_store = SessionStore(db_path)
         if config.session_retention_days > 0:
+            project_path = str(config.workspace_root.resolve())
+            protected_session_id = None
+            if args.session is not None:
+                session_store.require_session_project(args.session, project_path)
+                protected_session_id = args.session
+            elif args.resume:
+                protected_session_id = session_store.resolve_session(
+                    args.resume,
+                    project_path,
+                ).session_id
             session_store.cleanup_sessions(
                 config.session_retention_days,
-                project_path=str(config.workspace_root.resolve()),
+                project_path=project_path,
+                protected_session_id=protected_session_id,
             )
     except Exception as exc:  # noqa: BLE001 - stable CLI error boundary
         return _report_cli_error(
