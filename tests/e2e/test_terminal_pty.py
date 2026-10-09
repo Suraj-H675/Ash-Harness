@@ -1071,15 +1071,19 @@ def test_resume_and_clear_replace_the_active_conversation_view(tmp_path: Path) -
         expect("›".encode())
         os.write(master_fd, f"/resume {selected.session_id}\r".encode())
         expect(b"selected answer")
-        selected_answer_end = captured.index(b"selected answer") + len(
-            b"selected answer"
-        )
         time.sleep(0.2)
+        clear_start = len(captured)
         os.write(master_fd, b"/clear\r")
-        expect(b"Ready", after=selected_answer_end)
-        time.sleep(0.1)
+        expect(b"Ready", after=clear_start)
+        # The previous screen can redraw "Ready" while /clear is still
+        # switching sessions; wait for the new durable session too.
+        deadline = time.monotonic() + 10
+        while len(store.list_sessions(project_path=str(workspace))) < 3:
+            assert time.monotonic() < deadline, "clear did not create a new session"
+            time.sleep(0.05)
+        time.sleep(0.2)
         os.write(master_fd, b"/exit\r")
-        process.wait(timeout=10)
+        process.wait(timeout=15)
         while select.select([master_fd], [], [], 0.1)[0]:
             try:
                 chunk = os.read(master_fd, 65_536)
