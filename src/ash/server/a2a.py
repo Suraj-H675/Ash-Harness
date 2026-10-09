@@ -10,6 +10,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, closing
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
@@ -390,6 +391,12 @@ async def _settle_a2a_cleanup_task(
     return None, interrupted
 
 
+@dataclass(slots=True)
+class _A2AContextGate:
+    lock: asyncio.Lock
+    references: int = 0
+
+
 class AshA2AExecutor(AgentExecutor):
     """Translate A2A tasks into cancellation-safe Ash SDK turns."""
 
@@ -406,6 +413,7 @@ class AshA2AExecutor(AgentExecutor):
         self.registry = registry
         self._max_in_flight_tasks = max_in_flight_tasks
         self._active_tasks = 0
+        self._context_gates: dict[str, _A2AContextGate] = {}
         self._retired_clients: set[AshClient] = set()
         self._cleanup_lock = asyncio.Lock()
 
@@ -419,6 +427,24 @@ class AshA2AExecutor(AgentExecutor):
         if self._active_tasks <= 0:
             raise RuntimeError("A2A task admission accounting underflow")
         self._active_tasks -= 1
+
+    def _retain_context_gate(self, context_id: str) -> _A2AContextGate:
+        """Keep the shared gate alive while a task owns or waits for it."""
+        gate = self._context_gates.get(context_id)
+        if gate is None:
+            gate = _A2AContextGate(asyncio.Lock())
+            self._context_gates[context_id] = gate
+        gate.references += 1
+        return gate
+
+    def _release_context_gate(
+        self, context_id: str, gate: _A2AContextGate, *, acquired: bool
+    ) -> None:
+        if acquired:
+            gate.lock.release()
+        gate.references -= 1
+        if gate.references == 0 and self._context_gates.get(context_id) is gate:
+            del self._context_gates[context_id]
 
     async def _retry_retired_clients(self) -> int:
         async with self._cleanup_lock:
@@ -512,7 +538,12 @@ class AshA2AExecutor(AgentExecutor):
         client: AshClient | None = None
         cancellation: asyncio.CancelledError | None = None
         terminal_published = False
+        gate: _A2AContextGate | None = None
+        gate_acquired = False
         try:
+            gate = self._retain_context_gate(context_id)
+            await gate.lock.acquire()
+            gate_acquired = True
             session_id = await self.registry.get(context_id)
             client = await AshClient.create(
                 config=self.config,
@@ -520,7 +551,10 @@ class AshA2AExecutor(AgentExecutor):
                 run_maintenance=False,
             )
             assert client.loop.current_session is not None
-            await self.registry.bind(context_id, client.loop.current_session.session_id)
+            await self.registry.bind(
+                context_id,
+                client.loop.current_session.session_id,
+            )
             await updater.start_work()
             artifact_id = f"ash-response-{uuid4()}"
             pending = ""
@@ -604,7 +638,13 @@ class AshA2AExecutor(AgentExecutor):
                         elif not terminal_published:
                             raise asyncio.CancelledError
             finally:
-                self._release_task_slot()
+                try:
+                    if gate is not None:
+                        self._release_context_gate(
+                            context_id, gate, acquired=gate_acquired
+                        )
+                finally:
+                    self._release_task_slot()
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         updater = TaskUpdater(

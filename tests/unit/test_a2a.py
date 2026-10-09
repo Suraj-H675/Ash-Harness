@@ -2879,3 +2879,383 @@ async def test_a2a_cancel_preempts_active_ash_turn(tmp_path: Path, monkeypatch) 
             assert cancelled.task_id == response.task.id
             await asyncio.wait_for(closed.wait(), timeout=2)
             await client.close()
+
+
+@pytest.mark.asyncio
+async def test_a2a_executor_binds_one_session_for_concurrent_first_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    registry = A2ASessionRegistry(tmp_path / "a2a.db", workspace)
+    create_started = asyncio.Event()
+    allow_create = asyncio.Event()
+    create_requests: list[str | None] = []
+    durable_sessions: set[str] = set()
+    processed_prompts: list[str] = []
+
+    class DurableFakeAshClient:
+        def __init__(self, session_id: str) -> None:
+            self.loop = SimpleNamespace(
+                current_session=SimpleNamespace(session_id=session_id)
+            )
+
+        async def stream_prompt(
+            self, prompt: str, **_kwargs: Any
+        ) -> AsyncIterator[AshEvent]:
+            processed_prompts.append(prompt)
+            yield AshEvent("turn.completed", {"response": "done"})
+
+        async def close(self) -> None:
+            return None
+
+    async def create_client(**kwargs: Any) -> DurableFakeAshClient:
+        requested = kwargs.get("session_id")
+        create_requests.append(requested)
+        if requested is None:
+            session_id = f"session-{len(durable_sessions) + 1}"
+        else:
+            session_id = str(requested)
+        durable_sessions.add(session_id)
+        create_started.set()
+        await allow_create.wait()
+        return DurableFakeAshClient(session_id)
+
+    def request(task_id: str) -> RequestContext:
+        return RequestContext(
+            call_context=ServerCallContext(),
+            request=SendMessageRequest(
+                message=Message(
+                    message_id=f"message-{task_id}",
+                    role=Role.ROLE_USER,
+                    parts=[Part(text=task_id)],
+                )
+            ),
+            task_id=task_id,
+            context_id="concurrent-first-use",
+        )
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    executor = AshA2AExecutor(config, registry)
+    queues = [EventQueueSource(), EventQueueSource()]
+    executions: list[asyncio.Task[None]] = []
+    try:
+        executions.append(
+            asyncio.create_task(executor.execute(request("first"), queues[0]))
+        )
+        await asyncio.wait_for(create_started.wait(), timeout=1)
+        executions.append(
+            asyncio.create_task(executor.execute(request("second"), queues[1]))
+        )
+        await asyncio.sleep(0)
+        allow_create.set()
+        await asyncio.gather(*executions)
+
+        terminal_states = []
+        for queue in queues:
+            await queue.test_only_join_incoming_queue()
+            states = []
+            while not queue.queue.empty():
+                event = await queue.dequeue_event()
+                if isinstance(event, TaskStatusUpdateEvent):
+                    states.append(event.status.state)
+                queue.task_done()
+            terminal_states.append(states[-1])
+
+        bound_session = await registry.get("concurrent-first-use")
+        assert len(durable_sessions) == 1, {
+            "durable_session_ids": sorted(durable_sessions),
+            "create_requests": create_requests,
+            "terminal_states": terminal_states,
+            "bound_session": bound_session,
+        }
+        session_id = next(iter(durable_sessions))
+        assert create_requests == [None, session_id]
+        assert bound_session == session_id
+        assert terminal_states == [
+            TaskState.TASK_STATE_COMPLETED,
+            TaskState.TASK_STATE_COMPLETED,
+        ]
+        assert processed_prompts == ["first", "second"]
+        assert executor._active_tasks == 0
+    finally:
+        allow_create.set()
+        await asyncio.gather(*executions, return_exceptions=True)
+        for queue in queues:
+            await queue.close(immediate=True)
+
+
+@pytest.mark.asyncio
+async def test_a2a_executor_serializes_context_turns_and_isolates_other_contexts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    registry = A2ASessionRegistry(tmp_path / "a2a.db", workspace)
+    await registry.bind("shared-context", "shared-session")
+    await registry.bind("other-context", "other-session")
+    first_shared_started = asyncio.Event()
+    second_shared_started = asyncio.Event()
+    other_started = asyncio.Event()
+    release_first_shared = asyncio.Event()
+    release_second_shared = asyncio.Event()
+    release_other = asyncio.Event()
+    active_by_session: dict[str, int] = {}
+    max_active_by_session: dict[str, int] = {}
+
+    class BlockingAshClient:
+        def __init__(self, session_id: str) -> None:
+            self.loop = SimpleNamespace(
+                current_session=SimpleNamespace(session_id=session_id)
+            )
+
+        async def stream_prompt(
+            self, *_args: Any, **_kwargs: Any
+        ) -> AsyncIterator[AshEvent]:
+            session_id = self.loop.current_session.session_id
+            active = active_by_session.get(session_id, 0) + 1
+            active_by_session[session_id] = active
+            max_active_by_session[session_id] = max(
+                active, max_active_by_session.get(session_id, 0)
+            )
+            try:
+                if session_id == "shared-session":
+                    if not first_shared_started.is_set():
+                        first_shared_started.set()
+                        await release_first_shared.wait()
+                    else:
+                        second_shared_started.set()
+                        await release_second_shared.wait()
+                else:
+                    other_started.set()
+                    await release_other.wait()
+                yield AshEvent("turn.completed", {"response": "done"})
+            finally:
+                active_by_session[session_id] -= 1
+
+        async def close(self) -> None:
+            return None
+
+    async def create_client(**kwargs: Any) -> BlockingAshClient:
+        return BlockingAshClient(str(kwargs["session_id"]))
+
+    def request(task_id: str, context_id: str) -> RequestContext:
+        return RequestContext(
+            call_context=ServerCallContext(),
+            request=SendMessageRequest(
+                message=Message(
+                    message_id=f"message-{task_id}",
+                    role=Role.ROLE_USER,
+                    parts=[Part(text=task_id)],
+                )
+            ),
+            task_id=task_id,
+            context_id=context_id,
+        )
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    executor = AshA2AExecutor(config, registry, max_in_flight_tasks=3)
+    queues = [EventQueueSource(), EventQueueSource(), EventQueueSource()]
+    executions: list[asyncio.Task[None]] = []
+    try:
+        executions.append(
+            asyncio.create_task(
+                executor.execute(
+                    request("shared-first", "shared-context"), queues[0]
+                )
+            )
+        )
+        await asyncio.wait_for(first_shared_started.wait(), timeout=1)
+        executions.append(
+            asyncio.create_task(
+                executor.execute(
+                    request("shared-second", "shared-context"), queues[1]
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        executions.append(
+            asyncio.create_task(
+                executor.execute(request("other", "other-context"), queues[2])
+            )
+        )
+        await asyncio.wait_for(other_started.wait(), timeout=1)
+
+        assert not second_shared_started.is_set()
+        assert max_active_by_session["shared-session"] == 1
+        assert max_active_by_session["other-session"] == 1
+
+        release_first_shared.set()
+        await asyncio.wait_for(second_shared_started.wait(), timeout=1)
+        release_second_shared.set()
+        release_other.set()
+        await asyncio.gather(*executions)
+
+        assert max_active_by_session["shared-session"] == 1
+        assert executor._active_tasks == 0
+    finally:
+        release_first_shared.set()
+        release_second_shared.set()
+        release_other.set()
+        await asyncio.gather(*executions, return_exceptions=True)
+        for queue in queues:
+            await queue.close(immediate=True)
+
+
+@pytest.mark.asyncio
+async def test_a2a_executor_cancellation_releases_context_after_client_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    registry = A2ASessionRegistry(tmp_path / "a2a.db", workspace)
+    await registry.bind("shared-context", "shared-session")
+    await registry.bind("other-context", "other-session")
+    owner_started = asyncio.Event()
+    owner_close_started = asyncio.Event()
+    release_owner_close = asyncio.Event()
+    other_started = asyncio.Event()
+    later_started = asyncio.Event()
+    active_by_session: dict[str, int] = {}
+    max_active_by_session: dict[str, int] = {}
+    create_requests: list[str] = []
+    processed_prompts: list[str] = []
+
+    class BlockingCloseAshClient:
+        def __init__(self, session_id: str) -> None:
+            self.loop = SimpleNamespace(
+                current_session=SimpleNamespace(session_id=session_id)
+            )
+            self.prompt = ""
+
+        async def stream_prompt(
+            self, prompt: str, **_kwargs: Any
+        ) -> AsyncIterator[AshEvent]:
+            self.prompt = prompt
+            processed_prompts.append(prompt)
+            session_id = self.loop.current_session.session_id
+            active = active_by_session.get(session_id, 0) + 1
+            active_by_session[session_id] = active
+            max_active_by_session[session_id] = max(
+                active, max_active_by_session.get(session_id, 0)
+            )
+            try:
+                if prompt == "owner":
+                    owner_started.set()
+                    await asyncio.Event().wait()
+                elif prompt == "other":
+                    other_started.set()
+                else:
+                    later_started.set()
+                yield AshEvent("turn.completed", {"response": "done"})
+            finally:
+                active_by_session[session_id] -= 1
+
+        async def close(self) -> None:
+            if self.prompt == "owner":
+                owner_close_started.set()
+                await release_owner_close.wait()
+
+    async def create_client(**kwargs: Any) -> BlockingCloseAshClient:
+        session_id = str(kwargs["session_id"])
+        create_requests.append(session_id)
+        return BlockingCloseAshClient(session_id)
+
+    def request(task_id: str, context_id: str) -> RequestContext:
+        return RequestContext(
+            call_context=ServerCallContext(),
+            request=SendMessageRequest(
+                message=Message(
+                    message_id=f"message-{task_id}",
+                    role=Role.ROLE_USER,
+                    parts=[Part(text=task_id)],
+                )
+            ),
+            task_id=task_id,
+            context_id=context_id,
+        )
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    executor = AshA2AExecutor(config, registry, max_in_flight_tasks=3)
+    owner_queue = EventQueueSource()
+    waiter_queue = EventQueueSource()
+    other_queue = EventQueueSource()
+    later_queue = EventQueueSource()
+    executions: list[asyncio.Task[None]] = []
+    try:
+        owner = asyncio.create_task(
+            executor.execute(request("owner", "shared-context"), owner_queue)
+        )
+        executions.append(owner)
+        await asyncio.wait_for(owner_started.wait(), timeout=1)
+
+        waiter = asyncio.create_task(
+            executor.execute(request("waiter", "shared-context"), waiter_queue)
+        )
+        executions.append(waiter)
+        await asyncio.sleep(0)
+        assert create_requests == ["shared-session"]
+
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert executor._active_tasks == 1
+
+        owner.cancel()
+        await asyncio.wait_for(owner_close_started.wait(), timeout=1)
+        other = asyncio.create_task(
+            executor.execute(request("other", "other-context"), other_queue)
+        )
+        executions.append(other)
+        await asyncio.wait_for(other_started.wait(), timeout=1)
+
+        later = asyncio.create_task(
+            executor.execute(request("later", "shared-context"), later_queue)
+        )
+        executions.append(later)
+        await asyncio.sleep(0)
+        assert not later_started.is_set()
+        assert create_requests == ["shared-session", "other-session"]
+
+        owner.cancel()
+        release_owner_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        await asyncio.wait_for(later_started.wait(), timeout=1)
+        await asyncio.gather(other, later)
+
+        await later_queue.test_only_join_incoming_queue()
+        terminal_states = []
+        while not later_queue.queue.empty():
+            event = await later_queue.dequeue_event()
+            if isinstance(event, TaskStatusUpdateEvent):
+                terminal_states.append(event.status.state)
+            later_queue.task_done()
+        assert terminal_states[-1] == TaskState.TASK_STATE_COMPLETED
+        assert processed_prompts == ["owner", "other", "later"]
+        assert max_active_by_session["shared-session"] == 1
+        assert executor._active_tasks == 0
+        assert executor._context_gates == {}
+    finally:
+        release_owner_close.set()
+        await asyncio.gather(*executions, return_exceptions=True)
+        for queue in (owner_queue, waiter_queue, other_queue, later_queue):
+            await queue.close(immediate=True)
