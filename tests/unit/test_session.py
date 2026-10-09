@@ -1306,6 +1306,112 @@ def test_session_retention_does_not_delete_old_session_during_a_new_turn(
         store.load_session(expired.session_id)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="cross-process flock is POSIX-only")
+def test_cleanup_skips_expired_tree_with_leased_branch_in_another_process(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "retention.db"
+    store = SessionStore(db_path)
+    root = store.create_session(str(tmp_path))
+    active = store.fork_session(root.session_id, branch_name="in-progress")
+    expired = store.create_session(str(tmp_path))
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?",
+            ("2020-01-01T00:00:00+00:00",),
+        )
+
+    ready = tmp_path / "lease-ready"
+    release = tmp_path / "lease-release"
+    lease_code = """
+import sys
+import time
+from pathlib import Path
+from ash.core.session import SessionStore
+
+database = Path(sys.argv[1])
+session_id = sys.argv[2]
+ready = Path(sys.argv[3])
+release = Path(sys.argv[4])
+lease = SessionStore(database).acquire_session_runtime_lease(session_id)
+try:
+    ready.write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 20
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("parent did not release test lease")
+        time.sleep(0.01)
+finally:
+    lease.close()
+"""
+    cleanup_code = """
+import sys
+from ash.core.session import SessionStore
+
+store = SessionStore(sys.argv[1])
+print(store.cleanup_sessions(30, project_path=sys.argv[2]))
+"""
+    lease_process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            lease_code,
+            str(db_path),
+            active.session_id,
+            str(ready),
+            str(release),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and lease_process.poll() is None:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        if not ready.exists():
+            stdout, stderr = lease_process.communicate(timeout=5)
+            pytest.fail(f"lease process did not become ready: {stdout}\n{stderr}")
+
+        busy_cleanup = subprocess.run(
+            [sys.executable, "-c", cleanup_code, str(db_path), str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert busy_cleanup.returncode == 0, busy_cleanup.stderr
+        assert busy_cleanup.stdout.strip() == "1"
+        assert store.load_session(root.session_id).session_id == root.session_id
+        assert store.load_session(active.session_id).session_id == active.session_id
+        with pytest.raises(KeyError, match="Session not found"):
+            store.load_session(expired.session_id)
+
+        release.write_text("release", encoding="utf-8")
+        stdout, stderr = lease_process.communicate(timeout=5)
+        assert lease_process.returncode == 0, (stdout, stderr)
+
+        idle_cleanup = subprocess.run(
+            [sys.executable, "-c", cleanup_code, str(db_path), str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert idle_cleanup.returncode == 0, idle_cleanup.stderr
+        assert idle_cleanup.stdout.strip() == "2"
+        with pytest.raises(KeyError, match="Session not found"):
+            store.load_session(root.session_id)
+        with pytest.raises(KeyError, match="Session not found"):
+            store.load_session(active.session_id)
+    finally:
+        release.write_text("release", encoding="utf-8")
+        if lease_process.poll() is None:
+            lease_process.kill()
+            lease_process.communicate(timeout=5)
+
+
 def test_session_cleanup_treats_unrepresentable_retention_as_noop(
     tmp_path: Path,
 ) -> None:

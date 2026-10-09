@@ -1121,6 +1121,18 @@ class SessionStore:
     def acquire_session_runtime_lease(self, session_id: str) -> _SessionRuntimeLease:
         """Fail fast when another process is actively mutating this session."""
 
+        lease = self._try_acquire_session_runtime_lease(session_id)
+        if lease is None:
+            raise SessionStorageError(
+                f"session {session_id!r} is active in another Ash process"
+            )
+        return lease
+
+    def _try_acquire_session_runtime_lease(
+        self, session_id: str
+    ) -> _SessionRuntimeLease | None:
+        """Acquire a session lease, returning None only when it is already held."""
+
         if os.name != "posix" or fcntl is None:
             raise SessionStorageError(
                 "session runtime locking is unavailable on this platform"
@@ -1146,10 +1158,8 @@ class SessionStore:
                     )
                 try:
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError as exc:
-                    raise SessionStorageError(
-                        f"session {session_id!r} is active in another Ash process"
-                    ) from exc
+                except BlockingIOError:
+                    return None
                 if not parent.same_entry(lock_name, descriptor):
                     raise SessionStorageError(
                         "session runtime lock changed while it was being acquired"
@@ -2759,40 +2769,130 @@ class SessionStore:
         except OverflowError:
             # No persisted datetime can be older than an unrepresentable cutoff.
             return 0
-        clause = " WHERE project_key = ?" if project_path is not None else ""
-        params: tuple[Any, ...] = (
-            (normalize_project_path(project_path), _serialize_datetime(cutoff))
-            if project_path is not None
-            else (_serialize_datetime(cutoff),)
+        scope_clause = " AND project_key = ?" if project_path is not None else ""
+        scoped_project_key = (
+            normalize_project_path(project_path) if project_path is not None else None
         )
-        query = (
-            "DELETE FROM sessions WHERE root_session_id IN ("
+        serialized_cutoff = _serialize_datetime(cutoff)
+
+        expired_roots_query = (
             "SELECT root_session_id FROM sessions"
-            + clause
+            + (" WHERE project_key = ?" if project_path is not None else "")
             + " GROUP BY root_session_id "
-            "HAVING MAX(COALESCE(updated_at, created_at)) < ?)"
+            "HAVING MAX(COALESCE(updated_at, created_at)) < ?"
+        )
+        expired_roots_params: tuple[Any, ...] = (
+            (scoped_project_key, serialized_cutoff)
+            if scoped_project_key is not None
+            else (serialized_cutoff,)
         )
         if protected_session_id is not None:
-            query += (
+            expired_roots_query += (
                 " AND root_session_id NOT IN ("
                 "SELECT root_session_id FROM sessions WHERE session_id = ?)"
             )
-            params += (protected_session_id,)
+            expired_roots_params += (protected_session_id,)
+
+        candidate_members: dict[str, list[str]] = {}
         with closing(self._connect()) as conn, conn:
             if protected_session_id is not None:
-                scope = " AND project_key = ?" if project_path is not None else ""
                 activity_params: tuple[Any, ...] = (
                     _serialize_datetime(_utc_now()),
                     protected_session_id,
                 )
-                if project_path is not None:
-                    activity_params += (normalize_project_path(project_path),)
+                if scoped_project_key is not None:
+                    activity_params += (scoped_project_key,)
                 conn.execute(
-                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?" + scope,
+                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?"
+                    + scope_clause,
                     activity_params,
                 )
-            cursor = conn.execute(query, params)
-            deleted = cursor.rowcount
+            else:
+                conn.execute("BEGIN")
+
+            expired_members_query = (
+                "SELECT root_session_id, session_id FROM sessions "
+                "WHERE root_session_id IN ("
+                + expired_roots_query
+                + ") ORDER BY root_session_id, session_id"
+            )
+            expired_members = conn.execute(
+                expired_members_query,
+                expired_roots_params,
+            ).fetchall()
+            for row in expired_members:
+                root_session_id = str(row["root_session_id"])
+                candidate_members.setdefault(root_session_id, []).append(
+                    str(row["session_id"])
+                )
+
+        deleted = 0
+        for root_session_id, candidate_member_ids in candidate_members.items():
+            member_ids = tuple(candidate_member_ids)
+            leases: list[_SessionRuntimeLease] = []
+            try:
+                for session_id in member_ids:
+                    lease = self._try_acquire_session_runtime_lease(session_id)
+                    if lease is None:
+                        break
+                    leases.append(lease)
+                else:
+                    with closing(self._connect()) as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        try:
+                            current_members = conn.execute(
+                                "SELECT session_id FROM sessions "
+                                "WHERE root_session_id = ? ORDER BY session_id",
+                                (root_session_id,),
+                            ).fetchall()
+                            current_member_ids = tuple(
+                                str(row["session_id"]) for row in current_members
+                            )
+                            if current_member_ids != member_ids:
+                                conn.rollback()
+                                continue
+
+                            eligible_root = conn.execute(
+                                "SELECT root_session_id FROM sessions "
+                                "WHERE root_session_id = ?"
+                                + scope_clause
+                                + " GROUP BY root_session_id "
+                                "HAVING MAX(COALESCE(updated_at, created_at)) < ?"
+                                + (
+                                    " AND root_session_id NOT IN ("
+                                    "SELECT root_session_id FROM sessions "
+                                    "WHERE session_id = ?)"
+                                    if protected_session_id is not None
+                                    else ""
+                                ),
+                                (
+                                    (root_session_id, scoped_project_key, serialized_cutoff)
+                                    if scoped_project_key is not None
+                                    else (root_session_id, serialized_cutoff)
+                                )
+                                + (
+                                    (protected_session_id,)
+                                    if protected_session_id is not None
+                                    else ()
+                                ),
+                            ).fetchone()
+                            if eligible_root is None:
+                                conn.rollback()
+                                continue
+
+                            cursor = conn.execute(
+                                "DELETE FROM sessions WHERE root_session_id = ?",
+                                (root_session_id,),
+                            )
+                            conn.commit()
+                            deleted += cursor.rowcount
+                        except BaseException:
+                            conn.rollback()
+                            raise
+            finally:
+                for lease in reversed(leases):
+                    lease.close()
+
         with closing(self._connect()) as conn:
             conn.execute("VACUUM")
         return deleted
