@@ -351,6 +351,33 @@ async def test_session_switch_commands_all_load_the_selected_transcript_snapshot
 
 
 @pytest.mark.asyncio
+async def test_resume_accepts_multiword_session_title_without_quoting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    current = store.create_session(str(tmp_path), model="ollama/test-model")
+    target = store.create_session(str(tmp_path), model="ollama/test-model")
+    store.rename_session(target.session_id, "Auth refactor")
+    started: list[str | None] = []
+
+    assert await _run_repl(
+        tmp_path,
+        monkeypatch,
+        iter(("/resume Auth refactor", '/resume "Auth refactor"', "/exit")),
+        session_store=store,
+        current_session=current,
+        session_starts=started,
+    ) == 0
+
+    assert started == [target.session_id, target.session_id]
+    output = capsys.readouterr()
+    assert "Usage: /resume" not in output.err
+    assert output.out.count("Resumed chat.") == 2
+
+
+@pytest.mark.asyncio
 async def test_import_uses_current_runtime_model_not_exported_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

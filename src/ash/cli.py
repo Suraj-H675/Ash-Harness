@@ -1636,14 +1636,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     )
                 continue
             if command.name == "resume":
-                if len(arguments) > 1:
-                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
-                    continue
                 try:
                     selected_session_id: str | None
                     if arguments:
                         summary = loop.session_store.resolve_session(
-                            arguments[0], str(loop.project_root)
+                            " ".join(arguments), str(loop.project_root)
                         )
                         selected_session_id = summary.session_id
                     else:
@@ -1685,8 +1682,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     _print_classified_error(exc)
                     continue
                 loop.ui.load_session_transcript(session)
-                if has_live_surface:
-                    transition_feedback("Resumed chat.")
+                transition_feedback("Resumed chat.")
                 continue
             if command.name == "rename":
                 if not arguments or loop.current_session is None:
