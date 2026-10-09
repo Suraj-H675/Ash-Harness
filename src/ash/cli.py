@@ -6078,7 +6078,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if args.prompt is not None:
         try:
             return asyncio.run(
-                _bootstrap_and_headless(
+                _headless_with_sigterm_cleanup(
                     loop,
                     config,
                     prompt=args.prompt,
@@ -6102,6 +6102,51 @@ def _main_impl(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130
+
+
+async def _headless_with_sigterm_cleanup(
+    loop: AshLoop,
+    config: AshConfig,
+    *,
+    prompt: str,
+    session_id: str | None,
+    ui: Any,
+    json_schema_path: Path | None = None,
+) -> int:
+    import signal
+
+    event_loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    terminated = False
+    installed = False
+
+    def on_sigterm() -> None:
+        nonlocal terminated
+        if not terminated and task is not None:
+            terminated = True
+            task.cancel()
+
+    try:
+        event_loop.add_signal_handler(signal.SIGTERM, on_sigterm)
+        installed = True
+    except (NotImplementedError, RuntimeError):
+        pass
+    try:
+        return await _bootstrap_and_headless(
+            loop,
+            config,
+            prompt=prompt,
+            session_id=session_id,
+            ui=ui,
+            json_schema_path=json_schema_path,
+        )
+    except asyncio.CancelledError:
+        if terminated:
+            return 143
+        raise
+    finally:
+        if installed:
+            event_loop.remove_signal_handler(signal.SIGTERM)
 
 
 async def _bootstrap_and_repl(

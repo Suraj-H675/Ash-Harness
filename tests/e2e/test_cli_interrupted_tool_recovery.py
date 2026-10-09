@@ -133,7 +133,8 @@ def test_cli_restart_preserves_completed_write_without_replay(tmp_path: Path) ->
         )
         assert (workspace / "kept.txt").read_bytes() == b"written-before-crash\n"
 
-        process.terminate()
+        # Model an abrupt process death, not the graceful SIGTERM shutdown.
+        process.kill()
         process.communicate(timeout=5)
         assert process.returncode is not None and process.returncode != 0
         release_second.set()
