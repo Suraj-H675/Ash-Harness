@@ -24,7 +24,17 @@ def _plain_terminal_output(raw: bytes) -> bytes:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
-def test_help_overlay_renders_and_closes_in_six_row_pty() -> None:
+@pytest.mark.parametrize(
+    ("columns", "footer"),
+    [
+        (24, "Up/Down  Esc close"),
+        (30, "Up/Down  Enter/Esc close"),
+        (40, "Up/Down move  Enter/Esc/Ctrl-C close"),
+    ],
+)
+def test_help_overlay_renders_and_closes_in_six_row_pty(
+    columns: int, footer: str
+) -> None:
     import fcntl
     import termios
 
@@ -38,7 +48,7 @@ async def main():
 asyncio.run(main())
 """
     master_fd, slave_fd = pty.openpty()
-    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 6, 40, 0, 0))
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 6, columns, 0, 0))
     environment = os.environ.copy()
     environment["TERM"] = "xterm-256color"
     environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
@@ -52,7 +62,7 @@ asyncio.run(main())
         close_fds=True,
     )
     os.close(slave_fd)
-    screen = pyte.Screen(columns=40, lines=6)
+    screen = pyte.Screen(columns=columns, lines=6)
     stream = pyte.Stream(screen)
     decoder = codecs.getincrementaldecoder("utf-8")()
     visible_screen = ""
@@ -76,7 +86,7 @@ asyncio.run(main())
                     "Search",
                     "/help",
                     "/help [query]",
-                    "Up/Down move  Enter/Esc/Ctrl-C close",
+                    footer,
                 )
             ):
                 assert "Window too small" not in visible_screen

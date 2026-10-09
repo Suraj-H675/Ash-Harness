@@ -89,9 +89,7 @@ class HelpOverlay:
                     style="class:detail",
                 ),
                 Window(
-                    FormattedTextControl(
-                        " Up/Down move  Enter/Esc/Ctrl-C close "
-                    ),
+                    FormattedTextControl(self._render_footer),
                     height=1,
                     style="class:footer",
                 ),
@@ -146,6 +144,19 @@ class HelpOverlay:
             max(0, len(self._filtered) - page_size),
         )
         return start, start + page_size
+
+    def _render_footer(self) -> str:
+        app = get_app_or_none()
+        columns = app.output.get_size().columns if app is self.application else 80
+        for hint in (
+            " Up/Down move  Enter/Esc/Ctrl-C close ",
+            " Up/Down  Enter/Esc close ",
+            " Up/Down  Esc close ",
+            " Esc close ",
+        ):
+            if len(hint) <= columns:
+                return hint
+        return "Esc" if columns >= 3 else ""
 
     def _render_list(self) -> FormattedText:
         if not self._filtered:
