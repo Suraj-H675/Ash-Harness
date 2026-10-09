@@ -10,12 +10,17 @@ manager, and git layer are all real.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
+import json
+import os
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Callable
 
+import pytest
 
 from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
@@ -369,3 +374,269 @@ def test_e2e_session_persists_through_db_restore(tmp_path: Path) -> None:
     assert session.messages[0].content == "do it"
     assert session.messages[-1].role == "assistant"
     assert "second loop" in session.messages[-1].content
+
+
+def test_e2e_explorer_cancelled_turn_preserves_completed_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, str], None],
+) -> None:
+    """Cancel after a real write and inspect durable state through fresh CLI processes."""
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    scratch_tmp = tmp_path / "tmp"
+    scratch_tmp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch_tmp))
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    db_directory = tmp_path / "db"
+    db_directory.mkdir()
+    db_path = db_directory / "sessions.db"
+
+    source_root = Path(__file__).resolve().parents[2]
+    sanitized_env = {
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "TMPDIR": str(scratch_tmp),
+        "PATH": os.defpath,
+        "PYTHONPATH": str(source_root / "src"),
+        "PYTHONUTF8": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "NO_COLOR": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=workspace,
+            env=sanitized_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "ash@test")
+    git("config", "user.name", "Ash Test")
+    (workspace / "README.md").write_text("# e2e\n", encoding="utf-8")
+    git("add", "README.md")
+    git("commit", "-q", "-m", "seed")
+
+    class CancelAfterWriteProvider(SessionProvider):
+        def __init__(self) -> None:
+            super().__init__(scripts=[])
+            self.second_request_started = asyncio.Event()
+
+        async def stream_chat(
+            self,
+            messages: list[dict[str, Any]],
+            temperature: float = 0.0,
+            tools=None,
+        ) -> AsyncGenerator[StreamChunk, None]:
+            self.received_messages.append(list(messages))
+            self._call_count += 1
+            if self._call_count == 1:
+                for fragment in (
+                    '<call_tool name="write_file">',
+                    '<arg name="file_path">completed.txt</arg>',
+                    '<arg name="content">completed-before-cancel\n</arg>',
+                    '<arg name="overwrite">false</arg>',
+                    "</call_tool>",
+                ):
+                    yield StreamChunk(content=fragment)
+                yield StreamChunk(content="", is_done=True)
+                return
+            if self._call_count == 2:
+                self.second_request_started.set()
+                await asyncio.Event().wait()
+                return
+            raise AssertionError("the cancelled turn unexpectedly requested another response")
+
+        async def aclose(self) -> None:
+            return None
+
+    provider = CancelAfterWriteProvider()
+
+    async def cancel_turn() -> str:
+        loop = _make_loop(workspace, db_path, provider)
+        from ash.core.checkpoints import FileCheckpointMiddleware
+        from ash.core.secret_middleware import SecretRedactionMiddleware
+
+        def checkpoint_context() -> tuple[str, str, str] | None:
+            if loop.current_session is None or loop.turn_context is None:
+                return None
+            return (
+                loop.current_session.session_id,
+                loop.turn_context.turn_id,
+                str(loop.turn_context.get("tool_call_id", "")),
+            )
+
+        loop.tool_middlewares.extend(
+            [
+                FileCheckpointMiddleware(
+                    loop.session_store, loop.safety_guard, checkpoint_context
+                ),
+                SecretRedactionMiddleware(),
+            ]
+        )
+        await asyncio.wait_for(loop.start_session(), timeout=5)
+        assert loop.current_session is not None
+        session_id = loop.current_session.session_id
+        turn = asyncio.create_task(loop.run_turn("write the fixture file"))
+        try:
+            await asyncio.wait_for(provider.second_request_started.wait(), timeout=5)
+            turn.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(turn, timeout=5)
+        finally:
+            if not turn.done():
+                turn.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(turn, return_exceptions=True), timeout=5
+            )
+            await asyncio.wait_for(loop.aclose(), timeout=5)
+        return session_id
+
+    session_id = asyncio.run(cancel_turn())
+
+    written_bytes = b"completed-before-cancel\n"
+    written_path = workspace / "completed.txt"
+    assert written_path.read_bytes() == written_bytes
+    digest = hashlib.sha256(written_bytes).hexdigest()
+
+    session = SessionStore(db_path).load_session(session_id)
+    write_calls = [call for call in session.tool_calls if call.tool_name == "write_file"]
+    assert len(write_calls) == 1
+    write_call = write_calls[0]
+    assert write_call.approved is True
+    assert write_call.executed is True
+    assert write_call.error is None
+    assert provider._call_count == 2
+
+    store = SessionStore(db_path)
+    checkpoints = store.latest_file_checkpoints(session_id)
+    assert len(checkpoints) == 1
+    assert checkpoints[0]["call_id"] == write_call.call_id
+    assert checkpoints[0]["existed"] == 0
+    assert checkpoints[0]["after_sha256"] == digest
+    assert store.started_turns(session_id) == []
+    reports = store.interrupted_recovery_reports(session_id)
+    assert len(reports) == 1
+    report = reports[0]
+    assert report["status"] == "interrupted"
+    assert report["compensated_calls"] == []
+    assert report["unknown_calls"] == []
+    assert report["unresolved_files"] == []
+    assert report["recovered_calls"] == []
+    assert store.verify_audit_log(session_id) == []
+    assert any(
+        audit.details.get("call_id") == write_call.call_id
+        and audit.result == "SUCCESS"
+        for audit in store.list_audit_logs(session_id)
+    )
+
+    event_types = [
+        item.event["type"] for item in store.list_runtime_events(session_id, limit=100)
+    ]
+    completed_index = event_types.index("tool.completed")
+    request_cancelled_index = event_types.index("model.request.cancelled")
+    turn_cancelled_index = event_types.index("turn.cancelled")
+    assert completed_index < request_cancelled_index < turn_cancelled_index
+
+    def run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ash",
+                "--db-directory",
+                str(db_directory),
+                *arguments,
+            ],
+            cwd=workspace,
+            env=sanitized_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    recovery_result = run_cli("sessions", "recovery", "--session", session_id, "--json")
+    assert recovery_result.returncode == 0, recovery_result.stderr
+    recovery_payload = json.loads(recovery_result.stdout)
+    assert len(recovery_payload["reports"]) == 1
+    cli_report = recovery_payload["reports"][0]
+    assert cli_report["status"] == "interrupted"
+    assert cli_report["turn_id"] == report["turn_id"]
+    assert cli_report["compensated_calls"] == []
+    assert cli_report["unknown_calls"] == []
+    assert cli_report["unresolved_files"] == []
+
+    audit_result = run_cli("audit", "verify", "--session", session_id, "--json")
+    assert audit_result.returncode == 0, audit_result.stderr
+    audit_payload = json.loads(audit_result.stdout)
+    assert audit_payload["ok"] is True
+    assert audit_payload["errors"] == []
+
+    git_status = git("status", "--short", "--untracked-files=all").splitlines()
+    assert git_status == ["?? completed.txt"]
+    commits = git("log", "--oneline").splitlines()
+    assert len(commits) == 1
+    assert commits[0].endswith(" seed")
+
+    record_property(
+        "ash.explorer.evidence",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "scenario": "cancel_after_completed_write",
+                "session_id": session_id,
+                "file_sha256": digest,
+                "tool_call": {
+                    "approved": write_call.approved,
+                    "executed": write_call.executed,
+                    "succeeded": write_call.error is None,
+                },
+                "recovery_status": report["status"],
+                "recovery_counts": {
+                    "compensated": len(report["compensated_calls"]),
+                    "unknown": len(report["unknown_calls"]),
+                    "unresolved": len(report["unresolved_files"]),
+                    "recovered": len(report["recovered_calls"]),
+                },
+                "runtime_event_order": [
+                    event_types[completed_index],
+                    event_types[request_cancelled_index],
+                    event_types[turn_cancelled_index],
+                ],
+                "audit_valid": audit_payload["ok"],
+                "git_status": git_status,
+                "commit_count": len(commits),
+                "cli_exit_codes": {
+                    "recovery": recovery_result.returncode,
+                    "audit_verify": audit_result.returncode,
+                },
+                "reproduction_command": (
+                    'evidence_dir="$(mktemp -d "${TMPDIR:-/tmp}/ash-explorer.XXXXXX")" && '
+                    "PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q "
+                    "--timeout=45 --timeout-method=thread "
+                    "-p no:cacheprovider -o junit_family=xunit1 "
+                    "tests/e2e/test_real_session.py::"
+                    "test_e2e_explorer_cancelled_turn_preserves_completed_write "
+                    '--junitxml="$evidence_dir/results.xml"'
+                ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
