@@ -265,9 +265,7 @@ class JSONRPCServer:
         ]
 
     async def _fork_session(self, params: dict[str, Any]) -> dict[str, str]:
-        session_id = params.get("session_id")
-        if session_id is not None and not isinstance(session_id, str):
-            raise ValueError("session_id must be a string")
+        session_id = _optional_session_id(params)
         message_count = params.get("message_count")
         if message_count is not None and (
             not isinstance(message_count, int)
@@ -298,18 +296,14 @@ class JSONRPCServer:
         }
 
     async def _session_tree(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        session_id = params.get("session_id")
-        if session_id is not None and not isinstance(session_id, str):
-            raise ValueError("session_id must be a string")
+        session_id = _optional_session_id(params)
         return [
             item.model_dump(mode="json")
             for item in self.client.session_tree(session_id)
         ]
 
     async def _list_events(self, params: dict[str, Any]) -> dict[str, Any]:
-        session_id = params.get("session_id")
-        if session_id is not None and not isinstance(session_id, str):
-            raise ValueError("session_id must be a string")
+        session_id = _optional_session_id(params)
         after_sequence = _bounded_integer(
             params.get("after_sequence", 0),
             name="after_sequence",
@@ -353,6 +347,17 @@ class JSONRPCServer:
             "context_tokens": self.client.loop._last_context_tokens,
             "usage": self.client.loop.last_turn_usage,
         }
+
+
+def _optional_session_id(params: dict[str, Any]) -> str | None:
+    session_id = params.get("session_id")
+    if session_id is not None and (
+        not isinstance(session_id, str)
+        or not session_id
+        or len(session_id.encode("utf-8")) > 512
+    ):
+        raise ValueError("session_id must be a non-empty string of at most 512 bytes")
+    return session_id
 
 
 def _bounded_integer(

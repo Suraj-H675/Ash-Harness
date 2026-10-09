@@ -304,6 +304,28 @@ async def test_jsonrpc_forks_and_lists_session_tree() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ("session/fork", "session/tree", "event/list"))
+@pytest.mark.parametrize(
+    "session_id", ("", "é" * 257), ids=("empty", "oversized-utf8")
+)
+async def test_jsonrpc_rejects_invalid_explicit_optional_session_ids(
+    method: str, session_id: str
+) -> None:
+    server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
+
+    response = await server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": {"session_id": session_id},
+        }
+    )
+
+    assert response["error"]["code"] == -32602
+
+
+@pytest.mark.asyncio
 async def test_jsonrpc_turn_validation_and_unknown_method() -> None:
     server = JSONRPCServer(FakeClient())  # type: ignore[arg-type]
     response = await server.handle_request(
