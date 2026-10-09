@@ -3819,6 +3819,37 @@ async def test_repeated_compaction_bounds_live_history_without_pruning_durable_h
 
 
 @pytest.mark.asyncio
+async def test_resuming_old_session_marks_it_active_for_other_retention_workers(
+    tmp_path: Path,
+) -> None:
+    config = AshConfig(
+        model="custom/retention-resume",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(tmp_path / "resume-retention.db")
+    resumed = store.create_session(str(tmp_path), model=config.model)
+    expired = store.create_session(str(tmp_path), model=config.model)
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?",
+            ("2020-01-01T00:00:00+00:00",),
+        )
+    loop = AshLoop(
+        store, MockProvider(), SafetyGuard(tmp_path), EventUI(), tmp_path, config=config
+    )
+    try:
+        assert (await loop.start_session(resumed.session_id)).session_id == resumed.session_id
+        worker = SessionStore(store.db_path)
+        assert worker.cleanup_sessions(30, project_path=str(tmp_path)) == 1
+        assert store.session_exists(resumed.session_id)
+        assert not store.session_exists(expired.session_id)
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_session_resume_loads_only_persisted_runtime_history_window(tmp_path) -> None:
     config = AshConfig(
         model="custom/runtime-window-resume",

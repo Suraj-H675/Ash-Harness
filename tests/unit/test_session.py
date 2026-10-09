@@ -1252,6 +1252,31 @@ def test_session_cleanup_deletes_only_complete_inactive_trees(tmp_path: Path) ->
         store.load_session(child.session_id)
 
 
+def test_protected_session_remains_recent_for_subsequent_retention_cleanup(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "retention.db")
+    root = store.create_session(str(tmp_path))
+    active = store.fork_session(root.session_id, branch_name="resumed")
+    expired = store.create_session(str(tmp_path))
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?",
+            ("2020-01-01T00:00:00+00:00",),
+        )
+
+    assert store.cleanup_sessions(
+        30, project_path=str(tmp_path), protected_session_id=active.session_id
+    ) == 1
+    # A second Ash process applies retention while the resumed user is idle.
+    other_store = SessionStore(store.db_path)
+    assert other_store.cleanup_sessions(30, project_path=str(tmp_path)) == 0
+    assert store.load_session(root.session_id).session_id == root.session_id
+    assert store.load_session(active.session_id).session_id == active.session_id
+    with pytest.raises(KeyError, match="Session not found"):
+        store.load_session(expired.session_id)
+
+
 def test_session_retention_does_not_delete_old_session_during_a_new_turn(
     tmp_path: Path,
 ) -> None:

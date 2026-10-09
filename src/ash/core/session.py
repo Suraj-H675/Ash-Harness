@@ -2779,11 +2779,35 @@ class SessionStore:
             )
             params += (protected_session_id,)
         with closing(self._connect()) as conn, conn:
+            if protected_session_id is not None:
+                scope = " AND project_key = ?" if project_path is not None else ""
+                activity_params: tuple[Any, ...] = (
+                    _serialize_datetime(_utc_now()),
+                    protected_session_id,
+                )
+                if project_path is not None:
+                    activity_params += (normalize_project_path(project_path),)
+                conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?" + scope,
+                    activity_params,
+                )
             cursor = conn.execute(query, params)
             deleted = cursor.rowcount
         with closing(self._connect()) as conn:
             conn.execute("VACUUM")
         return deleted
+
+    def mark_session_active(self, session_id: str) -> datetime:
+        """Record that a saved conversation was resumed, even before its next turn."""
+        now = _utc_now()
+        with closing(self._connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                (_serialize_datetime(now), session_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Session not found: {session_id}")
+        return now
 
     def start_turn(self, session_id: str, turn_id: str, user_input: str) -> None:
         """Persist intent before provider or tool work starts."""

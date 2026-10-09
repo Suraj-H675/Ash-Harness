@@ -2069,6 +2069,9 @@ class AshLoop:
                     session_id,
                     runtime_window=True,
                 )
+                restored_session.updated_at = self.session_store.mark_session_active(
+                    session_id
+                )
             finally:
                 session_lease.close()
             self.current_session = restored_session
