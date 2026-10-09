@@ -1596,7 +1596,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         print("Usage: /sessions prune <days>", file=sys.stderr)
                         continue
                     deleted = loop.session_store.cleanup_sessions(
-                        retention_days, project_path=str(loop.project_root)
+                        retention_days,
+                        project_path=str(loop.project_root),
+                        protected_session_id=(
+                            loop.current_session.session_id
+                            if loop.current_session is not None
+                            else None
+                        ),
                     )
                     print(f"Deleted {deleted} expired session(s).")
                     continue

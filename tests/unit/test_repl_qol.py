@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from ash.cli import _repl, _session_usage_lines
-from ash.core.session import Message, SessionStore, SessionUsage
+from ash.core.session import Message, SessionStore, SessionUsage, get_db_connection
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionMode, PermissionPolicy
 from ash.tools.base import ToolResult
@@ -375,6 +375,37 @@ async def test_resume_accepts_multiword_session_title_without_quoting(
     output = capsys.readouterr()
     assert "Usage: /resume" not in output.err
     assert output.out.count("Resumed chat.") == 2
+
+
+@pytest.mark.asyncio
+async def test_prune_preserves_current_session_tree_while_deleting_other_expired_trees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    current = store.create_session(str(tmp_path), model="ollama/test-model")
+    child = store.fork_session(current.session_id, branch_name="work")
+    expired = store.create_session(str(tmp_path), model="ollama/test-model")
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?",
+            ("2020-01-01T00:00:00+00:00",),
+        )
+
+    assert await _run_repl(
+        tmp_path,
+        monkeypatch,
+        iter(("/sessions prune 30", "/exit")),
+        session_store=store,
+        current_session=current,
+    ) == 0
+
+    assert store.load_session(current.session_id).session_id == current.session_id
+    assert store.load_session(child.session_id).session_id == child.session_id
+    with pytest.raises(KeyError, match="Session not found"):
+        store.load_session(expired.session_id)
+    assert "Deleted 1 expired session(s)." in capsys.readouterr().out
 
 
 @pytest.mark.asyncio

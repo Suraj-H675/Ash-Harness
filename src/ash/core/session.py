@@ -2745,7 +2745,11 @@ class SessionStore:
         return dict(row)
 
     def cleanup_sessions(
-        self, retention_days: int, *, project_path: str | None = None
+        self,
+        retention_days: int,
+        *,
+        project_path: str | None = None,
+        protected_session_id: str | None = None,
     ) -> int:
         """Delete old sessions and compact the database explicitly."""
         if retention_days < 1:
@@ -2761,15 +2765,21 @@ class SessionStore:
             if project_path is not None
             else (_serialize_datetime(cutoff),)
         )
-        with closing(self._connect()) as conn, conn:
-            cursor = conn.execute(
-                "DELETE FROM sessions WHERE root_session_id IN ("
-                "SELECT root_session_id FROM sessions"
-                + clause
-                + " GROUP BY root_session_id "
-                "HAVING MAX(COALESCE(updated_at, created_at)) < ?) ",
-                params,
+        query = (
+            "DELETE FROM sessions WHERE root_session_id IN ("
+            "SELECT root_session_id FROM sessions"
+            + clause
+            + " GROUP BY root_session_id "
+            "HAVING MAX(COALESCE(updated_at, created_at)) < ?)"
+        )
+        if protected_session_id is not None:
+            query += (
+                " AND root_session_id NOT IN ("
+                "SELECT root_session_id FROM sessions WHERE session_id = ?)"
             )
+            params += (protected_session_id,)
+        with closing(self._connect()) as conn, conn:
+            cursor = conn.execute(query, params)
             deleted = cursor.rowcount
         with closing(self._connect()) as conn:
             conn.execute("VACUUM")
