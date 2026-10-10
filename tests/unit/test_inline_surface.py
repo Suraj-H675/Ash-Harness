@@ -488,25 +488,44 @@ async def test_transcript_scroll_keeps_bottom_chrome_pinned_and_does_not_follow_
             transcript=transcript,
         )
         pending = asyncio.create_task(surface.read())
-        await asyncio.sleep(0.05)
 
         def screen_rows() -> dict[int, str]:
             screen = surface.application.renderer._last_screen
-            assert screen is not None
+            if screen is None:
+                return {}
             return {
                 row: "".join(cell.char for _column, cell in sorted(cells.items()))
                 for row, cells in screen.data_buffer.items()
             }
 
-        initial = screen_rows()
+        async def wait_for_render(predicate) -> dict[int, str]:
+            ready = asyncio.get_running_loop().create_future()
+
+            def on_render(_app) -> None:
+                rows = screen_rows()
+                if predicate(rows) and not ready.done():
+                    ready.set_result(rows)
+
+            surface.application.after_render += on_render
+            try:
+                surface.invalidate()
+                return await asyncio.wait_for(ready, timeout=2)
+            finally:
+                surface.application.after_render -= on_render
+
+        initial = await wait_for_render(
+            lambda rows: any("›" in text for text in rows.values())
+            and any("model" in text for text in rows.values())
+        )
         composer_row = next(row for row, text in initial.items() if "›" in text)
         status_row = next(row for row, text in initial.items() if "model" in text)
         assert composer_row == 18
         assert status_row == 19
 
         surface.transcript_view.scroll(-7)
-        await asyncio.sleep(0.05)
-        detached_rows = screen_rows()
+        detached_rows = await wait_for_render(
+            lambda rows: any("Ctrl+End" in text for text in rows.values())
+        )
         assert surface.transcript_view.detached is True
         assert "Ctrl+End" in "\n".join(detached_rows.values())
         assert next(row for row, text in detached_rows.items() if "›" in text) == composer_row
@@ -515,16 +534,16 @@ async def test_transcript_scroll_keeps_bottom_chrome_pinned_and_does_not_follow_
         anchor = surface.transcript_view._anchor_id
         live_id = transcript.begin("assistant", title="ash")
         transcript.append_delta(live_id, "new streamed content")
-        await asyncio.sleep(0.05)
         assert surface.transcript_view.detached is True
         assert surface.transcript_view._anchor_id == anchor
 
         surface.transcript_view.scroll_to_latest()
         transcript.finalize(live_id)
-        await asyncio.sleep(0.05)
         assert surface.transcript_view.follow_latest is True
-        current_rows = "\n".join(screen_rows().values())
-        assert "new streamed content" in current_rows
+        current = await wait_for_render(
+            lambda rows: any("new streamed content" in text for text in rows.values())
+        )
+        assert "new streamed content" in "\n".join(current.values())
         pipe.send_text("done\r")
         assert await pending == "done"
         await surface.aclose()
