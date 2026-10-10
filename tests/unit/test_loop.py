@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import os
 import shlex
+import sqlite3
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -8669,7 +8670,14 @@ async def test_read_only_tool_calls_bound_parallel_fanout(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_parallel_read_only_calls_preserve_results_on_cancellation(tmp_path):
+async def test_parallel_read_only_calls_drain_siblings_on_parent_cancellation(
+    tmp_path,
+):
+    sibling_started = asyncio.Event()
+    sibling_cleanup_started = asyncio.Event()
+    allow_sibling_cleanup = asyncio.Event()
+    sibling_finished = asyncio.Event()
+
     class CancellableReadTool(BaseTool):
         name = "test_cancellable_read"
         args_schema = None
@@ -8677,7 +8685,14 @@ async def test_parallel_read_only_calls_preserve_results_on_cancellation(tmp_pat
 
         async def run(self, **kwargs):
             if kwargs["index"] == 1:
-                await asyncio.Event().wait()
+                sibling_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    sibling_cleanup_started.set()
+                    await allow_sibling_cleanup.wait()
+                    sibling_finished.set()
+                    raise
             return ToolResult(success=True, output=f"result-{kwargs['index']}")
 
     guard = SafetyGuard(project_root=tmp_path)
@@ -8705,13 +8720,206 @@ async def test_parallel_read_only_calls_preserve_results_on_cancellation(tmp_pat
             session,
         )
     )
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(sibling_started.wait(), timeout=1)
     batch.cancel()
+    try:
+        await asyncio.wait_for(sibling_cleanup_started.wait(), timeout=1)
+        assert not batch.done(), "turn cancellation returned before sibling cleanup"
+    finally:
+        allow_sibling_cleanup.set()
     with pytest.raises(asyncio.CancelledError):
         await batch
 
     records = store.load_session(session.session_id).tool_calls
     assert any(record.dispatched is True for record in records)
+    assert sibling_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_parallel_read_only_calls_drain_siblings_after_intent_store_failure(
+    tmp_path, monkeypatch
+):
+    sibling_started = asyncio.Event()
+    sibling_release = asyncio.Event()
+    sibling_cleanup_started = asyncio.Event()
+    allow_sibling_cleanup = asyncio.Event()
+    sibling_finished = asyncio.Event()
+    failure_raised = asyncio.Event()
+    failed_call_started = asyncio.Event()
+
+    class SlowReadTool(BaseTool):
+        name = "test_slow_read"
+        args_schema = None
+        execution_contract = ToolExecutionContract(parallel_safe=True)
+
+        async def run(self, **kwargs):
+            if kwargs["index"] == 0:
+                failed_call_started.set()
+            else:
+                sibling_started.set()
+                try:
+                    await sibling_release.wait()
+                except asyncio.CancelledError:
+                    sibling_cleanup_started.set()
+                    await allow_sibling_cleanup.wait()
+                    sibling_finished.set()
+                    raise
+                sibling_finished.set()
+            return ToolResult(success=True, output=f"result-{kwargs['index']}")
+
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "parallel-store-failure.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"test_slow_read": SlowReadTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+    save_tool_call = store.save_tool_call
+
+    with get_db_connection(store.db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TRIGGER fail_tool_call_intent
+            BEFORE INSERT ON tool_calls
+            WHEN NEW.call_id = 'db-failure'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected tool intent store failure');
+            END;
+            """
+        )
+
+    def observe_intent_save_failure(session_id, record, *, turn_id=None):
+        try:
+            save_tool_call(session_id, record, turn_id=turn_id)
+        except sqlite3.IntegrityError:
+            if record.call_id == "db-failure":
+                failure_raised.set()
+            raise
+
+    monkeypatch.setattr(store, "save_tool_call", observe_intent_save_failure)
+
+    async def approve_tool(_tool_name, arguments):
+        if arguments["index"] == 0:
+            await asyncio.wait_for(sibling_started.wait(), timeout=1)
+        return True
+
+    loop.on_tool_approval = approve_tool
+    batch = asyncio.create_task(
+        loop._execute_tool_calls(
+            [
+                {
+                    "call_id": "db-failure",
+                    "name": "test_slow_read",
+                    "arguments": {"index": 0},
+                },
+                {
+                    "call_id": "sibling",
+                    "name": "test_slow_read",
+                    "arguments": {"index": 1},
+                },
+            ],
+            session,
+            persist_tool_messages=True,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(failure_raised.wait(), timeout=1)
+        done, _ = await asyncio.wait({batch}, timeout=0.05)
+        returned_before_sibling_finished = bool(done)
+        assert not returned_before_sibling_finished, (
+            "batch returned from the tool intent-store failure while its sibling "
+            "was still running"
+        )
+        assert sibling_cleanup_started.is_set()
+    finally:
+        sibling_release.set()
+        allow_sibling_cleanup.set()
+        outcome = await asyncio.gather(batch, return_exceptions=True)
+
+    assert isinstance(outcome[0], sqlite3.IntegrityError)
+    assert "injected tool intent store failure" in str(outcome[0])
+    assert not failed_call_started.is_set()
+    assert sibling_finished.is_set()
+    records = {record.call_id: record for record in store.load_session(session.session_id).tool_calls}
+    assert records["sibling"].dispatched is True
+    assert records["sibling"].executed is False
+
+
+@pytest.mark.asyncio
+async def test_parallel_read_only_child_cancellation_cancels_and_drains_siblings(
+    tmp_path,
+):
+    sibling_started = asyncio.Event()
+    sibling_release = asyncio.Event()
+    sibling_cleanup_started = asyncio.Event()
+    allow_sibling_cleanup = asyncio.Event()
+    sibling_finished = asyncio.Event()
+    cancellation_raised = asyncio.Event()
+
+    class CancellableReadTool(BaseTool):
+        name = "test_cancellable_read"
+        args_schema = None
+        execution_contract = ToolExecutionContract(parallel_safe=True)
+
+        async def run(self, **kwargs):
+            if kwargs["index"] == 0:
+                await asyncio.wait_for(sibling_started.wait(), timeout=1)
+                cancellation_raised.set()
+                raise asyncio.CancelledError
+            sibling_started.set()
+            try:
+                await sibling_release.wait()
+            except asyncio.CancelledError:
+                sibling_cleanup_started.set()
+                await allow_sibling_cleanup.wait()
+                sibling_finished.set()
+                raise
+
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "parallel-child-cancel.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"test_cancellable_read": CancellableReadTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+    batch = asyncio.create_task(
+        loop._execute_tool_calls(
+            [
+                {
+                    "call_id": f"cancel-{index}",
+                    "name": "test_cancellable_read",
+                    "arguments": {"index": index},
+                }
+                for index in range(2)
+            ],
+            session,
+            persist_tool_messages=True,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(cancellation_raised.wait(), timeout=1)
+        done, _ = await asyncio.wait({batch}, timeout=0.05)
+        assert not done, "child cancellation escaped while a sibling was pending"
+        assert sibling_cleanup_started.is_set()
+    finally:
+        sibling_release.set()
+        allow_sibling_cleanup.set()
+        outcome = await asyncio.gather(batch, return_exceptions=True)
+
+    assert isinstance(outcome[0], asyncio.CancelledError)
+    assert sibling_finished.is_set()
 
 
 @pytest.mark.asyncio

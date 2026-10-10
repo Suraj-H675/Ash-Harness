@@ -5500,9 +5500,17 @@ class AshLoop:
                         ),
                     )
 
-            grouped = await asyncio.gather(
-                *(execute_read_only(call) for call in tool_calls)
-            )
+            tasks = [
+                asyncio.create_task(execute_read_only(call)) for call in tool_calls
+            ]
+            try:
+                grouped = await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
             flattened = [result for group in grouped for result in group]
             if persist_tool_messages:
                 for call, result in zip(tool_calls, flattened, strict=True):
