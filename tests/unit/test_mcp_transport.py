@@ -195,27 +195,41 @@ async def test_http_post_rejects_oversized_response_before_json_parsing(
         await http.aclose()
 
 
-@pytest.mark.asyncio
-async def test_sse_line_reader_rejects_unterminated_event() -> None:
-    response = httpx.Response(200, content=b"data: " + b"x" * 33)
+def test_sse_decoder_rejects_oversized_unterminated_event() -> None:
+    decoder = mcp_client_module.SSEDecoder(32)
 
-    with pytest.raises(MCPProtocolError, match="SSE event exceeded 32 bytes"):
-        async for _line in mcp_client_module._iter_bounded_sse_lines(response, 32):
-            pass
+    with pytest.raises(ValueError, match="SSE event exceeded 32 bytes"):
+        list(decoder.feed(b"data: " + b"x" * 33))
 
 
-@pytest.mark.asyncio
-async def test_sse_line_reader_limits_individual_events_not_coalesced_chunks() -> None:
+def test_sse_decoder_limits_individual_events_not_coalesced_chunks() -> None:
     payload = b"data: one\n\ndata: two\n\ndata: three\n\n"
     assert len(payload) > 16
-    response = httpx.Response(200, stream=httpx.ByteStream(payload))
+    decoder = mcp_client_module.SSEDecoder(16)
+    events = list(decoder.feed(payload))
 
-    lines = [
-        line
-        async for line in mcp_client_module._iter_bounded_sse_lines(response, 16)
+    assert [event.data for event in events] == ["one", "two", "three"]
+
+
+def test_sse_decoder_handles_split_bom_crlf_fields_and_empty_event_id() -> None:
+    decoder = mcp_client_module.SSEDecoder(128)
+    chunks = (
+        b"\xef",
+        b"\xbb\xbfdata:  first\r",
+        b"\nevent: message\r\n",
+        b"data: second\r\nid: event-1\r",
+        b"\nretry: 0\r\n\r",
+        b"\nid:\n\n",
+    )
+
+    events = [event for chunk in chunks for event in decoder.feed(chunk)]
+
+    assert [(event.event, event.data, event.event_id) for event in events] == [
+        ("message", " first\nsecond", "event-1"),
+        ("", None, ""),
     ]
-
-    assert lines == ["data: one", "", "data: two", "", "data: three", ""]
+    assert decoder.last_event_id == ""
+    assert decoder.retry_ms == 0
 
 
 def test_http_sse_parser_rejects_oversized_event(
@@ -231,6 +245,80 @@ def test_http_sse_parser_rejects_oversized_event(
 
     with pytest.raises(MCPProtocolError, match="SSE event exceeded 32 bytes"):
         mcp_client_module._parse_http_messages(response)
+
+
+def test_http_sse_parser_discards_incomplete_event_at_eof() -> None:
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=b'data: {"jsonrpc":"2.0","id":1,"result":{}}\n',
+    )
+
+    assert mcp_client_module._parse_http_messages(response) == []
+
+
+def test_http_sse_parser_handles_bom_and_cr_only_line_endings() -> None:
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=(
+            b'\xef\xbb\xbfdata: {"jsonrpc":"2.0","id":1,"result":{}}\r\r'
+        ),
+    )
+
+    assert mcp_client_module._parse_http_messages(response) == [
+        {"jsonrpc": "2.0", "id": 1, "result": {}}
+    ]
+
+
+def test_http_sse_parser_ignores_empty_data_cursor_event() -> None:
+    response = httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=b"id: resume-here\ndata:\n\n",
+    )
+
+    assert mcp_client_module._parse_http_messages(response) == []
+
+
+@pytest.mark.asyncio
+async def test_http_streamed_sse_bounds_individual_events_not_total_traffic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_client_module, "MAX_HTTP_RESPONSE_BYTES", 64)
+
+    class ManySmallEvents(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(12):
+                yield b"id: cursor\n\n"
+            yield b'data: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=ManySmallEvents(),
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    client._initialized = True
+    client.protocol_version = "2025-06-18"
+    try:
+        assert await client.request("ping") == {}
+    finally:
+        await client.disconnect()
+        await http.aclose()
 
 
 @pytest.mark.parametrize(
@@ -260,13 +348,20 @@ def test_http_parsers_reject_duplicate_json_keys(content_type: str, body: bytes)
 @pytest.mark.asyncio
 async def test_http_get_stream_dispatches_events_and_honors_405() -> None:
     requests: list[httpx.Request] = []
-    mode = {"get": True}
+    mode = {"get": "events"}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
             requests.append(request)
-            if not mode["get"]:
+            if mode["get"] == "off":
                 return httpx.Response(405)
+            if mode["get"] == "clear":
+                mode["get"] = "off"
+                return httpx.Response(
+                    200,
+                    text="id:\n\n",
+                    headers={"content-type": "text/event-stream"},
+                )
             body = (
                 "retry: 5\n"
                 'id: event-1\ndata: {"jsonrpc":"2.0","method":"notifications/message",'
@@ -325,7 +420,7 @@ async def test_http_get_stream_dispatches_events_and_honors_405() -> None:
     assert requests[0].headers["MCP-Protocol-Version"] == "2025-06-18"
     assert "Last-Event-ID" not in requests[0].headers
 
-    mode["get"] = False
+    mode["get"] = "clear"
     client._sse_supported = True
     client._sse_generation += 1
     client._sse_task = asyncio.create_task(client._read_http_events())
@@ -333,7 +428,8 @@ async def test_http_get_stream_dispatches_events_and_honors_405() -> None:
         await asyncio.sleep(0.01)
         if client._sse_supported is False:
             break
-    assert requests[-1].headers.get("Last-Event-ID") == "event-1"
+    assert requests[-2].headers.get("Last-Event-ID") == "event-1"
+    assert "Last-Event-ID" not in requests[-1].headers
     assert client._sse_supported is False
 
     await client.disconnect()
@@ -378,6 +474,381 @@ async def test_http_get_stream_handles_huge_valid_retry_without_overflow(
     assert client._sse_retry_ms == int(retry)
     assert sleeps == [mcp_client_module.MAX_SSE_RETRY_SLEEP_SLICE_MS / 1000]
     await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_get_404_recovers_session_and_clears_event_cursor() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            requests.append(request)
+            if request.headers.get("Mcp-Session-Id") == "session-1":
+                return httpx.Response(404)
+            return httpx.Response(405)
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        if payload["method"] == "initialize":
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": "session-2"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                    },
+                },
+            )
+        if payload["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        raise AssertionError(f"unexpected request payload: {payload}")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    client._initialized = True
+    client._http_session_id = "session-1"
+    client._session_generation = 1
+    client._sse_generation = 1
+    client._sse_last_event_id = "stale-event"
+    client.protocol_version = "2025-06-18"
+    client._sse_supported = True
+    try:
+        await client._read_http_events()
+        for _ in range(10):
+            if client._sse_task is not None and client._sse_task.done():
+                break
+            await asyncio.sleep(0)
+
+        assert requests[0].headers["Last-Event-ID"] == "stale-event"
+        assert requests[1].headers["Mcp-Session-Id"] == "session-2"
+        assert "Last-Event-ID" not in requests[1].headers
+        assert sum(
+            request.method == "GET"
+            and request.headers.get("Mcp-Session-Id") == "session-2"
+            for request in requests
+        ) == 1
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_post_sse_resumes_after_socket_disconnect_without_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_client_module, "MAX_HTTP_RESPONSE_BYTES", 64)
+    requests: list[tuple[str, dict[str, str]]] = []
+
+    async def read_request(
+        reader: asyncio.StreamReader,
+    ) -> tuple[str, dict[str, str], bytes]:
+        request_line = await reader.readline()
+        method = request_line.decode("ascii").split(" ", 1)[0]
+        headers: dict[str, str] = {}
+        while line := await reader.readline():
+            if line in {b"\r\n", b"\n"}:
+                break
+            name, value = line.decode("latin-1").split(":", 1)
+            headers[name.casefold()] = value.strip()
+        body_length = int(headers.get("content-length", "0"))
+        body = await reader.readexactly(body_length) if body_length else b""
+        return method, headers, body
+
+    async def send_chunk(writer: asyncio.StreamWriter, body: bytes) -> None:
+        writer.write(f"{len(body):x}\r\n".encode("ascii") + body + b"\r\n")
+        await writer.drain()
+
+    async def handle(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        method, headers, body = await read_request(reader)
+        requests.append((method, headers))
+        try:
+            if method == "POST":
+                payload = json.loads(body)
+                assert payload["method"] == "tools/call"
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/event-stream\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                await send_chunk(
+                    writer, b"retry: 0\r\nid: tcp-cursor-1\ndata:\n\n"
+                )
+                # Close before the terminating chunk to reproduce a dropped
+                # response stream after the server accepted the single POST.
+            elif method == "GET":
+                assert headers["last-event-id"] == "tcp-cursor-1"
+                result = (
+                    b'id: tcp-cursor-2\ndata: '
+                    b'{"jsonrpc":"2.0","id":1,"result":{"content":[]}}\n\n'
+                )
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/event-stream\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                await send_chunk(writer, result)
+                writer.write(b"0\r\n\r\n")
+                await writer.drain()
+            elif method == "DELETE":
+                writer.write(
+                    b"HTTP/1.1 405 Method Not Allowed\r\n"
+                    b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                await writer.drain()
+            else:
+                raise AssertionError(f"unexpected method: {method}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    http = httpx.AsyncClient(timeout=1, trust_env=False)
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url=f"http://127.0.0.1:{port}/rpc",
+        ),
+        http_client=http,
+        timeout=1,
+    )
+    client._initialized = True
+    client._http_session_id = "session-1"
+    client._session_generation = 3
+    client.protocol_version = "2025-06-18"
+    try:
+        result = await client.request(
+            "tools/call", {"name": "write", "arguments": {"value": 1}}
+        )
+
+        assert result["content"] == []
+        assert [method for method, _ in requests] == ["POST", "GET"]
+        get_headers = requests[1][1]
+        assert get_headers["mcp-session-id"] == "session-1"
+        assert get_headers["mcp-protocol-version"] == "2025-06-18"
+        assert get_headers["last-event-id"] == "tcp-cursor-1"
+    finally:
+        await client.disconnect()
+        await http.aclose()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_modern_http_does_not_resume_post_sse_with_get() -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        if request.method == "GET":
+            raise AssertionError("modern MCP HTTP must not resume SSE with GET")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"retry: 0\nid: event-1\n\n",
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    client._initialized = True
+    client._session_generation = 1
+    client.protocol_version = mcp_client_module.MODERN_PROTOCOL_VERSION
+    try:
+        with pytest.raises(MCPProtocolError, match="omitted request id 1"):
+            await client.request(
+                "tools/call", {"name": "write", "arguments": {"value": 1}}
+            )
+
+        assert methods == ["POST"]
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resumed_post_404_recovers_without_replaying_tool_call() -> None:
+    trace: list[tuple[str, str | None]] = []
+    tool_post_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tool_post_count
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        if request.method == "GET":
+            trace.append(("GET", request.headers.get("Mcp-Session-Id")))
+            if request.headers.get("Mcp-Session-Id") == "session-1":
+                return httpx.Response(404)
+            return httpx.Response(405)
+        payload = json.loads(request.content)
+        method = payload["method"]
+        session_id = request.headers.get("Mcp-Session-Id")
+        trace.append((method, session_id))
+        if method == "tools/call":
+            tool_post_count += 1
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"retry: 0\nid: resume-1\n\n",
+            )
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": "session-2"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        raise AssertionError(f"unexpected request method: {method}")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+        timeout=1,
+    )
+    client._initialized = True
+    client._http_session_id = "session-1"
+    client._session_generation = 3
+    client.protocol_version = "2025-06-18"
+    try:
+        with pytest.raises(MCPProtocolError, match="operation was not replayed"):
+            await client.request(
+                "tools/call", {"name": "write", "arguments": {"value": 1}}
+            )
+
+        for _ in range(10):
+            if client._sse_task is not None and client._sse_task.done():
+                break
+            await asyncio.sleep(0)
+        assert tool_post_count == 1
+        assert trace.count(("tools/call", "session-1")) == 1
+        assert trace.count(("initialize", None)) == 1
+    finally:
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("protocol_version", "expected_methods"),
+    [
+        (mcp_client_module.MODERN_PROTOCOL_VERSION, ["tools/call"]),
+        ("2025-06-18", ["tools/call", "notifications/cancelled"]),
+    ],
+)
+async def test_http_cancellation_closes_post_sse_without_replay(
+    protocol_version: str,
+    expected_methods: list[str],
+) -> None:
+    methods: list[str] = []
+    stream_started = asyncio.Event()
+    stream_closed = asyncio.Event()
+
+    class BlockedEvents(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"id: event-1\n\n"
+            stream_started.set()
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            stream_closed.set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(405)
+        if request.method == "GET":
+            raise AssertionError("cancelled request must not resume")
+        payload = json.loads(request.content)
+        methods.append(payload["method"])
+        if payload["method"] == "notifications/cancelled":
+            assert payload["params"]["requestId"] == 1
+            return httpx.Response(202)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=BlockedEvents(),
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote",
+            command="",
+            args=[],
+            env={},
+            transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+    )
+    client._initialized = True
+    client._session_generation = 1
+    client._http_session_id = "session-1" if protocol_version == "2025-06-18" else ""
+    client.protocol_version = protocol_version
+    task = asyncio.create_task(
+        client.request("tools/call", {"name": "write", "arguments": {}})
+    )
+    try:
+        await asyncio.wait_for(stream_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+        await asyncio.wait_for(stream_closed.wait(), timeout=1)
+
+        assert methods == expected_methods
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await client.disconnect()
+        await http.aclose()
 
 
 @pytest.mark.asyncio
@@ -2699,22 +3170,37 @@ async def test_refresh_storm_is_bounded_and_reported(tmp_path: Path) -> None:
 async def test_legacy_sse_discovers_endpoint_and_receives_async_response() -> None:
     requests: list[tuple[str, str]] = []
     initialized = asyncio.Event()
+    unsolicited_done = asyncio.Event()
+    posted_messages: asyncio.Queue[dict[str, object]] = asyncio.Queue()
 
     class StreamingSSETransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
             requests.append((request.method, str(request.url)))
             if request.url.path != "/sse":
+                posted_messages.put_nowait(json.loads(request.content))
                 return httpx.Response(202)
 
             class SSEStream(httpx.AsyncByteStream):
                 async def __aiter__(self):
                     yield b"event: endpoint\ndata: /messages?session=legacy-1\n\n"
+                    initialize = await posted_messages.get()
+                    assert initialize["method"] == "initialize"
                     yield (
-                        'event: message\ndata: {"jsonrpc":"2.0","id":1,'
+                        f'event: message\ndata: {{"jsonrpc":"2.0","id":{initialize["id"]},'
                         '"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n\n'
                     ).encode()
+                    for response_id in [2, *range(1000, 2000)]:
+                        yield (
+                            f'event: message\ndata: {{"jsonrpc":"2.0",'
+                            f'"id":{response_id},"result":{{}}}}\n\n'
+                        ).encode()
+                    unsolicited_done.set()
+                    list_tools = await posted_messages.get()
+                    while list_tools["method"] != "tools/list":
+                        list_tools = await posted_messages.get()
+                    assert list_tools["method"] == "tools/list"
                     yield (
-                        'event: message\ndata: {"jsonrpc":"2.0","id":2,'
+                        f'event: message\ndata: {{"jsonrpc":"2.0","id":{list_tools["id"]},'
                         '"result":{"tools":[]}}\n\n'
                     ).encode()
                     yield (
@@ -2743,10 +3229,16 @@ async def test_legacy_sse_discovers_endpoint_and_receives_async_response() -> No
         http_client=http,
     )
     notifications: list[str] = []
-    client.notification_handler = lambda method, params: notifications.append(method)
-    await asyncio.wait_for(client.connect(), timeout=1)
-    tools = await asyncio.wait_for(client.list_tools(), timeout=1)
-    initialized.set()
+
+    def on_notification(method: str, params: dict[str, object]) -> None:
+        notifications.append(method)
+        notification_received.set()
+
+    notification_received = asyncio.Event()
+    client.notification_handler = on_notification
+    await asyncio.wait_for(client.connect(), timeout=3)
+    await asyncio.wait_for(unsolicited_done.wait(), timeout=3)
+    tools = await asyncio.wait_for(client.list_tools(), timeout=3)
     await asyncio.wait_for(
         client.notify(
             "notifications/initialized",
@@ -2755,6 +3247,8 @@ async def test_legacy_sse_discovers_endpoint_and_receives_async_response() -> No
         ),
         timeout=1,
     )
+    await asyncio.wait_for(notification_received.wait(), timeout=1)
+    initialized.set()
     assert tools == []
     assert client._pending == {}
     assert client._legacy_sse_endpoint == (
@@ -2764,6 +3258,75 @@ async def test_legacy_sse_discovers_endpoint_and_receives_async_response() -> No
     await client.disconnect()
     await http.aclose()
     assert all(method != "DELETE" for method, _ in requests)
+
+
+@pytest.mark.asyncio
+async def test_legacy_sse_eof_fails_pending_requests_and_blocks_new_posts() -> None:
+    endpoint_seen = asyncio.Event()
+    post_seen = asyncio.Event()
+    close_stream = asyncio.Event()
+    post_count = 0
+
+    class StreamingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal post_count
+            if request.method == "POST":
+                post_count += 1
+                post_seen.set()
+                return httpx.Response(202)
+
+            class SSEStream(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    yield b"event: endpoint\ndata: /messages\n\n"
+                    endpoint_seen.set()
+                    await close_stream.wait()
+
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=SSEStream(),
+            )
+
+    http = httpx.AsyncClient(transport=StreamingTransport())
+    client = MCPClient(
+        MCPServerConfig(
+            name="legacy",
+            command="",
+            args=[],
+            env={},
+            transport="sse",
+            url="https://legacy.example.test/sse",
+        ),
+        http_client=http,
+        timeout=10,
+    )
+    client._legacy_sse_discovery = asyncio.get_running_loop().create_future()
+    client._sse_task = asyncio.create_task(client._read_legacy_sse_events(1))
+    try:
+        await asyncio.wait_for(endpoint_seen.wait(), timeout=1)
+        await asyncio.wait_for(client._legacy_sse_discovery, timeout=1)
+        request = asyncio.create_task(
+            client._request_legacy_sse(
+                1,
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            )
+        )
+        await asyncio.wait_for(post_seen.wait(), timeout=1)
+        close_stream.set()
+        with pytest.raises(MCPProtocolError, match="event stream closed"):
+            await asyncio.wait_for(request, timeout=1)
+
+        assert client._pending == {}
+        with pytest.raises(MCPProtocolError, match="event stream is disconnected"):
+            await client._request_legacy_sse(
+                2,
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            )
+        assert post_count == 1
+    finally:
+        close_stream.set()
+        await client.disconnect()
+        await http.aclose()
 
 
 @pytest.mark.asyncio
@@ -2934,14 +3497,18 @@ async def test_streamable_http_tool_call_sends_validated_parameter_headers() -> 
 
 @pytest.mark.asyncio
 async def test_legacy_sse_tool_calls_reject_http_parameter_headers() -> None:
+    initialize_posted = asyncio.Event()
+
     class StreamingSSETransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
             if request.url.path != "/sse":
+                initialize_posted.set()
                 return httpx.Response(202)
 
             class SSEStream(httpx.AsyncByteStream):
                 async def __aiter__(self):
                     yield b"event: endpoint\ndata: /messages\n\n"
+                    await initialize_posted.wait()
                     yield (
                         'event: message\ndata: {"jsonrpc":"2.0","id":1,'
                         '"result":{"protocolVersion":"2024-11-05","capabilities":{}}}\n\n'
