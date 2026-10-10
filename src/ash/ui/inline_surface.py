@@ -969,7 +969,7 @@ class InlinePromptSurface:
             if self._choice_mode:
                 choice_future = self._choice_future
                 if choice_future is not None and not choice_future.done():
-                    choice_future.set_result(None)
+                    choice_future.set_exception(PromptInterrupted())
                     self.application.invalidate()
                 return
             future = self._read_future

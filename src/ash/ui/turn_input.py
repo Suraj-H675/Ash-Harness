@@ -22,7 +22,7 @@ from ash.safety.grants import (
 )
 from ash.safety.policy import PolicyAction
 from ash.tools.base import sensitive_tool_argument_fields
-from ash.ui.input_signals import PromptInterrupted
+from ash.ui.input_signals import PromptInterrupted, UserRequestedTurnCancellation
 from ash.ui.notifications import NotificationEvent, NotificationSink
 from ash.ui.prompt import PromptChoice
 
@@ -176,7 +176,11 @@ class InteractiveTurnController:
                     self.write_status(f"Steering rejected: {exc}")
                     continue
                 self.write_status(f"Steering queued ({pending_count} pending).")
-            response = await turn
+            try:
+                response = await turn
+            except UserRequestedTurnCancellation:
+                await self._cancel_turn(turn)
+                return None
             self.ui.commit_completed_turn()
             message = "Ash turn complete."
             if self.notification_include_preview and response.strip():
@@ -467,7 +471,9 @@ class InteractiveTurnController:
         except PermissionGrantError as exc:
             self.write_status(f"Permission scope rejected: {exc}")
             return False
-        except (EOFError, KeyboardInterrupt, PromptInterrupted):
+        except PromptInterrupted as exc:
+            raise UserRequestedTurnCancellation() from exc
+        except (EOFError, KeyboardInterrupt):
             return False
 
     async def _select_approval(
@@ -671,7 +677,9 @@ class InteractiveTurnController:
                     .strip()
                     .casefold()
                 )
-            except (EOFError, KeyboardInterrupt, PromptInterrupted):
+            except PromptInterrupted as exc:
+                raise UserRequestedTurnCancellation() from exc
+            except (EOFError, KeyboardInterrupt):
                 return False
             if answer in {"y", "yes"}:
                 return True

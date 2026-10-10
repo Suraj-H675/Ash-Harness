@@ -14,6 +14,7 @@ from prompt_toolkit.output import DummyOutput
 import ash.ui.history as history_module
 import ash.ui.prompt as prompt_module
 from ash.repo.parser import Symbol
+from ash.ui.input_signals import PromptInterrupted
 from ash.ui.prompt import AshCompleter, PromptChoice, PromptInput
 from ash.ui.transcript import Transcript
 
@@ -278,7 +279,7 @@ async def test_choice_selector_uses_keyboard_without_mouse_capture(
 
 
 @pytest.mark.asyncio
-async def test_choice_selector_interrupt_denies_active_choice(
+async def test_choice_selector_interrupt_is_distinct_from_dismissal(
     tmp_path: Path,
     cursor_ui: None,
 ) -> None:
@@ -301,7 +302,38 @@ async def test_choice_selector_interrupt_denies_active_choice(
 
             done, _ = await asyncio.wait({pending}, timeout=0.5)
             assert pending in done
-            assert pending.result() is None
+            with pytest.raises(PromptInterrupted):
+                pending.result()
+        finally:
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            await prompt.aclose()
+
+
+@pytest.mark.asyncio
+async def test_choice_selector_escape_dismisses_active_choice(
+    tmp_path: Path,
+    cursor_ui: None,
+) -> None:
+    with create_pipe_input() as pipe:
+        prompt = PromptInput(
+            input_stream=TtyStringIO(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = asyncio.create_task(
+            prompt.choose(
+                "write_file permission",
+                (PromptChoice("y", "Allow once"),),
+            )
+        )
+        try:
+            await asyncio.sleep(0.05)
+            pipe.send_bytes(b"\x1b")
+
+            assert await asyncio.wait_for(pending, timeout=1.5) is None
         finally:
             if not pending.done():
                 pending.cancel()

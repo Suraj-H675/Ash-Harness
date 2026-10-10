@@ -270,6 +270,96 @@ async def test_interactive_controller_cancels_on_prompt_interrupt(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_selector_ctrl_c_recovers_turn_without_dispatch(tmp_path: Path) -> None:
+    class InterruptedSelectorPrompt(SelectorApprovalPrompt):
+        async def choose(
+            self,
+            title,
+            options,
+            *,
+            default_value=None,
+            context="",
+        ):
+            del title, options, default_value, context
+            raise PromptInterrupted
+
+    prompt = InterruptedSelectorPrompt()
+    statuses: list[str] = []
+    ui = make_ui()
+    guard = SafetyGuard(tmp_path)
+    tool = WriteFileTool(guard)
+    store = SessionStore(tmp_path / "sessions.db")
+    provider = WriteProvider()
+    loop = AshLoop(
+        store,
+        provider,
+        guard,
+        ui,
+        tmp_path,
+        tools={tool.name: tool},
+    )
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+
+    response = await controller.run("write the file")
+
+    assert response is None
+    assert statuses == ["Turn cancelled."]
+    assert provider.calls == 1
+    assert loop.is_turn_running is False
+    assert not (tmp_path / "approved.txt").exists()
+    assert loop.current_session is not None
+    calls = [
+        call
+        for call in store.load_session(loop.current_session.session_id).tool_calls
+        if call.tool_name == "write_file"
+    ]
+    assert len(calls) == 1
+    assert calls[0].approved is False
+    assert calls[0].dispatched is False
+    reports = store.interrupted_recovery_reports(loop.current_session.session_id)
+    assert len(reports) == 1
+    assert reports[0]["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_external_controller_cancellation_is_propagated(
+    tmp_path: Path,
+) -> None:
+    provider = BlockingProvider()
+    prompt = RoutedPrompt()
+    statuses: list[str] = []
+    ui = make_ui()
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        provider,
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+    )
+    controller = InteractiveTurnController(
+        loop,
+        prompt,  # type: ignore[arg-type]
+        ui,
+        write_status=statuses.append,
+    )
+    turn = asyncio.create_task(controller.run("start"))
+    await provider.started.wait()
+
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert turn.cancelled()
+    assert loop.is_turn_running is False
+    assert statuses == ["Turn cancelled."]
+
+
+@pytest.mark.asyncio
 async def test_interactive_controller_cancels_linear_turn_on_sigint(
     tmp_path: Path,
 ) -> None:

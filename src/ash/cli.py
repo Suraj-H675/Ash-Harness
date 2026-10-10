@@ -1404,11 +1404,14 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                         ),
                     )
                     if prompt_input.supports_choice_ui:
-                        selected = await prompt_input.choose(
-                            "Reasoning effort",
-                            options,
-                            default_value=loop.reasoning_effort or "default",
-                        )
+                        try:
+                            selected = await prompt_input.choose(
+                                "Reasoning effort",
+                                options,
+                                default_value=loop.reasoning_effort or "default",
+                            )
+                        except PromptInterrupted:
+                            selected = None
                     else:
                         print(
                             "Reasoning effort choices: "
