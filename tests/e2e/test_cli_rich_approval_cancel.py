@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import pty
@@ -14,6 +15,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pyte
 import pytest
 
 from ash.core.session import SessionStore
@@ -117,6 +119,18 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
     process: subprocess.Popen[bytes] | None = None
     slave_open = True
     captured = bytearray()
+    screen = pyte.Screen(columns=80, lines=24)
+    stream = pyte.Stream(screen)
+    decoder = codecs.getincrementaldecoder("utf-8")()
+
+    def capture_output() -> None:
+        if select.select([master_fd], [], [], 0.05)[0]:
+            try:
+                chunk = os.read(master_fd, 65_536)
+            except OSError:
+                return
+            captured.extend(chunk)
+            stream.feed(decoder.decode(chunk))
 
     def wait_for(marker: bytes, timeout: float = 15) -> None:
         deadline = time.monotonic() + timeout
@@ -125,14 +139,21 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
                 return
             if process is not None and process.poll() is not None:
                 break
-            if select.select([master_fd], [], [], 0.05)[0]:
-                try:
-                    captured.extend(os.read(master_fd, 65_536))
-                except OSError:
-                    break
+            capture_output()
         raise AssertionError(
             f"missing {marker!r}; exit={process.poll() if process else None}; "
             f"output={captured[-3000:]!r}"
+        )
+
+    def wait_for_main_composer(timeout: float = 15) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and process is not None and process.poll() is None:
+            capture_output()
+            if screen.display[-2].lstrip().startswith("› "):
+                return
+        raise AssertionError(
+            f"Ash did not return to its main composer; exit={process.poll() if process else None}; "
+            f"screen={screen.display!r}"
         )
 
     try:
@@ -158,6 +179,7 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
         slave_open = False
 
         wait_for(b"Ready", timeout=25)
+        wait_for_main_composer()
         os.write(master_fd, b"please run the fixture command\r")
         wait_for(b"Allow once", timeout=25)
         os.write(master_fd, b"\x03")
@@ -165,6 +187,7 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
             "the provider received another request after Ctrl-C in approval"
         )
         wait_for(b"Turn cancelled.", timeout=15)
+        wait_for_main_composer()
 
         assert len(requests) == 1
         assert not (workspace / "denied.marker").exists()
@@ -172,12 +195,14 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
         os.write(master_fd, b"/recovery\r")
         wait_for(b"Recovery 1:", timeout=10)
         wait_for(b"interrupted", timeout=5)
+        wait_for_main_composer()
         assert len(requests) == 1
 
         os.write(master_fd, b"continue safely\r")
         wait_for(b"NEXT_TURN_OK", timeout=20)
         assert second_request.is_set()
         assert len(requests) == 2
+        wait_for_main_composer()
         os.write(master_fd, b"/exit\r")
         process.wait(timeout=15)
         assert process.returncode == 0
