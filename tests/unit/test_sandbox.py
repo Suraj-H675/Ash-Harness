@@ -1989,6 +1989,74 @@ async def test_sandbox_subprocess_marks_timeout_after_effect(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_sandbox_timeout_cleanup_survives_second_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrapped: bool,
+) -> None:
+    import ash.sandbox.manager as sandbox_module
+    import ash.sandbox.process_utils as process_utils
+
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    cleanup_complete = asyncio.Event()
+    cleanup_calls = 0
+
+    async def fake_spawn(*_args, **_kwargs):
+        return SimpleNamespace(pid=12345, returncode=None)
+
+    async def blocked_output(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    async def fake_terminate(_process, *, plan, grace_seconds=1.0):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await cleanup_release.wait()
+        cleanup_complete.set()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    monkeypatch.setattr(sandbox_module, "communicate_process", blocked_output)
+    monkeypatch.setattr(process_utils, "terminate_process_tree", fake_terminate)
+
+    kwargs = dict(
+        cwd=tmp_path,
+        deadline=0.02,
+        workspace_root=tmp_path,
+        env={"PATH": os.environ.get("PATH", os.defpath)},
+    )
+    if wrapped:
+        runner = sandbox_module._run_subprocess(
+            ["/bin/sh", "-c", "true"],
+            tier=SANDBOX_TIER_BWRAP,
+            backend_name="test",
+            **kwargs,
+        )
+    else:
+        runner = sandbox_module._run_scoped(
+            sandbox_module._ScopedBackend(),
+            ["/bin/sh", "-c", "true"],
+            fallback=False,
+            **kwargs,
+        )
+    task = asyncio.create_task(runner)
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=0.05)
+        assert not done, "sandbox returned before subprocess cleanup finished"
+    finally:
+        cleanup_release.set()
+        if not task.done():
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleanup_complete.is_set()
+    assert cleanup_calls == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("exit_code", "timed_out", "expected_outcome"),
     [

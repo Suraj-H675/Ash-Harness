@@ -1121,6 +1121,77 @@ async def test_run_command_timeout_after_effect_is_unknown(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pty", [False, True])
+async def test_command_timeout_cleanup_survives_second_cancellation(
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pty: bool,
+) -> None:
+    import ash.sandbox.process_utils as process_utils
+    import ash.tools.command as command_module
+
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    cleanup_calls = 0
+
+    class FakeProcess:
+        pid = 12345
+        returncode = None
+
+    async def fake_spawn(*_args, **_kwargs):
+        return FakeProcess()
+
+    async def blocked_output(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    async def fake_terminate(_process, *, plan, grace_seconds=1.0):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await release_cleanup.wait()
+        cleanup_finished.set()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    monkeypatch.setattr(command_module, "communicate_process", blocked_output)
+    monkeypatch.setattr(command_module, "communicate_pty_process", blocked_output)
+    monkeypatch.setattr(process_utils, "terminate_process_tree", fake_terminate)
+
+    tool = RunCommandTool(SafetyGuard(project_root), project_root=project_root)
+    kwargs = dict(
+        timeout_seconds=0.02,
+        cwd=None,
+        env={"PATH": os.environ.get("PATH", "")},
+        stream_callback=None,
+        expected_cwd_identity=None,
+    )
+    if pty:
+        task = asyncio.create_task(
+            tool._run_pty(
+                ["/bin/sh", "-c", "true"],
+                passthrough_env_names=(),
+                **kwargs,
+            )
+        )
+    else:
+        task = asyncio.create_task(tool._run_scoped("true", **kwargs))
+
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=0.05)
+        assert not done, "command returned while subprocess cleanup was still running"
+    finally:
+        release_cleanup.set()
+        if not task.done():
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleanup_finished.is_set()
+    assert cleanup_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_run_command_cleans_process_tree_after_unexpected_io_failure(
     project_root: Path,
     monkeypatch: pytest.MonkeyPatch,

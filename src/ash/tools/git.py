@@ -32,13 +32,12 @@ from ash.safety.scoped_io import ScopedIOError, snapshot_scoped_file
 from ash.sandbox import SandboxBackendUnavailable, SandboxManager
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
-    ProcessTreeError,
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
     prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
-    terminate_process_tree,
+    terminate_process_tree_after_timeout,
 )
 from ash.tools.base import (
     BaseTool,
@@ -1130,14 +1129,15 @@ async def _run_prepared_git_result(
             output_truncated=True,
         )
     except asyncio.TimeoutError:
-        try:
-            await terminate_process_tree(process, plan=process_tree_plan)
-        except ProcessTreeError as exc:
+        cleanup_error = await terminate_process_tree_after_timeout(
+            process, plan=process_tree_plan
+        )
+        if cleanup_error is not None:
             return _GitCommandResult(
                 125,
                 "",
                 "git command timed out after 30 seconds; "
-                f"process-tree cleanup failed: {exc}",
+                f"process-tree cleanup failed: {cleanup_error}",
                 timed_out=True,
             )
         return _GitCommandResult(

@@ -24,7 +24,6 @@ from ash.sandbox import (
 )
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
-    ProcessTreeError,
     ProcessTreeUnavailable,
     close_pty_fd,
     communicate_pty_process,
@@ -35,7 +34,7 @@ from ash.sandbox.process_utils import (
     prepare_scoped_process_launch,
     pty_process_spawn_options,
     settle_process_tree_after_cancellation,
-    terminate_process_tree,
+    terminate_process_tree_after_timeout,
 )
 from ash.tools.base import (
     BaseTool,
@@ -385,12 +384,14 @@ class RunCommandTool(BaseTool):
         except asyncio.TimeoutError:
             process_started = "process" in locals()
             if process_started:
-                try:
-                    await terminate_process_tree(process, plan=process_tree_plan)
-                except ProcessTreeError as exc:
-                    cleanup = f" Process-tree cleanup failed: {exc}."
-                else:
-                    cleanup = ""
+                cleanup_error = await terminate_process_tree_after_timeout(
+                    process, plan=process_tree_plan
+                )
+                cleanup = (
+                    f" Process-tree cleanup failed: {cleanup_error}."
+                    if cleanup_error is not None
+                    else ""
+                )
             else:
                 cleanup = ""
             return ToolResult(
@@ -609,12 +610,14 @@ class RunCommandTool(BaseTool):
         except asyncio.TimeoutError:
             process_started = "process" in locals()
             if process_started:
-                try:
-                    await terminate_process_tree(process, plan=process_tree_plan)
-                except ProcessTreeError as exc:
-                    cleanup = f" Process-tree cleanup failed: {exc}."
-                else:
-                    cleanup = ""
+                cleanup_error = await terminate_process_tree_after_timeout(
+                    process, plan=process_tree_plan
+                )
+                cleanup = (
+                    f" Process-tree cleanup failed: {cleanup_error}."
+                    if cleanup_error is not None
+                    else ""
+                )
             else:
                 cleanup = ""
             return ToolResult(

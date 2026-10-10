@@ -473,6 +473,70 @@ async def test_git_inspection_reports_process_timeout(tmp_path: Path) -> None:
     assert result.outcome is ToolExecutionOutcome.COMPLETED
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["git", "patch"])
+async def test_git_timeout_cleanup_survives_second_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    import ash.sandbox.process_utils as process_utils
+    import ash.tools.git as git_module
+    import ash.tools.patch as patch_module
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    calls = 0
+
+    async def fake_spawn(*_args, **_kwargs):
+        return SimpleNamespace(pid=12345, returncode=None)
+
+    async def timed_out(*_args, **_kwargs):
+        raise asyncio.TimeoutError
+
+    async def fake_terminate(_process, *, plan, grace_seconds=1.0):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        finished.set()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    monkeypatch.setattr(git_module, "communicate_process", timed_out)
+    monkeypatch.setattr(patch_module, "communicate_process", timed_out)
+    monkeypatch.setattr(process_utils, "terminate_process_tree", fake_terminate)
+
+    if operation == "git":
+        git = shutil.which("git")
+        assert git is not None
+        runner = git_module._run_prepared_git_result(
+            tmp_path,
+            git,
+            ["status"],
+            {"PATH": os.environ.get("PATH", os.defpath)},
+            (),
+            expected_cwd_identity=None,
+            sandbox_manager=None,
+        )
+    else:
+        runner = patch_module._git_apply(tmp_path, "", check=True)
+    task = asyncio.create_task(runner)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=0.05)
+        assert not done, "Git subprocess cleanup stopped after another interrupt"
+    finally:
+        release.set()
+        if not task.done():
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
+    assert calls == 1
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX Git process timeout regression")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("timeout_stage", ["update-ref", "post-commit"])

@@ -45,14 +45,13 @@ from ash.sandbox.docker import (
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     ProcessStreamCallback,
-    ProcessTreeError,
     ProcessTreePlan,
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
     prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
-    terminate_process_tree,
+    terminate_process_tree_after_timeout,
 )
 from ash.safety.environment import resolve_host_executable
 
@@ -1098,12 +1097,14 @@ async def _run_scoped(
             timeout=deadline,
         )
     except asyncio.TimeoutError:
-        try:
-            await terminate_process_tree(process, plan=process_tree_plan)
-        except ProcessTreeError as exc:
-            cleanup = f" Process-tree cleanup failed: {exc}."
-        else:
-            cleanup = ""
+        cleanup_error = await terminate_process_tree_after_timeout(
+            process, plan=process_tree_plan
+        )
+        cleanup = (
+            f" Process-tree cleanup failed: {cleanup_error}."
+            if cleanup_error is not None
+            else ""
+        )
         return SandboxResult(
             exit_code=-1,
             stdout="",
@@ -1231,12 +1232,14 @@ async def _run_subprocess(
             timeout=deadline,
         )
     except asyncio.TimeoutError:
-        try:
-            await terminate_process_tree(process, plan=process_tree_plan)
-        except ProcessTreeError as exc:
-            cleanup = f" Process-tree cleanup failed: {exc}."
-        else:
-            cleanup = ""
+        cleanup_error = await terminate_process_tree_after_timeout(
+            process, plan=process_tree_plan
+        )
+        cleanup = (
+            f" Process-tree cleanup failed: {cleanup_error}."
+            if cleanup_error is not None
+            else ""
+        )
         return SandboxResult(
             exit_code=-1,
             stdout="",

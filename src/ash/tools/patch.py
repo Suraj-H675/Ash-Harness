@@ -15,13 +15,12 @@ from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import ScopedIOError, workspace_mutation_lock
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
-    ProcessTreeError,
     ProcessTreeUnavailable,
     communicate_process,
     prepare_process_tree,
     prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
-    terminate_process_tree,
+    terminate_process_tree_after_timeout,
 )
 from ash.tools.base import BaseTool, ToolResult
 
@@ -227,10 +226,11 @@ async def _git_apply(cwd: Path, patch: str, *, check: bool) -> tuple[int, str, s
             ),
         )
     except asyncio.TimeoutError as timeout_error:
-        try:
-            await terminate_process_tree(process, plan=process_tree_plan)
-        except ProcessTreeError as exc:
-            timeout_error.add_note(f"Process-tree cleanup failed: {exc}")
+        cleanup_error = await terminate_process_tree_after_timeout(
+            process, plan=process_tree_plan
+        )
+        if cleanup_error is not None:
+            timeout_error.add_note(f"Process-tree cleanup failed: {cleanup_error}")
         raise
     except asyncio.CancelledError as cancellation:
         cleanup_error, cleanup_cancelled = (

@@ -706,6 +706,24 @@ async def settle_process_tree_after_cancellation(
     return None, cancelled
 
 
+async def terminate_process_tree_after_timeout(
+    process: asyncio.subprocess.Process,
+    *,
+    plan: ProcessTreePlan | None = None,
+) -> ProcessTreeError | None:
+    """Finish timed-out process cleanup even if another cancellation arrives."""
+
+    cleanup_error, cancelled = await settle_process_tree_after_cancellation(
+        process, plan=plan
+    )
+    if cancelled:
+        cancellation = asyncio.CancelledError()
+        if cleanup_error is not None:
+            cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        raise cancellation
+    return cleanup_error
+
+
 async def _terminate_windows_process_tree(
     process: asyncio.subprocess.Process,
     *,
