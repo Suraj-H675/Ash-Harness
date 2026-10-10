@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import errno
 import os
 import shutil
@@ -265,6 +266,11 @@ async def communicate_pty_process(
     read_total = 0
     output_limit_exceeded = False
     cleanup_error: ProcessTreeError | None = None
+    decoder = (
+        codecs.getincrementaldecoder("utf-8")("replace")
+        if stream_callback is not None
+        else None
+    )
     async for chunk in iter_pty_output(master_fd):
         read_total += len(chunk)
         if capture_output and (
@@ -276,9 +282,11 @@ async def communicate_pty_process(
                 else max_output_bytes - len(captured)
             )
             captured.extend(chunk[:remaining])
-        if stream_callback is not None:
+        if stream_callback is not None and decoder is not None:
             try:
-                stream_callback("stdout", chunk.decode("utf-8", errors="replace"))
+                text = decoder.decode(chunk)
+                if text:
+                    stream_callback("stdout", text)
             except Exception:
                 pass
         if max_output_bytes is not None and read_total > max_output_bytes:
@@ -288,6 +296,13 @@ async def communicate_pty_process(
             except ProcessTreeError as exc:
                 cleanup_error = exc
             break
+    if stream_callback is not None and decoder is not None:
+        trailing = decoder.decode(b"", final=True)
+        if trailing:
+            try:
+                stream_callback("stdout", trailing)
+            except Exception:
+                pass
     if output_limit_exceeded:
         raise ProcessOutputLimitExceeded(
             f"subprocess output exceeded {max_output_bytes} bytes",
@@ -1214,6 +1229,11 @@ async def communicate_process(
         if stream is None:
             return b""
         chunks: list[bytes] = []
+        decoder = (
+            codecs.getincrementaldecoder("utf-8")("replace")
+            if stream_callback is not None
+            else None
+        )
         while True:
             chunk = await stream.read(4096)
             if not chunk:
@@ -1230,12 +1250,20 @@ async def communicate_process(
             if max_output_bytes is not None and read_total > max_output_bytes:
                 output_limit_exceeded = True
                 await terminate_after_output_limit()
-            text = chunk.decode("utf-8", errors="replace")
-            if stream_callback is not None:
+            if stream_callback is not None and decoder is not None:
                 try:
-                    stream_callback(stream_name, text)
+                    text = decoder.decode(chunk)
+                    if text:
+                        stream_callback(stream_name, text)
                 except Exception:
                     # Rendering and observer failures must never kill user commands.
+                    pass
+        if stream_callback is not None and decoder is not None:
+            trailing = decoder.decode(b"", final=True)
+            if trailing:
+                try:
+                    stream_callback(stream_name, trailing)
+                except Exception:
                     pass
         return b"".join(chunks)
 

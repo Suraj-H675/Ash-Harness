@@ -138,6 +138,59 @@ async def test_pty_output_limit_cleanup_failure_returns_promptly(
     assert isinstance(caught.value.cleanup_error, ProcessTreeTerminationError)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_pty_live_output_preserves_utf8_across_read_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.sandbox.process_utils as process_utils
+
+    text = "star ⭐ and moon 🌙"
+    encoded = text.encode("utf-8")
+
+    async def fragmented_output():
+        for byte in encoded:
+            yield bytes([byte])
+
+    monkeypatch.setattr(process_utils, "iter_pty_output", lambda _fd: fragmented_output())
+    process = Mock(returncode=0, wait=AsyncMock(return_value=0))
+    events: list[str] = []
+    captured = await communicate_pty_process(
+        process, 123, stream_callback=lambda stream, delta: events.append(delta)
+    )
+
+    assert captured == encoded
+    assert "".join(events) == text
+
+
+@pytest.mark.asyncio
+async def test_pipe_live_output_preserves_utf8_across_read_boundaries() -> None:
+    class FragmentedStream:
+        def __init__(self, content: str) -> None:
+            self._chunks = iter(bytes([byte]) for byte in content.encode("utf-8"))
+
+        async def read(self, _size: int) -> bytes:
+            return next(self._chunks, b"")
+
+    stdout_text = "hello 星"
+    stderr_text = "warning 🌙"
+    process = Mock(
+        returncode=0,
+        stdin=None,
+        stdout=FragmentedStream(stdout_text),
+        stderr=FragmentedStream(stderr_text),
+    )
+    events: list[tuple[str, str]] = []
+    stdout, stderr = await communicate_process(
+        process, stream_callback=lambda name, delta: events.append((name, delta))
+    )
+
+    assert stdout == stdout_text.encode("utf-8")
+    assert stderr == stderr_text.encode("utf-8")
+    assert "".join(delta for name, delta in events if name == "stdout") == stdout_text
+    assert "".join(delta for name, delta in events if name == "stderr") == stderr_text
+
+
 def test_prepare_windows_cwd_launch_wraps_command_with_expected_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
