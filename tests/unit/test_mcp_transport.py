@@ -1870,6 +1870,287 @@ async def test_request_timeout_sends_cancellation_notification() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_tool_stream_heartbeat_cannot_extend_request_deadline() -> None:
+    stream_closed = asyncio.Event()
+    methods: list[str] = []
+
+    class Heartbeats(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            try:
+                while True:
+                    yield b": heartbeat\n\n"
+                    await asyncio.sleep(0.005)
+            finally:
+                stream_closed.set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        methods.append(payload["method"])
+        if payload["method"] == "tools/call":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=Heartbeats(),
+            )
+        assert payload["method"] == "notifications/cancelled"
+        return httpx.Response(202)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote", command="", args=[], env={}, transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+        timeout=0.03,
+    )
+    client._initialized = True
+    client.protocol_version = "2025-06-18"
+    request = asyncio.create_task(client.call_tool("write", {}))
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(request), timeout=1)
+        assert request.done(), "SSE heartbeats kept the tool call alive past its timeout"
+        assert stream_closed.is_set()
+        assert methods == ["tools/call", "notifications/cancelled"]
+    finally:
+        if not request.done():
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_timeout_does_not_hang_on_streaming_cancellation_ack() -> None:
+    stream_closed = asyncio.Event()
+    methods: list[str] = []
+
+    class Heartbeats(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            try:
+                while True:
+                    yield b": still working\n\n"
+                    await asyncio.sleep(0.005)
+            finally:
+                stream_closed.set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        methods.append(payload["method"])
+        if payload["method"] == "tools/call":
+            raise httpx.ReadTimeout("tool timed out", request=request)
+        assert payload["method"] == "notifications/cancelled"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=Heartbeats(),
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote", command="", args=[], env={}, transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+        timeout=0.03,
+    )
+    client._initialized = True
+    client.protocol_version = "2025-06-18"
+    request = asyncio.create_task(client.call_tool("write", {}))
+    try:
+        with pytest.raises(httpx.ReadTimeout):
+            await asyncio.wait_for(asyncio.shield(request), timeout=1)
+        assert stream_closed.is_set()
+        assert methods == ["tools/call", "notifications/cancelled"]
+    finally:
+        if not request.done():
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_notification_stream_cannot_extend_send_deadline() -> None:
+    stream_closed = asyncio.Event()
+
+    class Heartbeats(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            try:
+                while True:
+                    yield b": notification pending\n\n"
+                    await asyncio.sleep(0.005)
+            finally:
+                stream_closed.set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["method"] == "notifications/progress"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=Heartbeats(),
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote", command="", args=[], env={}, transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+        timeout=0.03,
+    )
+    client._initialized = True
+    client.protocol_version = "2025-06-18"
+    notification = asyncio.create_task(client.notify("notifications/progress"))
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(notification), timeout=1)
+        assert notification.done(), "SSE heartbeats kept notification send alive"
+        assert stream_closed.is_set()
+    finally:
+        if not notification.done():
+            notification.cancel()
+            await asyncio.gather(notification, return_exceptions=True)
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stdio_request_timeout_includes_backpressured_write() -> None:
+    write_started = asyncio.Event()
+
+    class BlockedStdin:
+        def write(self, _data: bytes) -> None:
+            write_started.set()
+
+        async def drain(self) -> None:
+            await asyncio.Event().wait()
+
+    client = MCPClient(
+        MCPServerConfig(name="blocked", command="blocked", args=[], env={}),
+        timeout=0.03,
+    )
+    client._process = Mock(stdin=BlockedStdin())
+    request = asyncio.create_task(client.request("ping"))
+    try:
+        await asyncio.wait_for(write_started.wait(), timeout=1)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(request), timeout=1)
+        assert request.done(), "stdio output backpressure bypassed request deadline"
+        assert client._pending == {}
+    finally:
+        if not request.done():
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_on", ["recovery_lock", "session_readiness"])
+async def test_http_request_preflight_respects_deadline(blocked_on: str) -> None:
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: pytest.fail("preflight must not send a request")
+        )
+    )
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote", command="", args=[], env={}, transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+        timeout=0.03,
+    )
+    client._initialized = True
+    if blocked_on == "recovery_lock":
+        await client._session_recovery_lock.acquire()
+    else:
+        client._session_ready.clear()
+    task = asyncio.create_task(client.request("tools/call", {"name": "write"}))
+    finished = asyncio.Event()
+    task.add_done_callback(lambda _task: finished.set())
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=0.4)
+        with pytest.raises(asyncio.TimeoutError):
+            await task
+        assert client._next_id == 1
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if client._session_recovery_lock.locked():
+            client._session_recovery_lock.release()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_expired_session_recovery_callback_respects_deadline() -> None:
+    tool_posts = 0
+    recovery_started = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tool_posts
+        if request.method == "DELETE":
+            return httpx.Response(204)
+        payload = json.loads(request.content)
+        method = payload["method"]
+        if method == "tools/call":
+            tool_posts += 1
+            return httpx.Response(404)
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": "replacement"},
+                json={
+                    "jsonrpc": "2.0", "id": payload["id"],
+                    "result": {"protocolVersion": "2025-11-25", "capabilities": {}},
+                },
+            )
+        assert method in {"notifications/initialized", "notifications/cancelled"}
+        return httpx.Response(202)
+
+    async def blocked_recovery(_generation: int, _method: str, _params: dict) -> bool:
+        recovery_started.set()
+        await asyncio.Event().wait()
+        return True
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = MCPClient(
+        MCPServerConfig(
+            name="remote", command="", args=[], env={}, transport="http",
+            url="https://mcp.example.test/rpc",
+        ),
+        http_client=http,
+        timeout=0.03,
+        session_reinitialized_handler=blocked_recovery,
+    )
+    client._initialized = True
+    client._session_generation = 1
+    client._http_session_id = "expired"
+    client.protocol_version = "2025-11-25"
+    client._sse_supported = False
+    request = asyncio.create_task(client.call_tool("write", {}))
+    finished = asyncio.Event()
+    request.add_done_callback(lambda _task: finished.set())
+    try:
+        await asyncio.wait_for(recovery_started.wait(), timeout=0.5)
+        await asyncio.wait_for(finished.wait(), timeout=0.4)
+        with pytest.raises(asyncio.TimeoutError):
+            await request
+        assert tool_posts == 1
+        assert client._session_ready.is_set()
+    finally:
+        if not request.done():
+            request.cancel()
+            await asyncio.gather(request, return_exceptions=True)
+        await client.disconnect()
+        await http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_stdio_send_failure_cleans_pending_future() -> None:
     client = MCPClient(MCPServerConfig(name="fake", command="fake", args=[], env={}))
     client._process = Mock(stdin=object())

@@ -1872,11 +1872,12 @@ class MCPClient:
         _input_required_round: int = 0,
     ) -> dict[str, Any]:
         if self.config.transport != "stdio" and _allow_session_recovery:
-            async with self._session_recovery_lock:
-                if not self._initialized and self._session_generation:
-                    await self._initialize_protocol()
-                readiness = self._session_ready
-            await readiness.wait()
+            async with asyncio.timeout(self.timeout):
+                async with self._session_recovery_lock:
+                    if not self._initialized and self._session_generation:
+                        await self._initialize_protocol()
+                    readiness = self._session_ready
+                await readiness.wait()
         if (
             _expected_tool_contract is not None
             and self.tool_contract_validator is not None
@@ -1907,25 +1908,31 @@ class MCPClient:
                 }
                 try:
                     if self.config.transport == "stdio":
-                        response = await self._request_stdio(
+                        response_coro = self._request_stdio(
                             request_id,
                             payload,
                             expected_tool_contract=_expected_tool_contract,
                         )
                     else:
-                        response = await self._request_http(
+                        response_coro = self._request_http(
                             request_id,
                             payload,
                             expected_tool_contract=_expected_tool_contract,
                             header_annotations=_header_annotations,
                             bypass_session_readiness=not _allow_session_recovery,
                         )
+                    response = await asyncio.wait_for(
+                        response_coro, timeout=self.timeout
+                    )
                     break
                 except MCPSessionExpired as exc:
                     if not _allow_session_recovery or method == "initialize":
                         raise
-                    retry_allowed = await self._recover_http_session(
-                        exc, method=method, params=params or {}
+                    retry_allowed = await asyncio.wait_for(
+                        self._recover_http_session(
+                            exc, method=method, params=params or {}
+                        ),
+                        timeout=self.timeout,
                     )
                     if method == "tools/call":
                         raise MCPProtocolError(
@@ -2481,7 +2488,7 @@ class MCPClient:
                 {"requestId": request_id, "reason": reason},
                 _allow_session_recovery=False,
             )
-        except (MCPProtocolError, httpx.HTTPError, OSError):
+        except (asyncio.TimeoutError, MCPProtocolError, httpx.HTTPError, OSError):
             return
 
     async def notify(
@@ -2491,9 +2498,12 @@ class MCPClient:
         *,
         _allow_session_recovery: bool = True,
     ) -> None:
-        await self._send_message(
-            {"jsonrpc": "2.0", "method": method, "params": params or {}},
-            _allow_session_recovery=_allow_session_recovery,
+        await asyncio.wait_for(
+            self._send_message(
+                {"jsonrpc": "2.0", "method": method, "params": params or {}},
+                _allow_session_recovery=_allow_session_recovery,
+            ),
+            timeout=self.timeout,
         )
 
     async def _send_message(
