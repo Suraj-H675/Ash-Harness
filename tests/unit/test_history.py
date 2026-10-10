@@ -66,6 +66,180 @@ def test_history_compaction_preserves_recent_tool_pair() -> None:
     assert result.messages[-3]["tool_calls"][0]["call_id"] == "call-1"
 
 
+def test_compaction_keeps_interleaved_multi_tool_call_group_together() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "c1", "name": "read_file", "arguments": {}},
+                {"call_id": "c2", "name": "read_file", "arguments": {}},
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "permission denied: read blocked",
+            "tool_call_id": "c1",
+        },
+        {
+            "role": "system",
+            "content": "transient skill nudge",
+            "_ash_runtime_only": True,
+        },
+        {"role": "tool", "content": "second result", "tool_call_id": "c2"},
+        {"role": "user", "content": "current request"},
+    ]
+
+    result = HistoryCompactor(
+        max_context_tokens=1_000,
+        completion_reserve=100,
+        recent_messages=2,
+    ).compact(messages, count_tokens=count_words, force=True)
+
+    retained_call_ids = {
+        call["call_id"]
+        for message in result.messages
+        for call in message.get("tool_calls", [])
+    }
+    retained_result_ids = {
+        message["tool_call_id"]
+        for message in result.messages
+        if message.get("role") == "tool"
+    }
+    assert retained_call_ids == {"c1", "c2"}
+    assert retained_result_ids == {"c1", "c2"}
+    assert result.messages[-1]["content"] == "current request"
+
+
+def test_compaction_keeps_pending_tool_call_in_recent_history() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "pending", "name": "read_file", "arguments": {}}
+            ],
+        },
+        {"role": "user", "content": "current request"},
+        {"role": "assistant", "content": "current answer"},
+    ]
+
+    result = HistoryCompactor(
+        max_context_tokens=1_000,
+        completion_reserve=100,
+        recent_messages=1,
+    ).compact(messages, count_tokens=count_words, force=True)
+
+    assert any(
+        call.get("call_id") == "pending"
+        for message in result.messages
+        for call in message.get("tool_calls", [])
+    )
+
+
+def test_hard_limit_removes_interleaved_tool_call_group_atomically() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request " + "old " * 40},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "c1", "name": "read_file", "arguments": {}},
+                {"call_id": "c2", "name": "read_file", "arguments": {}},
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "first result " + "one " * 40,
+            "tool_call_id": "c1",
+        },
+        {
+            "role": "system",
+            "content": "transient skill nudge",
+            "_ash_runtime_only": True,
+        },
+        {
+            "role": "tool",
+            "content": "second result " + "two " * 40,
+            "tool_call_id": "c2",
+        },
+        {"role": "user", "content": "current request"},
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=80,
+        completion_reserve=10,
+        threshold=1.0,
+        recent_messages=6,
+        input_token_limit=35,
+    )
+
+    result = compactor.compact(
+        messages,
+        count_tokens=count_words,
+        force=True,
+        protected_from_index=len(messages) - 1,
+    )
+
+    assert result.estimated_tokens <= compactor.input_limit
+    assert result.messages[-1]["content"] == "current request"
+    assert not any(
+        message.get("tool_call_id") in {"c1", "c2"}
+        for message in result.messages
+    )
+    assert not any(
+        call.get("call_id") in {"c1", "c2"}
+        for message in result.messages
+        for call in message.get("tool_calls", [])
+    )
+
+
+def test_hard_limit_keeps_unclassified_system_interstitial_with_pending_group() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request " + "old " * 40},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "c1", "name": "read_file", "arguments": {}},
+                {"call_id": "c2", "name": "read_file", "arguments": {}},
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "first result " + "one " * 40,
+            "tool_call_id": "c1",
+        },
+        {"role": "system", "content": "unclassified system context"},
+        {
+            "role": "tool",
+            "content": "second result " + "two " * 40,
+            "tool_call_id": "c2",
+        },
+        {"role": "user", "content": "current request"},
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=80,
+        completion_reserve=10,
+        threshold=1.0,
+        recent_messages=6,
+        input_token_limit=35,
+    )
+
+    with pytest.raises(ContextBudgetExceededError):
+        compactor.compact(
+            messages,
+            count_tokens=count_words,
+            force=True,
+            protected_from_index=len(messages) - 1,
+        )
+
+
 def test_force_compaction_works_below_threshold() -> None:
     messages = [
         {"role": "system", "content": "system"},

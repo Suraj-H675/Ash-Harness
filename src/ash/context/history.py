@@ -18,6 +18,7 @@ DEFAULT_CONTEXT_BUDGET_WEIGHTS: dict[str, float] = {
     "memory": 0.10,
 }
 IMAGE_TOKEN_ESTIMATE = 1024
+RUNTIME_ONLY_HISTORY_KEY = "_ash_runtime_only"
 
 
 class ContextFragmentKind(StrEnum):
@@ -373,8 +374,11 @@ class HistoryCompactor:
         cutoff = max(body_start, len(messages) - self.recent_messages)
         if protected_from_index is not None:
             cutoff = min(cutoff, protected_from_index)
-        while cutoff > body_start and messages[cutoff].get("role") == "tool":
-            cutoff -= 1
+        cutoff = self._rewind_cutoff_to_tool_boundary(
+            messages,
+            cutoff=cutoff,
+            body_start=body_start,
+        )
 
         removed = list(messages[body_start:cutoff])
         recent = list(messages[cutoff:])
@@ -386,9 +390,8 @@ class HistoryCompactor:
         )
 
         # Fit protected current-turn state first. Older recent history may be
-        # removed, but assistant tool calls and their contiguous tool results
-        # move as one protocol unit. The last user message and everything after
-        # it belong to the active turn and are never discarded here.
+        # removed, but assistant tool calls and all matching results move as
+        # one protocol unit. The current turn is never discarded here.
         while self._count(prefix + recent, count_tokens) > self.input_limit:
             span = self._oldest_removable_span(
                 recent,
@@ -494,35 +497,91 @@ class HistoryCompactor:
         tool_calls = candidate.get("tool_calls") if role == "assistant" else None
         if not tool_calls:
             return (0, 1)
-        if not isinstance(tool_calls, list):
-            return None
-
-        call_ids = {
-            str(call.get("call_id") or call.get("id") or "")
-            for call in tool_calls
-            if isinstance(call, dict)
-        }
-        call_ids.discard("")
-        if not call_ids:
-            return None
-
-        observed: set[str] = set()
-        end = 1
-        while end < len(messages) and messages[end].get("role") == "tool":
-            tool_id = str(
-                messages[end].get("tool_call_id")
-                or messages[end].get("call_id")
-                or ""
-            )
-            if not tool_id or tool_id not in call_ids:
-                return None
-            observed.add(tool_id)
-            end += 1
-        if observed != call_ids or (
-            protected_from_index is not None and end > protected_from_index
+        span = HistoryCompactor._tool_call_span(messages, 0)
+        if span is None or (
+            protected_from_index is not None and span[1] > protected_from_index
         ):
             return None
-        return (0, end)
+        return span
+
+    @staticmethod
+    def _rewind_cutoff_to_tool_boundary(
+        messages: list[dict[str, Any]],
+        *,
+        cutoff: int,
+        body_start: int,
+    ) -> int:
+        """Keep a tool call and all of its results on the same side of cutoff."""
+
+        index = body_start
+        while index < cutoff:
+            message = messages[index]
+            tool_calls = message.get("tool_calls")
+            if message.get("role") != "assistant" or not tool_calls:
+                index += 1
+                continue
+
+            span = HistoryCompactor._tool_call_span(messages, index)
+            if span is None or span[1] > cutoff:
+                return index
+            index = span[1]
+
+        if cutoff < len(messages) and messages[cutoff].get("role") == "tool":
+            # A result without a provable assistant call is malformed history.
+            # Retain it rather than placing an orphan tool message in the tail.
+            return body_start
+        return cutoff
+
+    @staticmethod
+    def _tool_call_span(
+        messages: list[dict[str, Any]],
+        start: int,
+    ) -> tuple[int, int] | None:
+        """Find a complete tool-call unit, allowing interstitial system nudges."""
+
+        if not 0 <= start < len(messages):
+            return None
+        candidate = messages[start]
+        raw_calls = candidate.get("tool_calls")
+        if candidate.get("role") != "assistant" or not isinstance(raw_calls, list):
+            return None
+        if not raw_calls:
+            return None
+
+        call_ids: set[str] = set()
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                return None
+            call_id = str(call.get("call_id") or call.get("id") or "")
+            if not call_id or call_id in call_ids:
+                return None
+            call_ids.add(call_id)
+
+        pending_ids = set(call_ids)
+        end = start + 1
+        while end < len(messages):
+            message = messages[end]
+            role = message.get("role")
+            if (
+                role == "system"
+                and message.get(RUNTIME_ONLY_HISTORY_KEY) is True
+            ):
+                end += 1
+                continue
+            if role != "tool":
+                break
+
+            tool_id = str(
+                message.get("tool_call_id") or message.get("call_id") or ""
+            )
+            if not tool_id or tool_id not in pending_ids:
+                return None
+            pending_ids.remove(tool_id)
+            end += 1
+
+        if pending_ids:
+            return None
+        return (start, end)
 
     def _prune_tool_outputs(
         self, messages: list[dict[str, Any]]
@@ -558,15 +617,22 @@ class HistoryCompactor:
         messages: list[dict[str, Any]],
         previous_summary: str,
     ) -> str:
+        durable_messages = [
+            message
+            for message in messages
+            if message.get(RUNTIME_ONLY_HISTORY_KEY) is not True
+        ]
+        if not durable_messages:
+            return previous_summary
         priority_lines: list[str] = []
         if previous_summary:
             priority_lines.append("Earlier summary:")
             priority_lines.append(
                 _preserve_ends(previous_summary, self.summary_char_limit // 3)
             )
-        priority_lines.extend(_preserved_state_lines(messages))
+        priority_lines.extend(_preserved_state_lines(durable_messages))
         event_lines = ["Compacted events:"]
-        for message in messages:
+        for message in durable_messages:
             role = str(message.get("role", "unknown"))
             content = _summary_content(message.get("content", "")).strip()
             content = " ".join(content.split())
@@ -606,6 +672,7 @@ def _without_image_data(
     image_count = 0
     for message in messages:
         copied = dict(message)
+        copied.pop(RUNTIME_ONLY_HISTORY_KEY, None)
         content = copied.get("content")
         if isinstance(content, list):
             blocks: list[Any] = []

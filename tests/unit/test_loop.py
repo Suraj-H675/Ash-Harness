@@ -3710,6 +3710,61 @@ async def test_persisted_compaction_summary_is_redacted(tmp_path):
     assert "REDACTED" in summaries[0]
 
 
+@pytest.mark.asyncio
+async def test_compaction_offset_counts_only_durable_messages(tmp_path: Path) -> None:
+    config = AshConfig(
+        model="ollama/test",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        context_recent_messages=2,
+    )
+    store = SessionStore(tmp_path / "transient-compaction-offset.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        config=config,
+    )
+    session = await loop.start_session()
+    for role, content in (("user", "old request"), ("assistant", "old answer")):
+        message = Message(
+            role=role, content=content, timestamp=datetime.now(timezone.utc)
+        )
+        store.save_message(session.session_id, message)
+        session.messages.append(message)
+    runtime_message = Message(
+        role="system",
+        content="transient memory nudge",
+        timestamp=datetime.now(timezone.utc),
+    )
+    runtime_message.mark_runtime_only()
+    session.messages.append(runtime_message)
+    for role, content in (("user", "next request"), ("assistant", "next answer")):
+        message = Message(
+            role=role, content=content, timestamp=datetime.now(timezone.utc)
+        )
+        store.save_message(session.session_id, message)
+        session.messages.append(message)
+
+    loop.compact_current_context()
+
+    resumed = store.load_session(session.session_id, runtime_window=True)
+    persisted = store.load_session(session.session_id)
+    assert session.resident_message_offset == 2
+    assert resumed.resident_message_offset == 2
+    assert [message.content for message in resumed.messages] == [
+        "next request",
+        "next answer",
+    ]
+    assert "transient memory nudge" not in persisted.context_summary
+    assert all(
+        "_ash_runtime_only" not in message for message in loop._build_messages(session)
+    )
+
+
 def test_compaction_persistence_failure_keeps_live_history_and_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

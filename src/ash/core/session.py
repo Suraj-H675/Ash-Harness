@@ -348,6 +348,18 @@ class Message(BaseModel):
     content: str
     timestamp: datetime
     metadata: dict[str, Any] = Field(default_factory=dict)
+    _runtime_only: bool = PrivateAttr(default=False)
+
+    @property
+    def is_runtime_only(self) -> bool:
+        """Whether this message exists only in the current process context."""
+
+        return self._runtime_only
+
+    def mark_runtime_only(self) -> None:
+        """Exclude this in-memory message from durable transcript accounting."""
+
+        self._runtime_only = True
 
 
 class ToolCallRecord(BaseModel):
@@ -407,14 +419,17 @@ class Session(BaseModel):
         return self._resident_message_offset
 
     def discard_compacted_prefix(self, count: int) -> None:
-        """Drop a summarized live prefix while leaving durable history untouched."""
+        """Drop a summarized prefix and advance by its durable messages only."""
 
         if count < 0 or count > len(self.messages):
             raise ValueError("compacted message count is outside the resident history")
         if count == 0:
             return
+        durable_count = sum(
+            not message.is_runtime_only for message in self.messages[:count]
+        )
         del self.messages[:count]
-        self._resident_message_offset += count
+        self._resident_message_offset += durable_count
 
 
 MAX_SESSION_TITLE_CHARS = 256

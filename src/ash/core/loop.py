@@ -4091,9 +4091,11 @@ class AshLoop:
             ):
                 nudge = self._build_memory_nudge()
                 if nudge:
-                    session.messages.append(
-                        Message(role="system", content=nudge, timestamp=_utc_now())
+                    runtime_message = Message(
+                        role="system", content=nudge, timestamp=_utc_now()
                     )
+                    runtime_message.mark_runtime_only()
+                    session.messages.append(runtime_message)
                 self._turns_since_nudge = 0
 
             # The assistant produced tool calls; loop and let the model
@@ -6086,9 +6088,11 @@ class AshLoop:
                 ):
                     nudge = self._build_skill_nudge()
                     if nudge and self.current_session:
-                        self.current_session.messages.append(
-                            Message(role="system", content=nudge, timestamp=_utc_now())
+                        runtime_message = Message(
+                            role="system", content=nudge, timestamp=_utc_now()
                         )
+                        runtime_message.mark_runtime_only()
+                        self.current_session.messages.append(runtime_message)
                     self._iterations_since_skill_use = 0
 
         return results
@@ -6685,6 +6689,7 @@ class AshLoop:
                 ContextFragmentKind,
                 ContextTrust,
                 HistoryCompactor,
+                RUNTIME_ONLY_HISTORY_KEY,
                 context_fragment,
             )
 
@@ -6798,6 +6803,8 @@ class AshLoop:
                 # OpenAI requires tool_call_id on role=tool messages.
                 if message.role == "tool" and message.metadata.get("call_id"):
                     msg_dict["tool_call_id"] = message.metadata["call_id"]
+                if message.is_runtime_only:
+                    msg_dict[RUNTIME_ONLY_HISTORY_KEY] = True
                 messages.append(msg_dict)
                 if (
                     self._turn_running
@@ -6854,8 +6861,12 @@ class AshLoop:
             self.ui.update_token_count(self._last_context_tokens, maximum_input)
             if result.compacted:
                 durable_summary = redact_text(result.summary)
+                removed_durable_messages = sum(
+                    not message.is_runtime_only
+                    for message in session.messages[: result.removed_messages]
+                )
                 summarized_message_count = (
-                    session.resident_message_offset + result.removed_messages
+                    session.resident_message_offset + removed_durable_messages
                 )
                 durable_message_count = self.session_store.durable_message_count(
                     session.session_id
@@ -6877,6 +6888,8 @@ class AshLoop:
                 session.context_summary = durable_summary
                 if result.removed_messages:
                     session.discard_compacted_prefix(result.removed_messages)
+            for history_message in result.messages:
+                history_message.pop(RUNTIME_ONLY_HISTORY_KEY, None)
             history_content = json.dumps(
                 result.messages[1:], sort_keys=True, default=str
             )
