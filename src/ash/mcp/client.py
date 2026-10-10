@@ -3945,20 +3945,24 @@ async def _iter_bounded_sse_lines(
     pending = bytearray()
     event_bytes = 0
     async for chunk in response.aiter_bytes():
-        if len(chunk) > max_event_bytes:
-            raise MCPProtocolError(f"MCP SSE event exceeded {max_event_bytes} bytes")
-        pending.extend(chunk)
-        while True:
-            newline = pending.find(b"\n")
-            if newline < 0:
-                break
-            raw_line = bytes(pending[:newline])
-            del pending[: newline + 1]
-            event_bytes += len(raw_line) + 1
-            if event_bytes > max_event_bytes:
+        start = 0
+        while start < len(chunk):
+            newline = chunk.find(b"\n", start)
+            end = newline if newline >= 0 else len(chunk)
+            delimiter_bytes = 1 if newline >= 0 else 0
+            if (
+                event_bytes + len(pending) + end - start + delimiter_bytes
+                > max_event_bytes
+            ):
                 raise MCPProtocolError(
                     f"MCP SSE event exceeded {max_event_bytes} bytes"
                 )
+            pending.extend(chunk[start:end])
+            if newline < 0:
+                break
+            raw_line = bytes(pending)
+            pending.clear()
+            event_bytes += len(raw_line) + 1
             if raw_line.endswith(b"\r"):
                 raw_line = raw_line[:-1]
             try:
@@ -3970,8 +3974,7 @@ async def _iter_bounded_sse_lines(
             if not raw_line:
                 event_bytes = 0
             yield line
-        if len(pending) > max_event_bytes:
-            raise MCPProtocolError(f"MCP SSE event exceeded {max_event_bytes} bytes")
+            start = newline + 1
     if pending:
         event_bytes += len(pending) + 1
         if event_bytes > max_event_bytes:

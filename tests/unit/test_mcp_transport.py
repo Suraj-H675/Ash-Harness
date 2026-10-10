@@ -204,6 +204,20 @@ async def test_sse_line_reader_rejects_unterminated_event() -> None:
             pass
 
 
+@pytest.mark.asyncio
+async def test_sse_line_reader_limits_individual_events_not_coalesced_chunks() -> None:
+    payload = b"data: one\n\ndata: two\n\ndata: three\n\n"
+    assert len(payload) > 16
+    response = httpx.Response(200, stream=httpx.ByteStream(payload))
+
+    lines = [
+        line
+        async for line in mcp_client_module._iter_bounded_sse_lines(response, 16)
+    ]
+
+    assert lines == ["data: one", "", "data: two", "", "data: three", ""]
+
+
 def test_http_sse_parser_rejects_oversized_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
