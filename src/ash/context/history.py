@@ -60,13 +60,95 @@ class ContextBudgetSlice:
 
 @dataclass(frozen=True)
 class ContextBudgetReport:
-    """Per-turn token budget accounting for provider input construction."""
+    """Provider input accounting with combined and response-reserve limits."""
 
     maximum: int
     completion_reserve: int
     input_limit: int
     slices: dict[str, ContextBudgetSlice]
     fragments: tuple[ContextFragment, ...] = ()
+
+
+@dataclass(frozen=True)
+class RequestTokenBudget:
+    """Effective input and response limits for one provider request."""
+
+    combined_limit: int
+    input_limit: int
+    response_limit: int
+
+    def response_limit_for_request(
+        self,
+        *,
+        estimated_input_tokens: int,
+        remaining_turn_tokens: int | None = None,
+    ) -> int | None:
+        """Apply the turn-wide ceiling without exceeding this request's cap."""
+
+        if estimated_input_tokens < 0:
+            raise ValueError("estimated_input_tokens cannot be negative")
+        if remaining_turn_tokens is None:
+            return self.response_limit
+        available = remaining_turn_tokens - estimated_input_tokens
+        return min(self.response_limit, available) if available > 0 else None
+
+
+class RequestBudgetError(RuntimeError):
+    """Raised when declared provider and configured limits cannot form a request."""
+
+
+def resolve_request_token_budget(
+    *,
+    configured_context_tokens: int,
+    configured_response_tokens: int,
+    provider_context_window: int | None = None,
+    provider_max_input_tokens: int | None = None,
+    provider_max_output_tokens: int | None = None,
+) -> RequestTokenBudget:
+    """Resolve distinct combined, input-only, and response-only limits."""
+
+    if configured_context_tokens < 1:
+        raise ValueError("configured_context_tokens must be positive")
+    if configured_response_tokens < 1:
+        raise ValueError("configured_response_tokens must be positive")
+
+    context_limit = _positive_limit(provider_context_window)
+    input_limit = _positive_limit(provider_max_input_tokens)
+    output_limit = _positive_limit(provider_max_output_tokens)
+    combined_limit = min(
+        configured_context_tokens,
+        context_limit if context_limit is not None else configured_context_tokens,
+    )
+    response_limit = min(
+        configured_response_tokens,
+        output_limit if output_limit is not None else configured_response_tokens,
+    )
+    if response_limit >= combined_limit:
+        raise RequestBudgetError(
+            f"max_completion_tokens ({response_limit:,}) leaves no input room "
+            f"inside the effective context limit ({combined_limit:,}); lower "
+            "max_completion_tokens or choose a model with a larger context window"
+        )
+
+    effective_input_limit = combined_limit - response_limit
+    if input_limit is not None:
+        effective_input_limit = min(effective_input_limit, input_limit)
+    if effective_input_limit < 1:
+        raise RequestBudgetError(
+            "effective request limits leave no input room after the response reserve; "
+            "lower max_completion_tokens or choose a model with a larger input limit"
+        )
+    return RequestTokenBudget(
+        combined_limit=combined_limit,
+        input_limit=effective_input_limit,
+        response_limit=response_limit,
+    )
+
+
+def _positive_limit(value: int | None) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
 
 
 @dataclass(frozen=True)
@@ -124,6 +206,7 @@ class ContextBudgetAllocator:
         max_context_tokens: int,
         completion_reserve: int,
         weights: dict[str, float] | None = None,
+        input_token_limit: int | None = None,
     ) -> None:
         if max_context_tokens < 1:
             raise ValueError("max_context_tokens must be positive")
@@ -132,14 +215,31 @@ class ContextBudgetAllocator:
         self.max_context_tokens = max_context_tokens
         self.completion_reserve = completion_reserve
         self.weights = normalize_context_budget_weights(weights)
+        self._input_token_limit = input_token_limit
+        if input_token_limit is not None and (
+            isinstance(input_token_limit, bool)
+            or not isinstance(input_token_limit, int)
+            or input_token_limit < 1
+        ):
+            raise RequestBudgetError(
+                "provider input limit must be a positive integer"
+            )
         if self.input_limit < len(self.weights):
-            raise ValueError(
-                "usable context must provide at least one token per budget bucket"
+            raise RequestBudgetError(
+                f"effective request limits leave only {self.input_limit:,} input tokens, "
+                f"but Ash needs at least {len(self.weights)} for its context "
+                "sections; increase max_context_tokens or choose a model with a "
+                "larger input limit"
             )
 
     @property
     def input_limit(self) -> int:
-        return max(1, self.max_context_tokens - self.completion_reserve)
+        usable = max(1, self.max_context_tokens - self.completion_reserve)
+        return (
+            min(usable, self._input_token_limit)
+            if self._input_token_limit is not None
+            else usable
+        )
 
     def allocate(self) -> dict[str, int]:
         remaining = self.input_limit

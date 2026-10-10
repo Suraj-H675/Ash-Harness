@@ -68,6 +68,7 @@ class OpenRouterProvider(OpenAIProvider):
                     reasoning=bool({"reasoning", "reasoning_effort"} & params),
                     context_window=metadata.context_window,
                     max_output_tokens=metadata.max_output_tokens,
+                    max_input_tokens=metadata.max_input_tokens,
                 )
         except Exception:
             # Preserve the conservative runtime view, but let callers such as

@@ -364,7 +364,12 @@ def _render_model_list(
 def _render_context_budget(report: Any | None) -> str:
     if report is None:
         return ""
-    lines = ["Budget:"]
+    lines = [
+        "Budget: "
+        f"input={report.input_limit:,}; "
+        f"response_reserve={report.completion_reserve:,}; "
+        f"combined={report.maximum:,}"
+    ]
     for name, item in report.slices.items():
         suffix = " truncated" if item.truncated else ""
         lines.append(f"  {name}: ~{item.used}/{item.limit}{suffix}")
@@ -429,6 +434,8 @@ def _render_model_capabilities(model_string: str, config: AshConfig | None = Non
     budgets: list[str] = []
     if capabilities.context_window is not None:
         budgets.append(f"context {capabilities.context_window:,}")
+    if capabilities.max_input_tokens is not None:
+        budgets.append(f"input {capabilities.max_input_tokens:,}")
     if capabilities.max_output_tokens is not None:
         budgets.append(f"output {capabilities.max_output_tokens:,}")
     suffix = f"; {'; '.join(budgets)}" if budgets else ""
@@ -468,6 +475,8 @@ def _render_runtime_capabilities(loop: AshLoop, config: AshConfig) -> str:
     ]
     if capabilities.context_window is not None:
         lines.append(f"  context_window={capabilities.context_window:,}")
+    if capabilities.max_input_tokens is not None:
+        lines.append(f"  max_input_tokens={capabilities.max_input_tokens:,}")
     if capabilities.max_output_tokens is not None:
         lines.append(f"  max_output_tokens={capabilities.max_output_tokens:,}")
     return "\n".join(lines)

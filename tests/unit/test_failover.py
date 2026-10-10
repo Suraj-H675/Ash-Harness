@@ -280,7 +280,8 @@ def test_capabilities_are_conservative_for_local_models() -> None:
     assert local.local is True
     assert local.native_tools is False
     sonnet = infer_capabilities("anthropic", "claude-sonnet-4-6")
-    assert sonnet.context_window == 1_000_000
+    assert sonnet.context_window is None
+    assert sonnet.max_input_tokens == 1_000_000
 
 
 def test_failover_rejects_mixed_native_and_fallback_protocols() -> None:
@@ -403,14 +404,16 @@ def test_failover_capabilities_are_conservative_across_entire_chain() -> None:
         "first",
         ProviderCapabilities(
             native_tools=True, vision=True, reasoning=True, local=False,
-            context_window=200_000, max_output_tokens=16_000,
+            context_window=200_000, max_input_tokens=120_000,
+            max_output_tokens=16_000,
         ),
     )
     second = CapProvider(
         "second",
         ProviderCapabilities(
             native_tools=True, vision=False, reasoning=False, local=False,
-            context_window=64_000, max_output_tokens=4_000,
+            context_window=64_000, max_input_tokens=48_000,
+            max_output_tokens=4_000,
         ),
     )
     provider = FailoverProvider([first, second])
@@ -418,6 +421,7 @@ def test_failover_capabilities_are_conservative_across_entire_chain() -> None:
     assert provider.capabilities == ProviderCapabilities(
         native_tools=True, vision=False, reasoning=False, local=False,
         context_window=64_000, max_output_tokens=4_000,
+        max_input_tokens=48_000,
     )
 
 
@@ -437,6 +441,7 @@ def test_failover_keeps_limits_unknown_when_any_child_limit_is_unknown() -> None
                 "known",
                 ProviderCapabilities(
                     context_window=128_000,
+                    max_input_tokens=96_000,
                     max_output_tokens=8_000,
                 ),
             ),
@@ -445,6 +450,7 @@ def test_failover_keeps_limits_unknown_when_any_child_limit_is_unknown() -> None
     )
 
     assert provider.capabilities.context_window is None
+    assert provider.capabilities.max_input_tokens is None
     assert provider.capabilities.max_output_tokens is None
 
 

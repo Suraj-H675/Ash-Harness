@@ -11,6 +11,13 @@ from ash.providers.reasoning import ReasoningEffortSpec, reasoning_effort_spec
 
 @dataclass(frozen=True)
 class ProviderCapabilities:
+    """Provider-declared features and distinct request token limits.
+
+    ``context_window`` is the combined input-plus-response window;
+    ``max_input_tokens`` and ``max_output_tokens`` are independent per-request
+    limits. Unknown limits remain ``None``.
+    """
+
     native_tools: bool = False
     vision: bool = False
     reasoning: bool = False
@@ -18,6 +25,7 @@ class ProviderCapabilities:
     context_window: int | None = None
     max_output_tokens: int | None = None
     reasoning_effort: ReasoningEffortSpec | None = None
+    max_input_tokens: int | None = None
 
 
 CapabilityResolver = Callable[[str], ProviderCapabilities]
@@ -83,49 +91,49 @@ _ANTHROPIC_STATIC_CAPABILITIES: dict[str, ProviderCapabilities] = {
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=128_000,
     ),
     "claude-opus-5-5": ProviderCapabilities(
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=128_000,
     ),
     "claude-sonnet-5-5": ProviderCapabilities(
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=128_000,
     ),
     "claude-haiku-4-5": ProviderCapabilities(
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=200_000,
+        max_input_tokens=200_000,
         max_output_tokens=64_000,
     ),
     "claude-haiku-4-5-20251001": ProviderCapabilities(
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=200_000,
+        max_input_tokens=200_000,
         max_output_tokens=64_000,
     ),
     "claude-opus-4-7": ProviderCapabilities(
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=128_000,
     ),
     "claude-sonnet-4-6": ProviderCapabilities(
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=128_000,
     ),
 }
@@ -257,7 +265,7 @@ def google_capabilities(model: str) -> ProviderCapabilities:
             native_tools=True,
             vision=True,
             reasoning=True,
-            context_window=1_000_000,
+            max_input_tokens=1_000_000,
             max_output_tokens=64_000,
             reasoning_effort=effort,
         )
@@ -292,7 +300,7 @@ def vertex_google_capabilities(model: str) -> ProviderCapabilities:
             native_tools=True,
             vision=True,
             reasoning=True,
-            context_window=1_048_576,
+            max_input_tokens=1_048_576,
             max_output_tokens=65_536,
             reasoning_effort=effort,
         )

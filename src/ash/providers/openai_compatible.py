@@ -204,6 +204,11 @@ class CatalogOpenAIProvider(OpenAIProvider):
                 for item in matched
                 if item.max_output_tokens is not None
             ]
+            input_limits = [
+                item.max_input_tokens
+                for item in matched
+                if item.max_input_tokens is not None
+            ]
             self._dynamic_capabilities = ProviderCapabilities(
                 native_tools=native_tools,
                 vision=vision,
@@ -219,6 +224,11 @@ class CatalogOpenAIProvider(OpenAIProvider):
                     min(output_limits)
                     if output_limits
                     else declared_capabilities.max_output_tokens
+                ),
+                max_input_tokens=(
+                    min(input_limits)
+                    if input_limits
+                    else declared_capabilities.max_input_tokens
                 ),
             )
         elif failures and len(failures) == len(self._catalog_sources):

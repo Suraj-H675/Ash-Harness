@@ -2008,7 +2008,7 @@ class _FakeAnthropicMessages:
 
 
 @pytest.mark.asyncio
-async def test_anthropic_does_not_forward_deprecated_temperature() -> None:
+async def test_anthropic_request_applies_response_cap_without_temperature() -> None:
     from ash.providers.anthropic import AnthropicProvider
 
     messages = _FakeAnthropicMessages(SimpleNamespace())
@@ -2018,6 +2018,7 @@ async def test_anthropic_does_not_forward_deprecated_temperature() -> None:
         client=SimpleNamespace(messages=messages),
     )
     provider.configure_reasoning_effort("xhigh")
+    provider.configure_max_tokens(123)
 
     _ = [
         chunk
@@ -2028,6 +2029,7 @@ async def test_anthropic_does_not_forward_deprecated_temperature() -> None:
     ]
 
     assert "temperature" not in messages.kwargs
+    assert messages.kwargs["max_tokens"] == 123
     assert messages.kwargs["output_config"] == {"effort": "xhigh"}
 
 
@@ -2262,7 +2264,7 @@ async def test_anthropic_capabilities_use_provider_model_metadata() -> None:
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=128_000,
         reasoning_effort=infer_capabilities(
             "anthropic", "claude-sonnet-5-5"
@@ -2300,7 +2302,7 @@ async def test_anthropic_unknown_model_metadata_keeps_tools_conservative() -> No
         native_tools=False,
         vision=True,
         reasoning=True,
-        context_window=2_000_000,
+        max_input_tokens=2_000_000,
         max_output_tokens=256_000,
     )
 
@@ -2320,7 +2322,7 @@ async def test_anthropic_capability_probe_without_models_api_uses_static_truth()
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=128_000,
         reasoning_effort=infer_capabilities(
             "anthropic", "claude-sonnet-5-5"

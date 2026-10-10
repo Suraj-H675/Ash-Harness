@@ -688,7 +688,8 @@ def test_probe_google_model_metadata_preserves_native_limits_and_thinking(
     assert entry.model_id == "gemini-3.8-flash"
     assert entry.aliases == frozenset({"gemini-3.8-flash-001"})
     assert entry.reasoning is True
-    assert entry.context_window == 1_000_000
+    assert entry.context_window is None
+    assert entry.max_input_tokens == 1_000_000
     assert entry.max_output_tokens == 64_000
     assert entry.native_tools is None
     assert entry.vision is None

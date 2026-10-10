@@ -251,7 +251,7 @@ def test_vertex_registry_enables_current_gemini_capabilities_and_replay(
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_048_576,
+        max_input_tokens=1_048_576,
         max_output_tokens=65_536,
         reasoning_effort=ReasoningEffortSpec(("low", "medium", "high")),
     )
@@ -688,7 +688,7 @@ def test_google_current_model_has_exact_offline_capability_floor() -> None:
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=64_000,
         reasoning_effort=ReasoningEffortSpec(("low", "medium", "high"), "medium"),
     )
@@ -705,7 +705,7 @@ def test_anthropic_current_capabilities_are_exact_and_unknowns_fail_closed() -> 
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=128_000,
         reasoning_effort=ReasoningEffortSpec(
             ("low", "medium", "high", "xhigh", "max"), "high"
@@ -1027,6 +1027,7 @@ def test_custom_openai_compatible_provider_uses_explicit_model_capabilities() ->
                         "vision": True,
                         "reasoning": True,
                         "context_window": 128_000,
+                        "max_input_tokens": 96_000,
                         "max_output_tokens": 8192,
                     }
                 },
@@ -1040,6 +1041,7 @@ def test_custom_openai_compatible_provider_uses_explicit_model_capabilities() ->
     assert provider.capabilities.vision is True
     assert provider.capabilities.reasoning is True
     assert provider.capabilities.context_window == 128_000
+    assert provider.capabilities.max_input_tokens == 96_000
     assert provider.capabilities.max_output_tokens == 8192
 
 
@@ -1134,7 +1136,7 @@ async def test_google_uses_native_selected_model_metadata(
             ProviderModelMetadata(
                 model_id="gemini-3.8-flash",
                 reasoning=True,
-                context_window=1_000_000,
+                max_input_tokens=1_000_000,
                 max_output_tokens=64_000,
             ),
         )
@@ -1147,7 +1149,7 @@ async def test_google_uses_native_selected_model_metadata(
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=64_000,
         reasoning_effort=google_capabilities("gemini-3.8-flash").reasoning_effort,
     )
@@ -1177,7 +1179,7 @@ async def test_google_native_alias_inherits_verified_base_model_capabilities(
                 model_id="gemini-3.8-flash",
                 aliases=frozenset({"gemini-3.8-flash-001"}),
                 reasoning=True,
-                context_window=1_000_000,
+                max_input_tokens=1_000_000,
                 max_output_tokens=64_000,
             ),
         ),
@@ -1187,7 +1189,7 @@ async def test_google_native_alias_inherits_verified_base_model_capabilities(
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_000_000,
+        max_input_tokens=1_000_000,
         max_output_tokens=64_000,
         reasoning_effort=google_capabilities("gemini-3.8-flash").reasoning_effort,
     )

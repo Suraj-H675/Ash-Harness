@@ -1443,7 +1443,7 @@ def test_model_capability_display_covers_budgets_and_custom_models() -> None:
     list_rendered = _render_model_list(config)
 
     assert "tools" in rendered and "vision" in rendered and "reasoning" in rendered
-    assert "context 1,000,000" in rendered
+    assert "input 1,000,000" in rendered
     assert "output 128,000" in rendered
     assert "claude-opus-5-5 [tools, vision, reasoning]" in list_rendered
     assert "gemini-3.8-flash [tools, vision, reasoning]" in list_rendered
@@ -1464,6 +1464,7 @@ def test_custom_model_capability_display_uses_configured_declaration() -> None:
                         "native_tools": True,
                         "vision": True,
                         "context_window": 32_768,
+                        "max_input_tokens": 24_576,
                         "max_output_tokens": 4096,
                     }
                 },
@@ -1475,6 +1476,7 @@ def test_custom_model_capability_display_uses_configured_declaration() -> None:
 
     assert "[tools, vision]" in rendered
     assert "context 32,768" in rendered
+    assert "input 24,576" in rendered
     assert "output 4,096" in rendered
 
 
@@ -1553,7 +1555,9 @@ def test_runtime_capabilities_render_dynamic_and_static_sources() -> None:
         provider=SimpleNamespace(
             provider_family="ollama",
             model_name="tool-model",
-            capabilities=ProviderCapabilities(True, local=True, context_window=32768),
+            capabilities=ProviderCapabilities(
+                True, local=True, context_window=32768, max_input_tokens=24576
+            ),
             _dynamic_capabilities=ProviderCapabilities(True, local=True),
         ),
     )
@@ -1587,6 +1591,7 @@ def test_runtime_capabilities_render_dynamic_and_static_sources() -> None:
     assert "Runtime capabilities for ollama/tool-model:" in dynamic_rendered
     assert "source: dynamic manifest" in dynamic_rendered
     assert "context_window=32,768" in dynamic_rendered
+    assert "max_input_tokens=24,576" in dynamic_rendered
     assert "Runtime capabilities for openai/gpt-test:" in static_rendered
     assert "source: static/default registry" in static_rendered
     assert "source: dynamic manifest" in nested_rendered

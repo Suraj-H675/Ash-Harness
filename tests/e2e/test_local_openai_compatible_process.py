@@ -11,6 +11,22 @@ from pathlib import Path
 import pytest
 
 
+def _route_loopback_directly(environment: dict[str, str]) -> None:
+    """Keep host proxy settings from intercepting the fake local provider."""
+
+    for variable in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        environment.pop(variable, None)
+    environment["NO_PROXY"] = "127.0.0.1,localhost"
+    environment["no_proxy"] = "127.0.0.1,localhost"
+
+
 @pytest.mark.parametrize(
     ("provider", "base_env", "catalog_path"),
     [
@@ -25,6 +41,7 @@ def test_local_openai_compatible_route_runs_through_fresh_cli_process(
     catalog_path: str,
 ) -> None:
     seen: list[tuple[str, str, str | None]] = []
+    request_bodies: list[dict[str, object]] = []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -47,6 +64,7 @@ def test_local_openai_compatible_route_runs_through_fresh_cli_process(
                             {
                                 "key": "local-model",
                                 "type": "llm",
+                                "max_output_tokens": 64,
                                 "loaded_instances": [
                                     {"config": {"context_length": 32768}}
                                 ],
@@ -59,7 +77,11 @@ def test_local_openai_compatible_route_runs_through_fresh_cli_process(
                 self._json(
                     {
                         "object": "list",
-                        "data": [{"id": "local-model", "max_model_len": 32768}],
+                        "data": [{
+                            "id": "local-model",
+                            "max_model_len": 32768,
+                            "max_output_tokens": 64,
+                        }],
                     }
                 )
                 return
@@ -74,7 +96,7 @@ def test_local_openai_compatible_route_runs_through_fresh_cli_process(
                 return
             length = int(self.headers.get("Content-Length", "0") or 0)
             if length:
-                self.rfile.read(length)
+                request_bodies.append(json.loads(self.rfile.read(length)))
             chunk = {
                 "id": "local",
                 "object": "chat.completion.chunk",
@@ -118,6 +140,7 @@ def test_local_openai_compatible_route_runs_through_fresh_cli_process(
                 "NO_COLOR": "1",
             }
         )
+        _route_loopback_directly(environment)
         for other in {"LMSTUDIO_API_BASE", "VLLM_API_BASE"} - {base_env}:
             environment.pop(other, None)
 
@@ -158,6 +181,7 @@ def test_local_openai_compatible_route_runs_through_fresh_cli_process(
         assert payload["model"] == f"{provider}/local-model"
         assert ("GET", catalog_path, None) in seen
         assert ("POST", "/v1/chat/completions", None) in seen
+        assert request_bodies[0]["max_tokens"] == 64
         assert all(authorization is None for _, _, authorization in seen)
     finally:
         server.shutdown()
@@ -365,6 +389,7 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
                 "NO_COLOR": "1",
             }
         )
+        _route_loopback_directly(environment)
         for other in {"LMSTUDIO_API_BASE", "VLLM_API_BASE"} - {base_env}:
             environment.pop(other, None)
 

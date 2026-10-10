@@ -469,6 +469,71 @@ def test_loop_runs_editable_planning_phase_before_execution(tmp_path: Path) -> N
     assert sprint.items[0].description == "Add login endpoint"
 
 
+def test_planner_and_loop_use_their_own_provider_budgets(tmp_path: Path) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+
+    class BudgetProvider(FakeProvider):
+        def __init__(self, scripts: list[list[str]], capabilities: ProviderCapabilities):
+            super().__init__(scripts)
+            self.capabilities = capabilities
+            self.completion_limits: list[int] = []
+
+        def configure_max_tokens(self, max_tokens: int) -> None:
+            self.completion_limits.append(max_tokens)
+
+    plan_provider = BudgetProvider(
+        [
+            [
+                "## Goal\nImplement login\n\n## Test Command\npytest\n\n"
+                "## Rollback Plan\nrevert\n\n## Checklist\n\n"
+                "### Implementation\n- [ ] Add login endpoint\n"
+            ],
+        ],
+        ProviderCapabilities(
+            context_window=1_000,
+            max_input_tokens=500,
+            max_output_tokens=80,
+        ),
+    )
+    execution_provider = BudgetProvider(
+        [["<response>executed plan</response>"]],
+        ProviderCapabilities(
+            context_window=2_000,
+            max_input_tokens=1_200,
+            max_output_tokens=40,
+        ),
+    )
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        max_context_tokens=5_000,
+        max_completion_tokens=1_000,
+        memory_backend="off",
+    )
+    store = SessionStore(tmp_path / "route-budget.db")
+    loop = AshLoop(
+        store,
+        execution_provider,
+        SafetyGuard(tmp_path),
+        _make_ui(input_text="y\n"),
+        tmp_path,
+        tools={},
+        config=config,
+        system_prompt="test",
+        planner=Planner(plan_provider),
+        enable_sprint_planning=True,
+    )
+
+    asyncio.run(loop.start_session())
+    response = asyncio.run(
+        loop.run_turn("Implement user authentication for the API")
+    )
+
+    assert response == "executed plan"
+    assert plan_provider.completion_limits == [80]
+    assert execution_provider.completion_limits == [40]
+
+
 def test_loop_injects_live_persisted_plan_state_into_provider(tmp_path: Path) -> None:
     provider = FakeProvider(
         scripts=[

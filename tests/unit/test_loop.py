@@ -5350,6 +5350,101 @@ async def test_turn_token_budget_blocks_next_provider_request(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_provider_output_limit_is_used_for_context_and_request(tmp_path):
+    class LimitedProvider(ProviderABC):
+        model_name = "limited-context-provider"
+        capabilities = ProviderCapabilities(
+            context_window=2_000,
+            max_input_tokens=64,
+            max_output_tokens=48,
+        )
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.completion_limits: list[int] = []
+
+        def count_tokens(self, text: str) -> int:
+            return 0
+
+        def configure_max_tokens(self, max_tokens: int) -> None:
+            self.completion_limits.append(max_tokens)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            yield StreamChunk(content="done", is_done=True)
+
+    provider = LimitedProvider()
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        max_context_tokens=5_000,
+        max_completion_tokens=4_000,
+        memory_backend="off",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "provider-output-budget.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={},
+        config=config,
+        system_prompt="test",
+    )
+
+    assert await loop.run_turn("hello") == "done"
+
+    assert provider.completion_limits == [48]
+    assert provider.calls == 1
+    assert loop._last_context_maximum == 64
+    assert loop._last_context_budget is not None
+    assert loop._last_context_budget.maximum == 2_000
+    assert loop._last_context_budget.completion_reserve == 48
+    assert loop._last_context_budget.input_limit == 64
+
+
+@pytest.mark.asyncio
+async def test_impossible_provider_budget_fails_before_dispatch(tmp_path):
+    class TooSmallProvider(ProviderABC):
+        model_name = "too-small-context-provider"
+        capabilities = ProviderCapabilities(context_window=2_000)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text: str) -> int:
+            return len(str(text).split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            yield StreamChunk(content="unexpected", is_done=True)
+
+    provider = TooSmallProvider()
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        max_context_tokens=5_000,
+        max_completion_tokens=4_000,
+        memory_backend="off",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "impossible-provider-budget.db"),
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={},
+        config=config,
+        system_prompt="test",
+    )
+
+    with pytest.raises(RuntimeError, match="max_completion_tokens"):
+        await loop.run_turn("hello")
+
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_tool_execution_writes_tamper_evident_audit_log(tmp_path):
     provider = NativeToolProvider()
     tool = CaptureTool(SafetyGuard(project_root=tmp_path))

@@ -55,6 +55,7 @@ class FailoverProvider(ProviderABC):
     def capabilities(self) -> ProviderCapabilities:
         capabilities = [provider.capabilities for provider in self.providers]
         context_windows = [item.context_window for item in capabilities]
+        input_limits = [item.max_input_tokens for item in capabilities]
         output_limits = [item.max_output_tokens for item in capabilities]
         effort_supports = [item.reasoning_effort for item in capabilities]
         effort_support = None
@@ -86,6 +87,11 @@ class FailoverProvider(ProviderABC):
             max_output_tokens=(
                 min(value for value in output_limits if value is not None)
                 if all(value is not None for value in output_limits)
+                else None
+            ),
+            max_input_tokens=(
+                min(value for value in input_limits if value is not None)
+                if all(value is not None for value in input_limits)
                 else None
             ),
         )

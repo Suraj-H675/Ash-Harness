@@ -1,8 +1,16 @@
 # Context Management
 
-Ash builds each provider request under a hard input limit derived from the
-configured model window and completion reserve. The limit covers chat messages
-and provider-facing tool schemas.
+Ash builds each provider request under an input limit derived from its
+configured combined context allowance and response reserve. A provider's
+combined `context_window`, input-only `max_input_tokens`, and response-only
+`max_output_tokens` remain separate limits. Ash applies each known provider
+limit and treats missing metadata as unknown; configured values remain local
+Ash ceilings. The input limit covers chat messages and provider-facing tool
+schemas. `/context` reports the effective input, response reserve, and combined
+allowance for the last request.
+An adapter that does not accept a response ceiling can only use the reserve for
+input admission; the ChatGPT-plan preview route currently does not transmit a
+maximum response value.
 
 ## Budget buckets
 

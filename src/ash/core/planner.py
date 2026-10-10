@@ -22,6 +22,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
+from ash.context.history import RequestBudgetError, RequestTokenBudget
 from ash.core.sprint import (
     ChecklistItem,
     ChecklistStatus,
@@ -149,6 +150,12 @@ class Planner:
 
         self._provider = provider
 
+    @property
+    def provider(self) -> ProviderABC:
+        """Return the provider whose capabilities and request path the planner uses."""
+
+        return self._provider
+
     async def decompose(
         self,
         user_request: str,
@@ -180,6 +187,7 @@ class Planner:
         timeout_seconds: float = 1800.0,
         total_token_budget: int = 0,
         max_completion_tokens: int | None = None,
+        request_budget: RequestTokenBudget | None = None,
     ) -> tuple[SprintExecution, CompletionOutcome]:
         """Return a sprint and its architect request usage for turn accounting."""
 
@@ -195,7 +203,33 @@ class Planner:
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": prompt},
         ]
-        if total_token_budget > 0:
+        if request_budget is not None:
+            counter = (
+                self._token_counter.count
+                if self._token_counter is not None
+                else self._provider.count_tokens
+            )
+            estimated_input = max(
+                1, int(counter(json.dumps(messages, ensure_ascii=False)))
+            )
+            if estimated_input > request_budget.input_limit:
+                raise RequestBudgetError(
+                    f"planner prompt estimate ({estimated_input:,}) exceeds the "
+                    f"provider input limit ({request_budget.input_limit:,})"
+                )
+            output_limit = request_budget.response_limit_for_request(
+                estimated_input_tokens=estimated_input,
+                remaining_turn_tokens=(
+                    total_token_budget if total_token_budget > 0 else None
+                ),
+            )
+            if output_limit is None:
+                raise PlannerError(
+                    "planner input exceeds turn token budget or leaves no "
+                    "response tokens within it"
+                )
+            self._provider.configure_max_tokens(output_limit)
+        elif total_token_budget > 0:
             counter = (
                 self._token_counter.count
                 if self._token_counter is not None

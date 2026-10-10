@@ -34,6 +34,7 @@ def test_render_context_budget_shows_bucket_usage() -> None:
         )
     )
 
+    assert "input=90; response_reserve=10; combined=100" in rendered
     assert "system: ~12/20" in rendered
     assert "memory: ~10/10 truncated" in rendered
     assert "system: assembled_system_prompt [mixed] sha256=aaaaaaaaaaaa" in rendered

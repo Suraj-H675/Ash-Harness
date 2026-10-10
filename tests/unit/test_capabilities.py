@@ -185,6 +185,18 @@ def test_reasoning_effort_is_declared_only_for_verified_model_routes() -> None:
     assert infer_capabilities("openrouter", "vendor/model").reasoning_effort is None
 
 
+def test_provider_input_limits_are_not_reported_as_combined_windows() -> None:
+    anthropic = infer_capabilities("anthropic", "claude-sonnet-5-5")
+    google = google_capabilities("gemini-3.8-flash")
+
+    assert anthropic.context_window is None
+    assert anthropic.max_input_tokens == 1_000_000
+    assert anthropic.max_output_tokens == 128_000
+    assert google.context_window is None
+    assert google.max_input_tokens == 1_000_000
+    assert google.max_output_tokens == 64_000
+
+
 def test_provider_rejects_unsupported_reasoning_effort() -> None:
     provider = DeclaredProvider("model")
     with pytest.raises(ValueError, match="unavailable"):

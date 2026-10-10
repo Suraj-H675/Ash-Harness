@@ -73,7 +73,7 @@ def test_vertex_current_gemini_capabilities_are_exact_and_unknowns_conservative(
         native_tools=True,
         vision=True,
         reasoning=True,
-        context_window=1_048_576,
+        max_input_tokens=1_048_576,
         max_output_tokens=65_536,
         reasoning_effort=ReasoningEffortSpec(("low", "medium", "high")),
     )

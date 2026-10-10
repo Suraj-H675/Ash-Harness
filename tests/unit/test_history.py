@@ -9,12 +9,53 @@ from ash.context.history import (
     ContextFragmentKind,
     ContextTrust,
     HistoryCompactor,
+    RequestBudgetError,
     context_fragment,
 )
 
 
 def count_words(text: str) -> int:
     return len(text.split())
+
+
+def test_request_token_budget_keeps_limit_kinds_separate() -> None:
+    from ash.context.history import resolve_request_token_budget
+
+    budget = resolve_request_token_budget(
+        configured_context_tokens=500,
+        configured_response_tokens=80,
+        provider_context_window=300,
+        provider_max_input_tokens=140,
+        provider_max_output_tokens=60,
+    )
+
+    assert budget.combined_limit == 300
+    assert budget.input_limit == 140
+    assert budget.response_limit == 60
+    assert budget.response_limit_for_request(
+        estimated_input_tokens=90,
+        remaining_turn_tokens=120,
+    ) == 30
+    assert budget.response_limit_for_request(
+        estimated_input_tokens=90,
+        remaining_turn_tokens=90,
+    ) is None
+
+
+def test_invalid_provider_token_limits_remain_unknown() -> None:
+    from ash.context.history import resolve_request_token_budget
+
+    budget = resolve_request_token_budget(
+        configured_context_tokens=500,
+        configured_response_tokens=80,
+        provider_context_window=True,
+        provider_max_input_tokens=0,
+        provider_max_output_tokens=-1,
+    )
+
+    assert budget.combined_limit == 500
+    assert budget.input_limit == 420
+    assert budget.response_limit == 80
 
 
 def test_history_below_budget_is_unchanged() -> None:
@@ -336,7 +377,7 @@ def test_context_budget_allocator_rejects_overflowing_weight_sum() -> None:
 
 
 def test_context_budget_allocator_rejects_too_little_usable_context() -> None:
-    with pytest.raises(ValueError, match="at least one token per budget bucket"):
+    with pytest.raises(RequestBudgetError, match="at least 5"):
         ContextBudgetAllocator(
             max_context_tokens=5,
             completion_reserve=1,

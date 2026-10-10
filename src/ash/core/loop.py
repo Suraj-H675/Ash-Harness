@@ -43,6 +43,7 @@ from xml.sax.saxutils import escape as xml_escape, quoteattr
 
 from pydantic import ValidationError
 
+from ash.context.history import RequestTokenBudget, resolve_request_token_budget
 from ash.core.goals import (
     DEFAULT_MAX_GOAL_CONTINUATIONS,
     GoalRecord,
@@ -3818,9 +3819,11 @@ class AshLoop:
                     self._pending_memory_context = "\n\n".join(
                         f"// From {hit.file_path}:\n{hit.content[:500]}" for hit in hits
                     )
+            request_budget = self._resolve_request_token_budget()
             try:
                 messages = self._build_messages(
                     session,
+                    request_budget=request_budget,
                     provider_tools=iteration_tools,
                     tool_schema_payload=iteration_tool_schema,
                 )
@@ -3841,7 +3844,29 @@ class AshLoop:
                     ).strip()
                     break
                 raise
-            if turn_token_budget > 0:
+            if request_budget is not None:
+                remaining_turn_tokens: int | None = None
+                estimated_prompt = 0
+                used_before_request = 0
+                if turn_token_budget > 0:
+                    used_before_request = total_prompt_tokens + total_completion_tokens
+                    remaining_turn_tokens = turn_token_budget - used_before_request
+                    estimated_prompt = max(1, self._last_context_tokens)
+                response_limit = request_budget.response_limit_for_request(
+                    estimated_input_tokens=estimated_prompt,
+                    remaining_turn_tokens=remaining_turn_tokens,
+                )
+                if response_limit is None:
+                    turn_budget_exhausted = True
+                    final_text = (
+                        f"{final_text}\n\n"
+                        "[Turn token budget exhausted before another model request: "
+                        f"used {used_before_request}, next input requires approximately "
+                        f"{estimated_prompt}, budget {turn_token_budget}.]"
+                    ).strip()
+                    break
+                self.provider.configure_max_tokens(response_limit)
+            elif turn_token_budget > 0:
                 used_before_request = total_prompt_tokens + total_completion_tokens
                 remaining = turn_token_budget - used_before_request
                 estimated_prompt = max(1, self._last_context_tokens)
@@ -4579,9 +4604,8 @@ class AshLoop:
             total_token_budget=int(
                 getattr(self._config, "max_turn_total_tokens", 0)
             ),
-            max_completion_tokens=(
-                self._config.max_completion_tokens
-                if self._config is not None else None
+            request_budget=self._resolve_request_token_budget(
+                self.planner.provider
             ),
         )
 
@@ -6590,10 +6614,29 @@ class AshLoop:
 
     # --- message building ---------------------------------------------------
 
+    def _resolve_request_token_budget(
+        self, provider: Any | None = None
+    ) -> RequestTokenBudget | None:
+        """Resolve one provider-aware budget from config and declared capabilities."""
+
+        if self._config is None:
+            return None
+        capabilities = _provider_capabilities(
+            self.provider if provider is None else provider
+        )
+        return resolve_request_token_budget(
+            configured_context_tokens=self._config.max_context_tokens,
+            configured_response_tokens=self._config.max_completion_tokens,
+            provider_context_window=capabilities.context_window,
+            provider_max_input_tokens=capabilities.max_input_tokens,
+            provider_max_output_tokens=capabilities.max_output_tokens,
+        )
+
     def _build_messages(
         self,
         session: Session,
         *,
+        request_budget: RequestTokenBudget | None = None,
         force_compaction: bool = False,
         provider_tools: dict[str, BaseTool] | None = None,
         tool_schema_payload: list[dict[str, Any]] | None = None,
@@ -6689,19 +6732,22 @@ class AshLoop:
                 ContextFragmentKind,
                 ContextTrust,
                 HistoryCompactor,
+                RequestBudgetError,
                 RUNTIME_ONLY_HISTORY_KEY,
                 context_fragment,
             )
 
-            maximum_context = min(
-                self._config.max_context_tokens,
-                _provider_capabilities(self.provider).context_window
-                or self._config.max_context_tokens,
-            )
+            if request_budget is None:
+                request_budget = self._resolve_request_token_budget()
+            if request_budget is None:
+                raise RequestBudgetError(
+                    "provider request budget is unavailable for configured context"
+                )
             allocator = ContextBudgetAllocator(
-                max_context_tokens=maximum_context,
-                completion_reserve=self._config.max_completion_tokens,
+                max_context_tokens=request_budget.combined_limit,
+                completion_reserve=request_budget.response_limit,
                 weights=self._config.context_budget_weights,
+                input_token_limit=request_budget.input_limit,
             )
             budget_limits = allocator.allocate()
             budget_usage: dict[str, int] = {}
@@ -6820,8 +6866,8 @@ class AshLoop:
             )
             provider_input_limit = allocator.input_limit - native_tool_schema_tokens
             compactor = HistoryCompactor(
-                max_context_tokens=maximum_context,
-                completion_reserve=self._config.max_completion_tokens,
+                max_context_tokens=request_budget.combined_limit,
+                completion_reserve=request_budget.response_limit,
                 threshold=self._config.context_compaction_threshold,
                 recent_messages=self._config.context_recent_messages,
                 max_tool_output_chars=self._config.max_tool_result_tokens * 4,
@@ -6838,7 +6884,7 @@ class AshLoop:
             self._last_context_tokens = (
                 result.estimated_tokens + native_tool_schema_tokens
             )
-            maximum_input = max(1, maximum_context - self._config.max_completion_tokens)
+            maximum_input = request_budget.input_limit
             self._last_context_maximum = maximum_input
             if self._last_context_tokens > maximum_input:
                 raise ContextBudgetExceededError(

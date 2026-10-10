@@ -213,9 +213,9 @@ class AnthropicProvider(ProviderABC):
                 else baseline.reasoning
             ),
             reasoning_effort=baseline.reasoning_effort,
-            context_window=(
+            max_input_tokens=(
                 positive_limit(getattr(info, "max_input_tokens", None))
-                or baseline.context_window
+                or baseline.max_input_tokens
             ),
             max_output_tokens=(
                 positive_limit(getattr(info, "max_tokens", None))

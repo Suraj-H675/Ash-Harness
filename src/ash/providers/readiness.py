@@ -137,7 +137,7 @@ class ProviderVerification:
 
 @dataclass(frozen=True)
 class ProviderModelMetadata:
-    """Validated model capability metadata from a provider catalog."""
+    """Validated catalog metadata with distinct combined, input, and output limits."""
 
     model_id: str
     aliases: frozenset[str] = frozenset()
@@ -148,6 +148,7 @@ class ProviderModelMetadata:
     reasoning: bool | None = None
     context_window: int | None = None
     max_output_tokens: int | None = None
+    max_input_tokens: int | None = None
 
 
 def select_provider_model_metadata(
@@ -939,8 +940,10 @@ def probe_model_catalog_metadata(
             or _positive_catalog_integer(item.get("context_length"))
             or _positive_catalog_integer(item.get("contextLength"))
         )
+        max_input = None
         if catalog_format == "google":
-            context_window = _positive_catalog_integer(item.get("inputTokenLimit"))
+            context_window = None
+            max_input = _positive_catalog_integer(item.get("inputTokenLimit"))
         if catalog_format == "huggingface" and huggingface_live_providers:
             provider_contexts = [
                 value
@@ -973,6 +976,7 @@ def probe_model_catalog_metadata(
                 reasoning=reasoning,
                 context_window=context_window,
                 max_output_tokens=max_output,
+                max_input_tokens=max_input,
             )
         )
     if not models:

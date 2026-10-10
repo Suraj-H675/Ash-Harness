@@ -455,7 +455,10 @@ class AshConfig(BaseSettings):
     max_context_tokens: int = Field(
         128000,
         gt=0,
-        description="Maximum total tokens in the input context window.",
+        description=(
+            "Maximum combined input and response tokens for one provider request; "
+            "max_completion_tokens is reserved from this limit."
+        ),
     )
     max_completion_tokens: int = Field(
         4000,

@@ -234,7 +234,10 @@ cloud identity material remain excluded.
 
 Wire compatibility does not imply model capability. Custom routes therefore
 fail closed for native tools, vision, and reasoning unless the user declares
-capabilities for the exact model. Optional limits are positive integers:
+capabilities for the exact model. Optional limits are positive integers.
+`context_window` is the combined input-plus-response window;
+`max_input_tokens` and `max_output_tokens` are independent input and response
+limits:
 
 ```toml
 [custom_providers.example.model_capabilities."agent-model"]
@@ -242,6 +245,7 @@ native_tools = true
 vision = true
 reasoning = false
 context_window = 131072
+max_input_tokens = 120000
 max_output_tokens = 8192
 ```
 

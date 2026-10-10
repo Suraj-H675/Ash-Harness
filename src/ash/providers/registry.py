@@ -660,6 +660,7 @@ def _custom_model_capabilities(
         "reasoning",
         "context_window",
         "max_output_tokens",
+        "max_input_tokens",
     }
     unknown = set(raw) - allowed
     if unknown:
@@ -679,7 +680,7 @@ def _custom_model_capabilities(
         boolean_values[field] = value
 
     integer_values: dict[str, int | None] = {}
-    for field in ("context_window", "max_output_tokens"):
+    for field in ("context_window", "max_input_tokens", "max_output_tokens"):
         value = raw.get(field)
         if value is not None and (
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
@@ -696,6 +697,7 @@ def _custom_model_capabilities(
         reasoning=boolean_values["reasoning"],
         context_window=integer_values["context_window"],
         max_output_tokens=integer_values["max_output_tokens"],
+        max_input_tokens=integer_values["max_input_tokens"],
     )
 
 
