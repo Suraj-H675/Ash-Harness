@@ -308,6 +308,7 @@ async def test_run_command_pty_enforces_output_capture_limit(
     assert result.truncated is True
     assert len(result.output) < 256
     assert "Process output capture limit reached" in result.output
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
 
 
 @pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
@@ -974,6 +975,7 @@ async def test_run_command_handles_output_capture_limit_without_escaping(
     assert result.success is True
     assert result.truncated is True
     assert "Process output capture limit reached" in result.output
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
 
 
 @pytest.mark.asyncio

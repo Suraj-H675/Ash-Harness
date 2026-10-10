@@ -19,7 +19,7 @@ import re
 import secrets
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -120,6 +120,7 @@ class SandboxResult:
     duration_seconds: float = 0.0
     output_truncated: bool = False
     timed_out: bool = False
+    outcome_unknown: bool = False
 
 
 @dataclass(frozen=True)
@@ -742,12 +743,18 @@ class SandboxManager:
         if not isinstance(backend, DockerSandbox) or backend.docker_path is None:
             raise SandboxBackendUnavailable("Docker backend is unavailable")
         volume_name = f"ash-plugin-{secrets.token_hex(12)}"
-        created = False
+        volume_may_exist = False
+
+        def mark_volume_create_started() -> None:
+            nonlocal volume_may_exist
+            volume_may_exist = True
+
         try:
             await _run_docker_control(
-                [backend.docker_path, "volume", "create", volume_name]
+                [backend.docker_path, "volume", "create", volume_name],
+                on_spawn=mark_volume_create_started,
             )
-            created = True
+            volume_may_exist = True
             stager = DockerSandbox(
                 image=self.docker_image,
                 workspace_root=self.workspace_root,
@@ -770,7 +777,7 @@ class SandboxManager:
             await _run_docker_control(stage_argv, stdin=archive, timeout_seconds=300)
             return volume_name
         except BaseException as primary:
-            if created:
+            if volume_may_exist:
                 cleanup_task = asyncio.create_task(
                     self.remove_docker_workspace(volume_name)
                 )
@@ -1144,6 +1151,7 @@ async def _run_scoped(
             fallback_used=fallback,
             duration_seconds=time.monotonic() - start,
             output_truncated=True,
+            outcome_unknown=exc.interrupted,
         )
     except Exception as primary_error:
         await _settle_unexpected_process_failure(
@@ -1279,6 +1287,7 @@ async def _run_subprocess(
             fallback_used=False,
             duration_seconds=time.monotonic() - start,
             output_truncated=True,
+            outcome_unknown=exc.interrupted,
         )
     except Exception as primary_error:
         await _settle_unexpected_process_failure(
@@ -1325,6 +1334,7 @@ async def _run_docker_control(
     *,
     stdin: BinaryIO | None = None,
     timeout_seconds: float = 60,
+    on_spawn: Callable[[], None] | None = None,
 ) -> bytes:
     """Run one bounded Docker CLI control command with managed cleanup."""
 
@@ -1345,6 +1355,8 @@ async def _run_docker_control(
             env=docker_cli_environment(),
             **process_tree_plan.spawn_options,
         )
+        if on_spawn is not None:
+            on_spawn()
     except OSError as exc:
         raise SandboxBackendUnavailable(
             f"Docker control command was not started: {exc}"

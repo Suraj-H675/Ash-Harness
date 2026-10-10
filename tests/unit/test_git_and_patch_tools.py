@@ -463,13 +463,125 @@ async def test_patch_tool_does_not_execute_workspace_shadowed_git(
 
 
 @pytest.mark.asyncio
-async def test_git_inspection_reports_process_timeout(tmp_path: Path) -> None:
-    with patch("ash.tools.git.communicate_process", side_effect=asyncio.TimeoutError):
-        result = await GitStatusTool(SafetyGuard(tmp_path)).run()
+@pytest.mark.parametrize(
+    ("timeout_on_apply", "expected_outcome"),
+    [
+        (False, ToolExecutionOutcome.COMPLETED),
+        (True, ToolExecutionOutcome.UNKNOWN),
+    ],
+)
+async def test_patch_timeout_outcome_tracks_mutation_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_on_apply: bool,
+    expected_outcome: ToolExecutionOutcome,
+) -> None:
+    import ash.tools.patch as patch_module
+
+    patch_text = """diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-old
++new
+"""
+
+    async def timeout_at_selected_stage(
+        _cwd: Path,
+        _patch: str,
+        *,
+        check: bool,
+    ) -> tuple[int, str, str]:
+        if check == timeout_on_apply:
+            return 0, "", ""
+        failure = asyncio.TimeoutError()
+        failure.add_note("Process-tree cleanup failed: synthetic cleanup failure")
+        raise failure
+
+    monkeypatch.setattr(patch_module, "_git_apply", timeout_at_selected_stage)
+
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(patch=patch_text)
+
+    assert result.success is False
+    assert result.outcome is expected_outcome
+    assert "timed out after 30 seconds" in (result.error or "")
+    assert "process-tree cleanup failed: synthetic cleanup failure" in (
+        result.error or ""
+    ).casefold()
+    if timeout_on_apply:
+        assert "Inspect the affected files before retrying" in (result.error or "")
+    else:
+        assert "no files were changed" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_patch_output_limit_after_dispatch_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.patch as patch_module
+
+    async def exceed_output_limit(
+        _cwd: Path,
+        _patch: str,
+        *,
+        check: bool,
+    ) -> tuple[int, str, str]:
+        if check:
+            return 0, "", ""
+        return patch_module.PATCH_OUTPUT_LIMIT_EXIT, "partial", "output exceeded"
+
+    monkeypatch.setattr(patch_module, "_git_apply", exceed_output_limit)
+    patch_text = """diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-old
++new
+"""
+
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(patch=patch_text)
+
+    assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
+    assert result.truncated is True
+    assert "workspace may have changed" in (result.error or "")
+    assert "output exceeded" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_git_inspection_reports_process_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.git as git_module
+    import ash.sandbox.process_utils as process_utils
+
+    async def fail_cleanup(*_args: object, **_kwargs: object) -> None:
+        from ash.sandbox.process_utils import ProcessTreeTerminationError
+
+        raise ProcessTreeTerminationError("synthetic cleanup failure")
+
+    monkeypatch.setattr(process_utils, "terminate_process_tree", fail_cleanup)
+    process = SimpleNamespace(pid=4321, returncode=None)
+    monkeypatch.setattr(
+        git_module.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    monkeypatch.setattr(
+        git_module,
+        "communicate_process",
+        AsyncMock(side_effect=asyncio.TimeoutError),
+    )
+    result = await GitStatusTool(SafetyGuard(tmp_path)).run()
 
     assert result.success is False
     assert result.output == ""
     assert "timed out after 30 seconds" in (result.error or "")
+    assert "process-tree cleanup failed: synthetic cleanup failure" in (
+        result.error or ""
+    )
     assert result.outcome is ToolExecutionOutcome.COMPLETED
 
 
@@ -537,7 +649,7 @@ async def test_git_timeout_cleanup_survives_second_cancellation(
     assert calls == 1
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX Git process timeout regression")
+@pytest.mark.skipif(os.name == "nt", reason="POSIX Git outcome regression")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("timeout_stage", ["update-ref", "post-commit"])
 async def test_auto_commit_reports_ambiguous_timeout_after_mutation(
@@ -553,38 +665,41 @@ async def test_auto_commit_reports_ambiguous_timeout_after_mutation(
     await _git(tmp_path, "add", "owned.txt")
     await _git(tmp_path, "commit", "-qm", "initial")
     target.write_text("after\n", encoding="utf-8")
+    post_commit_ran = tmp_path / "post-commit-ran"
     post_commit = tmp_path / ".git" / "hooks" / "post-commit"
     post_commit.write_text(
-        "#!/bin/sh\nsleep 2\nprintf ran > post-commit-ran\n",
+        f"#!/bin/sh\nprintf ran > '{post_commit_ran}'\n",
         encoding="utf-8",
     )
     post_commit.chmod(0o755)
 
     real_git = shutil.which("git")
     assert real_git is not None
-    git_wrapper = tmp_path / "git-wrapper"
-    git_wrapper.write_text(
-        "#!/bin/sh\n"
-        f"'{real_git}' \"$@\"\n"
-        "status=$?\n"
-        f"if [ \"{int(timeout_stage == 'update-ref')}\" -eq 1 ] "
-        "&& [ \"$1\" = update-ref ] && [ \"$status\" -eq 0 ]; then sleep 2; fi\n"
-        "exit \"$status\"\n",
-        encoding="utf-8",
-    )
-    git_wrapper.chmod(0o755)
-    monkeypatch.setattr(
-        git_module,
-        "resolve_host_executable",
-        lambda *_args, **_kwargs: str(git_wrapper),
-    )
-    real_wait_for = asyncio.wait_for
+    real_run_git_result = git_module._run_git_result
 
-    async def shortened_wait_for(awaitable, *, timeout):
-        del timeout
-        return await real_wait_for(awaitable, timeout=0.25)
+    async def report_lost_response(workspace_root, args, *run_args, **run_kwargs):
+        result = await real_run_git_result(
+            workspace_root, args, *run_args, **run_kwargs
+        )
+        mutation_completed = (
+            args[:1] == ["update-ref"]
+            if timeout_stage == "update-ref"
+            else (
+                args[:3] == ["hook", "run", "--ignore-missing"]
+                and "post-commit" in args
+            )
+        )
+        if mutation_completed:
+            return git_module._GitCommandResult(
+                result.returncode,
+                result.stdout,
+                result.stderr,
+                timed_out=True,
+                output_truncated=result.output_truncated,
+            )
+        return result
 
-    monkeypatch.setattr(git_module.asyncio, "wait_for", shortened_wait_for)
+    monkeypatch.setattr(git_module, "_run_git_result", report_lost_response)
 
     result = await AutoCommitTool(SafetyGuard(tmp_path)).run(
         message="capture owned change",
@@ -602,6 +717,7 @@ async def test_auto_commit_reports_ambiguous_timeout_after_mutation(
         assert "side effects may be incomplete" in (result.error or "")
         assert "Commit " in result.output
         assert "created." in result.output
+        assert post_commit_ran.read_text(encoding="utf-8") == "ran"
     head_subject = subprocess.run(
         [real_git, "log", "-1", "--format=%s"],
         cwd=tmp_path,
@@ -610,7 +726,6 @@ async def test_auto_commit_reports_ambiguous_timeout_after_mutation(
         text=True,
     ).stdout.strip()
     assert head_subject == "capture owned change"
-    assert not (tmp_path / "post-commit-ran").exists()
 
 
 @pytest.mark.asyncio

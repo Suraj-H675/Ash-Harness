@@ -63,6 +63,43 @@ def test_process_group_options_can_inherit_automation_group(
     assert process_group_options() == {}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ProcessTreeTerminationError("synthetic cleanup failure"),
+        RuntimeError("synthetic unexpected cleanup failure"),
+    ],
+)
+async def test_timeout_settlement_returns_process_tree_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: Exception,
+) -> None:
+    import ash.sandbox.process_utils as process_utils
+
+    process = Mock(pid=4321, returncode=None)
+    plan = ProcessTreePlan(
+        {"start_new_session": True},
+        None,
+        tmp_path,
+        "darwin",
+    )
+    async def fail_cleanup(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(process_utils, "terminate_process_tree", fail_cleanup)
+
+    cleanup_error = await process_utils.terminate_process_tree_after_timeout(
+        process, plan=plan
+    )
+    if isinstance(failure, ProcessTreeTerminationError):
+        assert cleanup_error is failure
+    else:
+        assert isinstance(cleanup_error, ProcessTreeTerminationError)
+        assert str(cleanup_error) == "managed process-tree cleanup raised RuntimeError"
+
+
 @pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
 def test_pty_rejects_inherited_automation_process_group(
     monkeypatch: pytest.MonkeyPatch,
@@ -1109,6 +1146,7 @@ async def test_communicate_process_preserves_bounded_output_on_overflow() -> Non
     assert process.returncode == 0
     assert len(raised.value.stdout) == 100_000
     assert raised.value.stderr == b""
+    assert raised.value.interrupted is False
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX command syntax")
@@ -1123,13 +1161,14 @@ async def test_communicate_process_stops_a_chatty_child_on_output_overflow() -> 
         **process_group_options(),
     )
 
-    with pytest.raises(ProcessOutputLimitExceeded):
+    with pytest.raises(ProcessOutputLimitExceeded) as raised:
         await asyncio.wait_for(
             communicate_process(process, max_output_bytes=100_000),
             timeout=5,
         )
 
     assert process.returncode is not None
+    assert raised.value.interrupted is True
 
 
 @pytest.mark.asyncio

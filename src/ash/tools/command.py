@@ -437,6 +437,11 @@ class RunCommandTool(BaseTool):
                 success=process.returncode == 0 and exc.cleanup_error is None,
                 output=output,
                 error=error,
+                outcome=(
+                    ToolExecutionOutcome.UNKNOWN
+                    if exc.interrupted
+                    else ToolExecutionOutcome.COMPLETED
+                ),
                 token_count=count_output_tokens(output),
                 truncated=True,
                 diagnostics=extract_diagnostics("", output),
@@ -540,7 +545,7 @@ class RunCommandTool(BaseTool):
             error=error or None,
             outcome=(
                 ToolExecutionOutcome.UNKNOWN
-                if result.timed_out
+                if result.timed_out or result.outcome_unknown
                 else ToolExecutionOutcome.COMPLETED
             ),
             token_count=count_output_tokens(output),
@@ -663,6 +668,11 @@ class RunCommandTool(BaseTool):
                 success=process.returncode == 0 and exc.cleanup_error is None,
                 output=output,
                 error=error,
+                outcome=(
+                    ToolExecutionOutcome.UNKNOWN
+                    if exc.interrupted
+                    else ToolExecutionOutcome.COMPLETED
+                ),
                 token_count=count_output_tokens(output),
                 truncated=True,
                 diagnostics=extract_diagnostics(stdout, stderr),

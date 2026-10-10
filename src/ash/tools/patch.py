@@ -22,7 +22,7 @@ from ash.sandbox.process_utils import (
     settle_process_tree_after_cancellation,
     terminate_process_tree_after_timeout,
 )
-from ash.tools.base import BaseTool, ToolResult
+from ash.tools.base import BaseTool, ToolExecutionOutcome, ToolResult
 
 
 class ApplyPatchArgs(BaseModel):
@@ -54,11 +54,14 @@ class ApplyPatchTool(BaseTool):
         except (ValueError, SafetyViolation) as exc:
             return ToolResult(success=False, output="", error=f"Invalid patch: {exc}")
         if args.dry_run:
-            check = await _git_apply(
-                self.safety_guard.project_root,
-                args.patch,
-                check=True,
-            )
+            try:
+                check = await _git_apply(
+                    self.safety_guard.project_root,
+                    args.patch,
+                    check=True,
+                )
+            except asyncio.TimeoutError as exc:
+                return _patch_timeout_result(exc, mutation_may_have_started=False)
             if check[0] != 0:
                 return ToolResult(
                     success=False,
@@ -69,6 +72,7 @@ class ApplyPatchTool(BaseTool):
                 success=True,
                 output=f"Patch is valid for {len(paths)} file(s); no files changed.",
             )
+        mutation_attempted = False
         try:
             with workspace_mutation_lock():
                 check = await _git_apply(
@@ -84,11 +88,17 @@ class ApplyPatchTool(BaseTool):
                     )
                 for path in paths:
                     self.safety_guard.validate_mutation_path(path)
+                mutation_attempted = True
                 applied = await _git_apply(
                     self.safety_guard.project_root,
                     args.patch,
                     check=False,
                 )
+        except asyncio.TimeoutError as exc:
+            return _patch_timeout_result(
+                exc,
+                mutation_may_have_started=mutation_attempted,
+            )
         except SafetyViolation as exc:
             return ToolResult(
                 success=False,
@@ -101,6 +111,21 @@ class ApplyPatchTool(BaseTool):
                 output="",
                 error=f"Patch workspace mutation was refused: {exc}",
             )
+        if applied[0] == PATCH_OUTPUT_LIMIT_EXIT:
+            detail = applied[2].strip()
+            error = (
+                "Patch apply output exceeded its capture limit; the workspace may "
+                "have changed. Inspect the affected files before retrying."
+            )
+            if detail:
+                error += f" {detail}"
+            return ToolResult(
+                success=False,
+                output=applied[1],
+                error=error,
+                outcome=ToolExecutionOutcome.UNKNOWN,
+                truncated=True,
+            )
         if applied[0] != 0:
             return ToolResult(
                 success=False,
@@ -111,6 +136,33 @@ class ApplyPatchTool(BaseTool):
             success=True,
             output="Applied patch to: " + ", ".join(sorted(paths)),
         )
+
+
+def _patch_timeout_result(
+    timeout_error: TimeoutError,
+    *,
+    mutation_may_have_started: bool,
+) -> ToolResult:
+    if mutation_may_have_started:
+        error = (
+            "Patch apply timed out after 30 seconds; the workspace may have "
+            "changed. Inspect the affected files before retrying."
+        )
+    else:
+        error = "Patch validation timed out after 30 seconds; no files were changed."
+    notes = getattr(timeout_error, "__notes__", ())
+    if notes:
+        error += " " + " ".join(notes)
+    return ToolResult(
+        success=False,
+        output="",
+        error=error,
+        outcome=(
+            ToolExecutionOutcome.UNKNOWN
+            if mutation_may_have_started
+            else ToolExecutionOutcome.COMPLETED
+        ),
+    )
 
 
 def extract_patch_paths(patch: str, guard: SafetyGuard) -> set[str]:

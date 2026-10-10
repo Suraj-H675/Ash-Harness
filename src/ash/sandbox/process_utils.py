@@ -308,6 +308,7 @@ async def communicate_pty_process(
             f"subprocess output exceeded {max_output_bytes} bytes",
             stdout=bytes(captured),
             cleanup_error=cleanup_error,
+            interrupted=True,
         )
     await process.wait()
     return bytes(captured)
@@ -403,6 +404,7 @@ class ProcessOutputLimitExceeded(RuntimeError):
         stdout: bytes = b"",
         stderr: bytes = b"",
         cleanup_error: ProcessTreeError | None = None,
+        interrupted: bool = False,
     ):
         if cleanup_error is not None:
             message += f"; process-tree cleanup failed: {cleanup_error}"
@@ -410,6 +412,7 @@ class ProcessOutputLimitExceeded(RuntimeError):
         self.stdout = stdout
         self.stderr = stderr
         self.cleanup_error = cleanup_error
+        self.interrupted = interrupted
 
 
 def process_group_options() -> dict[str, Any]:
@@ -687,15 +690,22 @@ async def settle_process_tree_after_cancellation(
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:
-            cancelled = True
             current = asyncio.current_task()
-            if current is not None:
-                current.uncancel()
+            if current is None or current.cancelling() == 0:
+                break
+            cancelled = True
+            current.uncancel()
+        except Exception:
+            break
     try:
         cleanup.result()
     except ProcessTreeError as exc:
         return exc, cancelled
-    except BaseException as exc:
+    except asyncio.CancelledError:
+        return ProcessTreeTerminationError(
+            "managed process-tree cleanup was cancelled"
+        ), cancelled
+    except Exception as exc:
         return (
             ProcessTreeTerminationError(
                 "managed process-tree cleanup raised "
@@ -1213,9 +1223,10 @@ async def communicate_process(
     captured_total = 0
     read_total = 0
     termination_started = False
+    process_tree_interrupted = False
 
     async def terminate_after_output_limit() -> None:
-        nonlocal termination_started
+        nonlocal termination_started, process_tree_interrupted
         if termination_started:
             return
         termination_started = True
@@ -1231,12 +1242,14 @@ async def communicate_process(
                 await asyncio.sleep(0.005)
         if process.returncode is not None and process_tree_plan is None:
             return
+        process_tree_interrupted = True
         try:
             await terminate_process_tree(process, plan=process_tree_plan)
         except ProcessTreeError as exc:
             raise ProcessOutputLimitExceeded(
                 f"subprocess output exceeded {max_output_bytes} bytes",
                 cleanup_error=exc,
+                interrupted=process_tree_interrupted,
             ) from exc
 
     async def read_stream(
@@ -1342,5 +1355,6 @@ async def communicate_process(
             f"subprocess output exceeded {max_output_bytes} bytes",
             stdout=stdout,
             stderr=stderr,
+            interrupted=process_tree_interrupted,
         )
     return stdout, stderr

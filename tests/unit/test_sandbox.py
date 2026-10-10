@@ -1256,6 +1256,53 @@ async def test_manager_removes_docker_volume_when_staging_fails(
 
 
 @pytest.mark.asyncio
+async def test_manager_removes_docker_volume_after_ambiguous_create_failure(
+    tmp_path: Path,
+) -> None:
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake_docker.chmod(0o755)
+    calls: list[list[str]] = []
+
+    async def docker_control(
+        argv: list[str],
+        *,
+        on_spawn=None,
+        **_kwargs: object,
+    ) -> bytes:
+        if argv[1:3] == ["volume", "create"]:
+            assert on_spawn is not None
+            on_spawn()
+            raise SandboxBackendUnavailable("volume create timed out")
+        calls.append(argv)
+        return b""
+
+    with (
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+        patch(
+            "ash.sandbox.docker.resolve_host_executable",
+            return_value=str(fake_docker),
+        ),
+        patch(
+            "ash.sandbox.manager.resolve_host_executable",
+            return_value=str(fake_docker),
+        ),
+        patch("ash.sandbox.manager._run_docker_control", docker_control),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+        )
+        with pytest.raises(SandboxBackendUnavailable, match="create timed out"):
+            await manager.stage_docker_workspace(io.BytesIO(b"tar"))
+
+    assert len(calls) == 1
+    assert calls[0][:4] == [str(fake_docker), "volume", "rm", "--force"]
+    assert calls[0][4].startswith("ash-plugin-")
+
+
+@pytest.mark.asyncio
 async def test_manager_refuses_to_remove_foreign_docker_volume(tmp_path: Path) -> None:
     manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
 
@@ -1399,10 +1446,19 @@ async def test_docker_control_uses_scrubbed_docker_environment(
         "communicate_process",
         AsyncMock(return_value=(b"ok", b"")),
     )
+    process_started = False
 
-    result = await manager_module._run_docker_control(["/usr/bin/docker", "version"])
+    def mark_process_started() -> None:
+        nonlocal process_started
+        process_started = True
+
+    result = await manager_module._run_docker_control(
+        ["/usr/bin/docker", "version"],
+        on_spawn=mark_process_started,
+    )
 
     assert result == b"ok"
+    assert process_started is True
     call = create.await_args
     assert call is not None
     environment = call.kwargs["env"]
@@ -2058,16 +2114,18 @@ async def test_sandbox_timeout_cleanup_survives_second_cancellation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("exit_code", "timed_out", "expected_outcome"),
+    ("exit_code", "timed_out", "outcome_unknown", "expected_outcome"),
     [
-        (-1, True, ToolExecutionOutcome.UNKNOWN),
-        (-15, False, ToolExecutionOutcome.COMPLETED),
+        (-1, True, False, ToolExecutionOutcome.UNKNOWN),
+        (-15, False, False, ToolExecutionOutcome.COMPLETED),
+        (-15, False, True, ToolExecutionOutcome.UNKNOWN),
     ],
 )
 async def test_run_command_maps_sandbox_outcome(
     tmp_path: Path,
     exit_code: int,
     timed_out: bool,
+    outcome_unknown: bool,
     expected_outcome: ToolExecutionOutcome,
 ) -> None:
     class FakeSandboxManager:
@@ -2085,6 +2143,7 @@ async def test_run_command_maps_sandbox_outcome(
                 tier=SANDBOX_TIER_BWRAP,
                 backend_name="test",
                 timed_out=timed_out,
+                outcome_unknown=outcome_unknown,
             )
 
     from ash.safety.guard import SafetyGuard
