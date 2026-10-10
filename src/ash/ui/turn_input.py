@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import signal
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from ash.core.loop import AshLoop
@@ -53,9 +54,11 @@ class InteractiveTurnController:
             loop._config, "approval_diff_mode", "unified"
         ) or "unified"
         self._steering_read: asyncio.Task[str] | None = None
-        self._approval_active = False
-        self._approval_complete = asyncio.Event()
-        self._approval_complete.set()
+        self._approval_input_lock = asyncio.Lock()
+        self._pending_approval_inputs = 0
+        self._approval_preempted_steering: asyncio.Task[str] | None = None
+        self._approval_inputs_idle = asyncio.Event()
+        self._approval_inputs_idle.set()
 
     async def run(
         self,
@@ -100,6 +103,35 @@ class InteractiveTurnController:
         )
         try:
             while not turn.done():
+                if self._pending_approval_inputs:
+                    approval_idle = asyncio.create_task(
+                        self._approval_inputs_idle.wait()
+                    )
+                    pending_approval_tasks: set[asyncio.Task[Any]] = {
+                        turn,
+                        approval_idle,
+                    }
+                    if interrupt_wait is not None:
+                        pending_approval_tasks.add(interrupt_wait)
+                    try:
+                        done, _ = await asyncio.wait(
+                            pending_approval_tasks,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        if not approval_idle.done():
+                            approval_idle.cancel()
+                            await asyncio.gather(
+                                approval_idle, return_exceptions=True
+                            )
+                    if interrupt_wait is not None and interrupt_wait in done:
+                        await self._cancel_steering_read()
+                        await self._cancel_turn(turn)
+                        return None
+                    if turn in done:
+                        await self._cancel_steering_read()
+                        break
+                    continue
                 steering_read = asyncio.create_task(self.prompt_input.read("steer> "))
                 self._steering_read = steering_read
                 wait_tasks: set[asyncio.Task[Any]] = {turn, steering_read}
@@ -120,8 +152,8 @@ class InteractiveTurnController:
                 try:
                     steering = steering_read.result().strip()
                 except asyncio.CancelledError:
-                    if self._approval_active:
-                        await self._approval_complete.wait()
+                    if self._approval_preempted_steering is steering_read:
+                        self._approval_preempted_steering = None
                         continue
                     raise
                 except (KeyboardInterrupt, PromptInterrupted):
@@ -153,6 +185,7 @@ class InteractiveTurnController:
             return response
         finally:
             await self._cancel_steering_read()
+            self._approval_preempted_steering = None
             if not turn.done():
                 await self._cancel_turn(turn)
             if interrupt_wait is not None and not interrupt_wait.done():
@@ -170,9 +203,12 @@ class InteractiveTurnController:
     ) -> bool:
         """Review one MCP sampling request/response using the single prompt reader."""
 
-        self._approval_active = True
-        self._approval_complete.clear()
-        await self._cancel_steering_read()
+        async with self._approval_input():
+            return await self._review_mcp_sampling_owned(server, stage, payload)
+
+    async def _review_mcp_sampling_owned(
+        self, server: str, stage: str, payload: dict[str, Any]
+    ) -> bool:
         self._notify(
             NotificationEvent.APPROVAL_REQUIRED,
             f"MCP server {server} requests sampling review",
@@ -196,18 +232,20 @@ class InteractiveTurnController:
             return answer in {"y", "yes"}
         except (EOFError, KeyboardInterrupt, PromptInterrupted, TypeError, ValueError):
             return False
-        finally:
-            self._approval_active = False
-            self._approval_complete.set()
 
     async def request_mcp_elicitation(
         self, server: str, message: str, schema: dict[str, Any]
     ) -> dict[str, Any]:
         """Collect and review one MCP form using the single prompt reader."""
 
-        self._approval_active = True
-        self._approval_complete.clear()
-        await self._cancel_steering_read()
+        async with self._approval_input():
+            return await self._request_mcp_elicitation_owned(
+                server, message, schema
+            )
+
+    async def _request_mcp_elicitation_owned(
+        self, server: str, message: str, schema: dict[str, Any]
+    ) -> dict[str, Any]:
         self._notify(
             NotificationEvent.APPROVAL_REQUIRED,
             f"MCP server {server} requests information",
@@ -270,9 +308,6 @@ class InteractiveTurnController:
                 return {"action": "cancel"}
         except (EOFError, KeyboardInterrupt, PromptInterrupted):
             return {"action": "cancel"}
-        finally:
-            self._approval_active = False
-            self._approval_complete.set()
 
     async def _request_approval(
         self, tool_name: str, arguments: dict[str, object]
@@ -298,9 +333,18 @@ class InteractiveTurnController:
         *,
         requester: str | None = None,
     ) -> bool | str:
-        self._approval_active = True
-        self._approval_complete.clear()
-        await self._cancel_steering_read()
+        async with self._approval_input():
+            return await self._prompt_tool_approval_owned(
+                tool_name, arguments, requester=requester
+            )
+
+    async def _prompt_tool_approval_owned(
+        self,
+        tool_name: str,
+        arguments: dict[str, object],
+        *,
+        requester: str | None = None,
+    ) -> bool | str:
         approval_owner = requester or "Ash"
         self._notify(
             NotificationEvent.APPROVAL_REQUIRED,
@@ -425,9 +469,6 @@ class InteractiveTurnController:
             return False
         except (EOFError, KeyboardInterrupt, PromptInterrupted):
             return False
-        finally:
-            self._approval_active = False
-            self._approval_complete.set()
 
     async def _select_approval(
         self,
@@ -609,43 +650,40 @@ class InteractiveTurnController:
         )
 
     async def _request_plan_approval(self, execution) -> bool:
-        self._approval_active = True
-        self._approval_complete.clear()
-        await self._cancel_steering_read()
+        async with self._approval_input():
+            return await self._request_plan_approval_owned(execution)
+
+    async def _request_plan_approval_owned(self, execution) -> bool:
         self._notify(
             NotificationEvent.APPROVAL_REQUIRED,
             "Ash needs plan approval.",
         )
-        try:
-            while True:
-                plan_details = self.ui.show_plan_review(execution)
-                try:
-                    answer = (
-                        (
-                            await self.prompt_input.read(
-                                "Plan [y/e/N]? ",
-                                context=plan_details,
-                            )
+        while True:
+            plan_details = self.ui.show_plan_review(execution)
+            try:
+                answer = (
+                    (
+                        await self.prompt_input.read(
+                            "Plan [y/e/N]? ",
+                            context=plan_details,
                         )
-                        .strip()
-                        .casefold()
                     )
-                except (EOFError, KeyboardInterrupt, PromptInterrupted):
-                    return False
-                if answer in {"y", "yes"}:
-                    return True
-                if answer not in {"e", "edit"}:
-                    return False
-                try:
-                    await self.prompt_input.suspend_for_overlay(
-                        lambda: self.ui.edit_plan(execution)
-                    )
-                except Exception as exc:  # noqa: BLE001 - editor errors deny safely
-                    self.write_status(f"Plan edit failed: {exc}")
-                    return False
-        finally:
-            self._approval_active = False
-            self._approval_complete.set()
+                    .strip()
+                    .casefold()
+                )
+            except (EOFError, KeyboardInterrupt, PromptInterrupted):
+                return False
+            if answer in {"y", "yes"}:
+                return True
+            if answer not in {"e", "edit"}:
+                return False
+            try:
+                await self.prompt_input.suspend_for_overlay(
+                    lambda: self.ui.edit_plan(execution)
+                )
+            except Exception as exc:  # noqa: BLE001 - editor errors deny safely
+                self.write_status(f"Plan edit failed: {exc}")
+                return False
 
     def _notify(self, event: NotificationEvent, message: str) -> None:
         if self.notifier is None:
@@ -655,13 +693,42 @@ class InteractiveTurnController:
         except Exception:  # noqa: BLE001 - optional notifications cannot break turns
             return
 
-    async def _cancel_steering_read(self) -> None:
+    @asynccontextmanager
+    async def _approval_input(self) -> AsyncIterator[None]:
+        self._pending_approval_inputs += 1
+        self._approval_inputs_idle.clear()
+        try:
+            async with self._approval_input_lock:
+                await self._cancel_steering_read(approval_preemption=True)
+                yield
+        finally:
+            self._pending_approval_inputs -= 1
+            if self._pending_approval_inputs == 0:
+                self._approval_inputs_idle.set()
+
+    async def _cancel_steering_read(
+        self, *, approval_preemption: bool = False
+    ) -> None:
         task = self._steering_read
         self._steering_read = None
         if task is None or task.done():
             return
+        if approval_preemption:
+            self._approval_preempted_steering = task
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        drain = asyncio.gather(task, return_exceptions=True)
+        try:
+            await asyncio.shield(drain)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is None or not current.cancelling():
+                return
+            while not drain.done():
+                try:
+                    await asyncio.shield(drain)
+                except asyncio.CancelledError:
+                    continue
+            raise
 
     async def _cancel_turn(self, turn: asyncio.Task[str]) -> None:
         if not turn.done():

@@ -1318,3 +1318,125 @@ asyncio.run(main())
             check=False,
             capture_output=True,
         )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_live_approvals_keep_terminal_input_owner_in_pty(tmp_path: Path) -> None:
+    import fcntl
+    import termios
+
+    code = """
+import asyncio
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+from ash.ui.prompt import PromptInput
+from ash.ui.terminal import TerminalUI
+from ash.ui.turn_input import InteractiveTurnController
+
+
+class ObservedPrompt(PromptInput):
+    async def read(self, prompt="> ", *, context=""):
+        if prompt.startswith("Approve MCP sampling"):
+            print("FIRST_PROMPT", flush=True)
+        elif prompt.startswith("Approve [y]"):
+            print("SECOND_PROMPT", flush=True)
+        return await super().read(prompt, context=context)
+
+
+async def main():
+    prompt = ObservedPrompt(
+        history_path=Path(%r),
+        input_stream=sys.stdin,
+        screen_reader_mode=True,
+    )
+    ui = TerminalUI(input_stream=sys.stdin, screen_reader_mode=True)
+    loop = SimpleNamespace(
+        _config=SimpleNamespace(approval_diff_mode="unified"),
+        tools={},
+        on_tool_approval=None,
+        on_plan_approval=None,
+    )
+    controller = InteractiveTurnController(loop, prompt, ui, write_status=lambda _: None)
+    first = asyncio.create_task(
+        controller.review_mcp_sampling("docs", "request", {})
+    )
+    await asyncio.sleep(0)
+    second = asyncio.create_task(
+        controller._prompt_tool_approval("write_file", {"file_path": "x"})
+    )
+    await asyncio.sleep(0)
+    print("SECOND_REQUESTED", flush=True)
+    try:
+        done, _ = await asyncio.wait(
+            {first, second}, return_when=asyncio.FIRST_COMPLETED
+        )
+        assert first in done, "queued tool approval consumed the sampling answer"
+        print(f"FIRST_RESULT={first.result()}", flush=True)
+        second_result = await second
+        print(f"SECOND_RESULT={second_result}", flush=True)
+    finally:
+        for task in (first, second):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+        await prompt.aclose()
+
+
+asyncio.run(main())
+""" % str(tmp_path / "approval-history")
+    root = Path(__file__).parents[2]
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+    environment = {
+        "PATH": os.defpath,
+        "HOME": str(tmp_path / "home"),
+        "USERPROFILE": str(tmp_path / "home"),
+        "TMPDIR": str(tmp_path),
+        "PYTHONPATH": str(root / "src"),
+        "TERM": "xterm-256color",
+        "NO_COLOR": "1",
+    }
+    (tmp_path / "home").mkdir()
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        cwd=root,
+        env=environment,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    captured = bytearray()
+
+    def wait_for(marker: bytes, timeout: float = 5) -> None:
+        deadline = time.monotonic() + timeout
+        while marker not in captured and process.poll() is None:
+            if time.monotonic() >= deadline:
+                break
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master_fd, 65_536))
+                except OSError:
+                    break
+        assert marker in captured, (
+            f"missing {marker!r}; exit={process.poll()}; "
+            f"terminal output={captured.decode(errors='replace')!r}"
+        )
+
+    try:
+        wait_for(b"FIRST_PROMPT")
+        wait_for(b"SECOND_REQUESTED")
+        os.write(master_fd, b"n\r")
+        wait_for(b"FIRST_RESULT=False")
+        wait_for(b"SECOND_PROMPT")
+        os.write(master_fd, b"y\r")
+        wait_for(b"SECOND_RESULT=True")
+        assert process.wait(timeout=5) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master_fd)

@@ -346,6 +346,219 @@ async def test_interactive_approval_preempts_steering_reader(tmp_path: Path) -> 
     ]
 
 
+class BlockingApprovalPrompt:
+    supports_choice_ui = False
+
+    def __init__(self) -> None:
+        self.started: asyncio.Queue[str] = asyncio.Queue()
+        self.responses: asyncio.Queue[str] = asyncio.Queue()
+        self.prompts: list[str] = []
+
+    async def read(self, prompt: str = "> ", *, context: str = "") -> str:
+        del context
+        self.prompts.append(prompt)
+        self.started.put_nowait(prompt)
+        return await self.responses.get()
+
+
+def make_approval_controller(tmp_path: Path, prompt: BlockingApprovalPrompt):
+    ui = make_ui()
+    loop = SimpleNamespace(
+        _config=AshConfig(),
+        tools={},
+        project_root=tmp_path,
+        permission_policy=SimpleNamespace(add_session_rule=lambda _rule: None),
+        notify_permission_rules_changed=lambda **_kwargs: None,
+    )
+    return InteractiveTurnController(loop, prompt, ui), ui
+
+
+@pytest.mark.asyncio
+async def test_linear_sigint_cancels_turn_while_approval_owns_input(
+    tmp_path: Path,
+) -> None:
+    class LinearApprovalPrompt(BlockingApprovalPrompt):
+        linear_mode = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.steering_started = asyncio.Event()
+
+        async def read(self, prompt: str = "> ", *, context: str = "") -> str:
+            if prompt == "steer> ":
+                self.steering_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            return await super().read(prompt, context=context)
+
+    prompt = LinearApprovalPrompt()
+    ui = make_ui()
+    guard = SafetyGuard(tmp_path)
+    tool = WriteFileTool(guard)
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessions.db"),
+        WriteProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={tool.name: tool},
+    )
+    controller = InteractiveTurnController(loop, prompt, ui)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    turn = asyncio.create_task(controller.run("write the file"))
+    try:
+        approval_prompt = await asyncio.wait_for(prompt.started.get(), timeout=1)
+        assert approval_prompt.startswith("Approve [y]")
+        signal.raise_signal(signal.SIGINT)
+
+        assert await asyncio.wait_for(turn, timeout=1) is None
+        assert not (tmp_path / "approved.txt").exists()
+        assert controller._pending_approval_inputs == 0
+        assert controller._approval_inputs_idle.is_set()
+    finally:
+        if not turn.done():
+            turn.cancel()
+            await asyncio.gather(turn, return_exceptions=True)
+        assert signal.getsignal(signal.SIGINT) == previous_sigint
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_approval_does_not_take_terminal_input(
+    tmp_path: Path,
+) -> None:
+    prompt = BlockingApprovalPrompt()
+    controller, _ = make_approval_controller(tmp_path, prompt)
+    owner = asyncio.create_task(
+        controller.review_mcp_sampling("docs", "request", {})
+    )
+    queued: asyncio.Task[bool | str] | None = None
+    try:
+        assert (await prompt.started.get()).startswith("Approve MCP sampling")
+        queued = asyncio.create_task(
+            controller._prompt_tool_approval("write_file", {"file_path": "x"})
+        )
+        await asyncio.sleep(0)
+
+        assert prompt.prompts == ["Approve MCP sampling request? [y/N] "]
+
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        assert not owner.done()
+
+        prompt.responses.put_nowait("n")
+        assert await owner is False
+        assert controller._approval_inputs_idle.is_set()
+    finally:
+        for task in (owner, queued):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(owner, *(task for task in (queued,) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_approval_owner_hands_input_to_next_request(
+    tmp_path: Path,
+) -> None:
+    prompt = BlockingApprovalPrompt()
+    controller, ui = make_approval_controller(tmp_path, prompt)
+    owner = asyncio.create_task(
+        controller._prompt_tool_approval("write_file", {"file_path": "x"})
+    )
+    next_request: asyncio.Task[bool | str] | None = None
+    try:
+        assert (await prompt.started.get()).startswith("Approve [y]")
+        next_request = asyncio.create_task(
+            controller.review_mcp_sampling("docs", "request", {})
+        )
+        await asyncio.sleep(0)
+        assert len(prompt.prompts) == 1
+
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+
+        assert (
+            await asyncio.wait_for(prompt.started.get(), timeout=0.5)
+        ).startswith(
+            "Approve MCP sampling"
+        )
+        prompt.responses.put_nowait("y")
+        assert await next_request is True
+        assert not ui.is_tool_approved_for_session("write_file")
+        assert controller._approval_inputs_idle.is_set()
+    finally:
+        for task in (owner, next_request):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            owner,
+            *(task for task in (next_request,) if task is not None),
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_approval_drains_preempted_steering_cleanup(
+    tmp_path: Path,
+) -> None:
+    class CleanupPrompt(BlockingApprovalPrompt):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cleanup_started = asyncio.Event()
+            self.allow_cleanup = asyncio.Event()
+            self.cleanup_finished = asyncio.Event()
+
+        async def read(self, prompt: str = "> ", *, context: str = "") -> str:
+            if prompt == "steer> ":
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.cleanup_started.set()
+                    await self.allow_cleanup.wait()
+                    self.cleanup_finished.set()
+            return await super().read(prompt, context=context)
+
+    prompt = CleanupPrompt()
+    controller, ui = make_approval_controller(tmp_path, prompt)
+    steering = asyncio.create_task(prompt.read("steer> "))
+    controller._steering_read = steering
+    owner = asyncio.create_task(
+        controller.review_mcp_sampling("docs", "request", {})
+    )
+    queued = asyncio.create_task(
+        controller._prompt_tool_approval("write_file", {"file_path": "x"})
+    )
+    try:
+        await asyncio.wait_for(prompt.cleanup_started.wait(), timeout=0.5)
+        owner.cancel()
+        await asyncio.sleep(0)
+
+        assert not owner.done()
+        assert not steering.done()
+        assert not queued.done()
+        assert prompt.started.empty()
+        assert not controller._approval_inputs_idle.is_set()
+
+        prompt.allow_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        assert prompt.cleanup_finished.is_set()
+        assert (
+            await asyncio.wait_for(prompt.started.get(), timeout=0.5)
+        ).startswith("Approve [y]")
+        prompt.responses.put_nowait("n")
+        assert await queued is False
+        assert not ui.is_tool_approved_for_session("write_file")
+        assert controller._approval_inputs_idle.is_set()
+    finally:
+        prompt.allow_cleanup.set()
+        for task in (steering, owner, queued):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(steering, owner, queued, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_interactive_approval_uses_selector_instead_of_letter_prompt(
     tmp_path: Path,
@@ -1059,8 +1272,8 @@ async def test_interactive_controller_reviews_mcp_sampling_with_prompt_input(
 
     assert approved is True
     assert prompt.prompts == ["Approve MCP sampling request? [y/N] "]
-    assert controller._approval_active is False
-    assert controller._approval_complete.is_set()
+    assert controller._pending_approval_inputs == 0
+    assert controller._approval_inputs_idle.is_set()
 
 
 @pytest.mark.asyncio
@@ -1104,5 +1317,5 @@ async def test_interactive_controller_collects_mcp_elicitation_with_prompt_input
     }
     assert prompt.prompts[-1].startswith("Submit MCP form")
     assert any("Provide safe values" in status for status in statuses)
-    assert controller._approval_active is False
-    assert controller._approval_complete.is_set()
+    assert controller._pending_approval_inputs == 0
+    assert controller._approval_inputs_idle.is_set()

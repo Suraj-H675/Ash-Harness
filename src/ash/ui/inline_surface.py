@@ -185,6 +185,7 @@ class InlinePromptSurface:
         self._app_ready: asyncio.Future[None] | None = None
         self._app_loop: asyncio.AbstractEventLoop | None = None
         self._closing = False
+        self._closed = False
         self._app_error: BaseException | None = None
         self._input_enabled = False
         self._running = False
@@ -379,6 +380,8 @@ class InlinePromptSurface:
             self._terminal_callbacks.popleft()()
 
     async def start(self) -> None:
+        if self._closed:
+            raise EOFError()
         if self._app_task is not None and not self._app_task.done():
             return
         loop = asyncio.get_running_loop()
@@ -400,6 +403,10 @@ class InlinePromptSurface:
         else:
             error = EOFError()
         if self._closing:
+            ready = self._app_ready
+            if ready is not None and not ready.done():
+                ready.set_exception(EOFError())
+            self._resolve_pending_input_on_close()
             return
         self._app_error = error
         ready = self._app_ready
@@ -509,16 +516,31 @@ class InlinePromptSurface:
         self._app_task = None
 
     async def aclose(self) -> None:
+        self._closed = True
+        self._resolve_pending_input_on_close()
         await self._stop_application()
         self.transcript_view.close()
+
+    def _resolve_pending_input_on_close(self) -> None:
+        choice_future = self._choice_future
+        if choice_future is not None and not choice_future.done():
+            choice_future.set_result(None)
+        read_future = self._read_future
+        if read_future is not None and not read_future.done():
+            read_future.set_exception(EOFError())
 
     def close(self) -> None:
         """Request shutdown for synchronous compatibility callers."""
 
+        self._closed = True
         task = self._app_task
-        if task is not None and not task.done() and self.application.is_running:
+        if task is not None and not task.done():
             self._closing = True
-            self.application.exit(result=None)
+            self._resolve_pending_input_on_close()
+            if self.application.is_running:
+                self.application.exit(result=None)
+            else:
+                task.cancel()
 
     def invalidate(self) -> None:
         self._thinking_cache_key = None
@@ -944,6 +966,12 @@ class InlinePromptSurface:
 
         @bindings.add("c-c")
         def interrupt(event) -> None:
+            if self._choice_mode:
+                choice_future = self._choice_future
+                if choice_future is not None and not choice_future.done():
+                    choice_future.set_result(None)
+                    self.application.invalidate()
+                return
             future = self._read_future
             if future is not None and not future.done():
                 future.set_exception(PromptInterrupted())

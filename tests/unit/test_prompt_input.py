@@ -277,6 +277,122 @@ async def test_choice_selector_uses_keyboard_without_mouse_capture(
         assert await pending == "n"
 
 
+@pytest.mark.asyncio
+async def test_choice_selector_interrupt_denies_active_choice(
+    tmp_path: Path,
+    cursor_ui: None,
+) -> None:
+    with create_pipe_input() as pipe:
+        prompt = PromptInput(
+            input_stream=TtyStringIO(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = asyncio.create_task(
+            prompt.choose(
+                "write_file permission",
+                (PromptChoice("y", "Allow once"),),
+            )
+        )
+        try:
+            await asyncio.sleep(0.05)
+            pipe.send_bytes(b"\x03")
+
+            done, _ = await asyncio.wait({pending}, timeout=0.5)
+            assert pending in done
+            assert pending.result() is None
+        finally:
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            await prompt.aclose()
+
+
+@pytest.mark.asyncio
+async def test_closing_surface_releases_active_choice(
+    tmp_path: Path,
+    cursor_ui: None,
+) -> None:
+    with create_pipe_input() as pipe:
+        prompt = PromptInput(
+            input_stream=TtyStringIO(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = asyncio.create_task(
+            prompt.choose(
+                "write_file permission",
+                (PromptChoice("y", "Allow once"),),
+            )
+        )
+        try:
+            await asyncio.sleep(0.05)
+            await prompt.aclose()
+
+            done, _ = await asyncio.wait({pending}, timeout=0.5)
+            assert pending in done
+            assert pending.result() is None
+
+            with pytest.raises(EOFError):
+                await prompt.choose(
+                    "queued write_file permission",
+                    (PromptChoice("y", "Allow once"),),
+                )
+        finally:
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.parametrize("sync_close", [False, True])
+@pytest.mark.asyncio
+async def test_closing_surface_during_start_releases_startup_waiter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cursor_ui: None,
+    sync_close: bool,
+) -> None:
+    with create_pipe_input() as pipe:
+        prompt = PromptInput(
+            input_stream=TtyStringIO(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=DummyOutput(),
+        )
+        assert prompt._surface is not None
+
+        async def blocked_run_async(*, handle_sigint: bool):
+            del handle_sigint
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            prompt._surface.application,
+            "run_async",
+            blocked_run_async,
+        )
+        starting = asyncio.create_task(prompt._surface.start())
+        try:
+            await asyncio.sleep(0)
+            assert prompt._surface._app_ready is not None
+            assert not prompt._surface._app_ready.done()
+
+            if sync_close:
+                prompt.close()
+            else:
+                await prompt.aclose()
+
+            done, _ = await asyncio.wait({starting}, timeout=0.5)
+            assert starting in done
+            with pytest.raises(EOFError):
+                await starting
+        finally:
+            if not starting.done():
+                starting.cancel()
+            await asyncio.gather(starting, return_exceptions=True)
+
+
 def test_screen_reader_mode_uses_reduced_dynamic_prompt(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
