@@ -4,21 +4,151 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
+import time
 
 import pytest
+from prompt_toolkit.input.defaults import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 
 from ash.cli import main
 from ash.commands.sessions import (
     list_session_summaries,
     parse_session_retention_days,
+    pick_session,
     render_recovery_reports,
     render_session_summaries,
     render_session_tree,
     select_startup_session,
 )
 from ash.core.checkpoints import recover_interrupted_turns
-from ash.core.session import Message, SessionStore, ToolCallRecord, get_db_connection
+from ash.core.session import (
+    Message,
+    SessionStore,
+    SessionSummary,
+    ToolCallRecord,
+    get_db_connection,
+)
 from ash.safety.guard import SafetyGuard
+
+
+@pytest.mark.parametrize(
+    "query", ("needle-only-in-archived-session", "archived-heading-unique")
+)
+@pytest.mark.asyncio
+async def test_pick_session_can_select_old_project_scoped_transcript_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+) -> None:
+    from ash.ui.session_picker import SessionPicker
+
+    project = tmp_path / "project"
+    project.mkdir()
+    store = SessionStore(tmp_path / "sessions.db")
+    archived = store.create_session(str(project))
+    store.save_message(
+        archived.session_id,
+        Message(
+            role="user",
+            content="needle-only-in-archived-session",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    store.rename_session(archived.session_id, "archived-heading-unique")
+    for _ in range(200):
+        store.create_session(str(project))
+
+    assert archived.session_id not in {
+        summary.session_id
+        for summary in store.list_sessions(project_path=str(project), limit=200)
+    }
+    assert store.search_session_messages(
+        project_path=str(project),
+        query="needle-only-in-archived-session",
+        limit=50,
+    )
+
+    with create_pipe_input() as pipe:
+        original_picker = SessionPicker
+
+        def picker_with_test_io(*args, **kwargs):
+            return original_picker(
+                *args,
+                input=pipe,
+                output=DummyOutput(),
+                **kwargs,
+            )
+
+        monkeypatch.setattr("ash.ui.session_picker.SessionPicker", picker_with_test_io)
+        pending = asyncio.create_task(
+            pick_session(store, project_path=str(project))
+        )
+        await asyncio.sleep(0)
+        pipe.send_text(f"{query}\r")
+
+        assert await pending == archived.session_id
+
+
+@pytest.mark.asyncio
+async def test_pick_session_loads_initial_sessions_without_blocking_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(project))
+    original_list_sessions = store.list_sessions
+    release_read = threading.Event()
+
+    def blocked_list_sessions(
+        *, project_path: str, limit: int
+    ) -> list[SessionSummary]:
+        release_read.wait(timeout=1)
+        return original_list_sessions(project_path=project_path, limit=limit)
+
+    class ImmediatePicker:
+        def __init__(
+            self,
+            sessions: list[SessionSummary],
+            **_kwargs: object,
+        ) -> None:
+            self.sessions = sessions
+
+        async def run(self) -> str:
+            return self.sessions[0].session_id
+
+    monkeypatch.setattr(store, "list_sessions", blocked_list_sessions)
+    monkeypatch.setattr("ash.ui.session_picker.SessionPicker", ImmediatePicker)
+
+    loop = asyncio.get_running_loop()
+    heartbeat: asyncio.Future[float] = loop.create_future()
+    started_at = loop.time()
+    released_at: float | None = None
+
+    def mark_heartbeat() -> None:
+        heartbeat.set_result(loop.time())
+
+    def release_blocked_read() -> None:
+        nonlocal released_at
+        released_at = time.monotonic()
+        release_read.set()
+
+    timer = threading.Timer(0.2, release_blocked_read)
+    timer.start()
+    loop.call_later(0.01, mark_heartbeat)
+    pending = asyncio.create_task(pick_session(store, project_path=str(project)))
+    try:
+        heartbeat_at = await heartbeat
+        selected = await pending
+        assert released_at is not None
+        assert heartbeat_at < released_at
+        assert selected == session.session_id
+        assert heartbeat_at > started_at
+    finally:
+        release_read.set()
+        timer.cancel()
 
 
 def test_session_summary_renderer_emits_json(tmp_path: Path) -> None:

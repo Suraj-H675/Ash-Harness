@@ -74,6 +74,8 @@ MAX_SESSION_SEARCH_LIMIT = 100
 MAX_SESSION_SEARCH_QUERY_CHARS = 500
 MAX_SESSION_SEARCH_TERMS = 20
 MAX_SESSION_SEARCH_EXCERPT_CHARS = 1200
+MAX_SESSION_PREVIEW_MESSAGES = 3
+MAX_SESSION_PREVIEW_MESSAGE_CHARS = 1200
 MAX_SESSION_TREE_NODES = 4096
 MAX_AUDIT_VERIFICATION_ERRORS = 1000
 MAX_RECOVERY_TOOL_OUTPUT_PREVIEW_BYTES = 2 * 1024 * 1024
@@ -650,6 +652,11 @@ class SessionSearchHit(BaseModel):
     excerpt: str
 
 
+class SessionPreviewMessage(BaseModel):
+    role: Role
+    content: str
+
+
 class SessionLineage(BaseModel):
     session_id: str
     root_session_id: str
@@ -726,6 +733,28 @@ def _serialize_datetime(value: datetime) -> str:
 
 def _deserialize_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _normalize_session_search_query(query: str) -> str:
+    normalized = " ".join(query.split())
+    if not normalized:
+        raise ValueError("session search query cannot be blank")
+    if len(normalized) > MAX_SESSION_SEARCH_QUERY_CHARS:
+        raise ValueError(
+            "session search query exceeds "
+            f"{MAX_SESSION_SEARCH_QUERY_CHARS} characters"
+        )
+    return normalized
+
+
+def _session_search_match_query(normalized: str) -> str:
+    terms = normalized.split()
+    if len(terms) > MAX_SESSION_SEARCH_TERMS:
+        raise ValueError(
+            "session search query exceeds "
+            f"{MAX_SESSION_SEARCH_TERMS} terms"
+        )
+    return " AND ".join('"' + term.replace('"', '""') + '"' for term in terms)
 
 
 def _tool_result_message_exists(rows: list[sqlite3.Row], call_id: str) -> bool:
@@ -2566,27 +2595,12 @@ class SessionStore:
     ) -> list[SessionSearchHit]:
         """Search user/assistant text in durable sessions for one project."""
 
-        normalized = " ".join(query.split())
-        if not normalized:
-            raise ValueError("session search query cannot be blank")
-        if len(normalized) > MAX_SESSION_SEARCH_QUERY_CHARS:
-            raise ValueError(
-                "session search query exceeds "
-                f"{MAX_SESSION_SEARCH_QUERY_CHARS} characters"
-            )
+        normalized = _normalize_session_search_query(query)
         if not 1 <= limit <= MAX_SESSION_SEARCH_LIMIT:
             raise ValueError(
                 f"session search limit must be between 1 and {MAX_SESSION_SEARCH_LIMIT}"
             )
-        terms = normalized.split()
-        if len(terms) > MAX_SESSION_SEARCH_TERMS:
-            raise ValueError(
-                "session search query exceeds "
-                f"{MAX_SESSION_SEARCH_TERMS} terms"
-            )
-        match_query = " AND ".join(
-            '"' + term.replace('"', '""') + '"' for term in terms
-        )
+        match_query = _session_search_match_query(normalized)
         project_key = normalize_project_path(project_path)
         with closing(self._connect()) as conn:
             rows = conn.execute(
@@ -2619,6 +2633,119 @@ class SessionStore:
                     ],
                 )
                 for row in rows
+            ]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
+
+    def search_session_summaries(
+        self,
+        *,
+        project_path: str | Path,
+        query: str,
+        limit: int = 50,
+    ) -> list[SessionSummary]:
+        """Return summaries for ranked transcript hits in one project.
+
+        The limit applies to matching messages, preserving transcript search's
+        existing ranking and bounded work. Duplicate session IDs are hydrated
+        only once and returned in their first matching message's rank order.
+        """
+
+        normalized = _normalize_session_search_query(query)
+        if not 1 <= limit <= MAX_SESSION_SEARCH_LIMIT:
+            raise ValueError(
+                f"session search limit must be between 1 and {MAX_SESSION_SEARCH_LIMIT}"
+            )
+        match_query = _session_search_match_query(normalized)
+        project_key = normalize_project_path(project_path)
+        with closing(self._connect()) as conn:
+            hit_rows = conn.execute(
+                """
+                SELECT m.session_id
+                FROM messages_fts
+                JOIN messages m ON m.message_id = messages_fts.rowid
+                JOIN sessions s ON s.session_id = m.session_id
+                WHERE messages_fts MATCH ?
+                  AND s.project_key = ?
+                  AND m.role IN ('user', 'assistant')
+                ORDER BY bm25(messages_fts), m.timestamp DESC, m.message_id DESC
+                LIMIT ?
+                """,
+                (match_query, project_key, limit),
+            ).fetchall()
+            ranked_ids = tuple(dict.fromkeys(str(row["session_id"]) for row in hit_rows))
+            if not ranked_ids:
+                return []
+            placeholders = ", ".join("?" for _ in ranked_ids)
+            summary_rows = conn.execute(
+                f"""
+                SELECT s.session_id, s.project_path, s.title, s.created_at,
+                       COALESCE(s.updated_at, s.created_at) AS updated_at,
+                       COUNT(m.message_id) AS message_count, s.model,
+                       s.parent_session_id, s.root_session_id,
+                       s.fork_message_count, s.branch_name, s.depth,
+                       s.context_summary
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.session_id
+                WHERE s.project_key = ? AND s.session_id IN ({placeholders})
+                GROUP BY s.session_id
+                """,
+                (project_key, *ranked_ids),
+            ).fetchall()
+        try:
+            summaries_by_id = {
+                str(row["session_id"]): SessionSummary(
+                    session_id=row["session_id"],
+                    project_path=row["project_path"],
+                    title=row["title"] or "",
+                    created_at=_deserialize_datetime(row["created_at"]),
+                    updated_at=_deserialize_datetime(row["updated_at"]),
+                    message_count=int(row["message_count"]),
+                    model=row["model"] or "",
+                    parent_session_id=row["parent_session_id"],
+                    root_session_id=row["root_session_id"] or row["session_id"],
+                    fork_message_count=row["fork_message_count"],
+                    branch_name=row["branch_name"] or "",
+                    depth=int(row["depth"] or 0),
+                    context_summary=row["context_summary"] or "",
+                )
+                for row in summary_rows
+            }
+            return [summaries_by_id[session_id] for session_id in ranked_ids if session_id in summaries_by_id]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
+
+    def load_session_preview(self, session_id: str) -> list[SessionPreviewMessage]:
+        """Load only the bounded transcript tail needed by the session picker."""
+
+        with closing(self._connect()) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"Session not found: {session_id}")
+            rows = conn.execute(
+                """
+                SELECT role, substr(content, 1, ?) AS content
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY message_id DESC
+                LIMIT ?
+                """,
+                (
+                    MAX_SESSION_PREVIEW_MESSAGE_CHARS,
+                    session_id,
+                    MAX_SESSION_PREVIEW_MESSAGES,
+                ),
+            ).fetchall()
+        try:
+            return [
+                SessionPreviewMessage(
+                    role=row["role"],
+                    content=str(row["content"] or ""),
+                )
+                for row in reversed(rows)
             ]
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise _invalid_stored_data_error(self.db_path) from exc

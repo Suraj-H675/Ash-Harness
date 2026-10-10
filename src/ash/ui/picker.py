@@ -81,9 +81,7 @@ class FilterPicker:
                 Window(self._list_control, wrap_lines=False),
                 Window(self._detail_control, height=2, wrap_lines=True, style="class:detail"),
                 Window(
-                    FormattedTextControl(
-                        " ↑/↓ move  Enter select  Esc clear/back  Ctrl-C cancel "
-                    ),
+                    FormattedTextControl(self._render_footer),
                     height=1,
                     style="class:footer",
                 ),
@@ -227,6 +225,22 @@ class FilterPicker:
                 fragments.append(("", "\n"))
             fragments.append(("class:meta", " " + state))
         return FormattedText(fragments or [("class:muted", " ")])
+
+    def _render_footer(self) -> FormattedText:
+        app = get_app_or_none()
+        columns = app.output.get_size().columns if app is self.application else 80
+        if columns < cell_len("Esc"):
+            return FormattedText([])
+        hints = (
+            "↑/↓ move  Enter select  Esc clear/back  Ctrl-C cancel",
+            "↑/↓ move  Enter select  Esc clear  Ctrl-C cancel",
+            "Enter select  Esc clear  Ctrl-C cancel",
+            "Enter  Esc clear",
+            "Enter  Esc",
+            "Esc",
+        )
+        hint = next((item for item in hints if cell_len(item) <= columns), hints[-1])
+        return FormattedText([("", _fit_cell_text(hint, columns))])
 
     def _move(self, offset: int) -> None:
         if not self._filtered:

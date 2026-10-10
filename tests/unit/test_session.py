@@ -2787,6 +2787,94 @@ def test_session_message_search_is_project_scoped_and_excludes_tool_output(
     )
 
 
+def test_session_summary_message_search_deduplicates_hits_in_rank_order(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    other_project = tmp_path / "other"
+    store = SessionStore(tmp_path / "sessions.db")
+    first = store.create_session(str(project))
+    second = store.create_session(str(project))
+    external = store.create_session(str(other_project))
+    timestamp = datetime.now(timezone.utc)
+    for content in (
+        "needle repeated in this session",
+        "needle appears twice in this session",
+    ):
+        store.save_message(
+            first.session_id,
+            Message(role="user", content=content, timestamp=timestamp),
+        )
+    store.save_message(
+        second.session_id,
+        Message(role="assistant", content="needle in another session", timestamp=timestamp),
+    )
+    store.save_message(
+        external.session_id,
+        Message(role="user", content="needle outside this project", timestamp=timestamp),
+    )
+
+    summaries = store.search_session_summaries(
+        project_path=project,
+        query="needle",
+        limit=50,
+    )
+    ranked_ids = tuple(
+        dict.fromkeys(
+            hit.session_id
+            for hit in store.search_session_messages(
+                project_path=project,
+                query="needle",
+                limit=50,
+            )
+        )
+    )
+
+    assert {summary.session_id for summary in summaries} == {
+        first.session_id,
+        second.session_id,
+    }
+    assert len(summaries) == 2
+    assert tuple(summary.session_id for summary in summaries) == ranked_ids
+
+
+def test_session_preview_reads_only_bounded_messages_and_no_tool_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    timestamp = datetime.now(timezone.utc)
+    for index in range(10):
+        store.save_message(
+            session.session_id,
+            Message(
+                role="assistant",
+                content=(f"message-{index}" if index < 9 else "x" * 5000),
+                timestamp=timestamp,
+            ),
+        )
+    statements: list[str] = []
+    connect = store._connect
+
+    def traced_connect() -> sqlite3.Connection:
+        connection = connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", traced_connect)
+
+    preview = store.load_session_preview(session.session_id)
+
+    assert [message.content for message in preview] == [
+        "message-7",
+        "message-8",
+        "x" * 1200,
+    ]
+    assert any("LIMIT 3" in statement.upper() for statement in statements)
+    assert not any("TOOL_CALLS" in statement.upper() for statement in statements)
+
+
 def test_session_message_search_rebuilds_existing_messages_on_v18_migration(
     tmp_path: Path,
 ) -> None:

@@ -147,3 +147,18 @@ def test_filter_picker_never_overflows_tiny_terminal_rows(monkeypatch, columns) 
     assert row.startswith(">")
     if 4 <= columns <= 12:
         assert "E" in row
+
+
+@pytest.mark.parametrize("columns", [1, 4, 8, 12, 20, 28, 80])
+def test_filter_picker_footer_fits_terminal_width(monkeypatch, columns) -> None:
+    picker = FilterPicker(
+        "Provider",
+        [PickerOption("openai", "OpenAI")],
+        output=SizedDummyOutput(columns=columns),
+    )
+    monkeypatch.setattr("ash.ui.picker.get_app_or_none", lambda: picker.application)
+
+    footer = _plain(picker._render_footer())
+    assert cell_len(footer) <= columns
+    if columns < 3:
+        assert footer == ""

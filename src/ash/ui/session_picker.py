@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
@@ -22,7 +23,7 @@ from prompt_toolkit.layout import (
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.output.base import Output
 from rich.cells import cell_len, set_cell_size
-from ash.core.session import Session, SessionSummary
+from ash.core.session import SessionPreviewMessage, SessionSummary
 from ash.core.redaction import redact_text
 from ash.ui.safe_text import terminal_safe_text
 from ash.ui.theme import get_theme, overlay_styles, prompt_style
@@ -51,8 +52,8 @@ class SessionPicker:
         self,
         sessions: Sequence[SessionSummary],
         *,
-        load_session: Callable[[str], Session] | None = None,
-        search_session_ids: Callable[[str], Sequence[str]] | None = None,
+        load_preview: Callable[[str], Sequence[SessionPreviewMessage]] | None = None,
+        search_sessions: Callable[[str], Sequence[SessionSummary]] | None = None,
         initial_query: str = "",
         theme: str = "dark",
         no_color: bool = False,
@@ -60,12 +61,21 @@ class SessionPicker:
         output: Output | None = None,
     ) -> None:
         self._sessions = tuple(sessions)
-        self._load_session = load_session
-        self._search_session_ids = search_session_ids
+        self._load_preview = load_preview
+        self._search_sessions = search_sessions
+        self._content_matches: tuple[SessionSummary, ...] = ()
         self._filtered = list(self._sessions)
         self._selected = 0
+        self._query = ""
+        self._search_generation = 0
+        self._query_changed_event = asyncio.Event()
+        self._search_task: asyncio.Task[None] | None = None
+        self._active = False
+        self._accept_pending = False
         self._previewed_id: str | None = None
         self._preview_text = ""
+        self._preview_generation = 0
+        self._preview_task: asyncio.Task[None] | None = None
         self.search_buffer = Buffer(multiline=False)
         self.search_buffer.on_text_changed += self._on_query_changed
 
@@ -111,9 +121,7 @@ class SessionPicker:
                     style="class:preview",
                 ),
                 Window(
-                    FormattedTextControl(
-                        " ↑/↓ navigate  Enter resume  Ctrl-Space preview  Esc cancel "
-                    ),
+                    FormattedTextControl(self._render_footer),
                     height=1,
                     style="class:footer",
                 ),
@@ -135,25 +143,94 @@ class SessionPicker:
             self.search_buffer.text = initial_query
 
     async def run(self) -> str | None:
-        return await self.application.run_async()
+        self._active = True
+        self._ensure_search_task()
+        try:
+            return await self.application.run_async()
+        finally:
+            self._active = False
 
     def _on_query_changed(self, _: Buffer) -> None:
-        terms = self.search_buffer.text.casefold().split()
-        content_matches: set[str] = set()
-        if terms and self._search_session_ids is not None:
-            try:
-                content_matches = set(self._search_session_ids(" ".join(terms)))
-            except Exception:  # noqa: BLE001 - metadata search remains available
-                content_matches = set()
-        self._filtered = [
+        self._query = " ".join(self.search_buffer.text.casefold().split())
+        self._search_generation += 1
+        self._query_changed_event.set()
+        self._content_matches = ()
+        self._apply_filter()
+        self._clear_preview()
+        self._ensure_search_task()
+        self.application.invalidate()
+
+    def _ensure_search_task(self) -> None:
+        if (
+            not self._active
+            or not self._query
+            or self._search_sessions is None
+            or (self._search_task is not None and not self._search_task.done())
+        ):
+            return
+        self._search_task = self.application.create_background_task(
+            self._search_latest_query()
+        )
+
+    async def _search_latest_query(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while True:
+                generation = self._search_generation
+                query = self._query
+                if not query or self._search_sessions is None:
+                    return
+                await asyncio.sleep(0.1)
+                if generation != self._search_generation:
+                    continue
+                try:
+                    matches = await asyncio.to_thread(self._search_sessions, query)
+                except Exception:  # noqa: BLE001 - transcript search is best-effort
+                    matches = ()
+                if generation != self._search_generation:
+                    continue
+                selected_id = self._selected_session_id()
+                self._content_matches = tuple(matches)
+                self._apply_filter(preferred_session_id=selected_id)
+                self.application.invalidate()
+                return
+        finally:
+            if self._search_task is current_task:
+                self._search_task = None
+
+    def _apply_filter(self, *, preferred_session_id: str | None = None) -> None:
+        terms = self._query.split()
+        metadata_matches = [
             session
             for session in self._sessions
             if all(term in self._search_text(session) for term in terms)
-            or session.session_id in content_matches
+        ]
+        seen = {session.session_id for session in metadata_matches}
+        self._filtered = metadata_matches + [
+            session
+            for session in self._content_matches
+            if session.session_id not in seen
         ]
         self._selected = 0
-        self._clear_preview()
-        self.application.invalidate()
+        if preferred_session_id is not None:
+            for index, session in enumerate(self._filtered):
+                if session.session_id == preferred_session_id:
+                    self._selected = index
+                    break
+
+    def _selected_session_id(self) -> str | None:
+        if not self._filtered:
+            return None
+        return self._filtered[min(self._selected, len(self._filtered) - 1)].session_id
+
+    def _selected_session_matches_metadata(self) -> bool:
+        session_id = self._selected_session_id()
+        terms = self._query.split()
+        return any(
+            session.session_id == session_id
+            and all(term in self._search_text(session) for term in terms)
+            for session in self._sessions
+        )
 
     @staticmethod
     def _search_text(session: SessionSummary) -> str:
@@ -228,6 +305,7 @@ class SessionPicker:
         return FormattedText([("", self._preview_text or "No transcript messages")])
 
     def _clear_preview(self) -> None:
+        self._preview_generation += 1
         self._previewed_id = None
         self._preview_text = ""
 
@@ -238,25 +316,64 @@ class SessionPicker:
         if self._previewed_id == session_id:
             self._clear_preview()
             return
+        self._clear_preview()
         self._previewed_id = session_id
-        if self._load_session is None:
+        if self._load_preview is None:
             self._preview_text = "Transcript preview unavailable"
             return
-        try:
-            session = self._load_session(session_id)
-        except Exception as exc:  # noqa: BLE001
-            self._preview_text = "Could not load preview: " + terminal_safe_text(
-                redact_text(str(exc))[:300], single_line=True
-            )
+        self._preview_text = "Loading preview…"
+        self._ensure_preview_task()
+
+    def _ensure_preview_task(self) -> None:
+        if (
+            not self._active
+            or self._previewed_id is None
+            or self._load_preview is None
+            or (self._preview_task is not None and not self._preview_task.done())
+        ):
             return
-        messages = [
-            f"{terminal_safe_text(str(message.role), single_line=True)}: "
-            f"{terminal_safe_text(str(message.content))}"
-            for message in session.messages[-3:]
-            if message.content
-        ]
-        text = "\n".join(messages)
-        self._preview_text = text[:1200] + ("…" if len(text) > 1200 else "")
+        self._preview_task = self.application.create_background_task(
+            self._load_preview_for_selection()
+        )
+
+    async def _load_preview_for_selection(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while True:
+                session_id = self._previewed_id
+                generation = self._preview_generation
+                load_preview = self._load_preview
+                if session_id is None or load_preview is None:
+                    return
+                try:
+                    messages = await asyncio.to_thread(load_preview, session_id)
+                except Exception as exc:  # noqa: BLE001 - preview reads are best-effort
+                    preview_text = "Could not load preview: " + terminal_safe_text(
+                        redact_text(str(exc))[:300], single_line=True
+                    )
+                else:
+                    messages_text = [
+                        f"{terminal_safe_text(str(message.role), single_line=True)}: "
+                        f"{terminal_safe_text(redact_text(message.content))}"
+                        for message in messages
+                        if message.content
+                    ]
+                    text = "\n".join(messages_text)
+                    preview_text = text[:1200] + (
+                        "…" if len(text) > 1200 else ""
+                    )
+                if (
+                    generation != self._preview_generation
+                    or self._previewed_id != session_id
+                    or self._selected_session_id() != session_id
+                ):
+                    continue
+                self._preview_text = preview_text
+                self.application.invalidate()
+                return
+        finally:
+            if self._preview_task is current_task:
+                self._preview_task = None
 
     def _move(self, offset: int) -> None:
         if not self._filtered:
@@ -264,6 +381,22 @@ class SessionPicker:
         self._selected = (self._selected + offset) % len(self._filtered)
         self._clear_preview()
         self.application.invalidate()
+
+    def _render_footer(self) -> FormattedText:
+        app = get_app_or_none()
+        columns = app.output.get_size().columns if app is self.application else 80
+        if columns < cell_len("Esc"):
+            return FormattedText([])
+        hints = (
+            "↑/↓ navigate  Enter resume  Ctrl-Space preview  Esc cancel",
+            "↑/↓ move  Enter resume  Ctrl-Space preview  Esc",
+            "↑/↓  Enter resume  Ctrl-Space",
+            "↑/↓  Enter  Ctrl-Space",
+            "Enter  Esc",
+            "Esc",
+        )
+        hint = next((item for item in hints if cell_len(item) <= columns), hints[-1])
+        return FormattedText([("", _fit_cell_text(hint, columns))])
 
     def _key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
@@ -280,10 +413,37 @@ class SessionPicker:
 
         @bindings.add("enter", eager=True)
         def accept(event: Any) -> None:
-            selected = (
-                self._filtered[self._selected].session_id if self._filtered else None
-            )
-            event.app.exit(result=selected)
+            if self._accept_pending:
+                return
+            self._accept_pending = True
+
+            async def accept_after_search() -> None:
+                try:
+                    while self._query and not self._selected_session_matches_metadata():
+                        search_task = self._search_task
+                        if search_task is None:
+                            break
+                        self._query_changed_event.clear()
+                        query_change_task = asyncio.create_task(
+                            self._query_changed_event.wait()
+                        )
+                        try:
+                            await asyncio.wait(
+                                (search_task, query_change_task),
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        finally:
+                            if not query_change_task.done():
+                                query_change_task.cancel()
+                            await asyncio.gather(
+                                query_change_task,
+                                return_exceptions=True,
+                            )
+                    event.app.exit(result=self._selected_session_id())
+                finally:
+                    self._accept_pending = False
+
+            event.app.create_background_task(accept_after_search())
 
         @bindings.add("c-space", eager=True)
         def preview(event: Any) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -49,22 +50,27 @@ async def pick_session(
 
     from ash.ui.session_picker import SessionPicker
 
-    sessions = store.list_sessions(project_path=project_path, limit=limit)
+    sessions = await asyncio.to_thread(
+        store.list_sessions,
+        project_path=project_path,
+        limit=limit,
+    )
     if not sessions:
         raise ValueError("no sessions found in this project")
+
+    def search_sessions(query: str) -> tuple[SessionSummary, ...]:
+        metadata = store.list_sessions(project_path=project_path, query=query, limit=50)
+        transcript = store.search_session_summaries(
+            project_path=project_path, query=query, limit=50
+        )
+        return tuple(
+            {item.session_id: item for item in (*metadata, *transcript)}.values()
+        )
+
     return await SessionPicker(
         sessions,
-        load_session=store.load_session,
-        search_session_ids=lambda query: tuple(
-            dict.fromkeys(
-                hit.session_id
-                for hit in store.search_session_messages(
-                    project_path=project_path,
-                    query=query,
-                    limit=50,
-                )
-            )
-        ),
+        load_preview=store.load_session_preview,
+        search_sessions=search_sessions,
         initial_query=initial_query,
         theme=theme,
         no_color=no_color,
