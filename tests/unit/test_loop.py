@@ -8618,6 +8618,59 @@ async def test_read_only_tool_calls_run_concurrently_with_stable_order(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_parallel_tool_runtime_events_have_task_local_call_identity(tmp_path):
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    observed: list[tuple[int, str | None]] = []
+
+    class CorrelatedReadTool(BaseTool):
+        name = "test_slow_read"
+        args_schema = None
+        execution_contract = ToolExecutionContract(parallel_safe=True)
+
+        async def run(self, **kwargs):
+            index = kwargs["index"]
+            if index == 0:
+                first_started.set()
+                await second_started.wait()
+            else:
+                second_started.set()
+                await first_started.wait()
+            event = loop._envelope_event({"type": "tool.progress"})
+            observed.append((index, event["operation_id"]))
+            return ToolResult(success=True, output="read")
+
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "parallel-correlation.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"test_slow_read": CorrelatedReadTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+    loop.turn_context = TurnContext(session.session_id, "turn-correlated")
+    store.start_turn(session.session_id, "turn-correlated", "parallel reads")
+
+    await loop._execute_tool_calls(
+        [
+            {
+                "call_id": f"call-{index}",
+                "name": "test_slow_read",
+                "arguments": {"index": index},
+            }
+            for index in range(2)
+        ],
+        session,
+    )
+
+    assert sorted(observed) == [(0, "call-0"), (1, "call-1")]
+
+
+@pytest.mark.asyncio
 async def test_read_only_tool_calls_bound_parallel_fanout(tmp_path):
     active = 0
     max_active = 0
@@ -8736,8 +8789,74 @@ async def test_parallel_read_only_calls_drain_siblings_on_parent_cancellation(
 
 
 @pytest.mark.asyncio
+async def test_parallel_read_only_calls_drain_siblings_after_repeated_cancellation(
+    tmp_path,
+):
+    sibling_started = asyncio.Event()
+    sibling_cleanup_started = asyncio.Event()
+    allow_sibling_cleanup = asyncio.Event()
+    sibling_finished = asyncio.Event()
+
+    class SlowReadTool(BaseTool):
+        name = "test_cancellable_read"
+        args_schema = None
+        execution_contract = ToolExecutionContract(parallel_safe=True)
+
+        async def run(self, **kwargs):
+            if kwargs["index"] == 0:
+                return ToolResult(success=True, output="ready")
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sibling_cleanup_started.set()
+                await allow_sibling_cleanup.wait()
+                sibling_finished.set()
+                raise
+
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "parallel-double-cancel.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"test_cancellable_read": SlowReadTool(guard)},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+    batch = asyncio.create_task(
+        loop._execute_tool_calls(
+            [
+                {
+                    "call_id": f"call-{index}",
+                    "name": "test_cancellable_read",
+                    "arguments": {"index": index},
+                }
+                for index in range(2)
+            ],
+            session,
+        )
+    )
+    try:
+        await asyncio.wait_for(sibling_started.wait(), timeout=1)
+        batch.cancel()
+        await asyncio.wait_for(sibling_cleanup_started.wait(), timeout=1)
+        batch.cancel()
+        done, _ = await asyncio.wait({batch}, timeout=0.05)
+        assert not done, "repeated cancellation escaped while a tool was cleaning up"
+    finally:
+        allow_sibling_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await batch
+    assert sibling_finished.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt_cleanup", [False, True])
 async def test_parallel_read_only_calls_drain_siblings_after_intent_store_failure(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, interrupt_cleanup
 ):
     sibling_started = asyncio.Event()
     sibling_release = asyncio.Event()
@@ -8830,6 +8949,9 @@ async def test_parallel_read_only_calls_drain_siblings_after_intent_store_failur
 
     try:
         await asyncio.wait_for(failure_raised.wait(), timeout=1)
+        await asyncio.wait_for(sibling_cleanup_started.wait(), timeout=1)
+        if interrupt_cleanup:
+            batch.cancel()
         done, _ = await asyncio.wait({batch}, timeout=0.05)
         returned_before_sibling_finished = bool(done)
         assert not returned_before_sibling_finished, (
@@ -8842,8 +8964,11 @@ async def test_parallel_read_only_calls_drain_siblings_after_intent_store_failur
         allow_sibling_cleanup.set()
         outcome = await asyncio.gather(batch, return_exceptions=True)
 
-    assert isinstance(outcome[0], sqlite3.IntegrityError)
-    assert "injected tool intent store failure" in str(outcome[0])
+    if interrupt_cleanup:
+        assert isinstance(outcome[0], asyncio.CancelledError)
+    else:
+        assert isinstance(outcome[0], sqlite3.IntegrityError)
+        assert "injected tool intent store failure" in str(outcome[0])
     assert not failed_call_started.is_set()
     assert sibling_finished.is_set()
     records = {record.call_id: record for record in store.load_session(session.session_id).tool_calls}

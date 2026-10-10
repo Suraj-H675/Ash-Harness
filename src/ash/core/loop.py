@@ -1766,7 +1766,9 @@ class AshLoop:
         turn_context = getattr(self, "turn_context", None)
         call_id = payload.get("call_id")
         if call_id is None and turn_context is not None:
-            call_id = turn_context.get("tool_call_id")
+            call_id = current_log_context().get("operation_id") or turn_context.get(
+                "tool_call_id"
+            )
         event = envelope_event(
             payload,
             context=EventContext(
@@ -5503,13 +5505,30 @@ class AshLoop:
             tasks = [
                 asyncio.create_task(execute_read_only(call)) for call in tool_calls
             ]
+            grouped_tasks = asyncio.gather(*tasks)
             try:
-                grouped = await asyncio.gather(*tasks)
-            except BaseException:
+                grouped = await asyncio.shield(grouped_tasks)
+            except BaseException as primary_error:
                 for task in tasks:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+
+                async def drain_siblings() -> None:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    await asyncio.gather(grouped_tasks, return_exceptions=True)
+
+                cleanup = asyncio.create_task(drain_siblings())
+                cleanup_error, cleanup_interrupted = await _settle_owned_cleanup_task(
+                    cleanup
+                )
+                if cleanup_error is not None:
+                    primary_error.add_note(
+                        f"parallel tool cleanup failed: {type(cleanup_error).__name__}"
+                    )
+                if cleanup_interrupted and not isinstance(
+                    primary_error, asyncio.CancelledError
+                ):
+                    raise asyncio.CancelledError from primary_error
                 raise
             flattened = [result for group in grouped for result in group]
             if persist_tool_messages:
