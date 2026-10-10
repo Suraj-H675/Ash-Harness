@@ -6,6 +6,50 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0]
+
+### Upgrade notes
+- The published `0.3.1` release uses session schema v18. Opening an existing
+  profile with `0.4.0` migrates it to v19 to persist a per-session permission
+  mode and first creates a validated `before-v19-migration` database backup.
+  Rolling the package back to `0.3.1` does not downgrade the database; restore
+  the v18 backup while running `0.4.0` before reinstalling the older package.
+  See [Maintenance and recovery](docs/guides/MAINTENANCE.md#roll-back-across-a-session-schema-migration).
+
+### Added
+- Added property-based state and crash recovery checks, terminal PTY
+  integration, and an opt-in network chaos test against a synthetic provider
+  endpoint.
+
+### Changed
+- Replaced the full-screen transcript view with a retained terminal interface
+  for the active turn. Completed turns use native terminal scrollback, while
+  bounded current-turn rendering keeps the composer, status row, and approval
+  choices visible.
+- Kept session model and reasoning choices with their durable session and
+  restored them on resume. Live and explicitly resumed sessions now remain
+  protected from retention cleanup.
+- Kept provider and planner requests within declared model limits. The planner
+  stays on the active provider and records its usage against the turn.
+- Scoped tool lifecycle state, approval input, and background agents to their
+  owning session and invocation. A2A turns and session creation are serialized
+  per context.
+
+### Fixed
+- Preserved completed work during cancellation and shutdown. Timed-out
+  subprocesses and failed parallel tool batches now clean up without hiding
+  uncertain side-effect outcomes or replaying ambiguous mutations.
+- Hardened imported session and planner input. Imported system-role instructions
+  are rejected, and session discovery redacts credentials.
+- Bounded MCP request and notification deadlines and SSE event sizes. HTTP/SSE
+  streams now close when their turn disconnects.
+- Preserved UTF-8 across streamed subprocess chunks and reclaimed transcript
+  history during streaming and turn shutdown.
+- Fixed terminal session switching, retention, narrow-screen picker navigation,
+  approval interruption, and help-overlay behavior.
+
+## [0.3.1] - 2026-10-06
+
 ### Added
 - Added opt-in POSIX PTY execution for foreground commands and managed
   background jobs, including interactive input, Bubblewrap/scoped
@@ -303,6 +347,8 @@ All notable changes to Ash are documented here. The format follows
 - Fixed duplicate `project.urls` tables so the distribution builds with modern
   `setuptools`; expanded CI across Python 3.11 and 3.12.
 
-[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.2.0...HEAD
+[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.0...HEAD
+[0.4.0]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.3.1...ash-v0.4.0
+[0.3.1]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.3.0...ash-v0.3.1
 [0.2.0]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.1.0...ash-v0.2.0
 [0.1.0]: https://github.com/Suraj-H675/Ash-Harness/releases/tag/ash-v0.1.0

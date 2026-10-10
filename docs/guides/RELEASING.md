@@ -82,6 +82,12 @@ migrates it through v17 to v18 after creating a validated
 restoring the v16 backup as well as installing the older package. See
 [Maintenance and recovery](MAINTENANCE.md#roll-back-across-a-session-schema-migration).
 
+For the 0.4.0 upgrade, the published 0.3.1 release creates schema-v18 session
+databases. Opening one with 0.4.0 automatically backs it up as
+`before-v19-migration` before adding the v19 per-session permission-mode field.
+Returning to 0.3.1 requires restoring that v18 backup **before** rolling the
+package back; installing 0.3.1 alone cannot open the migrated v19 database.
+
 ## Verify a published release
 
 GitHub CLI can verify both the release attestation and an individual downloaded

@@ -89,6 +89,14 @@ If no compatible pre-migration backup exists, do not force an older binary to
 open the newer schema. Keep the newer release installed or recover from another
 known-good backup instead.
 
+For **0.3.1 → 0.4.0**, the published 0.3.1 release stores sessions with schema
+v18, while 0.4.0 migrates them to v19 (persisted per-session permission mode).
+The automatic `sessions.db.before-v19-migration.<timestamp>.backup` preserves
+the v18 state. To roll back to 0.3.1, follow the same four steps above using
+this **v18 backup** while 0.4.0 is still installed, then install the immutable
+0.3.1 package. Changes made only after the v19 migration are not present in
+that earlier backup; export or preserve newer work separately before restoring.
+
 ## Reset selected default-profile state
 
 Ash reset is deliberately selective:

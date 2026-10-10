@@ -760,11 +760,18 @@ they are complete:
   executed directly; and
 - a broad messaging-channel gateway is not currently part of Ash.
 
-Ash has a real immutable production distribution. The strict post-0.2.0 parity
-re-audit currently keeps P0, P5, P7, and P8 open while corrected release claims
-and strengthened hosted PTY/browser evidence are verified; P1-P4 and P6 remain
-closed. This does not claim literal feature identity with desktop/mobile/gateway
-products or turn qualified provider/protocol rows into broader support claims.
+Ash is a production-worthy local-first terminal coding harness within its
+documented scope. The supported-host CI run for source commit `fb8fb1b` passed
+the Chromium browser journey, Linux and macOS PTY lanes, and the supported
+Python matrix. P0/M1, P5, and the final P7/P8 publication claims are closed for
+the 0.4.0 release. Its package README is checked against this source README.
+The tag-triggered release workflow reruns CI, checks that the tag matches the
+package version, builds and smoke-tests the artifacts, then attests them before
+publication. The immutable 0.3.1 wheel retains its earlier gate wording. This
+does not claim literal feature identity with desktop, mobile, or gateway
+products, or broader support than each provider and protocol row documents. See
+the [production parity checklist](docs/architecture/PRODUCTION_HARNESS_PARITY.md)
+for evidence and scope boundaries.
 Production observability is available as an explicit opt-in OpenTelemetry/OTLP
 trace-and-metrics path; qualified boundaries above remain truthful support
 limits rather than claims of feature identity with every comparator.

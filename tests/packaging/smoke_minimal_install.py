@@ -61,6 +61,17 @@ def run_ash(
 def assert_distribution_metadata() -> None:
     installed = distribution("ash-ai")
     requirements = [Requirement(value) for value in installed.requires or ()]
+    metadata_path = next(
+        path
+        for path in installed.files or ()
+        if str(path).endswith(".dist-info/METADATA")
+    )
+    metadata_bytes = Path(installed.locate_file(metadata_path)).read_bytes()
+    _, separator, embedded_readme = metadata_bytes.partition(b"\n\n")
+    source_readme = Path(__file__).resolve().parents[2] / "README.md"
+    assert separator and embedded_readme == source_readme.read_bytes(), (
+        "installed wheel README differs from source README.md"
+    )
     base_names = {
         requirement.name.casefold()
         for requirement in requirements
