@@ -3259,10 +3259,14 @@ async def test_model_failure_emits_paired_lifecycle_and_closes_turn(tmp_path):
 @pytest.mark.asyncio
 async def test_tool_error_lifecycle_covers_unknown_and_reported_failures(tmp_path):
     observed = []
+    event_call_ids = []
     hooks = HookRegistry()
 
     async def capture(payload):
         observed.append(payload)
+        event_call_ids.append(
+            loop._envelope_event({"type": "hook.progress"})["operation_id"]
+        )
 
     hooks.register_lifecycle(LifecycleHook("tool_error", capture))
     guard = SafetyGuard(tmp_path)
@@ -3307,6 +3311,7 @@ async def test_tool_error_lifecycle_covers_unknown_and_reported_failures(tmp_pat
     ]
     assert "sk-proj" not in str(observed[0]["arguments"])
     assert observed[1]["error"] == "reported failure"
+    assert event_call_ids == ["unknown-call", "failure-call"]
 
 
 @pytest.mark.asyncio
@@ -8654,6 +8659,69 @@ async def test_parallel_tool_runtime_events_have_task_local_call_identity(tmp_pa
     session = await loop.start_session()
     loop.turn_context = TurnContext(session.session_id, "turn-correlated")
     store.start_turn(session.session_id, "turn-correlated", "parallel reads")
+
+    await loop._execute_tool_calls(
+        [
+            {
+                "call_id": f"call-{index}",
+                "name": "test_slow_read",
+                "arguments": {"index": index},
+            }
+            for index in range(2)
+        ],
+        session,
+    )
+
+    assert sorted(observed) == [(0, "call-0"), (1, "call-1")]
+
+
+@pytest.mark.asyncio
+async def test_parallel_pre_tool_hook_events_keep_their_own_call_identity(tmp_path):
+    import re
+
+    from ash.hooks.registry import PreToolUseHook
+
+    first_entered = asyncio.Event()
+    second_entered = asyncio.Event()
+    observed: list[tuple[int, str | None]] = []
+
+    class ReadTool(BaseTool):
+        name = "test_slow_read"
+        args_schema = None
+        execution_contract = ToolExecutionContract(parallel_safe=True)
+
+        async def run(self, **kwargs):
+            return ToolResult(success=True, output=str(kwargs["index"]))
+
+    hooks = HookRegistry()
+
+    async def before(_name, arguments):
+        index = arguments["index"]
+        if index == 0:
+            first_entered.set()
+            await second_entered.wait()
+        else:
+            second_entered.set()
+            await first_entered.wait()
+        event = loop._envelope_event({"type": "hook.progress"})
+        observed.append((index, event["operation_id"]))
+
+    hooks.register_pre_tool(PreToolUseHook(re.compile("test_slow_read"), before))
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "parallel-hook-correlation.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"test_slow_read": ReadTool(guard)},
+        hooks=hooks,
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+    loop.turn_context = TurnContext(session.session_id, "turn-hooks")
+    store.start_turn(session.session_id, "turn-hooks", "reads")
 
     await loop._execute_tool_calls(
         [

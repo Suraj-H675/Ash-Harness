@@ -2643,7 +2643,9 @@ class AshLoop:
         if session is None or turn_context is None:
             raise RuntimeError("MCP task was created outside an active Ash turn")
         call_id = payload.get("call_id")
-        active_call_id = turn_context.get("tool_call_id")
+        active_call_id = current_log_context().get("operation_id") or turn_context.get(
+            "tool_call_id"
+        )
         if (
             not isinstance(call_id, str)
             or not call_id
@@ -5404,19 +5406,22 @@ class AshLoop:
         arguments: dict[str, Any],
         error: str,
     ) -> None:
-        await self._fire_hook_lifecycle(
-            "tool_error",
-            {
-                "session_id": session.session_id,
-                "turn_id": (
-                    self.turn_context.turn_id if self.turn_context is not None else None
-                ),
-                "call_id": call_id,
-                "tool": tool_name,
-                "arguments": redact_value(arguments),
-                "error": redact_text(error),
-            },
-        )
+        with log_context(operation_id=call_id):
+            await self._fire_hook_lifecycle(
+                "tool_error",
+                {
+                    "session_id": session.session_id,
+                    "turn_id": (
+                        self.turn_context.turn_id
+                        if self.turn_context is not None
+                        else None
+                    ),
+                    "call_id": call_id,
+                    "tool": tool_name,
+                    "arguments": redact_value(arguments),
+                    "error": redact_text(error),
+                },
+            )
 
     def _redact_tool_calls_for_persistence(
         self,
@@ -5821,12 +5826,14 @@ class AshLoop:
                 else None
             )
             mutation_context_entered = False
+            previous_operation_id = current_log_context().get("operation_id")
             try:
                 if mutation_context is not None:
                     mutation_context.__enter__()
                     mutation_context_entered = True
                 contract = _validated_tool_execution_contract(tool)
                 replay_policy = contract.replay_policy.value
+                set_log_context(operation_id=record.call_id)
                 if self.turn_context is not None:
                     self.turn_context.set("tool_call_id", record.call_id)
 
@@ -5856,21 +5863,20 @@ class AshLoop:
                     )
                 else:
                     self._emit_event({"type": "tool.started", **event_base})
-                    with log_context(operation_id=record.call_id):
-                        tool_context = {
-                            **event_base,
-                            "session_id": session.session_id,
-                            **(
-                                {"turn_id": self.turn_context.turn_id}
-                                if self.turn_context is not None
-                                else {}
-                            ),
-                        }
-                        with tool.event_context(tool_context):
-                            tool_started = True
-                            result_dict = await _execute_tool_once(
-                                tool, deepcopy(arguments)
-                            )
+                    tool_context = {
+                        **event_base,
+                        "session_id": session.session_id,
+                        **(
+                            {"turn_id": self.turn_context.turn_id}
+                            if self.turn_context is not None
+                            else {}
+                        ),
+                    }
+                    with tool.event_context(tool_context):
+                        tool_started = True
+                        result_dict = await _execute_tool_once(
+                            tool, deepcopy(arguments)
+                        )
                     tool_result = ToolResult(
                         success=result_dict["success"],
                         output=result_dict["output"],
@@ -6015,6 +6021,7 @@ class AshLoop:
                 results.append(result_payload)
                 continue
             finally:
+                set_log_context(operation_id=previous_operation_id)
                 if mutation_context_entered and mutation_context is not None:
                     mutation_context.__exit__(None, None, None)
 

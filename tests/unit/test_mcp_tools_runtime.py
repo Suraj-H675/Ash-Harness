@@ -2136,6 +2136,19 @@ async def test_loop_persists_mcp_task_only_for_active_tool_call(
         with pytest.raises(RuntimeError, match="does not match active tool"):
             await loop._persist_mcp_task_state(payload)
         assert len(store.list_mcp_tasks(session.session_id)) == 1
+
+        from ash.logging import log_context
+
+        with log_context(operation_id="call-2"):
+            another = {
+                **payload,
+                "call_id": "call-2",
+                "task": {**payload["task"], "taskId": "task-2"},
+            }
+            await loop._persist_mcp_task_state(another)
+        assert [row["task_id"] for row in store.list_mcp_tasks(session.session_id)] == [
+            "task-1", "task-2"
+        ]
     finally:
         loop.turn_context = None
     await loop.aclose()

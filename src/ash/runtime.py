@@ -21,6 +21,7 @@ from ash.core.redaction import redact_text
 from ash.core.secret_middleware import SecretRedactionMiddleware
 from ash.core.session import SessionStore
 from ash.hooks.config import HookConfigSource, load_command_hooks
+from ash.logging import current_log_context
 from ash.mcp.interactions import (
     ElicitationCallback,
     MCPInteractionController,
@@ -758,7 +759,10 @@ def build_runtime(
             return (
                 loop.current_session.session_id,
                 loop.turn_context.turn_id,
-                str(loop.turn_context.get("tool_call_id", "")),
+                str(
+                    current_log_context().get("operation_id")
+                    or loop.turn_context.get("tool_call_id", "")
+                ),
             )
 
         loop.tool_middlewares.append(
