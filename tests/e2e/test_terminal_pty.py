@@ -1071,7 +1071,9 @@ def test_resume_and_clear_replace_the_active_conversation_view(tmp_path: Path) -
         expect("›".encode())
         os.write(master_fd, f"/resume {selected.session_id}\r".encode())
         expect(b"selected answer")
-        time.sleep(0.2)
+        resume_start = len(captured)
+        os.write(master_fd, b"/status\r")
+        expect(f"Session: {selected.session_id}".encode(), after=resume_start)
         clear_start = len(captured)
         os.write(master_fd, b"/clear\r")
         expect(b"Ready", after=clear_start)
@@ -1081,9 +1083,31 @@ def test_resume_and_clear_replace_the_active_conversation_view(tmp_path: Path) -
         while len(store.list_sessions(project_path=str(workspace))) < 3:
             assert time.monotonic() < deadline, "clear did not create a new session"
             time.sleep(0.05)
-        time.sleep(0.2)
+        new_session_ids = {
+            summary.session_id
+            for summary in store.list_sessions(project_path=str(workspace))
+        } - {active.session_id, selected.session_id}
+        assert len(new_session_ids) == 1
+        new_session_id = new_session_ids.pop()
+        status_start = len(captured)
+        os.write(master_fd, b"/status\r")
+        expect(f"Session: {new_session_id}".encode(), after=status_start)
         os.write(master_fd, b"/exit\r")
-        process.wait(timeout=15)
+        # Continue draining PTY output while Ash redraws and shuts down. A
+        # blocked PTY writer cannot exit if the parent only waits for the PID.
+        deadline = time.monotonic() + 15
+        while process.poll() is None and time.monotonic() < deadline:
+            if select.select([master_fd], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(master_fd, 65_536)
+                except OSError:
+                    break
+                if chunk:
+                    captured.extend(chunk)
+        assert process.poll() is not None, (
+            "Ash did not exit after /exit: "
+            + bytes(captured).decode("utf-8", errors="replace")[-3000:]
+        )
         while select.select([master_fd], [], [], 0.1)[0]:
             try:
                 chunk = os.read(master_fd, 65_536)
