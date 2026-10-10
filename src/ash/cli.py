@@ -20,6 +20,7 @@ import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from ash.core.redaction import redact_text
 from ash.safe_io import read_bounded_bytes, read_bounded_text, strict_json_loads
 from ash.mcp.diagnostics import safe_mcp_diagnostic
 from ash.safety.scoped_io import atomic_write_scoped_text_chunks
@@ -1301,6 +1302,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     if session is not None
                     else None
                 )
+                session_title = (
+                    terminal_safe_text(
+                        redact_text(session.title or "(untitled)"), single_line=True
+                    )
+                    if session is not None
+                    else "(none)"
+                )
                 print(
                     "\n".join(
                         (
@@ -1308,7 +1316,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"Workspace: {config.workspace_root}",
                             f"Mode: {loop.safety_tier}",
                             f"Session: {session.session_id if session else '(none)'}",
-                            f"Title: {(session.title or '(untitled)') if session else '(none)'}",
+                            f"Title: {session_title}",
                             "Goal: "
                             + (
                                 f"{goal.state.value} ({goal.goal_id[:8]})"
@@ -1644,7 +1652,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     print("No matching sessions.", flush=True)
                 for item in sessions:
                     title = terminal_safe_text(
-                        item.title or "(untitled)", single_line=True
+                        redact_text(item.title or "(untitled)"), single_line=True
                     )
                     session_id = terminal_safe_text(item.session_id, single_line=True)
                     print(
@@ -1725,7 +1733,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 loop.current_session.title = " ".join(title.split())
                 print(
                     "Renamed session to "
-                    + terminal_safe_text(loop.current_session.title, single_line=True),
+                    + terminal_safe_text(
+                        redact_text(loop.current_session.title), single_line=True
+                    ),
                     flush=True,
                 )
                 continue

@@ -17,6 +17,7 @@ from ash.commands.sessions import (
     parse_session_retention_days,
     pick_session,
     render_recovery_reports,
+    render_session_search_hits,
     render_session_summaries,
     render_session_tree,
     select_startup_session,
@@ -167,6 +168,40 @@ def test_session_summary_renderer_emits_json(tmp_path: Path) -> None:
     assert payload["sessions"][0]["title"] == "Feature Work"
     assert payload["sessions"][0]["message_count"] == 1
     assert payload["sessions"][0]["model"] == "openai/gpt-5.2"
+
+
+def test_session_discovery_redacts_credentials_in_persisted_titles(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz"
+    store.rename_session(session.session_id, f"Debug {secret}")
+    store.save_message(
+        session.session_id,
+        Message(role="user", content="searchable needle", timestamp=datetime.now(timezone.utc)),
+    )
+
+    summaries = list_session_summaries(store, project_path=str(tmp_path))
+    hits = store.search_session_messages(project_path=tmp_path, query="needle")
+    assert len(hits) == 1
+    for rendered in (
+        render_session_summaries(summaries),
+        render_session_summaries(summaries, json_output=True),
+        render_session_search_hits(hits),
+        render_session_search_hits(hits, json_output=True),
+    ):
+        assert secret not in rendered
+        assert "[REDACTED]" in rendered
+
+    assert store.load_session(session.session_id).title == f"Debug {secret}"
+
+    child = store.fork_session(session.session_id, branch_name=f"Branch {secret}")
+    for rendered in (
+        render_session_tree(store.session_tree(session.session_id)),
+        render_session_tree(store.session_tree(session.session_id), json_output=True),
+    ):
+        assert secret not in rendered
+        assert "[REDACTED]" in rendered
+    assert store.load_session(child.session_id).branch_name == f"Branch {secret}"
 
 
 def test_session_human_renderers_neutralize_persisted_terminal_controls(

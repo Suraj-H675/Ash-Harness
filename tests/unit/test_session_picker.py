@@ -178,6 +178,17 @@ def test_session_picker_sanitizes_persisted_list_metadata() -> None:
     assert "openai/model\\x1b]0;owned" in rendered
 
 
+def test_session_picker_redacts_credentials_in_titles() -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz"
+    picker = SessionPicker(
+        [_summary("first-id", f"Investigate {secret}")], output=DummyOutput()
+    )
+
+    rendered = _plain(picker._render_list())
+    assert secret not in rendered
+    assert "[REDACTED]" in rendered
+
+
 @pytest.mark.asyncio
 async def test_session_picker_sanitizes_and_redacts_transcript_preview() -> None:
     secret = "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz"

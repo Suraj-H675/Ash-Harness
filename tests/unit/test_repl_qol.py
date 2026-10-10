@@ -176,9 +176,17 @@ async def _run_repl(
         active_model_id=active_model_id,
         reasoning_effort_label="effort unavailable",
         provider=SimpleNamespace(
-            capabilities=SimpleNamespace(vision=vision),
+            capabilities=SimpleNamespace(
+                vision=vision, native_tools=False, reasoning=False, local=True
+            ),
             count_tokens=lambda text: len(text),
         ),
+        provider_circuit_breaker=SimpleNamespace(
+            snapshot=lambda _key: {"open": False, "failures": 0}
+        ),
+        _provider_circuit_key="test",
+        recovered_turns=0,
+        recovery_summary=None,
         permission_policy=PermissionPolicy(safety_tier),
         safety_tier=safety_tier,
         notify_permission_rules_changed=lambda **_kwargs: None,
@@ -249,6 +257,7 @@ async def test_repl_session_commands_escape_metadata_and_recover_from_invalid_re
     store = SessionStore(tmp_path / "sessions.db")
     session = store.create_session(str(tmp_path), model="ollama/test-model")
     store.rename_session(session.session_id, "original\x1b[2J\u202eforged\u202c")
+    session.title = store.load_session(session.session_id).title
     store.fork_session(
         session.session_id,
         branch_name="branch\x1b[3J\u202ehidden\u202c",
@@ -256,10 +265,12 @@ async def test_repl_session_commands_escape_metadata_and_recover_from_invalid_re
 
     commands = iter(
         (
+            "/status",
             "/sessions",
             "/tree",
             "/rename new\x1b[2J\u202elabel\u202c",
             "/rename " + "x" * 257,
+            "/rename Debug sk-proj-abcdefghijklmnopqrstuvwxyz",
             "/rename Safe title",
             "/fork next\x1b[2J\u202ebranch\u202c",
             "/exit",
@@ -277,8 +288,11 @@ async def test_repl_session_commands_escape_metadata_and_recover_from_invalid_re
     assert "\x1b" not in capture.out
     assert "\u202e" not in capture.out
     assert "original\\x1b[2J\\u202eforged\\u202c" in capture.out
+    assert "Title: original\\x1b[2J\\u202eforged\\u202c" in capture.out
     assert "branch\\x1b[3J\\u202ehidden\\u202c" in capture.out
     assert "Renamed session to new\\x1b[2J\\u202elabel\\u202c" in capture.out
+    assert "sk-proj-abcdefghijklmnopqrstuvwxyz" not in capture.out
+    assert "Renamed session to Debug [REDACTED]" in capture.out
     assert "Forked next\\x1b[2J\\u202ebranch\\u202c" in capture.out
     assert "session title cannot exceed 256 characters" in capture.err
     assert "Renamed session to Safe title" in capture.out

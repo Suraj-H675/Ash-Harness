@@ -264,9 +264,11 @@ class SessionPicker:
         for index, session in enumerate(self._filtered[start:end], start=start):
             style = "class:selected" if index == self._selected else ""
             marker = ("> " if index == self._selected else "  ")[:columns]
-            title = terminal_safe_text(session.title or "(untitled)", single_line=True)
+            title = terminal_safe_text(
+                redact_text(session.title or "(untitled)"), single_line=True
+            )
             model = terminal_safe_text(
-                session.model or "unknown model", single_line=True
+                redact_text(session.model or "unknown model"), single_line=True
             )
             session_id = terminal_safe_text(session.session_id[:8], single_line=True)
             metadata = (

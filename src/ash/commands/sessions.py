@@ -7,7 +7,7 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from ash.core.redaction import redact_text
+from ash.core.redaction import redact_text, redact_value
 from ash.core.session import (
     SessionLineage,
     SessionSearchHit,
@@ -165,7 +165,12 @@ def render_session_summaries(
 ) -> str:
     if json_output:
         return json.dumps(
-            {"sessions": [session.model_dump(mode="json") for session in sessions]},
+            {
+                "sessions": [
+                    redact_value(session.model_dump(mode="json"))
+                    for session in sessions
+                ]
+            },
             sort_keys=True,
         )
     if not sessions:
@@ -173,9 +178,15 @@ def render_session_summaries(
     lines: list[str] = []
     for session in sessions:
         session_id = terminal_safe_text(session.session_id, single_line=True)
-        title = terminal_safe_text(session.title or "(untitled)", single_line=True)
-        model = terminal_safe_text(session.model or "unknown", single_line=True)
-        project_path = terminal_safe_text(session.project_path, single_line=True)
+        title = terminal_safe_text(
+            redact_text(session.title or "(untitled)"), single_line=True
+        )
+        model = terminal_safe_text(
+            redact_text(session.model or "unknown"), single_line=True
+        )
+        project_path = terminal_safe_text(
+            redact_text(session.project_path), single_line=True
+        )
         lines.append(
             f"{session_id}  {title}  {session.message_count} messages  "
             f"{model}  {session.updated_at.isoformat()}  {project_path}"
@@ -190,14 +201,16 @@ def render_session_search_hits(
 ) -> str:
     if json_output:
         return json.dumps(
-            {"matches": [hit.model_dump(mode="json") for hit in hits]},
+            {"matches": [redact_value(hit.model_dump(mode="json")) for hit in hits]},
             sort_keys=True,
         )
     if not hits:
         return "No matching session messages."
     lines: list[str] = []
     for hit in hits:
-        title = terminal_safe_text(hit.title or "(untitled)", single_line=True)
+        title = terminal_safe_text(
+            redact_text(hit.title or "(untitled)"), single_line=True
+        )
         excerpt = terminal_safe_text(redact_text(hit.excerpt), single_line=True)
         lines.append(
             f"{hit.session_id}  {title}  {hit.role}  "
@@ -213,15 +226,16 @@ def render_session_tree(
 ) -> str:
     if json_output:
         return json.dumps(
-            {"sessions": [node.model_dump(mode="json") for node in tree]},
+            {"sessions": [redact_value(node.model_dump(mode="json")) for node in tree]},
             sort_keys=True,
         )
     lines: list[str] = []
     for node in tree:
         session_id = terminal_safe_text(node.session_id, single_line=True)
         label = terminal_safe_text(
-            node.branch_name or (
-                "root" if node.parent_session_id is None else "branch"
+            redact_text(
+                node.branch_name
+                or ("root" if node.parent_session_id is None else "branch")
             ),
             single_line=True,
         )
