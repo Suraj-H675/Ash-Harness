@@ -469,6 +469,186 @@ def test_provider_test_reports_ready_after_real_completion_probe(monkeypatch) ->
     assert provider.messages == [{"role": "user", "content": "Reply with exactly OK."}]
 
 
+@pytest.mark.asyncio
+async def test_native_tool_probe_verifies_structured_call_without_execution(monkeypatch) -> None:
+    from ash.commands import providers
+
+    provider = _ScriptedProbeProvider(
+        chunks=[
+            StreamChunk(
+                native_tool_calls=[
+                    CanonicalToolCall(
+                        call_id="diagnostic-1",
+                        name="ash_diagnostic_echo",
+                        arguments={"value": "ASH_TOOL_OK"},
+                    )
+                ]
+            ),
+            StreamChunk(is_done=True, stop_reason="tool_calls"),
+        ]
+    )
+    _install_probe_provider(monkeypatch, provider)
+
+    passed, error = await providers._probe_native_tool_protocol(
+        _provider_command_config(), _provider_verification(), timeout=1.0
+    )
+
+    assert passed is True
+    assert error is None
+    assert provider.closed is True
+    assert provider.max_tokens == providers.PROVIDER_NATIVE_TOOL_TEST_MAX_TOKENS
+    assert len(provider.tools) == 1
+    assert provider.tools[0]["function"]["name"] == "ash_diagnostic_echo"
+    assert provider.tools[0]["function"]["parameters"]["required"] == ["value"]
+    assert len(provider.messages) == 1
+
+
+@pytest.mark.parametrize(
+    ("chunks", "error_fragment"),
+    [
+        (
+            [StreamChunk(content='<tool_call name="ash_diagnostic_echo">'), StreamChunk(is_done=True)],
+            "did not return the requested native diagnostic tool call",
+        ),
+        (
+            [StreamChunk(tool_call_delta="<call_tool name='ash_diagnostic_echo'>")],
+            "text/XML instead of native tool calls",
+        ),
+        (
+            [
+                StreamChunk(
+                    native_tool_calls=[
+                        CanonicalToolCall(
+                            call_id="wrong",
+                            name="ash_diagnostic_echo",
+                            arguments={"value": "WRONG"},
+                        )
+                    ]
+                ),
+                StreamChunk(is_done=True, stop_reason="tool_calls"),
+            ],
+            "did not return the requested native diagnostic tool call",
+        ),
+        (
+            [StreamChunk(content="just text")],
+            "before a terminal completion",
+        ),
+        (
+            [StreamChunk(is_done=True, stop_reason="length")],
+            "did not finish normally",
+        ),
+        (
+            [StreamChunk(content="X" * 4097), StreamChunk(is_done=True)],
+            "response was too large",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_native_tool_probe_refuses_unverified_streams(
+    monkeypatch, chunks: list[StreamChunk], error_fragment: str
+) -> None:
+    from ash.commands import providers
+
+    provider = _ScriptedProbeProvider(chunks=chunks)
+    _install_probe_provider(monkeypatch, provider)
+
+    passed, error = await providers._probe_native_tool_protocol(
+        _provider_command_config(), _provider_verification(), timeout=1.0
+    )
+    assert passed is False
+    assert error_fragment in (error or "")
+    assert provider.closed is True
+
+
+def test_native_tool_probe_timeout_and_cleanup(monkeypatch) -> None:
+    from ash.commands import providers
+
+    provider = _ScriptedProbeProvider(delay=0.1)
+    _install_probe_provider(monkeypatch, provider)
+    result = asyncio.run(
+        providers._probe_native_tool_protocol(
+            _provider_command_config(), _provider_verification(), timeout=0.01
+        )
+    )
+    assert result == (False, "provider native tool probe timed out")
+    assert provider.closed is True
+
+
+def test_native_tool_probe_error_redacts_provider_credential(monkeypatch) -> None:
+    from ash.commands import providers
+
+    provider = _ScriptedProbeProvider(error=RuntimeError("failed secret-value"))
+    _install_probe_provider(monkeypatch, provider)
+    passed, error = asyncio.run(
+        providers._probe_native_tool_protocol(
+            _provider_command_config(), _provider_verification(), timeout=1.0
+        )
+    )
+    assert passed is False
+    assert error == "failed [REDACTED]"
+    assert provider.closed is True
+
+
+def test_provider_native_tool_probe_is_explicit_and_gates_requested_result(monkeypatch) -> None:
+    from ash.commands import providers
+
+    config = _provider_command_config()
+    config.model = "vllm/test-model"
+    connection = ProviderConnection(
+        provider="vllm",
+        model_name="test-model",
+        base_url="http://localhost:8000/v1",
+        catalog_endpoint="http://localhost:8000/v1/models",
+        catalog_format="openai",
+        auth_mode="none",
+    )
+    verification = ProviderVerification(
+        connection=connection,
+        models=("test-model",),
+        selected_model_available=True,
+    )
+    monkeypatch.setattr(
+        providers, "verify_provider_connection", lambda _config, *, timeout: verification
+    )
+    providers_built: list[_ScriptedProbeProvider] = []
+
+    class Registry:
+        def build(self, _config):
+            probe = _ScriptedProbeProvider(
+                chunks=[
+                    StreamChunk(content="OK"),
+                    StreamChunk(is_done=True, stop_reason="stop"),
+                ]
+            )
+            providers_built.append(probe)
+            return probe
+
+    monkeypatch.setattr("ash.providers.registry.get_provider_registry", lambda: Registry())
+    result = providers.test_provider(config, tools=True, timeout=1.0)
+
+    assert len(providers_built) == 2
+    assert result.ready_to_use is True
+    assert result.native_tool_probe_attempted is True
+    assert result.native_tool_probe_verified is False
+    assert result.requested_checks_passed is False
+    assert providers.provider_test_payload(result)["ok"] is False
+    assert "native tool calling was not verified" in providers.render_provider_test(result)
+
+
+def test_native_tool_probe_rejected_for_nonlocal_provider_before_network(monkeypatch) -> None:
+    from ash.commands import providers
+
+    monkeypatch.setattr(
+        providers,
+        "verify_provider_connection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("should not probe the network")
+        ),
+    )
+    with pytest.raises(ValueError, match="only for vllm and lmstudio"):
+        providers.test_provider(_provider_command_config(), tools=True)
+
+
 def test_provider_test_skips_completion_when_selected_model_is_missing(
     monkeypatch,
 ) -> None:
@@ -760,7 +940,7 @@ def test_main_provider_test_exit_requires_verified_completion(
     monkeypatch.setattr(
         providers,
         "test_provider",
-        lambda _config, *, model=None, timeout=10.0: verification,
+        lambda _config, *, model=None, timeout=10.0, tools=False: verification,
     )
 
     assert cli.main(["providers", "test", "--json"]) == expected_exit

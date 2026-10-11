@@ -137,6 +137,10 @@ This table describes implemented route families, not blanket conformance for
 every model/version exposed by each catalog. `ash providers test` verifies one
 selected route with a bounded real completion; richer tool, vision, reasoning,
 and provider-version behavior remains capability- and model-specific.
+For LM Studio and vLLM, `ash providers test --tools --timeout 120` additionally
+checks whether the selected model/server returns one correctly structured native
+tool call. This opt-in probe never executes the synthetic tool and does not
+enable native tools automatically; slow local models may need a longer timeout.
 
 The provider layer also provides:
 

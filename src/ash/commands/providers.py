@@ -30,8 +30,26 @@ if TYPE_CHECKING:
 
 
 PROVIDER_TEST_MAX_TOKENS = 8
+PROVIDER_NATIVE_TOOL_TEST_MAX_TOKENS = 128
 MAX_PROVIDER_TEST_RESPONSE_CHARS = 4096
 _PROVIDER_TEST_PROMPT = "Reply with exactly OK."
+_NATIVE_PROBE_TOOL_NAME = "ash_diagnostic_echo"
+_NATIVE_PROBE_VALUE = "ASH_TOOL_OK"
+_NATIVE_PROBE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": _NATIVE_PROBE_TOOL_NAME,
+            "description": "A harmless diagnostic echo. No action will be executed.",
+            "parameters": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
 
 
 async def verify_provider_catalog(
@@ -182,7 +200,10 @@ def provider_test_payload(verification: ProviderVerification) -> dict[str, Any]:
         "completion_attempted": verification.completion_attempted,
         "completion_verified": verification.completion_verified,
         "completion_error": verification.completion_error,
-        "ok": verification.ready_to_use,
+        "native_tool_probe_attempted": verification.native_tool_probe_attempted,
+        "native_tool_probe_verified": verification.native_tool_probe_verified,
+        "native_tool_probe_error": verification.native_tool_probe_error,
+        "ok": verification.requested_checks_passed,
     }
 
 
@@ -204,6 +225,13 @@ def render_provider_test(
         completion = "failed: " + terminal_safe_text(detail, single_line=True)
     else:
         completion = "not attempted"
+    if verification.native_tool_probe_verified:
+        tool_probe = "verified (no tool executed)"
+    elif verification.native_tool_probe_attempted:
+        detail = verification.native_tool_probe_error or "no valid tool call returned"
+        tool_probe = "failed: " + terminal_safe_text(detail, single_line=True)
+    else:
+        tool_probe = "not attempted"
     return "\n".join(
         [
             "Provider: "
@@ -230,8 +258,11 @@ def render_provider_test(
                 )
             ),
             f"Completion: {completion}",
+            f"Native tool protocol: {tool_probe}",
             (
                 "Result: ready to use"
+                if verification.requested_checks_passed
+                else "Result: completion works, but native tool calling was not verified"
                 if verification.ready_to_use
                 else "Result: endpoint is reachable, but the selected model is unavailable"
                 if (
@@ -396,11 +427,108 @@ async def _probe_provider_completion(
     return verified, error
 
 
+async def _probe_native_tool_protocol(
+    config: "AshConfig",
+    verification: ProviderVerification,
+    *,
+    timeout: float,
+) -> tuple[bool, str | None]:
+    """Verify native tool-call encoding, without registering or running a tool."""
+
+    from ash.providers.registry import get_provider_registry
+
+    provider = None
+    verified = False
+    error: str | None = None
+    primary_cancellation: asyncio.CancelledError | None = None
+    try:
+        provider = get_provider_registry().build(config)
+        provider.configure_max_tokens(PROVIDER_NATIVE_TOOL_TEST_MAX_TOKENS)
+        calls = []
+        response_chars = 0
+        saw_terminal = False
+        terminal_stop_reason: str | None = None
+        async with asyncio.timeout(timeout):
+            async for chunk in provider.stream_chat(
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Call ash_diagnostic_echo once with value ASH_TOOL_OK. "
+                            "Do not answer in text. This is a no-side-effect diagnostic."
+                        ),
+                    }
+                ],
+                temperature=0.0,
+                tools=_NATIVE_PROBE_TOOLS,
+            ):
+                has_output = bool(
+                    chunk.content or chunk.tool_call_delta or chunk.native_tool_calls
+                )
+                if saw_terminal and has_output:
+                    raise RuntimeError("provider emitted output after its terminal completion")
+                if chunk.tool_call_delta:
+                    raise RuntimeError("provider returned text/XML instead of native tool calls")
+                response_chars += len(chunk.content)
+                if response_chars > MAX_PROVIDER_TEST_RESPONSE_CHARS:
+                    raise RuntimeError("provider native tool probe response was too large")
+                if chunk.native_tool_calls:
+                    calls.extend(chunk.native_tool_calls)
+                    if len(calls) > 1:
+                        raise RuntimeError("provider returned more than one diagnostic tool call")
+                if chunk.is_done:
+                    if not saw_terminal:
+                        saw_terminal = True
+                        terminal_stop_reason = chunk.stop_reason
+                    elif chunk.stop_reason is not None and (
+                        completion_stop_category(chunk.stop_reason)
+                        != completion_stop_category(terminal_stop_reason)
+                    ):
+                        raise RuntimeError("provider emitted conflicting terminal stop reasons")
+
+        if not saw_terminal:
+            raise RuntimeError("provider stream ended before a terminal completion")
+        if completion_stop_category(terminal_stop_reason) is not CompletionStopCategory.COMPLETE:
+            raise RuntimeError("provider native tool probe did not finish normally")
+        if len(calls) != 1 or calls[0].name != _NATIVE_PROBE_TOOL_NAME or (
+            calls[0].arguments != {"value": _NATIVE_PROBE_VALUE}
+        ):
+            raise RuntimeError("provider did not return the requested native diagnostic tool call")
+        verified = True
+    except asyncio.CancelledError as cancellation:
+        primary_cancellation = cancellation
+        raise
+    except TimeoutError:
+        error = "provider native tool probe timed out"
+    except Exception as exc:  # noqa: BLE001 - probe errors become diagnostic evidence
+        error = _redact_completion_error(exc, verification)
+    finally:
+        if provider is not None:
+            cleanup_error, cleanup_interrupted = await _settle_probe_provider_close(provider)
+            if cleanup_error is not None:
+                cleanup_text = _redact_completion_error(cleanup_error, verification)
+                if primary_cancellation is not None:
+                    primary_cancellation.add_note(
+                        "native tool probe cleanup failed: " + cleanup_text
+                    )
+                elif isinstance(cleanup_error, asyncio.CancelledError):
+                    raise cleanup_error
+                else:
+                    verified = False
+                    error = (error + "; " if error else "") + (
+                        "provider native tool probe cleanup failed: " + cleanup_text
+                    )
+            if cleanup_interrupted and primary_cancellation is None:
+                raise asyncio.CancelledError() from cleanup_error
+    return verified, error
+
+
 def test_provider(
     config: "AshConfig",
     *,
     model: str | None = None,
     timeout: float = 10.0,
+    tools: bool = False,
 ) -> ProviderVerification:
     """Verify one route, optionally overriding the active model for the probe."""
 
@@ -414,6 +542,8 @@ def test_provider(
     from ash.providers.identifiers import parse_model_string
 
     provider_name, _model_name = parse_model_string(test_config.model)
+    if tools and provider_name not in {"vllm", "lmstudio"}:
+        raise ValueError("--tools is supported only for vllm and lmstudio local routes")
     if provider_name in {"vertex", "bedrock", "azure"}:
         connection = resolve_provider_connection(test_config)
         verification = ProviderVerification(
@@ -438,11 +568,22 @@ def test_provider(
             timeout=timeout,
         )
     )
-    return replace(
+    verification = replace(
         verification,
         completion_attempted=True,
         completion_verified=completion_verified,
         completion_error=completion_error,
+    )
+    if not tools or not completion_verified:
+        return verification
+    native_verified, native_error = asyncio.run(
+        _probe_native_tool_protocol(test_config, verification, timeout=timeout)
+    )
+    return replace(
+        verification,
+        native_tool_probe_attempted=True,
+        native_tool_probe_verified=native_verified,
+        native_tool_probe_error=native_error,
     )
 
 

@@ -3055,6 +3055,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
     )
     providers_test.add_argument("--json", action="store_true")
     providers_test.add_argument("--timeout", type=float, default=10.0)
+    providers_test.add_argument(
+        "--tools",
+        action="store_true",
+        help="Also verify one harmless native tool call on a local vLLM or LM Studio model",
+    )
     auth_parser = subparsers.add_parser(
         "auth",
         help="Manage user-owned provider authentication sessions",
@@ -4240,12 +4245,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 config,
                 model=args.model,
                 timeout=args.timeout,
+                tools=args.tools,
             )
         except (ProviderConfigurationError, ProviderVerificationError, ValueError) as exc:
             print(provider_test_error(exc, json_output=args.json), file=sys.stderr)
             return 2
         print(render_provider_test(verification, json_output=args.json))
-        return 0 if verification.ready_to_use else 1
+        return 0 if verification.requested_checks_passed else 1
 
     if args.command == "doctor":
         from ash.commands.doctor import render_doctor, run_doctor

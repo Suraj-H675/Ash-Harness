@@ -124,6 +124,9 @@ class ProviderVerification:
     completion_attempted: bool = False
     completion_verified: bool = False
     completion_error: str | None = None
+    native_tool_probe_attempted: bool = False
+    native_tool_probe_verified: bool = False
+    native_tool_probe_error: str | None = None
 
     @property
     def ready_to_use(self) -> bool:
@@ -133,6 +136,12 @@ class ProviderVerification:
             self.selected_model_available if self.catalog_authoritative else True
         )
         return catalog_ready and self.completion_verified
+
+    @property
+    def requested_checks_passed(self) -> bool:
+        return self.ready_to_use and (
+            not self.native_tool_probe_attempted or self.native_tool_probe_verified
+        )
 
 
 @dataclass(frozen=True)

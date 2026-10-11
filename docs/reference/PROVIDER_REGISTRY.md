@@ -305,6 +305,12 @@ disabled unless the provider's catalog proves support; an explicit catalog
 denial still wins. These declarations do not activate a model or start its
 server, and unverified/native-tool-incompatible models should not opt in.
 Repository-controlled project configuration cannot set this user-owned field.
+Before opting in, use `ash providers test --tools --timeout 120` with a running
+LM Studio or vLLM server. It separately reports catalog discovery, normal
+completion, and a synthetic native tool-call check in text or `--json` output.
+The synthetic function is **never executed**, so a pass proves protocol
+encoding, not the safety or reliability of real tool execution. The check is
+opt-in, bounded, and does not change capabilities or saved configuration.
 Generic `openai-compatible` routes likewise require catalog
 evidence. Exact model IDs take precedence; provider aliases are accepted only
 when they map to exactly one catalog entry. Without a verified catalog claim

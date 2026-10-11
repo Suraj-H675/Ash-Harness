@@ -30,6 +30,116 @@ def _route_loopback_directly(environment: dict[str, str]) -> None:
 
 
 @pytest.mark.parametrize(
+    ("route", "native_reply"),
+    [("vllm", True), ("lmstudio", True), ("vllm", False)],
+)
+def test_provider_tool_protocol_diagnostic_uses_real_cli_without_dispatch(
+    tmp_path: Path, route: str, native_reply: bool
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+        def do_GET(self) -> None:
+            if self.path == "/api/v1/models":
+                catalog = {"models": [{"key": "local-model", "type": "llm"}]}
+            elif self.path == "/v1/models":
+                catalog = {"data": [{"id": "local-model"}]}
+            else:
+                self.send_error(404)
+                return
+            payload = json.dumps(catalog).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self) -> None:
+            if self.path != "/v1/chat/completions":
+                self.send_error(404)
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            request = json.loads(self.rfile.read(length))
+            requests.append(request)
+            if request.get("tools") and native_reply:
+                delta = {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "diagnostic-call",
+                        "type": "function",
+                        "function": {
+                            "name": "ash_diagnostic_echo",
+                            "arguments": '{"value":"ASH_TOOL_OK"}',
+                        },
+                    }]
+                }
+                reason = "tool_calls"
+            else:
+                delta = {"content": "OK"}
+                reason = "stop"
+            chunks = [
+                {"id": "diag", "object": "chat.completion.chunk", "created": 1,
+                 "model": "local-model", "choices": [{"index": 0, "delta": delta,
+                                                      "finish_reason": None}]},
+                {"id": "diag", "object": "chat.completion.chunk", "created": 1,
+                 "model": "local-model", "choices": [{"index": 0, "delta": {},
+                                                      "finish_reason": reason}]},
+            ]
+            body = ("".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
+                    + "data: [DONE]\n\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        workspace = tmp_path / "workspace"
+        home = tmp_path / "home"
+        workspace.mkdir()
+        home.mkdir()
+        environment = os.environ.copy()
+        environment.update({
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "ASH_MODEL": f"{route}/local-model",
+            f"{route.upper()}_API_BASE": f"http://127.0.0.1:{server.server_port}/v1",
+            "NO_COLOR": "1",
+        })
+        _route_loopback_directly(environment)
+        result = subprocess.run(
+            [sys.executable, "-m", "ash", "providers", "test", "--tools", "--json"],
+            cwd=workspace,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+        assert result.returncode == (0 if native_reply else 1), result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["completion_verified"] is True
+        assert payload["native_tool_probe_attempted"] is True
+        assert payload["native_tool_probe_verified"] is native_reply
+        assert payload["ok"] is native_reply
+        assert len(requests) == 2
+        assert "tools" not in requests[0]
+        assert requests[1]["tools"][0]["function"]["name"] == "ash_diagnostic_echo"
+        assert list(workspace.iterdir()) == []
+        assert all("Authorization" not in str(request) for request in requests)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
     ("provider", "base_env", "catalog_path"),
     [
         ("lmstudio", "LMSTUDIO_API_BASE", "/api/v1/models"),
