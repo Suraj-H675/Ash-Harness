@@ -384,7 +384,8 @@ def _recover_interrupted_turns_locked(
                 )
             )
 
-        for missing in store.assistant_tool_calls_missing_results(session_id, turn_id):
+        missing_calls = store.assistant_tool_calls_missing_results(session_id, turn_id)
+        for missing in missing_calls:
             call_id = str(missing["call_id"])
             if call_id in deferred_call_ids or call_id in pending_ids:
                 continue
@@ -496,6 +497,12 @@ def _recover_interrupted_turns_locked(
                 unresolved_files.append(path)
                 turn_unresolved.append(_relative_display(path, guard.project_root))
 
+        assistant_order = {
+            str(call["call_id"]): index for index, call in enumerate(missing_calls)
+        }
+        turn_recovered.sort(
+            key=lambda call: assistant_order.get(call.call_id, len(assistant_order))
+        )
         status = (
             "needs_attention"
             if turn_unknown or turn_unresolved

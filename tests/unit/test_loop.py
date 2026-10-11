@@ -8666,7 +8666,7 @@ async def test_read_only_tool_calls_run_concurrently_with_stable_order(tmp_path)
             active += 1
             max_active = max(max_active, active)
             try:
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(0.03 if kwargs["index"] == 0 else 0.005)
                 return ToolResult(success=True, output=f"result-{kwargs['index']}")
             finally:
                 active -= 1
@@ -8694,6 +8694,7 @@ async def test_read_only_tool_calls_run_concurrently_with_stable_order(tmp_path)
             for index in range(3)
         ],
         session,
+        persist_tool_messages=True,
     )
 
     assert max_active == 3
@@ -8701,6 +8702,13 @@ async def test_read_only_tool_calls_run_concurrently_with_stable_order(tmp_path)
         "result-0",
         "result-1",
         "result-2",
+    ]
+    saved_messages = [
+        message for message in store.load_session(session.session_id).messages
+        if message.role == "tool"
+    ]
+    assert [message.metadata["call_id"] for message in saved_messages] == [
+        "call-0", "call-1", "call-2"
     ]
 
 
@@ -8936,6 +8944,95 @@ async def test_parallel_read_only_calls_drain_siblings_on_parent_cancellation(
     records = store.load_session(session.session_id).tool_calls
     assert any(record.dispatched is True for record in records)
     assert sibling_finished.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed_index", [0, 1])
+async def test_parallel_completed_read_remains_known_after_sibling_cancellation(
+    tmp_path, completed_index: int,
+) -> None:
+    from ash.core.checkpoints import recover_interrupted_turns
+
+    read_finished = asyncio.Event()
+    sibling_started = asyncio.Event()
+
+    class PartiallyCompletedReadTool(BaseTool):
+        name = "test_slow_read"
+        args_schema = None
+        execution_contract = ToolExecutionContract(parallel_safe=True)
+
+        async def run(self, **kwargs):
+            if kwargs["index"] == completed_index:
+                read_finished.set()
+                return ToolResult(success=True, output="completed-read")
+            sibling_started.set()
+            await asyncio.Event().wait()
+
+    guard = SafetyGuard(project_root=tmp_path)
+    store = SessionStore(tmp_path / "parallel-completed-cancel.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"test_slow_read": PartiallyCompletedReadTool(guard)},
+        safety_tier="auto_approve",
+    )
+    calls = [
+        {
+            "call_id": f"read-{index}",
+            "name": "test_slow_read",
+            "arguments": {"index": index},
+        }
+        for index in range(2)
+    ]
+    try:
+        session = await loop.start_session()
+        turn_id = "parallel-interrupted"
+        loop.turn_context = TurnContext(session.session_id, turn_id)
+        store.start_turn(session.session_id, turn_id, "inspect")
+        store.save_message(
+            session.session_id,
+            Message(
+                role="assistant",
+                content="",
+                metadata={"tool_calls": calls},
+                timestamp=datetime.now(timezone.utc),
+            ),
+            turn_id=turn_id,
+        )
+        batch = asyncio.create_task(
+            loop._execute_tool_calls(calls, session, persist_tool_messages=True)
+        )
+        await asyncio.wait_for(read_finished.wait(), timeout=1)
+        await asyncio.wait_for(sibling_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        batch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await batch
+
+        durable = {call.call_id: call for call in store.load_session(session.session_id).tool_calls}
+        assert durable[f"read-{completed_index}"].result == "completed-read"
+        assert durable[f"read-{completed_index}"].executed is True
+        assert durable[f"read-{1 - completed_index}"].result is None
+
+        summary = recover_interrupted_turns(store, guard, session.session_id)
+        assert summary.interrupted_turns == 1
+        assert summary.unknown_calls == (
+            f"test_slow_read (read-{1 - completed_index})",
+        )
+        recovered = store.load_session(session.session_id)
+        tool_messages = [message for message in recovered.messages if message.role == "tool"]
+        assert [message.metadata["call_id"] for message in tool_messages] == [
+            "read-0", "read-1"
+        ]
+        assert '"success": true' in tool_messages[completed_index].content
+        assert "completed-read" in tool_messages[completed_index].content
+        assert store.recoverable_turns(session.session_id) == []
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
 
 
 @pytest.mark.asyncio

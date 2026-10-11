@@ -5498,7 +5498,7 @@ class AshLoop:
 
             async def execute_read_only(call: dict[str, Any]) -> list[dict[str, Any]]:
                 async with concurrency:
-                    return await self._execute_tool_calls(
+                    completed = await self._execute_tool_calls(
                         [call],
                         session,
                         tools_snapshot=tools_snapshot,
@@ -5506,6 +5506,24 @@ class AshLoop:
                             persist_tool_messages or _defer_terminal_persistence
                         ),
                     )
+                    if persist_tool_messages:
+                        # A sibling can stall or be cancelled after this read
+                        # finishes. Preserve the known outcome now, while
+                        # emitting model-visible tool messages in call order
+                        # once the whole batch settles. Startup recovery can
+                        # reconstruct a missing message without replaying it.
+                        for result in completed:
+                            record = result.get("_terminal_record")
+                            if isinstance(record, ToolCallRecord):
+                                self.session_store.save_tool_call(
+                                    session.session_id,
+                                    record,
+                                    turn_id=(
+                                        self.turn_context.turn_id
+                                        if self.turn_context else None
+                                    ),
+                                )
+                    return completed
 
             tasks = [
                 asyncio.create_task(execute_read_only(call)) for call in tool_calls
