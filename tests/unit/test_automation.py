@@ -4379,6 +4379,120 @@ async def test_worker_honors_cross_process_cancellation(
 
 
 @pytest.mark.asyncio
+async def test_scheduled_worker_settles_cancellation_while_operation_resists(
+    tmp_path: Path,
+    clock: list[float],
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    now = datetime.fromtimestamp(clock[0], tz=timezone.utc)
+    store.create_job(
+        name="cancel resistant scheduled run",
+        prompt="Wait until cleanup is released",
+        workspace=workspace,
+        schedule=build_schedule(every="10s", now=now),
+        timeout_seconds=30,
+    )
+    clock[0] += 10
+
+    class RepeatedCancellationResistantClient(_FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_seen = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def prompt(self, text: str, *, user_metadata=None) -> AshResult:
+            self.started.set()
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    self.cancel_seen.set()
+            return self.result
+
+    client = RepeatedCancellationResistantClient()
+
+    async def factory(config, root):
+        del config, root
+        return client
+
+    monkeypatch.setattr("ash.automation.worker.is_workspace_trusted", lambda path: True)
+    worker = AutomationWorkerService(
+        store,
+        workspace,
+        worker_id="scheduled-cancel-worker",
+        lease_seconds=5,
+        poll_seconds=0.1,
+        client_factory=factory,
+    )
+    cancellation_store = AutomationStore(store.db_path, clock=lambda: clock[0])
+    service_task = asyncio.create_task(worker.run_forever(once=True))
+
+    try:
+        await client.started.wait()
+        run_id = worker.active_run_ids[0]
+        requested = cancellation_store.request_cancel(run_id, workspace=workspace)
+        assert requested.cancel_requested is True
+        await asyncio.wait_for(client.cancel_seen.wait(), timeout=2)
+
+        summary = await asyncio.wait_for(asyncio.shield(service_task), timeout=2)
+
+        assert summary.interrupted == 1
+        assert store.get_run(run_id).status == "interrupted"
+        assert client.closed is False
+    finally:
+        client.release.set()
+        cancellation_store.close()
+        if not service_task.done():
+            await asyncio.wait_for(service_task, timeout=2)
+        await worker.aclose()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX SQLite file-lock regression")
+def test_closing_peer_store_does_not_invalidate_live_wal_writer(
+    tmp_path: Path,
+) -> None:
+    """Peer process closure must not unlink an active writer's WAL files."""
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    db_path = tmp_path / "automation.db"
+    with AutomationStore(db_path) as owner:
+        job = owner.create_job(
+            name="peer cancellation",
+            prompt="Wait",
+            workspace=workspace,
+            schedule=build_schedule(every="1h", now=datetime.now(timezone.utc)),
+            enabled=False,
+        )
+        lease = owner.claim_manual(
+            job.job_id, workspace=workspace, worker_id="owner", lease_seconds=60,
+        )
+        assert lease is not None
+        peer = subprocess.run(
+            [
+                sys.executable, "-c",
+                "from ash.automation.store import AutomationStore; import sys; "
+                "db = AutomationStore(sys.argv[1]); "
+                "db.request_cancel(sys.argv[2], workspace=sys.argv[3]); "
+                "db.close()",
+                str(db_path), lease.run.run_id, str(workspace),
+            ],
+            check=False, text=True, capture_output=True, timeout=10,
+        )
+        assert peer.returncode == 0, peer.stderr
+        assert owner.cancel_requested(lease.run.run_id, lease.token)
+        assert owner.finish_run(
+            lease.run.run_id, lease.token, status="cancelled",
+        ).status == "cancelled"
+        with AutomationStore(db_path) as observer:
+            observed = observer.get_run(lease.run.run_id)
+            assert observed is not None
+            assert observed.status == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_committed_cancellation_wins_over_immediate_success(
     tmp_path: Path,
     clock: list[float],

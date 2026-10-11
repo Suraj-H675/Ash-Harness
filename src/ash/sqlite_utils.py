@@ -19,6 +19,42 @@ class SQLitePathError(RuntimeError):
     """A SQLite path could not be bound to one stable local file identity."""
 
 
+def _restrict_existing_file(
+    directory: AnchoredDirectory,
+    name: str,
+    expected: os.stat_result,
+    *,
+    label: str,
+    mode: int = 0o600,
+) -> None:
+    """Restrict one pinned entry without opening another SQLite file descriptor."""
+
+    current = directory.stat(name)
+    if (
+        current is None
+        or not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        raise SQLitePathError(f"{label} storage identity changed: {directory.path / name}")
+    # Closing any extra descriptor for a SQLite file releases this process's
+    # POSIX locks, including locks owned by another live SQLite connection.
+    if stat.S_IMODE(current.st_mode) != mode:
+        try:
+            os.chmod(name, mode, dir_fd=directory.descriptor, follow_symlinks=False)
+        except (OSError, ValueError, NotImplementedError) as exc:
+            raise SQLitePathError(
+                f"cannot secure {label} {directory.path / name}: {exc}"
+            ) from exc
+    secured = directory.stat(name)
+    if (
+        secured is None
+        or not stat.S_ISREG(secured.st_mode)
+        or (secured.st_dev, secured.st_ino) != (expected.st_dev, expected.st_ino)
+        or stat.S_IMODE(secured.st_mode) != mode
+    ):
+        raise SQLitePathError(f"{label} storage changed: {directory.path / name}")
+
+
 def sqlite_wal_is_safe(
     version: tuple[int, ...] | None = None,
 ) -> bool:
@@ -122,27 +158,22 @@ class PinnedSQLiteDatabase:
                     )
                 if not stat.S_ISREG(metadata.st_mode):
                     raise SQLitePathError(f"{label} is not a regular file: {database}")
-                try:
-                    if descriptor < 0:
-                        descriptor = directory.open_file(
-                            database.name,
-                            os.O_RDWR,
-                            expected=metadata,
-                            expected_type=stat.S_IFREG,
-                        )
-                    if hasattr(os, "fchmod"):
+                if created:
+                    try:
                         os.fchmod(descriptor, 0o600)
-                    opened = os.fstat(descriptor)
-                    if (
-                        opened.st_dev != metadata.st_dev
-                        or opened.st_ino != metadata.st_ino
-                    ):
-                        raise SQLitePathError(
-                            f"{label} changed while it was being opened: {database}"
-                        )
-                finally:
-                    if descriptor >= 0:
+                        opened = os.fstat(descriptor)
+                        if (opened.st_dev, opened.st_ino) != (
+                            metadata.st_dev, metadata.st_ino
+                        ):
+                            raise SQLitePathError(
+                                f"{label} changed while it was being created: {database}"
+                            )
+                    finally:
                         os.close(descriptor)
+                else:
+                    _restrict_existing_file(
+                        directory, database.name, metadata, label=label,
+                    )
                 directory.validation_path()
                 if created:
                     directory.sync()
@@ -280,18 +311,6 @@ class PinnedSQLiteDatabase:
                     raise SQLitePathError(
                         f"{label} storage is not a regular file: {directory.path / name}"
                     )
-                descriptor = directory.open_file(
-                    name,
-                    os.O_RDWR,
-                    expected=metadata,
-                    expected_type=stat.S_IFREG,
+                _restrict_existing_file(
+                    directory, name, metadata, label=label, mode=mode,
                 )
-                try:
-                    os.fchmod(descriptor, mode)
-                    if not directory.same_entry(name, descriptor):
-                        raise SQLitePathError(
-                            f"{label} storage changed while securing permissions: "
-                            f"{directory.path / name}"
-                        )
-                finally:
-                    os.close(descriptor)

@@ -933,6 +933,8 @@ class AutomationWorkerService:
                         monitor_error = monitor_task.exception()
                         if monitor_error is not None:
                             raise monitor_error
+                        if not operation_task.done():
+                            raise asyncio.CancelledError
                     result = await operation_task
                     operation_settled = True
             except TimeoutError:
