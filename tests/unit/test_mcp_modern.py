@@ -333,6 +333,53 @@ async def test_modern_task_persistence_failure_requests_cancellation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resumed_task_save_failure_preserves_remote_task() -> None:
+    client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {"extensions": {"io.modelcontextprotocol/tasks": {}}}
+    task_id = "existing-durable-task"
+    initial = {
+        "taskId": task_id,
+        "status": "working",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": 60_000,
+        "pollIntervalMs": 0,
+    }
+    methods: list[str] = []
+
+    async def request(method: str, params: dict, **kwargs: Any) -> dict:
+        del kwargs
+        assert params == {"taskId": task_id}
+        methods.append(method)
+        assert method == "tasks/get", "recovery must not cancel or replay the task"
+        if len(methods) == 1:
+            return initial
+        return {
+            **initial,
+            "status": "completed",
+            "lastUpdatedAt": "2026-09-20T00:00:02Z",
+            "result": {"content": [{"type": "text", "text": "completed remotely"}]},
+        }
+
+    client.request = request  # type: ignore[method-assign]
+
+    async def failed_save(task: dict[str, Any], answered: dict[str, str]) -> None:
+        del task, answered
+        raise OSError("local database unavailable")
+
+    with pytest.raises(MCPProtocolError, match="could not be persisted"):
+        await client.resume_modern_task(
+            initial, {}, state_callback=failed_save, timeout=1
+        )
+    assert methods == ["tasks/get"]
+
+    result = await client.resume_modern_task(initial, {}, timeout=1)
+    assert result["content"][0]["text"] == "completed remotely"
+    assert methods == ["tasks/get", "tasks/get"]
+
+
+@pytest.mark.asyncio
 async def test_resume_modern_task_uses_task_id_without_replaying_tool_call() -> None:
     client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
     client.protocol_version = "2026-07-28"

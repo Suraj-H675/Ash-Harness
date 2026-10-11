@@ -3090,6 +3090,7 @@ class MCPClient:
         allow_new_input_requests: bool = True,
         cancel_on_timeout: bool = True,
         cancel_on_cancellation: bool = True,
+        cancel_on_persistence_failure: bool = True,
     ) -> dict[str, Any]:
         """Drive one server-directed 2026-07-28 task to a terminal result."""
 
@@ -3109,6 +3110,7 @@ class MCPClient:
             state_callback,
             task,
             answered_inputs,
+            cancel_on_failure=cancel_on_persistence_failure,
         )
         subscription_started = task["status"] in {"working", "input_required"}
         if subscription_started:
@@ -3170,6 +3172,7 @@ class MCPClient:
                             state_callback,
                             task,
                             answered_inputs,
+                            cancel_on_failure=cancel_on_persistence_failure,
                         )
 
                 remaining = deadline - loop.time()
@@ -3207,6 +3210,7 @@ class MCPClient:
                         state_callback,
                         task,
                         answered_inputs,
+                        cancel_on_failure=cancel_on_persistence_failure,
                     )
                     continue
                 if loop.time() >= deadline:
@@ -3225,6 +3229,7 @@ class MCPClient:
                     state_callback,
                     task,
                     answered_inputs,
+                    cancel_on_failure=cancel_on_persistence_failure,
                 )
 
             if task["status"] == "completed":
@@ -3320,6 +3325,7 @@ class MCPClient:
             allow_new_input_requests=False,
             cancel_on_timeout=cancel_on_timeout,
             cancel_on_cancellation=cancel_on_cancellation,
+            cancel_on_persistence_failure=False,
         )
 
     async def _persist_modern_task_state(
@@ -3327,15 +3333,21 @@ class MCPClient:
         callback: ModernTaskStateCallback | None,
         task: dict[str, Any],
         answered_inputs: dict[str, str],
+        *,
+        cancel_on_failure: bool = True,
     ) -> None:
         if callback is None:
             return
         try:
             await callback(dict(task), dict(answered_inputs))
         except Exception as exc:
-            await self._cancel_mcp_task(task["taskId"])
+            if cancel_on_failure:
+                await self._cancel_mcp_task(task["taskId"])
+                detail = "cancellation was requested"
+            else:
+                detail = "existing remote task was preserved"
             raise MCPProtocolError(
-                "MCP task state could not be persisted; cancellation was requested"
+                f"MCP task state could not be persisted; {detail}"
             ) from exc
 
     async def _cancel_mcp_task(self, task_id: str) -> None:

@@ -13,7 +13,7 @@ import pytest
 
 from ash.core.loop import AshLoop
 from ash.core.secret_middleware import SecretRedactionMiddleware
-from ash.core.session import SessionStore, ToolCallRecord
+from ash.core.session import SessionStore, ToolCallRecord, get_db_connection
 from ash.mcp import client as mcp_client_module
 from ash.mcp.client import (
     MCPClient,
@@ -2516,6 +2516,127 @@ async def test_loop_preserves_deferred_mcp_task_until_server_returns(
             and "eventually recovered" in message.content
             for message in recovered.messages
         )
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_recovery_database_failure_does_not_cancel_remote_task(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id, call_id, task_id = "resume-turn", "resume-call", "remote-task"
+    server_config = MCPServerConfig(name="server", command="fake", args=[], env={})
+    client = MCPClient(server_config)
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {"extensions": {"io.modelcontextprotocol/tasks": {}}}
+    guard = SafetyGuard(tmp_path)
+    tool = MCPTool(
+        guard,
+        client=client,
+        server_name="server",
+        definition={
+            "name": "long",
+            "description": "Durable remote task",
+            "inputSchema": {"type": "object", "additionalProperties": False},
+        },
+        protocol_version="2026-07-28",
+    )
+    initial_task = {
+        "taskId": task_id,
+        "status": "working",
+        "createdAt": "2026-09-20T00:00:00Z",
+        "lastUpdatedAt": "2026-09-20T00:00:01Z",
+        "ttlMs": 60_000,
+        "pollIntervalMs": 0,
+    }
+    store.start_turn(session.session_id, turn_id, "run remote tool")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name=tool.name,
+            arguments={},
+            approved=True,
+            executed=False,
+            dispatched=True,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.save_mcp_task(
+        task_id=task_id,
+        session_id=session.session_id,
+        turn_id=turn_id,
+        call_id=call_id,
+        server_name="server",
+        remote_tool_name="long",
+        contract_fingerprint=tool.contract_fingerprint(),
+        server_fingerprint=mcp_server_fingerprint(server_config, {}),
+        protocol_version="2026-07-28",
+        task=initial_task,
+        answered_inputs={},
+    )
+    methods: list[str] = []
+
+    async def request(method: str, params: dict, **kwargs: Any) -> dict:
+        del kwargs
+        methods.append(method)
+        assert method == "tasks/get" and params == {"taskId": task_id}
+        if len(methods) == 1:
+            return initial_task
+        return {
+            **initial_task,
+            "status": "completed",
+            "lastUpdatedAt": "2026-09-20T00:00:02Z",
+            "result": {"content": [{"type": "text", "text": "recovered"}]},
+        }
+
+    client.request = request  # type: ignore[method-assign]
+    runtime = MCPRuntime({}, guard)
+    runtime.clients["server"] = client
+    loop = AshLoop(
+        session_store=store,
+        provider=IdleProvider(),
+        safety_guard=guard,
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+    loop._mcp_runtime = runtime
+    loop.tools[tool.name] = tool
+    try:
+        with get_db_connection(store.db_path) as conn:
+            conn.executescript(
+                "CREATE TRIGGER fail_task_state BEFORE UPDATE ON mcp_tasks BEGIN "
+                "SELECT RAISE(ABORT, 'injected task-state write failure'); END;"
+            )
+        with pytest.raises(RuntimeError, match="waiting for durable MCP task recovery"):
+            await loop.start_session(session.session_id)
+
+        assert methods == ["tasks/get"]
+        assert len(store.list_mcp_tasks(session.session_id)) == 1
+        pending = store.tool_call_for_recovery(session.session_id, turn_id, call_id)
+        assert pending is not None and pending["executed"] == 0
+        assert pending["error"] is None
+
+        with get_db_connection(store.db_path) as conn:
+            conn.execute("DROP TRIGGER fail_task_state")
+        resumed = await loop.start_session(session.session_id)
+        assert methods == ["tasks/get", "tasks/get"]
+        assert store.list_mcp_tasks(session.session_id) == []
+        assert (
+            len(
+                [
+                    m
+                    for m in resumed.messages
+                    if m.role == "tool" and m.metadata.get("call_id") == call_id
+                ]
+            )
+            == 1
+        )
+        assert store.verify_audit_log(session.session_id) == []
+        assert len(store.list_audit_logs(session.session_id)) == 1
     finally:
         await loop.aclose()
 
