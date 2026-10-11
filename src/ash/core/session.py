@@ -4524,10 +4524,56 @@ class SessionStore:
         message: Message,
         *,
         turn_id: str | None = None,
-    ) -> None:
-        """Atomically persist a terminal tool outcome and model-visible result."""
+    ) -> bool:
+        """Atomically finalize a tool once; identical retries are no-ops."""
+
+        if message.role != "tool" or message.metadata.get("call_id") != record.call_id:
+            raise SessionStorageError("conflicting terminal tool message identity")
 
         with closing(self._connect()) as conn, conn:
+            # Acquire the writer lock before checking the call ID: two callers
+            # must not both observe an absent terminal message and insert it.
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT tool_name, arguments_json, approved, executed, dispatched, "
+                "result, error, turn_id FROM tool_calls "
+                "WHERE session_id = ? AND call_id = ?",
+                (session_id, record.call_id),
+            ).fetchone()
+            terminal_messages = conn.execute(
+                "SELECT content, metadata_json, turn_id FROM messages "
+                "WHERE session_id = ? AND role = 'tool' "
+                "AND json_extract(metadata_json, '$.call_id') = ?",
+                (session_id, record.call_id),
+            ).fetchall()
+            if existing is not None and (
+                existing["tool_name"] != record.tool_name
+                or json.loads(existing["arguments_json"]) != record.arguments
+                or (turn_id is not None and existing["turn_id"] != turn_id)
+            ):
+                raise SessionStorageError("conflicting terminal tool call retry")
+            if existing is not None and (
+                existing["result"] is not None or existing["error"] is not None
+            ):
+                if (
+                    bool(existing["approved"]) != record.approved
+                    or bool(existing["executed"]) != record.executed
+                    or bool(existing["dispatched"]) != record.dispatched
+                    or existing["result"] != record.result
+                    or existing["error"] != record.error
+                ):
+                    raise SessionStorageError("conflicting terminal tool call retry")
+            if terminal_messages:
+                if (
+                    len(terminal_messages) != 1
+                    or existing is None
+                    or terminal_messages[0]["content"] != message.content
+                    or json.loads(terminal_messages[0]["metadata_json"])
+                    != message.metadata
+                    or (turn_id is not None and terminal_messages[0]["turn_id"] != turn_id)
+                ):
+                    raise SessionStorageError("conflicting terminal tool message retry")
+                return False
             conn.execute(
                 """
                 INSERT INTO tool_calls (
@@ -4594,6 +4640,7 @@ class SessionStore:
                 "DELETE FROM mcp_tasks WHERE session_id = ? AND call_id = ?",
                 (session_id, record.call_id),
             )
+            return True
 
     def save_mcp_task(
         self,

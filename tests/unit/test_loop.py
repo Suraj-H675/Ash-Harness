@@ -5080,6 +5080,54 @@ async def test_tool_result_message_failure_rolls_back_terminal_tool_state(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_retried_terminal_persistence_keeps_one_in_memory_tool_message(
+    tmp_path,
+) -> None:
+    store = SessionStore(tmp_path / "retry-terminal.db")
+    loop = AshLoop(store, MockProvider(), SafetyGuard(tmp_path), EventUI(), tmp_path)
+    try:
+        session = await loop.start_session()
+        loop.turn_context = TurnContext(session.session_id, "retry-turn")
+        store.start_turn(session.session_id, "retry-turn", "test retry")
+        call = {"call_id": "retry-call", "name": "read_file", "arguments": {}}
+        record = ToolCallRecord(
+            call_id="retry-call",
+            tool_name="read_file",
+            arguments={},
+            approved=True,
+            executed=True,
+            dispatched=True,
+            result="known result",
+            timestamp=datetime.now(timezone.utc),
+        )
+        for _ in range(2):
+            result = loop._tool_result_payload(
+                {"success": True, "output": "known result", "error": None},
+                record,
+                defer_terminal_persistence=True,
+            )
+            loop._persist_deferred_tool_result(
+                session=session, call=call, result=result
+            )
+        assert (
+            len([message for message in session.messages if message.role == "tool"])
+            == 1
+        )
+        assert (
+            len(
+                [
+                    message
+                    for message in store.load_session(session.session_id).messages
+                    if message.role == "tool"
+                ]
+            )
+            == 1
+        )
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_denied_tool_result_failure_recovers_orphan_without_execution(tmp_path):
     provider = NativeToolProvider()
     tool = CaptureTool(SafetyGuard(project_root=tmp_path))

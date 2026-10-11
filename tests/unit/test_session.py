@@ -26,6 +26,164 @@ from ash.core.session import (
 from ash.sqlite_utils import preferred_sqlite_journal_mode
 
 
+def test_terminal_tool_persistence_retry_is_idempotent_and_conflicts_are_rejected(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "tool-retry.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-retry"
+    store.start_turn(session.session_id, turn_id, "perform tool call")
+    timestamp = datetime.now(timezone.utc)
+    record = ToolCallRecord(
+        call_id="call-retry",
+        tool_name="run_command",
+        arguments={"command_line": "echo hello"},
+        approved=True,
+        executed=True,
+        dispatched=True,
+        result="hello",
+        error=None,
+        timestamp=timestamp,
+    )
+    message = Message(
+        role="tool",
+        content='{"success":true,"output":"hello"}',
+        timestamp=timestamp,
+        metadata={"call_id": record.call_id},
+    )
+    created = store.finalize_tool_call_with_message(
+        session.session_id, record, message, turn_id=turn_id
+    )
+    retried = store.finalize_tool_call_with_message(
+        session.session_id, record, message, turn_id=turn_id
+    )
+    loaded = store.load_session(session.session_id)
+    assert len(loaded.tool_calls) == 1
+    assert [m.metadata.get("call_id") for m in loaded.messages if m.role == "tool"] == [
+        record.call_id
+    ]
+    assert created is True
+    assert retried is False
+
+    with pytest.raises(SessionStorageError, match="conflicting terminal tool"):
+        store.finalize_tool_call_with_message(
+            session.session_id,
+            record.model_copy(update={"result": "different"}),
+            message.model_copy(update={"content": "different"}),
+            turn_id=turn_id,
+        )
+    preserved = store.load_session(session.session_id)
+    assert preserved.tool_calls[0].result == "hello"
+    assert len([m for m in preserved.messages if m.role == "tool"]) == 1
+
+
+def test_terminal_tool_persistence_can_retry_after_transaction_rollback(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "tool-atomic-retry.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-atomic-retry"
+    store.start_turn(session.session_id, turn_id, "retry")
+    stamp = datetime.now(timezone.utc)
+    record = ToolCallRecord(
+        call_id="retry-call",
+        tool_name="run_command",
+        arguments={"command_line": "echo ok"},
+        approved=True,
+        executed=True,
+        dispatched=True,
+        result="ok",
+        timestamp=stamp,
+    )
+    message = Message(
+        role="tool",
+        content='{"success":true,"output":"ok"}',
+        timestamp=stamp,
+        metadata={"call_id": record.call_id},
+    )
+    with get_db_connection(store.db_path) as conn:
+        conn.executescript(
+            "CREATE TRIGGER fail_terminal_message BEFORE INSERT ON messages "
+            "WHEN NEW.role = 'tool' BEGIN "
+            "SELECT RAISE(ABORT, 'injected terminal message failure'); END;"
+        )
+    with pytest.raises(
+        sqlite3.IntegrityError, match="injected terminal message failure"
+    ):
+        store.finalize_tool_call_with_message(
+            session.session_id, record, message, turn_id=turn_id
+        )
+    failed = store.load_session(session.session_id)
+    assert failed.tool_calls == []
+    assert [item for item in failed.messages if item.role == "tool"] == []
+    with get_db_connection(store.db_path) as conn:
+        conn.execute("DROP TRIGGER fail_terminal_message")
+    assert (
+        store.finalize_tool_call_with_message(
+            session.session_id, record, message, turn_id=turn_id
+        )
+        is True
+    )
+    assert (
+        store.finalize_tool_call_with_message(
+            session.session_id, record, message, turn_id=turn_id
+        )
+        is False
+    )
+    restored = store.load_session(session.session_id)
+    assert len(restored.tool_calls) == 1
+    assert len([item for item in restored.messages if item.role == "tool"]) == 1
+
+
+def test_terminal_tool_persistence_completes_existing_durable_result(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "tool-terminal-no-message.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-partial"
+    store.start_turn(session.session_id, turn_id, "parallel read")
+    stamp = datetime.now(timezone.utc)
+    record = ToolCallRecord(
+        call_id="partial-call",
+        tool_name="read_file",
+        arguments={"file_path": "safe.txt"},
+        approved=True,
+        executed=True,
+        dispatched=True,
+        result="contents",
+        timestamp=stamp,
+    )
+    store.save_tool_call(session.session_id, record, turn_id=turn_id)
+    message = Message(
+        role="tool",
+        content='{"success":true,"output":"contents"}',
+        timestamp=stamp,
+        metadata={"call_id": record.call_id},
+    )
+    assert (
+        store.finalize_tool_call_with_message(
+            session.session_id, record, message, turn_id=turn_id
+        )
+        is True
+    )
+    assert (
+        store.finalize_tool_call_with_message(
+            session.session_id, record, message, turn_id=turn_id
+        )
+        is False
+    )
+    assert (
+        len(
+            [
+                item
+                for item in store.load_session(session.session_id).messages
+                if item.role == "tool"
+            ]
+        )
+        == 1
+    )
+
+
 def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
     db_path = tmp_path / "session_store.db"
     store = SessionStore(db_path)

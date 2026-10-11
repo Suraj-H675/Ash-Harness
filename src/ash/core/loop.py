@@ -6206,14 +6206,15 @@ class AshLoop:
             timestamp=_utc_now(),
             metadata={"call_id": call["call_id"]},
         )
-        self.session_store.finalize_tool_call_with_message(
+        created = self.session_store.finalize_tool_call_with_message(
             session.session_id,
             record,
             tool_message,
             turn_id=self.turn_context.turn_id if self.turn_context else None,
         )
         result.pop("_terminal_record", None)
-        session.messages.append(tool_message)
+        if created:
+            session.messages.append(tool_message)
 
     def _remember_repo_file(self, path: Path) -> None:
         """Keep a bounded least-recently-used list of files relevant to context."""
