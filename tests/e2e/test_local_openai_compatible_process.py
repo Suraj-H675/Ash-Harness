@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from ash.core.session import SessionStore
+
 
 def _route_loopback_directly(environment: dict[str, str]) -> None:
     """Keep host proxy settings from intercepting the fake local provider."""
@@ -202,7 +204,34 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
     base_env: str,
     native_tools: bool,
 ) -> None:
+    """Exercise failing test feedback, repair, and verification through a real CLI."""
     requests: list[dict[str, object]] = []
+    actions: list[tuple[str, dict[str, object]]] = [
+        (
+            "write_file",
+            {"file_path": "local_agent.txt", "content": "BROKEN\n", "overwrite": False},
+        ),
+        (
+            "run_command",
+            {
+                "command_line": "python3 -B test_local_agent.py",
+                "cwd": ".",
+                "timeout_seconds": 10,
+            },
+        ),
+        (
+            "write_file",
+            {"file_path": "local_agent.txt", "content": "LOCAL_AGENT_OK\n", "overwrite": True},
+        ),
+        (
+            "run_command",
+            {
+                "command_line": "python3 -B test_local_agent.py",
+                "cwd": ".",
+                "timeout_seconds": 10,
+            },
+        ),
+    ]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -269,7 +298,8 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
             payload = json.loads(self.rfile.read(length) if length else b"{}")
             requests.append(payload)
             call_number = len(requests)
-            if call_number == 1:
+            if call_number <= len(actions):
+                name, arguments = actions[call_number - 1]
                 if native_tools:
                     assert payload.get("tools")
                     tool_delta = {
@@ -284,15 +314,11 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
                                     "tool_calls": [
                                         {
                                             "index": 0,
-                                            "id": "call-local-write",
+                                            "id": f"call-local-{call_number}",
                                             "type": "function",
                                             "function": {
-                                                "name": "write_file",
-                                                "arguments": (
-                                                    '{"file_path":"local_agent.txt",'
-                                                    '"content":"LOCAL_AGENT_OK\\n",'
-                                                    '"overwrite":false}'
-                                                ),
+                                                "name": name,
+                                                "arguments": json.dumps(arguments),
                                             },
                                         }
                                     ]
@@ -329,11 +355,14 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
                                     "index": 0,
                                     "delta": {
                                         "content": (
-                                            '<call_tool name="write_file">'
-                                            '<arg name="file_path">local_agent.txt</arg>'
-                                            '<arg name="content">LOCAL_AGENT_OK\n</arg>'
-                                            '<arg name="overwrite">false</arg>'
-                                            "</call_tool>"
+                                            f'<call_tool name="{name}">'
+                                            + "".join(
+                                                f'<arg name="{key}">'
+                                                f"{str(value).lower() if isinstance(value, bool) else value}"
+                                                "</arg>"
+                                                for key, value in arguments.items()
+                                            )
+                                            + "</call_tool>"
                                         )
                                     },
                                     "finish_reason": "stop",
@@ -343,11 +372,11 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
                     ]
                 )
                 return
-            assert call_number == 2
+            assert call_number == len(actions) + 1
             if native_tools:
                 assert any(
                     message.get("role") == "tool"
-                    and message.get("tool_call_id") == "call-local-write"
+                    and message.get("tool_call_id") == f"call-local-{len(actions)}"
                     for message in payload.get("messages", [])
                 )
             else:
@@ -378,6 +407,11 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
         home = tmp_path / "home"
         workspace.mkdir()
         home.mkdir()
+        (workspace / "test_local_agent.py").write_text(
+            "from pathlib import Path\n"
+            "assert Path('local_agent.txt').read_text() == 'LOCAL_AGENT_OK\\n'\n"
+        )
+        (workspace / "unrelated.txt").write_text("preserve unrelated work\n")
         port = int(server.server_address[1])
         environment = os.environ.copy()
         environment.update(
@@ -387,6 +421,7 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
                 "ASH_MODEL": f"{provider}/local-model",
                 base_env: f"http://127.0.0.1:{port}/v1",
                 "NO_COLOR": "1",
+                "ASH_ALLOW_UNSAFE_AUTO_APPROVE": "true",
             }
         )
         _route_loopback_directly(environment)
@@ -412,9 +447,9 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
                 "--db-directory",
                 str(tmp_path / "db"),
                 "--mode",
-                "auto_edit",
+                "auto_approve",
                 "-p",
-                "Create local_agent.txt containing exactly LOCAL_AGENT_OK and finish.",
+                "Create local_agent.txt, run its test, repair the failure, and verify.",
                 "--output-format",
                 "json",
             ],
@@ -422,7 +457,7 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
             env=environment,
             text=True,
             capture_output=True,
-            timeout=25,
+            timeout=45,
             check=False,
         )
 
@@ -433,7 +468,35 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
         assert (workspace / "local_agent.txt").read_text(encoding="utf-8") == (
             "LOCAL_AGENT_OK\n"
         )
-        assert len(requests) == 2
+        assert (workspace / "unrelated.txt").read_text() == "preserve unrelated work\n"
+        assert (
+            subprocess.run(
+                [sys.executable, "-B", "test_local_agent.py"],
+                cwd=workspace,
+                check=False,
+                timeout=5,
+            ).returncode
+            == 0
+        )
+        assert len(requests) == len(actions) + 1
+        messages_after_failure = json.dumps(requests[2]["messages"])
+        assert "AssertionError" in messages_after_failure
+        tool_messages = [
+            message for message in requests[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert tool_messages
+        assert '"success": true' in str(tool_messages[-1]["content"])
+
+        store = SessionStore(tmp_path / "db" / "sessions.db")
+        sessions = store.list_sessions(project_path=str(workspace))
+        assert len(sessions) == 1
+        calls = store.load_session(sessions[0].session_id).tool_calls
+        assert [call.tool_name for call in calls] == [name for name, _ in actions]
+        assert all(call.executed and call.approved for call in calls)
+        assert calls[1].error is not None and "AssertionError" in calls[1].error
+        assert calls[3].error is None
+        assert store.verify_audit_log(sessions[0].session_id) == []
     finally:
         server.shutdown()
         server.server_close()
