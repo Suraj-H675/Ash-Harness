@@ -190,8 +190,27 @@ def _tools(tmp_path: Path, *, max_concurrency: int = 2):
         state,
         spawn,
         config,
+        owns_shared_state=False,
     )
     return config, spawn, delegate
+
+
+@pytest.mark.asyncio
+async def test_closing_borrowing_delegate_keeps_shared_agent_state_open(
+    tmp_path: Path,
+) -> None:
+    _, spawn, delegate = _tools(tmp_path)
+
+    try:
+        await delegate.aclose()
+
+        task = spawn._shared_state.tasks.create_task(
+            "still available to the owning spawn tool",
+            task_id="borrowed-state-remains-open",
+        )
+        assert task.state == "queued"
+    finally:
+        await spawn.aclose()
 
 
 @pytest.mark.asyncio

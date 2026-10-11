@@ -6262,7 +6262,7 @@ async def _bootstrap_and_headless(
         # A turn may recheck recovery state and clear this summary. Preserve the
         # startup finding for the one-shot operator result.
         startup_recovery = (
-            loop.recovery_summary if loop.recovered_turns else None
+            loop.recovery_summary if getattr(loop, "recovered_turns", 0) else None
         )
         attention_reports = (
             [

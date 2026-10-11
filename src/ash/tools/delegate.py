@@ -78,6 +78,7 @@ class DelegateAgentsTool(BaseTool):
         *,
         allow_background: bool = True,
         owns_spawn_tool: bool = False,
+        owns_shared_state: bool = True,
     ) -> None:
         super().__init__(safety_guard)
         self._shared_state = shared_state
@@ -85,6 +86,7 @@ class DelegateAgentsTool(BaseTool):
         self._config = config
         self._allow_background = allow_background
         self._owns_spawn_tool = owns_spawn_tool
+        self._owns_shared_state = owns_shared_state
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = DelegateAgentsArgs(**kwargs)
@@ -304,7 +306,7 @@ class DelegateAgentsTool(BaseTool):
     async def aclose(self) -> None:
         if self._owns_spawn_tool:
             await self._spawn_tool.aclose()
-        else:
+        elif self._owns_shared_state:
             self._shared_state.close()
 
 

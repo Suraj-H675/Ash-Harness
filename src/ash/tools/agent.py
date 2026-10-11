@@ -2253,6 +2253,7 @@ class SpawnAgentTool(BaseTool):
                 self._config,
                 allow_background=False,
                 owns_spawn_tool=True,
+                owns_shared_state=False,
             )
             tools[nested_delegate.name] = nested_delegate
         if agent_definition is not None and agent_definition.allowed_tools:

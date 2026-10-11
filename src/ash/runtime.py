@@ -352,6 +352,7 @@ def build_tools(
                         spawn_state,
                         spawn_tool,
                         runtime_config,
+                        owns_shared_state=False,
                     )
                 )
         if repo_map is not None:
