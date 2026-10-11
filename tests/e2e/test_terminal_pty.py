@@ -5,6 +5,7 @@ import os
 import pty
 import re
 import select
+import signal
 import shutil
 import subprocess
 import sys
@@ -1091,7 +1092,14 @@ def test_resume_and_clear_replace_the_active_conversation_view(tmp_path: Path) -
         new_session_id = new_session_ids.pop()
         status_start = len(captured)
         os.write(master_fd, b"/status\r")
-        expect(f"Session: {new_session_id}".encode(), after=status_start)
+        status_marker = f"Session: {new_session_id}".encode()
+        expect(status_marker, after=status_start)
+        # Status output may precede the next input read, or the enabled
+        # composer may already be drawn. Force a fresh TTY redraw and wait
+        # for its ready state before sending the next command.
+        ready_start = len(captured)
+        os.kill(process.pid, signal.SIGWINCH)
+        expect("›".encode(), after=ready_start)
         os.write(master_fd, b"/exit\r")
         # Continue draining PTY output while Ash redraws and shuts down. A
         # blocked PTY writer cannot exit if the parent only waits for the PID.
