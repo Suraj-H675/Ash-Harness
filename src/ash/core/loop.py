@@ -5601,7 +5601,6 @@ class AshLoop:
                     },
                     result="FAILURE",
                 )
-                self.circuit_breaker.record_failure(tool_name)
                 self._emit_event(
                     {"type": "tool.error", **event_base, "error": record.error}
                 )
@@ -5628,6 +5627,7 @@ class AshLoop:
                         result=result_payload,
                     )
                 results.append(result_payload)
+                self.circuit_breaker.record_failure(tool_name)
                 continue
 
             try:
@@ -5657,7 +5657,6 @@ class AshLoop:
                     },
                     result="FAILURE",
                 )
-                self.circuit_breaker.record_failure(tool_name)
                 self._emit_event(
                     {"type": "tool.error", **event_base, "error": record.error}
                 )
@@ -5684,6 +5683,7 @@ class AshLoop:
                         result=result_payload,
                     )
                 results.append(result_payload)
+                self.circuit_breaker.record_failure(tool_name)
                 continue
 
             decision = self.permission_policy.evaluate(
@@ -5984,7 +5984,6 @@ class AshLoop:
                     },
                     result="FAILURE",
                 )
-                self.circuit_breaker.record_failure(tool_name)
                 self._emit_event(
                     {
                         "type": "tool.error",
@@ -6019,6 +6018,7 @@ class AshLoop:
                         result=result_payload,
                     )
                 results.append(result_payload)
+                self.circuit_breaker.record_failure(tool_name)
                 continue
             finally:
                 set_log_context(operation_id=previous_operation_id)

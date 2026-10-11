@@ -8114,6 +8114,88 @@ async def test_unknown_tool_is_rejected_before_requesting_approval(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unknown", "invalid_args", "dispatched_exception"])
+async def test_circuit_breaker_trip_persists_terminal_tool_result(
+    tmp_path, failure: str
+) -> None:
+    from ash.core.recovery import CircuitBreaker, CircuitBreakerError
+    from ash.tools.filesystem import WriteFileTool
+
+    class ExplodingTool(MyTestTool):
+        async def run(self, **kwargs):
+            raise RuntimeError("tool failed after dispatch")
+
+    guard = SafetyGuard(tmp_path)
+    tools = {
+        "write_file": WriteFileTool(guard),
+        "my_tool": ExplodingTool(guard),
+    }
+    name, arguments = {
+        "unknown": ("nonexistent_tool", {}),
+        "invalid_args": ("write_file", {"content": "missing path"}),
+        "dispatched_exception": ("my_tool", {}),
+    }[failure]
+    store = SessionStore(tmp_path / f"breaker-{failure}.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(),
+        tmp_path,
+        tools=tools,
+        safety_tier="auto_approve",
+        circuit_breaker=CircuitBreaker(max_failures=1),
+    )
+    try:
+        session = await loop.start_session()
+        with pytest.raises(CircuitBreakerError):
+            await loop._execute_tool_calls(
+                [{"call_id": "breaker-call", "name": name, "arguments": arguments}],
+                session,
+                persist_tool_messages=True,
+            )
+        recovered = store.load_session(session.session_id)
+        assert len(recovered.tool_calls) == 1
+        assert recovered.tool_calls[0].call_id == "breaker-call"
+        assert recovered.tool_calls[0].error is not None
+        terminal = [message for message in recovered.messages if message.role == "tool"]
+        assert len(terminal) == 1
+        assert terminal[0].metadata["call_id"] == "breaker-call"
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_turn_can_resume_from_persisted_failure(tmp_path) -> None:
+    from ash.core.recovery import CircuitBreaker
+
+    store = SessionStore(tmp_path / "breaker-turn.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={},
+        circuit_breaker=CircuitBreaker(max_failures=1),
+    )
+    try:
+        session = await loop.start_session()
+        response = await loop.run_turn("Read the missing test file")
+        assert "Circuit breaker tripped" in response
+        saved = store.load_session(session.session_id)
+        assert len(saved.tool_calls) == 1
+        assert saved.tool_calls[0].error == "Unknown tool: read_file"
+        assert [message.role for message in saved.messages] == [
+            "user", "assistant", "tool",
+        ]
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_on_tool_approval_callback_is_called(tmp_path):
     call_log = []
 
