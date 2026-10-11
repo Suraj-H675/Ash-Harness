@@ -4257,6 +4257,93 @@ async def test_turn_running_state_resets_after_cancellation(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cancelled_partial_provider_stream_resumes_without_dispatching_tools(
+    tmp_path,
+) -> None:
+    from ash.providers.base import CanonicalToolCall
+
+    class PartialNativeProvider(ProviderABC):
+        model_name = "partial-native"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self):
+            self.partial_started = asyncio.Event()
+            self.stream_closed = asyncio.Event()
+            self.requests = []
+
+        def count_tokens(self, text):
+            return 0
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests.append(messages)
+            if len(self.requests) > 1:
+                yield StreamChunk(content="fresh response", is_done=True, stop_reason="stop")
+                return
+            try:
+                yield StreamChunk(content="partial text")
+                yield StreamChunk(
+                    native_tool_calls=[CanonicalToolCall(
+                        call_id="unfinished-call", name="count_calls", arguments={}
+                    )]
+                )
+                self.partial_started.set()
+                await asyncio.Event().wait()
+            finally:
+                self.stream_closed.set()
+
+    class CountCalls(BaseTool):
+        name = "count_calls"
+        args_schema = None
+
+        def __init__(self, guard):
+            super().__init__(guard)
+            self.count = 0
+
+        async def run(self, **kwargs):
+            self.count += 1
+            return ToolResult(success=True, output="called")
+
+    guard = SafetyGuard(tmp_path)
+    provider = PartialNativeProvider()
+    tool = CountCalls(guard)
+    store = SessionStore(tmp_path / "partial-stream-resume.db")
+    loop = AshLoop(
+        store, provider, guard, EventUI(), tmp_path,
+        tools={tool.name: tool}, safety_tier="auto_approve",
+    )
+    try:
+        session = await loop.start_session()
+        interrupted = asyncio.create_task(loop.run_turn("first task"))
+        await asyncio.wait_for(provider.partial_started.wait(), timeout=2)
+        interrupted.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await interrupted
+
+        assert provider.stream_closed.is_set()
+        assert tool.count == 0
+        saved = store.load_session(session.session_id)
+        assert [message.role for message in saved.messages] == ["user"]
+        assert saved.tool_calls == []
+        assert store.started_turns(session.session_id) == []
+        assert store.verify_audit_log(session.session_id) == []
+
+        assert await loop.run_turn("second task") == "fresh response"
+        assert tool.count == 0
+        assert len(provider.requests) == 2
+        assert "partial text" not in str(provider.requests[1])
+        assert "unfinished-call" not in str(provider.requests[1])
+        saved = store.load_session(session.session_id)
+        assert [message.role for message in saved.messages] == [
+            "user", "user", "assistant"
+        ]
+        assert saved.tool_calls == []
+        assert store.recoverable_turns(session.session_id) == []
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_approved_tool_intent_is_durable_before_execution_finishes(tmp_path):
     provider = NativeToolProvider()
     tool = BlockingCaptureTool(SafetyGuard(tmp_path))
@@ -6461,6 +6548,112 @@ async def test_failed_resumed_session_provider_preparation_preserves_current_ses
     assert loop.active_model_id == "provider/default"
     assert created[-1].closed is True
     await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_session_recovery_preserves_active_session(tmp_path, monkeypatch):
+    store = SessionStore(tmp_path / "cancel-session-resume.db")
+    loop = AshLoop(
+        store, MockProvider(), SafetyGuard(tmp_path), EventUI(), tmp_path
+    )
+    current = await loop.start_session()
+    target = store.create_session(str(tmp_path))
+    recovery_started = asyncio.Event()
+
+    async def blocked_target_recovery(session_id):
+        if session_id == target.session_id:
+            recovery_started.set()
+            await asyncio.Event().wait()
+        return set()
+
+    monkeypatch.setattr(loop, "_recover_persisted_mcp_tasks", blocked_target_recovery)
+    try:
+        pending = asyncio.create_task(loop.start_session(target.session_id))
+        await asyncio.wait_for(recovery_started.wait(), timeout=2)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        assert loop.current_session is current
+        assert await loop.run_turn("still in original session")
+        assert loop.current_session.session_id == current.session_id
+        assert store.load_session(target.session_id).messages == []
+        monkeypatch.undo()
+        assert (await loop.start_session(target.session_id)).session_id == target.session_id
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["cancel", "error"])
+async def test_failed_resume_recovery_closes_unpublished_provider(
+    tmp_path, monkeypatch, failure: str
+) -> None:
+    class ReplacementProvider(ProviderABC):
+        def __init__(self, model_name: str):
+            self._model_name = model_name
+            self.closed = False
+
+        @property
+        def model_name(self):
+            return self._model_name
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="ok", is_done=True, stop_reason="stop")
+
+        async def aclose(self):
+            self.closed = True
+
+    config = AshConfig(
+        model="ollama/old-model", workspace_root=tmp_path,
+        db_directory=tmp_path / "db", memory_backend="off",
+    )
+    old_provider = ReplacementProvider("old-model")
+    candidates = []
+
+    def factory(config):
+        provider = ReplacementProvider(config.model.split("/", 1)[1])
+        candidates.append(provider)
+        return provider
+
+    store = SessionStore(tmp_path / "cancel-resume-provider.db")
+    loop = AshLoop(
+        store, old_provider, SafetyGuard(tmp_path), EventUI(), tmp_path,
+        provider_factory=factory, config=config,
+    )
+    current = await loop.start_session()
+    target = store.create_session(str(tmp_path), model="ollama/new-model")
+    recovery_started = asyncio.Event()
+
+    async def recover(session_id):
+        assert session_id == target.session_id
+        recovery_started.set()
+        if failure == "error":
+            raise RuntimeError("target recovery unavailable")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(loop, "_recover_persisted_mcp_tasks", recover)
+    try:
+        task = asyncio.create_task(loop.start_session(target.session_id))
+        await asyncio.wait_for(recovery_started.wait(), timeout=2)
+        if failure == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(RuntimeError, match="target recovery unavailable"):
+                await task
+        assert loop.current_session is current
+        assert loop.provider is old_provider
+        assert loop._config is config
+        assert old_provider.closed is False
+        assert len(candidates) == 1
+        assert candidates[0].closed is True
+    finally:
+        await loop.aclose()
 
 
 @pytest.mark.asyncio

@@ -1985,6 +1985,44 @@ class AshLoop:
         prepared_provider = await self._prepare_session_model(target_model)
         if prepared_provider is None:
             await self._negotiate_provider_capabilities()
+        from ash.core.checkpoints import RecoverySummary, recover_interrupted_turns
+
+        restored_session: Session | None = None
+        prepared_recovery: RecoverySummary | None = None
+        if session_id is not None and not pending_tool_start:
+            # Recovery can await a remote MCP task. Do it before ending the
+            # current session or activating the target provider, so a failed
+            # or cancelled resume cannot discard the active conversation.
+            session_lease = self.session_store.acquire_session_runtime_lease(
+                session_id
+            )
+            try:
+                deferred_mcp_calls = await self._recover_persisted_mcp_tasks(session_id)
+                prepared_recovery = recover_interrupted_turns(
+                    self.session_store,
+                    self.safety_guard,
+                    session_id,
+                    deferred_call_ids=deferred_mcp_calls,
+                )
+                if deferred_mcp_calls:
+                    raise RuntimeError(
+                        "Session resume is waiting for durable MCP task recovery; "
+                        "the task handle was preserved and no tool call was replayed."
+                    )
+                restored_session = self.session_store.load_session(
+                    session_id, runtime_window=True
+                )
+                restored_session.updated_at = self.session_store.mark_session_active(
+                    session_id
+                )
+            except BaseException as primary_error:
+                if prepared_provider is not None:
+                    await self._close_prepared_provider(
+                        prepared_provider[1], primary_error
+                    )
+                raise
+            finally:
+                session_lease.close()
         search_tool = self.tools.get("search_tools")
         reset_activations = getattr(search_tool, "reset_activations", None)
         if callable(reset_activations):
@@ -2049,34 +2087,9 @@ class AshLoop:
         self.system_prompt = self._base_system_prompt
 
         if session_id is not None:
-            self.session_store.require_session_project(session_id, self.project_root)
-            from ash.core.checkpoints import recover_interrupted_turns
-
-            session_lease = self.session_store.acquire_session_runtime_lease(
-                session_id
-            )
-            try:
-                deferred_mcp_calls = await self._recover_persisted_mcp_tasks(session_id)
-                self.recovery_summary = recover_interrupted_turns(
-                    self.session_store,
-                    self.safety_guard,
-                    session_id,
-                    deferred_call_ids=deferred_mcp_calls,
-                )
-                if deferred_mcp_calls:
-                    raise RuntimeError(
-                        "Session resume is waiting for durable MCP task recovery; "
-                        "the task handle was preserved and no tool call was replayed."
-                    )
-                restored_session = self.session_store.load_session(
-                    session_id,
-                    runtime_window=True,
-                )
-                restored_session.updated_at = self.session_store.mark_session_active(
-                    session_id
-                )
-            finally:
-                session_lease.close()
+            assert restored_session is not None
+            assert prepared_recovery is not None
+            self.recovery_summary = prepared_recovery
             self.current_session = restored_session
             self._apply_session_permission_mode(target_permission_mode)
             set_log_context(
