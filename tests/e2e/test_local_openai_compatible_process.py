@@ -30,11 +30,19 @@ def _route_loopback_directly(environment: dict[str, str]) -> None:
 
 
 @pytest.mark.parametrize(
-    ("route", "native_reply"),
-    [("vllm", True), ("lmstudio", True), ("vllm", False)],
+    ("route", "reply_mode", "failure_kind"),
+    [
+        ("vllm", "native", None),
+        ("lmstudio", "native", None),
+        ("vllm", "text", "no_native_tool_call"),
+        ("vllm", "truncated", "output_truncated"),
+        ("vllm", "wrong_args", "invalid_native_tool_call"),
+        ("vllm", "invalid_json", "malformed_stream"),
+        ("vllm", "rejected", "provider_error"),
+    ],
 )
 def test_provider_tool_protocol_diagnostic_uses_real_cli_without_dispatch(
-    tmp_path: Path, route: str, native_reply: bool
+    tmp_path: Path, route: str, reply_mode: str, failure_kind: str | None
 ) -> None:
     requests: list[dict[str, object]] = []
 
@@ -64,7 +72,15 @@ def test_provider_tool_protocol_diagnostic_uses_real_cli_without_dispatch(
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
             requests.append(request)
-            if request.get("tools") and native_reply:
+            if request.get("tools") and reply_mode == "rejected":
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                error = b'{"error":{"message":"tool parser unavailable"}}'
+                self.send_header("Content-Length", str(len(error)))
+                self.end_headers()
+                self.wfile.write(error)
+                return
+            if request.get("tools") and reply_mode in {"native", "wrong_args", "invalid_json"}:
                 delta = {
                     "tool_calls": [{
                         "index": 0,
@@ -72,14 +88,17 @@ def test_provider_tool_protocol_diagnostic_uses_real_cli_without_dispatch(
                         "type": "function",
                         "function": {
                             "name": "ash_diagnostic_echo",
-                            "arguments": '{"value":"ASH_TOOL_OK"}',
+                            "arguments": {
+                                "invalid_json": '{"value":',
+                                "wrong_args": '{"value":"WRONG"}',
+                            }.get(reply_mode, '{"value":"ASH_TOOL_OK"}'),
                         },
                     }]
                 }
                 reason = "tool_calls"
             else:
                 delta = {"content": "OK"}
-                reason = "stop"
+                reason = "length" if request.get("tools") and reply_mode == "truncated" else "stop"
             chunks = [
                 {"id": "diag", "object": "chat.completion.chunk", "created": 1,
                  "model": "local-model", "choices": [{"index": 0, "delta": delta,
@@ -122,11 +141,14 @@ def test_provider_tool_protocol_diagnostic_uses_real_cli_without_dispatch(
             check=False,
             timeout=15,
         )
+        native_reply = reply_mode == "native"
         assert result.returncode == (0 if native_reply else 1), result.stderr
         payload = json.loads(result.stdout)
         assert payload["completion_verified"] is True
         assert payload["native_tool_probe_attempted"] is True
         assert payload["native_tool_probe_verified"] is native_reply
+        assert payload["native_tool_probe_failure_kind"] == failure_kind
+        assert (payload["native_tool_probe_guidance"] is None) is native_reply
         assert payload["ok"] is native_reply
         assert len(requests) == 2
         assert "tools" not in requests[0]

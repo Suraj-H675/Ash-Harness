@@ -315,6 +315,11 @@ completion, and a synthetic native tool-call check in text or `--json` output.
 The synthetic function is **never executed**, so a pass proves protocol
 encoding, not the safety or reliability of real tool execution. The check is
 opt-in, bounded, and does not change capabilities or saved configuration.
+JSON diagnostics distinguish `no_native_tool_call`, `invalid_native_tool_call`,
+`output_truncated`, `malformed_stream`, `timeout`, `provider_error`, and
+`cleanup_error` through `native_tool_probe_failure_kind`; accompanying
+`native_tool_probe_guidance` suggests the next check. These are observed
+failure categories, not assertions about an unverified model or server cause.
 Generic `openai-compatible` routes likewise require catalog
 evidence. Exact model IDs take precedence; provider aliases are accepted only
 when they map to exactly one catalog entry. Without a verified catalog claim

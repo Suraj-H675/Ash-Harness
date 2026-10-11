@@ -127,6 +127,7 @@ class ProviderVerification:
     native_tool_probe_attempted: bool = False
     native_tool_probe_verified: bool = False
     native_tool_probe_error: str | None = None
+    native_tool_probe_failure_kind: str | None = None
 
     @property
     def ready_to_use(self) -> bool:

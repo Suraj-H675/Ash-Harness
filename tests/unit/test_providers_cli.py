@@ -489,12 +489,11 @@ async def test_native_tool_probe_verifies_structured_call_without_execution(monk
     )
     _install_probe_provider(monkeypatch, provider)
 
-    passed, error = await providers._probe_native_tool_protocol(
+    result = await providers._probe_native_tool_protocol(
         _provider_command_config(), _provider_verification(), timeout=1.0
     )
 
-    assert passed is True
-    assert error is None
+    assert result == providers.NativeToolProbeResult(True)
     assert provider.closed is True
     assert provider.max_tokens == providers.PROVIDER_NATIVE_TOOL_TEST_MAX_TOKENS
     assert len(provider.tools) == 1
@@ -504,15 +503,17 @@ async def test_native_tool_probe_verifies_structured_call_without_execution(monk
 
 
 @pytest.mark.parametrize(
-    ("chunks", "error_fragment"),
+    ("chunks", "error_fragment", "failure_kind"),
     [
         (
             [StreamChunk(content='<tool_call name="ash_diagnostic_echo">'), StreamChunk(is_done=True)],
-            "did not return the requested native diagnostic tool call",
+            "text or no tool calls",
+            "no_native_tool_call",
         ),
         (
             [StreamChunk(tool_call_delta="<call_tool name='ash_diagnostic_echo'>")],
             "text/XML instead of native tool calls",
+            "no_native_tool_call",
         ),
         (
             [
@@ -528,35 +529,40 @@ async def test_native_tool_probe_verifies_structured_call_without_execution(monk
                 StreamChunk(is_done=True, stop_reason="tool_calls"),
             ],
             "did not return the requested native diagnostic tool call",
+            "invalid_native_tool_call",
         ),
         (
             [StreamChunk(content="just text")],
             "before a terminal completion",
+            "malformed_stream",
         ),
         (
             [StreamChunk(is_done=True, stop_reason="length")],
-            "did not finish normally",
+            "stopped: length",
+            "output_truncated",
         ),
         (
             [StreamChunk(content="X" * 4097), StreamChunk(is_done=True)],
             "response was too large",
+            "malformed_stream",
         ),
     ],
 )
 @pytest.mark.asyncio
 async def test_native_tool_probe_refuses_unverified_streams(
-    monkeypatch, chunks: list[StreamChunk], error_fragment: str
+    monkeypatch, chunks: list[StreamChunk], error_fragment: str, failure_kind: str
 ) -> None:
     from ash.commands import providers
 
     provider = _ScriptedProbeProvider(chunks=chunks)
     _install_probe_provider(monkeypatch, provider)
 
-    passed, error = await providers._probe_native_tool_protocol(
+    result = await providers._probe_native_tool_protocol(
         _provider_command_config(), _provider_verification(), timeout=1.0
     )
-    assert passed is False
-    assert error_fragment in (error or "")
+    assert result.verified is False
+    assert error_fragment in (result.error or "")
+    assert result.failure_kind == failure_kind
     assert provider.closed is True
 
 
@@ -570,7 +576,9 @@ def test_native_tool_probe_timeout_and_cleanup(monkeypatch) -> None:
             _provider_command_config(), _provider_verification(), timeout=0.01
         )
     )
-    assert result == (False, "provider native tool probe timed out")
+    assert result == providers.NativeToolProbeResult(
+        False, "provider native tool probe timed out", "timeout"
+    )
     assert provider.closed is True
 
 
@@ -579,13 +587,14 @@ def test_native_tool_probe_error_redacts_provider_credential(monkeypatch) -> Non
 
     provider = _ScriptedProbeProvider(error=RuntimeError("failed secret-value"))
     _install_probe_provider(monkeypatch, provider)
-    passed, error = asyncio.run(
+    result = asyncio.run(
         providers._probe_native_tool_protocol(
             _provider_command_config(), _provider_verification(), timeout=1.0
         )
     )
-    assert passed is False
-    assert error == "failed [REDACTED]"
+    assert result == providers.NativeToolProbeResult(
+        False, "failed [REDACTED]", "provider_error"
+    )
     assert provider.closed is True
 
 
@@ -630,8 +639,11 @@ def test_provider_native_tool_probe_is_explicit_and_gates_requested_result(monke
     assert result.ready_to_use is True
     assert result.native_tool_probe_attempted is True
     assert result.native_tool_probe_verified is False
+    assert result.native_tool_probe_failure_kind == "no_native_tool_call"
     assert result.requested_checks_passed is False
     assert providers.provider_test_payload(result)["ok"] is False
+    assert providers.provider_test_payload(result)["native_tool_probe_failure_kind"] == "no_native_tool_call"
+    assert "tool support and server chat template" in providers.render_provider_test(result)
     assert "native tool calling was not verified" in providers.render_provider_test(result)
 
 
