@@ -38,6 +38,7 @@ def test_cli_sigterm_cleans_running_command_and_records_unknown_outcome(
         '<arg name="timeout_seconds">15</arg>'
         "</call_tool>"
     )
+    provider_requests = 0
 
     class LocalProvider(BaseHTTPRequestHandler):
         def log_message(self, *_args: object) -> None:
@@ -54,12 +55,15 @@ def test_cli_sigterm_cleans_running_command_and_records_unknown_outcome(
             self.wfile.write(data)
 
         def do_POST(self) -> None:
+            nonlocal provider_requests
             length = int(self.headers.get("Content-Length", "0"))
             self.rfile.read(length)
+            provider_requests += 1
+            response = tool_request if provider_requests == 1 else "RESUMED"
             chunk = {
                 "id": "test", "object": "chat.completion.chunk", "created": 1,
                 "model": "local-model",
-                "choices": [{"index": 0, "delta": {"content": tool_request}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {"content": response}, "finish_reason": "stop"}],
             }
             data = ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode()
             self.send_response(200)
@@ -142,6 +146,54 @@ def test_cli_sigterm_cleans_running_command_and_records_unknown_outcome(
         assert len(reports[0]["unknown_calls"]) == 1
         assert reports[0]["unresolved_files"] == []
         assert store.verify_audit_log(session_id) == []
+
+        resumed = subprocess.run(
+            [
+                sys.executable, "-m", "ash", "--db-directory", str(db_directory),
+                "--session", session_id, "--mode", "auto_edit", "-p", "resume safely",
+                "--output-format", "json",
+            ],
+            cwd=workspace, env=environment, text=True, capture_output=True,
+            timeout=15, check=False,
+        )
+        assert resumed.returncode == 0, resumed.stderr
+        result = json.loads(resumed.stdout)
+        assert result["response"] == "RESUMED"
+        assert result["recovery_attention"] == {
+            "needs_attention": True,
+            "interrupted_turns": 1,
+            "unknown_calls": 1,
+            "unresolved_files": 0,
+        }
+
+        streamed = subprocess.run(
+            [
+                sys.executable, "-m", "ash", "--db-directory", str(db_directory),
+                "--session", session_id, "--mode", "auto_edit", "-p", "resume safely",
+                "--output-format", "stream-json",
+            ],
+            cwd=workspace, env=environment, text=True, capture_output=True,
+            timeout=15, check=False,
+        )
+        assert streamed.returncode == 0, streamed.stderr
+        events = [json.loads(line) for line in streamed.stdout.splitlines()]
+        assert any(
+            event["type"] == "session.recovery.attention"
+            and event["unknown_calls"] == 1
+            for event in events
+        )
+        textual = subprocess.run(
+            [
+                sys.executable, "-m", "ash", "--db-directory", str(db_directory),
+                "--session", session_id, "--mode", "auto_edit", "-p", "resume safely",
+            ],
+            cwd=workspace, env=environment, text=True, capture_output=True,
+            timeout=15, check=False,
+        )
+        assert textual.returncode == 0, textual.stderr
+        assert "RESUMED" in textual.stdout
+        assert "1 unknown tool outcome(s)" in textual.stderr
+        assert provider_requests == 4  # Never replay the interrupted command.
     finally:
         if process is not None and process.poll() is None:
             process.kill()

@@ -6259,6 +6259,51 @@ async def _bootstrap_and_headless(
     result_code = 0
     try:
         session = await loop.start_session(session_id)
+        # A turn may recheck recovery state and clear this summary. Preserve the
+        # startup finding for the one-shot operator result.
+        startup_recovery = (
+            loop.recovery_summary if loop.recovered_turns else None
+        )
+        attention_reports = (
+            [
+                report
+                for report in loop.session_store.interrupted_recovery_reports(
+                    session.session_id
+                )
+                if report.get("status") == "needs_attention"
+            ]
+            if session_id is not None
+            else []
+        )
+        recovery_attention = (
+            {
+                "needs_attention": True,
+                "interrupted_turns": len(attention_reports),
+                "unknown_calls": sum(
+                    len(report.get("unknown_calls", ())) for report in attention_reports
+                ),
+                "unresolved_files": sum(
+                    len(report.get("unresolved_files", ())) for report in attention_reports
+                ),
+            }
+            if attention_reports
+            else None
+        )
+        if recovery_attention is not None and ui.output_format == "text":
+            print(
+                "Warning: the resumed session has "
+                f"{recovery_attention['unknown_calls']} unknown tool outcome(s) and "
+                f"{recovery_attention['unresolved_files']} unresolved file(s). "
+                "Inspect `ash sessions recovery` before retrying side effects.",
+                file=sys.stderr,
+                flush=True,
+            )
+        if (
+            recovery_attention is not None
+            and ui.output_format == "stream-json"
+            and (startup_recovery is None or not startup_recovery.needs_attention)
+        ):
+            ui.emit_event({"type": "session.recovery.attention", **recovery_attention})
         safety_guard = getattr(loop, "safety_guard", None)
         provider = getattr(loop, "provider", None)
         prepared = (
@@ -6296,8 +6341,13 @@ async def _bootstrap_and_headless(
             "context_tokens": loop._last_context_tokens,
             "usage": loop.last_turn_usage,
         }
-        if loop.recovery_summary is not None and loop.recovered_turns:
-            payload["recovery"] = loop.recovery_summary.to_dict()
+        recovery = startup_recovery or (
+            loop.recovery_summary if loop.recovered_turns else None
+        )
+        if recovery is not None:
+            payload["recovery"] = recovery.to_dict()
+        if recovery_attention is not None:
+            payload["recovery_attention"] = recovery_attention
         if schema is not None:
             payload["structured_output"] = validate_structured_output(response, schema)
         result_payload = payload
