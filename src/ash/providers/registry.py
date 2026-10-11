@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from dataclasses import replace
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import quote
@@ -456,7 +457,9 @@ def _build_openai_compatible(
                 catalog_endpoint = fireworks_endpoint
                 catalog_format = "fireworks"
 
-        declared_capabilities = None
+        declared_capabilities = _local_model_capabilities(
+            config, connection.provider, model_name
+        )
         replay_state_cipher = None
         google_thought_signature_replay = False
         if connection.provider == "google" and connection.uses_default_base_url:
@@ -641,16 +644,26 @@ def _custom_model_capabilities(
     raw_models = provider_config.get("model_capabilities")
     if raw_models is None:
         return ProviderCapabilities()
+    return _parse_model_capabilities(raw_models, provider_name, model_name)
+
+
+def _parse_model_capabilities(
+    raw_models: object,
+    provider_name: str,
+    model_name: str,
+    *,
+    source: str = "custom provider",
+) -> ProviderCapabilities:
     if not isinstance(raw_models, dict):
         raise ValueError(
-            f"custom provider {provider_name!r} model_capabilities must be a table"
+            f"{source} {provider_name!r} model_capabilities must be a table"
         )
     raw = raw_models.get(model_name)
     if raw is None:
         return ProviderCapabilities()
     if not isinstance(raw, dict):
         raise ValueError(
-            f"custom provider {provider_name!r} capabilities for {model_name!r} "
+            f"{source} {provider_name!r} capabilities for {model_name!r} "
             "must be a table"
         )
 
@@ -665,7 +678,7 @@ def _custom_model_capabilities(
     unknown = set(raw) - allowed
     if unknown:
         raise ValueError(
-            f"custom provider {provider_name!r} capabilities for {model_name!r} "
+            f"{source} {provider_name!r} capabilities for {model_name!r} "
             "contain unknown field(s): " + ", ".join(sorted(unknown))
         )
 
@@ -674,7 +687,7 @@ def _custom_model_capabilities(
         value = raw.get(field, False)
         if not isinstance(value, bool):
             raise ValueError(
-                f"custom provider {provider_name!r} capability {field!r} for "
+                f"{source} {provider_name!r} capability {field!r} for "
                 f"{model_name!r} must be boolean"
             )
         boolean_values[field] = value
@@ -686,7 +699,7 @@ def _custom_model_capabilities(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
         ):
             raise ValueError(
-                f"custom provider {provider_name!r} capability {field!r} for "
+                f"{source} {provider_name!r} capability {field!r} for "
                 f"{model_name!r} must be a positive integer"
             )
         integer_values[field] = value
@@ -701,6 +714,24 @@ def _custom_model_capabilities(
     )
 
 
+def _local_model_capabilities(
+    config: "AshConfig", provider_name: str, model_name: str
+) -> ProviderCapabilities | None:
+    if provider_name not in {"lmstudio", "vllm"}:
+        return None
+    declared = config.local_model_capabilities.get(provider_name)
+    if declared is None:
+        return None
+    if not isinstance(declared, dict):
+        raise ValueError(f"local_model_capabilities.{provider_name} must be a table")
+    if model_name not in declared:
+        return None
+    capabilities = _parse_model_capabilities(
+        declared, provider_name, model_name, source="local provider"
+    )
+    return replace(capabilities, local=True)
+
+
 def configured_model_capabilities(
     config: "AshConfig",
     model_string: str,
@@ -708,6 +739,9 @@ def configured_model_capabilities(
     """Resolve trusted static capability metadata without network I/O."""
 
     provider_name, model_name = parse_model_string(model_string)
+    local = _local_model_capabilities(config, provider_name, model_name)
+    if local is not None:
+        return local
     if provider_name in config.custom_providers:
         return _custom_model_capabilities(config, provider_name, model_name)
     return get_capability_registry().resolve(provider_name, model_name)

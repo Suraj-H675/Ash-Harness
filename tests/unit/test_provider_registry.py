@@ -957,6 +957,75 @@ async def test_vllm_explicit_tool_capability_enables_native_tools(
     await provider.aclose()
 
 
+@pytest.mark.parametrize("route", ["lmstudio", "vllm"])
+@pytest.mark.asyncio
+async def test_local_model_exact_opt_in_enables_native_tools_without_guessing(
+    monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+    from ash.providers.registry import configured_model_capabilities
+
+    declared = {route: {"local-model": {"native_tools": True}}}
+    config = AshConfig(model=f"{route}/local-model", local_model_capabilities=declared)
+    provider = create_default_provider_registry().build(config)
+    assert provider.capabilities == ProviderCapabilities(native_tools=True, local=True)
+    assert configured_model_capabilities(config, config.model) == provider.capabilities
+    assert configured_model_capabilities(
+        config, f"{route}/another-model"
+    ) == ProviderCapabilities(local=True)
+
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata",
+        lambda *args, **kwargs: (
+            ProviderModelMetadata(model_id="local-model", context_window=16384),
+        ),
+    )
+    assert await provider.detect_capabilities() == ProviderCapabilities(
+        native_tools=True, local=True, context_window=16384
+    )
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_local_model_declaration_does_not_override_explicit_catalog_denial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.providers.readiness import ProviderModelMetadata
+
+    provider = create_default_provider_registry().build(
+        AshConfig(
+            model="vllm/local-model",
+            local_model_capabilities={"vllm": {"local-model": {"native_tools": True}}},
+        )
+    )
+    monkeypatch.setattr(
+        "ash.providers.openai_compatible.probe_model_catalog_metadata",
+        lambda *args, **kwargs: (
+            ProviderModelMetadata(model_id="local-model", native_tools=False),
+        ),
+    )
+    assert await provider.detect_capabilities() == ProviderCapabilities(local=True)
+    await provider.aclose()
+
+
+@pytest.mark.parametrize(
+    "declarations, error",
+    [
+        ({"ollama": {"model": {"native_tools": True}}}, "only lmstudio and vllm"),
+        ({"vllm": {"model": {"native_tools": "yes"}}}, "native_tools.*boolean"),
+        ({"vllm": {"model": {"unrecognized": True}}}, "unknown field"),
+    ],
+)
+def test_local_model_capabilities_refuse_invalid_declarations(
+    declarations: dict, error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        config = AshConfig(model="vllm/model", local_model_capabilities=declarations)
+        create_default_provider_registry().build(config)
+
+
 @pytest.mark.asyncio
 async def test_custom_anonymous_openai_compatible_provider_builds_without_bearer_auth() -> (
     None

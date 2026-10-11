@@ -286,9 +286,26 @@ reasoning, and the conservative loaded-instance context. vLLM reads served
 model limits from `/v1/models`, but its catalog does not prove that
 `--enable-auto-tool-choice` plus a compatible tool parser were enabled, so Ash
 does not activate native auto-tool calling from wire compatibility or model
-name alone. Generic `openai-compatible` routes likewise require catalog
+name alone. Users who have independently verified native tool calling for a
+particular local server and model can opt in without creating a second custom
+provider. Put this user-owned declaration in `~/.ash/ash.toml`:
+
+```toml
+[local_model_capabilities.vllm."local-model"]
+native_tools = true
+```
+
+The selected model remains `vllm/local-model`; configure its endpoint with
+`VLLM_API_BASE` as usual. The same exact-model opt-in works under
+`local_model_capabilities.lmstudio`. Omitting a declaration leaves native tools
+disabled unless the provider's catalog proves support; an explicit catalog
+denial still wins. These declarations do not activate a model or start its
+server, and unverified/native-tool-incompatible models should not opt in.
+Repository-controlled project configuration cannot set this user-owned field.
+Generic `openai-compatible` routes likewise require catalog
 evidence. Exact model IDs take precedence; provider aliases are accepted only
-when they map to exactly one catalog entry. Missing, malformed, conflicting,
+when they map to exactly one catalog entry. Without a verified catalog claim
+or explicit per-model declaration, missing, malformed, conflicting,
 ambiguous-alias, or different-model metadata keeps the conservative path.
 
 Local runtime lifecycle remains runtime-owned. Ash connects to and verifies

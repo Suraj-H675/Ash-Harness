@@ -896,6 +896,27 @@ def test_trusted_project_layers_have_precise_precedence_and_provenance(
     )
 
 
+def test_local_model_capability_opt_in_is_user_owned_project_config(
+    tmp_path: Path,
+) -> None:
+    from ash.config import AshConfig, _filter_project_config
+
+    source = tmp_path / "config.toml"
+    diagnostics: list[str] = []
+    filtered = _filter_project_config(
+        AshConfig,
+        source,
+        {"local_model_capabilities": {"vllm": {"model": {"native_tools": True}}}},
+        diagnostics,
+    )
+    assert filtered == {}
+    assert any("user-owned" in item for item in diagnostics)
+    assert AshConfig(
+        model="vllm/model",
+        local_model_capabilities={"vllm": {"model": {"native_tools": True}}},
+    ).local_model_capabilities["vllm"]["model"]["native_tools"] is True
+
+
 def test_project_config_cannot_override_user_owned_controls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
