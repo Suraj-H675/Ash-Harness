@@ -711,6 +711,144 @@ def test_local_runtime_setup_guidance_is_runtime_specific(
     assert expected in _local_runtime_guidance(provider_id)
 
 
+@pytest.mark.parametrize("provider_id", ["lmstudio", "vllm"])
+def test_local_setup_can_opt_in_to_native_tools_without_overwriting_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider_id: str
+) -> None:
+    from ash.commands import config as cli_config
+    from ash.commands.setup import ModelProbe, SetupOutcome, _flow_openai_compatible_builtin
+    from ash.provider_catalog import get_provider_descriptor
+    from ash.providers.registry import configured_model_capabilities
+    from ash.config import AshConfig
+
+    descriptor = get_provider_descriptor(provider_id)
+    assert descriptor is not None
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(f"{provider_id.upper()}_API_BASE", raising=False)
+    cli_config.save_config(
+        {"theme": "light", "local_model_capabilities": {"vllm": {"other": {"vision": True}}}}
+    )
+    monkeypatch.setattr("builtins.input", _fake_input(["", "1", "2"]))
+
+    with (
+        patch("ash.commands.setup._probe_models_detailed", return_value=ModelProbe(models=("model-a",))),
+        patch("ash.commands.setup.save_env_values") as save,
+    ):
+        assert _flow_openai_compatible_builtin(descriptor, "") is SetupOutcome.SUCCESS
+
+    save.assert_called_once_with({"ASH_MODEL": f"{provider_id}/model-a"})
+    stored = cli_config.load_config(strict=True)
+    assert stored["theme"] == "light"
+    assert stored["local_model_capabilities"]["vllm"]["other"] == {"vision": True}
+    assert stored["local_model_capabilities"][provider_id]["model-a"] == {
+        "native_tools": True
+    }
+    config = AshConfig(
+        model=f"{provider_id}/model-a",
+        local_model_capabilities=stored["local_model_capabilities"],
+    )
+    assert configured_model_capabilities(config, config.model).native_tools is True
+
+
+@pytest.mark.parametrize("choice", ["", "1"])
+def test_local_setup_conservative_choice_does_not_change_capabilities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, choice: str
+) -> None:
+    from ash.commands import config as cli_config
+    from ash.commands.setup import ModelProbe, SetupOutcome, _flow_openai_compatible_builtin
+    from ash.provider_catalog import get_provider_descriptor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("VLLM_API_BASE", raising=False)
+    descriptor = get_provider_descriptor("vllm")
+    assert descriptor is not None
+    monkeypatch.setattr("builtins.input", _fake_input(["", "1", choice]))
+    with (
+        patch("ash.commands.setup._probe_models_detailed", return_value=ModelProbe(models=("model-a",))),
+        patch("ash.commands.setup.save_env_values") as save,
+        patch("ash.commands.setup.mutate_config") as mutation,
+    ):
+        assert _flow_openai_compatible_builtin(descriptor, "") is SetupOutcome.SUCCESS
+    save.assert_called_once()
+    mutation.assert_not_called()
+    assert cli_config.load_config(strict=True) == {}
+
+
+def test_local_setup_removes_only_selected_native_tool_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ash.commands import config as cli_config
+    from ash.commands.setup import ModelProbe, SetupOutcome, _flow_openai_compatible_builtin
+    from ash.provider_catalog import get_provider_descriptor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LMSTUDIO_API_BASE", raising=False)
+    descriptor = get_provider_descriptor("lmstudio")
+    assert descriptor is not None
+    cli_config.save_config(
+        {"local_model_capabilities": {"lmstudio": {
+            "model-a": {"native_tools": True, "vision": True},
+            "model-b": {"native_tools": True},
+        }}}
+    )
+    monkeypatch.setattr("builtins.input", _fake_input(["", "1", "2"]))
+    with (
+        patch("ash.commands.setup._probe_models_detailed", return_value=ModelProbe(models=("model-a",))),
+        patch("ash.commands.setup.save_env_values"),
+    ):
+        assert _flow_openai_compatible_builtin(descriptor, "") is SetupOutcome.SUCCESS
+
+    saved = cli_config.load_config(strict=True)["local_model_capabilities"]["lmstudio"]
+    assert saved["model-a"] == {"vision": True}
+    assert saved["model-b"] == {"native_tools": True}
+
+
+def test_local_setup_cancellation_does_not_persist_route_or_capabilities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ash.commands.setup import ModelProbe, SetupCancelled, _flow_openai_compatible_builtin
+    from ash.provider_catalog import get_provider_descriptor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("VLLM_API_BASE", raising=False)
+    descriptor = get_provider_descriptor("vllm")
+    assert descriptor is not None
+    monkeypatch.setattr("builtins.input", _fake_input(["", "1", "c"]))
+    with (
+        patch("ash.commands.setup._probe_models_detailed", return_value=ModelProbe(models=("model-a",))),
+        patch("ash.commands.setup.save_env_values") as save,
+        patch("ash.commands.setup.mutate_config") as mutation,
+    ):
+        with pytest.raises(SetupCancelled):
+            _flow_openai_compatible_builtin(descriptor, "")
+    save.assert_not_called()
+    mutation.assert_not_called()
+
+
+def test_local_setup_failed_env_save_leaves_capability_config_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ash.commands import config as cli_config
+    from ash.commands.setup import ModelProbe, _flow_openai_compatible_builtin
+    from ash.provider_catalog import get_provider_descriptor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("VLLM_API_BASE", raising=False)
+    descriptor = get_provider_descriptor("vllm")
+    assert descriptor is not None
+    cli_config.save_config({"theme": "dark"})
+    monkeypatch.setattr("builtins.input", _fake_input(["", "1", "2"]))
+    with (
+        patch("ash.commands.setup._probe_models_detailed", return_value=ModelProbe(models=("model-a",))),
+        patch("ash.commands.setup.save_env_values", side_effect=OSError("write failed")),
+        patch("ash.commands.setup.mutate_config") as mutation,
+    ):
+        with pytest.raises(OSError, match="write failed"):
+            _flow_openai_compatible_builtin(descriptor, "")
+    mutation.assert_not_called()
+    assert cli_config.load_config(strict=True) == {"theme": "dark"}
+
+
 def test_google_onboarding_uses_documented_key_precedence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

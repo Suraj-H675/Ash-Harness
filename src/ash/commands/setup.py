@@ -1100,14 +1100,82 @@ def _flow_openai_compatible_builtin(
     model = _prompt_model_list(models, current)
     _confirm_undiscovered_model(model, models, verified)
 
+    native_tool_choice = "keep"
+    if descriptor.id in {"lmstudio", "vllm"}:
+        native_tool_choice = _prompt_local_native_tools(descriptor.id, model)
+
     settings: dict[str, str] = {"ASH_MODEL": f"{descriptor.id}/{model}"}
     if descriptor.key_env is not None:
         settings[descriptor.key_env] = api_key
     if base_url_override:
         settings[base_env] = base_url_override
     save_env_values(settings)
+    if native_tool_choice != "keep":
+        _save_local_native_tools(descriptor.id, model, native_tool_choice == "enable")
+        if native_tool_choice == "enable":
+            _print_info(
+                "Native tools enabled by your declaration; setup has not "
+                "verified tool execution. Run a real task to confirm support."
+            )
+        else:
+            _print_info("Removed your native-tools opt-in for the selected model.")
     _print_verification_status(verified)
     return SetupOutcome.SUCCESS
+
+
+def _prompt_local_native_tools(provider: str, model: str) -> str:
+    """Ask for an explicit model/server opt-in; catalog discovery is not proof."""
+    user_config = load_config(strict=True)
+    routes = user_config.get("local_model_capabilities", {})
+    route = routes.get(provider, {}) if isinstance(routes, dict) else {}
+    model_config = route.get(model, {}) if isinstance(route, dict) else {}
+    enabled = isinstance(model_config, dict) and model_config.get("native_tools") is True
+
+    print(
+        "  Native tool calling requires a tool-capable model AND server. "
+        "Model discovery alone does not verify this."
+    )
+    if enabled:
+        choice = _prompt_choice(
+            "Native tools for this model",
+            ["Keep existing native-tools opt-in", "Remove my native-tools opt-in"],
+            default=0,
+        )
+        return "keep" if choice == 0 else "remove"
+    choice = _prompt_choice(
+        "Native tools for this model",
+        [
+            "Use detected capabilities (safe default)",
+            "Enable native tools (I verified this model and server)",
+        ],
+        default=0,
+    )
+    return "keep" if choice == 0 else "enable"
+
+
+def _save_local_native_tools(provider: str, model: str, enabled: bool) -> None:
+    def update(user_config: dict[str, Any]) -> None:
+        routes = user_config.setdefault("local_model_capabilities", {})
+        if not isinstance(routes, dict):
+            raise ValueError("local_model_capabilities must be a table")
+        route = routes.setdefault(provider, {})
+        if not isinstance(route, dict):
+            raise ValueError(f"local_model_capabilities.{provider} must be a table")
+        model_config = route.setdefault(model, {})
+        if not isinstance(model_config, dict):
+            raise ValueError("local model capability declaration must be a table")
+        if enabled:
+            model_config["native_tools"] = True
+        else:
+            model_config.pop("native_tools", None)
+            if not model_config:
+                route.pop(model, None)
+            if not route:
+                routes.pop(provider, None)
+            if not routes:
+                user_config.pop("local_model_capabilities", None)
+
+    mutate_config(update)
 
 
 def _local_runtime_guidance(provider_id: str) -> str:
