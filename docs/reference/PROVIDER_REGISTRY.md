@@ -298,9 +298,13 @@ native_tools = true
 The selected model remains `vllm/local-model`; configure its endpoint with
 `VLLM_API_BASE` as usual. The same exact-model opt-in works under
 `local_model_capabilities.lmstudio`. Interactive `ash setup model` offers this
-choice for LM Studio and vLLM after selecting a model, defaults to detected
-capabilities, and can remove a previous opt-in without removing other model
-settings. Omitting a declaration leaves native tools
+choice for LM Studio and vLLM after selecting a model. Users can first select
+**Verify native tool protocol now** to send one bounded (60-second) synthetic
+tool-call request to the selected endpoint, before its configuration is saved.
+Ash reports the result and then asks for a separate capability choice; the
+probe never executes a tool or automatically enables native tools. The default
+uses detected capabilities, and existing opt-ins can be removed without
+removing other model settings. Omitting a declaration leaves native tools
 disabled unless the provider's catalog proves support; an explicit catalog
 denial still wins. These declarations do not activate a model or start its
 server, and unverified/native-tool-incompatible models should not opt in.

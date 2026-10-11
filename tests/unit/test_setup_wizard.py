@@ -774,6 +774,97 @@ def test_local_setup_conservative_choice_does_not_change_capabilities(
     assert cli_config.load_config(strict=True) == {}
 
 
+@pytest.mark.parametrize("verified", [True, False])
+def test_local_setup_probes_selected_endpoint_before_capability_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verified: bool, capsys
+) -> None:
+    from ash.commands import config as cli_config
+    from ash.commands.setup import ModelProbe, SetupOutcome, _flow_openai_compatible_builtin
+    from ash.provider_catalog import get_provider_descriptor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("VLLM_API_BASE", raising=False)
+    descriptor = get_provider_descriptor("vllm")
+    assert descriptor is not None
+    endpoint = "http://127.0.0.1:18105/v1"
+    monkeypatch.setattr(
+        "builtins.input",
+        _fake_input([endpoint, "1", "3", "2" if verified else "1"]),
+    )
+
+    def probe(provider: str, model: str, base_url: str, *, timeout: float):
+        assert (provider, model, base_url, timeout) == (
+            "vllm", "model-a", endpoint, 60.0
+        )
+        assert cli_config.load_config(strict=True) == {}
+        save.assert_not_called()
+        return verified, None if verified else "unsupported tool parser"
+
+    with (
+        patch("ash.commands.setup._probe_models_detailed", return_value=ModelProbe(models=("model-a",))),
+        patch("ash.commands.setup.save_env_values") as save,
+        patch("ash.commands.providers.probe_local_native_tool_protocol", side_effect=probe) as tool_probe,
+    ):
+        assert _flow_openai_compatible_builtin(descriptor, "") is SetupOutcome.SUCCESS
+
+    tool_probe.assert_called_once()
+    save.assert_called_once_with({
+        "ASH_MODEL": "vllm/model-a", "VLLM_API_BASE": endpoint
+    })
+    saved = cli_config.load_config(strict=True)
+    if verified:
+        assert saved["local_model_capabilities"]["vllm"]["model-a"]["native_tools"] is True
+        assert "Native tool protocol verified" in capsys.readouterr().out
+    else:
+        assert saved == {}
+        assert "Native tool protocol not verified: unsupported tool parser" in capsys.readouterr().out
+
+
+def test_local_setup_probe_cancel_does_not_persist_choices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ash.commands import config as cli_config
+    from ash.commands.setup import ModelProbe, SetupCancelled, _flow_openai_compatible_builtin
+    from ash.provider_catalog import get_provider_descriptor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("LMSTUDIO_API_BASE", raising=False)
+    descriptor = get_provider_descriptor("lmstudio")
+    assert descriptor is not None
+    monkeypatch.setattr("builtins.input", _fake_input(["", "1", "3", "c"]))
+    with (
+        patch("ash.commands.setup._probe_models_detailed", return_value=ModelProbe(models=("model-a",))),
+        patch("ash.commands.providers.probe_local_native_tool_protocol", return_value=(True, None)),
+        patch("ash.commands.setup.save_env_values") as save,
+        patch("ash.commands.setup.mutate_config") as mutation,
+    ):
+        with pytest.raises(SetupCancelled):
+            _flow_openai_compatible_builtin(descriptor, "")
+    save.assert_not_called()
+    mutation.assert_not_called()
+    assert cli_config.load_config(strict=True) == {}
+
+
+def test_local_setup_successful_probe_does_not_auto_enable_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ash.commands import config as cli_config
+    from ash.commands.setup import _prompt_local_native_tools
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("builtins.input", _fake_input(["3", ""]))
+    with patch(
+        "ash.commands.providers.probe_local_native_tool_protocol",
+        return_value=(True, None),
+    ) as probe:
+        choice = _prompt_local_native_tools(
+            "vllm", "local-model", "http://localhost:8000/v1"
+        )
+    assert choice == "keep"
+    probe.assert_called_once()
+    assert cli_config.load_config(strict=True) == {}
+
+
 def test_local_setup_removes_only_selected_native_tool_opt_in(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

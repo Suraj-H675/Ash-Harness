@@ -1102,7 +1102,7 @@ def _flow_openai_compatible_builtin(
 
     native_tool_choice = "keep"
     if descriptor.id in {"lmstudio", "vllm"}:
-        native_tool_choice = _prompt_local_native_tools(descriptor.id, model)
+        native_tool_choice = _prompt_local_native_tools(descriptor.id, model, base_url)
 
     settings: dict[str, str] = {"ASH_MODEL": f"{descriptor.id}/{model}"}
     if descriptor.key_env is not None:
@@ -1123,7 +1123,7 @@ def _flow_openai_compatible_builtin(
     return SetupOutcome.SUCCESS
 
 
-def _prompt_local_native_tools(provider: str, model: str) -> str:
+def _prompt_local_native_tools(provider: str, model: str, base_url: str) -> str:
     """Ask for an explicit model/server opt-in; catalog discovery is not proof."""
     user_config = load_config(strict=True)
     routes = user_config.get("local_model_capabilities", {})
@@ -1135,22 +1135,45 @@ def _prompt_local_native_tools(provider: str, model: str) -> str:
         "  Native tool calling requires a tool-capable model AND server. "
         "Model discovery alone does not verify this."
     )
-    if enabled:
+    probe_verified = False
+    while True:
+        choices = (
+            ["Keep existing native-tools opt-in", "Remove my native-tools opt-in"]
+            if enabled
+            else [
+                "Use detected capabilities (safe default)",
+                (
+                    "Enable native tools (protocol probe passed)"
+                    if probe_verified
+                    else "Enable native tools (I verified this model and server)"
+                ),
+            ]
+        )
         choice = _prompt_choice(
             "Native tools for this model",
-            ["Keep existing native-tools opt-in", "Remove my native-tools opt-in"],
+            [*choices, "Verify native tool protocol now (up to 60s; no tool runs)"],
             default=0,
         )
-        return "keep" if choice == 0 else "remove"
-    choice = _prompt_choice(
-        "Native tools for this model",
-        [
-            "Use detected capabilities (safe default)",
-            "Enable native tools (I verified this model and server)",
-        ],
-        default=0,
-    )
-    return "keep" if choice == 0 else "enable"
+        if choice == 0:
+            return "keep"
+        if choice == 1:
+            return "remove" if enabled else "enable"
+
+        from ash.commands.providers import probe_local_native_tool_protocol
+
+        _print_info("Probing one synthetic tool call; nothing will be executed.")
+        probe_verified, error = probe_local_native_tool_protocol(
+            provider, model, base_url, timeout=60.0
+        )
+        if probe_verified:
+            _print_info(
+                "Native tool protocol verified for this model and endpoint. "
+                "Real tool execution is not verified."
+            )
+        else:
+            detail = terminal_safe_text(error or "no valid native tool call", single_line=True)
+            print(f"  Native tool protocol not verified: {detail}")
+            print("  Keep the default unless you have verified support separately.")
 
 
 def _save_local_native_tools(provider: str, model: str, enabled: bool) -> None:

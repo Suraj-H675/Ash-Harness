@@ -14,7 +14,11 @@ from rich.table import Table
 
 from ash.core.redaction import redact_text
 from ash.provider_catalog import BUILTIN_PROVIDERS
-from ash.providers.base import CompletionStopCategory, completion_stop_category
+from ash.providers.base import (
+    CanonicalToolCall,
+    CompletionStopCategory,
+    completion_stop_category,
+)
 from ash.providers.readiness import (
     ProviderConfigurationError,
     ProviderVerification,
@@ -428,23 +432,27 @@ async def _probe_provider_completion(
 
 
 async def _probe_native_tool_protocol(
-    config: "AshConfig",
+    config: "AshConfig | None",
     verification: ProviderVerification,
     *,
     timeout: float,
+    probe_provider: Any | None = None,
 ) -> tuple[bool, str | None]:
     """Verify native tool-call encoding, without registering or running a tool."""
 
     from ash.providers.registry import get_provider_registry
 
-    provider = None
+    provider = probe_provider
     verified = False
     error: str | None = None
     primary_cancellation: asyncio.CancelledError | None = None
     try:
-        provider = get_provider_registry().build(config)
+        if provider is None:
+            if config is None:
+                raise ValueError("provider config is required without a probe provider")
+            provider = get_provider_registry().build(config)
         provider.configure_max_tokens(PROVIDER_NATIVE_TOOL_TEST_MAX_TOKENS)
-        calls = []
+        calls: list[CanonicalToolCall] = []
         response_chars = 0
         saw_terminal = False
         terminal_stop_reason: str | None = None
@@ -521,6 +529,42 @@ async def _probe_native_tool_protocol(
             if cleanup_interrupted and primary_cancellation is None:
                 raise asyncio.CancelledError() from cleanup_error
     return verified, error
+
+
+def probe_local_native_tool_protocol(
+    provider_name: str,
+    model: str,
+    base_url: str,
+    *,
+    timeout: float = 60.0,
+) -> tuple[bool, str | None]:
+    """Probe the selected local endpoint before setup persists a new route."""
+    from ash.providers.openai import OpenAIProvider
+    from ash.providers.readiness import ProviderConnection
+
+    if provider_name not in {"lmstudio", "vllm"}:
+        raise ValueError("native tool setup probe supports only lmstudio and vllm")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("native tool probe timeout must be positive and finite")
+    connection = ProviderConnection(
+        provider=provider_name,
+        model_name=model,
+        base_url=base_url,
+        catalog_endpoint="",
+        catalog_format="openai",
+        auth_mode="none",
+    )
+    probe = OpenAIProvider(model_name=model, base_url=base_url, allow_anonymous=True)
+    verification = ProviderVerification(
+        connection=connection,
+        models=(model,),
+        selected_model_available=True,
+    )
+    return asyncio.run(
+        _probe_native_tool_protocol(
+            None, verification, timeout=timeout, probe_provider=probe
+        )
+    )
 
 
 def test_provider(
