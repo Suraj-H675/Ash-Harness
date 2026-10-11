@@ -19,7 +19,7 @@ class SQLitePathError(RuntimeError):
     """A SQLite path could not be bound to one stable local file identity."""
 
 
-def _restrict_existing_file(
+def restrict_sqlite_file_permissions(
     directory: AnchoredDirectory,
     name: str,
     expected: os.stat_result,
@@ -171,7 +171,7 @@ class PinnedSQLiteDatabase:
                     finally:
                         os.close(descriptor)
                 else:
-                    _restrict_existing_file(
+                    restrict_sqlite_file_permissions(
                         directory, database.name, metadata, label=label,
                     )
                 directory.validation_path()
@@ -311,6 +311,6 @@ class PinnedSQLiteDatabase:
                     raise SQLitePathError(
                         f"{label} storage is not a regular file: {directory.path / name}"
                     )
-                _restrict_existing_file(
+                restrict_sqlite_file_permissions(
                     directory, name, metadata, label=label, mode=mode,
                 )

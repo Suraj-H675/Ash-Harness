@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -411,6 +413,53 @@ def test_memory_sqlite_files_are_private(tmp_path: Path) -> None:
         sidecar = Path(f"{index.db_path}{suffix}")
         if sidecar.exists():
             assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux POSIX locks are observable")
+def test_memory_index_peer_preserves_live_sqlite_locks(tmp_path: Path) -> None:
+    if preferred_sqlite_journal_mode() != "WAL":
+        pytest.skip("requires a SQLite runtime with safe WAL mode")
+
+    index = _index(tmp_path)
+    db_stat = index.db_path.stat()
+    lock_identity = (
+        f"{os.major(db_stat.st_dev):02x}:{os.minor(db_stat.st_dev):02x}:"
+        f"{db_stat.st_ino}"
+    )
+
+    def active_locks() -> list[str]:
+        return [
+            line
+            for line in Path("/proc/locks").read_text().splitlines()
+            if lock_identity in line
+        ]
+
+    with sqlite3.connect(index.db_path) as live:
+        live.execute("BEGIN")
+        live.execute("SELECT COUNT(*) FROM memory_documents").fetchone()
+        assert active_locks()
+        assert index.document_paths() == set()
+        assert active_locks()
+
+        peer = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from ash.memory.sqlite_index import SQLiteMemoryIndex; "
+                "import sys; "
+                "SQLiteMemoryIndex(sys.argv[1], workspace_root=sys.argv[2], "
+                "chunking_version='lines-30-overlap-5-v1').document_paths()",
+                str(index.db_path),
+                str(tmp_path / "workspace"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert peer.returncode == 0, peer.stderr
+        assert active_locks()
+        assert Path(f"{index.db_path}-wal").exists()
+        assert Path(f"{index.db_path}-shm").exists()
 
 
 def test_corrupt_vector_blob_fails_closed_without_losing_lexical_rows(

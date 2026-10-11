@@ -19,7 +19,11 @@ from typing import Iterator, Sequence
 
 from ash.context.compaction import Chunk
 from ash.safety.anchored_fs import AnchoredDirectory, AnchoredFilesystemError
-from ash.sqlite_utils import configure_sqlite_journal_mode
+from ash.sqlite_utils import (
+    SQLitePathError,
+    configure_sqlite_journal_mode,
+    restrict_sqlite_file_permissions,
+)
 
 
 MEMORY_SCHEMA_VERSION = 1
@@ -144,7 +148,6 @@ class SQLiteMemoryIndex:
         *,
         initialize: bool = False,
     ) -> Iterator[sqlite3.Connection]:
-        pin = -1
         connection: sqlite3.Connection | None = None
         try:
             existing = directory.stat(self._name)
@@ -153,12 +156,6 @@ class SQLiteMemoryIndex:
                     raise MemoryIndexError(
                         f"memory database is not a regular file: {self.db_path}"
                     )
-                pin = directory.open_file(
-                    self._name,
-                    os.O_RDWR,
-                    expected=existing,
-                    expected_type=stat.S_IFREG,
-                )
             sqlite_path = self._sqlite_path(directory)
             connection = sqlite3.connect(
                 sqlite_path,
@@ -171,20 +168,24 @@ class SQLiteMemoryIndex:
             if initialize:
                 configure_sqlite_journal_mode(connection)
                 connection.execute("PRAGMA synchronous=NORMAL")
-            if pin >= 0 and not directory.same_entry(self._name, pin):
+            opened = directory.stat(self._name)
+            if (
+                opened is None
+                or not stat.S_ISREG(opened.st_mode)
+                or (existing is not None and not _same_identity(existing, opened))
+            ):
                 raise MemoryIndexError(
                     "memory database changed while opening; restart Ash and rebuild memory"
                 )
             yield connection
-            if pin >= 0 and not directory.same_entry(self._name, pin):
+            current = directory.stat(self._name)
+            if current is None or not _same_identity(opened, current):
                 raise MemoryIndexError(
                     "memory database changed during use; restart Ash and rebuild memory"
                 )
         finally:
             if connection is not None:
                 connection.close()
-            if pin >= 0:
-                os.close(pin)
 
     def _sqlite_path(self, directory: AnchoredDirectory) -> str:
         if sys.platform.startswith("linux") and Path("/proc/self/fd").is_dir():
@@ -620,16 +621,12 @@ class SQLiteMemoryIndex:
                 raise MemoryIndexError(
                     f"memory SQLite state is not a regular file: {self._parent / name}"
                 )
-            descriptor = directory.open_file(
-                name,
-                os.O_RDWR,
-                expected=metadata,
-                expected_type=stat.S_IFREG,
-            )
             try:
-                os.fchmod(descriptor, 0o600)
-            finally:
-                os.close(descriptor)
+                restrict_sqlite_file_permissions(
+                    directory, name, metadata, label="memory SQLite",
+                )
+            except SQLitePathError as exc:
+                raise MemoryIndexError(str(exc)) from exc
 
 
 def _workspace_identity(path: Path) -> tuple[int, int] | None:

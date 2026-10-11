@@ -6,6 +6,20 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-11
+
+### Fixed
+- Preserved SQLite POSIX locks for the optional workspace memory index when
+  multiple connections or processes use the same index. Memory index file
+  identity and permissions are now checked without opening and closing extra
+  database/WAL descriptors that could invalidate a live SQLite connection's
+  locks. A real cross-process WAL regression guards the boundary.
+
+### Upgrade notes
+- This is a package-only upgrade from 0.4.1 with no session or memory database
+  schema change. As with the 0.4.1 integrity fix, upgrading cannot repair data
+  already damaged under a previous version.
+
 ## [0.4.1] - 2026-10-11
 
 ### Fixed
@@ -371,7 +385,8 @@ All notable changes to Ash are documented here. The format follows
 - Fixed duplicate `project.urls` tables so the distribution builds with modern
   `setuptools`; expanded CI across Python 3.11 and 3.12.
 
-[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.1...HEAD
+[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.2...HEAD
+[0.4.2]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.1...ash-v0.4.2
 [0.4.1]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.0...ash-v0.4.1
 [0.4.0]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.3.1...ash-v0.4.0
 [0.3.1]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.3.0...ash-v0.3.1
