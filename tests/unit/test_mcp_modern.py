@@ -333,6 +333,58 @@ async def test_modern_task_persistence_failure_requests_cancellation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_initial_mcp_task_save_requests_remote_cancel() -> None:
+    client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
+    client.protocol_version = "2026-07-28"
+    client.server_capabilities = {"extensions": {"io.modelcontextprotocol/tasks": {}}}
+    task_id = "new-unsaved-task"
+    save_started = asyncio.Event()
+    cancel_started = asyncio.Event()
+    release_cancel = asyncio.Event()
+    methods: list[str] = []
+
+    async def blocked_save(task: dict[str, Any], answers: dict[str, str]) -> None:
+        assert task["taskId"] == task_id and answers == {}
+        save_started.set()
+        await asyncio.Event().wait()
+
+    async def request(method: str, params: dict, **kwargs: Any) -> dict:
+        del kwargs
+        methods.append(method)
+        if method == "tools/call":
+            assert params == {"name": "long-running", "arguments": {}}
+            return {
+                "resultType": "task",
+                "taskId": task_id,
+                "status": "working",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:01Z",
+                "ttlMs": 60_000,
+            }
+        assert method == "tasks/cancel" and params == {"taskId": task_id}
+        cancel_started.set()
+        await release_cancel.wait()
+        return {"resultType": "complete"}
+
+    client.request = request  # type: ignore[method-assign]
+    task = asyncio.create_task(
+        client.call_tool("long-running", {}, modern_task_state_callback=blocked_save)
+    )
+    try:
+        await asyncio.wait_for(save_started.wait(), 1)
+        task.cancel()
+        await asyncio.wait_for(cancel_started.wait(), 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release_cancel.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert methods == ["tools/call", "tasks/cancel"]
+
+
+@pytest.mark.asyncio
 async def test_resumed_task_save_failure_preserves_remote_task() -> None:
     client = MCPClient(MCPServerConfig(name="modern", command="fake", args=[], env={}))
     client.protocol_version = "2026-07-28"

@@ -3106,16 +3106,17 @@ class MCPClient:
         answered_inputs = dict(answered_inputs or {})
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        await self._persist_modern_task_state(
-            state_callback,
-            task,
-            answered_inputs,
-            cancel_on_failure=cancel_on_persistence_failure,
-        )
-        subscription_started = task["status"] in {"working", "input_required"}
-        if subscription_started:
-            self._start_modern_task_subscription(task_id)
+        subscription_started = False
         try:
+            await self._persist_modern_task_state(
+                state_callback,
+                task,
+                answered_inputs,
+                cancel_on_failure=cancel_on_persistence_failure,
+            )
+            subscription_started = task["status"] in {"working", "input_required"}
+            if subscription_started:
+                self._start_modern_task_subscription(task_id)
             while task["status"] in {"working", "input_required"}:
                 if task["status"] == "input_required":
                     raw_requests = task.get("inputRequests")
