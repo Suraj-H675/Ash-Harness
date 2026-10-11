@@ -9036,6 +9036,96 @@ async def test_parallel_completed_read_remains_known_after_sibling_cancellation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["reported", "unknown", "invalid_args", "exception"]
+)
+async def test_cancelled_tool_error_hook_does_not_erase_known_tool_failure(
+    tmp_path, failure: str
+) -> None:
+    from ash.core.checkpoints import recover_interrupted_turns
+    from ash.tools.filesystem import WriteFileTool
+
+    class ExplodingTool(BaseTool):
+        name = "exploding_tool"
+        args_schema = None
+
+        async def run(self, **kwargs):
+            raise RuntimeError("known execution exception")
+
+    hook_started = asyncio.Event()
+
+    async def blocked_error_hook(_payload):
+        hook_started.set()
+        await asyncio.Event().wait()
+
+    hooks = HookRegistry()
+    hooks.register_lifecycle(LifecycleHook("tool_error", blocked_error_hook))
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "error-hook-cancel.db")
+    tools = {
+        "reported_failure": ReportedFailureTool(guard),
+        "write_file": WriteFileTool(guard),
+        "exploding_tool": ExplodingTool(guard),
+    }
+    name, arguments, error_fragment = {
+        "reported": ("reported_failure", {}, "reported failure"),
+        "unknown": ("missing_tool", {}, "Unknown tool"),
+        "invalid_args": (
+            "write_file",
+            {"content": "missing path"},
+            "Invalid tool arguments",
+        ),
+        "exception": ("exploding_tool", {}, "known execution exception"),
+    }[failure]
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(),
+        tmp_path,
+        tools=tools,
+        hooks=hooks,
+        safety_tier="auto_approve",
+    )
+    call = {"call_id": "known-failure", "name": name, "arguments": arguments}
+    try:
+        session = await loop.start_session()
+        turn_id = "error-hook-interruption"
+        loop.turn_context = TurnContext(session.session_id, turn_id)
+        store.start_turn(session.session_id, turn_id, "call failing tool")
+        store.save_message(
+            session.session_id,
+            Message(
+                role="assistant",
+                content="",
+                timestamp=datetime.now(timezone.utc),
+                metadata={"tool_calls": [call]},
+            ),
+            turn_id=turn_id,
+        )
+        task = asyncio.create_task(
+            loop._execute_tool_calls([call], session, persist_tool_messages=True)
+        )
+        await asyncio.wait_for(hook_started.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        durable = store.load_session(session.session_id)
+        assert error_fragment in (durable.tool_calls[0].error or "")
+        assert durable.tool_calls[0].executed is (failure in {"reported", "exception"})
+        assert [
+            message.metadata["call_id"]
+            for message in durable.messages
+            if message.role == "tool"
+        ] == ["known-failure"]
+        summary = recover_interrupted_turns(store, guard, session.session_id)
+        assert summary.unknown_calls == ()
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_parallel_read_only_calls_drain_siblings_after_repeated_cancellation(
     tmp_path,
 ):

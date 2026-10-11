@@ -5622,13 +5622,6 @@ class AshLoop:
                 self._emit_event(
                     {"type": "tool.error", **event_base, "error": record.error}
                 )
-                await self._fire_tool_error_hook(
-                    session,
-                    call_id=record.call_id,
-                    tool_name=tool_name,
-                    arguments=record.arguments,
-                    error=record.error,
-                )
                 result_payload = self._tool_result_payload(
                     {
                         "success": False,
@@ -5645,6 +5638,13 @@ class AshLoop:
                         result=result_payload,
                     )
                 results.append(result_payload)
+                await self._fire_tool_error_hook(
+                    session,
+                    call_id=record.call_id,
+                    tool_name=tool_name,
+                    arguments=record.arguments,
+                    error=record.error,
+                )
                 self.circuit_breaker.record_failure(tool_name)
                 continue
 
@@ -5678,13 +5678,6 @@ class AshLoop:
                 self._emit_event(
                     {"type": "tool.error", **event_base, "error": record.error}
                 )
-                await self._fire_tool_error_hook(
-                    session,
-                    call_id=record.call_id,
-                    tool_name=tool_name,
-                    arguments=record.arguments,
-                    error=record.error,
-                )
                 result_payload = self._tool_result_payload(
                     {
                         "success": False,
@@ -5701,6 +5694,13 @@ class AshLoop:
                         result=result_payload,
                     )
                 results.append(result_payload)
+                await self._fire_tool_error_hook(
+                    session,
+                    call_id=record.call_id,
+                    tool_name=tool_name,
+                    arguments=record.arguments,
+                    error=record.error,
+                )
                 self.circuit_breaker.record_failure(tool_name)
                 continue
 
@@ -6013,13 +6013,6 @@ class AshLoop:
                         "replay_policy": replay_policy,
                     }
                 )
-                await self._fire_tool_error_hook(
-                    session,
-                    call_id=record.call_id,
-                    tool_name=tool_name,
-                    arguments=record.arguments,
-                    error=error,
-                )
                 result_payload = self._tool_result_payload(
                     {
                         "success": False,
@@ -6036,6 +6029,13 @@ class AshLoop:
                         result=result_payload,
                     )
                 results.append(result_payload)
+                await self._fire_tool_error_hook(
+                    session,
+                    call_id=record.call_id,
+                    tool_name=tool_name,
+                    arguments=record.arguments,
+                    error=error,
+                )
                 self.circuit_breaker.record_failure(tool_name)
                 continue
             finally:
@@ -6091,15 +6091,6 @@ class AshLoop:
                     "replay_policy": replay_policy,
                 }
             )
-            if not tool_result.success:
-                await self._fire_tool_error_hook(
-                    session,
-                    call_id=record.call_id,
-                    tool_name=tool_name,
-                    arguments=record.arguments,
-                    error=tool_result.error or "tool reported failure",
-                )
-
             result_payload = self._tool_result_payload(
                 {
                     "success": tool_result.success,
@@ -6139,6 +6130,14 @@ class AshLoop:
                     result=result_payload,
                 )
             results.append(result_payload)
+            if not tool_result.success:
+                await self._fire_tool_error_hook(
+                    session,
+                    call_id=record.call_id,
+                    tool_name=tool_name,
+                    arguments=record.arguments,
+                    error=tool_result.error or "tool reported failure",
+                )
             if not tool_started:
                 continue
             self._record_repo_map_activity(tool_name, arguments, tool_result)
