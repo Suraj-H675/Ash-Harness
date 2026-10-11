@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 
@@ -681,6 +682,151 @@ async def test_startup_recovery_compensates_only_the_pending_file_call(
     assert report["compensated_calls"] == ["call-pending"]
     assert (
         recover_interrupted_turns(store, guard, session.session_id).interrupted_turns
+        == 0
+    )
+
+
+def test_recovery_retry_after_restoration_but_failed_database_commit(tmp_path) -> None:
+    """A rolled-back DB recovery commit must not undo a completed restoration."""
+    import sqlite3
+
+    from ash.core.session import get_db_connection
+
+    file = tmp_path / "changed.txt"
+    file.write_text("before", encoding="utf-8")
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "interrupted-edit"
+    call_id = "call-edit"
+    store.start_turn(session.session_id, turn_id, "edit")
+    store.save_tool_call(
+        session.session_id,
+        _tool_record(call_id, "whole_edit", executed=False),
+        turn_id=turn_id,
+    )
+    store.save_file_checkpoint(
+        session.session_id,
+        turn_id,
+        "whole_edit",
+        str(file),
+        existed=True,
+        before_content=b"before",
+        before_mode=file.stat().st_mode,
+        call_id=call_id,
+    )
+    file.write_text("after", encoding="utf-8")
+    store.finish_file_checkpoint(
+        session.session_id,
+        turn_id,
+        str(file),
+        hashlib.sha256(b"after").hexdigest(),
+        call_id=call_id,
+    )
+    with get_db_connection(store.db_path) as conn:
+        conn.executescript(
+            "CREATE TRIGGER fail_recovery_commit BEFORE UPDATE ON turn_journal "
+            "WHEN NEW.recovery_json != '{}' BEGIN "
+            "SELECT RAISE(ABORT, 'injected recovery commit failure'); END;"
+        )
+
+    with pytest.raises(
+        sqlite3.IntegrityError, match="injected recovery commit failure"
+    ):
+        recover_interrupted_turns(store, SafetyGuard(tmp_path), session.session_id)
+
+    assert file.read_text(encoding="utf-8") == "before"
+    assert len(store.pending_tool_calls(session.session_id, turn_id)) == 1
+    assert store.interrupted_recovery_reports(session.session_id) == []
+    assert store.list_audit_logs(session.session_id) == []
+    assert store.file_checkpoints_for_call(session.session_id, turn_id, call_id)
+
+    with get_db_connection(store.db_path) as conn:
+        conn.execute("DROP TRIGGER fail_recovery_commit")
+
+    summary = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), session.session_id
+    )
+    assert summary.interrupted_turns == 1
+    assert summary.compensated_calls == 1
+    assert summary.unknown_calls == ()
+    assert file.read_text(encoding="utf-8") == "before"
+    assert len(store.list_audit_logs(session.session_id)) == 1
+    assert len(store.interrupted_recovery_reports(session.session_id)) == 1
+    assert store.verify_audit_log(session.session_id) == []
+    assert (
+        recover_interrupted_turns(
+            store, SafetyGuard(tmp_path), session.session_id
+        ).interrupted_turns
+        == 0
+    )
+
+
+def test_recovery_resumes_after_process_exit_midway_through_multi_file_restore(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovery resumes a partly restored patch without rerunning the edit."""
+    import ash.core.checkpoints as checkpoints
+
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id, call_id = "incomplete-patch", "call-patch"
+    store.start_turn(session.session_id, turn_id, "patch files")
+    store.save_tool_call(
+        session.session_id,
+        _tool_record(call_id, "apply_patch", executed=False),
+        turn_id=turn_id,
+    )
+    paths = [tmp_path / "a.txt", tmp_path / "b.txt"]
+    for path in paths:
+        path.write_text("before", encoding="utf-8")
+        store.save_file_checkpoint(
+            session.session_id,
+            turn_id,
+            "apply_patch",
+            str(path),
+            existed=True,
+            before_content=b"before",
+            before_mode=path.stat().st_mode,
+            call_id=call_id,
+        )
+        path.write_text("after", encoding="utf-8")
+        store.finish_file_checkpoint(
+            session.session_id,
+            turn_id,
+            str(path),
+            hashlib.sha256(b"after").hexdigest(),
+            call_id=call_id,
+        )
+
+    original_apply = checkpoints._apply_checkpoint_rows
+
+    def halt_after_first_restore(rows, guard, originals, rollback_expected):
+        original_apply(rows[:1], guard, originals, rollback_expected)
+        raise SystemExit("simulated hard stop after first restored file")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(checkpoints, "_apply_checkpoint_rows", halt_after_first_restore)
+        with pytest.raises(SystemExit, match="simulated hard stop"):
+            recover_interrupted_turns(store, SafetyGuard(tmp_path), session.session_id)
+
+    assert {path.read_text(encoding="utf-8") for path in paths} == {"before", "after"}
+    assert store.pending_tool_calls(session.session_id, turn_id)
+    assert store.interrupted_recovery_reports(session.session_id) == []
+
+    summary = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), session.session_id
+    )
+    assert summary.interrupted_turns == 1
+    assert summary.compensated_calls == 1
+    assert summary.unknown_calls == ()
+    assert all(path.read_text(encoding="utf-8") == "before" for path in paths)
+    assert len(store.list_audit_logs(session.session_id)) == 1
+    assert len(store.interrupted_recovery_reports(session.session_id)) == 1
+    assert store.verify_audit_log(session.session_id) == []
+    assert (
+        recover_interrupted_turns(
+            store, SafetyGuard(tmp_path), session.session_id
+        ).interrupted_turns
         == 0
     )
 
