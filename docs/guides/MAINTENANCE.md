@@ -62,6 +62,20 @@ Restore only after inspecting the backup and explicitly confirming:
 Backups cover the session database. They are not a replacement for backing up
 all of ~/.ash when you need a complete user-state archive.
 
+### Recovery after suspected SQLite corruption on 0.4.0
+
+Ash 0.4.0 could release SQLite advisory locks when multiple Ash processes used
+the same database, potentially invalidating active WAL state. Upgrade to 0.4.1
+before resuming concurrent processes. The upgrade prevents the reproduced
+failure path; it cannot repair previously damaged data.
+
+If database corruption is suspected, stop all Ash processes using that profile
+and preserve a copy of the affected files before attempting recovery. Diagnose
+the affected database and restore a verified, consistent backup if needed;
+do not assume a package reinstall will repair it. `ash storage check` and
+`ash storage restore` apply to the session database, not every other Ash-owned
+SQLite database. Back up the complete profile if other durable state is affected.
+
 ### Roll back across a session-schema migration
 
 Installing an older immutable Ash release rolls back the **package**, not a

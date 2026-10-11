@@ -6,6 +6,30 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-11
+
+### Fixed
+- Preserved SQLite advisory locks across concurrent Ash processes. Permission
+  checks no longer open and close extra database/WAL descriptors that could
+  release another live SQLite connection's POSIX locks, unlink active WAL
+  sidecars, or corrupt durable state.
+- Settled unattended automation cancellation when its monitor finishes but the
+  provider operation remains pending. Cancellation now takes the existing
+  bounded cleanup path and records an interrupted outcome if it cannot prove
+  that the operation stopped.
+- Preserved durable background-agent task state during concurrent tool
+  shutdown; delegating tools no longer close state borrowed from the owning
+  spawn tool.
+- Included still-unresolved interrupted-tool outcomes in resumed headless JSON,
+  stream-JSON, and text output without retrying ambiguous side effects. Error
+  classification remains correct for runtimes without recovery state.
+
+### Upgrade notes
+- This is a package-only upgrade from 0.4.0; the session database schema stays
+  at v19. The SQLite lock fix prevents the reproduced concurrent-process
+  corruption path but does not repair data already damaged under an older
+  version. See [Maintenance and recovery](docs/guides/MAINTENANCE.md).
+
 ## [0.4.0]
 
 ### Upgrade notes
@@ -347,7 +371,8 @@ All notable changes to Ash are documented here. The format follows
 - Fixed duplicate `project.urls` tables so the distribution builds with modern
   `setuptools`; expanded CI across Python 3.11 and 3.12.
 
-[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.0...HEAD
+[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.1...HEAD
+[0.4.1]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.0...ash-v0.4.1
 [0.4.0]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.3.1...ash-v0.4.0
 [0.3.1]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.3.0...ash-v0.3.1
 [0.2.0]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.1.0...ash-v0.2.0
