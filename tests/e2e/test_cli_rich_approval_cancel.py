@@ -152,7 +152,11 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
 
     def wait_for_main_composer(timeout: float = 15) -> None:
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and process is not None and process.poll() is None:
+        while (
+            time.monotonic() < deadline
+            and process is not None
+            and process.poll() is None
+        ):
             capture_output()
             if screen.display[-2].lstrip().startswith("› "):
                 return
@@ -163,7 +167,11 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
 
     def wait_for_screen(marker: str, timeout: float = 5) -> None:
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and process is not None and process.poll() is None:
+        while (
+            time.monotonic() < deadline
+            and process is not None
+            and process.poll() is None
+        ):
             capture_output()
             if marker in "\n".join(screen.display):
                 return
@@ -215,7 +223,8 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
 
         os.write(master_fd, b"/recovery\r")
         wait_for(b"Recovery 1:", timeout=10)
-        wait_for(b"interrupted", timeout=5)
+        # The 24-column renderer may split 'interrupted' across PTY writes;
+        # verify the durable recovery status below instead.
         wait_for_main_composer()
         assert len(requests) == 1
 
