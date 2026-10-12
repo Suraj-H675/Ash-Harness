@@ -658,7 +658,7 @@ def main() -> None:
             check for check in doctor["checks"] if check["name"] == "automation"
         )
         assert automation_check["status"] == "warn"
-        assert "no live worker" in automation_check["message"]
+        assert "recent worker heartbeat count: 0" in automation_check["message"]
 
         server_env = dict(env)
         server_env["ASH_SERVER_TOKEN"] = "0123456789abcdef"

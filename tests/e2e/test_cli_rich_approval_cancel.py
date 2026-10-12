@@ -196,7 +196,10 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
         os.write(master_fd, b"please run the fixture command\r")
         wait_for(b"Allow once", timeout=25)
         os.write(master_fd, b"\x1b[A")
-        wait_for_screen("Allow scope (session)")
+        # The option label is already visible before the Up key is processed.
+        # Wait for the selection indicator and the associated description.
+        wait_for_screen("> Allow scope (session)")
+        wait_for_screen("Matching scope only.")
         visible_screen = "\n".join(screen.display)
         assert "Matching scope only." in visible_screen
         assert "Esc deny" in visible_screen
