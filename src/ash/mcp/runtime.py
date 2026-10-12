@@ -753,7 +753,9 @@ class MCPTool(BaseTool):
                 **call_options,
             )
         except MCPProtocolError as exc:
-            message = safe_mcp_diagnostic(self._redact_remote_output(str(exc)))
+            message = safe_mcp_diagnostic(
+                self._redact_remote_output(str(exc).strip() or type(exc).__name__)
+            )
             error_payload: dict[str, Any] = {
                 "type": "mcp_protocol_error",
                 "message": message,
@@ -774,7 +776,9 @@ class MCPTool(BaseTool):
                 outcome=ToolExecutionOutcome.UNKNOWN,
             )
         except Exception as exc:  # noqa: BLE001 - prevent unsafe automatic replay
-            message = safe_mcp_diagnostic(self._redact_remote_output(str(exc)))
+            message = safe_mcp_diagnostic(
+                self._redact_remote_output(str(exc).strip() or type(exc).__name__)
+            )
             output = _json_dump(
                 {
                     "error": {

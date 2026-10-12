@@ -1450,10 +1450,277 @@ async def test_mcp_task_timeout_cancels_remote_task() -> None:
     request.side_effect = request_side_effect
     client._task_poll_delay = lambda task: 1.0  # type: ignore[method-assign]
 
-    with pytest.raises(MCPTaskTimeout):
+    with pytest.raises(MCPTaskTimeout) as timeout_error:
         await client.call_tool("slow", {}, as_task=True)
 
     assert request.await_args_list[-1].args[:2] == ("tasks/cancel", {"taskId": "slow"})
+    assert timeout_error.value.task_id == "slow"
+    assert timeout_error.value.last_status == "working"
+    assert "remote completion may still occur" in str(timeout_error.value)
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_uses_exception_class_for_empty_timeout_diagnostic(
+    tmp_path: Path,
+) -> None:
+    client = StubMCPClient({})
+
+    async def timeout_call(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        raise asyncio.TimeoutError()
+
+    client.call_tool = timeout_call  # type: ignore[method-assign]
+    tool = _mcp_tool(
+        tmp_path,
+        client,
+        input_schema={"type": "object"},
+        protocol_version="2026-07-28",
+    )
+
+    result = await tool.run()
+
+    assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
+    assert result.error == "TimeoutError"
+    assert json.loads(result.output)["error"]["message"] == "TimeoutError"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_modern_task_handle_survives_restart_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.context.turn import TurnContext
+
+    database_path = tmp_path / "sessions.db"
+    store = SessionStore(database_path)
+    server_name = "billing"
+    task_id = "remote-task-unknown"
+    tool_name = "refund"
+    config = MCPServerConfig(name=server_name, command="fake", args=[], env={})
+    first_client = MCPClient(config)
+    first_client.protocol_version = "2026-07-28"
+    first_client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    first_client.timeout = 0.01
+    monkeypatch.setattr(first_client, "_modern_task_poll_delay", lambda _task: 1.0)
+    dispatched: list[str] = []
+    effects: list[str] = []
+
+    async def first_request(method: str, params: dict, **kwargs: Any) -> dict:
+        del kwargs
+        dispatched.append(method)
+        if method == "tools/call":
+            if params["arguments"].get("mode") == "lost-response":
+                effects.append("lost-response-effect")
+                raise MCPProtocolError("simulated response loss after remote effect")
+            effects.append("refund")
+            assert params == {"name": tool_name, "arguments": {}}
+            return {
+                "resultType": "task",
+                "taskId": task_id,
+                "status": "working",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:01Z",
+                "ttlMs": 60_000,
+                "pollIntervalMs": 1_000,
+            }
+        if method == "tasks/cancel":
+            assert params == {"taskId": task_id}
+            raise MCPProtocolError("simulated cancellation transport failure")
+        raise AssertionError(f"unexpected first-process MCP request: {method}")
+
+    first_client.request = first_request  # type: ignore[method-assign]
+    guard = SafetyGuard(tmp_path)
+    loop = AshLoop(
+        session_store=store,
+        provider=IdleProvider(),
+        safety_guard=guard,
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+    runtime = MCPRuntime({}, guard)
+    runtime.clients[server_name] = first_client
+    loop._mcp_runtime = runtime
+
+    async def approve(_name: str, _arguments: dict[str, Any]) -> bool:
+        return True
+
+    loop.on_tool_approval = approve
+    tool = MCPTool(
+        guard,
+        client=first_client,
+        server_name=server_name,
+        definition={
+            "name": tool_name,
+            "description": "A simulated remote refund",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"mode": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+        protocol_version="2026-07-28",
+        task_state_handler=loop._persist_mcp_task_state,
+    )
+    loop.tools[tool.name] = tool
+    session = await loop.start_session()
+    turn_id = "turn-timeout"
+    call_id = "call-timeout"
+    lost_response_call_id = "call-lost-response"
+    store.start_turn(session.session_id, turn_id, "refund the remote invoice")
+    loop.turn_context = TurnContext(session.session_id, turn_id)
+
+    try:
+        results = await loop._execute_tool_calls(
+            [
+                {"call_id": call_id, "name": tool.name, "arguments": {}},
+                {
+                    "call_id": lost_response_call_id,
+                    "name": tool.name,
+                    "arguments": {"mode": "lost-response"},
+                },
+            ],
+            session,
+            persist_tool_messages=True,
+        )
+
+        assert len(results) == 2
+        assert "ambiguous" in str(results[0]["error"]).lower()
+        assert task_id in str(results[0]["error"])
+        assert "cancellation could not be confirmed" in str(results[0]["error"])
+        assert "ambiguous" in str(results[1]["error"]).lower()
+        assert "simulated response loss after remote effect" in str(results[1]["error"])
+        assert dispatched == ["tools/call", "tasks/cancel", "tools/call"]
+        assert effects == ["refund", "lost-response-effect"]
+        handles = store.list_ambiguous_mcp_task_handles(str(tmp_path))
+        assert len(handles) == 1
+        assert handles[0].task_id == task_id
+        assert handles[0].session_id == session.session_id
+        assert handles[0].call_id == call_id
+        assert handles[0].last_status == "working"
+
+        audit = store.list_audit_logs(session.session_id)
+        tool_logs = [
+            item
+            for item in audit
+            if item.target_resource == tool.name and item.action_type == "tool_call"
+        ]
+        timeout_log = next(
+            item for item in tool_logs if item.details["call_id"] == call_id
+        )
+        lost_response_log = next(
+            item
+            for item in tool_logs
+            if item.details["call_id"] == lost_response_call_id
+        )
+        assert timeout_log.details["ambiguous"] is True
+        assert timeout_log.details["replayed"] is False
+        assert task_id in timeout_log.details["error"]
+        assert lost_response_log.details["ambiguous"] is True
+        assert lost_response_log.details["replayed"] is False
+        assert "simulated response loss" in lost_response_log.details["error"]
+
+        crash_gap_call_id = "call-final-save-gap"
+        crash_gap_task_id = "remote-task-final-save-gap"
+        crash_gap_turn_id = "turn-final-save-gap"
+        store.start_turn(
+            session.session_id,
+            crash_gap_turn_id,
+            "check the interrupted remote refund",
+        )
+        store.save_tool_call(
+            session.session_id,
+            ToolCallRecord(
+                call_id=crash_gap_call_id,
+                tool_name=tool.name,
+                arguments={},
+                approved=True,
+                executed=True,
+                dispatched=True,
+                error="Tool outcome is ambiguous; Ash did not retry.",
+                timestamp=datetime.now(timezone.utc),
+            ),
+            turn_id=crash_gap_turn_id,
+        )
+        store.save_mcp_task(
+            task_id=crash_gap_task_id,
+            session_id=session.session_id,
+            turn_id=crash_gap_turn_id,
+            call_id=crash_gap_call_id,
+            server_name=server_name,
+            remote_tool_name=tool_name,
+            contract_fingerprint=tool.contract_fingerprint(),
+            server_fingerprint=mcp_server_fingerprint(
+                first_client.config, first_client.server_info
+            ),
+            protocol_version="2026-07-28",
+            task={
+                "taskId": crash_gap_task_id,
+                "status": "working",
+                "createdAt": "2026-09-20T00:00:00Z",
+                "lastUpdatedAt": "2026-09-20T00:00:01Z",
+                "ttlMs": 60_000,
+            },
+            answered_inputs={},
+        )
+    finally:
+        await loop.aclose()
+
+    reopened_store = SessionStore(database_path)
+    recovery_client = MCPClient(config)
+    recovery_client.protocol_version = "2026-07-28"
+    recovery_client.server_capabilities = {
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    }
+    recovery_requests: list[str] = []
+
+    async def recovery_request(method: str, params: dict, **kwargs: Any) -> dict:
+        del params, kwargs
+        recovery_requests.append(method)
+        raise AssertionError(f"archived task must not be queried: {method}")
+
+    recovery_client.request = recovery_request  # type: ignore[method-assign]
+    recovery_guard = SafetyGuard(tmp_path)
+    recovery_tool = MCPTool(
+        recovery_guard,
+        client=recovery_client,
+        server_name=server_name,
+        definition={
+            "name": tool_name,
+            "description": "A simulated remote refund",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"mode": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+        protocol_version="2026-07-28",
+    )
+    recovery_runtime = MCPRuntime({}, recovery_guard)
+    recovery_runtime.clients[server_name] = recovery_client
+    recovered_loop = AshLoop(
+        session_store=reopened_store,
+        provider=IdleProvider(),
+        safety_guard=recovery_guard,
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+    recovered_loop._mcp_runtime = recovery_runtime
+    recovered_loop.tools[recovery_tool.name] = recovery_tool
+    try:
+        await recovered_loop.start_session(session.session_id)
+        await recovered_loop.start_session()
+        assert recovery_requests == []
+        assert effects == ["refund", "lost-response-effect"]
+        assert {
+            item.task_id
+            for item in reopened_store.list_ambiguous_mcp_task_handles(str(tmp_path))
+        } == {task_id, crash_gap_task_id}
+        assert reopened_store.list_mcp_tasks(session.session_id) == []
+    finally:
+        await recovered_loop.aclose()
 
 
 @pytest.mark.asyncio
@@ -2801,10 +3068,87 @@ async def test_loop_falls_back_to_unknown_for_legacy_v12_mcp_task(
         recovered = await loop.start_session(session.session_id)
 
         assert store.list_mcp_tasks(session.session_id) == []
+        assert [
+            handle.task_id
+            for handle in store.list_ambiguous_mcp_task_handles(str(tmp_path))
+        ] == [task_id]
         call = next(call for call in recovered.tool_calls if call.call_id == call_id)
         assert call.executed is True
         assert call.error is not None
         assert "outcome is unknown" in call.error
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_loop_preserves_task_handle_when_call_record_is_missing(
+    tmp_path: Path,
+) -> None:
+    from ash.core.session import Message
+
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-missing-call"
+    call_id = "call-missing-record"
+    task_id = "task-missing-call-record"
+    store.start_turn(session.session_id, turn_id, "recover remote task")
+    store.save_message(
+        session.session_id,
+        Message(
+            role="assistant",
+            content="calling remote tool",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "tool_calls": [
+                    {
+                        "call_id": call_id,
+                        "name": "mcp__server__long",
+                        "arguments": {},
+                    }
+                ]
+            },
+        ),
+        turn_id=turn_id,
+    )
+    store.save_mcp_task(
+        task_id=task_id,
+        session_id=session.session_id,
+        turn_id=turn_id,
+        call_id=call_id,
+        server_name="server",
+        remote_tool_name="long",
+        contract_fingerprint="contract",
+        server_fingerprint="server-fingerprint",
+        protocol_version="2026-07-28",
+        task={
+            "taskId": task_id,
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+        },
+        answered_inputs={},
+    )
+    loop = AshLoop(
+        session_store=store,
+        provider=IdleProvider(),
+        safety_guard=SafetyGuard(tmp_path),
+        ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+        project_root=tmp_path,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="waiting for durable MCP task recovery"):
+            await loop.start_session(session.session_id)
+
+        assert [row["task_id"] for row in store.list_mcp_tasks(session.session_id)] == [
+            task_id
+        ]
+        handles = store.list_persisted_mcp_task_handles(str(tmp_path))
+        assert len(handles) == 1
+        assert handles[0].task_id == task_id
+        assert handles[0].disposition == "active"
+        assert store.tool_call_for_recovery(session.session_id, turn_id, call_id) is None
     finally:
         await loop.aclose()
 

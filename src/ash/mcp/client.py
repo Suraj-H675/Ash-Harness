@@ -179,6 +179,17 @@ class _EndpointDiscovered(Exception):
 class MCPTaskTimeout(MCPProtocolError):
     """A task-augmented operation exceeded the configured task wait limit."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        task_id: str | None = None,
+        last_status: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.task_id = task_id
+        self.last_status = last_status
+
 
 class MCPTaskTerminalError(MCPProtocolError):
     """A durable MCP task reached a non-success terminal state."""
@@ -3059,9 +3070,17 @@ class MCPClient:
             detail = f": {task['statusMessage']}" if task.get("statusMessage") else ""
             raise MCPProtocolError(f"MCP tool task {status}{detail}")
         except asyncio.TimeoutError as exc:
-            await self._cancel_mcp_task(task_id)
+            cancellation_sent = await self._cancel_mcp_task(task_id)
+            cancel_detail = (
+                "cancellation was requested; remote completion may still occur"
+                if cancellation_sent
+                else "cancellation could not be confirmed; remote completion may still occur"
+            )
             raise MCPTaskTimeout(
-                f"MCP tool task timed out after {wait_timeout} seconds"
+                f"MCP tool task timed out after {wait_timeout} seconds "
+                f"(taskId={task_id}, last observed status={status}); {cancel_detail}",
+                task_id=task_id,
+                last_status=status,
             ) from exc
         except asyncio.CancelledError as cancellation:
             cancel_task = asyncio.create_task(
@@ -3261,10 +3280,25 @@ class MCPClient:
                 f"MCP tool task {task['status']}{detail}"
             )
         except asyncio.TimeoutError as exc:
+            cancellation_sent = False
             if cancel_on_timeout:
-                await self._cancel_mcp_task(task_id)
+                cancellation_sent = await self._cancel_mcp_task(task_id)
+                cancel_detail = (
+                    "cancellation was requested; remote completion may still occur"
+                    if cancellation_sent
+                    else "cancellation could not be confirmed; remote completion may still occur"
+                )
+            else:
+                cancel_detail = (
+                    "cancellation was not requested during recovery; "
+                    "remote completion may still occur"
+                )
             raise MCPTaskTimeout(
-                f"MCP tool task timed out after {timeout} seconds"
+                f"MCP tool task timed out after {timeout} seconds "
+                f"(taskId={task_id}, last observed status={task['status']}); "
+                f"{cancel_detail}",
+                task_id=task_id,
+                last_status=task["status"],
             ) from exc
         except asyncio.CancelledError as cancellation:
             if cancel_on_cancellation:
@@ -3343,21 +3377,28 @@ class MCPClient:
             await callback(dict(task), dict(answered_inputs))
         except Exception as exc:
             if cancel_on_failure:
-                await self._cancel_mcp_task(task["taskId"])
-                detail = "cancellation was requested"
+                cancellation_sent = await self._cancel_mcp_task(task["taskId"])
+                detail = (
+                    "cancellation was requested"
+                    if cancellation_sent
+                    else "cancellation could not be confirmed"
+                )
             else:
                 detail = "existing remote task was preserved"
             raise MCPProtocolError(
-                f"MCP task state could not be persisted; {detail}"
+                "MCP task state could not be persisted "
+                f"(taskId={task['taskId']}, last observed status={task['status']}); "
+                f"{detail}"
             ) from exc
 
-    async def _cancel_mcp_task(self, task_id: str) -> None:
+    async def _cancel_mcp_task(self, task_id: str) -> bool:
         try:
             await self.request(
                 "tasks/cancel", {"taskId": task_id}, _allow_session_recovery=False
             )
+            return True
         except (MCPProtocolError, httpx.HTTPError, OSError):
-            return
+            return False
 
     async def cancel_mcp_task(self, task_id: str) -> dict[str, Any]:
         if not isinstance(task_id, str) or not task_id:

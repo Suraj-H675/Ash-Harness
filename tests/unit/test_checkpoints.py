@@ -959,6 +959,33 @@ def test_startup_recovery_flags_non_file_tool_outcome_as_unknown(tmp_path) -> No
     assert "outcome is unknown" in (recovered.error or "")
 
 
+def test_startup_recovery_directs_ambiguous_mcp_calls_to_remote_service(
+    tmp_path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "refund an invoice")
+    store.save_tool_call(
+        session.session_id,
+        _tool_record("call-refund", "mcp__billing__refund", executed=False),
+        turn_id="turn-1",
+    )
+
+    summary = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), session.session_id
+    )
+
+    assert summary.needs_attention is True
+    recovered = store.load_session(session.session_id).tool_calls[0]
+    assert "remote service" in (recovered.error or "")
+    assert "Inspect the workspace" not in (recovered.error or "")
+    assert "did not replay" in (recovered.error or "")
+    audit = store.list_audit_logs(session.session_id)
+    recovery_audit = next(item for item in audit if item.target_resource == recovered.tool_name)
+    assert recovery_audit.details["ambiguous"] is True
+    assert recovery_audit.details["replayed"] is False
+
+
 def test_recovery_marks_an_unstarted_approved_intent_as_not_run(tmp_path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     session = store.create_session(str(tmp_path))

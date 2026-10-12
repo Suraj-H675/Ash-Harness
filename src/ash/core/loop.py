@@ -2719,7 +2719,10 @@ class AshLoop:
                 call_id,
             )
             if call is None:
-                self.session_store.delete_mcp_task(server_name, task_id)
+                # The durable task itself proves tools/call returned a remote
+                # task ID. Keep it and stop session recovery instead of letting
+                # transcript-only recovery assume the call was never dispatched.
+                deferred.add(call_id)
                 continue
             tool_name = str(call["tool_name"])
             stored_output = str(call["result"] or "")
@@ -2750,6 +2753,7 @@ class AshLoop:
                     call_id=call_id,
                     tool_name=tool_name,
                     success=stored_error is None,
+                    ambiguous=stored_error is not None,
                     result=stored_output,
                     error=stored_error,
                     message=message,
@@ -2766,20 +2770,26 @@ class AshLoop:
                 tool_name not in {expected_tool_name, legacy_tool_name}
                 or not bool(call["dispatched"])
             ):
-                self.session_store.delete_mcp_task(server_name, task_id)
+                # Inconsistent local identity cannot justify dropping the task
+                # handle or treating this call as unstarted.
+                deferred.add(call_id)
                 continue
             if not persisted_server_fingerprint:
                 # v12 rows predate server-identity binding.  Do not send their
-                # task IDs to any current server; generic recovery will mark
-                # the dispatched call outcome unknown without replaying it.
-                self.session_store.delete_mcp_task(server_name, task_id)
+                # task IDs to any current server. Preserve the ID locally;
+                # generic recovery will mark the dispatched call unknown.
+                self.session_store.archive_ambiguous_mcp_task_handle(
+                    session_id, call_id
+                )
                 continue
 
             try:
                 persisted_task = json.loads(str(row["task_json"]))
                 answered_inputs = json.loads(str(row["answered_inputs_json"] or "{}"))
             except (TypeError, json.JSONDecodeError):
-                self.session_store.delete_mcp_task(server_name, task_id)
+                self.session_store.archive_ambiguous_mcp_task_handle(
+                    session_id, call_id
+                )
                 continue
             if (
                 not isinstance(persisted_task, dict)
@@ -2790,7 +2800,9 @@ class AshLoop:
                     for key, value in answered_inputs.items()
                 )
             ):
-                self.session_store.delete_mcp_task(server_name, task_id)
+                self.session_store.archive_ambiguous_mcp_task_handle(
+                    session_id, call_id
+                )
                 continue
 
             tool = self.tools.get(expected_tool_name)
@@ -2909,6 +2921,7 @@ class AshLoop:
                 call_id=call_id,
                 tool_name=tool_name,
                 success=tool_result.success,
+                ambiguous=tool_result.outcome is ToolExecutionOutcome.UNKNOWN,
                 result=tool_result.output,
                 error=tool_result.error,
                 message=message,
@@ -5999,6 +6012,7 @@ class AshLoop:
                         turn_id=(
                             self.turn_context.turn_id if self.turn_context else None
                         ),
+                        archive_ambiguous_mcp_task=dispatched,
                     )
                 self._append_tool_audit(
                     session,
@@ -6034,6 +6048,7 @@ class AshLoop:
                     },
                     record,
                     defer_terminal_persistence=defer_terminal_persistence,
+                    archive_ambiguous_mcp_task=dispatched,
                 )
                 if persist_tool_messages:
                     self._persist_deferred_tool_result(
@@ -6065,6 +6080,7 @@ class AshLoop:
                     session.session_id,
                     record,
                     turn_id=self.turn_context.turn_id if self.turn_context else None,
+                    archive_ambiguous_mcp_task=ambiguous,
                 )
             self._append_tool_audit(
                 session,
@@ -6135,6 +6151,7 @@ class AshLoop:
                 },
                 record,
                 defer_terminal_persistence=defer_terminal_persistence,
+                archive_ambiguous_mcp_task=ambiguous,
             )
             if persist_tool_messages:
                 self._persist_deferred_tool_result(
@@ -6191,9 +6208,12 @@ class AshLoop:
         record: ToolCallRecord,
         *,
         defer_terminal_persistence: bool,
+        archive_ambiguous_mcp_task: bool = False,
     ) -> dict[str, Any]:
         if defer_terminal_persistence:
             payload["_terminal_record"] = record.model_copy(deep=True)
+            if archive_ambiguous_mcp_task:
+                payload["_archive_ambiguous_mcp_task"] = True
         return payload
 
     def _persist_deferred_tool_result(
@@ -6206,9 +6226,10 @@ class AshLoop:
         record = result.get("_terminal_record")
         if not isinstance(record, ToolCallRecord):
             raise RuntimeError("deferred tool result is missing terminal record")
-        visible_result = {
-            key: value for key, value in result.items() if key != "_terminal_record"
-        }
+        archive_ambiguous_mcp_task = bool(
+            result.pop("_archive_ambiguous_mcp_task", False)
+        )
+        visible_result = {key: value for key, value in result.items() if key != "_terminal_record"}
         tool_message = Message(
             role="tool",
             content=_render_tool_response(
@@ -6224,6 +6245,7 @@ class AshLoop:
             record,
             tool_message,
             turn_id=self.turn_context.turn_id if self.turn_context else None,
+            archive_ambiguous_mcp_task=archive_ambiguous_mcp_task,
         )
         result.pop("_terminal_record", None)
         if created:

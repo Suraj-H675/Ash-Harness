@@ -9,7 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 from ash.cli import _repl, _session_usage_lines
-from ash.core.session import Message, SessionStore, SessionUsage, get_db_connection
+from ash.core.session import (
+    Message,
+    SessionStore,
+    SessionUsage,
+    ToolCallRecord,
+    get_db_connection,
+)
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionMode, PermissionPolicy
 from ash.tools.base import ToolResult
@@ -246,6 +252,95 @@ def _persist_turn(
     for message in messages:
         store.save_message(session.session_id, message, turn_id=turn_id)
         session.messages.append(message)
+
+
+@pytest.mark.asyncio
+async def test_mcp_tasks_command_shows_retained_handles_without_live_servers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path), model="ollama/test-model")
+    turn_id = "turn-unknown"
+    call_id = "call-unknown"
+    store.save_mcp_task(
+        task_id="remote-task-unknown",
+        session_id=session.session_id,
+        turn_id=turn_id,
+        call_id=call_id,
+        server_name="billing",
+        remote_tool_name="refund",
+        contract_fingerprint="contract",
+        server_fingerprint="server-fingerprint",
+        protocol_version="2026-07-28",
+        task={
+            "taskId": "remote-task-unknown",
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+        },
+        answered_inputs={},
+    )
+    store.finalize_tool_call_with_message(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name="mcp__billing__refund",
+            arguments={},
+            approved=True,
+            executed=True,
+            dispatched=True,
+            error="Tool outcome is ambiguous; Ash did not retry.",
+            timestamp=datetime.now(timezone.utc),
+        ),
+        Message(
+            role="tool",
+            content="remote result not received",
+            timestamp=datetime.now(timezone.utc),
+            metadata={"call_id": call_id},
+        ),
+        turn_id=turn_id,
+        archive_ambiguous_mcp_task=True,
+    )
+    store.save_mcp_task(
+        task_id="remote-task-active",
+        session_id=session.session_id,
+        turn_id="turn-active",
+        call_id="call-active",
+        server_name="billing",
+        remote_tool_name="reconcile",
+        contract_fingerprint="contract",
+        server_fingerprint="server-fingerprint",
+        protocol_version="2026-07-28",
+        task={
+            "taskId": "remote-task-active",
+            "status": "input_required",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+        },
+        answered_inputs={},
+    )
+
+    assert await _run_repl(
+        tmp_path,
+        monkeypatch,
+        iter(("/mcp tasks", "/exit")),
+        session_store=store,
+        current_session=session,
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "Locally stored MCP task handles" in output
+    assert "not queried" in output
+    assert "remote-task-unknown" in output
+    assert "remote-task-active" in output
+    assert "ambiguous billing" in output
+    assert "active billing" in output
+    assert "last observed status" in output
+    assert "No live MCP servers." in output
 
 
 @pytest.mark.asyncio

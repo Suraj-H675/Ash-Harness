@@ -229,10 +229,18 @@ def _recover_interrupted_turns_locked(
                 )
                 continue
             if tool_name not in EDIT_TOOLS:
-                error = (
-                    "Ash stopped while this tool was running; its outcome is unknown. "
-                    "Inspect the workspace before continuing."
-                )
+                if tool_name.startswith("mcp__"):
+                    error = (
+                        "Ash stopped while this remote MCP tool was running; its "
+                        "outcome is unknown. Inspect the remote service before "
+                        "deciding whether to retry. Ash did not replay the call."
+                    )
+                else:
+                    error = (
+                        "Ash stopped while this tool was running; its outcome is "
+                        "unknown. Inspect the affected system before deciding whether "
+                        "to retry. Ash did not replay the call."
+                    )
                 call_errors[call_id] = error
                 unknown_calls.append(f"{tool_name} ({call_id})")
                 turn_unknown.append({"call_id": call_id, "tool": tool_name})

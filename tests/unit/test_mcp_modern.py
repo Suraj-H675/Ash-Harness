@@ -318,13 +318,16 @@ async def test_modern_task_persistence_failure_requests_cancellation() -> None:
         del task, answered_inputs
         raise OSError("database unavailable")
 
-    with pytest.raises(MCPProtocolError, match="could not be persisted"):
+    with pytest.raises(MCPProtocolError, match="could not be persisted") as error:
         await client._await_modern_tool_task(
             initial,
             timeout=1,
             state_callback=fail_persistence,
         )
 
+    assert "durability-failed" in str(error.value)
+    assert "last observed status=working" in str(error.value)
+    assert "cancellation was requested" in str(error.value)
     assert request.await_count == 1
     assert request.await_args.args == (
         "tasks/cancel",
@@ -808,11 +811,14 @@ async def test_modern_task_timeout_cancels_without_post_deadline_poll(
         "pollIntervalMs": 1000,
     }
 
-    with pytest.raises(MCPTaskTimeout):
+    with pytest.raises(MCPTaskTimeout) as timeout_error:
         await client._await_modern_tool_task(initial, timeout=0.01)
 
     assert [call.args[0] for call in request.await_args_list] == ["tasks/cancel"]
     assert request.await_args.args[1] == {"taskId": "slow-task"}
+    assert timeout_error.value.task_id == "slow-task"
+    assert timeout_error.value.last_status == "working"
+    assert "remote completion may still occur" in str(timeout_error.value)
 
 
 @pytest.mark.asyncio

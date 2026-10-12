@@ -127,6 +127,26 @@ def _mcp_task_cancel_message(task: dict[str, Any]) -> str:
     return f"{server}: {task_id} {task['status']}{suffix}"
 
 
+def _print_persisted_mcp_task_handles(loop: Any) -> None:
+    """Show locally stored MCP task IDs without querying remote servers."""
+
+    handles = loop.session_store.list_persisted_mcp_task_handles(loop.project_root)
+    if not handles:
+        print("No locally stored MCP task handles.")
+        return
+    print("Locally stored MCP task handles (last observed status; not queried):")
+    for handle in handles:
+        print(
+            f"  {safe_mcp_diagnostic(handle.disposition)} "
+            f"{safe_mcp_diagnostic(handle.server_name)}: "
+            f"{safe_mcp_diagnostic(handle.task_id)} "
+            f"{safe_mcp_diagnostic(handle.last_status)}; "
+            f"tool={safe_mcp_diagnostic(handle.remote_tool_name)}; "
+            f"session={safe_mcp_diagnostic(handle.session_id)}; "
+            f"call={safe_mcp_diagnostic(handle.call_id)}"
+        )
+
+
 def _emit_config_diagnostics(config: AshConfig) -> None:
     for diagnostic in config.config_diagnostics:
         print(f"Warning: {diagnostic}", file=sys.stderr)
@@ -2514,6 +2534,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     continue
                 runtime = loop._mcp_runtime
                 if runtime is None:
+                    if action == "tasks":
+                        _print_persisted_mcp_task_handles(loop)
+                        print("No live MCP servers.")
+                        continue
                     print("No live MCP servers.")
                     continue
                 assert runtime is not None
@@ -2669,9 +2693,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             f"{safe_mcp_diagnostic(watch['uri'])}"
                         )
                 elif action == "tasks":
+                    _print_persisted_mcp_task_handles(loop)
                     tasks = await runtime.list_tasks()
                     if not tasks:
-                        print("No MCP tasks.")
+                        print("No live server MCP tasks.")
                     for task in tasks:
                         message = task.get("statusMessage")
                         suffix = (

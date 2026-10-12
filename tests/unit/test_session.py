@@ -217,6 +217,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         "tool_calls",
         "audit_logs",
         "runtime_events",
+        "mcp_task_handles",
     }.issubset(table_names)
     assert {
         "idx_messages_session",
@@ -234,6 +235,7 @@ def test_session_creation_initializes_required_tables(tmp_path: Path) -> None:
         assert {
             "idx_mcp_tasks_session_status",
             "idx_mcp_tasks_session_turn",
+            "idx_mcp_task_handles_session_archived",
         }.issubset(index_names)
         audit_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(audit_logs)")
@@ -713,6 +715,274 @@ def test_mcp_task_state_is_durable_and_updatable(tmp_path: Path) -> None:
 
     store.delete_mcp_task("server", "task-1")
     assert store.list_mcp_tasks(session.session_id) == []
+
+
+def test_ambiguous_mcp_task_archive_is_atomic_and_project_scoped(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    store = SessionStore(db_path)
+    session = store.create_session(str(tmp_path))
+    turn_id = "turn-unknown"
+    call_id = "call-unknown"
+    store.start_turn(session.session_id, turn_id, "refund an invoice")
+    pending = ToolCallRecord(
+        call_id=call_id,
+        tool_name="mcp__billing__refund",
+        arguments={},
+        approved=True,
+        executed=False,
+        dispatched=True,
+        timestamp=datetime.now(timezone.utc),
+    )
+    store.save_tool_call(session.session_id, pending, turn_id=turn_id)
+    store.save_mcp_task(
+        task_id="remote-task-unknown",
+        session_id=session.session_id,
+        turn_id=turn_id,
+        call_id=call_id,
+        server_name="billing",
+        remote_tool_name="refund",
+        contract_fingerprint="contract",
+        server_fingerprint="server-fingerprint",
+        protocol_version="2026-07-28",
+        task={
+            "taskId": "remote-task-unknown",
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+        },
+        answered_inputs={},
+    )
+    with closing(get_db_connection(db_path)) as conn, conn:
+        conn.execute(
+            "CREATE TRIGGER fail_mcp_task_handle BEFORE INSERT ON mcp_task_handles "
+            "BEGIN SELECT RAISE(ABORT, 'injected task archive failure'); END"
+        )
+
+    terminal = pending.model_copy(
+        update={
+            "executed": True,
+            "error": "outcome unknown; no retry",
+            "timestamp": datetime.now(timezone.utc),
+        }
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="injected task archive failure"):
+        store.save_tool_call(
+            session.session_id,
+            terminal,
+            turn_id=turn_id,
+            archive_ambiguous_mcp_task=True,
+        )
+
+    still_pending = store.load_session(session.session_id).tool_calls[0]
+    assert still_pending.error is None
+    assert [row["task_id"] for row in store.list_mcp_tasks(session.session_id)] == [
+        "remote-task-unknown"
+    ]
+    assert store.list_ambiguous_mcp_task_handles(str(tmp_path)) == []
+
+    with closing(get_db_connection(db_path)) as conn, conn:
+        conn.execute("DROP TRIGGER fail_mcp_task_handle")
+    store.save_tool_call(
+        session.session_id,
+        terminal,
+        turn_id=turn_id,
+        archive_ambiguous_mcp_task=True,
+    )
+
+    handles = store.list_ambiguous_mcp_task_handles(str(tmp_path))
+    assert len(handles) == 1
+    assert handles[0].task_id == "remote-task-unknown"
+    assert handles[0].session_id == session.session_id
+    assert handles[0].call_id == call_id
+    assert handles[0].last_status == "working"
+    assert store.list_mcp_tasks(session.session_id) == []
+    assert store.list_ambiguous_mcp_task_handles(str(tmp_path / "other")) == []
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_recovered_mcp_failure_archives_only_unknown_outcomes(
+    tmp_path: Path, ambiguous: bool
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    turn_id, call_id, task_id = "turn-failed", "call-failed", "task-failed"
+    store.start_turn(session.session_id, turn_id, "remote operation")
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id=call_id,
+            tool_name="mcp__remote__run",
+            arguments={},
+            approved=True,
+            dispatched=True,
+            executed=False,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id=turn_id,
+    )
+    store.save_mcp_task(
+        task_id=task_id,
+        session_id=session.session_id,
+        turn_id=turn_id,
+        call_id=call_id,
+        server_name="remote",
+        remote_tool_name="run",
+        contract_fingerprint="contract",
+        server_fingerprint="server-id",
+        protocol_version="2026-07-28",
+        task={
+            "taskId": task_id,
+            "status": "failed",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60000,
+            "error": {"code": -1, "message": "failed"},
+        },
+        answered_inputs={},
+    )
+    inserted = store.finalize_mcp_task_recovery(
+        server_name="remote",
+        task_id=task_id,
+        session_id=session.session_id,
+        turn_id=turn_id,
+        call_id=call_id,
+        tool_name="mcp__remote__run",
+        success=False,
+        ambiguous=ambiguous,
+        result="",
+        error="remote failure",
+        message=Message(
+            role="tool",
+            content="remote failure",
+            metadata={"call_id": call_id},
+            timestamp=datetime.now(timezone.utc),
+        ),
+        audit_details={"call_id": call_id, "replayed": False},
+    )
+    assert inserted is True
+    assert store.list_mcp_tasks(session.session_id) == []
+    handles = store.list_ambiguous_mcp_task_handles(tmp_path)
+    assert [handle.task_id for handle in handles] == ([task_id] if ambiguous else [])
+    assert (
+        len(
+            [
+                m
+                for m in store.load_session(session.session_id).messages
+                if m.role == "tool"
+            ]
+        )
+        == 1
+    )
+    assert store.verify_audit_log(session.session_id) == []
+
+
+def test_missing_tool_call_does_not_discard_durable_mcp_task(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "remote operation")
+    store.save_mcp_task(
+        task_id="task-orphan",
+        session_id=session.session_id,
+        turn_id="turn-1",
+        call_id="call-missing",
+        server_name="remote",
+        remote_tool_name="run",
+        contract_fingerprint="contract",
+        server_fingerprint="server-id",
+        protocol_version="2026-07-28",
+        task={
+            "taskId": "task-orphan",
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60000,
+        },
+        answered_inputs={},
+    )
+    assert (
+        store.finalize_mcp_task_recovery(
+            server_name="remote",
+            task_id="task-orphan",
+            session_id=session.session_id,
+            turn_id="turn-1",
+            call_id="call-missing",
+            tool_name="mcp__remote__run",
+            success=False,
+            ambiguous=True,
+            result="",
+            error="unknown",
+            audit_details={},
+            message=Message(
+                role="tool",
+                content="unknown",
+                metadata={"call_id": "call-missing"},
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+        is False
+    )
+    assert [row["task_id"] for row in store.list_mcp_tasks(session.session_id)] == [
+        "task-orphan"
+    ]
+    assert store.list_ambiguous_mcp_task_handles(tmp_path) == []
+    assert (
+        len(
+            [
+                m
+                for m in store.load_session(session.session_id).messages
+                if m.role == "tool"
+            ]
+        )
+        == 0
+    )
+
+
+def test_v19_session_database_migrates_without_losing_active_mcp_tasks(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    store = SessionStore(db_path)
+    session = store.create_session(str(tmp_path))
+    store.save_mcp_task(
+        task_id="task-before-migration",
+        session_id=session.session_id,
+        turn_id="turn-1",
+        call_id="call-1",
+        server_name="server",
+        remote_tool_name="tool",
+        contract_fingerprint="contract",
+        server_fingerprint="server-fingerprint",
+        protocol_version="2026-07-28",
+        task={
+            "taskId": "task-before-migration",
+            "status": "working",
+            "createdAt": "2026-09-20T00:00:00Z",
+            "lastUpdatedAt": "2026-09-20T00:00:01Z",
+            "ttlMs": 60_000,
+        },
+        answered_inputs={},
+    )
+    with closing(get_db_connection(db_path)) as conn, conn:
+        conn.execute("DROP INDEX idx_mcp_task_handles_session_archived")
+        conn.execute("DROP TABLE mcp_task_handles")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 20")
+
+    migrated = SessionStore(db_path)
+
+    assert [row["task_id"] for row in migrated.list_mcp_tasks(session.session_id)] == [
+        "task-before-migration"
+    ]
+    with closing(get_db_connection(db_path)) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == CURRENT_SCHEMA_VERSION
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'mcp_task_handles'"
+        ).fetchone()
 
 
 def test_mcp_task_durable_state_has_count_and_payload_limits(

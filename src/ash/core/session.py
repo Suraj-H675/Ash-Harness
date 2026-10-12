@@ -15,7 +15,7 @@ import weakref
 from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, Literal, Sequence
+from typing import Any, AsyncIterator, Iterator, Literal, Sequence, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, PrivateAttr
@@ -57,7 +57,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 19
+CURRENT_SCHEMA_VERSION = 20
 SQLITE_INTEGER_MAX = 2**63 - 1
 SQLITE_REAL_MAX = sys.float_info.max
 MAX_SESSION_IMPORT_BYTES = 64 * 1024 * 1024
@@ -386,6 +386,22 @@ class AuditLogRecord(BaseModel):
     timestamp: datetime
     previous_hash: str = ""
     sha256_hash: str
+
+
+class MCPTaskHandle(BaseModel):
+    """Compact local record of an MCP task retained for outcome inspection."""
+
+    disposition: Literal["active", "ambiguous"]
+    task_id: str
+    session_id: str
+    turn_id: str
+    call_id: str
+    server_name: str
+    remote_tool_name: str
+    protocol_version: str
+    last_status: str
+    updated_at: str
+    archived_at: str | None = None
 
 
 class Session(BaseModel):
@@ -1287,6 +1303,8 @@ class SessionStore:
                 self._migrate_v18(conn)
             if from_version < 19:
                 self._migrate_v19(conn)
+            if from_version < 20:
+                self._migrate_v20(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -1834,6 +1852,35 @@ class SessionStore:
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
             "VALUES (?, ?)",
             (19, _serialize_datetime(_utc_now())),
+        )
+
+    def _migrate_v20(self, conn: sqlite3.Connection) -> None:
+        """Retain compact MCP task handles after ambiguous calls are finalized."""
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS mcp_task_handles (
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                remote_tool_name TEXT NOT NULL,
+                protocol_version TEXT NOT NULL,
+                last_status TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                archived_at TIMESTAMP NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+                PRIMARY KEY(session_id, call_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_mcp_task_handles_session_archived
+                ON mcp_task_handles(session_id, archived_at DESC);
+            """
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (20, _serialize_datetime(_utc_now())),
         )
 
     def backup(
@@ -4471,6 +4518,7 @@ class SessionStore:
         record: ToolCallRecord,
         *,
         turn_id: str | None = None,
+        archive_ambiguous_mcp_task: bool = False,
     ) -> None:
         """Save or update a tool execution record."""
 
@@ -4516,6 +4564,10 @@ class SessionStore:
                     turn_id,
                 ),
             )
+            if archive_ambiguous_mcp_task:
+                self._archive_mcp_task_handle_in_connection(
+                    conn, session_id, record.call_id
+                )
 
     def finalize_tool_call_with_message(
         self,
@@ -4524,6 +4576,7 @@ class SessionStore:
         message: Message,
         *,
         turn_id: str | None = None,
+        archive_ambiguous_mcp_task: bool = False,
     ) -> bool:
         """Atomically finalize a tool once; identical retries are no-ops."""
 
@@ -4636,11 +4689,68 @@ class SessionStore:
                 "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
                 (_serialize_datetime(message.timestamp), session_id),
             )
-            conn.execute(
-                "DELETE FROM mcp_tasks WHERE session_id = ? AND call_id = ?",
-                (session_id, record.call_id),
-            )
+            if archive_ambiguous_mcp_task:
+                self._archive_mcp_task_handle_in_connection(
+                    conn, session_id, record.call_id
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM mcp_tasks WHERE session_id = ? AND call_id = ?",
+                    (session_id, record.call_id),
+                )
             return True
+
+    @staticmethod
+    def _archive_mcp_task_handle_in_connection(
+        conn: sqlite3.Connection,
+        session_id: str,
+        call_id: str,
+    ) -> bool:
+        """Move one active task to its compact inspection record atomically."""
+
+        row = conn.execute(
+            "SELECT task_id, session_id, turn_id, call_id, server_name, "
+            "remote_tool_name, protocol_version, status, updated_at "
+            "FROM mcp_tasks WHERE session_id = ? AND call_id = ?",
+            (session_id, call_id),
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            """
+            INSERT INTO mcp_task_handles (
+                session_id, turn_id, call_id, task_id, server_name,
+                remote_tool_name, protocol_version, last_status, updated_at,
+                archived_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, call_id) DO UPDATE SET
+                turn_id = excluded.turn_id,
+                task_id = excluded.task_id,
+                server_name = excluded.server_name,
+                remote_tool_name = excluded.remote_tool_name,
+                protocol_version = excluded.protocol_version,
+                last_status = excluded.last_status,
+                updated_at = excluded.updated_at,
+                archived_at = excluded.archived_at
+            """,
+            (
+                str(row["session_id"]),
+                str(row["turn_id"]),
+                str(row["call_id"]),
+                str(row["task_id"]),
+                str(row["server_name"]),
+                str(row["remote_tool_name"]),
+                str(row["protocol_version"]),
+                str(row["status"]),
+                str(row["updated_at"]),
+                _serialize_datetime(_utc_now()),
+            ),
+        )
+        conn.execute(
+            "DELETE FROM mcp_tasks WHERE session_id = ? AND call_id = ?",
+            (session_id, call_id),
+        )
+        return True
 
     def save_mcp_task(
         self,
@@ -4774,6 +4884,16 @@ class SessionStore:
                 (server_name, task_id),
             )
 
+    def archive_ambiguous_mcp_task_handle(
+        self, session_id: str, call_id: str
+    ) -> bool:
+        """Keep the task ID when local state is insufficient for safe recovery."""
+
+        with closing(self._connect()) as conn, conn:
+            return self._archive_mcp_task_handle_in_connection(
+                conn, session_id, call_id
+            )
+
     def list_mcp_tasks(self, session_id: str) -> list[sqlite3.Row]:
         """Return durable MCP task records for one session oldest-first."""
 
@@ -4788,6 +4908,93 @@ class SessionStore:
                 "durable MCP task count exceeds the supported session capacity"
             )
         return rows
+
+    def list_ambiguous_mcp_task_handles(
+        self, project_path: str | Path
+    ) -> list[MCPTaskHandle]:
+        """List retained task IDs for ambiguous dispatched calls in this project."""
+
+        project_key = normalize_project_path(project_path)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT h.task_id, h.session_id, h.turn_id, h.call_id,
+                       h.server_name, h.remote_tool_name, h.protocol_version,
+                       h.last_status, h.updated_at, h.archived_at
+                FROM mcp_task_handles AS h
+                JOIN sessions AS s ON s.session_id = h.session_id
+                WHERE s.project_key = ?
+                ORDER BY h.archived_at DESC, h.session_id, h.call_id
+                """,
+                (project_key,),
+            ).fetchall()
+        return [
+            MCPTaskHandle(
+                disposition="ambiguous",
+                task_id=str(row["task_id"]),
+                session_id=str(row["session_id"]),
+                turn_id=str(row["turn_id"]),
+                call_id=str(row["call_id"]),
+                server_name=str(row["server_name"]),
+                remote_tool_name=str(row["remote_tool_name"]),
+                protocol_version=str(row["protocol_version"]),
+                last_status=str(row["last_status"]),
+                updated_at=str(row["updated_at"]),
+                archived_at=str(row["archived_at"]),
+            )
+            for row in rows
+        ]
+
+    def list_persisted_mcp_task_handles(
+        self, project_path: str | Path
+    ) -> list[MCPTaskHandle]:
+        """List local active and ambiguous MCP task IDs for one project."""
+
+        project_key = normalize_project_path(project_path)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT 'active' AS disposition, t.task_id, t.session_id,
+                           t.turn_id, t.call_id, t.server_name, t.remote_tool_name,
+                           t.protocol_version, t.status AS last_status,
+                           t.updated_at, NULL AS archived_at
+                    FROM mcp_tasks AS t
+                    JOIN sessions AS s ON s.session_id = t.session_id
+                    WHERE s.project_key = ?
+                    UNION ALL
+                    SELECT 'ambiguous' AS disposition, h.task_id, h.session_id,
+                           h.turn_id, h.call_id, h.server_name, h.remote_tool_name,
+                           h.protocol_version, h.last_status, h.updated_at,
+                           h.archived_at
+                    FROM mcp_task_handles AS h
+                    JOIN sessions AS s ON s.session_id = h.session_id
+                    WHERE s.project_key = ?
+                ) AS handles
+                ORDER BY updated_at DESC, session_id, call_id
+                """,
+                (project_key, project_key),
+            ).fetchall()
+        return [
+            MCPTaskHandle(
+                disposition=cast(
+                    Literal["active", "ambiguous"], str(row["disposition"])
+                ),
+                task_id=str(row["task_id"]),
+                session_id=str(row["session_id"]),
+                turn_id=str(row["turn_id"]),
+                call_id=str(row["call_id"]),
+                server_name=str(row["server_name"]),
+                remote_tool_name=str(row["remote_tool_name"]),
+                protocol_version=str(row["protocol_version"]),
+                last_status=str(row["last_status"]),
+                updated_at=str(row["updated_at"]),
+                archived_at=(
+                    str(row["archived_at"]) if row["archived_at"] is not None else None
+                ),
+            )
+            for row in rows
+        ]
 
     def delete_mcp_task_for_call(self, session_id: str, call_id: str) -> None:
         """Drop a durable MCP handle after its Ash tool result is committed."""
@@ -4820,6 +5027,7 @@ class SessionStore:
         call_id: str,
         tool_name: str,
         success: bool,
+        ambiguous: bool,
         result: str,
         error: str | None,
         message: Message,
@@ -4832,15 +5040,13 @@ class SessionStore:
 
         with closing(self._connect()) as conn, conn:
             call = conn.execute(
-                "SELECT executed, error FROM tool_calls WHERE session_id = ? "
+                "SELECT executed, dispatched, error FROM tool_calls WHERE session_id = ? "
                 "AND turn_id = ? AND call_id = ?",
                 (session_id, turn_id, call_id),
             ).fetchone()
             if call is None:
-                conn.execute(
-                    "DELETE FROM mcp_tasks WHERE server_name = ? AND task_id = ?",
-                    (server_name, task_id),
-                )
+                # The task ID may be the only durable evidence of an external
+                # side effect. A missing local call row cannot justify dropping it.
                 return False
             already_terminal = bool(call["executed"]) or call["error"] is not None
             if not already_terminal:
@@ -4898,10 +5104,18 @@ class SessionStore:
                     "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
                     (_serialize_datetime(message.timestamp), session_id),
                 )
-            conn.execute(
-                "DELETE FROM mcp_tasks WHERE server_name = ? AND task_id = ?",
-                (server_name, task_id),
+            archived = (
+                ambiguous
+                and bool(call["dispatched"])
+                and self._archive_mcp_task_handle_in_connection(
+                    conn, session_id, call_id
+                )
             )
+            if not archived:
+                conn.execute(
+                    "DELETE FROM mcp_tasks WHERE server_name = ? AND task_id = ?",
+                    (server_name, task_id),
+                )
             return inserted
 
     def append_audit_log(
