@@ -343,7 +343,10 @@ class WorktreeManager:
             "--untracked-files=all",
         )
         if status.stdout:
-            raise WorktreeError("applying agent changes requires a clean lead worktree")
+            raise WorktreeError(
+                "applying agent changes requires a clean lead worktree; "
+                "commit or stash current changes, then retry"
+            )
         commit = (await self._git("rev-parse", "--verify", branch)).stdout.strip()
         result = await self._git_mutation(
             "-c",

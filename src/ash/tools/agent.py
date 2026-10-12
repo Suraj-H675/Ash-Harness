@@ -62,6 +62,7 @@ if TYPE_CHECKING:
 _PERSISTED_STOP_REASON = "stopped by persisted message"
 _SUBAGENT_STDERR_BYTES = 64 * 1024
 _SUBAGENT_DIAGNOSTIC_CHARS = 4_000
+_SUBPROCESS_TASK_EVENT_POLL_SECONDS = 0.1
 
 
 def _subprocess_stderr_suffix(stderr: bytes) -> str:
@@ -668,6 +669,11 @@ class SpawnAgentTool(BaseTool):
                 error=f"Could not start subagent subprocess: {exc}{cleanup_note}",
             )
 
+        prior_events = self._shared_state.tasks.list_events(
+            task_id=durable_task.task_id,
+            limit=10_000,
+        )
+        event_sequence = prior_events[-1].sequence if prior_events else 0
         launch = asyncio.create_task(
             asyncio.create_subprocess_exec(
                 sys.executable,
@@ -750,6 +756,15 @@ class SpawnAgentTool(BaseTool):
             )
 
         assert process is not None
+        event_stop = asyncio.Event()
+        event_forwarder = asyncio.create_task(
+            self._forward_subprocess_task_events(
+                durable_task.task_id,
+                after_sequence=event_sequence,
+                stopped=event_stop,
+            ),
+            name=f"ash-subagent-events-{durable_task.task_id}",
+        )
         primary_error: BaseException | None = None
         try:
             stderr = b""
@@ -853,6 +868,10 @@ class SpawnAgentTool(BaseTool):
                 )
             return self._subprocess_task_result(durable_task.task_id)
         finally:
+            event_stop.set()
+            event_cleanup_error, event_cleanup_interrupted = (
+                await _settle_spawn_cleanup_task(event_forwarder)
+            )
             if approval_server is not None:
                 approval_cleanup_error, cleanup_interrupted = (
                     await self._close_approval_server(
@@ -893,6 +912,77 @@ class SpawnAgentTool(BaseTool):
                         raise cleanup_cancellation from approval_cleanup_error
                     if approval_cleanup_error is not None:
                         raise approval_cleanup_error
+            if primary_error is not None:
+                if event_cleanup_error is not None:
+                    primary_error.add_note(
+                        "subagent task event forwarding failed: "
+                        + redact_text(str(event_cleanup_error))[:500]
+                    )
+                if event_cleanup_interrupted:
+                    primary_error.add_note(
+                        "subagent task event forwarding cleanup was interrupted"
+                    )
+            elif event_cleanup_interrupted:
+                event_cancellation = asyncio.CancelledError()
+                if event_cleanup_error is not None:
+                    event_cancellation.add_note(
+                        "subagent task event forwarding failed: "
+                        + redact_text(str(event_cleanup_error))[:500]
+                    )
+                raise event_cancellation from event_cleanup_error
+            elif event_cleanup_error is not None:
+                raise event_cleanup_error
+
+    async def _forward_subprocess_task_events(
+        self,
+        task_id: str,
+        *,
+        after_sequence: int,
+        stopped: asyncio.Event,
+    ) -> None:
+        sequence = after_sequence
+        while True:
+            events = self._shared_state.tasks.list_events(
+                task_id=task_id,
+                after_sequence=sequence,
+                limit=1_000,
+            )
+            for event in events:
+                sequence = event.sequence
+                event_type = event.event.get("type")
+                state = event.event.get("state")
+                if (
+                    not isinstance(event_type, str)
+                    or not event_type.startswith("agent.task.")
+                    or event_type == "agent.task.created"
+                    or not isinstance(state, str)
+                ):
+                    continue
+                payload = {
+                    "type": event_type,
+                    "task_id": event.task_id,
+                    "sequence": event.sequence,
+                    "state": state,
+                }
+                for key in (
+                    "reason",
+                    "attempt",
+                    "max_attempts",
+                    "retryable",
+                    "owner_agent_id",
+                ):
+                    if key in event.event:
+                        payload[key] = event.event[key]
+                self.emit_event(payload)
+            if stopped.is_set():
+                return
+            try:
+                await asyncio.wait_for(
+                    stopped.wait(),
+                    timeout=_SUBPROCESS_TASK_EVENT_POLL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
 
     async def _close_approval_server(
         self,
