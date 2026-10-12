@@ -92,6 +92,8 @@ def test_empty_interactive_start_runs_setup_by_default_and_refuses_broken_repl(
     terminal_input = MagicMock()
     terminal_input.isatty.return_value = True
     monkeypatch.setattr("ash.cli.sys.stdin", terminal_input)
+    # This test models an interactive terminal while capsys still captures output.
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
 
     assert main([]) == 2
 
