@@ -681,10 +681,10 @@ async def test_interactive_approval_uses_selector_instead_of_letter_prompt(
             "write_file permission",
             (
                 "Allow once",
-                "Allow this scope for session",
+                "Allow scope (session)",
                 "Deny",
-                "Deny and guide Ash",
-                "More approval options…",
+                "Deny + feedback",
+                "More options…",
             ),
         )
     ]
@@ -710,12 +710,12 @@ async def test_selector_approval_keeps_broader_rules_behind_more_options(
 
     assert selected == "a"
     assert prompt.choice_defaults == ["n", "back"]
-    assert prompt.choice_calls[0][1][-1] == "More approval options…"
+    assert prompt.choice_calls[0][1][-1] == "More options…"
     assert prompt.choice_calls[1][1] == (
-        "Allow this tool for session",
-        "Allow this scope for project",
-        "Edit scope and allow for project",
-        "Deny this scope for project",
+        "Allow tool (session)",
+        "Allow scope (project)",
+        "Edit scope (project)",
+        "Deny scope (project)",
         "Back",
     )
 

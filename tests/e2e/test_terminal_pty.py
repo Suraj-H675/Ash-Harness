@@ -171,6 +171,9 @@ def test_real_repl_help_returns_to_clean_composer_in_six_row_pty(tmp_path: Path)
         # No autocomplete popup should cover the returned empty composer.
         assert "/status" not in visible
         assert "Show available commands" not in visible
+        os.write(master_fd, b"/exit\r")
+        process.wait(timeout=5)
+        assert process.returncode == 0
     finally:
         if process.poll() is None:
             process.kill()

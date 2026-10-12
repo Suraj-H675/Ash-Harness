@@ -395,8 +395,10 @@ async def test_closing_surface_during_start_releases_startup_waiter(
         )
         assert prompt._surface is not None
 
-        async def blocked_run_async(*, handle_sigint: bool):
-            del handle_sigint
+        async def blocked_run_async(
+            *, pre_run: object, handle_sigint: bool
+        ):
+            del pre_run, handle_sigint
             await asyncio.Event().wait()
 
         monkeypatch.setattr(
@@ -423,6 +425,32 @@ async def test_closing_surface_during_start_releases_startup_waiter(
             if not starting.done():
                 starting.cancel()
             await asyncio.gather(starting, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_inline_surface_restart_initializes_terminal_pump_again(
+    tmp_path: Path, cursor_ui: None
+) -> None:
+    with create_pipe_input() as pipe:
+        prompt = PromptInput(
+            input_stream=TtyStringIO(),
+            history_path=tmp_path / "history",
+            input=pipe,
+            output=DummyOutput(),
+        )
+        assert prompt._surface is not None
+        surface = prompt._surface
+        try:
+            await asyncio.wait_for(surface.start(), timeout=1)
+            first_wakeup = surface._terminal_wakeup
+            assert first_wakeup is not None
+            await asyncio.wait_for(
+                prompt.suspend_for_overlay(lambda: None), timeout=1
+            )
+            await asyncio.wait_for(surface.start(), timeout=1)
+            assert surface._terminal_wakeup is not first_wakeup
+        finally:
+            await prompt.aclose()
 
 
 def test_screen_reader_mode_uses_reduced_dynamic_prompt(

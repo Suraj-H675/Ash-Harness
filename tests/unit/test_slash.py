@@ -94,6 +94,12 @@ def test_help_filters_by_command_alias_and_description() -> None:
     )
 
 
+def test_help_search_matches_each_term_across_command_metadata() -> None:
+    rendered = render_help("model switch")
+
+    assert "/model [provider/model]" in rendered
+
+
 def test_help_lists_mcp_authorization_actions() -> None:
     rendered = render_help("mcp")
 

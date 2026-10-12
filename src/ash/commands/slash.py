@@ -242,7 +242,11 @@ def _command_matches(command: SlashCommand, query: str) -> bool:
         *(command.aliases),
         *(f"/{alias}" for alias in command.aliases),
     )
-    return any(query in field.casefold() for field in fields)
+    normalized_fields = tuple(field.casefold() for field in fields)
+    return all(
+        any(term in field for field in normalized_fields)
+        for term in query.split()
+    )
 
 
 def _render_aliases(aliases: tuple[str, ...]) -> str:

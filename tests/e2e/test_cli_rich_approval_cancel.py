@@ -22,8 +22,9 @@ from ash.core.session import SessionStore
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+@pytest.mark.parametrize("columns", [24, 80])
 def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
-    tmp_path: Path,
+    tmp_path: Path, columns: int
 ) -> None:
     import fcntl
     import termios
@@ -115,11 +116,15 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
         "ASH_SCREEN_READER_MODE": "false",
     }
     master_fd, slave_fd = pty.openpty()
-    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+    fcntl.ioctl(
+        slave_fd,
+        termios.TIOCSWINSZ,
+        struct.pack("HHHH", 24, columns, 0, 0),
+    )
     process: subprocess.Popen[bytes] | None = None
     slave_open = True
     captured = bytearray()
-    screen = pyte.Screen(columns=80, lines=24)
+    screen = pyte.Screen(columns=columns, lines=24)
     stream = pyte.Stream(screen)
     decoder = codecs.getincrementaldecoder("utf-8")()
 
@@ -156,6 +161,14 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
             f"screen={screen.display!r}"
         )
 
+    def wait_for_screen(marker: str, timeout: float = 5) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and process is not None and process.poll() is None:
+            capture_output()
+            if marker in "\n".join(screen.display):
+                return
+        raise AssertionError(f"missing {marker!r}; screen={screen.display!r}")
+
     try:
         trust = subprocess.run(
             [sys.executable, "-m", "ash", "trust", "add", str(workspace)],
@@ -182,6 +195,11 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
         wait_for_main_composer()
         os.write(master_fd, b"please run the fixture command\r")
         wait_for(b"Allow once", timeout=25)
+        os.write(master_fd, b"\x1b[A")
+        wait_for_screen("Allow scope (session)")
+        visible_screen = "\n".join(screen.display)
+        assert "Matching scope only." in visible_screen
+        assert "Esc deny" in visible_screen
         os.write(master_fd, b"\x03")
         assert not second_request.wait(timeout=2), (
             "the provider received another request after Ctrl-C in approval"

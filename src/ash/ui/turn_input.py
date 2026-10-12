@@ -485,64 +485,64 @@ class InteractiveTurnController:
             PromptChoice(
                 "y",
                 "Allow once",
-                "Approve only this tool request.",
+                "Approve this request.",
             ),
             PromptChoice(
                 "s",
-                "Allow this scope for session",
-                "Allow matching safe arguments until this Ash session ends.",
+                "Allow scope (session)",
+                "Matching scope only.",
             ),
             PromptChoice(
                 "n",
                 "Deny",
-                "Reject only this request.",
+                "Reject this request.",
             ),
             PromptChoice(
                 "f",
-                "Deny and guide Ash",
-                "Reject this request and provide corrective feedback.",
+                "Deny + feedback",
+                "Reject and guide Ash.",
             ),
             PromptChoice(
                 "more",
-                "More approval options…",
-                "Broader session/project rules and command-prefix approvals.",
+                "More options…",
+                "Project/session rules.",
             ),
         )
         advanced = [
             PromptChoice(
                 "a",
-                "Allow this tool for session",
-                "Allow every use of this tool until this Ash session ends.",
+                "Allow tool (session)",
+                "Calls for this session.",
             ),
             PromptChoice(
                 "p",
-                "Allow this scope for project",
-                "Persist the current exact safe scope for this project.",
+                "Allow scope (project)",
+                "Save exact scope.",
             ),
             PromptChoice(
                 "e",
-                "Edit scope and allow for project",
-                "Edit the exact persisted scope before approving it.",
+                "Edit scope (project)",
+                "Edit exact scope.",
             ),
             PromptChoice(
                 "x",
-                "Deny this scope for project",
-                "Persist a deny rule for this exact scope in this project.",
+                "Deny scope (project)",
+                "Save deny rule.",
             ),
         ]
         if tool_name == "run_command":
             advanced.append(
                 PromptChoice(
                     "c",
-                    "Allow command prefix for project",
-                    "Persist an allow rule for a verified shell-command prefix.",
+                    "Allow prefix (project)",
+                    "Allow command prefix.",
                 )
             )
         advanced.append(
             PromptChoice(
                 "back",
                 "Back",
-                "Return to the common approval choices.",
+                "Common choices.",
             )
         )
 

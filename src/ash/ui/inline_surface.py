@@ -341,7 +341,6 @@ class InlinePromptSurface:
             min_redraw_interval=0.03,
             terminal_size_polling_interval=0.5,
         )
-        self.application.pre_run_callables.append(self._start_terminal_pump)
         self.transcript_view.set_invalidator(self.invalidate)
 
     def write_terminal(self, callback: Callable[[], None]) -> None:
@@ -390,7 +389,10 @@ class InlinePromptSurface:
         self._app_error = None
         self._closing = False
         self._app_task = loop.create_task(
-            self.application.run_async(handle_sigint=False)
+            self.application.run_async(
+                pre_run=self._start_terminal_pump,
+                handle_sigint=False,
+            )
         )
         self._app_task.add_done_callback(self._application_finished)
         await self._app_ready
@@ -821,7 +823,7 @@ class InlinePromptSurface:
         return FormattedText(
             [
                 ("class:meta", " " + description if description else ""),
-                ("class:muted", "\n ↑/↓ choose  Enter select  Esc deny"),
+                ("class:muted", "\n ↑↓ move Enter; Esc deny"),
             ]
         )
 

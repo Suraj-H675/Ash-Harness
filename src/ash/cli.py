@@ -149,7 +149,10 @@ def _print_persisted_mcp_task_handles(loop: Any) -> None:
 
 def _emit_config_diagnostics(config: AshConfig) -> None:
     for diagnostic in config.config_diagnostics:
-        print(f"Warning: {diagnostic}", file=sys.stderr)
+        print(
+            f"Warning: {terminal_safe_text(diagnostic, single_line=True)}",
+            file=sys.stderr,
+        )
 
 
 def _load_config_or_report(
@@ -5932,7 +5935,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         try:
             answer = input(
                 f"Trust project-controlled Ash configuration in "
-                f"{config.workspace_root.resolve()}? [y/N] "
+                f"{terminal_safe_text(str(config.workspace_root.resolve()), single_line=True)}? [y/N] "
             ).strip().casefold()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -5955,7 +5958,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
             except (OSError, ValueError) as exc:
                 print(
                     "Warning: could not remember the untrusted workspace decision: "
-                    f"{exc}",
+                    f"{terminal_safe_text(str(exc), single_line=True)}",
                     file=sys.stderr,
                 )
             loaded_config, config_exit_code = _load_config_or_report(
@@ -5974,7 +5977,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
     from ash.commands.setup import _has_provider_configured
 
     if not _has_provider_configured(config):
-        if args.prompt is not None or not sys.stdin.isatty():
+        if (
+            args.prompt is not None
+            or not sys.stdin.isatty()
+            or not sys.stdout.isatty()
+        ):
             return _report_cli_error(
                 AshConfigError(
                     "Ash is not configured. Run 'ash setup' in an interactive terminal."
