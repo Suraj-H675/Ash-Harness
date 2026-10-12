@@ -92,6 +92,10 @@ class AshResult:
     estimated_cost_usd: float = 0.0
     cost_known: bool = True
     budget_exhausted: bool = False
+    stop_reason: str = "completed"
+    iterations: int = 0
+    iteration_limit: int = 10
+    token_budget: int = 0
 
     @property
     def usage(self) -> dict[str, int | float | str | bool]:
@@ -393,6 +397,10 @@ class AshClient:
             estimated_cost_usd=float(usage["estimated_cost_usd"]),
             cost_known=bool(usage["cost_known"]),
             budget_exhausted=self.loop._last_turn_budget_exhausted,
+            stop_reason=self.loop._last_turn_stop_reason,
+            iterations=self.loop._last_turn_iterations,
+            iteration_limit=self.loop._last_turn_iteration_limit,
+            token_budget=self.loop._last_turn_token_budget,
         )
 
     async def stream_prompt(

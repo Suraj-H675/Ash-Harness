@@ -231,6 +231,14 @@ async def test_async_sdk_owns_runtime_and_sessions(tmp_path) -> None:
         assert result.usage_source == "provider"
         assert result.usage["has_estimates"] is False
         assert result.usage["cache_hit_rate"] == 0.8
+        assert result.stop_reason == "completed"
+        assert result.iterations == 1
+        assert result.iteration_limit == 10
+        assert result.token_budget == 0
+        stored_usage = client.loop.session_store.get_session_usage(result.session_id)
+        assert stored_usage.prompt_tokens == 100
+        assert stored_usage.completion_tokens == 10
+        assert stored_usage.total_tokens == 110
         assert result.model == "ollama/sdk-model"
         assert client.sessions()[0].session_id == result.session_id
         assert client.sessions()[0].model == "ollama/sdk-model"

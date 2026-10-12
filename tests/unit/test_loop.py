@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import shlex
 import sqlite3
@@ -2195,6 +2196,10 @@ async def test_runtime_event_observer_receives_content_free_projection(tmp_path)
             "type": "turn.completed",
             "response": "SECRET-ASSISTANT-RESPONSE",
             "usage": {"prompt_tokens": 100},
+            "stop_reason": "iteration_limit",
+            "iterations": 10,
+            "iteration_limit": 10,
+            "token_budget": 0,
         }
     )
     loop._emit_event(
@@ -2226,6 +2231,10 @@ async def test_runtime_event_observer_receives_content_free_projection(tmp_path)
     assert turn_event["type"] == "turn.completed"
     assert "response" not in turn_event
     assert "usage" not in turn_event
+    assert turn_event["stop_reason"] == "iteration_limit"
+    assert turn_event["iterations"] == 10
+    assert turn_event["iteration_limit"] == 10
+    assert turn_event["token_budget"] == 0
     assert provider_event["failure_category"] == "rate_limit"
     assert provider_event["credential_profile"] == "OPENAI_BACKUP"
     assert provider_event["credential_pool_size"] == 2
@@ -4257,6 +4266,91 @@ async def test_turn_running_state_resets_after_cancellation(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_cancelled_turn_keeps_completed_response_usage_and_tool_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from contextlib import nullcontext
+
+    class UsageThenWaitProvider(ProviderABC):
+        model_name = "usage-then-wait"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.requests = 0
+            self.second_request_started = asyncio.Event()
+
+        def count_tokens(self, text):
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            self.requests += 1
+            if self.requests == 1:
+                yield StreamChunk(
+                    is_done=True,
+                    native_tool_calls=[
+                        {
+                            "id": "read-before-cancel",
+                            "name": "read_file",
+                            "arguments": {"file_path": "sample.txt"},
+                        }
+                    ],
+                    prompt_tokens=100,
+                    completion_tokens=10,
+                    usage_source="provider",
+                )
+                return
+            self.second_request_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "ash.core.checkpoints.workspace_mutation_lock",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+    (tmp_path / "sample.txt").write_text("known tool result", encoding="utf-8")
+    provider = UsageThenWaitProvider()
+    ui = EventUI()
+    store = SessionStore(tmp_path / "cancelled-usage.db")
+    guard = SafetyGuard(project_root=tmp_path)
+    read_tool = ReadFileTool(guard)
+    loop = AshLoop(
+        store,
+        provider,
+        guard,
+        ui,
+        tmp_path,
+        tools={read_tool.name: read_tool},
+        safety_tier="auto_approve",
+    )
+    session = await loop.start_session()
+    turn = asyncio.create_task(loop.run_turn("read then continue"))
+    await provider.second_request_started.wait()
+
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    usage = store.get_session_usage(session.session_id)
+    assert usage.prompt_tokens == 100
+    assert usage.completion_tokens == 10
+    assert usage.total_tokens == 110
+    durable = store.load_session(session.session_id)
+    assert [message.role for message in durable.messages] == ["user", "assistant", "tool"]
+    assert "known tool result" in durable.messages[-1].content
+    cancelled = next(event for event in ui.events if event["type"] == "turn.cancelled")
+    assert cancelled["usage"]["prompt_tokens"] == 100
+    assert cancelled["usage"]["completion_tokens"] == 10
+    with store._connect() as conn:
+        journal = conn.execute(
+            "SELECT usage_json, status FROM turn_journal WHERE session_id = ?",
+            (session.session_id,),
+        ).fetchone()
+    assert json.loads(journal["usage_json"])["prompt_tokens"] == 100
+    assert journal["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_partial_provider_stream_resumes_without_dispatching_tools(
     tmp_path,
 ) -> None:
@@ -5439,6 +5533,7 @@ async def test_turn_token_budget_stops_before_tool_side_effects(tmp_path):
     assert tool.arguments is None
     assert provider.calls == 1
     assert loop._last_turn_budget_exhausted is True
+    assert loop._last_turn_stop_reason == "token_budget"
     assert loop._last_turn_prompt_tokens + loop._last_turn_completion_tokens == 80
     assert loop.current_session is not None
     loaded = loop.session_store.load_session(loop.current_session.session_id)
@@ -5488,6 +5583,7 @@ async def test_turn_token_budget_blocks_next_provider_request(tmp_path):
     assert provider.calls == 1
     assert provider.completion_limits == [4]
     assert loop._last_turn_budget_exhausted is True
+    assert loop._last_turn_stop_reason == "token_budget"
 
 
 @pytest.mark.asyncio

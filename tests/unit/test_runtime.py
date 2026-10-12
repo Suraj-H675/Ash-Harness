@@ -80,6 +80,7 @@ async def test_runtime_owns_observability_observer_until_loop_close(
         workspace_root=tmp_path,
         db_directory=tmp_path / "db",
         memory_backend="off",
+        max_turn_iterations=21,
         automation_enabled=False,
         lsp_enabled=False,
         repo_map_enabled=False,
@@ -96,6 +97,7 @@ async def test_runtime_owns_observability_observer_until_loop_close(
     )
 
     assert runtime.loop._event_observer is observer
+    assert runtime.loop.max_turn_iterations == 21
     assert observer.closed == 0
     await runtime.loop.aclose()
     assert observer.closed == 1

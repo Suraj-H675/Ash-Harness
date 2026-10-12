@@ -8,6 +8,14 @@ limit and treats missing metadata as unknown; configured values remain local
 Ash ceilings. The input limit covers chat messages and provider-facing tool
 schemas. `/context` reports the effective input, response reserve, and combined
 allowance for the last request.
+
+Each turn allows 10 model request cycles by default. Set `max_turn_iterations`
+in `~/.ash/ash.toml` or `ASH_MAX_TURN_ITERATIONS` to choose a value from 1 to
+100. This user-owned limit does not include extra cycles Ash may allow to apply
+queued steering messages. A configured `max_turn_total_tokens` also limits the
+combined prompt and completion tokens for a turn; `0` disables that token
+limit.
+
 An adapter that does not accept a response ceiling can only use the reserve for
 input admission; the ChatGPT-plan preview route currently does not transmit a
 maximum response value.

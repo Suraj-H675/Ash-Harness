@@ -474,6 +474,15 @@ class AshConfig(BaseSettings):
             "0 disables the turn-wide limit."
         ),
     )
+    max_turn_iterations: int = Field(
+        10,
+        ge=1,
+        le=100,
+        description=(
+            "Maximum model request cycles in one agent turn. This user-owned "
+            "limit does not include steering extensions."
+        ),
+    )
     max_tool_result_tokens: int = Field(
         20000,
         gt=0,

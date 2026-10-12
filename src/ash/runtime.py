@@ -695,6 +695,7 @@ def build_runtime(
             additional_instructions_loader=load_runtime_instructions,
             instruction_scope_directories=(instruction_current_directory,),
             config=config,
+            max_turn_iterations=config.max_turn_iterations,
             max_steering_messages=config.steering_queue_limit,
             planner=Planner(active_provider) if config.enable_sprint_planning else None,
             enable_sprint_planning=config.enable_sprint_planning,

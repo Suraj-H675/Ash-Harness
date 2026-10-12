@@ -1,3 +1,5 @@
+import json
+
 from ash.core.session import SessionStore
 
 
@@ -75,3 +77,50 @@ def test_session_usage_pricing_known_when_all_turns_are_priced(tmp_path) -> None
     usage = store.get_session_usage(session.session_id)
     assert usage.pricing_unknown_turns == 0
     assert usage.cost_known is True
+
+
+def test_turn_usage_snapshots_apply_only_deltas_and_preserve_pricing_state(
+    tmp_path,
+) -> None:
+    store = SessionStore(tmp_path / "snapshots.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "do work")
+
+    first = {
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "cache_read_tokens": 30,
+        "cache_write_tokens": 4,
+        "cost_usd": 0.01,
+        "cost_known": False,
+    }
+    store.save_turn_usage_snapshot("turn-1", first)
+    store.save_turn_usage_snapshot("turn-1", first)
+    usage = store.get_session_usage(session.session_id)
+    assert usage.total_tokens == 110
+    assert usage.cache_read_tokens == 30
+    assert usage.cache_write_tokens == 4
+    assert usage.pricing_unknown_turns == 1
+
+    updated = {
+        **first,
+        "prompt_tokens": 140,
+        "completion_tokens": 25,
+        "cost_usd": 0.02,
+        "cost_known": True,
+    }
+    store.save_turn_usage_snapshot("turn-1", updated)
+    store.save_turn_usage_snapshot("turn-1", updated)
+    usage = store.get_session_usage(session.session_id)
+    assert usage.total_tokens == 165
+    assert usage.prompt_tokens == 140
+    assert usage.completion_tokens == 25
+    assert usage.cache_read_tokens == 30
+    assert round(usage.cost_usd, 4) == 0.02
+    assert usage.pricing_unknown_turns == 0
+
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT usage_json FROM turn_journal WHERE turn_id = ?", ("turn-1",)
+        ).fetchone()
+    assert json.loads(row["usage_json"]) == updated

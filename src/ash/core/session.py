@@ -3132,6 +3132,107 @@ class SessionStore:
             if cursor.rowcount == 0:
                 raise KeyError(f"Turn not found: {turn_id}")
 
+    def save_turn_usage_snapshot(self, turn_id: str, usage: dict[str, Any]) -> None:
+        """Atomically replace one turn's usage snapshot and apply its delta.
+
+        Repeated snapshots are safe, so a completed response can be checkpointed
+        during a turn and finalized again at the turn boundary.
+        """
+
+        if not isinstance(usage.get("cost_known", True), bool):
+            raise TypeError("cost_known must be boolean")
+
+        usage_json = json.dumps(usage, sort_keys=True)
+        token_fields = (
+            "prompt_tokens",
+            "completion_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "estimated_prompt_tokens",
+            "estimated_completion_tokens",
+        )
+        cost_fields = ("cost_usd", "estimated_cost_usd")
+
+        def numeric_values(value: dict[str, Any]) -> dict[str, int | float]:
+            normalized: dict[str, int | float] = {}
+            for key in token_fields:
+                item = value.get(key, 0)
+                normalized[key] = (
+                    int(item)
+                    if isinstance(item, (int, float)) and not isinstance(item, bool)
+                    else 0
+                )
+            for key in cost_fields:
+                item = value.get(key, 0.0)
+                normalized[key] = (
+                    float(item)
+                    if isinstance(item, (int, float)) and not isinstance(item, bool)
+                    else 0.0
+                )
+            return normalized
+
+        current_values = numeric_values(usage)
+        with closing(self._connect()) as conn, conn:
+            row = conn.execute(
+                "SELECT session_id, usage_json FROM turn_journal WHERE turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Turn not found: {turn_id}")
+
+            previous_json = str(row["usage_json"] or "{}")
+            if previous_json == usage_json:
+                return
+            try:
+                previous_usage = json.loads(previous_json)
+            except (TypeError, json.JSONDecodeError):
+                previous_usage = {}
+            if not isinstance(previous_usage, dict):
+                previous_usage = {}
+            previous_values = numeric_values(previous_usage)
+            deltas = {
+                key: current_values[key] - previous_values[key]
+                for key in current_values
+            }
+            pricing_unknown_delta = int(usage.get("cost_known", True) is False) - int(
+                previous_usage.get("cost_known", True) is False
+            )
+
+            conn.execute(
+                "UPDATE turn_journal SET usage_json = ? WHERE turn_id = ?",
+                (usage_json, turn_id),
+            )
+            conn.execute(
+                """
+                UPDATE sessions
+                SET total_tokens = COALESCE(total_tokens, 0) + ?,
+                    total_prompt_tokens = COALESCE(total_prompt_tokens, 0) + ?,
+                    total_completion_tokens = COALESCE(total_completion_tokens, 0) + ?,
+                    total_cache_read_tokens = COALESCE(total_cache_read_tokens, 0) + ?,
+                    total_cache_write_tokens = COALESCE(total_cache_write_tokens, 0) + ?,
+                    total_cost_usd = COALESCE(total_cost_usd, 0) + ?,
+                    estimated_prompt_tokens = COALESCE(estimated_prompt_tokens, 0) + ?,
+                    estimated_completion_tokens = COALESCE(estimated_completion_tokens, 0) + ?,
+                    estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + ?,
+                    pricing_unknown_turns = MAX(
+                        0, COALESCE(pricing_unknown_turns, 0) + ?
+                    )
+                WHERE session_id = ?
+                """,
+                (
+                    deltas["prompt_tokens"] + deltas["completion_tokens"],
+                    deltas["prompt_tokens"],
+                    deltas["completion_tokens"],
+                    deltas["cache_read_tokens"],
+                    deltas["cache_write_tokens"],
+                    deltas["cost_usd"],
+                    deltas["estimated_prompt_tokens"],
+                    deltas["estimated_completion_tokens"],
+                    deltas["estimated_cost_usd"],
+                    pricing_unknown_delta,
+                    row["session_id"],
+                ),
+            )
     def interrupt_turn(self, turn_id: str) -> None:
         """Mark one in-flight turn interrupted without affecting other sessions."""
 

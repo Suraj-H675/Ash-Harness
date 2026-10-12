@@ -14,6 +14,7 @@ ENV_KEYS = [
     "ASH_TEMPERATURE",
     "ASH_MAX_CONTEXT_TOKENS",
     "ASH_MAX_COMPLETION_TOKENS",
+    "ASH_MAX_TURN_ITERATIONS",
     "ASH_MAX_TOOL_RESULT_TOKENS",
     "ASH_MAX_ATTACHMENT_TOKENS",
     "ASH_COMMAND_ENV_ALLOWLIST",
@@ -98,6 +99,7 @@ def test_config_loads_all_fields_from_ash_toml(
                 "temperature = 0.7",
                 "max_context_tokens = 64000",
                 "max_completion_tokens = 3000",
+                "max_turn_iterations = 24",
                 "max_tool_result_tokens = 12000",
                 'safety_tier = "dry_run"',
                 f"workspace_root = {json.dumps(str(workspace))}",
@@ -122,6 +124,7 @@ def test_config_loads_all_fields_from_ash_toml(
     assert config.temperature == 0.7
     assert config.max_context_tokens == 64000
     assert config.max_completion_tokens == 3000
+    assert config.max_turn_iterations == 24
     assert config.max_tool_result_tokens == 12000
     assert config.safety_tier == "dry_run"
     assert config.workspace_root == workspace
@@ -162,6 +165,7 @@ def test_environment_variables_override_ash_toml(
     monkeypatch.setenv("ASH_TEMPERATURE", "0.2")
     monkeypatch.setenv("ASH_MAX_CONTEXT_TOKENS", "32000")
     monkeypatch.setenv("ASH_MAX_COMPLETION_TOKENS", "2048")
+    monkeypatch.setenv("ASH_MAX_TURN_ITERATIONS", "31")
     monkeypatch.setenv("ASH_MAX_TOOL_RESULT_TOKENS", "8000")
     monkeypatch.setenv("ASH_SAFETY_TIER", "auto_approve")
     monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(env_workspace))
@@ -176,6 +180,7 @@ def test_environment_variables_override_ash_toml(
     assert config.temperature == 0.2
     assert config.max_context_tokens == 32000
     assert config.max_completion_tokens == 2048
+    assert config.max_turn_iterations == 31
     assert config.max_tool_result_tokens == 8000
     assert config.safety_tier == "auto_approve"
     assert config.workspace_root == env_workspace
@@ -935,6 +940,7 @@ def test_project_config_cannot_override_user_owned_controls(
                 'safety_tier = "auto_approve"',
                 "max_concurrent_agents = 32",
                 "agent_token_budget = 999999",
+                "max_turn_iterations = 100",
                 "agent_time_budget_seconds = 86400",
                 "agent_lease_seconds = 3600",
                 "agent_max_spawn_depth = 5",
@@ -1002,6 +1008,7 @@ def test_project_config_cannot_override_user_owned_controls(
     assert config.safety_tier == "interactive"
     assert config.max_concurrent_agents == 4
     assert config.agent_token_budget == 4000
+    assert config.max_turn_iterations == 10
     assert config.agent_time_budget_seconds == 900
     assert config.agent_lease_seconds == 30
     assert config.agent_max_spawn_depth == 1

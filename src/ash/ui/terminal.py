@@ -1122,6 +1122,84 @@ class TerminalUI:
         elif changed:
             self._invalidate_prompt_state()
 
+        if event_type == "turn.completed":
+            stop_reason = payload.get("stop_reason")
+            if stop_reason == "iteration_limit":
+                iterations = payload.get("iterations")
+                limit = payload.get("iteration_limit")
+                if (
+                    isinstance(iterations, int)
+                    and not isinstance(iterations, bool)
+                    and isinstance(limit, int)
+                    and not isinstance(limit, bool)
+                ):
+                    message = (
+                        f"Turn reached its iteration limit ({iterations}/{limit} "
+                        "model steps). Adjust max_turn_iterations in "
+                        "~/.ash/ash.toml or with ASH_MAX_TURN_ITERATIONS."
+                    )
+                else:
+                    message = (
+                        "Turn reached its iteration limit. Adjust "
+                        "max_turn_iterations in ~/.ash/ash.toml or with "
+                        "ASH_MAX_TURN_ITERATIONS."
+                    )
+                self.write_status(message)
+            elif stop_reason == "token_budget":
+                usage = payload.get("usage")
+                prompt = usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0
+                completion = (
+                    usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0
+                )
+                budget = payload.get("token_budget")
+                if (
+                    isinstance(prompt, int)
+                    and not isinstance(prompt, bool)
+                    and isinstance(completion, int)
+                    and not isinstance(completion, bool)
+                    and isinstance(budget, int)
+                    and not isinstance(budget, bool)
+                    and budget > 0
+                ):
+                    self.write_status(
+                        f"Turn token budget reached ({prompt + completion}/{budget} tokens)."
+                    )
+                else:
+                    self.write_status(
+                        "Turn stopped because its token budget was reached."
+                    )
+            elif stop_reason == "circuit_breaker":
+                self.write_status(
+                    "Turn stopped after repeated tool failures (circuit breaker)."
+                )
+        elif event_type == "turn.cancelled":
+            usage = payload.get("usage")
+            prompt = usage.get("prompt_tokens", 0) if isinstance(usage, dict) else 0
+            completion = (
+                usage.get("completion_tokens", 0) if isinstance(usage, dict) else 0
+            )
+            usage_source = (
+                usage.get("usage_source") if isinstance(usage, dict) else None
+            )
+            iterations = payload.get("iterations")
+            if (
+                isinstance(prompt, int)
+                and not isinstance(prompt, bool)
+                and isinstance(completion, int)
+                and not isinstance(completion, bool)
+                and isinstance(iterations, int)
+                and not isinstance(iterations, bool)
+                and iterations > 0
+            ):
+                step_label = "model step" if iterations == 1 else "model steps"
+                if prompt + completion > 0:
+                    usage_text = f"{prompt + completion} tokens recorded."
+                elif usage_source == "unavailable":
+                    usage_text = "token usage unavailable."
+                else:
+                    usage_text = "0 tokens reported."
+                self.write_status(f"Turn cancelled after {iterations} {step_label}; {usage_text}")
+
         if event_type not in {
             "tool.started",
             "tool.output",

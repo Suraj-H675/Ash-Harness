@@ -461,6 +461,57 @@ def test_inline_tool_lifecycle_uses_shared_semantic_label() -> None:
     assert "TOOL  read_file [completed]" in output.getvalue()
 
 
+def test_terminal_reports_iteration_limit_without_reprinting_response() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False))
+
+    ui.emit_event(
+        {
+            "type": "turn.completed",
+            "response": "already streamed answer",
+            "stop_reason": "iteration_limit",
+            "iterations": 10,
+            "iteration_limit": 10,
+        }
+    )
+
+    rendered = output.getvalue()
+    assert "iteration limit (10/10 model steps)" in rendered
+    assert "ASH_MAX_TURN_ITERATIONS" in rendered
+    assert "already streamed answer" not in rendered
+
+
+def test_terminal_reports_token_usage_at_budget_stop() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False))
+
+    ui.emit_event(
+        {
+            "type": "turn.completed",
+            "stop_reason": "token_budget",
+            "token_budget": 80,
+            "usage": {"prompt_tokens": 76, "completion_tokens": 4},
+        }
+    )
+
+    assert "Turn token budget reached (80/80 tokens)." in output.getvalue()
+
+
+def test_terminal_reports_usage_from_cancelled_turn() -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False))
+
+    ui.emit_event(
+        {
+            "type": "turn.cancelled",
+            "iterations": 1,
+            "usage": {"prompt_tokens": 100, "completion_tokens": 10},
+        }
+    )
+
+    assert "Turn cancelled after 1 model step; 110 tokens recorded." in output.getvalue()
+
+
 @pytest.mark.parametrize(
     "terminal_event", ["turn.completed", "turn.cancelled", "turn.error"]
 )

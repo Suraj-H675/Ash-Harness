@@ -719,3 +719,13 @@ def test_max_iterations_terminates_infinite_tool_loop(
     assert "max iterations" in response.lower()
     # We expect the loop to have made exactly max_turn_iterations calls.
     assert read_tool.calls == 4
+    completed = next(
+        event.event
+        for event in reversed(
+            session_store.list_runtime_events(loop.current_session.session_id)
+        )
+        if event.event["type"] == "turn.completed"
+    )
+    assert completed["stop_reason"] == "iteration_limit"
+    assert completed["iterations"] == 4
+    assert completed["iteration_limit"] == 4

@@ -348,6 +348,9 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "replay_policy",
         }
     ),
+    "turn.completed": frozenset(
+        {"stop_reason", "iterations", "iteration_limit", "token_budget"}
+    ),
 }
 _OBSERVER_ENVELOPE_FIELDS = frozenset(
     {
@@ -1213,7 +1216,7 @@ class AshLoop:
         additional_instructions_loader: Callable[[Sequence[Path]], str] | None = None,
         instruction_scope_directories: Sequence[Path] | None = None,
         token_counter: TokenCounterLike | None = None,
-        max_turn_iterations: int = DEFAULT_MAX_TURN_ITERATIONS,
+        max_turn_iterations: int | None = None,
         repo_map: RepoMap | None = None,
         auto_commit: bool = False,
         auto_commit_paths: list[Path] | None = None,
@@ -1300,7 +1303,13 @@ class AshLoop:
         self._base_system_prompt = self._compose_base_system_prompt()
         self.system_prompt = self._base_system_prompt
         self.token_counter = token_counter
-        self.max_turn_iterations = max_turn_iterations
+        self.max_turn_iterations = (
+            max_turn_iterations
+            if max_turn_iterations is not None
+            else int(
+                getattr(config, "max_turn_iterations", DEFAULT_MAX_TURN_ITERATIONS)
+            )
+        )
         if max_steering_messages < 1:
             raise ValueError("max_steering_messages must be at least 1")
         self.max_steering_messages = max_steering_messages
@@ -1374,6 +1383,12 @@ class AshLoop:
         self._last_turn_cost_usd = 0.0
         self._last_estimated_cost_usd = 0.0
         self._last_cost_known = True
+        self._last_turn_stop_reason = "completed"
+        self._last_turn_iterations = 0
+        self._last_turn_iteration_limit = self.max_turn_iterations
+        self._last_turn_token_budget = int(
+            getattr(config, "max_turn_total_tokens", 0)
+        )
         self.skill_nudge_interval = skill_nudge_interval
         self._iterations_since_skill_use = 0
         self.continuous_mode = continuous_mode
@@ -2193,17 +2208,7 @@ class AshLoop:
             ),
         )
         self._last_context_budget = None
-        self._last_turn_prompt_tokens = 0
-        self._last_turn_completion_tokens = 0
-        self._last_turn_budget_exhausted = False
-        self._last_cache_read_tokens = 0
-        self._last_cache_write_tokens = 0
-        self._last_estimated_prompt_tokens = 0
-        self._last_estimated_completion_tokens = 0
-        self._last_usage_source = "unavailable"
-        self._last_turn_cost_usd = 0.0
-        self._last_estimated_cost_usd = 0.0
-        self._last_cost_known = True
+        self._reset_last_turn_state()
         self._turns_since_nudge = 0
         self._iterations_since_skill_use = 0
         self._continuous_turns = 0
@@ -2221,6 +2226,25 @@ class AshLoop:
         self._base_system_prompt = self._compose_base_system_prompt()
         self.recovered_turns = 0
         self.recovery_summary = None
+
+    def _reset_last_turn_state(self) -> None:
+        self._last_turn_prompt_tokens = 0
+        self._last_turn_completion_tokens = 0
+        self._last_turn_budget_exhausted = False
+        self._last_cache_read_tokens = 0
+        self._last_cache_write_tokens = 0
+        self._last_estimated_prompt_tokens = 0
+        self._last_estimated_completion_tokens = 0
+        self._last_usage_source = "unavailable"
+        self._last_turn_cost_usd = 0.0
+        self._last_estimated_cost_usd = 0.0
+        self._last_cost_known = True
+        self._last_turn_stop_reason = "completed"
+        self._last_turn_iterations = 0
+        self._last_turn_iteration_limit = self.max_turn_iterations
+        self._last_turn_token_budget = int(
+            getattr(self._config, "max_turn_total_tokens", 0)
+        )
 
     async def _finish_pending_session_tool_start(self) -> None:
         session = self.current_session
@@ -3317,6 +3341,10 @@ class AshLoop:
                 "model_id": self.active_model_id,
                 "context_tokens": self._last_context_tokens,
                 "usage": self.last_turn_usage,
+                "stop_reason": self._last_turn_stop_reason,
+                "iterations": self._last_turn_iterations,
+                "iteration_limit": self._last_turn_iteration_limit,
+                "token_budget": self._last_turn_token_budget,
             }
         )
 
@@ -3401,6 +3429,7 @@ class AshLoop:
         )
         previous_log_context = current_log_context()
         self._turn_running = True
+        self._reset_last_turn_state()
         try:
             await self._finish_pending_session_tool_start()
             if self.current_session is not None:
@@ -3496,6 +3525,10 @@ class AshLoop:
                 {
                     "type": "turn.cancelled",
                     "discarded_steering": discarded,
+                    "usage": self.last_turn_usage,
+                    "iterations": self._last_turn_iterations,
+                    "iteration_limit": self._last_turn_iteration_limit,
+                    "token_budget": self._last_turn_token_budget,
                 }
             )
             await self._fire_hook_lifecycle(
@@ -3576,28 +3609,24 @@ class AshLoop:
                 }
             )
 
-    def _persist_turn_usage(self, session: Session) -> None:
-        """Journal usage and accumulate session totals at a turn boundary."""
+    def _persist_turn_usage(
+        self,
+        *,
+        emit_event: bool = True,
+    ) -> None:
+        """Checkpoint cumulative usage and emit it at the turn boundary."""
 
         if self.turn_context is None:
             raise RuntimeError("cannot persist usage outside a turn")
         usage = self.last_turn_usage
         self.turn_context.set("usage", usage)
-        self.session_store.save_turn_usage(self.turn_context.turn_id, usage)
+        self.session_store.save_turn_usage_snapshot(
+            self.turn_context.turn_id,
+            usage,
+        )
         if self._last_turn_prompt_tokens or self._last_turn_completion_tokens:
-            self._emit_event({"type": "turn.usage", **usage})
-            self.session_store.save_session_token_stats(
-                session.session_id,
-                self._last_turn_prompt_tokens,
-                self._last_turn_completion_tokens,
-                self._last_turn_cost_usd,
-                cache_read_tokens=self._last_cache_read_tokens,
-                cache_write_tokens=self._last_cache_write_tokens,
-                estimated_prompt_tokens=self._last_estimated_prompt_tokens,
-                estimated_completion_tokens=self._last_estimated_completion_tokens,
-                estimated_cost_usd=self._last_estimated_cost_usd,
-                cost_known=self._last_cost_known,
-            )
+            if emit_event:
+                self._emit_event({"type": "turn.usage", **usage})
 
     async def _run_turn(
         self,
@@ -3628,6 +3657,7 @@ class AshLoop:
             session_id=session.session_id,
             turn_id=str(uuid4()),
         )
+        self._reset_last_turn_state()
         set_log_context(
             session_id=session.session_id,
             turn_id=self.turn_context.turn_id,
@@ -3680,6 +3710,24 @@ class AshLoop:
                     cache_write_tokens=planning_usage.cache_write_tokens,
                     pricing=planning_pricing,
                 )
+                planning_estimated = planning_usage.usage_source == "estimated"
+                self._last_turn_prompt_tokens = planning_usage.prompt_tokens
+                self._last_turn_completion_tokens = planning_usage.completion_tokens
+                self._last_cache_read_tokens = planning_usage.cache_read_tokens
+                self._last_cache_write_tokens = planning_usage.cache_write_tokens
+                self._last_estimated_prompt_tokens = (
+                    planning_usage.prompt_tokens if planning_estimated else 0
+                )
+                self._last_estimated_completion_tokens = (
+                    planning_usage.completion_tokens if planning_estimated else 0
+                )
+                self._last_usage_source = planning_usage.usage_source
+                self._last_turn_cost_usd = planning_cost
+                self._last_estimated_cost_usd = (
+                    planning_cost if planning_estimated else 0.0
+                )
+                self._last_cost_known = planning_cost_known
+                self._persist_turn_usage(emit_event=False)
                 self.session_store.save_sprint(session.session_id, execution)
                 approved = (
                     await self.on_plan_approval(execution)
@@ -3708,7 +3756,7 @@ class AshLoop:
                     )
                     self._last_cost_known = planning_cost_known
                     self._last_turn_budget_exhausted = False
-                    self._persist_turn_usage(session)
+                    self._persist_turn_usage()
                     self.session_store.complete_turn(self.turn_context.turn_id)
                     response = (
                         f"Plan rejected. Sprint {execution.contract.contract_id[:8]} aborted; "
@@ -3781,6 +3829,7 @@ class AshLoop:
             {planning_usage.usage_source} if planning_usage is not None else set()
         )
         turn_token_budget = int(getattr(self._config, "max_turn_total_tokens", 0))
+        self._last_turn_token_budget = turn_token_budget
         from ash.context.history import ContextBudgetExceededError
 
         iteration = 0
@@ -3866,6 +3915,7 @@ class AshLoop:
                     and remaining <= exc.required_tokens
                 ):
                     turn_budget_exhausted = True
+                    self._last_turn_stop_reason = "token_budget"
                     final_text = (
                         f"{final_text}\n\n"
                         "[Turn token budget exhausted before another model request: "
@@ -3888,6 +3938,7 @@ class AshLoop:
                 )
                 if response_limit is None:
                     turn_budget_exhausted = True
+                    self._last_turn_stop_reason = "token_budget"
                     final_text = (
                         f"{final_text}\n\n"
                         "[Turn token budget exhausted before another model request: "
@@ -3902,6 +3953,7 @@ class AshLoop:
                 estimated_prompt = max(1, self._last_context_tokens)
                 if remaining <= estimated_prompt:
                     turn_budget_exhausted = True
+                    self._last_turn_stop_reason = "token_budget"
                     final_text = (
                         f"{final_text}\n\n"
                         "[Turn token budget exhausted before another model request: "
@@ -3988,6 +4040,35 @@ class AshLoop:
                     cache_write_tokens=0,
                     pricing=completion_pricing,
                 )
+            total_prompt_tokens += turn_prompt_tokens
+            total_completion_tokens += turn_completion_tokens
+            total_cache_read_tokens += turn_cache_read_tokens
+            total_cache_write_tokens += turn_cache_write_tokens
+            usage_sources.add(turn_usage_source)
+            if turn_usage_source == "estimated":
+                total_estimated_prompt_tokens += turn_prompt_tokens
+                total_estimated_completion_tokens += turn_completion_tokens
+
+            self._last_turn_prompt_tokens = int(total_prompt_tokens)
+            self._last_turn_completion_tokens = int(total_completion_tokens)
+            self._last_cache_read_tokens = int(total_cache_read_tokens)
+            self._last_cache_write_tokens = int(total_cache_write_tokens)
+            self._last_estimated_prompt_tokens = int(total_estimated_prompt_tokens)
+            self._last_estimated_completion_tokens = int(
+                total_estimated_completion_tokens
+            )
+            self._last_usage_source = (
+                next(iter(usage_sources))
+                if len(usage_sources) == 1
+                else "mixed"
+            )
+            self._last_turn_cost_usd = total_turn_cost_usd
+            self._last_estimated_cost_usd = total_estimated_cost_usd
+            self._last_cost_known = turn_cost_known
+            self._last_turn_iterations = iteration
+            self._last_turn_iteration_limit = iteration_budget
+            self._persist_turn_usage(emit_event=False)
+
             await self._fire_hook_lifecycle(
                 "post_model",
                 {
@@ -4005,14 +4086,6 @@ class AshLoop:
                     "usage_source": turn_usage_source,
                 },
             )
-            total_prompt_tokens += turn_prompt_tokens
-            total_completion_tokens += turn_completion_tokens
-            total_cache_read_tokens += turn_cache_read_tokens
-            total_cache_write_tokens += turn_cache_write_tokens
-            usage_sources.add(turn_usage_source)
-            if turn_usage_source == "estimated":
-                total_estimated_prompt_tokens += turn_prompt_tokens
-                total_estimated_completion_tokens += turn_completion_tokens
 
             # Persist the assistant turn.
             assistant_message = Message(
@@ -4052,6 +4125,7 @@ class AshLoop:
                 or (bool(tool_calls) and used_tokens >= turn_token_budget)
             ):
                 turn_budget_exhausted = True
+                self._last_turn_stop_reason = "token_budget"
                 if tool_calls:
                     budget_error = (
                         "Turn token budget was exhausted before this tool call could "
@@ -4122,6 +4196,7 @@ class AshLoop:
                 )
             except CircuitBreakerError:
                 _log.warning("circuit breaker tripped — halting turn")
+                self._last_turn_stop_reason = "circuit_breaker"
                 final_text = (
                     f"{assistant_text}\n\n"
                     "[Circuit breaker tripped — see prior tool errors. Halting turn.]"
@@ -4158,6 +4233,7 @@ class AshLoop:
             final_text = assistant_text
         else:
             # Loop exhausted without a terminal text response.
+            self._last_turn_stop_reason = "iteration_limit"
             final_text = (
                 f"{final_text}\n\n"
                 "[Turn reached max iterations without a final text response.]"
@@ -4189,7 +4265,9 @@ class AshLoop:
         self._last_turn_cost_usd = turn_cost_usd
         self._last_estimated_cost_usd = estimated_cost_usd
         self._last_cost_known = turn_cost_known
-        self._persist_turn_usage(session)
+        self._last_turn_iterations = iteration
+        self._last_turn_iteration_limit = iteration_budget
+        self._persist_turn_usage()
 
         if self.auto_commit:
             commit_paths = sorted(self._turn_modified_paths)
