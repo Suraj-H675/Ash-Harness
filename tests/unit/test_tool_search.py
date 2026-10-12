@@ -7,13 +7,16 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field
 
+from ash.cli import _render_context_provenance
+from ash.config import AshConfig
+from ash.context.history import ContextFragmentKind
 from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
-from ash.tools.tool_search import SearchToolsTool
+from ash.tools.tool_search import ESSENTIAL_TOOL_NAMES, SearchToolsTool
 from ash.ui.headless import HeadlessUI
 
 
@@ -32,6 +35,25 @@ class DummyTool(BaseTool):
     async def run(self, **kwargs: Any) -> ToolResult:
         args = TextArgs(**kwargs)
         return ToolResult(success=True, output=f"ran {self.name}: {args.text}")
+
+
+def test_large_catalog_keeps_compact_core_and_searchable_remainder(tmp_path) -> None:
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=8)
+    catalog[search.name] = search
+    for name in ESSENTIAL_TOOL_NAMES:
+        catalog[name] = DummyTool(guard, name, f"Essential {name} tool.")
+    for index in range(40):
+        name = f"optional_integration_{index}"
+        catalog[name] = DummyTool(guard, name, f"Optional integration {index}.")
+
+    visible = search.visible_tools(catalog)
+
+    assert len(catalog) > search.threshold
+    assert set(visible) == {*ESSENTIAL_TOOL_NAMES, search.name}
+    assert len(visible) == 10
+    assert len(visible) < len(catalog)
 
 
 @pytest.mark.asyncio
@@ -211,6 +233,62 @@ class SearchFlowProvider(ProviderABC):
             )
         else:
             yield StreamChunk(content="tool search complete", is_done=True)
+
+
+@pytest.mark.asyncio
+async def test_context_provenance_reports_frozen_visible_tool_selection(
+    tmp_path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=1)
+    catalog.update(
+        {
+            search.name: search,
+            "hidden_database": DummyTool(
+                guard, "hidden_database", "A database integration."
+            ),
+            "remote_storage": DummyTool(
+                guard, "remote_storage", "A remote storage integration."
+            ),
+        }
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "context-tool-provenance.db"),
+        SearchFlowProvider(),
+        guard,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path,
+        tools=catalog,
+        config=AshConfig(
+            model="local/search-flow",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            max_context_tokens=16_384,
+            max_completion_tokens=1_024,
+            memory_backend="off",
+        ),
+    )
+    session = await loop.start_session()
+
+    loop._build_messages(session)
+
+    assert loop._last_context_budget is not None
+    tool_fragment = next(
+        fragment
+        for fragment in loop._last_context_budget.fragments
+        if fragment.kind is ContextFragmentKind.TOOL_SCHEMA
+    )
+    metadata = dict(tool_fragment.metadata)
+    provenance = _render_context_provenance(loop._last_context_budget)
+
+    assert metadata["tool_count"] == "1"
+    assert metadata["registry_tool_count"] == "3"
+    assert metadata["deferred_tool_count"] == "2"
+    assert metadata["provider_visible_tool_names"] == "search_tools"
+    assert "provider_visible_tool_names=search_tools" in provenance
+    assert "deferred_tool_count=2" in provenance
+    await loop.aclose()
 
 
 @pytest.mark.asyncio

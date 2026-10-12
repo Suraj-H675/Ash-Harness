@@ -21,15 +21,11 @@ ESSENTIAL_TOOL_NAMES = frozenset(
         "activate_skill",
         "apply_patch",
         "ask_user",
-        "delegate_agents",
         "git_status",
-        "glob_files",
         "list_dir",
         "read_file",
-        "replace_file_content",
         "run_command",
         "search_text",
-        "spawn_agent",
         "write_file",
     }
 )

@@ -5933,6 +5933,62 @@ async def test_context_budget_report_enforces_sections(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_context_budget_retains_explicit_instruction_tail_and_reports_truncation(
+    tmp_path: Path,
+) -> None:
+    class SmallContextProvider(BudgetProvider):
+        capabilities = ProviderCapabilities(native_tools=True, context_window=1024)
+
+    project_instructions = (
+        "PROJECT PERSISTENT INSTRUCTIONS START. "
+        + "Preserve compatibility and follow the migration policy. " * 220
+        + "\nFINAL PROJECT RULE SENTINEL: retain the exact legacy configuration key."
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "small-context-instructions.db"),
+        SmallContextProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        system_prompt="CORE SYSTEM POLICY: preserve Ash permission checks. " * 220,
+        additional_instructions=project_instructions,
+        config=AshConfig(
+            model="openai/budget-test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            max_context_tokens=1024,
+            max_completion_tokens=64,
+            memory_backend="off",
+            context_budget_weights={
+                "system": 0.8,
+                "tools": 0.05,
+                "history": 0.05,
+                "repo_map": 0.05,
+                "memory": 0.05,
+            },
+        ),
+    )
+    session = await loop.start_session()
+
+    messages = loop._build_messages(session)
+
+    assert "CORE SYSTEM POLICY" in messages[0]["content"]
+    assert "FINAL PROJECT RULE SENTINEL: retain the exact legacy configuration key." in messages[0]["content"]
+    assert "explicitly loaded persistent instructions" in messages[0]["content"]
+    assert "remain subordinate to the user and Ash policy" in messages[0]["content"]
+    assert loop._last_context_budget is not None
+    assert loop._last_context_budget.slices["system"].truncated is True
+    system_fragment = next(
+        item
+        for item in loop._last_context_budget.fragments
+        if item.kind.value == "system"
+    )
+    assert dict(system_fragment.metadata)["persistent_instructions_truncated"] == "true"
+    assert loop._last_context_tokens <= loop._last_context_budget.input_limit
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_prior_session_recall_remains_untrusted_context(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "prior-session-context.db")
     prior = store.create_session(str(tmp_path), model="openai/budget-test")

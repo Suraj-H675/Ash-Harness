@@ -58,7 +58,10 @@ After a request is assembled, `ContextBudgetReport.fragments` records each
 fragment's typed kind, source, trust class, token use and limit, truncation
 state, SHA-256, and non-content metadata. The report intentionally does not
 retain a second copy of prompt content. Use `/context` to inspect current
-bucket use and fragment provenance.
+bucket use and fragment provenance. `/context --provenance` shows the exact
+provider-visible tool count, an eight-name preview, and how many registry tools
+remain deferred. It also reports whether core instructions, loaded persistent
+instructions, or supplemental system context were truncated.
 
 ## Compaction
 
@@ -67,8 +70,9 @@ request and the working `context_summary`:
 
 1. Bound stale tool outputs while retaining their call identity.
 2. Keep the configured recent message tail and complete assistant/tool pairs.
-3. Extract prior user requests, referenced paths, tool actions, and assistant
-   outcomes into a structured state section.
+3. Extract user requirements, assistant decisions and progress, referenced
+   paths, tool actions, recent tool outputs, and compacted events into bounded,
+   labeled sections. Tool outputs remain untrusted evidence.
 4. Preserve both the beginning and end of an earlier summary.
 5. Redact secrets before persisting the updated summary.
 6. Drop older complete entries only when the retained tail still exceeds the

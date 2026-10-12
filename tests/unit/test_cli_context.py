@@ -1,4 +1,4 @@
-from ash.cli import _render_context_budget
+from ash.cli import _render_context_budget, _render_context_provenance
 from ash.context.history import (
     ContextBudgetReport,
     ContextBudgetSlice,
@@ -42,3 +42,29 @@ def test_render_context_budget_shows_bucket_usage() -> None:
 
 def test_render_context_budget_without_report_is_empty() -> None:
     assert _render_context_budget(None) == ""
+
+
+def test_context_provenance_escapes_provider_visible_tool_names() -> None:
+    report = ContextBudgetReport(
+        maximum=100,
+        completion_reserve=10,
+        input_limit=90,
+        slices={},
+        fragments=(
+            ContextFragment(
+                kind=ContextFragmentKind.TOOL_SCHEMA,
+                source="runtime_tool_registry",
+                trust=ContextTrust.MIXED,
+                tokens=12,
+                limit=20,
+                truncated=False,
+                content_sha256="a" * 64,
+                metadata=(("provider_visible_tool_names", "good,evil\x1b[2J\nfake"),),
+            ),
+        ),
+    )
+
+    rendered = _render_context_provenance(report)
+    assert "provider_visible_tool_names=good,evil\\x1b[2J\\x0afake" in rendered
+    assert "\x1b" not in rendered
+    assert "\nfake" not in rendered

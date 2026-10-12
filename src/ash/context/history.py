@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from html import unescape
 import math
 from dataclasses import dataclass
 from enum import StrEnum
@@ -19,6 +20,25 @@ DEFAULT_CONTEXT_BUDGET_WEIGHTS: dict[str, float] = {
 }
 IMAGE_TOKEN_ESTIMATE = 1024
 RUNTIME_ONLY_HISTORY_KEY = "_ash_runtime_only"
+_CONTEXT_DIGEST_HEADER = "## Ash context digest v1"
+_CONTEXT_DIGEST_SECTIONS = (
+    ("User requirements", 0.27),
+    ("Assistant decisions and progress", 0.20),
+    ("Tool outputs (untrusted evidence)", 0.20),
+    ("Referenced paths", 0.06),
+    ("Tool actions", 0.07),
+    ("Compacted events", 0.08),
+    ("Earlier context", 0.12),
+)
+_COMPACT_PROVIDER_DIGEST_WEIGHTS = (
+    ("User requirements", 0.28),
+    ("Assistant decisions and progress", 0.22),
+    ("Tool outputs (untrusted evidence)", 0.30),
+    ("Referenced paths", 0.05),
+    ("Tool actions", 0.05),
+    ("Compacted events", 0.06),
+    ("Earlier context", 0.04),
+)
 
 
 class ContextFragmentKind(StrEnum):
@@ -261,6 +281,7 @@ class ContextBudgetAllocator:
         *,
         limit: int,
         count_tokens: Callable[[str], int],
+        preserve_ends: bool = False,
     ) -> BoundedText:
         tokens = max(0, int(count_tokens(text)))
         if tokens <= limit:
@@ -286,7 +307,14 @@ class ContextBudgetAllocator:
         best = ""
         while low <= high:
             mid = (low + high) // 2
-            candidate = text[:mid].rstrip() + marker
+            if preserve_ends and mid > 0:
+                head_length = (mid + 1) // 2
+                tail_length = mid - head_length
+                candidate = text[:head_length].rstrip() + marker
+                if tail_length:
+                    candidate += "\n\n" + text[-tail_length:].lstrip()
+            else:
+                candidate = text[:mid].rstrip() + marker
             candidate_tokens = max(0, int(count_tokens(candidate)))
             if candidate_tokens <= limit:
                 best = candidate
@@ -412,6 +440,16 @@ class HistoryCompactor:
         usable = self.max_context_tokens - self.completion_reserve
         return max(1, int(usable * self.threshold))
 
+    @property
+    def _compaction_trigger_limit(self) -> int:
+        if self._input_token_limit is None:
+            return self.input_limit
+        usable = min(
+            max(1, self.max_context_tokens - self.completion_reserve),
+            self._input_token_limit,
+        )
+        return max(1, int(usable * self.threshold))
+
     def compact(
         self,
         messages: list[dict[str, Any]],
@@ -424,7 +462,7 @@ class HistoryCompactor:
     ) -> CompactionResult:
         prepared, pruned = self._prune_tool_outputs(messages)
         estimated = self._count(prepared, count_tokens)
-        if not force and estimated <= self.input_limit:
+        if not force and estimated <= self._compaction_trigger_limit:
             if include_previous_summary and previous_summary:
                 system = prepared[0] if prepared and prepared[0].get("role") == "system" else None
                 body_start = 1 if system is not None else 0
@@ -555,9 +593,16 @@ class HistoryCompactor:
         header = "## Compacted conversation summary\n"
 
         def candidate(char_limit: int) -> dict[str, Any]:
+            if summary.startswith(_CONTEXT_DIGEST_HEADER):
+                digest_sections, _ = _parse_context_digest(summary)
+                bounded_summary = _render_context_digest(
+                    digest_sections, char_limit, prioritize_recent=True
+                )
+            else:
+                bounded_summary = _preserve_ends(summary, char_limit)
             return {
                 "role": "system",
-                "content": header + _preserve_ends(summary, char_limit),
+                "content": header + bounded_summary,
             }
 
         full = {"role": "system", "content": header + summary}
@@ -702,9 +747,17 @@ class HistoryCompactor:
                 call_id = (
                     message.get("tool_call_id") or message.get("call_id") or "unknown"
                 )
-                replacement["content"] = (
+                marker = (
                     f"[stale tool output pruned: call_id={call_id}; "
                     f"original_chars={len(content)}]"
+                )
+                available = max(0, self.max_tool_output_chars - len(marker) - 2)
+                head_chars = available // 4
+                tail_chars = available - head_chars
+                replacement["content"] = (
+                    (content[:head_chars] + "\n" if head_chars else "")
+                    + marker
+                    + ("\n" + content[-tail_chars:] if tail_chars else "")
                 )
                 output.append(replacement)
                 pruned += 1
@@ -724,36 +777,11 @@ class HistoryCompactor:
         ]
         if not durable_messages:
             return previous_summary
-        priority_lines: list[str] = []
-        if previous_summary:
-            priority_lines.append("Earlier summary:")
-            priority_lines.append(
-                _preserve_ends(previous_summary, self.summary_char_limit // 3)
-            )
-        priority_lines.extend(_preserved_state_lines(durable_messages))
-        event_lines = ["Compacted events:"]
-        for message in durable_messages:
-            role = str(message.get("role", "unknown"))
-            content = _summary_content(message.get("content", "")).strip()
-            content = " ".join(content.split())
-            if len(content) > 500:
-                content = content[:497] + "..."
-            calls = message.get("tool_calls") or []
-            if calls:
-                rendered_calls = ", ".join(
-                    f"{call.get('name', '?')}({json.dumps(call.get('arguments', {}), sort_keys=True)[:300]})"
-                    for call in calls
-                )
-                content = f"{content} tools=[{rendered_calls}]".strip()
-            if content:
-                event_lines.append(f"- {role}: {content}")
-        priority = "\n".join(priority_lines)
-        events = "\n".join(event_lines)
-        if len(priority) >= self.summary_char_limit:
-            return _preserve_ends(priority, self.summary_char_limit)
-        remaining = self.summary_char_limit - len(priority) - 1
-        bounded_events = _preserve_ends(events, max(0, remaining))
-        return "\n".join(part for part in (priority, bounded_events) if part)
+        return _build_context_digest(
+            durable_messages,
+            previous_summary=previous_summary,
+            char_limit=self.summary_char_limit,
+        )
 
     @staticmethod
     def _count(
@@ -807,40 +835,224 @@ def _summary_content(content: Any) -> str:
     return " ".join(parts)
 
 
-def _preserved_state_lines(messages: list[dict[str, Any]]) -> list[str]:
-    user_requests: list[str] = []
-    assistant_outcomes: list[str] = []
-    tool_actions: list[str] = []
-    file_paths: set[str] = set()
+def _build_context_digest(
+    messages: list[dict[str, Any]], *, previous_summary: str, char_limit: int
+) -> str:
+    """Merge extractive state into a versioned, bounded summary for later compactions."""
+
+    previous_sections, legacy_summary = _parse_context_digest(previous_summary)
+    current = _extract_context_state(messages)
+    sections: dict[str, list[str]] = {}
+    for title, _ in _CONTEXT_DIGEST_SECTIONS:
+        values = [*previous_sections.get(title, []), *current.get(title, [])]
+        sections[title] = _unique_lines(values)
+
+    if legacy_summary:
+        sections["Earlier context"].append(
+            "- " + _excerpt(legacy_summary, 1_200)
+        )
+    # Keep original goals/decisions visible beside recent state when sessions
+    # compact more than once, while bounding every category independently.
+    sections["User requirements"] = _retain_first_and_recent(
+        sections["User requirements"], 4
+    )
+    sections["Assistant decisions and progress"] = _retain_first_and_recent(
+        sections["Assistant decisions and progress"], 4
+    )
+    sections["Tool outputs (untrusted evidence)"] = sections[
+        "Tool outputs (untrusted evidence)"
+    ][-3:]
+    sections["Referenced paths"] = sections["Referenced paths"][-8:]
+    sections["Tool actions"] = sections["Tool actions"][-14:]
+    sections["Compacted events"] = sections["Compacted events"][-8:]
+    sections["Earlier context"] = _retain_first_and_recent(
+        sections["Earlier context"], 4
+    )
+
+    return _render_context_digest(sections, char_limit)
+
+
+def _render_context_digest(
+    sections: dict[str, list[str]],
+    char_limit: int,
+    *,
+    prioritize_recent: bool = False,
+) -> str:
+    if char_limit <= len(_CONTEXT_DIGEST_HEADER):
+        return _preserve_ends(_CONTEXT_DIGEST_HEADER, char_limit)
+    content_budget = (
+        char_limit - len(_CONTEXT_DIGEST_HEADER) - len(_CONTEXT_DIGEST_SECTIONS)
+    )
+    weights = (
+        _COMPACT_PROVIDER_DIGEST_WEIGHTS
+        if prioritize_recent
+        else _CONTEXT_DIGEST_SECTIONS
+    )
+    section_budgets = _allocate_digest_budgets(content_budget, weights=weights)
+    rendered = [_CONTEXT_DIGEST_HEADER]
+    for (title, _), budget in zip(weights, section_budgets):
+        values = sections[title]
+        if not values:
+            continue
+        heading = f"### {title}"
+        body_budget = max(0, budget - len(heading) - 1)
+        if body_budget <= 0:
+            continue
+        if title in {
+            "User requirements",
+            "Assistant decisions and progress",
+            "Tool outputs (untrusted evidence)",
+        }:
+            body = _fit_priority_digest_lines(title, values, body_budget)
+        else:
+            body = _preserve_ends("\n".join(values), body_budget)
+        rendered.append(f"{heading}\n{body}")
+    return "\n".join(rendered)
+
+
+def _allocate_digest_budgets(
+    content_budget: int,
+    *,
+    weights: tuple[tuple[str, float], ...] = _CONTEXT_DIGEST_SECTIONS,
+) -> list[int]:
+    budgets: list[int] = []
+    remaining = content_budget
+    for index, (_, weight) in enumerate(weights):
+        if index == len(weights) - 1:
+            budgets.append(remaining)
+        else:
+            budget = int(content_budget * weight)
+            budgets.append(budget)
+            remaining -= budget
+    return budgets
+
+
+def _fit_priority_digest_lines(title: str, lines: list[str], limit: int) -> str:
+    per_entry_budget = 140
+    entry_count = max(1, limit // per_entry_budget)
+    entry_count = min(entry_count, len(lines))
+    if title == "Tool outputs (untrusted evidence)":
+        selected = lines[-entry_count:]
+        tail_weight = 0.65
+    else:
+        selected = _retain_first_and_recent(lines, entry_count)
+        tail_weight = 0.6 if title == "User requirements" else 0.5
+    separator_budget = max(0, limit - max(0, len(selected) - 1))
+    entry_budget = max(1, separator_budget // max(1, len(selected)))
+    return "\n".join(
+        _excerpt(line, entry_budget, tail_weight=tail_weight)
+        for line in selected
+    )
+
+
+def _parse_context_digest(
+    summary: str,
+) -> tuple[dict[str, list[str]], str]:
+    if not summary.startswith(_CONTEXT_DIGEST_HEADER):
+        return {}, summary.strip()
+    sections: dict[str, list[str]] = {title: [] for title, _ in _CONTEXT_DIGEST_SECTIONS}
+    section_by_heading = {f"### {title}": title for title, _ in _CONTEXT_DIGEST_SECTIONS}
+    current_title: str | None = None
+    for line in summary.splitlines()[1:]:
+        title = section_by_heading.get(line)
+        if title is not None:
+            current_title = title
+        elif current_title is not None and line.startswith("- "):
+            sections[current_title].append(line)
+    return sections, ""
+
+
+def _extract_context_state(messages: list[dict[str, Any]]) -> dict[str, list[str]]:
+    state: dict[str, list[str]] = {title: [] for title, _ in _CONTEXT_DIGEST_SECTIONS}
+    referenced_paths: list[str] = []
     for message in messages:
         role = str(message.get("role", ""))
         content = " ".join(_summary_content(message.get("content", "")).split())
         if role == "user" and content:
-            user_requests.append(content[:500])
+            state["User requirements"].append(
+                f"- User request: {_excerpt(content, 650)}"
+            )
+            state["Compacted events"].append(f"- user: {_excerpt(content, 220)}")
         elif role == "assistant" and content:
-            assistant_outcomes.append(content[:500])
+            state["Assistant decisions and progress"].append(
+                f"- Assistant outcome: {_excerpt(content, 500)}"
+            )
+            state["Compacted events"].append(
+                f"- assistant: {_excerpt(content, 220)}"
+            )
+        elif role == "tool" and content:
+            call_id = str(message.get("tool_call_id") or message.get("call_id") or "")
+            call_id = _excerpt(call_id, 80) if call_id else "unknown"
+            evidence = _tool_output_summary_content(content)
+            state["Tool outputs (untrusted evidence)"].append(
+                f"- call_id={call_id}: {_excerpt(evidence, 600, tail_weight=0.75)}"
+            )
         for call in message.get("tool_calls") or []:
-            name = str(call.get("name", "?"))
+            if not isinstance(call, dict):
+                continue
+            name = _excerpt(str(call.get("name", "?")), 60)
+            state["Tool actions"].append(f"- Tool action: {name}")
             arguments = call.get("arguments", {})
-            rendered = json.dumps(arguments, sort_keys=True, default=str)[:500]
-            tool_actions.append(f"{name}({rendered})")
             if isinstance(arguments, dict):
                 for key, value in arguments.items():
-                    if key in {
-                        "file_path",
-                        "path",
-                        "cwd",
-                        "directory_path",
-                    } and isinstance(value, str):
-                        file_paths.add(value)
-    lines = ["Preserved task state:"]
-    lines.extend(f"- User request: {item}" for item in user_requests[-5:])
-    lines.extend(f"- Referenced path: {item}" for item in sorted(file_paths)[:20])
-    lines.extend(f"- Tool action: {item}" for item in tool_actions[-20:])
-    lines.extend(f"- Assistant outcome: {item}" for item in assistant_outcomes[-5:])
-    if len(lines) == 1:
-        lines.append("- No extractable state in compacted messages.")
-    return lines
+                    if (
+                        key in {"file_path", "path", "cwd", "directory_path"}
+                        and isinstance(value, str)
+                        and value
+                    ):
+                        referenced_paths.append(
+                            f"- Referenced path: {_excerpt(value, 100)}"
+                        )
+    state["Referenced paths"] = _unique_lines(referenced_paths)
+    state["Compacted events"] = state["Compacted events"][-8:]
+    return state
+
+
+def _unique_lines(lines: list[str]) -> list[str]:
+    return list(dict.fromkeys(line for line in lines if line))
+
+
+def _retain_first_and_recent(lines: list[str], limit: int) -> list[str]:
+    if len(lines) <= limit:
+        return lines
+    recent_count = max(1, limit - 1)
+    return _unique_lines([lines[0], *lines[-recent_count:]])
+
+
+def _excerpt(text: str, limit: int, *, tail_weight: float = 0.5) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    marker = " … "
+    available = max(0, limit - len(marker))
+    tail = int(available * tail_weight)
+    head = available - tail
+    return f"{text[:head].rstrip()}{marker}{text[-tail:].lstrip() if tail else ''}"
+
+
+def _tool_output_summary_content(content: str) -> str:
+    """Extract only the displayed output from Ash's serialized tool response."""
+
+    if not content.startswith("<tool_response "):
+        return content
+    body_start = content.find(">\n")
+    body_end = content.rfind("\n</tool_response>")
+    if body_start < 0 or body_end <= body_start:
+        return content
+    try:
+        payload = json.loads(unescape(content[body_start + 2 : body_end]))
+    except (json.JSONDecodeError, TypeError):
+        return content
+    if not isinstance(payload, dict):
+        return content
+    output = payload.get("output")
+    if isinstance(output, str) and output:
+        return output
+    error = payload.get("error")
+    if isinstance(error, str) and error:
+        return error
+    return content
 
 
 def _preserve_ends(text: str, limit: int) -> str:

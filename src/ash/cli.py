@@ -414,7 +414,11 @@ def _render_context_provenance(report: Any | None) -> str:
         return "Provenance unavailable; run a turn first."
     lines = ["Provider-input provenance:"]
     for fragment in report.fragments:
-        metadata = ", ".join(f"{key}={value}" for key, value in fragment.metadata)
+        metadata = ", ".join(
+            f"{terminal_safe_text(key, single_line=True)}="
+            f"{terminal_safe_text(value, single_line=True)}"
+            for key, value in fragment.metadata
+        )
         suffix = f"; {metadata}" if metadata else ""
         lines.append(
             f"  {fragment.kind} source={fragment.source} trust={fragment.trust.value} "

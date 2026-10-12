@@ -1,3 +1,4 @@
+import json
 import math
 
 import pytest
@@ -321,6 +322,44 @@ def test_stale_large_tool_output_is_pruned_without_mutating_transcript() -> None
     assert messages[2]["content"] == large
 
 
+def test_compaction_preserves_final_verdict_of_oversized_tool_output() -> None:
+    log = "verbose pytest collection details " * 3000
+    log += "\nFINAL VERIFICATION: 123 passed, 0 failed"
+    output = (
+        '<tool_response name="run_command" call_id="verify">\n'
+        + json.dumps({"success": True, "output": log})
+        + "\n</tool_response>"
+    )
+    messages = [
+        {"role": "system", "content": "policy"},
+        {"role": "user", "content": "Verify the fix"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"call_id": "verify", "name": "run_command", "arguments": {}}
+            ],
+        },
+        {"role": "tool", "content": output, "tool_call_id": "verify"},
+        *[
+            {"role": "user", "content": f"Follow-up request {index}"}
+            for index in range(16)
+        ],
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=2000,
+        completion_reserve=200,
+        recent_messages=3,
+        max_tool_output_chars=256,
+    )
+
+    result = compactor.compact(messages, count_tokens=count_words, force=True)
+
+    assert result.pruned_tool_outputs == 1
+    assert "FINAL VERIFICATION: 123 passed, 0 failed" in result.summary
+    assert "call_id=verify" in result.summary
+    assert messages[3]["content"] == output
+
+
 def test_context_budget_allocator_normalizes_and_fits_text() -> None:
     allocator = ContextBudgetAllocator(
         max_context_tokens=100,
@@ -591,6 +630,105 @@ def test_repeated_compaction_preserves_prior_goal_and_newer_decisions() -> None:
     assert "Tool action: read_file" in third.summary
 
 
+def test_repeated_compaction_preserves_request_and_tool_result_tails() -> None:
+    compactor = HistoryCompactor(
+        max_context_tokens=100_000,
+        completion_reserve=100,
+        recent_messages=12,
+        summary_char_limit=12_000,
+    )
+    request = (
+        "ORIGINAL GOAL: keep the public adapter stable.\n"
+        + "Additional repository context and requirements. " * 80
+        + "\nACCEPTANCE CRITERION: preserve the legacy configuration key exactly."
+    )
+    test_output = (
+        "pytest session started\n"
+        + "verbose assertion and collection detail " * 80
+        + "\nVERIFICATION RESULT: 123 passed, 0 failed"
+    )
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": request},
+        {
+            "role": "assistant",
+            "content": (
+                "REJECTED ATTEMPT: replacing the adapter broke older callers. "
+                "DECISION: preserve the existing public adapter."
+            ),
+            "tool_calls": [
+                {
+                    "call_id": "pytest-call",
+                    "name": "run_command",
+                    "arguments": {"command": "pytest -q"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": test_output,
+            "tool_call_id": "pytest-call",
+        },
+    ]
+    messages.extend(
+        {
+            "role": role,
+            "content": f"FOLLOWUP {index}: " + "routine progress detail " * 100,
+        }
+        for index in range(30)
+        for role in ("user", "assistant")
+    )
+
+    first = compactor.compact(messages, count_tokens=count_words, force=True)
+    resident_tail = first.messages[2:]
+    resident_tail.extend(
+        {
+            "role": role,
+            "content": f"LATER FOLLOWUP {index}: " + "routine progress detail " * 100,
+        }
+        for index in range(30)
+        for role in ("user", "assistant")
+    )
+    second = compactor.compact(
+        [{"role": "system", "content": "system"}, *resident_tail],
+        count_tokens=count_words,
+        previous_summary=first.summary,
+        force=True,
+    )
+
+    assert "ACCEPTANCE CRITERION: preserve the legacy configuration key exactly." in second.summary
+    assert "REJECTED ATTEMPT: replacing the adapter broke older callers." in second.summary
+    assert "DECISION: preserve the existing public adapter." in second.summary
+    assert "VERIFICATION RESULT: 123 passed, 0 failed" in second.summary
+
+
+def test_compaction_threshold_applies_below_explicit_provider_hard_limit() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "older context detail " * 250},
+        {"role": "assistant", "content": "I checked the current API."},
+        {"role": "user", "content": "Continue with the latest change."},
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=1_000,
+        completion_reserve=100,
+        threshold=0.5,
+        recent_messages=2,
+        input_token_limit=900,
+    )
+
+    result = compactor.compact(messages, count_tokens=count_words)
+
+    assert result.compacted is True
+    assert result.estimated_tokens <= 900
+    assert any(
+        str(message.get("content", "")).startswith(
+            "## Compacted conversation summary"
+        )
+        for message in result.messages
+    )
+
+
 def test_windowed_history_keeps_previous_summary_visible_below_compaction_limit() -> None:
     previous = "Earlier durable context"
     messages = [
@@ -753,6 +891,76 @@ def test_compaction_fits_provider_visible_summary_to_hard_limit() -> None:
     ]
     if visible_summaries:
         assert len(visible_summaries[0]) < len(result.summary) + 40
+
+
+def test_provider_visible_digest_retains_requirements_decisions_and_test_result() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {
+            "role": "user",
+            "content": (
+                "ORIGINAL GOAL: preserve adapter compatibility. "
+                + "requirement detail " * 180
+                + " ACCEPTANCE CRITERION: retain the legacy key exactly."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "DECISION: keep the existing public adapter. "
+            + "implementation detail " * 60,
+            "tool_calls": [
+                {
+                    "call_id": "call-1",
+                    "name": "read_file",
+                    "arguments": {"file_path": "src/adapter.py"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": (
+                '<tool_response name="run_command" call_id="call-1">\n'
+                + json.dumps(
+                    {
+                        "success": True,
+                        "output": "verbose test output " * 120
+                        + " VERIFICATION RESULT: 123 passed, 0 failed",
+                    },
+                    indent=2,
+                )
+                + "\n</tool_response>"
+            ),
+            "tool_call_id": "call-1",
+        },
+        {"role": "user", "content": "current user request"},
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=160,
+        completion_reserve=20,
+        recent_messages=1,
+        summary_char_limit=12_000,
+    )
+
+    result = compactor.compact(
+        messages,
+        count_tokens=count_words,
+        force=True,
+        protected_from_index=4,
+    )
+    visible_summary = next(
+        str(message.get("content", ""))
+        for message in result.messages
+        if message.get("role") == "system"
+        and str(message.get("content", "")).startswith(
+            "## Compacted conversation summary"
+        )
+    )
+
+    assert result.estimated_tokens <= compactor.input_limit
+    assert "ACCEPTANCE CRITERION: retain the legacy key exactly." in visible_summary
+    assert "DECISION: keep" in visible_summary
+    assert "123 passed, 0 failed" in visible_summary
+    assert "Tool outputs (untrusted evidence)" in visible_summary
 
 
 def test_compaction_rejects_oversized_protected_current_request() -> None:
