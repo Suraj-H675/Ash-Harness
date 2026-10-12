@@ -129,6 +129,83 @@ def test_agent_report_renderer_emits_json(tmp_path: Path) -> None:
     assert payload["reports"][0]["summary"] == "looks good"
 
 
+def test_agent_human_renderers_escape_untrusted_text_without_changing_json() -> None:
+    hostile = "injected\x1b[2J\nnew row\u202e"
+    samples = [
+        (
+            render_agent_statuses,
+            [
+                {
+                    "agent_id": "worker",
+                    "role": "coder",
+                    "status": "working",
+                    "current_task": hostile,
+                }
+            ],
+        ),
+        (
+            render_agent_reports,
+            [
+                {
+                    "sender_id": "worker",
+                    "role": "coder",
+                    "success": False,
+                    "summary": hostile,
+                }
+            ],
+        ),
+        (
+            render_agent_tasks,
+            [
+                {
+                    "task_id": "task",
+                    "role": "coder",
+                    "state": "failed",
+                    "owner_agent_id": "worker",
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    "used_tokens": 0,
+                    "token_budget": 100,
+                    "description": hostile,
+                }
+            ],
+        ),
+        (
+            render_agent_messages,
+            [
+                {
+                    "message_id": 1,
+                    "sender_id": "worker",
+                    "recipient_id": "lead",
+                    "message_type": "progress",
+                    "delivered": False,
+                    "content": {"summary": hostile},
+                }
+            ],
+        ),
+        (
+            render_agent_approvals,
+            [
+                {
+                    "request_id": 1,
+                    "agent_id": "worker",
+                    "tool_name": "run_command",
+                    "status": "pending",
+                    "arguments_preview": hostile,
+                }
+            ],
+        ),
+    ]
+    for renderer, records in samples:
+        text = renderer(records)
+        assert "\\x1b[2J" in text
+        assert "\\x0a" in text
+        assert "\\u202e" in text
+        assert "\x1b" not in text
+        assert "\n" not in text
+        assert json.dumps(hostile)[1:-1] in renderer(records, json_output=True)
+
+
 def test_agent_task_renderer_includes_durable_artifacts(tmp_path: Path) -> None:
     state = SharedState(tmp_path / "agents.db")
     state.tasks.create_task("implement", task_id="task-1", token_budget=20)
@@ -570,6 +647,44 @@ def test_agents_cli_lists_filtered_durable_tasks(
     assert "limit must be between" in capsys.readouterr().err
 
 
+def test_agents_cli_text_task_and_event_outputs_include_safe_failure_reason(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db"
+    state = SharedState(db_dir / "agents.db", workspace=tmp_path)
+    state.tasks.create_task(
+        "run tests",
+        task_id="failed-task",
+        metadata={"workspace": str(tmp_path.resolve())},
+    )
+    lease = state.tasks.claim_task("worker", task_id="failed-task")
+    assert lease is not None
+    state.tasks.start_task("failed-task", lease.token)
+    reason = "pytest failed: \x1b[31mtest_widget\x1b[0m\nrun repair"
+    state.tasks.fail_task("failed-task", lease.token, reason)
+    state.close()
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(tmp_path))
+
+    assert main(["agents", "tasks", "--state", "failed"]) == 0
+    task_output = capsys.readouterr().out
+    assert (
+        r"error=pytest failed: \x1b[31mtest_widget\x1b[0m\x0arun repair"
+        in task_output
+    )
+
+    assert main(["agents", "events", "--task", "failed-task"]) == 0
+    event_output = capsys.readouterr().out
+    assert (
+        r"reason=pytest failed: \x1b[31mtest_widget\x1b[0m\x0arun repair"
+        in event_output
+    )
+    assert "\nrun repair" not in event_output
+
+
 def test_agents_cli_replays_filtered_task_events(
     tmp_path: Path,
     monkeypatch,
@@ -650,21 +765,24 @@ def test_agents_cli_lists_reports_and_rejects_invalid_limit(
 ) -> None:
     db_dir = tmp_path / "db"
     state = SharedState(db_dir / "agents.db", workspace=tmp_path)
-    state.send_message(
-        "agent-a",
-        "lead",
-        "agent_report",
-        {
-            "agent_id": "agent-a",
-            "role": "tester",
-            "task": "test",
-            "success": False,
-            "summary": "failed tests",
-            "artifacts": {},
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    for index in range(20):
+        state.send_message("agent-a", "lead", "progress", {"index": index})
+    for index in range(25):
+        state.send_message(
+            "agent-a",
+            "lead",
+            "agent_report",
+            {
+                "agent_id": "agent-a",
+                "role": "tester",
+                "task": "test",
+                "success": False,
+                "summary": f"report-{index}",
+                "artifacts": {},
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
     state.close()
     monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
     monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
@@ -672,7 +790,9 @@ def test_agents_cli_lists_reports_and_rejects_invalid_limit(
 
     assert main(["agents", "reports", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["reports"][0]["summary"] == "failed tests"
+    assert [item["summary"] for item in payload["reports"]] == [
+        f"report-{index}" for index in range(24, 4, -1)
+    ]
 
     assert main(["agents", "reports", "--limit", "0"]) == 2
     assert "limit must be positive" in capsys.readouterr().err

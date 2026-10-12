@@ -10,10 +10,16 @@ from typing import Any
 from ash.agents.shared_state import SharedState
 from ash.agents.tasks import TaskState
 from ash.agents.worktree import WorktreeManager
+from ash.core.redaction import redact_text
 from ash.safe_io import strict_json_loads
+from ash.ui.safe_text import terminal_safe_text
 
 
 MAX_AGENT_TASK_LIST_PAYLOAD_BYTES = 8 * 1024 * 1024
+
+
+def _terminal_agent_text(value: Any) -> str:
+    return terminal_safe_text(redact_text(str(value)), single_line=True)
 
 
 def list_agent_statuses(
@@ -51,8 +57,9 @@ def list_agent_reports(
                 "lead",
                 undelivered_only=False,
                 limit=limit,
+                message_type="agent_report",
+                newest_first=True,
             )
-            if message.message_type == "agent_report"
         ]
 
 
@@ -328,7 +335,10 @@ def render_agent_statuses(
     if not statuses:
         return "No subagents recorded."
     return "\n".join(
-        f"{item['agent_id']} [{item['role']}] {item['status']}: {item['current_task']}"
+        f"{_terminal_agent_text(item['agent_id'])} "
+        f"[{_terminal_agent_text(item['role'])}] "
+        f"{_terminal_agent_text(item['status'])}: "
+        f"{_terminal_agent_text(item['current_task'])}"
         for item in statuses
     )
 
@@ -343,10 +353,10 @@ def render_agent_reports(
     if not reports:
         return "No subagent reports recorded."
     return "\n".join(
-        f"{item.get('agent_id', item['sender_id'])} "
-        f"[{item.get('role', 'unknown')}] "
+        f"{_terminal_agent_text(item.get('agent_id', item['sender_id']))} "
+        f"[{_terminal_agent_text(item.get('role', 'unknown'))}] "
         f"{'ok' if item.get('success') else 'failed'}: "
-        f"{item.get('summary', '')}"
+        f"{_terminal_agent_text(item.get('summary', ''))}"
         for item in reports
     )
 
@@ -360,14 +370,21 @@ def render_agent_tasks(
         return json.dumps({"tasks": tasks}, sort_keys=True)
     if not tasks:
         return "No durable agent tasks recorded."
-    return "\n".join(
-        f"{item['task_id']} [{item['role']}] {item['state']} "
-        f"owner={item['owner_agent_id'] or '-'} "
-        f"attempt={item['attempt']}/{item['max_attempts']} "
-        f"tokens={item['used_tokens']}/{item['token_budget']}: "
-        f"{item['description']}"
-        for item in tasks
-    )
+    rendered: list[str] = []
+    for item in tasks:
+        line = (
+            f"{_terminal_agent_text(item['task_id'])} "
+            f"[{_terminal_agent_text(item['role'])}] "
+            f"{_terminal_agent_text(item['state'])} "
+            f"owner={_terminal_agent_text(item['owner_agent_id'] or '-')} "
+            f"attempt={item['attempt']}/{item['max_attempts']} "
+            f"tokens={item['used_tokens']}/{item['token_budget']}: "
+            f"{_terminal_agent_text(item['description'])}"
+        )
+        if item.get("error"):
+            line += " error=" + _terminal_agent_text(item["error"])
+        rendered.append(line)
+    return "\n".join(rendered)
 
 
 def render_agent_task_events(
@@ -379,11 +396,19 @@ def render_agent_task_events(
         return json.dumps({"events": events}, sort_keys=True)
     if not events:
         return "No durable agent task events recorded."
-    return "\n".join(
-        f"{item['sequence']} {item['task_id']} {item['event']['type']}"
-        + (f" state={item['event']['state']}" if item["event"].get("state") else "")
-        for item in events
-    )
+    rendered: list[str] = []
+    for item in events:
+        event = item["event"]
+        line = (
+            f"{item['sequence']} {_terminal_agent_text(item['task_id'])} "
+            f"{_terminal_agent_text(event['type'])}"
+        )
+        if event.get("state"):
+            line += f" state={_terminal_agent_text(event['state'])}"
+        if event.get("reason"):
+            line += " reason=" + _terminal_agent_text(event["reason"])
+        rendered.append(line)
+    return "\n".join(rendered)
 
 
 def render_cancelled_agent_graph(
@@ -394,7 +419,7 @@ def render_cancelled_agent_graph(
     if json_output:
         return json.dumps({"cancellation": cancellation}, sort_keys=True)
     return (
-        f"Cancelled graph {cancellation['graph_id']} "
+        f"Cancelled graph {_terminal_agent_text(cancellation['graph_id'])} "
         f"({len(cancellation['task_ids'])} tasks)."
     )
 
@@ -409,10 +434,11 @@ def render_agent_messages(
     if not messages:
         return "No subagent messages recorded."
     return "\n".join(
-        f"{item['message_id']} {item['sender_id']} -> {item['recipient_id']} "
-        f"{item['message_type']} "
+        f"{item['message_id']} {_terminal_agent_text(item['sender_id'])} "
+        f"-> {_terminal_agent_text(item['recipient_id'])} "
+        f"{_terminal_agent_text(item['message_type'])} "
         f"{'delivered' if item['delivered'] else 'pending'}: "
-        f"{_summarize_content(item['content'])}"
+        f"{_terminal_agent_text(_summarize_content(item['content']))}"
         for item in messages
     )
 
@@ -427,9 +453,10 @@ def render_agent_approvals(
     if not approvals:
         return "No subagent approval requests recorded."
     return "\n".join(
-        f"{item['request_id']} {item.get('agent_id') or '?'} "
-        f"{item.get('tool_name') or '?'} {item['status']}: "
-        f"{item.get('arguments_preview') or '{}'}"
+        f"{item['request_id']} {_terminal_agent_text(item.get('agent_id') or '?')} "
+        f"{_terminal_agent_text(item.get('tool_name') or '?')} "
+        f"{_terminal_agent_text(item['status'])}: "
+        f"{_terminal_agent_text(item.get('arguments_preview') or '{}')}"
         for item in approvals
     )
 
@@ -444,7 +471,8 @@ def render_resolved_agent_approval(
     verb = "Approved" if resolution["approved"] else "Denied"
     return (
         f"{verb} subagent approval {resolution['request_message_id']} "
-        f"for {resolution['agent_id']} {resolution['tool_name']}."
+        f"for {_terminal_agent_text(resolution['agent_id'])} "
+        f"{_terminal_agent_text(resolution['tool_name'])}."
     )
 
 
@@ -457,8 +485,9 @@ def render_sent_agent_message(
         return json.dumps({"message": message}, sort_keys=True)
     return (
         f"Queued message {message['message_id']} "
-        f"{message['sender_id']} -> {message['recipient_id']} "
-        f"{message['message_type']}."
+        f"{_terminal_agent_text(message['sender_id'])} -> "
+        f"{_terminal_agent_text(message['recipient_id'])} "
+        f"{_terminal_agent_text(message['message_type'])}."
     )
 
 

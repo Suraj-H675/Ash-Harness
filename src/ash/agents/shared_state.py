@@ -611,8 +611,9 @@ class SharedState:
         undelivered_only: bool = True,
         limit: int = 100,
         message_type: str | None = None,
+        newest_first: bool = False,
     ) -> list[IPCMessage]:
-        """Return messages addressed to ``recipient_id``, oldest first."""
+        """Return messages addressed to ``recipient_id``, oldest first by default."""
 
         if type(limit) is not int or not 1 <= limit <= MAX_IPC_FETCH_MESSAGES:
             raise ValueError(
@@ -628,10 +629,11 @@ class SharedState:
             clauses.append("message_type = ?")
             params.append(message_type)
         params.append(limit)
+        order = "DESC" if newest_first else "ASC"
         sql = (
             "SELECT * FROM ipc_messages WHERE "
             + " AND ".join(clauses)
-            + " ORDER BY timestamp ASC, message_id ASC LIMIT ?"
+            + f" ORDER BY timestamp {order}, message_id {order} LIMIT ?"
         )
         with self._conn_lock, closing(self._conn.cursor()) as cur:
             rows = cur.execute(sql, params).fetchall()
