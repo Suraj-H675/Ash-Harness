@@ -537,11 +537,13 @@ def test_automation_doctor_warns_for_enabled_job_without_worker(tmp_path) -> Non
 
     assert check.status == "warn"
     assert "1 enabled job(s)" in check.message
-    assert "no live worker" in check.message
+    assert "recent worker heartbeat count: 0" in check.message
     assert "ash cron worker" in check.remedy
 
 
-def test_automation_doctor_reports_healthy_database_and_live_worker(tmp_path) -> None:
+def test_automation_doctor_reports_healthy_database_and_recent_worker_heartbeat(
+    tmp_path,
+) -> None:
     database = tmp_path / "db" / "automation.db"
     config = AshConfig(db_directory=database.parent, workspace_root=tmp_path)
     with AutomationStore(database) as store:
@@ -561,7 +563,7 @@ def test_automation_doctor_reports_healthy_database_and_live_worker(tmp_path) ->
     check = _check_automation(config)
 
     assert check.status == "pass"
-    assert "1 enabled job(s), 1 live worker(s)" in check.message
+    assert "1 enabled job(s), recent worker heartbeat count: 1" in check.message
 
 
 def test_automation_doctor_reports_corrupt_database(tmp_path) -> None:

@@ -398,7 +398,7 @@ def _check_automation(config: AshConfig) -> DoctorCheck:
                 ).fetchone()[0]
             )
             stale_after = max(config.automation_poll_seconds * 4, 10)
-            live_workers = int(
+            recent_worker_heartbeats = int(
                 connection.execute(
                     """
                     SELECT COUNT(*) FROM automation_workers
@@ -417,18 +417,20 @@ def _check_automation(config: AshConfig) -> DoctorCheck:
             "Check automation.db permissions and integrity.",
         )
 
-    if enabled_jobs and not live_workers:
+    if enabled_jobs and not recent_worker_heartbeats:
         return DoctorCheck(
             "automation",
             "warn",
-            f"Database healthy; {enabled_jobs} enabled job(s) but no live worker",
-            "Run `ash cron worker` for schedules to fire.",
+            f"Database healthy; {enabled_jobs} enabled job(s), "
+            "recent worker heartbeat count: 0",
+            "Start or restart `ash cron worker` if schedules should be firing.",
         )
     return DoctorCheck(
         "automation",
         "pass",
         f"Database healthy; {enabled_jobs} enabled job(s), "
-        f"{live_workers} live worker(s)",
+        "recent worker heartbeat count: "
+        f"{recent_worker_heartbeats}",
     )
 
 

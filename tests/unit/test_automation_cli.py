@@ -9,6 +9,7 @@ import pytest
 
 from ash.automation.models import AutomationRun
 from ash.automation.models import AutomationWorkerSummary
+from ash.automation.schedules import build_schedule
 from ash.automation.store import AutomationStore
 from ash.cli import main
 from ash.safety.trust import set_workspace_trusted
@@ -282,7 +283,19 @@ def test_cron_cli_status_and_idle_worker_once(
     assert main(_cron(db_directory, "status")) == 0
     status = capsys.readouterr().out
     assert "Jobs: 1 active / 1 total" in status
-    assert "Warning: no worker is active" in status
+    assert "no recent worker heartbeat" in status
+
+    with AutomationStore(db_directory / "automation.db") as store:
+        store.heartbeat_worker(
+            worker_id="recent-status-worker",
+            workspace=workspace,
+            pid=12345,
+            max_concurrent_runs=1,
+        )
+    assert main(_cron(db_directory, "status")) == 0
+    status_with_heartbeat = capsys.readouterr().out
+    assert "Workers with a recent heartbeat: 1" in status_with_heartbeat
+    assert "Workers: 1 active" not in status_with_heartbeat
 
     assert main(_cron(db_directory, "worker", "--once", "--json")) == 0
     assert json.loads(capsys.readouterr().out) == {
@@ -295,6 +308,57 @@ def test_cron_cli_status_and_idle_worker_once(
         "stopped": False,
         "succeeded": 0,
     }
+
+
+def test_cron_list_human_and_json_show_safe_failure_excerpt(
+    cron_environment: tuple[Path, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace, db_directory = cron_environment
+    prompt = "private schedule prompt marker Sam"
+    webhook_url = "https://hooks.example.com/private-path-marker"
+    with AutomationStore(db_directory / "automation.db") as store:
+        job = store.create_job(
+            name="failed schedule",
+            prompt=prompt,
+            workspace=workspace,
+            schedule=build_schedule(every="1h"),
+            webhook_url=webhook_url,
+        )
+        claim = store.claim_manual(
+            job.job_id, workspace=workspace, worker_id="synthetic-worker"
+        )
+        store.finish_run(
+            claim.run.run_id,
+            claim.token,
+            status="failed",
+            error=(
+                f"provider request failed for {prompt}; Sam could not be reached; endpoint {webhook_url}"
+                "\nline\u202e" + "x" * 500
+            ),
+        )
+
+    assert main(_cron(db_directory, "list")) == 0
+    human_output = capsys.readouterr().out
+    assert "provider request failed" in human_output
+    assert prompt not in human_output
+    assert "Sam" not in human_output
+    assert webhook_url not in human_output
+    assert "\u202e" not in human_output
+    assert "\\x0a" in human_output
+    assert not any(line == "line" for line in human_output.splitlines())
+    error_line = next(
+        line for line in human_output.splitlines() if line.startswith("  error: ")
+    )
+    assert len(error_line.removeprefix("  error: ")) <= 240
+
+    assert main(_cron(db_directory, "list", "--json")) == 0
+    json_output = capsys.readouterr().out
+    assert prompt not in json_output
+    assert "Sam" not in json_output
+    assert webhook_url not in json_output
+    assert "\u202e" not in json_output
+    assert "\\x0a" in json_output
 
 
 def test_cron_cli_manual_run_json_and_exit_status(

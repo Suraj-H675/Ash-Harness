@@ -8,6 +8,7 @@ import signal
 from collections.abc import Callable
 from typing import Any
 
+from ash.automation.diagnostics import automation_error_excerpt
 from ash.automation.delivery import webhook_display_target
 from ash.automation.models import (
     AutomationDelivery,
@@ -74,7 +75,7 @@ def job_payload(job: AutomationJob, *, include_prompt: bool = False) -> dict[str
         "next_run_at": job.next_run_at.isoformat() if job.next_run_at else None,
         "last_run_at": job.last_run_at.isoformat() if job.last_run_at else None,
         "last_run_status": job.last_run_status,
-        "last_error": job.last_error,
+        "last_error": automation_error_excerpt(job.last_error, job=job),
         "consecutive_failures": job.consecutive_failures,
         "misfire_grace_seconds": job.misfire_grace_seconds,
         "timeout_seconds": job.timeout_seconds,
@@ -143,6 +144,14 @@ def render_jobs(jobs: list[AutomationJob], *, json_output: bool = False) -> str:
             lines.append(
                 f"  last={job.last_run_status} failures={job.consecutive_failures}"
             )
+        if job.last_error:
+            error = automation_error_excerpt(
+                job.last_error,
+                job=job,
+                max_characters=240,
+            )
+            if error:
+                lines.append(f"  error: {error}")
     return "\n".join(lines)
 
 
@@ -260,7 +269,7 @@ def render_deliveries(
 def render_status(config: AshConfig, *, json_output: bool = False) -> str:
     with automation_store(config) as store:
         job_count, active_job_count = store.job_counts(config.workspace_root)
-        workers = store.list_workers(
+        recent_workers = store.list_workers(
             config.workspace_root,
             stale_after_seconds=max(config.automation_poll_seconds * 4, 10),
         )
@@ -278,7 +287,7 @@ def render_status(config: AshConfig, *, json_output: bool = False) -> str:
                 "heartbeat_at": worker.heartbeat_at.isoformat(),
                 "max_concurrent_runs": worker.max_concurrent_runs,
             }
-            for worker in workers
+            for worker in recent_workers
         ],
     }
     if json_output:
@@ -288,16 +297,17 @@ def render_status(config: AshConfig, *, json_output: bool = False) -> str:
         f"Workspace: {payload['workspace']}",
         f"Jobs: {payload['active_jobs']} active / {payload['jobs']} total",
         f"Runs: {payload['running']} running",
-        f"Workers: {len(workers)} active",
+        f"Workers with a recent heartbeat: {len(recent_workers)}",
     ]
-    for worker in workers:
+    for worker in recent_workers:
         lines.append(
             f"  {worker.worker_id} pid={worker.pid} "
             f"heartbeat={worker.heartbeat_at.isoformat()}"
         )
-    if config.automation_enabled and active_job_count and not workers:
+    if config.automation_enabled and active_job_count and not recent_workers:
         lines.append(
-            "Warning: no worker is active; run `ash cron worker` for schedules to fire."
+            "Warning: no recent worker heartbeat; start or restart "
+            "`ash cron worker` if schedules should be firing."
         )
     return "\n".join(lines)
 

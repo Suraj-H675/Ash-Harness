@@ -3355,7 +3355,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
     )
     cron_subparsers = cron_parser.add_subparsers(dest="cron_action", required=True)
     cron_status = cron_subparsers.add_parser(
-        "status", help="Show scheduler, run, and worker liveness for this workspace"
+        "status",
+        help=(
+            "Show scheduler, run, and recent worker heartbeat status "
+            "for this workspace"
+        ),
     )
     cron_status.add_argument("--json", action="store_true")
     cron_list = cron_subparsers.add_parser(

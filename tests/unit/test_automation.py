@@ -4634,3 +4634,150 @@ async def test_list_automations_is_side_effect_free_when_store_is_absent(
     assert json.loads(result.output) == []
     assert not store_path.exists()
     assert not store_path.parent.exists()
+
+    missing = await tool.run(job="missing schedule")
+    assert missing.success is False
+    assert "automation not found" in (missing.error or "")
+    assert not store_path.exists()
+    assert not store_path.parent.exists()
+
+    invalid = await tool.run(history_limit=5)
+    assert invalid.success is False
+    assert "history_limit requires a job" in (invalid.error or "")
+
+
+@pytest.mark.asyncio
+async def test_list_automations_inspects_bounded_safe_job_history(
+    tmp_path: Path, clock: list[float], store: AutomationStore
+) -> None:
+    workspace = tmp_path / "repo"
+    other_workspace = tmp_path / "other"
+    workspace.mkdir()
+    other_workspace.mkdir()
+    prompt = "private scheduled prompt marker"
+    webhook_url = "https://hooks.example.com/a/private-path-marker"
+    job = store.create_job(
+        name="history review",
+        prompt=prompt,
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        webhook_url=webhook_url,
+        webhook_secret_env="ASH_AUTOMATION_SECRET_NAME",
+    )
+    foreign = store.create_job(
+        name="foreign review",
+        prompt="foreign private prompt marker",
+        workspace=other_workspace,
+        schedule=build_schedule(every="1h"),
+    )
+
+    succeeded = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker-a"
+    )
+    store.finish_run(
+        succeeded.run.run_id,
+        succeeded.token,
+        status="succeeded",
+        response="private run response marker",
+    )
+    delivery = store.claim_pending_deliveries(
+        workspace=workspace, worker_id="delivery-worker"
+    )[0]
+    store.mark_delivery_dispatch_started(
+        delivery.delivery.delivery_id, delivery.token
+    )
+    store.finish_delivery(
+        delivery.delivery.delivery_id,
+        delivery.token,
+        status="ambiguous",
+        error=f"unknown outcome for {prompt} at {webhook_url}\n\u202e",
+    )
+
+    clock[0] += 1
+    failed = store.claim_manual(
+        job.job_id, workspace=workspace, worker_id="run-worker-b"
+    )
+    store.finish_run(
+        failed.run.run_id,
+        failed.token,
+        status="failed",
+        error=(
+            f"provider failed for {prompt}; partial prompt: private scheduled prompt; "
+            "partial endpoint path /a; "
+            f"endpoint {webhook_url}; encoded endpoint "
+            "https%3A%2F%2Fhooks.example.com%2Fprivate-path-marker\n\u202e"
+            + "x" * 800
+        ),
+    )
+
+    tool = ListAutomationsTool(SafetyGuard(workspace), Path(store.db_path))
+    overview = await tool.run()
+    assert overview.success is True
+    overview_payload = json.loads(overview.output)
+    assert len(overview_payload) == 1
+    assert overview_payload[0]["last_error"]
+    assert len(overview_payload[0]["last_error"]) <= 240
+    assert overview_payload[0]["last_error"].endswith("…[truncated]")
+    assert overview_payload[0]["last_run_status"] == "failed"
+
+    inspection = await tool.run(job=job.job_id, history_limit=2)
+    assert inspection.success is True
+    inspection_payload = json.loads(inspection.output)
+    assert len(inspection_payload) == 1
+    row = inspection_payload[0]
+    assert row["job_id"] == job.job_id
+    assert row["webhook_configured"] is True
+    assert row["history"]["more_runs"] is False
+    assert row["history"]["more_deliveries"] is False
+    assert [run["status"] for run in row["history"]["runs"]] == [
+        "failed",
+        "succeeded",
+    ]
+    assert len(row["history"]["runs"][0]["error"]) <= 500
+    assert row["history"]["runs"][0]["error"].endswith("…[truncated]")
+    assert [item["status"] for item in row["history"]["deliveries"]] == [
+        "pending",
+        "ambiguous",
+    ]
+    assert row["history"]["deliveries"][1]["recovery_safe"] is False
+    inspection_text = inspection.output
+    for forbidden in (
+        prompt,
+        "private scheduled prompt",
+        webhook_url,
+        "private-path-marker",
+        "https%3A%2F%2Fhooks.example.com%2Fprivate-path-marker",
+        "ASH_AUTOMATION_SECRET_NAME",
+        "private run response marker",
+        "worker_id",
+        "session_id",
+        str(workspace),
+        str(other_workspace),
+        "webhook_url",
+        "webhook_secret_env",
+        "/a",
+        "\u202e",
+    ):
+        assert forbidden not in inspection_text
+    assert "\\x0a" in inspection_text
+
+    bounded = await tool.run(job=job.job_id, history_limit=1)
+    assert bounded.success is True
+    bounded_history = json.loads(bounded.output)[0]["history"]
+    assert len(bounded_history["runs"]) == 1
+    assert len(bounded_history["deliveries"]) == 1
+    assert bounded_history["more_runs"] is True
+    assert bounded_history["more_deliveries"] is True
+
+    invalid_limit = await tool.run(job=job.job_id, history_limit=21)
+    assert invalid_limit.success is False
+
+    wrong_workspace = await tool.run(job=foreign.job_id)
+    assert wrong_workspace.success is False
+    assert "automation not found" in (wrong_workspace.error or "")
+    assert "foreign private prompt marker" not in (wrong_workspace.error or "")
+
+    store.remove_job(job.job_id, workspace=workspace)
+    removed_inspection = await tool.run(job=job.job_id)
+    assert removed_inspection.success is True
+    assert json.loads(removed_inspection.output)[0]["job_id"] == job.job_id

@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from ash.automation.diagnostics import automation_error_excerpt
 from ash.automation.delivery import webhook_display_target
 from ash.automation.schedules import build_schedule, render_schedule
 from ash.automation.store import AutomationError, AutomationStore
@@ -18,12 +19,35 @@ from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 
 class ListAutomationsArgs(BaseModel):
     include_disabled: bool = False
+    job: str | None = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        description="Optional workspace-local job ID or name to inspect.",
+    )
+    history_limit: int | None = Field(
+        None,
+        ge=1,
+        le=20,
+        strict=True,
+        description="Recent run and delivery records per stream; requires job; default 5.",
+    )
+
+    @model_validator(mode="after")
+    def validate_history_selector(self) -> "ListAutomationsArgs":
+        if self.history_limit is not None and self.job is None:
+            raise ValueError("history_limit requires a job")
+        return self
 
 
 class ListAutomationsTool(BaseTool):
     name = "list_automations"
     description = (
-        "List durable schedules for the current workspace without running them."
+        "List durable schedules for the current workspace, or inspect one by its "
+        "job ID or name. For inspection, pass job and optional history_limit "
+        "(1–20; default 5). A targeted row includes run and webhook delivery "
+        "histories separately, with more_runs and more_deliveries flags. Removed "
+        "schedules can be inspected by ID. This is a read-only view."
     )
     args_schema = ListAutomationsArgs
 
@@ -38,18 +62,48 @@ class ListAutomationsTool(BaseTool):
     async def run(self, **kwargs) -> ToolResult:
         try:
             args = ListAutomationsArgs(**kwargs)
+            history_limit = args.history_limit or (5 if args.job is not None else 0)
+            runs = []
+            deliveries = []
             if not self._store_path.is_file():
+                if args.job is not None:
+                    raise AutomationError(f"automation not found: {args.job}")
                 jobs = []
             else:
                 with AutomationStore(self._store_path) as store:
-                    jobs = store.list_jobs(
-                        self.safety_guard.project_root,
-                        include_disabled=args.include_disabled,
-                    )
+                    workspace = self.safety_guard.project_root
+                    if args.job is None:
+                        jobs = store.list_jobs(
+                            workspace,
+                            include_disabled=args.include_disabled,
+                        )
+                    else:
+                        job = store.get_job(
+                            args.job,
+                            workspace=workspace,
+                            include_deleted=True,
+                        )
+                        if job is None:
+                            raise AutomationError(
+                                f"automation not found: {args.job}"
+                            )
+                        jobs = [job]
+                        runs = store.list_runs(
+                            workspace=workspace,
+                            job_id=job.job_id,
+                            limit=history_limit + 1,
+                        )
+                        deliveries = store.list_deliveries(
+                            workspace=workspace,
+                            job_id=job.job_id,
+                            limit=history_limit + 1,
+                        )
         except (AutomationError, OSError, ValueError) as exc:
             return ToolResult(success=False, output="", error=str(exc))
-        payload = [
-            {
+
+        payload = []
+        for job in jobs:
+            row = {
                 "job_id": job.job_id,
                 "name": job.name,
                 "enabled": job.enabled,
@@ -58,9 +112,74 @@ class ListAutomationsTool(BaseTool):
                     job.next_run_at.isoformat() if job.next_run_at else None
                 ),
                 "last_run_status": job.last_run_status,
+                "last_error": automation_error_excerpt(
+                    job.last_error,
+                    job=job,
+                    max_characters=240,
+                ),
             }
-            for job in jobs
-        ]
+            if args.job is not None:
+                row.update(
+                    {
+                        "last_run_at": (
+                            job.last_run_at.isoformat() if job.last_run_at else None
+                        ),
+                        "consecutive_failures": job.consecutive_failures,
+                        "webhook_configured": job.webhook_url is not None,
+                        "history": {
+                            "runs": [
+                                {
+                                    "run_id": run.run_id,
+                                    "status": run.status,
+                                    "trigger": run.trigger,
+                                    "attempt": run.attempt,
+                                    "scheduled_for": run.scheduled_for.isoformat(),
+                                    "started_at": (
+                                        run.started_at.isoformat()
+                                        if run.started_at
+                                        else None
+                                    ),
+                                    "finished_at": (
+                                        run.finished_at.isoformat()
+                                        if run.finished_at
+                                        else None
+                                    ),
+                                    "error": automation_error_excerpt(
+                                        run.error,
+                                        job=job,
+                                        max_characters=500,
+                                    ),
+                                }
+                                for run in runs[:history_limit]
+                            ],
+                            "deliveries": [
+                                {
+                                    "delivery_id": delivery.delivery_id,
+                                    "run_id": delivery.run_id,
+                                    "status": delivery.status,
+                                    "attempt": delivery.attempt,
+                                    "response_status": delivery.response_status,
+                                    "created_at": delivery.created_at.isoformat(),
+                                    "finished_at": (
+                                        delivery.finished_at.isoformat()
+                                        if delivery.finished_at
+                                        else None
+                                    ),
+                                    "recovery_safe": delivery.recovery_safe,
+                                    "last_error": automation_error_excerpt(
+                                        delivery.last_error,
+                                        job=job,
+                                        max_characters=500,
+                                    ),
+                                }
+                                for delivery in deliveries[:history_limit]
+                            ],
+                            "more_runs": len(runs) > history_limit,
+                            "more_deliveries": len(deliveries) > history_limit,
+                        },
+                    }
+                )
+            payload.append(row)
         output = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return ToolResult(
             success=True,

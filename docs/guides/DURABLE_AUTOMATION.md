@@ -52,6 +52,18 @@ Every command that reads or changes structured state also supports `--json`.
 Prompts can be read from standard input with `--prompt -`. Active jobs have a
 case-insensitive unique name within one workspace.
 
+The human `ash cron list` view includes a short, redacted last-error excerpt for
+jobs with a saved error. The JSON list view provides a longer sanitized diagnostic.
+Redaction filters known secrets, prompt terms, and webhook endpoint material,
+but cannot guarantee removal of arbitrary transformed or paraphrased content.
+Avoid placing credentials in scheduled prompts or webhook URL paths. In
+an enabled model session, `list_automations` returns the same workspace's
+schedules and accepts an optional `job` selector with a bounded `history_limit`
+(1–20, default 5) to show recent run and webhook delivery outcomes separately.
+This inspection omits the stored prompt, run response, full webhook URL, and
+secret environment variable name. It can inspect retained history by a removed
+job's ID.
+
 ### Webhook result delivery
 
 Webhook delivery is an optional durable outbox attached to a job. Ash snapshots
@@ -150,11 +162,12 @@ On macOS use a per-user `launchd` agent. On Windows, run Ash inside WSL2 and
 use the Linux/systemd approach from the WSL distribution. Do not rely on a
 terminal window remaining open.
 
-`ash cron status` reports enabled jobs, active runs, and fresh worker
+`ash cron status` reports enabled jobs, active runs, and recent worker
 heartbeats. `ash doctor` performs read-only SQLite integrity and foreign-key
-checks and warns when enabled jobs have no live worker. A stale heartbeat is not
-proof that the old process is dead; leases, rather than heartbeat rows, decide
-run ownership.
+checks and warns when enabled jobs have no recent worker heartbeat. A recent
+heartbeat is not proof that the process is still alive, and a stale heartbeat
+does not prove that the old process is dead; leases, rather than heartbeat
+rows, decide run ownership.
 
 ## Safety and permissions
 
