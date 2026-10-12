@@ -18,6 +18,7 @@ class FakeModel:
         self.scenario = scenario
         self.requests: list[dict] = []
         self.parent_calls = 0
+        self.discovery_calls = 0
         self.child_calls = 0
         self.saw_driver_process = False
         self.live_status_probe = None
@@ -148,6 +149,13 @@ class FakeModel:
                     entry["function"]["name"] for entry in request.get("tools", [])
                 }
                 serialized = json.dumps(request.get("messages", []))
+                if "search_tools" in names and "spawn_agent" not in names:
+                    model.discovery_calls += 1
+                    assert model.discovery_calls == 1
+                    self._stream(
+                        tool=("search_tools", {"query": "spawn_agent", "limit": 1})
+                    )
+                    return
                 if "spawn_agent" in names:
                     model.parent_calls += 1
                     if model.scenario == "deny":
@@ -309,6 +317,7 @@ def test_provider_backed_coder_branch_handoff_through_cli(tmp_path: Path) -> Non
             "json",
         )
         assert denied.returncode == 0, (denied.stdout, denied.stderr)
+        assert deny_model.discovery_calls == 1
         assert deny_model.parent_calls == 2
         assert deny_model.child_calls == 0
         assert len(deny_model.requests) >= 2
@@ -353,6 +362,7 @@ def test_provider_backed_coder_branch_handoff_through_cli(tmp_path: Path) -> Non
             "stream-json",
         )
         assert result.returncode == 0, (result.stdout, result.stderr)
+        assert model.discovery_calls == 1
         assert model.parent_calls >= 2, len(model.requests)
         assert model.child_calls == 4
         assert model.saw_driver_process
