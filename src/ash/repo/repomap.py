@@ -888,6 +888,9 @@ class RepoMap:
             if module_name is not None:
                 module_index[module_name] = resolved
 
+        if next_cache == self._file_cache:
+            return
+
         self._files = files
         self._file_cache = next_cache
         self._module_index = module_index

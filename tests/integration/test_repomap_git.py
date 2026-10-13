@@ -121,6 +121,46 @@ def test_repo_map_injected_into_system_prompt(
     assert "alpha.py" in system_message["content"]
 
 
+def test_repo_map_refreshes_external_changes_between_turns(
+    git_workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
+) -> None:
+    client = git_workspace / "client.py"
+    client.write_text("class Client:\n    def charge(self): pass\n")
+    repo_map = RepoMap(git_workspace)
+    provider = FakeProvider(
+        scripts=[["<response>ready</response>"], ["<response>updated</response>"]]
+    )
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=git_workspace,
+        repo_map=repo_map,
+    )
+
+    async def run_turns() -> None:
+        await loop.run_turn("inspect the payment client")
+        (git_workspace / "refunds.py").write_text(
+            "def authorize_refund(amount: int): pass\n"
+        )
+        client.write_text(
+            "class Client:\n"
+            "    def charge(self): pass\n"
+            "    def refund(self): pass\n"
+        )
+        await loop.run_turn("inspect the new refund implementation")
+
+    asyncio.run(run_turns())
+
+    first_system = provider.received_messages[0][0]["content"]
+    second_system = provider.received_messages[1][0]["content"]
+    assert "refunds.py" not in first_system
+    assert "refunds.py" in second_system
+    assert "authorize_refund" in second_system
+    assert "refund" in second_system
+
+
 def test_multilanguage_repo_map_injected_into_system_prompt(
     workspace: Path, safety_guard: SafetyGuard, session_store: SessionStore
 ) -> None:

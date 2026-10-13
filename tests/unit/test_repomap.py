@@ -552,9 +552,11 @@ def test_repomap_refresh_reuses_unchanged_parse_results(tmp_path: Path) -> None:
     repo_map = RepoMap(tmp_path)
     extract = Mock(wraps=repo_map._extractor.extract)
     repo_map._extractor.extract = extract
+    adjacency = repo_map._adjacency
 
     repo_map.refresh()
     assert extract.call_count == 0
+    assert repo_map._adjacency is adjacency
 
     first.write_text("def first_changed(): pass\n")
     repo_map.refresh()

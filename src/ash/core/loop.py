@@ -3693,6 +3693,10 @@ class AshLoop:
             raise RuntimeError("turn started without an active session")
         session = self.current_session
 
+        # Workspace files can change outside Ash between user turns.
+        if callable(getattr(self.repo_map, "refresh", None)):
+            self._repo_map_dirty = True
+
         from ash.context.turn import TurnContext
 
         self._last_turn_non_goal_tool_calls = 0
