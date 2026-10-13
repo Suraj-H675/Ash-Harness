@@ -14,6 +14,7 @@ from ash.sandbox.process_utils import (
     ProcessTreeUnavailable,
     prepare_process_tree,
     settle_process_tree_after_cancellation,
+    spawn_process_tree,
     terminate_process_tree,
 )
 from ash.safety.environment import resolve_host_executable
@@ -72,14 +73,14 @@ async def pull_model(
         print(f"Error: could not start ollama pull: {exc}", file=sys.stderr)
         return 2
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await spawn_process_tree(
+            process_tree_plan,
             executable,
             "pull",
             normalized,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=_scrubbed_environment(),
-            **process_tree_plan.spawn_options,
         )
     except OSError as exc:
         print(f"Error: could not start ollama pull: {exc}", file=sys.stderr)

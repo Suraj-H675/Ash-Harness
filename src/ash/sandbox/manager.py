@@ -51,6 +51,7 @@ from ash.sandbox.process_utils import (
     prepare_process_tree,
     prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
+    spawn_process_tree,
     terminate_process_tree_after_timeout,
 )
 from ash.safety.environment import resolve_host_executable
@@ -1050,7 +1051,7 @@ async def _run_scoped(
     expected_cwd_identity: tuple[int, int] | None = None,
     expected_workspace_identity: tuple[int, int] | None = None,
 ) -> SandboxResult:
-    """Execute the command directly via asyncio.create_subprocess_exec."""
+    """Execute the command through the managed subprocess startup path."""
 
     start = time.monotonic()
     try:
@@ -1072,16 +1073,14 @@ async def _run_scoped(
             search_path=child_env.get("PATH"),
             expected_cwd_identity=expected_cwd_identity,
         ) as launch:
-            spawn_options = dict(process_tree_plan.spawn_options)
-            if launch.pass_fds:
-                spawn_options["pass_fds"] = launch.pass_fds
-            process = await asyncio.create_subprocess_exec(
+            process = await spawn_process_tree(
+                process_tree_plan,
                 *launch.argv,
                 cwd=launch.cwd,
                 env=child_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                **spawn_options,
+                pass_fds=launch.pass_fds or None,
             )
     except (ProcessTreeUnavailable, SafetyViolation, OSError) as exc:
         detail = str(exc)
@@ -1207,17 +1206,15 @@ async def _run_subprocess(
             search_path=(env or {}).get("PATH"),
             expected_cwd_identity=expected_cwd_identity,
         ) as launch:
-            spawn_options = dict(process_tree_plan.spawn_options)
             inherited_fds = tuple(dict.fromkeys((*pass_fds, *launch.pass_fds)))
-            if inherited_fds:
-                spawn_options["pass_fds"] = inherited_fds
-            process = await asyncio.create_subprocess_exec(
+            process = await spawn_process_tree(
+                process_tree_plan,
                 *launch.argv,
                 cwd=launch.cwd,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                **spawn_options,
+                pass_fds=inherited_fds or None,
             )
     except (ProcessTreeUnavailable, SafetyViolation, OSError) as exc:
         detail = str(exc)
@@ -1347,16 +1344,17 @@ async def _run_docker_control(
             f"Docker control command was not started: {exc}"
         ) from exc
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await spawn_process_tree(
+            process_tree_plan,
             *argv,
             stdin=stdin if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=docker_cli_environment(),
-            **process_tree_plan.spawn_options,
+            on_process_ready=(
+                (lambda _process: on_spawn()) if on_spawn is not None else None
+            ),
         )
-        if on_spawn is not None:
-            on_spawn()
     except OSError as exc:
         raise SandboxBackendUnavailable(
             f"Docker control command was not started: {exc}"

@@ -37,6 +37,7 @@ from ash.sandbox.process_utils import (
     prepare_process_tree,
     prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
+    spawn_process_tree,
     terminate_process_tree_after_timeout,
 )
 from ash.tools.base import (
@@ -1094,16 +1095,14 @@ async def _run_prepared_git_result(
                 )
             except ProcessTreeUnavailable as exc:
                 return _GitCommandResult(126, "", f"git command was not started: {exc}")
-            spawn_options = dict(process_tree_plan.spawn_options)
-            if launch.pass_fds:
-                spawn_options["pass_fds"] = launch.pass_fds
-            process = await asyncio.create_subprocess_exec(
+            process = await spawn_process_tree(
+                process_tree_plan,
                 *launch.argv,
                 cwd=launch.cwd,
                 env=environment,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                **spawn_options,
+                pass_fds=launch.pass_fds or None,
             )
     except (ProcessTreeUnavailable, SafetyViolation, ScopedIOError) as exc:
         return _GitCommandResult(126, "", f"git command was not started: {exc}")

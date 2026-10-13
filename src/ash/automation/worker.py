@@ -47,6 +47,7 @@ from ash.sandbox.process_utils import (
     prepare_process_tree,
     prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
+    spawn_process_tree,
     terminate_process_tree,
 )
 from ash.sdk import AshResult
@@ -398,7 +399,6 @@ class _SubprocessAutomationClient:
                             "automation subprocess requires an isolated POSIX process group; "
                             "restart the worker outside an inherited Ash process group"
                         )
-                    spawn_options = dict(process_tree_plan.spawn_options)
                     inherited_fds = tuple(
                         dict.fromkeys(
                             (
@@ -407,16 +407,15 @@ class _SubprocessAutomationClient:
                             )
                         )
                     )
-                    if inherited_fds:
-                        spawn_options["pass_fds"] = inherited_fds
-                    process = await asyncio.create_subprocess_exec(
+                    process = await spawn_process_tree(
+                        process_tree_plan,
                         *launch.argv,
                         cwd=launch.cwd,
                         env=environment,
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
-                        **spawn_options,
+                        pass_fds=inherited_fds or None,
                     )
             finally:
                 if lifeline_read_fd >= 0:

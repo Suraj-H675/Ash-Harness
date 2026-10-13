@@ -34,6 +34,7 @@ from ash.sandbox.process_utils import (
     communicate_process,
     prepare_process_tree,
     settle_process_tree_after_cancellation,
+    spawn_process_tree,
     terminate_process_tree,
 )
 
@@ -138,7 +139,8 @@ class CredentialHelperSource:
             ) from None
         environment = build_scrubbed_environment(self.env_names)
         try:
-            process = await asyncio.create_subprocess_exec(
+            process = await spawn_process_tree(
+                process_tree_plan,
                 executable,
                 *self.command[1:],
                 stdin=asyncio.subprocess.DEVNULL,
@@ -146,7 +148,6 @@ class CredentialHelperSource:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(state_directory),
                 env=environment,
-                **process_tree_plan.spawn_options,
             )
         except OSError:
             raise CredentialHelperError("credential helper could not be started") from None

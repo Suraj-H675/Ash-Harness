@@ -36,6 +36,7 @@ from ash.sandbox.process_utils import (
     prepare_process_tree,
     prepare_scoped_process_launch,
     settle_process_tree_after_cancellation,
+    spawn_process_tree,
 )
 
 
@@ -362,17 +363,15 @@ async def _run(
     except ProcessTreeUnavailable as exc:
         raise RuntimeError(f"hook process was not started: {exc}") from exc
     with launch_context as launch:
-        spawn_options = dict(process_tree_plan.spawn_options)
-        if launch.pass_fds:
-            spawn_options["pass_fds"] = launch.pass_fds
-        process = await asyncio.create_subprocess_exec(
+        process = await spawn_process_tree(
+            process_tree_plan,
             *launch.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=environment,
             cwd=launch.cwd,
-            **spawn_options,
+            pass_fds=launch.pass_fds or None,
         )
     try:
         stdout, stderr = await communicate_process(

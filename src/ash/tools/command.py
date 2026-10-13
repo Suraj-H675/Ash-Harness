@@ -32,8 +32,8 @@ from ash.sandbox.process_utils import (
     prepare_pty_process_argv,
     prepare_process_tree,
     prepare_scoped_process_launch,
-    pty_process_spawn_options,
     settle_process_tree_after_cancellation,
+    spawn_process_tree,
     terminate_process_tree_after_timeout,
 )
 from ash.tools.base import (
@@ -352,22 +352,20 @@ class RunCommandTool(BaseTool):
                     inherited_fds = tuple(
                         dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
                     )
-                    spawn_options = pty_process_spawn_options(process_tree_plan)
                     pty_argv = prepare_pty_process_argv(
                         launch.argv,
                         plan=process_tree_plan,
                         search_path=env.get("PATH"),
                     )
-                    if inherited_fds:
-                        spawn_options["pass_fds"] = inherited_fds
-                    process = await asyncio.create_subprocess_exec(
+                    process = await spawn_process_tree(
+                        process_tree_plan,
                         *pty_argv,
                         cwd=launch.cwd,
                         env=env,
                         stdin=slave_fd,
                         stdout=slave_fd,
                         stderr=slave_fd,
-                        **spawn_options,
+                        pass_fds=inherited_fds or None,
                     )
                     close_pty_fd(slave_fd)
                     slave_fd = None
@@ -588,14 +586,14 @@ class RunCommandTool(BaseTool):
                     search_path=env.get("PATH"),
                     expected_cwd_identity=expected_cwd_identity,
                 ) as launch:
-                    process = await asyncio.create_subprocess_exec(
+                    process = await spawn_process_tree(
+                        process_tree_plan,
                         *launch.argv,
                         cwd=launch.cwd,
                         env=env,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
-                        pass_fds=launch.pass_fds,
-                        **process_tree_plan.spawn_options,
+                        pass_fds=launch.pass_fds or None,
                     )
             except ProcessTreeUnavailable as exc:
                 return ToolResult(

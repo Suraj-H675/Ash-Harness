@@ -47,6 +47,7 @@ from ash.sandbox.process_utils import (
     ScopedProcessLaunch,
     prepare_process_tree,
     prepare_scoped_process_launch,
+    spawn_process_tree,
     terminate_process_tree,
 )
 from ash.tools.base import (
@@ -303,14 +304,12 @@ class PluginHostClient:
                         search_path=env.get("PATH"),
                         expected_cwd_identity=expected_identity,
                     )
-                spawn_options = dict(process_tree_plan.spawn_options)
                 with launch_context as launch:
                     inherited_fds = tuple(
                         dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
                     )
-                    if inherited_fds:
-                        spawn_options["pass_fds"] = inherited_fds
-                    self._process = await asyncio.create_subprocess_exec(
+                    self._process = await spawn_process_tree(
+                        process_tree_plan,
                         *launch.argv,
                         cwd=launch.cwd,
                         stdin=asyncio.subprocess.PIPE,
@@ -318,7 +317,7 @@ class PluginHostClient:
                         stderr=asyncio.subprocess.PIPE,
                         env=env,
                         limit=MAX_PLUGIN_MESSAGE_BYTES + 1,
-                        **spawn_options,
+                        pass_fds=inherited_fds or None,
                     )
         except SandboxBackendUnavailable as exc:
             self._process = None

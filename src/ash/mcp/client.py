@@ -34,6 +34,7 @@ from ash.sandbox.process_utils import (
     ProcessTreePlan,
     prepare_process_tree,
     prepare_scoped_process_launch,
+    spawn_process_tree,
     terminate_process_tree,
 )
 
@@ -1563,11 +1564,9 @@ class MCPClient:
                             f"MCP stdio server was not started: {exc}"
                         ) from exc
                     self._process_tree_plan = process_tree_plan
-                    spawn_options = dict(process_tree_plan.spawn_options)
-                    if launch.pass_fds:
-                        spawn_options["pass_fds"] = launch.pass_fds
                     try:
-                        self._process = await asyncio.create_subprocess_exec(
+                        self._process = await spawn_process_tree(
+                            process_tree_plan,
                             *launch.argv,
                             stdin=asyncio.subprocess.PIPE,
                             stdout=asyncio.subprocess.PIPE,
@@ -1575,7 +1574,7 @@ class MCPClient:
                             env=env,
                             cwd=launch.cwd,
                             limit=MAX_STDIO_MESSAGE_BYTES + 1,
-                            **spawn_options,
+                            pass_fds=launch.pass_fds or None,
                         )
                     except BaseException:
                         self._process_tree_plan = None
@@ -1598,7 +1597,8 @@ class MCPClient:
             ) from exc
         self._process_tree_plan = process_tree_plan
         try:
-            self._process = await asyncio.create_subprocess_exec(
+            self._process = await spawn_process_tree(
+                process_tree_plan,
                 *command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -1606,7 +1606,6 @@ class MCPClient:
                 env=env,
                 cwd=resolved_cwd,
                 limit=MAX_STDIO_MESSAGE_BYTES + 1,
-                **process_tree_plan.spawn_options,
             )
         except BaseException:
             self._process_tree_plan = None

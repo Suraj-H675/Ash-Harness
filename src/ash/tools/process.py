@@ -29,7 +29,7 @@ from ash.sandbox.process_utils import (
     prepare_pty_process_argv,
     prepare_process_tree,
     prepare_scoped_process_launch,
-    pty_process_spawn_options,
+    spawn_process_tree,
     terminate_process_tree,
     write_pty_input,
 )
@@ -338,11 +338,9 @@ class BackgroundProcessTool(BaseTool):
                     inherited_fds = tuple(
                         dict.fromkeys((*invocation.pass_fds, *launch.pass_fds))
                     )
-                    spawn_options = dict(process_tree_plan.spawn_options)
                     master_fd: int | None = None
                     slave_fd: int | None = None
                     if args.pty:
-                        spawn_options = pty_process_spawn_options(process_tree_plan)
                         launch_argv = prepare_pty_process_argv(
                             launch.argv,
                             plan=process_tree_plan,
@@ -351,17 +349,16 @@ class BackgroundProcessTool(BaseTool):
                         master_fd, slave_fd = open_process_pty()
                     else:
                         launch_argv = launch.argv
-                    if inherited_fds:
-                        spawn_options["pass_fds"] = inherited_fds
                     try:
-                        process = await asyncio.create_subprocess_exec(
+                        process = await spawn_process_tree(
+                            process_tree_plan,
                             *launch_argv,
                             cwd=launch.cwd,
                             env=environment,
                             stdin=(slave_fd if args.pty else asyncio.subprocess.PIPE),
                             stdout=(slave_fd if args.pty else asyncio.subprocess.PIPE),
                             stderr=(slave_fd if args.pty else asyncio.subprocess.PIPE),
-                            **spawn_options,
+                            pass_fds=inherited_fds or None,
                         )
                     except BaseException:
                         close_pty_fd(master_fd)

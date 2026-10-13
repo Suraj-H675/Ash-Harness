@@ -43,6 +43,7 @@ from ash.sandbox.process_utils import (
     communicate_process,
     prepare_process_tree,
     settle_process_tree_after_cancellation,
+    spawn_process_tree,
     terminate_process_tree,
 )
 from ash.tools.base import (
@@ -448,7 +449,8 @@ async def _validate_schema_instance(
         }
     try:
         process_tree_plan = prepare_process_tree()
-        process = await asyncio.create_subprocess_exec(
+        process = await spawn_process_tree(
+            process_tree_plan,
             sys.executable,
             "-I",
             "-m",
@@ -457,7 +459,7 @@ async def _validate_schema_instance(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=build_scrubbed_environment(),
-            **process_tree_plan.spawn_options,
+            cleanup_grace_seconds=0.1,
         )
     except ProcessTreeUnavailable as exc:
         return {

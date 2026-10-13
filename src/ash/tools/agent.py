@@ -50,6 +50,7 @@ from ash.sandbox.process_utils import (
     communicate_process,
     prepare_process_tree,
     settle_process_tree_after_cancellation,
+    spawn_process_tree,
 )
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.ui.headless import HeadlessUI
@@ -674,8 +675,10 @@ class SpawnAgentTool(BaseTool):
             limit=10_000,
         )
         event_sequence = prior_events[-1].sequence if prior_events else 0
-        launch = asyncio.create_task(
-            asyncio.create_subprocess_exec(
+        process: asyncio.subprocess.Process | None = None
+        try:
+            process = await spawn_process_tree(
+                plan,
                 sys.executable,
                 "-I",
                 "-m",
@@ -685,31 +688,9 @@ class SpawnAgentTool(BaseTool):
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
                 env=environment,
-                **plan.spawn_options,
-            ),
-            name=f"ash-subagent-process-launch-{durable_task.task_id}",
-        )
-        process: asyncio.subprocess.Process | None = None
-        try:
-            process = await asyncio.shield(launch)
+                task_name=f"ash-subagent-process-launch-{durable_task.task_id}",
+            )
         except asyncio.CancelledError as cancellation:
-            launch_error, launch_interrupted = await _settle_spawn_cleanup_task(launch)
-            if launch_interrupted:
-                cancellation.add_note("subagent process launch cleanup was interrupted")
-            if launch_error is None:
-                process = launch.result()
-                cleanup_error, cleanup_cancelled = (
-                    await settle_process_tree_after_cancellation(process, plan=plan)
-                )
-                if cleanup_error is not None:
-                    cancellation.add_note(
-                        "subagent subprocess cleanup failed: "
-                        f"{cleanup_error}"
-                    )
-                if cleanup_cancelled:
-                    cancellation.add_note(
-                        "subagent subprocess cleanup was interrupted by cancellation"
-                    )
             self._cancel_active_subprocess_task(
                 durable_task.task_id,
                 reason="subagent subprocess cancelled during launch",

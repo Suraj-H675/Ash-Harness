@@ -12,11 +12,11 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, IO, TypeVar
 
 from ash.safe_io import descriptor_path
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
@@ -330,6 +330,151 @@ class ProcessTreePlan:
     @property
     def is_windows(self) -> bool:
         return self.platform == "win32"
+
+
+_ProcessTreeResult = TypeVar("_ProcessTreeResult")
+
+
+async def _drain_process_start_task(
+    task: asyncio.Task[_ProcessTreeResult],
+) -> bool:
+    """Wait for a subprocess-start task despite repeated caller cancellation."""
+
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                break
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException:
+        pass
+    return cancelled
+
+
+async def spawn_process_tree(
+    plan: ProcessTreePlan,
+    *argv: str,
+    cwd: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+    stdin: int | IO[bytes] | None = None,
+    stdout: int | IO[bytes] | None = None,
+    stderr: int | IO[bytes] | None = None,
+    limit: int = 2**16,
+    pass_fds: Sequence[int] | None = None,
+    cleanup_grace_seconds: float = 1.0,
+    task_name: str | None = None,
+    on_process_ready: Callable[[asyncio.subprocess.Process], None] | None = None,
+) -> asyncio.subprocess.Process:
+    """Start a plan-owned process and settle its tree if startup is cancelled."""
+
+    startup_started = False
+
+    async def acquire_process() -> asyncio.subprocess.Process:
+        nonlocal startup_started
+        # This is the coroutine's first step and runs before its first await,
+        # so False identifies cancellation before the task began dispatching.
+        startup_started = True
+        options = dict(plan.spawn_options)
+        options.update(
+            cwd=cwd,
+            env=env,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            limit=limit,
+        )
+        if pass_fds is not None:
+            options["pass_fds"] = tuple(pass_fds)
+        return await asyncio.create_subprocess_exec(*argv, **options)
+
+    startup_task = asyncio.create_task(acquire_process(), name=task_name)
+    try:
+        process = await asyncio.shield(startup_task)
+    except asyncio.CancelledError as cancellation:
+        current = asyncio.current_task()
+        if (
+            startup_task.done()
+            and (current is None or current.cancelling() == 0)
+        ):
+            # The launch task itself was cancelled; no caller cancellation is pending.
+            raise
+
+        if not startup_started:
+            startup_task.cancel()
+            repeated_cancellation = await _drain_process_start_task(startup_task)
+            if repeated_cancellation:
+                cancellation.add_note("Process startup drain absorbed repeated cancellation")
+            raise
+
+        repeated_cancellation = await _drain_process_start_task(startup_task)
+        try:
+            process = startup_task.result()
+        except BaseException as startup_error:
+            cancellation.add_note(
+                "Process startup did not yield a handle after cancellation: "
+                f"{type(startup_error).__name__}"
+            )
+            if repeated_cancellation:
+                cancellation.add_note("Process startup drain absorbed repeated cancellation")
+            raise cancellation from startup_error
+
+        callback_error: BaseException | None = None
+        if on_process_ready is not None:
+            try:
+                on_process_ready(process)
+            except BaseException as exc:
+                callback_error = exc
+                cancellation.add_note(
+                    "Process-ready callback failed during startup cancellation: "
+                    f"{type(exc).__name__}"
+                )
+
+        cleanup_error, cleanup_cancelled = await settle_process_tree_after_cancellation(
+            process,
+            plan=plan,
+            grace_seconds=cleanup_grace_seconds,
+        )
+        if cleanup_error is not None:
+            cancellation.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+        if cleanup_cancelled or repeated_cancellation:
+            cancellation.add_note("Process-tree cleanup absorbed repeated cancellation")
+        if callback_error is not None:
+            cancellation.add_note("Process-ready callback failed; process tree was settled")
+        raise
+
+    if on_process_ready is not None:
+        try:
+            on_process_ready(process)
+        except BaseException as callback_error:
+            cleanup_error, cleanup_cancelled = await settle_process_tree_after_cancellation(
+                process,
+                plan=plan,
+                grace_seconds=cleanup_grace_seconds,
+            )
+            if cleanup_error is not None:
+                callback_error.add_note(f"Process-tree cleanup failed: {cleanup_error}")
+            if cleanup_cancelled:
+                cancelled_during_callback = asyncio.CancelledError()
+                cancelled_during_callback.add_note(
+                    "Process-ready callback failed while process-tree cleanup "
+                    "was cancelled"
+                )
+                if cleanup_error is not None:
+                    cancelled_during_callback.add_note(
+                        f"Process-tree cleanup failed: {cleanup_error}"
+                    )
+                raise cancelled_during_callback from callback_error
+            raise
+    return process
 
 
 @dataclass(frozen=True)
