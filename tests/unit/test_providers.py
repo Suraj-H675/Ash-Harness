@@ -1098,6 +1098,87 @@ async def test_openai_prompt_cache_and_usage_only_chunk() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openai_usage_only_chunk_before_choice_terminal_is_incomplete() -> None:
+    from ash.providers.base import ProviderIncompleteStreamError
+    from ash.providers.openai import OpenAIProvider
+
+    usage = SimpleNamespace(prompt_tokens=1200, completion_tokens=10)
+    client = _FakeOpenAIClient(
+        [
+            _openai_chunk(content="partial response"),
+            _openai_chunk(usage=usage),
+        ]
+    )
+    provider = OpenAIProvider("gpt-test", "test-key", client=client)
+    chunks: list[StreamChunk] = []
+
+    with pytest.raises(ProviderIncompleteStreamError):
+        async for chunk in provider.stream_chat([]):
+            chunks.append(chunk)
+
+    assert [chunk.content for chunk in chunks] == ["partial response", ""]
+    assert not any(chunk.is_done for chunk in chunks)
+    assert client.completions.last_stream is not None
+    assert client.completions.last_stream.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_error_redacts_exact_configured_credentials() -> None:
+    from ash.providers.openai import OpenAIProvider
+    from ash.providers.retry import classify_provider_failure
+
+    api_key = "short-key"
+    header_secret = "private-header"
+    rotated_key = "rotated-key"
+
+    class FaultyStream:
+        closed = 0
+
+        def __aiter__(self):
+            async def generate():
+                yield _openai_chunk(content="partial")
+                error = RuntimeError(
+                    f"stream rejected {api_key}, {header_secret}, {rotated_key}"
+                )
+                error.status_code = 429
+                raise error
+
+            return generate()
+
+        async def aclose(self) -> None:
+            self.closed += 1
+
+    stream = FaultyStream()
+
+    class FakeCompletions:
+        async def create(self, **_kwargs: Any) -> FaultyStream:
+            return stream
+
+    provider = OpenAIProvider(
+        "test",
+        api_key,
+        default_headers={"X-Auth-Tag": header_secret},
+        error_secrets_supplier=lambda: (rotated_key,),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions())),
+    )
+    chunks: list[StreamChunk] = []
+
+    with pytest.raises(RuntimeError) as raised:
+        async for chunk in provider.stream_chat([]):
+            chunks.append(chunk)
+
+    assert [chunk.content for chunk in chunks] == ["partial"]
+    assert api_key not in str(raised.value)
+    assert header_secret not in str(raised.value)
+    assert rotated_key not in str(raised.value)
+    assert "[REDACTED]" in str(raised.value)
+    failure = classify_provider_failure(raised.value)
+    assert failure.status_code == 429
+    assert failure.retriable is True
+    assert stream.closed == 1
+
+
+@pytest.mark.asyncio
 async def test_openai_provider_cancellation_closes_sdk_stream() -> None:
     from ash.providers.openai import OpenAIProvider
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 import httpx
 import openai  # type: ignore[import-not-found]
@@ -11,6 +12,7 @@ import openai  # type: ignore[import-not-found]
 from ash.context.tokens import OpenAITokenCounter
 from ash.providers.base import (
     ProviderABC,
+    ProviderIncompleteStreamError,
     StreamChunk,
     TokenCounterLike,
     managed_async_stream,
@@ -223,6 +225,25 @@ class OpenAIProvider(ProviderABC):
         self._client = openai.AsyncOpenAI(**options)
         return self._client
 
+    def _redacted_error_detail(self, exc: Exception) -> str:
+        dynamic_secrets: Sequence[str] = ()
+        if self._error_secrets_supplier is not None:
+            try:
+                dynamic_secrets = self._error_secrets_supplier()
+            except Exception:  # noqa: BLE001 - redaction must not mask provider error
+                pass
+        return redact_provider_error(str(exc), *self._error_secrets, *dynamic_secrets)
+
+    @asynccontextmanager
+    async def _redact_stream_errors(self) -> AsyncGenerator[None, None]:
+        try:
+            yield
+        except Exception as exc:  # noqa: BLE001 - SDK errors may expose credentials
+            detail = self._redacted_error_detail(exc)
+            if detail == str(exc):
+                raise
+            raise RuntimeError(f"OpenAI API stream error: {detail}") from None
+
     def configure_max_tokens(self, max_tokens: int) -> None:
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
@@ -292,17 +313,7 @@ class OpenAIProvider(ProviderABC):
             client = self._resolve_client()
             stream = await client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            dynamic_secrets: Sequence[str] = ()
-            if self._error_secrets_supplier is not None:
-                try:
-                    dynamic_secrets = self._error_secrets_supplier()
-                except Exception:  # noqa: BLE001 - redaction must not mask provider error
-                    dynamic_secrets = ()
-            detail = redact_provider_error(
-                str(exc),
-                *self._error_secrets,
-                *dynamic_secrets,
-            )
+            detail = self._redacted_error_detail(exc)
             raise RuntimeError(f"OpenAI API error: {detail}") from exc
 
         # Buffer for accumulating streaming tool calls.
@@ -311,15 +322,19 @@ class OpenAIProvider(ProviderABC):
         completed: list[CanonicalToolCall] = []
         stream_bytes = 0
         reasoning_parts: list[str] = []
+        saw_terminal_choice = False
 
-        async with managed_async_stream(stream, label='OpenAI') as managed_stream:
+        async with (
+            self._redact_stream_errors(),
+            managed_async_stream(stream, label='OpenAI') as managed_stream,
+        ):
             async for chunk in managed_stream:
                     choices = getattr(chunk, "choices", None) or []
                     usage = getattr(chunk, "usage", None)
                     if not choices:
                         if usage is not None:
                             yield StreamChunk(
-                                is_done=True,
+                                is_done=saw_terminal_choice,
                                 model=self._model_name,
                                 prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
                                 completion_tokens=(getattr(usage, "completion_tokens", 0) or 0),
@@ -343,6 +358,7 @@ class OpenAIProvider(ProviderABC):
                         )
                         reasoning_parts.append(reasoning_delta)
                     is_done = choice.finish_reason is not None
+                    saw_terminal_choice = saw_terminal_choice or is_done
                     prompt_tokens = 0
                     completion_tokens = 0
                     cache_read_tokens = 0
@@ -428,6 +444,10 @@ class OpenAIProvider(ProviderABC):
                     completed.clear()
                     if is_done:
                         reasoning_parts.clear()
+            if not saw_terminal_choice:
+                raise ProviderIncompleteStreamError(
+                    "OpenAI stream ended without a choice finish_reason"
+                )
 
     async def aclose(self) -> None:
         client = self._client
