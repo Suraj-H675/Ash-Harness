@@ -1103,7 +1103,10 @@ def test_resume_and_clear_replace_the_active_conversation_view(tmp_path: Path) -
         ready_start = len(captured)
         os.kill(process.pid, signal.SIGWINCH)
         expect("›".encode(), after=ready_start)
-        os.write(master_fd, b"/exit\r")
+        exit_start = len(captured)
+        os.write(master_fd, b"/exit")
+        expect(b"/exit", after=exit_start)
+        os.write(master_fd, b"\r")
         # Continue draining PTY output while Ash redraws and shuts down. A
         # blocked PTY writer cannot exit if the parent only waits for the PID.
         deadline = time.monotonic() + 15
@@ -1117,6 +1120,10 @@ def test_resume_and_clear_replace_the_active_conversation_view(tmp_path: Path) -
                     captured.extend(chunk)
         assert process.poll() is not None, (
             "Ash did not exit after /exit: "
+            + bytes(captured).decode("utf-8", errors="replace")[-3000:]
+        )
+        assert process.returncode == 0, (
+            "Ash exited unsuccessfully after /exit: "
             + bytes(captured).decode("utf-8", errors="replace")[-3000:]
         )
         while select.select([master_fd], [], [], 0.1)[0]:

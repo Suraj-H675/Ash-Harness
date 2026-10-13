@@ -311,7 +311,12 @@ def test_first_run_local_provider_picker_ctrl_c_cancels_setup(
         except subprocess.TimeoutExpired:
             pytest.fail("Ctrl-C returned to setup instead of canceling the wizard")
 
-        while select.select([master], [], [], 0)[0]:
+        # A process exit can precede the PTY's final readable/EOF notification.
+        drain_deadline = time.monotonic() + 1
+        while time.monotonic() < drain_deadline:
+            remaining = drain_deadline - time.monotonic()
+            if not select.select([master], [], [], min(0.1, remaining))[0]:
+                continue
             try:
                 chunk = os.read(master, 65_536)
             except OSError:
