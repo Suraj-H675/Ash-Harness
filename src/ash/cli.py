@@ -1782,6 +1782,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                             name_parts = arguments[1:]
                     forked = loop.session_store.fork_session(
                         loop.current_session.session_id,
+                        expected_project_path=loop.project_root,
                         message_count=count,
                         branch_name=" ".join(name_parts),
                     )

@@ -106,6 +106,10 @@ class SessionResolutionError(ValueError):
     """A human session reference cannot be resolved unambiguously."""
 
 
+class SessionForkConflictError(ValueError):
+    """A session has a started turn and cannot be forked yet."""
+
+
 class _DatabaseCoordinationState:
     """Process-local reader/writer state paired with a cross-process flock."""
 
@@ -4139,6 +4143,7 @@ class SessionStore:
         self,
         session_id: str,
         *,
+        expected_project_path: str | Path | None = None,
         message_count: int | None = None,
         branch_name: str = "",
         branch_summary: str = "",
@@ -4150,13 +4155,29 @@ class SessionStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 source = conn.execute(
-                    "SELECT session_id, project_path, title, context_summary, "
+                    "SELECT session_id, project_path, project_key, title, context_summary, "
                     "context_summary_message_count, model FROM sessions "
                     "WHERE session_id = ?",
                     (session_id,),
                 ).fetchone()
                 if source is None:
                     raise KeyError(f"Session not found: {session_id}")
+                if (
+                    expected_project_path is not None
+                    and str(source["project_key"])
+                    != normalize_project_path(expected_project_path)
+                ):
+                    raise ValueError("session belongs to a different workspace")
+                started_turn = conn.execute(
+                    "SELECT 1 FROM turn_journal WHERE session_id = ? "
+                    "AND status = 'started' LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if started_turn is not None:
+                    raise SessionForkConflictError(
+                        "session has an unfinished turn; finish or recover it "
+                        "before forking"
+                    )
                 total_count, retained, removed = _message_boundary_rows(
                     conn,
                     session_id,

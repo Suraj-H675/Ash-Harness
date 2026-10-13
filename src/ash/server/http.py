@@ -22,6 +22,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from ash.sdk import AshClient
 from ash.core.events import EVENT_SCHEMA_VERSION
 from ash.core.redaction import redact_text, redact_value
+from ash.core.session import SessionForkConflictError
 from ash.server.jsonrpc import JSONRPCServer
 from ash.tools.base import redact_tool_arguments
 
@@ -708,6 +709,8 @@ def create_app(
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=redact_text(str(exc))) from exc
+        except SessionForkConflictError as exc:
+            raise HTTPException(status_code=409, detail=redact_text(str(exc))) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=redact_text(str(exc))) from exc
         except RuntimeError as exc:

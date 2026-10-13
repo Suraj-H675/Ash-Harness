@@ -16,6 +16,7 @@ from ash.core.goals import GoalState
 from ash.core.session import (
     CURRENT_SCHEMA_VERSION,
     Message,
+    SessionForkConflictError,
     SessionResolutionError,
     SessionStore,
     SessionStorageError,
@@ -1600,6 +1601,52 @@ def test_session_fork_rejects_incomplete_tool_and_turn_boundaries(
     )
     with pytest.raises(ValueError, match="splits an Ash turn"):
         store.fork_session(turn_session.session_id, message_count=1)
+
+
+def test_session_fork_rejects_workspace_mismatch_without_creating_child(
+    tmp_path: Path,
+) -> None:
+    source_workspace = tmp_path / "source"
+    expected_workspace = tmp_path / "expected"
+    source_workspace.mkdir()
+    expected_workspace.mkdir()
+    store = SessionStore(tmp_path / "fork-scope.db")
+    source = store.create_session(str(source_workspace))
+
+    with pytest.raises(ValueError, match="different workspace") as exc_info:
+        store.fork_session(
+            source.session_id,
+            expected_project_path=expected_workspace,
+        )
+
+    assert type(exc_info.value) is ValueError
+    assert store.session_tree(source.session_id)[0].children == ()
+
+
+def test_session_fork_rejects_started_turn_without_mutating_journal(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "fork-active-turn.db")
+    source = store.create_session(str(tmp_path))
+    store.start_turn(source.session_id, "turn-active", "still running")
+    with closing(get_db_connection(store.db_path)) as conn:
+        before = conn.execute(
+            "SELECT turn_id, status, started_at, completed_at FROM turn_journal "
+            "WHERE session_id = ?",
+            (source.session_id,),
+        ).fetchall()
+
+    with pytest.raises(SessionForkConflictError, match="finish or recover"):
+        store.fork_session(source.session_id, expected_project_path=tmp_path)
+
+    with closing(get_db_connection(store.db_path)) as conn:
+        after = conn.execute(
+            "SELECT turn_id, status, started_at, completed_at FROM turn_journal "
+            "WHERE session_id = ?",
+            (source.session_id,),
+        ).fetchall()
+    assert [tuple(row) for row in after] == [tuple(row) for row in before]
+    assert store.session_tree(source.session_id)[0].children == ()
 
 
 def test_fork_session_does_not_preload_source_history(

@@ -689,6 +689,30 @@ def test_startup_resume_supports_name_and_fork(tmp_path: Path) -> None:
     assert store.load_session(selection.session_id).title == "auth refactor (fork)"
 
 
+def test_startup_fork_rejects_legacy_session_from_another_project(
+    tmp_path: Path,
+) -> None:
+    current_project = tmp_path / "current"
+    foreign_project = tmp_path / "foreign"
+    current_project.mkdir()
+    foreign_project.mkdir()
+    store = SessionStore(tmp_path / "sessions.db")
+    foreign = store.create_session(str(foreign_project))
+
+    with pytest.raises(ValueError, match="different workspace") as exc_info:
+        asyncio.run(
+            select_startup_session(
+                store,
+                project_path=str(current_project),
+                legacy_session_id=foreign.session_id,
+                fork_session=True,
+            )
+        )
+
+    assert type(exc_info.value) is ValueError
+    assert store.session_tree(foreign.session_id)[0].children == ()
+
+
 def test_bare_resume_requires_tty_and_honors_picker_cancel(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     store.create_session(str(tmp_path))

@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from ash.sdk import AshEvent, AshEventRecord, AshResult
-from ash.core.session import SessionLineage
+from ash.core.session import SessionForkConflictError, SessionLineage
 from ash.server.http import (
     HTTPApprovalBroker,
     MAX_HTTP_BODY_BYTES,
@@ -177,6 +177,7 @@ async def test_http_approval_broker_shutdown_fails_pending_closed() -> None:
 
 class FakeClient:
     def __init__(self):
+        self.fork_error = None
         self.steering_error = None
         self.resume_error = None
         self.tree_error = None
@@ -236,6 +237,8 @@ class FakeClient:
         branch_name="",
         branch_summary="",
     ):
+        if self.fork_error is not None:
+            raise self.fork_error
         return "session-fork"
 
     def session_tree(self, session_id=None):
@@ -1339,6 +1342,35 @@ async def test_http_server_forks_and_returns_session_tree() -> None:
     assert forked.json() == {"session_id": "session-fork"}
     assert tree.status_code == 200
     assert tree.json()["sessions"][0]["children"] == ["session-fork"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (SessionForkConflictError("session has an unfinished turn"), 409),
+        (ValueError("invalid fork boundary"), 422),
+    ],
+)
+async def test_http_fork_maps_conflicts_before_general_value_errors(
+    error: ValueError,
+    expected_status: int,
+) -> None:
+    client = FakeClient()
+    client.fork_error = error
+    app = create_app(client, bearer_token="0123456789abcdef")
+    headers = {"Authorization": "Bearer 0123456789abcdef"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://testserver"
+    ) as http:
+        response = await http.post(
+            "/v1/sessions/session-1/fork",
+            json={},
+            headers=headers,
+        )
+
+    assert response.status_code == expected_status
 
 
 @pytest.mark.asyncio

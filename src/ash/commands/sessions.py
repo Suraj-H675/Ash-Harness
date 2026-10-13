@@ -139,7 +139,9 @@ async def select_startup_session(
             raise ValueError(
                 "--fork-session requires --continue, --resume, or --session"
             )
-        session_id = store.fork_session(session_id).session_id
+        session_id = store.fork_session(
+            session_id, expected_project_path=project_path
+        ).session_id
     return StartupSessionSelection(session_id)
 
 

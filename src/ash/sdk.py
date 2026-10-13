@@ -925,6 +925,7 @@ class AshClient:
             )
             forked = self.loop.session_store.fork_session(
                 resolved_session_id,
+                expected_project_path=self.loop.project_root,
                 message_count=message_count,
                 branch_name=branch_name,
                 branch_summary=branch_summary,

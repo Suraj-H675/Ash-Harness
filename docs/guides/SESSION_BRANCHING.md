@@ -24,8 +24,9 @@ backup before migration.
 A fork cannot split an Ash turn or an assistant/tool-result pair. Ash copies the
 new session row and transcript prefix in one SQLite transaction, preserves
 message token metadata, clears inherited turn IDs, and only carries a context
-summary when the complete transcript is copied. A failure rolls back the entire
-child.
+summary when the complete transcript is copied. Runtime forks are scoped to the
+requesting workspace and refuse a started turn; finish or recover it first. A
+failure rolls back the entire child.
 
 Retention is tree-aware. Ash deletes a tree only when every node is older than
 the retention cutoff, preventing active descendants from becoming orphaned.

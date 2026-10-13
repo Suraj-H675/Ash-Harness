@@ -454,16 +454,10 @@ class AshACPAgent:
             await self._reserve_pending_session_id(child_id)
             child_id_reserved = True
             store, _stored = _stored_session_for_workspace(workspace, session_id)
-            if store.started_turns(session_id):
-                raise RequestError.invalid_request(
-                    {
-                        "sessionId": session_id,
-                        "reason": "session has an unfinished turn; resume or load it first",
-                    }
-                )
             try:
                 forked = store.fork_session(
                     session_id,
+                    expected_project_path=workspace,
                     _child_session_id=child_id,
                 )
             except ValueError as exc:
