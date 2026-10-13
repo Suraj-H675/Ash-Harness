@@ -4284,7 +4284,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 tools=args.tools,
             )
         except (ProviderConfigurationError, ProviderVerificationError, ValueError) as exc:
-            print(provider_test_error(exc, json_output=args.json), file=sys.stderr)
+            print(
+                provider_test_error(exc, json_output=args.json),
+                file=sys.stdout if args.json else sys.stderr,
+            )
             return 2
         print(render_provider_test(verification, json_output=args.json))
         return 0 if verification.requested_checks_passed else 1
