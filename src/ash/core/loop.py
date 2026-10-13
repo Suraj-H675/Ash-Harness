@@ -3970,12 +3970,14 @@ class AshLoop:
                         f"// From {hit.file_path}:\n{hit.content[:500]}" for hit in hits
                     )
             request_budget = self._resolve_request_token_budget()
+            repo_map_refresh_error = await self._refresh_repo_map_before_prompt()
             try:
                 messages = self._build_messages(
                     session,
                     request_budget=request_budget,
                     provider_tools=iteration_tools,
                     tool_schema_payload=iteration_tool_schema,
+                    repo_map_refresh_error=repo_map_refresh_error,
                 )
             except ContextBudgetExceededError as exc:
                 used_before_request = total_prompt_tokens + total_completion_tokens
@@ -6876,6 +6878,7 @@ class AshLoop:
         force_compaction: bool = False,
         provider_tools: dict[str, BaseTool] | None = None,
         tool_schema_payload: list[dict[str, Any]] | None = None,
+        repo_map_refresh_error: Exception | None = None,
     ) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""
 
@@ -6906,10 +6909,12 @@ class AshLoop:
                 repo_ready = bool(getattr(self.repo_map, "ready", True))
                 if not repo_ready:
                     repo_section = ""
-                elif self._repo_map_dirty:
-                    self.repo_map.refresh()
-                    self._repo_map_dirty = False
-                if repo_ready:
+                elif repo_map_refresh_error is not None:
+                    repo_section = f"(repo map unavailable: {repo_map_refresh_error})"
+                else:
+                    if self._repo_map_dirty:
+                        self.repo_map.refresh()
+                        self._repo_map_dirty = False
                     ranked = self.repo_map.rank(self._repo_map_active_files)
                     repo_section = self.repo_map.render(
                         ranked, top_files=5, symbols_per_file=6
@@ -7368,6 +7373,25 @@ class AshLoop:
                 msg_dict["tool_call_id"] = message.metadata["call_id"]
             messages.append(msg_dict)
         return messages
+
+    async def _refresh_repo_map_before_prompt(self) -> Exception | None:
+        """Refresh a dirty map off-loop before building the next prompt."""
+
+        repo_map = self.repo_map
+        if repo_map is None or not self._repo_map_dirty:
+            return None
+        try:
+            if not bool(getattr(repo_map, "ready", True)):
+                return None
+            async_refresh = getattr(repo_map, "arefresh", None)
+            if callable(async_refresh):
+                await async_refresh()
+            else:
+                await asyncio.to_thread(repo_map.refresh)
+        except Exception as exc:  # noqa: BLE001 — repo map is best-effort
+            return exc
+        self._repo_map_dirty = False
+        return None
 
     def compact_current_context(self) -> tuple[int, bool]:
         """Force compaction for the active session and return token estimate."""

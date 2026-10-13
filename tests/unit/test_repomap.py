@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 from pathlib import Path
@@ -70,6 +71,86 @@ def test_repomap_close_requests_deferred_refresh_cancellation(
     assert repo_map._initial_refresh_ready.wait(timeout=1)
 
 
+@pytest.mark.asyncio
+async def test_repomap_async_refresh_leaves_event_loop_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_map = RepoMap(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_refresh(*, cancel_event: threading.Event | None = None) -> None:
+        del cancel_event
+        started.set()
+        assert release.wait(timeout=2)
+
+    monkeypatch.setattr(repo_map, "_refresh", delayed_refresh)
+    refresh_task = asyncio.create_task(repo_map.arefresh())
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        assert not refresh_task.done()
+    finally:
+        release.set()
+    await refresh_task
+
+
+@pytest.mark.asyncio
+async def test_repomap_async_refresh_cancels_worker_before_returning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_map = RepoMap(tmp_path)
+    started = threading.Event()
+    cancelled = threading.Event()
+
+    def cancellable_refresh(*, cancel_event: threading.Event | None = None) -> None:
+        assert cancel_event is not None
+        started.set()
+        assert cancel_event.wait(timeout=2)
+        cancelled.set()
+
+    monkeypatch.setattr(repo_map, "_refresh", cancellable_refresh)
+    refresh_task = asyncio.create_task(repo_map.arefresh())
+    assert await asyncio.to_thread(started.wait, 1)
+    refresh_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await refresh_task
+
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_repomap_async_refresh_settles_worker_after_repeated_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_map = RepoMap(tmp_path)
+    started = threading.Event()
+    stop_requested = threading.Event()
+    release = threading.Event()
+
+    def delayed_refresh(*, cancel_event: threading.Event | None = None) -> None:
+        assert cancel_event is not None
+        started.set()
+        assert cancel_event.wait(timeout=2)
+        stop_requested.set()
+        assert release.wait(timeout=2)
+
+    monkeypatch.setattr(repo_map, "_refresh", delayed_refresh)
+    refresh_task = asyncio.create_task(repo_map.arefresh())
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        refresh_task.cancel()
+        assert await asyncio.to_thread(stop_requested.wait, 1)
+        refresh_task.cancel()
+        await asyncio.sleep(0)
+        assert not refresh_task.done(), "refresh returned before its worker settled"
+    finally:
+        release.set()
+        if not refresh_task.done():
+            refresh_task.cancel()
+        await asyncio.gather(refresh_task, return_exceptions=True)
+
+
 def test_pagerank_concentrates_on_teleport_node() -> None:
     matrix = [[0, 1, 0], [1, 0, 0], [0, 0, 0]]
     v = calculate_personalized_pagerank(matrix, teleport_indices=[0])
@@ -136,6 +217,32 @@ def test_repomap_rank_emphasizes_active_file(tmp_path: Path) -> None:
     assert by_path["active.py"] > by_path["isolated.py"]
 
 
+def test_repomap_includes_late_active_file_within_file_limit(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("def first(): pass\n")
+    (tmp_path / "b.py").write_text("def second(): pass\n")
+    active = tmp_path / "z_active.py"
+    active.write_text("def late_active_symbol(): pass\n")
+
+    repo_map = RepoMap(tmp_path, max_files=2)
+    assert active.resolve() not in {node.path for node in repo_map.files}
+
+    ranked = repo_map.rank([active])
+
+    assert len(repo_map.files) == 2
+    assert active.resolve() in {node.path for node in repo_map.files}
+    assert ranked[0][0] == active.resolve()
+    assert "late_active_symbol" in repo_map.render(ranked, top_files=1)
+
+    graph = repo_map._adjacency
+    extract = Mock(wraps=repo_map._extractor.extract)
+    repo_map._extractor.extract = extract
+    repo_map.rank([active])
+    repo_map.refresh()
+
+    assert repo_map._adjacency is graph
+    assert extract.call_count == 0
+
+
 def test_repomap_render_includes_top_symbols(tmp_path: Path) -> None:
     (tmp_path / "a.py").write_text("import b\ndef hello(): pass\nclass Foo: pass\n")
     (tmp_path / "b.py").write_text("def world(): pass\n")
@@ -177,6 +284,49 @@ def test_repomap_skips_directory_links(tmp_path: Path) -> None:
     repo_map = RepoMap(workspace)
 
     assert {node.path.name for node in repo_map.files} == {"keep.py"}
+
+
+def test_repomap_does_not_parse_active_file_swapped_to_external_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "a.py").write_text("def local(): pass\n", encoding="utf-8")
+    active = workspace / "z_active.py"
+    active.write_text("def harmless(): pass\n", encoding="utf-8")
+    saved = workspace / "z_active-saved.py"
+    outside = tmp_path / "outside.py"
+    outside.write_text("def OUTSIDE_ACTIVE_SECRET(): pass\n", encoding="utf-8")
+    repo_map = RepoMap(workspace, max_files=1)
+    real_stat = repomap_module.stat_scoped_path
+    swapped = False
+
+    def stat_then_swap(path: Path, guard):
+        nonlocal swapped
+        result = real_stat(path, guard)
+        if Path(path) == active and not swapped:
+            active.rename(saved)
+            try:
+                active.symlink_to(outside)
+            except OSError as exc:
+                saved.rename(active)
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+            swapped = True
+        return result
+
+    monkeypatch.setattr(repomap_module, "stat_scoped_path", stat_then_swap)
+    try:
+        ranked = repo_map.rank([active])
+        rendered = repo_map.render(ranked, top_files=5)
+    finally:
+        if active.is_symlink():
+            active.unlink()
+        if saved.exists():
+            saved.rename(active)
+
+    assert swapped is True
+    assert "OUTSIDE_ACTIVE_SECRET" not in rendered
+    assert active.resolve() not in {node.path for node in repo_map.files}
 
 
 def test_repomap_does_not_parse_file_swapped_to_external_symlink(
@@ -365,6 +515,11 @@ def test_repomap_applies_exclusions_before_file_limit(tmp_path: Path) -> None:
     )
 
     assert [node.path.name for node in repo_map.files] == ["z_kept.py"]
+    ranked = repo_map.rank([generated / "ignored.py"])
+    assert (generated / "ignored.py").resolve() not in {
+        node.path for node in repo_map.files
+    }
+    assert ranked[0][0] == (tmp_path / "z_kept.py").resolve()
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
@@ -377,6 +532,8 @@ def test_repomap_honors_gitignore_for_untracked_files(tmp_path: Path) -> None:
     repo_map = RepoMap(tmp_path)
 
     assert [node.path.name for node in repo_map.files] == ["kept.py"]
+    ranked = repo_map.rank([tmp_path / "generated.py"])
+    assert [path for path, _ in ranked] == [(tmp_path / "kept.py").resolve()]
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
@@ -678,7 +835,10 @@ def test_repomap_dot_graph_quotes_untrusted_filenames(tmp_path: Path) -> None:
         FileNode(dependency, (), ()),
     ]
     repo_map._index = {source.resolve(): 0, dependency.resolve(): 1}
-    repo_map._adjacency = [[0.0, 0.0], [1.0, 0.0]]
+    repo_map._adjacency = repomap_module._SparseAdjacency(
+        columns=(((1, 1.0),), ()),
+        column_sums=(1.0, 0.0),
+    )
     repo_map._initial_refresh_ready = threading.Event()
     repo_map._initial_refresh_ready.set()
     repo_map._initial_refresh_error = None

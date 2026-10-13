@@ -15,6 +15,7 @@ Given a workspace, the map:
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import stat
 import subprocess
@@ -94,6 +95,14 @@ class FileNode:
     path: Path
     symbols: tuple[Symbol, ...]
     referenced_modules: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _SparseAdjacency:
+    """Outgoing dependency edges, grouped by source file index."""
+
+    columns: tuple[tuple[tuple[int, float], ...], ...]
+    column_sums: tuple[float, ...]
 
 
 def _normalize_module_name(path: Path, project_root: Path) -> str | None:
@@ -556,7 +565,8 @@ class RepoMap:
         self._files: list[FileNode] = []
         self._module_index: dict[str, Path] = {}
         self._index: dict[Path, int] = {}
-        self._adjacency: list[list[float]] | None = None
+        self._adjacency: _SparseAdjacency | None = None
+        self._priority_paths: tuple[Path, ...] = ()
         self._file_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
         self._initial_refresh_ready = threading.Event()
         self._initial_refresh_error: BaseException | None = None
@@ -591,6 +601,29 @@ class RepoMap:
 
         self._wait_for_initial_refresh()
         self._refresh()
+
+    async def arefresh(self) -> None:
+        """Refresh in a worker thread and stop cooperatively on cancellation."""
+
+        await asyncio.to_thread(self._wait_for_initial_refresh)
+        cancel_event = threading.Event()
+        refresh_task = asyncio.create_task(
+            asyncio.to_thread(self._refresh, cancel_event=cancel_event)
+        )
+        try:
+            await asyncio.shield(refresh_task)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            while not refresh_task.done():
+                try:
+                    await asyncio.shield(refresh_task)
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+                except Exception:
+                    break
+            raise
 
     def close(self) -> None:
         """Request cancellation of a deferred initial refresh."""
@@ -683,16 +716,35 @@ class RepoMap:
         self._wait_for_initial_refresh()
         if not self._files or self._adjacency is None:
             return []
+        if not 0.0 <= alpha < 1.0:
+            raise ValueError("alpha must be in the range [0, 1)")
+
+        active_paths: list[Path] = []
+        active_set: set[Path] = set()
+        for path in active_files:
+            try:
+                resolved = path.resolve()
+                resolved.relative_to(self.project_root)
+            except (OSError, ValueError):
+                continue
+            if resolved not in active_set:
+                active_paths.append(resolved)
+                active_set.add(resolved)
+        self._priority_paths = tuple(active_paths)
+        prioritized = active_paths[-self._max_files :]
+        missing = [path for path in prioritized if path not in self._index]
+        if missing:
+            self._include_active_files(missing)
 
         teleport_indices: list[int] = []
-        for path in active_files:
-            resolved = path.resolve()
-            if resolved in self._index:
-                teleport_indices.append(self._index[resolved])
+        for path in active_paths:
+            index = self._index.get(path)
+            if index is not None:
+                teleport_indices.append(index)
         if not teleport_indices:
             teleport_indices = list(range(len(self._files)))
 
-        scores = calculate_personalized_pagerank(
+        scores = _calculate_sparse_personalized_pagerank(
             self._adjacency,
             teleport_indices=teleport_indices,
             alpha=alpha,
@@ -791,8 +843,8 @@ class RepoMap:
             src_label = _dot_quote(str(src_path.relative_to(self.project_root)))
             if self._adjacency is None:
                 continue
-            for dep_idx in range(len(self._adjacency)):
-                if self._adjacency[dep_idx][src_idx] > 0:
+            for dep_idx, weight in self._adjacency.columns[src_idx]:
+                if weight > 0:
                     dep_path = self._files[dep_idx].path
                     dep_label = _dot_quote(str(dep_path.relative_to(self.project_root)))
                     lines.append(f"  {src_label} -> {dep_label};")
@@ -845,7 +897,22 @@ class RepoMap:
         )
         if cancel_event is not None and cancel_event.is_set():
             return
-        paths = [path for path in discovered if path not in ignored][: self._max_files]
+        eligible = [path for path in discovered if path not in ignored]
+        eligible_set = set(eligible)
+        prioritized = [
+            path
+            for path in self._priority_paths[-self._max_files :]
+            if path in eligible_set
+        ]
+        prioritized_set = set(prioritized)
+        paths = [
+            *prioritized,
+            *(
+                path
+                for path in eligible
+                if path not in prioritized_set
+            ),
+        ][: self._max_files]
         files: list[FileNode] = []
         module_index: dict[str, Path] = {}
         next_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
@@ -853,35 +920,10 @@ class RepoMap:
         for path in paths:
             if cancel_event is not None and cancel_event.is_set():
                 return
-            try:
-                resolved, metadata = stat_scoped_path(path, self._guard)
-            except (OSError, SafetyViolation):
+            loaded = self._load_file(path)
+            if loaded is None:
                 continue
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_size > MAX_SOURCE_FILE_BYTES
-            ):
-                continue
-            fingerprint = (metadata.st_mtime_ns, metadata.st_size)
-            cached = self._file_cache.get(resolved)
-            if cached is not None and cached[0] == fingerprint:
-                node = cached[1]
-            else:
-                try:
-                    _, source = read_scoped_bytes(
-                        resolved,
-                        self._guard,
-                        max_bytes=MAX_SOURCE_FILE_BYTES,
-                    )
-                except (OSError, SafetyViolation):
-                    continue
-                symbols = tuple(self._extractor.extract(resolved, source=source))
-                refs = _extract_references(symbols)
-                node = FileNode(
-                    path=resolved,
-                    symbols=symbols,
-                    referenced_modules=tuple(sorted(refs)),
-                )
+            resolved, fingerprint, node = loaded
             files.append(node)
             next_cache[resolved] = (fingerprint, node)
             module_name = _normalize_module_name(resolved, self.project_root)
@@ -897,11 +939,117 @@ class RepoMap:
         self._index = {node.path: i for i, node in enumerate(files)}
         self._adjacency = self._build_adjacency()
 
-    def _build_adjacency(self) -> list[list[float]]:
+    def _load_file(self, path: Path) -> tuple[Path, tuple[int, int], FileNode] | None:
+        try:
+            resolved, metadata = stat_scoped_path(path, self._guard)
+        except (OSError, SafetyViolation):
+            return None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > MAX_SOURCE_FILE_BYTES
+        ):
+            return None
+        fingerprint = (metadata.st_mtime_ns, metadata.st_size)
+        cached = self._file_cache.get(resolved)
+        if cached is not None and cached[0] == fingerprint:
+            return resolved, fingerprint, cached[1]
+        try:
+            _, source = read_scoped_bytes(
+                resolved,
+                self._guard,
+                max_bytes=MAX_SOURCE_FILE_BYTES,
+            )
+        except (OSError, SafetyViolation):
+            return None
+        symbols = tuple(self._extractor.extract(resolved, source=source))
+        refs = _extract_references(symbols)
+        node = FileNode(
+            path=resolved,
+            symbols=symbols,
+            referenced_modules=tuple(sorted(refs)),
+        )
+        return resolved, fingerprint, node
+
+    def _include_active_files(self, paths: Sequence[Path]) -> None:
+        if self._max_files <= 0:
+            return
+        candidates: list[Path] = []
+        for path in paths:
+            try:
+                resolved, metadata = stat_scoped_path(path, self._guard)
+                relative = resolved.relative_to(self.project_root)
+            except (OSError, SafetyViolation, ValueError):
+                continue
+            if (
+                relative.suffix.casefold() not in SOURCE_SUFFIXES
+                or len(relative.parts) - 1 > MAX_REPO_DISCOVERY_DEPTH
+                or any(
+                    part in DEFAULT_IGNORED_DIRS or part.startswith(".")
+                    for part in relative.parts[:-1]
+                )
+                or _matches_exclude_pattern(
+                    relative, self._exclude_patterns, is_dir=False
+                )
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > MAX_SOURCE_FILE_BYTES
+            ):
+                continue
+            candidates.append(resolved)
+
+        ignored = _git_ignored_files(
+            self.project_root,
+            candidates,
+            guard=self._guard,
+            expected_root_identity=self._project_root_identity,
+        )
+        loaded_files: dict[Path, tuple[tuple[int, int], FileNode]] = {}
+        for path in candidates:
+            if path in ignored:
+                continue
+            loaded = self._load_file(path)
+            if loaded is not None:
+                resolved, fingerprint, node = loaded
+                loaded_files[resolved] = (fingerprint, node)
+        if not loaded_files:
+            return
+
+        nodes_by_path = {node.path: node for node in self._files}
+        nodes_by_path.update(
+            {path: cached[1] for path, cached in loaded_files.items()}
+        )
+        active_nodes = [
+            nodes_by_path[path]
+            for path in self._priority_paths
+            if path in nodes_by_path
+        ][-self._max_files :]
+        active_paths = {node.path for node in active_nodes}
+        remaining = [node for node in self._files if node.path not in active_paths]
+        files = [*active_nodes, *remaining[: self._max_files - len(active_nodes)]]
+        if len(files) == len(self._files) and all(
+            left.path == right.path for left, right in zip(files, self._files)
+        ):
+            return
+
+        self._files = files
+        self._file_cache = {
+            node.path: (
+                loaded_files[node.path]
+                if node.path in loaded_files
+                else self._file_cache[node.path]
+            )
+            for node in files
+        }
+        self._module_index = {}
+        for node in files:
+            module_name = _normalize_module_name(node.path, self.project_root)
+            if module_name is not None:
+                self._module_index[module_name] = node.path
+        self._index = {node.path: i for i, node in enumerate(files)}
+        self._adjacency = self._build_adjacency()
+
+    def _build_adjacency(self) -> _SparseAdjacency:
         n = len(self._files)
-        matrix = [[0.0 for _ in range(n)] for _ in range(n)]
-        if n == 0:
-            return matrix
+        columns: list[dict[int, float]] = [{} for _ in range(n)]
 
         for i, node in enumerate(self._files):
             for ref in node.referenced_modules:
@@ -915,10 +1063,16 @@ class RepoMap:
                     continue
                 j = self._index.get(target.resolve())
                 if j is not None and j != i:
-                    # Columns are sources and rows are destinations so M @ v
-                    # follows an import edge from the importer to its dependency.
-                    matrix[j][i] += 1.0
-        return matrix
+                    column = columns[i]
+                    column[j] = column.get(j, 0.0) + 1.0
+
+        frozen_columns = tuple(
+            tuple(sorted(column.items())) for column in columns
+        )
+        return _SparseAdjacency(
+            columns=frozen_columns,
+            column_sums=tuple(sum(weight for _, weight in column) for column in frozen_columns),
+        )
 
 
 def calculate_personalized_pagerank(
@@ -948,10 +1102,43 @@ def calculate_personalized_pagerank(
     if not 0.0 <= alpha < 1.0:
         raise ValueError("alpha must be in the range [0, 1)")
 
-    column_sums = [
-        sum(float(adjacency_matrix[row][col]) for row in range(n)) for col in range(n)
-    ]
+    edge_columns: list[tuple[tuple[int, float], ...]] = []
+    sums: list[float] = []
+    for col in range(n):
+        edges: list[tuple[int, float]] = []
+        column_sum = 0.0
+        for row in range(n):
+            weight = float(adjacency_matrix[row][col])
+            column_sum += weight
+            if weight:
+                edges.append((row, weight))
+        edge_columns.append(tuple(edges))
+        sums.append(column_sum)
+    return _calculate_sparse_personalized_pagerank(
+        _SparseAdjacency(tuple(edge_columns), tuple(sums)),
+        teleport_indices=teleport_indices,
+        alpha=alpha,
+        max_iter=max_iter,
+        tol=tol,
+    )
 
+
+def _calculate_sparse_personalized_pagerank(
+    adjacency: _SparseAdjacency,
+    *,
+    teleport_indices: list[int],
+    alpha: float,
+    max_iter: int,
+    tol: float,
+) -> list[float]:
+    n = len(adjacency.columns)
+    if n == 0:
+        return []
+    if not 0.0 <= alpha < 1.0:
+        raise ValueError("alpha must be in the range [0, 1)")
+
+    columns = adjacency.columns
+    column_sums = adjacency.column_sums
     # Teleport vector.
     p = [0.0] * n
     if teleport_indices:
@@ -969,17 +1156,17 @@ def calculate_personalized_pagerank(
     v = list(p)
     for _ in range(max_iter):
         v_next = [(1.0 - alpha) * value for value in p]
-        for col, column_sum in enumerate(column_sums):
+        dangling_mass = sum(
+            v[col] for col, column_sum in enumerate(column_sums) if column_sum <= 0
+        )
+        if dangling_mass:
+            dangling_share = alpha * dangling_mass / n
+            v_next = [value + dangling_share for value in v_next]
+        for col, (edges, column_sum) in enumerate(zip(columns, column_sums)):
             if column_sum > 0:
                 scale = alpha * v[col] / column_sum
-                for row in range(n):
-                    weight = float(adjacency_matrix[row][col])
-                    if weight:
-                        v_next[row] += scale * weight
-            else:
-                dangling_share = alpha * v[col] / n
-                for row in range(n):
-                    v_next[row] += dangling_share
+                for row, weight in edges:
+                    v_next[row] += scale * weight
         if sum(abs(next_value - value) for next_value, value in zip(v_next, v)) < tol:
             return v_next
         v = v_next

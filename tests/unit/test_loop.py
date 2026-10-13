@@ -5,6 +5,7 @@ import os
 import shlex
 import sqlite3
 import sys
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -42,6 +43,7 @@ from ash.providers.base import ProviderABC, ProviderCompletionError, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.failover import FailoverProvider
 from ash.providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
+from ash.repo.repomap import RepoMap
 from ash.safety.grants import PermissionRule, RuleEffect
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionMode, PolicyAction
@@ -6224,6 +6226,79 @@ def test_repo_map_refresh_failure_stays_dirty_and_retries_next_prompt(tmp_path: 
     assert "fresh repo context" in second[0]["content"]
     assert repo_map.refresh_calls == 2
     assert loop._repo_map_dirty is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_repo_map_refresh_runs_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_map = RepoMap(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_refresh(*, cancel_event: threading.Event | None = None) -> None:
+        del cancel_event
+        started.set()
+        assert release.wait(timeout=2)
+
+    monkeypatch.setattr(repo_map, "_refresh", delayed_refresh)
+    loop = AshLoop(
+        SessionStore(tmp_path / "repo-refresh-async.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        repo_map=repo_map,
+    )
+    loop._repo_map_dirty = True
+    refresh_task = asyncio.create_task(loop._refresh_repo_map_before_prompt())
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        assert not refresh_task.done()
+    finally:
+        release.set()
+
+    assert await refresh_task is None
+    assert loop._repo_map_dirty is False
+
+
+@pytest.mark.asyncio
+async def test_async_repo_map_refresh_failure_is_reported_without_ranking(
+    tmp_path: Path,
+) -> None:
+    class FailingRepoMap:
+        ready = True
+
+        async def arefresh(self) -> None:
+            raise RuntimeError("temporary async refresh failure")
+
+        def refresh(self) -> None:
+            raise AssertionError("async refresh failure must not retry synchronously")
+
+        def rank(self, active):
+            raise AssertionError("stale map must not be ranked after refresh failure")
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "repo-refresh-failure-async.db"),
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        repo_map=FailingRepoMap(),
+    )
+    loop._repo_map_dirty = True
+    refresh_error = await loop._refresh_repo_map_before_prompt()
+    assert isinstance(refresh_error, RuntimeError)
+    assert loop._repo_map_dirty is True
+
+    session = await loop.start_session()
+    messages = loop._build_messages(
+        session, repo_map_refresh_error=refresh_error
+    )
+
+    assert "repo map unavailable: temporary async refresh failure" in messages[0][
+        "content"
+    ]
 
 
 def test_build_messages_does_not_wait_for_deferred_repo_map(tmp_path: Path) -> None:

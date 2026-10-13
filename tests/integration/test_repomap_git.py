@@ -256,7 +256,7 @@ def test_repo_map_prioritizes_successfully_read_file(
         safety_guard=safety_guard,
         ui=_make_ui(),
         project_root=workspace,
-        repo_map=RepoMap(workspace),
+        repo_map=RepoMap(workspace, max_files=5),
         tools={"read_file": ReadFileTool(safety_guard)},
     )
 
