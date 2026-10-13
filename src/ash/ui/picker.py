@@ -29,6 +29,11 @@ class PickerOption:
     state: str = ""
 
 
+@dataclass(frozen=True)
+class PickerInterrupted:
+    """Distinguish Ctrl-C from picker actions that return no selection."""
+
+
 class FilterPicker:
     """Full-screen incremental picker with one predictable keyboard grammar."""
 
@@ -87,7 +92,7 @@ class FilterPicker:
                 ),
             ]
         )
-        self.application: Application[str | None] = Application(
+        self.application: Application[str | None | PickerInterrupted] = Application(
             layout=Layout(root, focused_element=self.filter_buffer),
             key_bindings=self._key_bindings(),
             full_screen=True,
@@ -100,10 +105,10 @@ class FilterPicker:
             output=output,
         )
 
-    def run(self) -> str | None:
+    def run(self) -> str | None | PickerInterrupted:
         return self.application.run()
 
-    async def run_async(self) -> str | None:
+    async def run_async(self) -> str | None | PickerInterrupted:
         return await self.application.run_async()
 
     def set_options(self, options: Sequence[PickerOption]) -> None:
@@ -274,7 +279,7 @@ class FilterPicker:
 
         @bindings.add("c-c", eager=True)
         def cancel(event: Any) -> None:
-            event.app.exit(result=None)
+            event.app.exit(result=PickerInterrupted())
         return bindings
 
 

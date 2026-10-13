@@ -1194,6 +1194,58 @@ def test_model_catalog_rendering_and_shared_input_picker() -> None:
     )
 
 
+def test_model_picker_ctrl_c_does_not_switch_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from prompt_toolkit.input.defaults import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from ash.cli import _interactive_model_picker
+    from ash.config import AshConfig
+    from ash.ui.picker import FilterPicker
+
+    config = AshConfig(model="openai/gpt-6-astra")
+    output = []
+
+    class Prompt:
+        supports_full_screen_ui = True
+
+    async def no_live_models(_config) -> list[str]:
+        return []
+
+    def unexpected_switch(_model: str) -> None:
+        raise AssertionError("interrupted selection must not switch models")
+
+    monkeypatch.setattr("ash.cli._discover_live_model_catalog", no_live_models)
+
+    with create_pipe_input() as pipe:
+        class PipePicker(FilterPicker):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(
+                    *args,
+                    input=pipe,
+                    output=DummyOutput(),
+                    **kwargs,
+                )
+
+        monkeypatch.setattr("ash.ui.picker.FilterPicker", PipePicker)
+        pipe.send_bytes(b"\x03")
+        asyncio.run(
+            _interactive_model_picker(
+                config,
+                SimpleNamespace(switch_model=unexpected_switch),
+                Prompt(),
+                output.append,
+            )
+        )
+
+    assert config.model == "openai/gpt-6-astra"
+    assert output == []
+
+
 @pytest.mark.parametrize("choice", ["0", "-1", "999", "not-a-number"])
 def test_model_picker_rejects_invalid_numeric_choices(choice: str) -> None:
     import asyncio

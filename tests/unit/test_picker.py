@@ -6,7 +6,7 @@ from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.cells import cell_len
 
-from ash.ui.picker import FilterPicker, PickerOption
+from ash.ui.picker import FilterPicker, PickerInterrupted, PickerOption
 
 
 class SizedDummyOutput(DummyOutput):
@@ -65,6 +65,21 @@ async def test_filter_picker_escape_clears_filter_before_closing() -> None:
 
         pipe.send_bytes(b"\x1b")
         assert await pending is None
+
+
+@pytest.mark.asyncio
+async def test_filter_picker_ctrl_c_returns_interrupted_marker() -> None:
+    with create_pipe_input() as pipe:
+        picker = FilterPicker(
+            "Provider",
+            [PickerOption("openai", "OpenAI")],
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pending = asyncio.create_task(picker.run_async())
+        pipe.send_bytes(b"\x03")
+
+        assert await pending == PickerInterrupted()
 
 
 def test_filter_picker_starts_on_current_value() -> None:

@@ -182,9 +182,9 @@ def _run_setup_picker(
     *,
     current_value: str | None = None,
 ) -> str | None:
-    from ash.ui.picker import FilterPicker, PickerOption
+    from ash.ui.picker import FilterPicker, PickerInterrupted, PickerOption
 
-    return FilterPicker(
+    selected = FilterPicker(
         title,
         [
             PickerOption(
@@ -199,6 +199,9 @@ def _run_setup_picker(
         current_value=current_value,
         no_color=_env_truthy("NO_COLOR") or _env_truthy("ASH_NO_COLOR"),
     ).run()
+    if isinstance(selected, PickerInterrupted):
+        raise SetupCancelled
+    return selected
 
 
 def _setup_status_text(label: str) -> Text:

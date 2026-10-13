@@ -611,7 +611,7 @@ async def _interactive_model_picker(
 
     use_overlay = bool(getattr(prompt_input, "supports_full_screen_ui", False))
     if use_overlay:
-        from ash.ui.picker import FilterPicker, PickerOption
+        from ash.ui.picker import FilterPicker, PickerInterrupted, PickerOption
 
         def picker_options(models: list[str]) -> list[PickerOption]:
             return [
@@ -670,7 +670,7 @@ async def _interactive_model_picker(
                     await refresh_task
                 except asyncio.CancelledError:
                     pass
-        if model_str is None:
+        if model_str is None or isinstance(model_str, PickerInterrupted):
             return
     else:
         lines = [f"Available {active_provider} models:"]

@@ -265,3 +265,62 @@ def test_first_run_trust_prompt_escapes_workspace_path_controls(tmp_path: Path) 
         assert process.returncode == 0
     finally:
         _stop_pty_cli(master, process)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_first_run_local_provider_picker_ctrl_c_cancels_setup(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    environment = _terminal_environment(home, workspace, model=None)
+    environment["TERM"] = "xterm-256color"
+    environment.pop("ASH_SCREEN_READER_MODE", None)
+    master, process = _open_pty_cli(
+        workspace,
+        environment,
+        rows=18,
+        columns=52,
+    )
+    captured = bytearray()
+
+    try:
+        _read_until(master, process, captured, b"? [y/N] ")
+        os.write(master, b"y\r")
+        _read_until(master, process, captured, b"Press Enter to run setup")
+        os.write(master, b"\r")
+        _read_until(
+            master,
+            process,
+            captured,
+            b"How do you want to connect Ash?",
+        )
+        os.write(master, b"Local runtimes\r")
+        _read_until(
+            master,
+            process,
+            captured,
+            b"Choose an inference provider",
+        )
+        assert b"Ctrl-C cancel" in captured
+        os.write(master, b"\x03")
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pytest.fail("Ctrl-C returned to setup instead of canceling the wizard")
+
+        while select.select([master], [], [], 0)[0]:
+            try:
+                chunk = os.read(master, 65_536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            captured.extend(chunk)
+
+        assert process.returncode == 1
+        assert b"Setup cancelled." in captured
+    finally:
+        _stop_pty_cli(master, process)
