@@ -111,6 +111,14 @@ this **v18 backup** while 0.4.0 is still installed, then install the immutable
 0.3.1 package. Changes made only after the v19 migration are not present in
 that earlier backup; export or preserve newer work separately before restoring.
 
+For **0.4.2 → 0.4.3**, the session schema advances from v19 to v20 to retain
+archived remote MCP task handles. Ash creates a
+`sessions.db.before-v20-migration.<timestamp>.backup` before migrating an
+existing database. If you must roll back to 0.4.2, preserve newer work
+separately, restore this v19 backup while still running 0.4.3, then install
+the immutable 0.4.2 package. Do not start 0.4.3 against that database again
+before reinstalling 0.4.2, or it will migrate the schema forward.
+
 ## Reset selected default-profile state
 
 Ash reset is deliberately selective:
