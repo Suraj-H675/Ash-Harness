@@ -312,17 +312,19 @@ def test_first_run_local_provider_picker_ctrl_c_cancels_setup(
         _read_until(master, process, captured, b"No matches for 'zzq9'")
         assert b"No matches for 'zzq9'" in captured[filter_start:]
         os.write(master, b"\x03")
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pytest.fail("Ctrl-C returned to setup instead of canceling the wizard")
-
-        # A process exit can precede the PTY's final readable/EOF notification.
-        drain_deadline = time.monotonic() + 1
-        while time.monotonic() < drain_deadline:
-            remaining = drain_deadline - time.monotonic()
-            if not select.select([master], [], [], min(0.1, remaining))[0]:
-                continue
+        # On macOS, PTY output can be lost when the last slave closes.
+        # Drain while the process is shutting down, not after it exits.
+        deadline = time.monotonic() + 5
+        while process.poll() is None and time.monotonic() < deadline:
+            if select.select([master], [], [], 0.02)[0]:
+                try:
+                    chunk = os.read(master, 65_536)
+                except OSError:
+                    break
+                if chunk:
+                    captured.extend(chunk)
+        assert process.poll() is not None, "Ctrl-C did not exit setup"
+        while select.select([master], [], [], 0)[0]:
             try:
                 chunk = os.read(master, 65_536)
             except OSError:
