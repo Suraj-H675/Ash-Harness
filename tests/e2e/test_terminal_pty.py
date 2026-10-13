@@ -5,7 +5,6 @@ import os
 import pty
 import re
 import select
-import signal
 import shutil
 import subprocess
 import sys
@@ -1097,12 +1096,8 @@ def test_resume_and_clear_replace_the_active_conversation_view(tmp_path: Path) -
         os.write(master_fd, b"/status\r")
         status_marker = f"Session: {new_session_id}".encode()
         expect(status_marker, after=status_start)
-        # Status output may precede the next input read, or the enabled
-        # composer may already be drawn. Force a fresh TTY redraw and wait
-        # for its ready state before sending the next command.
-        ready_start = len(captured)
-        os.kill(process.pid, signal.SIGWINCH)
-        expect("›".encode(), after=ready_start)
+        # Status text can render before the next input read. Confirm that
+        # the composer processed a fresh command before submitting Enter.
         exit_start = len(captured)
         os.write(master_fd, b"/exit")
         expect(b"/exit", after=exit_start)

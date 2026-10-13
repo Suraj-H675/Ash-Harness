@@ -67,7 +67,6 @@ def _open_pty_cli(
     *,
     rows: int = 24,
     columns: int = 80,
-    stderr_fd: int | None = None,
 ) -> tuple[int, subprocess.Popen[bytes]]:
     import fcntl
     import pty
@@ -85,7 +84,7 @@ def _open_pty_cli(
         env=environment,
         stdin=slave,
         stdout=slave,
-        stderr=stderr_fd if stderr_fd is not None else slave,
+        stderr=slave,
         close_fds=True,
     )
     os.close(slave)
@@ -272,8 +271,6 @@ def test_first_run_trust_prompt_escapes_workspace_path_controls(tmp_path: Path) 
 def test_first_run_local_provider_picker_ctrl_c_cancels_setup(
     tmp_path: Path,
 ) -> None:
-    import pty
-
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
     home.mkdir()
@@ -281,73 +278,60 @@ def test_first_run_local_provider_picker_ctrl_c_cancels_setup(
     environment = _terminal_environment(home, workspace, model=None)
     environment["TERM"] = "xterm-256color"
     environment.pop("ASH_SCREEN_READER_MODE", None)
-    # Python's interactive input prompt writes to stderr. Keep it a TTY while
-    # capturing cancellation diagnostics independently of the picker redraw.
-    error_master, error_slave = pty.openpty()
-    try:
-        master, process = _open_pty_cli(
-            workspace,
-            environment,
-            rows=18,
-            columns=52,
-            stderr_fd=error_slave,
-        )
-    finally:
-        os.close(error_slave)
+    master, process = _open_pty_cli(
+        workspace,
+        environment,
+        rows=18,
+        columns=52,
+    )
     captured = bytearray()
-    errors = bytearray()
-
-    def collect(fd: int) -> bool:
-        try:
-            chunk = os.read(fd, 65_536)
-        except OSError:
-            return False
-        if not chunk:
-            return False
-        captured.extend(chunk)
-        if fd == error_master:
-            errors.extend(chunk)
-        return True
-
-    def expect(marker: bytes) -> None:
-        deadline = time.monotonic() + 20
-        while (
-            marker not in captured
-            and process.poll() is None
-            and time.monotonic() < deadline
-        ):
-            for fd in select.select([master, error_master], [], [], 0.05)[0]:
-                collect(fd)
-        assert marker in captured, (
-            f"Ash did not show {marker!r}; exit={process.poll()}; "
-            f"output={bytes(captured[-3000:])!r}"
-        )
 
     try:
-        expect(b"? [y/N] ")
+        _read_until(master, process, captured, b"? [y/N] ")
         os.write(master, b"y\r")
-        expect(b"Press Enter to run setup")
+        _read_until(master, process, captured, b"Press Enter to run setup")
         os.write(master, b"\r")
-        expect(b"How do you want to connect Ash?")
+        _read_until(
+            master,
+            process,
+            captured,
+            b"How do you want to connect Ash?",
+        )
         os.write(master, b"Local runtimes\r")
-        expect(b"Choose an inference provider")
+        _read_until(
+            master,
+            process,
+            captured,
+            b"Choose an inference provider",
+        )
         assert b"Ctrl-C cancel" in captured
+        # The title alone does not prove that the picker accepts input.
+        # Check a filter update before testing Ctrl-C cancellation.
+        filter_start = len(captured)
+        os.write(master, b"zzq9")
+        _read_until(master, process, captured, b"No matches for 'zzq9'")
+        assert b"No matches for 'zzq9'" in captured[filter_start:]
         os.write(master, b"\x03")
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pytest.fail("Ctrl-C returned to setup instead of canceling the wizard")
 
-        remaining_fds = {master, error_master}
-        deadline = time.monotonic() + 1
-        while remaining_fds and time.monotonic() < deadline:
-            ready = select.select(list(remaining_fds), [], [], 0.1)[0]
-            for fd in ready:
-                if not collect(fd):
-                    remaining_fds.remove(fd)
+        # A process exit can precede the PTY's final readable/EOF notification.
+        drain_deadline = time.monotonic() + 1
+        while time.monotonic() < drain_deadline:
+            remaining = drain_deadline - time.monotonic()
+            if not select.select([master], [], [], min(0.1, remaining))[0]:
+                continue
+            try:
+                chunk = os.read(master, 65_536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            captured.extend(chunk)
 
         assert process.returncode == 1
-        assert b"Setup cancelled." in errors
+        assert b"Setup cancelled." in captured
     finally:
         _stop_pty_cli(master, process)
-        os.close(error_master)
