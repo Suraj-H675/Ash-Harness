@@ -946,11 +946,11 @@ def _openai_chunk(
     return SimpleNamespace(choices=choices, usage=usage)
 
 
-def _openai_tool_chunk(arguments: str) -> Any:
+def _openai_tool_chunk(arguments: str, *, name: str = "read_file") -> Any:
     tool_call = SimpleNamespace(
         index=0,
         id="call-1",
-        function=SimpleNamespace(name="read_file", arguments=arguments),
+        function=SimpleNamespace(name=name, arguments=arguments),
     )
     return SimpleNamespace(
         choices=[
@@ -1974,9 +1974,107 @@ async def test_openai_compatible_providers_handle_usage_only_terminal_chunk(
     assert chunks[-1].prompt_tokens == 1200
     assert chunks[-1].completion_tokens == 10
     assert chunks[-1].usage_source == "provider"
+    assert [chunk.stop_reason for chunk in chunks if chunk.stop_reason] == ["stop"]
 
     await provider.aclose()
     assert client.closed is True
+
+
+@pytest.mark.parametrize("provider_name", ["deepseek", "groq"])
+@pytest.mark.asyncio
+async def test_openai_compatible_usage_chunk_before_choice_terminal_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_name: str,
+) -> None:
+    from ash.providers.base import ProviderIncompleteStreamError
+    from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.groq import GroqProvider
+
+    usage = SimpleNamespace(prompt_tokens=1200, completion_tokens=10)
+    client = _FakeOpenAIClient(
+        [
+            _openai_tool_chunk(
+                '{"file_path":"stream-repro.txt","content":"unexpected write"}',
+                name="write_file",
+            ),
+            _openai_chunk(usage=usage),
+        ]
+    )
+    if provider_name == "deepseek":
+        monkeypatch.setattr(
+            "ash.providers.deepseek.openai.AsyncOpenAI", lambda **_: client
+        )
+        provider = DeepSeekProvider("test", "key")
+    else:
+        monkeypatch.setattr("ash.providers.groq.openai.AsyncOpenAI", lambda **_: client)
+        provider = GroqProvider("test", "key")
+
+    chunks: list[StreamChunk] = []
+    with pytest.raises(ProviderIncompleteStreamError):
+        async for chunk in provider.stream_chat([]):
+            chunks.append(chunk)
+
+    assert not any(chunk.native_tool_calls for chunk in chunks)
+    assert not any(chunk.is_done for chunk in chunks)
+    assert client.completions.last_stream is not None
+    assert client.completions.last_stream.closed == 1
+
+
+@pytest.mark.parametrize("provider_name", ["deepseek", "groq"])
+@pytest.mark.asyncio
+async def test_openai_compatible_stream_errors_redact_credentials_and_keep_status(
+    provider_name: str,
+) -> None:
+    from ash.providers.deepseek import DeepSeekProvider
+    from ash.providers.groq import GroqProvider
+    from ash.providers.retry import classify_provider_failure
+
+    api_key = f"{provider_name}-stream-dummy-key"
+
+    class FaultyStream:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def __aiter__(self):
+            async def generate():
+                yield _openai_chunk(content="partial")
+                error = RuntimeError(f"stream rejected credential {api_key}")
+                error.status_code = 429
+                raise error
+
+            return generate()
+
+        async def aclose(self) -> None:
+            self.closed += 1
+
+    stream = FaultyStream()
+
+    class Completions:
+        async def create(self, **_kwargs: Any) -> FaultyStream:
+            return stream
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions()),
+    )
+    provider = (
+        DeepSeekProvider("test", api_key)
+        if provider_name == "deepseek"
+        else GroqProvider("test", api_key)
+    )
+    provider._client = client
+
+    chunks: list[StreamChunk] = []
+    with pytest.raises(RuntimeError) as raised:
+        async for chunk in provider.stream_chat([]):
+            chunks.append(chunk)
+
+    assert [chunk.content for chunk in chunks] == ["partial"]
+    assert api_key not in str(raised.value)
+    assert "[REDACTED]" in str(raised.value)
+    failure = classify_provider_failure(raised.value)
+    assert failure.status_code == 429
+    assert failure.retriable is True
+    assert stream.closed == 1
 
 
 @pytest.mark.asyncio

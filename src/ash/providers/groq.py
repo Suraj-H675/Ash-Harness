@@ -14,6 +14,7 @@ import openai  # type: ignore[import-not-found]
 from ash.context.tokens import AnthropicTokenCounter
 from ash.providers.base import (
     ProviderABC,
+    ProviderIncompleteStreamError,
     StreamChunk,
     TokenCounterLike,
     managed_async_stream,
@@ -22,6 +23,7 @@ from ash.providers.capabilities import ProviderCapabilities, groq_capabilities
 from ash.providers.messages import CanonicalToolCall, MessageInput
 from ash.providers.openai import (
     _owned_openai_http_client,
+    _redact_openai_compatible_stream_errors,
     account_openai_compatible_stream_bytes,
     openai_compatible_cache_read_tokens,
     openai_compatible_reasoning_delta,
@@ -147,15 +149,19 @@ class GroqProvider(ProviderABC):
         completed: list[CanonicalToolCall] = []
         stream_bytes = 0
         reasoning_parts: list[str] = []
+        saw_terminal_choice = False
 
-        async with managed_async_stream(stream, label='Groq') as managed_stream:
+        async with (
+            _redact_openai_compatible_stream_errors("Groq", self._api_key),
+            managed_async_stream(stream, label='Groq') as managed_stream,
+        ):
             async for chunk in managed_stream:
                     choices = getattr(chunk, "choices", None) or []
                     usage = getattr(chunk, "usage", None)
                     if not choices:
                         if usage is not None:
                             yield StreamChunk(
-                                is_done=True,
+                                is_done=saw_terminal_choice,
                                 model=self._model_name,
                                 prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
                                 completion_tokens=(
@@ -181,6 +187,7 @@ class GroqProvider(ProviderABC):
                         )
                         reasoning_parts.append(reasoning_delta)
                     is_done = choice.finish_reason is not None
+                    saw_terminal_choice = saw_terminal_choice or is_done
                     prompt_tokens = 0
                     completion_tokens = 0
                     cache_read_tokens = 0
@@ -242,6 +249,10 @@ class GroqProvider(ProviderABC):
                     completed.clear()
                     if is_done:
                         reasoning_parts.clear()
+            if not saw_terminal_choice:
+                raise ProviderIncompleteStreamError(
+                    "Groq stream ended without a choice finish_reason"
+                )
 
     async def aclose(self) -> None:
         client = self._client

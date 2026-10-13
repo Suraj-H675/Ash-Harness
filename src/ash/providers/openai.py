@@ -28,6 +28,22 @@ from ash.providers.readiness import (
 MAX_OPENAI_COMPATIBLE_STREAM_BYTES = 16 * 1024 * 1024
 
 
+@asynccontextmanager
+async def _redact_openai_compatible_stream_errors(
+    provider: str,
+    api_key: str,
+) -> AsyncGenerator[None, None]:
+    """Remove configured credentials from errors raised while consuming a stream."""
+
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001 - SDK stream errors may expose credentials
+        detail = redact_provider_error(str(exc), api_key)
+        if detail == str(exc):
+            raise
+        raise RuntimeError(f"{provider} API stream error: {detail}") from None
+
+
 def account_openai_compatible_stream_bytes(
     total: int,
     value: str,

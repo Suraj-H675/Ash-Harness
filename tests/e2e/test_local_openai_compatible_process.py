@@ -635,6 +635,311 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
         thread.join(timeout=2)
 
 
+_BUILTIN_OPENAI_COMPATIBLE_ROUTES = [
+    ("deepseek", "DEEPSEEK_API_BASE", "DEEPSEEK_API_KEY"),
+    ("groq", "GROQ_API_BASE", "GROQ_API_KEY"),
+]
+
+
+def _builtin_provider_environment(
+    home: Path,
+    route: str,
+    base_variable: str,
+    key_variable: str,
+    endpoint: str,
+) -> dict[str, str]:
+    environment = {
+        "PATH": os.defpath,
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "NO_COLOR": "1",
+        "ASH_MODEL": f"{route}/future-model",
+        base_variable: endpoint,
+        key_variable: f"{route}-local-dummy-key",
+    }
+    _route_loopback_directly(environment)
+    return environment
+
+
+@pytest.mark.parametrize(
+    ("route", "base_variable", "key_variable"),
+    _BUILTIN_OPENAI_COMPATIBLE_ROUTES,
+)
+def test_builtin_provider_incomplete_xml_stream_does_not_write_file(
+    tmp_path: Path,
+    route: str,
+    base_variable: str,
+    key_variable: str,
+) -> None:
+    requests: list[dict[str, object]] = []
+    xml_tool_call = (
+        '<call_tool name="write_file"><arg name="file_path">stream-repro.txt'
+        "</arg><arg name=\"content\">unexpected write</arg></call_tool>"
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+        def _json(self, payload: object) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            self._json(
+                {
+                    "id": "future-model",
+                    "active": True,
+                    "context_window": 32768,
+                    "max_completion_tokens": 1024,
+                }
+            )
+
+        def do_POST(self) -> None:
+            if self.path != "/v1/chat/completions":
+                self.send_error(404)
+                return
+            request = json.loads(
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            )
+            requests.append(request)
+            if len(requests) == 1:
+                chunks = [
+                    {
+                        "id": "incomplete",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "future-model",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": xml_tool_call},
+                                "finish_reason": None,
+                            }
+                        ],
+                    },
+                    {
+                        "id": "incomplete",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "future-model",
+                        "choices": [],
+                        "usage": {"prompt_tokens": 12, "completion_tokens": 8},
+                    },
+                ]
+            else:
+                chunks = [
+                    {
+                        "id": "complete",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "future-model",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "done"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ]
+            body = "".join(
+                "data: " + json.dumps(chunk, separators=(",", ":")) + "\n\n"
+                for chunk in chunks
+            )
+            body += "data: [DONE]\n\n"
+            encoded = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        workspace = tmp_path / "workspace"
+        home = tmp_path / "home"
+        workspace.mkdir()
+        home.mkdir()
+        git_environment = os.environ.copy()
+        git_environment["PATH"] = os.defpath
+        subprocess.run(
+            ["git", "init", "-q"],
+            cwd=workspace,
+            env=git_environment,
+            check=True,
+        )
+        environment = _builtin_provider_environment(
+            home,
+            route,
+            base_variable,
+            key_variable,
+            f"http://127.0.0.1:{server.server_port}/v1",
+        )
+        trust = subprocess.run(
+            [sys.executable, "-m", "ash", "trust", "add", str(workspace)],
+            cwd=workspace,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        assert trust.returncode == 0, trust.stderr
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ash",
+                "--db-directory",
+                str(tmp_path / "db"),
+                "--mode",
+                "auto_edit",
+                "-p",
+                "Create stream-repro.txt using the write_file tool.",
+                "--output-format",
+                "json",
+            ],
+            cwd=workspace,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+        assert result.returncode != 0, result.stdout
+        payload = json.loads(result.stdout)
+        assert "finish_reason" in payload["error"]["message"]
+        assert len(requests) == 1
+        assert not (workspace / "stream-repro.txt").exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("route", "base_variable", "key_variable"),
+    _BUILTIN_OPENAI_COMPATIBLE_ROUTES,
+)
+def test_builtin_provider_stream_error_redacts_key_in_cli_json(
+    tmp_path: Path,
+    route: str,
+    base_variable: str,
+    key_variable: str,
+) -> None:
+    api_key = f"{route}-local-dummy-key"
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+        def _json(self, payload: object) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            self._json(
+                {
+                    "id": "future-model",
+                    "active": True,
+                    "context_window": 32768,
+                    "max_completion_tokens": 1024,
+                }
+            )
+
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            events = [
+                {
+                    "id": "partial",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "future-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "partial"},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {"error": {"message": f"Stream rejected credential {api_key}"}},
+            ]
+            body = "".join(
+                "data: " + json.dumps(event, separators=(",", ":")) + "\n\n"
+                for event in events
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        workspace = tmp_path / "workspace"
+        home = tmp_path / "home"
+        workspace.mkdir()
+        home.mkdir()
+        environment = _builtin_provider_environment(
+            home,
+            route,
+            base_variable,
+            key_variable,
+            f"http://127.0.0.1:{server.server_port}/v1",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ash",
+                "--db-directory",
+                str(tmp_path / "db"),
+                "--mode",
+                "auto_edit",
+                "-p",
+                "Respond briefly.",
+                "--output-format",
+                "json",
+            ],
+            cwd=workspace,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        payload = json.loads(result.stdout)
+        assert api_key not in result.stdout + result.stderr
+        assert "[REDACTED]" in payload["error"]["message"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_ollama_fresh_process_completes_native_file_edit_tool_turn(
     tmp_path: Path,
 ) -> None:
