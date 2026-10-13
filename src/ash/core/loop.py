@@ -854,6 +854,8 @@ SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness. Yo
 3. CONTEXT INTEGRITY: Maintain existing documentation and codebase styles. Do not remove comments unless explicitly told to.
 
 {tool_protocol}
+
+{tool_discovery}
 """
 
 NATIVE_TOOL_PROTOCOL = """### Tool Call Format
@@ -887,11 +889,23 @@ def _default_system_prompt(
     project_root: Path,
     *,
     native_tools: bool,
+    search_tools: bool = False,
 ) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(
         project_path=str(project_root),
         os_platform=_detect_platform(),
         tool_protocol=(NATIVE_TOOL_PROTOCOL if native_tools else XML_TOOL_PROTOCOL),
+        tool_discovery=(
+            "### Tool Discovery\n"
+            "Search only for concrete tool actions missing from the currently "
+            "available tools. For planning or advice that needs no tool, respond "
+            "directly. Call search_tools with a concise natural-language query for "
+            "the action and object. Its matching schemas become available on the "
+            "next provider iteration; use the returned tool name and schema. "
+            "Discovery does not grant permission or override Ash safety checks."
+            if search_tools
+            else ""
+        ),
     )
 
 
@@ -1351,6 +1365,7 @@ class AshLoop:
         self._core_system_prompt = system_prompt or _default_system_prompt(
             project_root,
             native_tools=_provider_capabilities(provider).native_tools,
+            search_tools="search_tools" in self.tools,
         )
         self._base_system_prompt = self._compose_base_system_prompt()
         self.system_prompt = self._base_system_prompt

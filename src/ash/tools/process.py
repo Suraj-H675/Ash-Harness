@@ -160,7 +160,11 @@ class BackgroundProcessArgs(BaseModel):
 
 class BackgroundProcessTool(BaseTool):
     name = "background_process"
-    description = "Start, list, poll, write to, or stop a managed background process."
+    description = (
+        "Start a development server or run tests and other commands in the "
+        "background, keep them running, and poll status or output to check "
+        "progress; send input or stop the process."
+    )
     args_schema = BackgroundProcessArgs
 
     def __init__(

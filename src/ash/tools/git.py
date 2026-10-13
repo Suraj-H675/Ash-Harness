@@ -114,7 +114,10 @@ class GitStatusTool(BaseTool):
 class GitDiffTool(BaseTool):
     name = "git_diff"
     execution_contract = ToolExecutionContract(parallel_safe=True)
-    description = "Show a unified Git diff for the workspace or one path."
+    description = (
+        "Show a unified Git diff or patch for the workspace or one path to "
+        "review staged or unstaged code changes."
+    )
     args_schema = GitDiffArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:

@@ -235,6 +235,59 @@ class SearchFlowProvider(ProviderABC):
             yield StreamChunk(content="tool search complete", is_done=True)
 
 
+class ScriptedDiscoveryProvider(ProviderABC):
+    model_name = "intent-discovery"
+
+    def __init__(
+        self,
+        query: str,
+        expected_tool: str | None,
+        context_window: int,
+    ) -> None:
+        self.query = query
+        self.expected_tool = expected_tool
+        self._ash_declared_capabilities = ProviderCapabilities(
+            native_tools=True,
+            context_window=context_window,
+            max_input_tokens=context_window - 1_024,
+            max_output_tokens=1_024,
+        )
+        self.calls = 0
+        self.tool_names: list[set[str]] = []
+        self.tool_schemas: list[dict[str, dict[str, Any]]] = []
+        self.initial_system_prompt = ""
+
+    def count_tokens(self, text: str) -> int:
+        return max(1, len(text) // 4)
+
+    async def stream_chat(self, messages, temperature=0.0, tools=None):
+        self.calls += 1
+        names = {item["function"]["name"] for item in (tools or [])}
+        self.tool_names.append(names)
+        self.tool_schemas.append(
+            {
+                item["function"]["name"]: item["function"]["parameters"]
+                for item in (tools or [])
+            }
+        )
+        if self.calls == 1:
+            self.initial_system_prompt = messages[0]["content"]
+            yield StreamChunk(
+                native_tool_calls=[
+                    {
+                        "id": "discover-intent",
+                        "name": "search_tools",
+                        "arguments": {"query": self.query},
+                    }
+                ],
+                is_done=True,
+            )
+        else:
+            if self.expected_tool is not None:
+                assert self.expected_tool in names
+            yield StreamChunk(content="discovery complete", is_done=True)
+
+
 @pytest.mark.asyncio
 async def test_context_provenance_reports_frozen_visible_tool_selection(
     tmp_path,
@@ -390,4 +443,139 @@ async def test_iteration_tool_snapshot_survives_live_catalog_removal(tmp_path) -
 
     assert results[0]["success"] is True
     assert results[0]["output"] == "ran dynamic_tool: still valid"
+    await loop.aclose()
+
+
+@pytest.mark.parametrize(
+    ("intent", "query", "expected_tool", "context_window"),
+    [
+        (
+            "Hand this focused coding subtask to another agent to work in parallel.",
+            "hand this focused coding subtask to another agent to work in parallel",
+            "delegate_agents",
+            8_192,
+        ),
+        (
+            "Apply several exact replacements to one file atomically.",
+            "apply several exact replacements to one file atomically",
+            "replace_file_edits",
+            8_192,
+        ),
+        (
+            "Fill out a browser form.",
+            "fill out a browser form",
+            "browser_type",
+            4_096,
+        ),
+        (
+            "Review my staged and unstaged code changes.",
+            "review my staged and unstaged code changes",
+            "git_diff",
+            4_096,
+        ),
+        (
+            "Run pytest and leave it running so I can check progress.",
+            "run pytest and leave it running so I can check progress",
+            "background_process",
+            4_096,
+        ),
+        (
+            "Start a server and keep it running while I edit code.",
+            "start server",
+            "background_process",
+            4_096,
+        ),
+        (
+            "Show the current Git patch.",
+            "get git patch",
+            "git_diff",
+            4_096,
+        ),
+        (
+            "Show me a plan before making changes.",
+            "show me a plan before making changes",
+            None,
+            4_096,
+        ),
+        ("Undo my last change.", "undo my last change", None, 4_096),
+        (
+            "Find a connected MCP action to create an issue.",
+            "find a connected MCP action to create an issue",
+            None,
+            4_096,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_default_runtime_discovers_tools_for_natural_language_intents(
+    tmp_path,
+    monkeypatch,
+    intent: str,
+    query: str,
+    expected_tool: str | None,
+    context_window: int,
+) -> None:
+    from ash.runtime import build_tools
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    config = AshConfig(
+        model="local/intent-discovery",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        max_context_tokens=16_384,
+        max_completion_tokens=1_024,
+        memory_backend="off",
+        tool_search_threshold=32,
+    )
+    guard = SafetyGuard(tmp_path)
+
+    def unexpected_provider_factory(*_args, **_kwargs):
+        raise AssertionError("discovery evaluation does not call provider tools")
+
+    catalog = build_tools(
+        guard,
+        tmp_path,
+        runtime_config=config,
+        provider_factory=unexpected_provider_factory,
+        agent_db_path=tmp_path / "agents.db",
+    )
+    provider = ScriptedDiscoveryProvider(query, expected_tool, context_window)
+    loop = AshLoop(
+        SessionStore(tmp_path / "intent-discovery.db"),
+        provider,
+        guard,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path,
+        tools=catalog,
+        config=config,
+    )
+
+    assert len(catalog) > config.tool_search_threshold
+    initial_payload = loop._tool_schema_payload()
+    initial_names = {item["function"]["name"] for item in initial_payload}
+    assert initial_names == {*ESSENTIAL_TOOL_NAMES, "search_tools"}
+
+    await loop.start_session()
+    response = await loop.run_turn(intent)
+
+    assert response == "discovery complete"
+    assert provider.tool_names[0] == initial_names
+    assert (
+        provider.tool_schemas[0]["search_tools"]
+        == catalog["search_tools"].json_schema()
+    )
+    if expected_tool is None:
+        assert provider.tool_names[1] == initial_names
+        assert not catalog["search_tools"].activated_names
+    else:
+        assert expected_tool in provider.tool_names[1]
+        assert expected_tool in catalog["search_tools"].activated_names
+        assert (
+            provider.tool_schemas[1][expected_tool]
+            == catalog[expected_tool].json_schema()
+        )
+    assert "search_tools" in provider.initial_system_prompt
+    assert "next provider iteration" in provider.initial_system_prompt.casefold()
+    assert "concrete tool actions" in provider.initial_system_prompt.casefold()
     await loop.aclose()

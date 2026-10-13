@@ -36,6 +36,21 @@ MAX_TOOL_SEARCH_EXACT_SCHEMA_BYTES = 8 * 1024
 MAX_TOOL_SEARCH_DESCRIPTION_CHARS = 2_048
 MAX_TOOL_SEARCH_SUMMARY_FIELDS = 32
 MAX_TOOL_SEARCH_SUMMARY_FIELD_CHARS = 128
+_SEARCH_WORD_PATTERN = re.compile(r"[a-z0-9]+")
+_SEARCH_STOP_WORDS = frozenset(
+    """
+    a an and are as at be by can could did do does for from had has have how i in
+    into is it its me my of on or our out please so that the their them then
+    show there these they this those to up use we were what when where which who
+    will with would you your action actions tool tools
+    """.split()
+)
+_NAME_MATCH_SCORE = 100
+_DESCRIPTION_MATCH_SCORE = 30
+_SCHEMA_MATCH_SCORE = 10
+_EXACT_NAME_MATCH_BOOST = 1_000
+_PREFIX_NAME_MATCH_BOOST = 500
+_MIN_QUERY_MATCH_TERMS = 2
 
 
 class SearchToolsArgs(BaseModel):
@@ -146,36 +161,57 @@ def _rank_tools(
     limit: int,
 ) -> list[tuple[str, BaseTool, int]]:
     normalized = query.strip().casefold()
-    terms = tuple(dict.fromkeys(re.findall(r"[a-z0-9_]+", normalized)))
+    terms = tuple(
+        dict.fromkeys(
+            term
+            for term in _SEARCH_WORD_PATTERN.findall(normalized)
+            if term not in _SEARCH_STOP_WORDS
+        )
+    )
+    normalized_name_query = re.sub(r"\s+", "_", normalized)
     ranked: list[tuple[str, BaseTool, int]] = []
     for name, tool in catalog.items():
         if name == SearchToolsTool.name:
             continue
         normalized_name = name.casefold()
+        name_words = _search_words(name)
         description = str(getattr(tool, "description", ""))[
             :MAX_TOOL_SEARCH_DESCRIPTION_CHARS
         ].casefold()
-        schema = _bounded_schema_search_text(tool.search_schema())
+        description_words = _search_words(description)
+        schema_words = _search_words(_bounded_schema_search_text(tool.search_schema()))
         score = 0
-        if normalized_name == normalized:
-            score += 1000
-        elif normalized_name.startswith(normalized):
-            score += 500
-        elif normalized in normalized_name:
-            score += 300
+        matched_terms = 0
         for term in terms:
-            if term == normalized_name:
-                score += 200
-            elif term in normalized_name:
-                score += 80
-            if term in description:
-                score += 30
-            if term in schema:
-                score += 10
-        if score:
+            if term in name_words:
+                score += _NAME_MATCH_SCORE
+                matched_terms += 1
+            elif term in description_words:
+                score += _DESCRIPTION_MATCH_SCORE
+                matched_terms += 1
+            elif term in schema_words:
+                score += _SCHEMA_MATCH_SCORE
+                matched_terms += 1
+        exact_name_query = normalized_name == normalized_name_query
+        name_prefix_query = bool(normalized_name_query) and normalized_name.startswith(
+            normalized_name_query
+        )
+        if exact_name_query:
+            score += _EXACT_NAME_MATCH_BOOST
+        elif name_prefix_query:
+            score += _PREFIX_NAME_MATCH_BOOST
+        if score and (
+            len(terms) < _MIN_QUERY_MATCH_TERMS
+            or matched_terms >= _MIN_QUERY_MATCH_TERMS
+            or name_prefix_query
+        ):
             ranked.append((name, tool, score))
     ranked.sort(key=lambda item: (-item[2], item[0]))
     return ranked[:limit]
+
+
+def _search_words(value: str) -> set[str]:
+    return set(_SEARCH_WORD_PATTERN.findall(value.casefold()))
 
 
 def _bounded_schema_search_text(schema: Any) -> str:

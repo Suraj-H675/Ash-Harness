@@ -2160,7 +2160,10 @@ class BrowserClickAtTool(_BrowserTool):
 
 class BrowserTypeTool(_BrowserTool):
     name = "browser_type"
-    description = "Fill or type into a referenced non-password browser control, optionally submit, and return the updated snapshot."
+    description = (
+        "Fill a browser form field or type into a referenced non-password browser "
+        "control, optionally submit it, and return the updated snapshot."
+    )
     args_schema = TypeArgs
     sensitive_argument_fields = frozenset({"text"})
 
