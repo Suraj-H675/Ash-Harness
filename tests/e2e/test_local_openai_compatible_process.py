@@ -833,7 +833,10 @@ def test_builtin_provider_incomplete_xml_stream_does_not_write_file(
 
 @pytest.mark.parametrize(
     ("route", "base_variable", "key_variable"),
-    _BUILTIN_OPENAI_COMPATIBLE_ROUTES,
+    [
+        *_BUILTIN_OPENAI_COMPATIBLE_ROUTES,
+        ("vllm", "VLLM_API_BASE", "VLLM_API_KEY"),
+    ],
 )
 def test_builtin_provider_stream_error_redacts_key_in_cli_json(
     tmp_path: Path,
@@ -856,17 +859,32 @@ def test_builtin_provider_stream_error_redacts_key_in_cli_json(
             self.wfile.write(body)
 
         def do_GET(self) -> None:
-            self._json(
-                {
+            if route == "vllm":
+                catalog = {
+                    "data": [
+                        {
+                            "id": "future-model",
+                            "max_model_len": 32768,
+                            "max_output_tokens": 1024,
+                        }
+                    ]
+                }
+            else:
+                catalog = {
                     "id": "future-model",
                     "active": True,
                     "context_window": 32768,
                     "max_completion_tokens": 1024,
                 }
-            )
+            self._json(catalog)
 
         def do_POST(self) -> None:
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            message = (
+                "stream response failed"
+                if route == "vllm"
+                else f"Stream rejected credential {api_key}"
+            )
             events = [
                 {
                     "id": "partial",
@@ -881,7 +899,7 @@ def test_builtin_provider_stream_error_redacts_key_in_cli_json(
                         }
                     ],
                 },
-                {"error": {"message": f"Stream rejected credential {api_key}"}},
+                {"error": {"message": message}},
             ]
             body = "".join(
                 "data: " + json.dumps(event, separators=(",", ":")) + "\n\n"
@@ -932,8 +950,17 @@ def test_builtin_provider_stream_error_redacts_key_in_cli_json(
 
         assert result.returncode == 1, (result.stdout, result.stderr)
         payload = json.loads(result.stdout)
+        error = payload["error"]
         assert api_key not in result.stdout + result.stderr
-        assert "[REDACTED]" in payload["error"]["message"]
+        if route == "vllm":
+            assert "stream response failed" in error["message"]
+        else:
+            assert "[REDACTED]" in error["message"]
+        assert error["category"] == "provider"
+        assert error["retriable"] is False
+        assert "selected model" in error["remedy"]
+        assert "local provider process" in error["remedy"]
+        assert "report it as an Ash bug" not in error["remedy"]
     finally:
         server.shutdown()
         server.server_close()

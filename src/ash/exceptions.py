@@ -260,6 +260,8 @@ def _is_pydantic_validation_error(exc: BaseException) -> bool:
 def _is_provider_error(module: str, lowered_message: str) -> bool:
     if module.startswith("ash.providers."):
         return True
+    if module == "openai" or module.startswith("openai."):
+        return True
     provider_markers = (
         "api key",
         "api error",
