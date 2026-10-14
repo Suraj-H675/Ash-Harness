@@ -862,6 +862,82 @@ def test_extensions_update_signed_publisher_uses_current_verified_entry(
     assert record.digest == second_digest
 
 
+def test_extensions_update_stale_signed_catalog_digest_fails_without_mutation(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = tmp_path / "repo"
+    source, _branch, first_digest = _git_plugin(repo)
+    subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True)
+    private_key = Ed25519PrivateKey.generate()
+    monkeypatch.setenv("ASH_CATALOG_KEYS", str(_write_keys(tmp_path, private_key)))
+    catalog = _write_catalog(
+        tmp_path / "catalog.json",
+        private_key,
+        publisher="alpha",
+        source=source,
+        version="1.0.0",
+        ref="main",
+        digest=first_digest,
+        sequence=1,
+    )
+    assert (
+        main(
+            [
+                "extensions",
+                "install",
+                "@alpha/demo",
+                "--catalog",
+                str(catalog),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    set_plugin_enabled("demo", enabled=False)
+    plugin_root = user_plugin_root() / "demo"
+    before_files = {
+        path.relative_to(plugin_root): path.read_bytes()
+        for path in plugin_root.rglob("*")
+        if path.is_file()
+    }
+    before_record = load_plugin_install_records()["demo"]
+    before_state = load_extension_state()
+
+    second_digest = _commit_plugin(repo, version="2.0.0")
+    assert second_digest != first_digest
+
+    assert (
+        main(
+            [
+                "extensions",
+                "update",
+                "demo",
+                "--catalog",
+                str(catalog),
+                "--json",
+            ]
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert captured.err == (
+        "Error: catalog plugin digest does not match cloned revision\n"
+    )
+    assert {
+        path.relative_to(plugin_root): path.read_bytes()
+        for path in plugin_root.rglob("*")
+        if path.is_file()
+    } == before_files
+    assert load_plugin_install_records()["demo"] == before_record
+    assert load_extension_state() == before_state
+
+
 def test_extensions_update_uses_registered_marketplace_without_catalog_flag(
     tmp_path: Path,
     isolated_home: Path,

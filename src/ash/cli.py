@@ -5442,6 +5442,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         )
         from ash.plugins.inventory import discover_extensions
         from ash.plugins.errors import PluginLifecycleError
+        from ash.plugins.catalog import PluginCatalogError
 
         action = args.extensions_action
         if action in {"inspect", "validate"}:
@@ -5561,7 +5562,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                         catalog=catalog_selection,
                     )
                     print(render_plugin_action(result, json_output=args.json))
-            except (OSError, PluginLifecycleError) as exc:
+            except (OSError, PluginCatalogError, PluginLifecycleError) as exc:
                 print(f"Error: {safe_plugin_diagnostic(exc)}", file=sys.stderr)
                 return 2
         else:
