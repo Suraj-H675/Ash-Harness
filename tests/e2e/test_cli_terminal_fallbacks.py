@@ -312,8 +312,8 @@ def test_first_run_local_provider_picker_ctrl_c_cancels_setup(
         _read_until(master, process, captured, b"No matches for 'zzq9'")
         assert b"No matches for 'zzq9'" in captured[filter_start:]
         os.write(master, b"\x03")
-        # On macOS, PTY output can be lost when the last slave closes.
-        # Drain while the process is shutting down, not after it exits.
+        # Drain during shutdown: on macOS, the last slave close can lose
+        # unread output; on Linux, the PTY may close before the child exits.
         deadline = time.monotonic() + 5
         while process.poll() is None and time.monotonic() < deadline:
             if select.select([master], [], [], 0.02)[0]:
@@ -321,9 +321,13 @@ def test_first_run_local_provider_picker_ctrl_c_cancels_setup(
                     chunk = os.read(master, 65_536)
                 except OSError:
                     break
-                if chunk:
-                    captured.extend(chunk)
-        assert process.poll() is not None, "Ctrl-C did not exit setup"
+                if not chunk:
+                    break
+                captured.extend(chunk)
+        try:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pytest.fail("Ctrl-C did not exit setup")
         while select.select([master], [], [], 0)[0]:
             try:
                 chunk = os.read(master, 65_536)
