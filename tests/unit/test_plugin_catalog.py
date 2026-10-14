@@ -1107,12 +1107,20 @@ def test_git_install_stops_clone_when_disk_budget_is_exceeded(
 ) -> None:
     fake_git = tmp_path / "fake-git"
     marker = tmp_path / "clone-survived"
+    child_started = tmp_path / "child-started"
+    release_child = tmp_path / "release-child"
     fake_git.write_text(
         "#!/bin/sh\n"
         "for checkout do :; done\n"
-        "mkdir -p \"$checkout\"\n"
-        "dd if=/dev/zero of=\"$checkout/blob\" bs=2048 count=1 2>/dev/null\n"
-        f'(sleep 0.3; printf survived > "{marker}") &\n'
+        # Delay the marker until *after* Ash has finished clone cleanup.
+        # A short timer started with Git can expire before size detection.
+        f'(printf ready > "{child_started}"; '
+        'attempt=0; while [ "$attempt" -lt 300 ]; do '
+        f'if [ -e "{release_child}" ]; then printf survived > "{marker}"; exit; fi; '
+        "sleep 0.02; attempt=$((attempt + 1)); done) &\n"
+        f'while [ ! -e "{child_started}" ]; do sleep 0.01; done\n'
+        'mkdir -p "$checkout"\n'
+        'dd if=/dev/zero of="$checkout/blob" bs=2048 count=1 2>/dev/null\n'
         "sleep 5\n",
         encoding="utf-8",
     )
@@ -1130,6 +1138,8 @@ def test_git_install_stops_clone_when_disk_budget_is_exceeded(
             destination_root=tmp_path / "installed",
         )
 
+    assert child_started.exists()
+    release_child.touch()
     time.sleep(0.5)
     assert not marker.exists()
     assert not (tmp_path / "installed").exists()
