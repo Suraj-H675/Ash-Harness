@@ -1113,6 +1113,13 @@ def test_resume_and_clear_replace_the_active_conversation_view(tmp_path: Path) -
                     break
                 if chunk:
                     captured.extend(chunk)
+        # The PTY may close before the child is reaped. Allow natural exit
+        # within the original deadline rather than treating PTY EIO as a hang.
+        if process.poll() is None:
+            try:
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
         assert process.poll() is not None, (
             "Ash did not exit after /exit: "
             + bytes(captured).decode("utf-8", errors="replace")[-3000:]
