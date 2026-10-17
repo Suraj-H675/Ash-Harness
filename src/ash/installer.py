@@ -1112,7 +1112,8 @@ def _run_streaming(
 
     if runner is subprocess.run:
         process_tree_plan = _prepare_process_tree()
-        popen_kwargs: dict[str, Any] = {"env": dict(environment)}
+        # Installer progress must not corrupt machine-readable CLI stdout.
+        popen_kwargs: dict[str, Any] = {"env": dict(environment), "stdout": 2}
         popen_kwargs.update(process_tree_plan.spawn_options)
         process = subprocess.Popen(list(command), **popen_kwargs)
         try:

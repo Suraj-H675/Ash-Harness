@@ -4,19 +4,21 @@ import base64
 import io
 import json
 import shlex
+import subprocess
 import sys
 import urllib.error
 
 import pytest
 
 from ash.commands.update import (
+    UpdateStatus,
     apply_update,
     check_for_update,
     render_update_status,
     repair_installation,
     require_managed_release_invocation,
 )
-from ash.installer import InstallError, InstallResult
+from ash.installer import InstallError, InstallResult, _run_streaming
 
 
 class Response(io.BytesIO):
@@ -422,6 +424,49 @@ def test_apply_update_json_success_is_machine_readable(capsys) -> None:
         "updated": True,
         "version": "ash 0.2.0",
     }
+
+
+@pytest.mark.parametrize("operation", ["update", "repair"])
+def test_json_install_commands_keep_subprocess_progress_off_stdout(
+    operation: str, capfd: pytest.CaptureFixture[str]
+) -> None:
+    def installer(*, ref: str | None = None) -> InstallResult:
+        assert ref == "ash-v0.4.4"
+        _run_streaming(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('pipx installation progress'); "
+                "print('pipx diagnostic', file=sys.stderr)",
+            ],
+            runner=subprocess.run,
+            environment={},
+            timeout=10,
+            description="test installation",
+            failure_message="install failed",
+        )
+        return InstallResult("pipx", "/isolated/bin/ash", "ash 0.4.4")
+
+    if operation == "update":
+        status = UpdateStatus(
+            current_version="0.4.3",
+            latest_version="0.4.4",
+            release_tag="ash-v0.4.4",
+            update_available=True,
+            release_url="https://github.com/example/release",
+        )
+        assert apply_update(status, installer=installer, json_output=True) == 0
+    else:
+        assert repair_installation(
+            current_version="0.4.4", installer=installer, json_output=True
+        ) == 0
+
+    stdout, stderr = capfd.readouterr()
+    payload = json.loads(stdout)
+    assert payload["manager"] == "pipx"
+    assert payload["updated" if operation == "update" else "repaired"] is True
+    assert "pipx installation progress" in stderr
+    assert "pipx diagnostic" in stderr
 
 
 def test_apply_update_json_noop_stays_machine_readable(capsys) -> None:
