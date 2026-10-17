@@ -108,7 +108,7 @@ jobs:
           uv sync --resolution lowest-direct --group dev --extra server --extra browser --extra acp --extra a2a --extra local-embeddings
       - name: Minimum-version compatibility slice
         run: >-
-          uv run --no-sync pytest -q
+          uv run --no-sync python -m pytest -q
           tests/unit/test_config.py
           tests/unit/test_embeddings.py
           tests/unit/test_tokens.py
