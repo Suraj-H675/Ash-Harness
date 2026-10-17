@@ -6,6 +6,19 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-10-17
+
+### Fixed
+- Prevented a second Ash process from clearing, replacing, pausing, or
+  resuming a Goal while another process is executing a turn in that session.
+  Goal progress can no longer be misattributed to a replacement objective.
+- Reported session-in-use contention with an actionable retry instruction
+  rather than suggesting a database repair.
+
+### Upgrade notes
+- This is a package-only upgrade from 0.4.5. There is no session database
+  schema migration; existing sessions and Goals are preserved.
+
 ## [0.4.5] - 2026-10-17
 
 ### Fixed
