@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from ash.core.goals import GoalState
 from ash.core.loop import AshLoop
 from ash.core.recovery import CircuitBreaker
-from ash.core.session import SessionStore
+from ash.core.session import SessionStorageError, SessionStore
 from ash.providers.base import StreamChunk
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
@@ -248,6 +248,42 @@ def test_tool_call_turn_executes_and_loops_back_to_provider(
 def _attach_goal_tool(loop: AshLoop, safety_guard: SafetyGuard) -> None:
     goal_tool = UpdateGoalTool(safety_guard, loop.update_goal)
     loop.tools[goal_tool.name] = goal_tool
+
+
+@pytest.mark.asyncio
+async def test_goal_controls_refuse_another_process_active_turn(
+    tmp_workspace: Path,
+    safety_guard: SafetyGuard,
+    session_store: SessionStore,
+) -> None:
+    loop = AshLoop(
+        session_store=session_store,
+        provider=FakeProvider(scripts=[]),
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=tmp_workspace,
+    )
+    session = await loop.start_session()
+
+    lease = session_store.acquire_session_runtime_lease(session.session_id)
+    try:
+        with pytest.raises(SessionStorageError, match="active in another Ash process"):
+            loop.create_goal("Original objective")
+    finally:
+        lease.close()
+
+    goal = loop.create_goal("Original objective")
+    lease = session_store.acquire_session_runtime_lease(session.session_id)
+    try:
+        for action in (loop.pause_goal, loop.resume_goal, loop.clear_goal):
+            with pytest.raises(
+                SessionStorageError, match="active in another Ash process"
+            ):
+                action()
+    finally:
+        lease.close()
+
+    assert session_store.load_current_goal(session.session_id) == goal
 
 
 def test_active_goal_auto_continues_real_work_until_verified_complete(

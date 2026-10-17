@@ -127,6 +127,14 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
             exit_code=2,
         )
 
+    if name == "SessionStorageError" and "is active in another ash process" in lowered:
+        return ErrorInfo(
+            ErrorCategory.SESSION,
+            message,
+            "Wait for the other Ash process to finish its turn, then retry the operation.",
+            retriable=True,
+        )
+
     if (
         name == "SessionStorageError"
         or module == "sqlite3"

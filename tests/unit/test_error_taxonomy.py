@@ -48,6 +48,16 @@ def test_classify_policy_storage_sandbox_and_context_errors() -> None:
     )
 
 
+def test_active_session_lease_is_not_misdiagnosed_as_database_damage() -> None:
+    error = classify_exception(
+        SessionStorageError("session '123' is active in another Ash process")
+    )
+    assert error.category == ErrorCategory.SESSION
+    assert error.retriable is True
+    assert "other Ash process" in error.remedy
+    assert "storage check" not in error.remedy
+
+
 def test_session_classification_does_not_match_unrelated_value_errors() -> None:
     assert (
         classify_exception(SessionResolutionError("session reference must not be empty")).category

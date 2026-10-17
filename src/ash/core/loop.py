@@ -18,6 +18,7 @@ emits new tool calls. A :class:`CircuitBreaker` halts the loop after
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from copy import deepcopy
 import fnmatch
 import hashlib
@@ -3287,15 +3288,24 @@ class AshLoop:
             return None
         return self.session_store.load_current_goal(session.session_id)
 
+    @contextmanager
+    def _goal_control_lease(self, session: Session) -> Iterator[None]:
+        lease = self.session_store.acquire_session_runtime_lease(session.session_id)
+        try:
+            yield
+        finally:
+            lease.close()
+
     def create_goal(self, objective: str) -> GoalRecord:
         session = self.current_session
         if session is None:
             raise RuntimeError("cannot create a Goal without an active session")
-        goal = self.session_store.create_goal(
-            session.session_id,
-            objective,
-            max_continuations=self.max_goal_continuations,
-        )
+        with self._goal_control_lease(session):
+            goal = self.session_store.create_goal(
+                session.session_id,
+                objective,
+                max_continuations=self.max_goal_continuations,
+            )
         self._emit_event(
             {
                 "type": "goal.created",
@@ -3310,6 +3320,10 @@ class AshLoop:
         session = self.current_session
         if session is None:
             return None
+        with self._goal_control_lease(session):
+            return self._pause_goal_under_lease(session)
+
+    def _pause_goal_under_lease(self, session: Session) -> GoalRecord | None:
         goal = self.session_store.pause_current_goal(session.session_id)
         if goal is not None:
             self._emit_event(
@@ -3325,7 +3339,8 @@ class AshLoop:
         session = self.current_session
         if session is None:
             raise RuntimeError("cannot resume a Goal without an active session")
-        goal = self.session_store.resume_current_goal(session.session_id)
+        with self._goal_control_lease(session):
+            goal = self.session_store.resume_current_goal(session.session_id)
         self._emit_event(
             {
                 "type": "goal.resumed",
@@ -3340,7 +3355,8 @@ class AshLoop:
         session = self.current_session
         if session is None:
             raise RuntimeError("cannot clear a Goal without an active session")
-        goal = self.session_store.clear_current_goal(session.session_id)
+        with self._goal_control_lease(session):
+            goal = self.session_store.clear_current_goal(session.session_id)
         self._emit_event(
             {
                 "type": "goal.cleared",
@@ -3395,7 +3411,9 @@ class AshLoop:
 
     def _pause_goal_nonfatal(self) -> None:
         try:
-            self.pause_goal()
+            # Turn failure/cancellation already owns the session runtime lease.
+            if self.current_session is not None:
+                self._pause_goal_under_lease(self.current_session)
         except (KeyError, RuntimeError, ValueError):
             return
 

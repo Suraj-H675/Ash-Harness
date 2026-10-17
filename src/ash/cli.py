@@ -2036,18 +2036,22 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     continue
                 action = arguments[0].casefold()
                 if len(arguments) == 1 and action == "pause":
-                    goal = loop.pause_goal()
-                    print(
-                        loop.render_goal_status()
-                        if goal is not None
-                        else "Goal: none",
-                        flush=True,
-                    )
+                    try:
+                        goal = loop.pause_goal()
+                    except RuntimeError as exc:
+                        _print_classified_error(exc)
+                    else:
+                        print(
+                            loop.render_goal_status()
+                            if goal is not None
+                            else "Goal: none",
+                            flush=True,
+                        )
                     continue
                 if len(arguments) == 1 and action == "clear":
                     try:
                         loop.clear_goal()
-                    except KeyError as exc:
+                    except (KeyError, RuntimeError) as exc:
                         _print_classified_error(exc)
                     else:
                         print("Goal cleared.", flush=True)
@@ -2055,7 +2059,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 if len(arguments) == 1 and action == "resume":
                     try:
                         goal = loop.resume_goal()
-                    except KeyError as exc:
+                    except (KeyError, RuntimeError) as exc:
                         _print_classified_error(exc)
                         continue
                     print(loop.render_goal_status(), flush=True)
