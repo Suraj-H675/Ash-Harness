@@ -6,6 +6,32 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-10-17
+
+### Fixed
+- Kept package-manager progress on stderr so managed `ash update --apply --json`
+  and `ash repair --json` return parseable JSON during installation.
+- Raised the minimum Rich version to 14.3.0 for the terminal grapheme API
+  Ash uses. Minimum-dependency CI now retains the resolved minimum versions and
+  invokes pytest through Python to collect tests reliably.
+
+### Upgrade notes
+- This is a package-only upgrade from 0.4.4; there is no session database
+  schema migration. Managed upgrades install the compatible Rich dependency.
+
+## [0.4.4] - 2026-10-14
+
+### Fixed
+- Rejected unsafe session forks across project boundaries or active turns.
+- Improved Ctrl-C cancellation in interactive setup and model pickers, and
+  preserved PTY output and child-exit handling during cancellation and cleanup.
+- Classified OpenAI client stream failures as provider errors and reported
+  stale signed-plugin updates without exposing an internal traceback.
+
+### Upgrade notes
+- This is a package-only upgrade from 0.4.3; there is no session database
+  schema migration.
+
 ## [0.4.3] - 2026-10-13
 
 ### Changed
