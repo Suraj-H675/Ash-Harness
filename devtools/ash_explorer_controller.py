@@ -582,6 +582,14 @@ def _has_verified_write_read(history: Sequence[dict[str, object]]) -> bool:
         outcome = observation.get("tool_outcome")
         succeeded = isinstance(outcome, dict) and outcome.get("success") is True
         if tool == "write_file":
+            if (
+                classification == "expected_refusal"
+                and not succeeded
+                and path in writes
+                and observation.get("target_before_sha256") == writes[path]
+                and observation.get("target_after_sha256") == writes[path]
+            ):
+                continue
             writes.pop(path, None)
             if classification == "expected_success" and succeeded:
                 digest = observation.get("target_after_sha256")

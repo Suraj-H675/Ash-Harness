@@ -549,8 +549,21 @@ def test_readback_verifier_rejects_unverified_or_stale_observations() -> None:
     digest, changed = "a" * 64, "b" * 64
     wrote = step("write_file", "same.txt", "expected_success", None, digest)
     read = step("read_file", "same.txt", "expected_success", digest, digest)
+    refused = step("write_file", "same.txt", "expected_refusal", digest, digest)
+    refused["observation"]["tool_outcome"]["success"] = False
     assert controller._has_verified_write_read([wrote, read]) is True
+    assert controller._has_verified_write_read([wrote, refused, read]) is True
     assert controller._has_verified_write_read([wrote]) is False
+    assert (
+        controller._has_verified_write_read(
+            [
+                wrote,
+                step("write_file", "same.txt", "expected_refusal", digest, changed),
+                read,
+            ]
+        )
+        is False
+    )
     assert (
         controller._has_verified_write_read(
             [wrote, step("read_file", "other.txt", "expected_success", digest, digest)]
