@@ -262,7 +262,10 @@ class WriteFileTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = WriteFileArgs(**kwargs)
-        resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        try:
+            resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        except SafetyViolation as exc:
+            return ToolResult(success=False, output="", error=str(exc))
 
         if resolved_path.exists() and not args.overwrite:
             return ToolResult(success=False, output="", error=EXISTS_ERROR)

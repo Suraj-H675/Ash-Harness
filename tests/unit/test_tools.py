@@ -574,10 +574,20 @@ async def test_write_file_overwrite_preserves_bom_encoding(
 
 @pytest.mark.asyncio
 async def test_write_file_blocks_paths_outside_project(
+    project_root: Path,
     guard: SafetyGuard,
 ) -> None:
-    with pytest.raises(SafetyViolation):
-        await WriteFileTool(guard).run(file_path="../outside.txt", content="nope")
+    outside = project_root.parent / "outside.txt"
+    outside.write_text("original\n", encoding="utf-8")
+
+    result = await WriteFileTool(guard).run(
+        file_path="../outside.txt", content="nope", overwrite=True
+    )
+
+    assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert "outside project scope" in (result.error or "")
+    assert outside.read_text(encoding="utf-8") == "original\n"
 
 
 @pytest.mark.asyncio

@@ -103,6 +103,21 @@ def test_tool_error_without_success_field_is_a_refusal_outcome() -> None:
     assert outcome["error"] == event["error"]
 
 
+def test_pre_dispatch_policy_denial_is_not_an_ambiguous_tool_outcome() -> None:
+    event = {
+        "type": "tool.denied",
+        "tool": "write_file",
+        "reason": "Access denied: path '../outside.txt' is outside project scope.",
+    }
+    outcome = _tool_outcome([event], {})
+
+    assert outcome is not None
+    assert outcome["success"] is False
+    assert outcome["dispatched"] is False
+    assert outcome["ambiguous"] is False
+    assert outcome["error"] == event["reason"]
+
+
 @pytest.mark.parametrize("expectation_kind", ["observed", "expected_refusal"])
 def test_ambiguous_tool_outcome_precedes_observed_and_refusal_matching(
     expectation_kind: str,
@@ -440,6 +455,30 @@ def test_agent_directed_run_adapts_after_real_write_observation(
         assert third_observation["type"] == "observation"
         assert third_observation["classification"] == "expected_refusal"
 
+        fourth_action = {
+            "action": "step",
+            "label": "adjacent scratch write escape",
+            "prompt": "Attempt a prohibited write to the synthetic outside marker.",
+            "tool_call": {
+                "name": "write_file",
+                "arguments": {
+                    "file_path": "../outside-marker.txt",
+                    "content": "must not replace marker\n",
+                    "overwrite": True,
+                },
+            },
+            "expect": {
+                "kind": "expected_refusal",
+                "error_contains": "outside project scope",
+            },
+        }
+        fourth_line = json.dumps(fourth_action, separators=(",", ":")).encode() + b"\n"
+        process.stdin.write(fourth_line)
+        process.stdin.flush()
+        fourth_observation = receive()
+        assert fourth_observation["type"] == "observation"
+        assert fourth_observation["classification"] == "expected_refusal"
+
         finish_line = b'{"action":"finish"}\n'
         process.stdin.write(finish_line)
         process.stdin.flush()
@@ -464,12 +503,13 @@ def test_agent_directed_run_adapts_after_real_write_observation(
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
 
-    accepted_actions = [first_line, second_line, third_line, finish_line]
+    accepted_actions = [first_line, second_line, third_line, fourth_line, finish_line]
     assert (evidence / "actions.jsonl").read_bytes() == b"".join(accepted_actions)
 
     first = json.loads((evidence / "steps" / "01" / "observation.json").read_text())
     second = json.loads((evidence / "steps" / "02" / "observation.json").read_text())
     third = json.loads((evidence / "steps" / "03" / "observation.json").read_text())
+    fourth = json.loads((evidence / "steps" / "04" / "observation.json").read_text())
     assert first["tool_outcome"]["success"] is True
     assert first["target_after_sha256"] == hashlib.sha256(b"probe-ok\n").hexdigest()
     assert second["tool_outcome"]["success"] is True
@@ -481,6 +521,18 @@ def test_agent_directed_run_adapts_after_real_write_observation(
     marker_hash = hashlib.sha256(b"ASH_EXPLORER_OUTSIDE_MARKER\n").hexdigest()
     assert third["target_before_sha256"] == marker_hash
     assert third["target_after_sha256"] == marker_hash
+    assert fourth["tool_outcome"]["success"] is False
+    assert fourth["tool_outcome"]["ambiguous"] is False
+    assert fourth["tool_outcome"]["dispatched"] is False
+    assert "outside project scope" in fourth["tool_outcome"]["error"]
+    assert fourth["target_before_sha256"] == marker_hash
+    assert fourth["target_after_sha256"] == marker_hash
+    fourth_events = [
+        json.loads(line)
+        for line in (evidence / "steps" / "04" / "stdout.bin").read_text().splitlines()
+    ]
+    assert any(event.get("type") == "tool.denied" for event in fourth_events)
+    assert not any(event.get("type") == "tool.started" for event in fourth_events)
 
     provider = json.loads((evidence / "steps" / "03" / "provider.json").read_text())
     assert provider["tool_outcome"]["success"] is False
@@ -541,8 +593,9 @@ def test_agent_directed_run_adapts_after_real_write_observation(
         "expected_success",
         "expected_success",
         "expected_refusal",
+        "expected_refusal",
     ]
-    for index in ("01", "02", "03"):
+    for index in ("01", "02", "03", "04"):
         original = json.loads(
             (evidence / "steps" / index / "observation.json").read_text()
         )

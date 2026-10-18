@@ -444,7 +444,7 @@ class RunState:
         tool_events = [
             event
             for event in events
-            if event.get("type") in {"tool.completed", "tool.error"}
+            if event.get("type") in {"tool.completed", "tool.error", "tool.denied"}
             and event.get("tool") == request.tool_name
         ]
         tool_outcome = _tool_outcome(tool_events, fixture_snapshot)
@@ -1094,9 +1094,11 @@ def _tool_outcome(
         succeeded = event["success"]
     elif kind == "tool.error" and isinstance(event.get("error"), str):
         succeeded = False
+    elif kind == "tool.denied" and isinstance(event.get("reason"), str):
+        succeeded = False
     else:
         return None
-    error = event.get("error")
+    error = event.get("reason") if kind == "tool.denied" else event.get("error")
     output = event.get("output")
     fixture_outcome = fixture.get("tool_outcome")
     return {
@@ -1104,8 +1106,8 @@ def _tool_outcome(
         "success": succeeded,
         "error": error if isinstance(error, str) else None,
         "output": output if isinstance(output, str) else None,
-        "dispatched": event.get("dispatched"),
-        "ambiguous": event.get("ambiguous"),
+        "dispatched": False if kind == "tool.denied" else event.get("dispatched"),
+        "ambiguous": False if kind == "tool.denied" else event.get("ambiguous"),
         "fixture_result": fixture_outcome,
     }
 

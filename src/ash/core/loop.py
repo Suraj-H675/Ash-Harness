@@ -107,7 +107,13 @@ from ash.providers.retry import (
 )
 from ash.repo.repomap import RepoMap
 from ash.safety.guard import SafetyGuard, SafetyViolation
-from ash.safety.policy import PermissionMode, PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
+from ash.safety.policy import (
+    PermissionMode,
+    PermissionPolicy,
+    PolicyAction,
+    PolicyDecision,
+    READ_ONLY_TOOLS,
+)
 from ash.safety.scoped_io import (
     read_scoped_bytes,
     snapshot_scoped_file,
@@ -5902,6 +5908,13 @@ class AshLoop:
             decision = self.permission_policy.evaluate(
                 tool_name, deepcopy(arguments)
             )
+            if tool_name == "write_file" and decision.action != PolicyAction.DENY:
+                path = arguments.get("file_path")
+                if isinstance(path, str):
+                    try:
+                        self.safety_guard.validate_mutation_path(path)
+                    except SafetyViolation as exc:
+                        decision = PolicyDecision(PolicyAction.DENY, str(exc))
             denial_feedback = ""
             if decision.action == PolicyAction.DENY:
                 approved = False
