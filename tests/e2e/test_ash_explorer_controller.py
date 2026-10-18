@@ -429,3 +429,90 @@ def test_controller_rejects_unauthorized_model_tool_before_dispatch(
     manifest = json.loads((evidence / "manifest.json").read_text())
     assert manifest["pending_cleanup"] is False
     assert not Path(manifest["scratch_path"]).exists()
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_error"),
+    [("timeout", "provider_timeout"), ("unauthorized", "runner_rejected_action")],
+)
+def test_controller_preserves_completed_step_when_later_model_decision_fails(
+    tmp_path: Path, failure_mode: str, expected_error: str
+) -> None:
+    _require_child_loopback()
+
+    class FailingSecondDecision(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            history = json.loads(messages[-1]["content"])["history"]
+            if not history:
+                decision = {
+                    "action": "step",
+                    "label": "completed write",
+                    "prompt": "Create a proof file.",
+                    "tool_call": {
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "proof.txt",
+                            "content": "retained\n",
+                            "overwrite": False,
+                        },
+                    },
+                    "expect": {"kind": "expected_success"},
+                }
+                yield StreamChunk(
+                    content=json.dumps({"decision": decision, "reason": "first probe"}),
+                    is_done=True,
+                    model=self.model_name,
+                )
+                return
+            assert len(history) == 1
+            assert history[0]["observation"]["classification"] == "expected_success"
+            if failure_mode == "timeout":
+                await asyncio.sleep(1)
+                return
+            decision = {
+                "action": "step",
+                "label": "prohibited command",
+                "prompt": "Run a shell command.",
+                "tool_call": {
+                    "name": "execute_shell",
+                    "arguments": {"command": "echo unauthorized"},
+                },
+                "expect": {"kind": "observed"},
+            }
+            yield StreamChunk(
+                content=json.dumps({"decision": decision, "reason": "unsafe"}),
+                is_done=True,
+                model=self.model_name,
+            )
+
+    evidence = tmp_path / failure_mode
+    report = asyncio.run(
+        controller.run_controller(
+            task="Stop safely when a later model decision fails.",
+            evidence=evidence,
+            seed=44,
+            provider=FailingSecondDecision(),
+            config=controller.ControllerConfig(
+                model_timeout_seconds=0.2, run_timeout_seconds=20
+            ),
+        )
+    )
+
+    assert report["status"] == "failed"
+    assert report["error_code"] == expected_error
+    assert report["classifications"] == ["expected_success"]
+    actions = [
+        json.loads(line)
+        for line in (evidence / "actions.jsonl").read_text().splitlines()
+    ]
+    assert [action["action"] for action in actions] == ["step", "finish"]
+    assert actions[0]["tool_call"]["name"] == "write_file"
+    observation = json.loads(
+        (evidence / "steps" / "01" / "observation.json").read_text()
+    )
+    assert (
+        observation["target_after_sha256"] == hashlib.sha256(b"retained\n").hexdigest()
+    )
+    manifest = json.loads((evidence / "manifest.json").read_text())
+    assert manifest["pending_cleanup"] is False
+    assert not Path(manifest["scratch_path"]).exists()
