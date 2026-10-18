@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -15,22 +16,23 @@ from pathlib import Path
 
 import pytest
 
-import devtools.ash_explorer as explorer
-from devtools.ash_explorer import (
-    ExpectedOutcome,
-    ExplorerError,
-    StepRequest,
-    _classify,
-    _handle_termination,
-    _extract_tool_outcome,
-    _read_live_line,
-    _target_path,
-    _tool_outcome,
-)
-
-
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "devtools" / "ash_explorer.py"
+_spec = importlib.util.spec_from_file_location("ash_explorer_under_test", RUNNER)
+assert _spec is not None and _spec.loader is not None
+explorer = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = explorer
+_spec.loader.exec_module(explorer)
+
+ExpectedOutcome = explorer.ExpectedOutcome
+ExplorerError = explorer.ExplorerError
+StepRequest = explorer.StepRequest
+_classify = explorer._classify
+_handle_termination = explorer._handle_termination
+_extract_tool_outcome = explorer._extract_tool_outcome
+_read_live_line = explorer._read_live_line
+_target_path = explorer._target_path
+_tool_outcome = explorer._tool_outcome
 
 
 def test_live_reader_returns_successive_jsonl_actions_without_dropping_lines() -> None:
