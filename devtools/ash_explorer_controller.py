@@ -62,7 +62,14 @@ when the result is exploratory and has no pass condition use {\"kind\":\"observe
 Ash validates each step before dispatch. Never emit commands, URLs, environment
 values, extra fields, markdown, tool calls, or hidden reasoning. An observation
 classified as observed is explicitly not a pass. Stop when the available
-observations are sufficient or show failure/ambiguity."""
+observations are sufficient or show failure/ambiguity.
+
+Every response MUST include the top-level "reason" string even when the action
+is self-explanatory; omitting it fails validation. Use this exact outer shape:
+{"decision":{"action":"step","label":"probe","prompt":"Write a test file.","tool_call":{"name":"write_file","arguments":{"file_path":"probe.txt","content":"test","overwrite":false}},"expect":{"kind":"expected_success"}},"reason":"Test a new file write."}
+To finish, return exactly:
+{"decision":{"action":"finish"},"reason":"The recorded results are sufficient."}
+Do not copy the example action without deciding what this task needs."""
 
 
 _runner_spec = importlib.util.spec_from_file_location(
@@ -528,6 +535,7 @@ def _make_report(
     error_code: str | None,
     runner_exit_code: int | None,
     runner_summary: Mapping[str, object] | None,
+    verified_readback: bool,
 ) -> dict[str, object]:
     report: dict[str, object] = {
         "schema_version": 1,
@@ -545,11 +553,49 @@ def _make_report(
         "decisions_path": "controller-decisions.jsonl",
         "error_code": error_code,
         "runner_exit_code": runner_exit_code,
+        "write_read_verified": verified_readback,
     }
     if runner_summary is not None:
         report["pending_cleanup"] = runner_summary.get("pending_cleanup")
         report["lifecycle"] = runner_summary.get("lifecycle")
     return report
+
+
+def _has_verified_write_read(history: Sequence[dict[str, object]]) -> bool:
+    """Prove a write/read round-trip using actual successful Ash observations."""
+    writes: dict[str, str] = {}
+    for entry in history:
+        action, observation = entry.get("action"), entry.get("observation")
+        if not isinstance(action, dict) or not isinstance(observation, dict):
+            continue
+        tool_call = action.get("tool_call")
+        if not isinstance(tool_call, dict):
+            continue
+        arguments = tool_call.get("arguments")
+        if not isinstance(arguments, dict):
+            continue
+        path = arguments.get("file_path")
+        if not isinstance(path, str):
+            continue
+        tool = tool_call.get("name")
+        classification = observation.get("classification")
+        outcome = observation.get("tool_outcome")
+        succeeded = isinstance(outcome, dict) and outcome.get("success") is True
+        if tool == "write_file":
+            writes.pop(path, None)
+            if classification == "expected_success" and succeeded:
+                digest = observation.get("target_after_sha256")
+                if isinstance(digest, str) and len(digest) == 64:
+                    writes[path] = digest
+        elif tool == "read_file" and path in writes:
+            if (
+                classification == "expected_success"
+                and succeeded
+                and observation.get("target_before_sha256") == writes[path]
+                and observation.get("target_after_sha256") == writes[path]
+            ):
+                return True
+    return False
 
 
 def _runner_environment(home: Path) -> dict[str, str]:
@@ -590,6 +636,7 @@ async def run_controller(
     provider: ProviderABC,
     requested_model: str | None = None,
     config: ControllerConfig = ControllerConfig(),
+    require_write_read: bool = False,
 ) -> dict[str, object]:
     """Run Ash Explorer and choose each subsequent action from real observations."""
 
@@ -827,6 +874,9 @@ async def run_controller(
                 in_flight_action_resolved = True
                 in_flight_action_hash = None
                 in_flight_step_index = None
+                if require_write_read and not _has_verified_write_read(history):
+                    status = "inconclusive"
+                    finish_reason = "unverified_completion"
                 break
 
             observation_event = await _read_event(process, deadline)
@@ -957,6 +1007,7 @@ async def run_controller(
                     error_code=error_code,
                     runner_exit_code=runner_exit_code,
                     runner_summary=runner_summary,
+                    verified_readback=_has_verified_write_read(history),
                 )
                 evidence_log.report(report)
             finally:
@@ -976,6 +1027,7 @@ async def run_controller(
         error_code=error_code,
         runner_exit_code=runner_exit_code,
         runner_summary=runner_summary,
+        verified_readback=_has_verified_write_read(history),
     )
 
 
@@ -1125,13 +1177,19 @@ async def _abort_runner(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Drive bounded Ash Explorer probes with local Ollama."
+        description="Drive bounded Ash Explorer probes using local Ollama or ChatGPT plan auth."
     )
     parser.add_argument("--task", required=True, help="the probe objective")
     parser.add_argument("--evidence", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=23)
-    parser.add_argument("--model", default="qwen2.5-coder:7b")
+    parser.add_argument("--provider", choices=("ollama", "chatgpt"), default="ollama")
+    parser.add_argument("--model", default=None)
     parser.add_argument("--port", type=int, default=11434)
+    parser.add_argument(
+        "--require-write-read",
+        action="store_true",
+        help="report an early model finish as inconclusive until a successful write/read round-trip is evidenced",
+    )
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--model-timeout", type=float, default=MAX_MODEL_SECONDS)
     parser.add_argument("--run-timeout", type=float, default=MAX_RUN_SECONDS)
@@ -1139,24 +1197,43 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def _run_cli(args: argparse.Namespace) -> dict[str, object]:
-    if not MODEL_NAME_RE.fullmatch(args.model):
-        raise ValueError("model must be a plain local Ollama model identifier")
+    provider_name = getattr(args, "provider", "ollama")
+    if provider_name not in {"ollama", "chatgpt"}:
+        raise ValueError("unsupported Explorer decision provider")
+    model = args.model or (
+        "gpt-6-luna" if provider_name == "chatgpt" else "qwen2.5-coder:7b"
+    )
+    if not MODEL_NAME_RE.fullmatch(model):
+        raise ValueError("model must be a plain model identifier")
     if not 1 <= args.port <= 65535:
         raise ValueError("port must be in the range 1..65535")
+    if provider_name == "chatgpt" and args.port != 11434:
+        raise ValueError("--port is only supported for local Ollama")
     timeout = _bounded_number(args.model_timeout, "model timeout", MAX_MODEL_SECONDS)
     config = ControllerConfig(
         model_timeout_seconds=timeout,
         run_timeout_seconds=args.run_timeout,
         max_tokens=args.max_tokens,
     ).bounded()
+    if provider_name == "chatgpt":
+        from ash.providers.openai_chatgpt import OpenAIChatGPTProvider
+
+        return await run_controller(
+            task=args.task,
+            evidence=args.evidence,
+            seed=args.seed,
+            provider=OpenAIChatGPTProvider(model_name=model),
+            requested_model=model,
+            config=config,
+            require_write_read=getattr(args, "require_write_read", False),
+        )
     async with httpx.AsyncClient(
-        timeout=config.model_timeout_seconds,
-        trust_env=False,
+        timeout=config.model_timeout_seconds, trust_env=False
     ) as client:
         from ash.providers.ollama import OllamaProvider
 
         provider = OllamaProvider(
-            model_name=args.model,
+            model_name=model,
             base_url=f"http://127.0.0.1:{args.port}",
             client=client,
         )
@@ -1165,8 +1242,9 @@ async def _run_cli(args: argparse.Namespace) -> dict[str, object]:
             evidence=args.evidence,
             seed=args.seed,
             provider=provider,
-            requested_model=args.model,
+            requested_model=model,
             config=config,
+            require_write_read=getattr(args, "require_write_read", False),
         )
 
 
@@ -1179,7 +1257,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ash Explorer controller failed: {type(exc).__name__}", file=sys.stderr)
         return 2
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
-    if report.get("status") == "failed":
+    if report.get("status") in {"failed", "inconclusive"}:
         print(
             f"Ash Explorer controller stopped: {report.get('error_code') or report.get('finish_reason')}",
             file=sys.stderr,

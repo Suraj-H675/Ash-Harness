@@ -2,10 +2,19 @@
 
 ## Model-directed local runs
 
-`ash_explorer_controller.py` can ask a local Ollama model to choose each
-bounded probe after inspecting the previous real Ash CLI observation. It uses
-Ash's existing provider adapter directly and does not need an API key or new
-credentials. Start Ollama separately and pull a model before running:
+`ash_explorer_controller.py` can ask a model to choose bounded probes after
+inspecting prior real Ash CLI observations. It uses Ash's existing provider
+adapters directly. For an eligible ChatGPT subscription, authorize Ash with
+`ash auth chatgpt login` if not already signed in, then run:
+
+```sh
+.venv/bin/python devtools/ash_explorer_controller.py \
+  --provider chatgpt --model gpt-6-luna \
+  --task "Write probe.txt and verify it by reading it back." \
+  --require-write-read --evidence /tmp/ash-explorer-gpt-01 --seed 23
+```
+
+Alternatively, start local Ollama separately and pull a model:
 
 ```sh
 ollama serve
@@ -15,14 +24,14 @@ ollama pull qwen2.5-coder:7b
   --evidence /tmp/ash-explorer-controller-01 --seed 23
 ```
 
-The controller connects only to `http://127.0.0.1:<port>` (default port
-`11434`) with proxy environment discovery disabled. The Ollama server is a
-separate process and is not OS-isolated from the host. The controller does not
-read Ash or Codex configuration or forward credential environment values. It
-gives the runner a minimal environment with a private temporary home and
-invokes `ash_explorer.py run` with fixed arguments, leaving the runner
-authoritative for validation, disposable state, sandboxing, cleanup, action
-recording, and replay.
+The Ollama backend connects only to `http://127.0.0.1:<port>` (default
+`11434`) with proxy discovery disabled; the server is not OS-isolated from the
+host. The ChatGPT backend uses Ash's subscription-authenticated Responses
+provider, and sends model prompts and bounded observations to OpenAI. The
+decision provider uses the existing authorization record, but the runner gets
+a private temporary home and minimal environment without Ash or Codex
+credentials. `ash_explorer.py run` remains authoritative for validation,
+disposable state, sandboxing, cleanup, action recording, and replay.
 
 The installed `codex-cli 0.162.1` was not used as the decision runtime: its
 `codex exec --help` did not expose a verified model-only/no-tools mode, and a
@@ -43,7 +52,12 @@ run. A dispatched ambiguous action is never replayed automatically.
 `expected_success` and `expected_refusal` are recorded classifications;
 `observed` is explicitly not a pass. The controller stops after a runner
 failure, unexpected result, ambiguous outcome, explicit finish, or exhausted
-budget. The runner's `actions.jsonl` remains the replay source:
+budget. A `finished` status means only that the model stopped. The report's
+`write_read_verified` is true only if real successful write and read actions
+for the same path have matching recorded SHA-256 hashes; it proves this
+round-trip, not arbitrary claims about task completion. With
+`--require-write-read`, an early model finish reports `inconclusive` and the
+CLI exits nonzero. The runner's `actions.jsonl` remains the replay source:
 
 ```sh
 .venv/bin/python devtools/ash_explorer.py replay \
@@ -56,9 +70,8 @@ The controller separately fsyncs `controller-decisions.jsonl` and
 visible reason, request digest and size, response size, decision/action hashes,
 observation digests and classifications, and relative replay path. They do not
 store model prompts or completions. `tests/e2e/test_ash_explorer_controller.py`
-uses only a deterministic fake provider and the real Ash CLI runner. No live
-model or provider call was performed; autonomous behavior is **not yet
-autonomously verified**.
+uses deterministic fake providers with the real Ash CLI runner; model quality
+and broader autonomous exploration require separate live verification.
 
 Ash Explorer lets an outside Codex or Poteto agent choose a bounded probe,
 inspect Ash's real CLI result, then choose the next probe. The local provider

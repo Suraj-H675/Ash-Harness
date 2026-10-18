@@ -135,10 +135,12 @@ def test_model_directed_run_adapts_from_real_observation_and_replays(
             evidence=evidence,
             seed=41,
             provider=provider,
+            require_write_read=True,
         )
     )
 
     assert report["status"] == "finished"
+    assert report["write_read_verified"] is True
     assert report["finish_reason"] == "model_finish"
     assert report["classifications"] == ["expected_success", "expected_success"]
     assert report["replay_path"] == "actions.jsonl"
@@ -371,6 +373,7 @@ def test_local_ollama_adapter_drives_real_ash_cli_without_credentials(
         thread.join(timeout=2)
 
     assert report["status"] == "finished", report
+    assert report["write_read_verified"] is True
     assert report["classifications"] == ["expected_success", "expected_success"]
     assert len(requests) == 3
     assert report["provider_family"] == "ollama"
@@ -379,6 +382,199 @@ def test_local_ollama_adapter_drives_real_ash_cli_without_credentials(
     manifest = json.loads((evidence / "manifest.json").read_text())
     assert manifest["pending_cleanup"] is False
     assert not Path(manifest["scratch_path"]).exists()
+
+
+def test_chatgpt_subscription_provider_uses_existing_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_child_loopback()
+    from ash.providers import openai_chatgpt
+
+    class ChatGPTFixture(FakeProvider):
+        provider_family = "openai"
+
+        def __init__(self, model_name: str):
+            super().__init__()
+            self._model_name = model_name
+
+        @property
+        def model_name(self) -> str:
+            return self._model_name
+
+    monkeypatch.setattr(openai_chatgpt, "OpenAIChatGPTProvider", ChatGPTFixture)
+    evidence = tmp_path / "chatgpt-adapter"
+    report = asyncio.run(
+        controller._run_cli(
+            Namespace(
+                task="Write a probe and read it back.",
+                evidence=evidence,
+                seed=48,
+                provider="chatgpt",
+                model=None,
+                port=11434,
+                require_write_read=True,
+                max_tokens=controller.DEFAULT_MAX_TOKENS,
+                model_timeout=30.0,
+                run_timeout=90.0,
+            )
+        )
+    )
+    assert report["status"] == "finished", report
+    assert report["provider_family"] == "openai"
+    assert report["selected_model"] == "gpt-6-luna"
+    assert report["requested_model"] == "gpt-6-luna"
+    assert report["write_read_verified"] is True
+    assert report["classifications"] == ["expected_success", "expected_success"]
+    manifest = json.loads((evidence / "manifest.json").read_text())
+    assert manifest["pending_cleanup"] is False
+    assert not Path(manifest["scratch_path"]).exists()
+
+
+def test_chatgpt_provider_rejects_local_port_override() -> None:
+    with pytest.raises(ValueError, match="port"):
+        asyncio.run(
+            controller._run_cli(
+                Namespace(
+                    task="test",
+                    evidence=Path("/tmp/unused-explorer-evidence"),
+                    seed=1,
+                    provider="chatgpt",
+                    model="gpt-6-luna",
+                    port=12345,
+                    max_tokens=256,
+                    model_timeout=30.0,
+                    run_timeout=90.0,
+                )
+            )
+        )
+
+
+def test_unverified_model_finish_exits_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_run(_args: Namespace) -> dict[str, object]:
+        return {
+            "status": "inconclusive",
+            "finish_reason": "unverified_completion",
+            "write_read_verified": False,
+        }
+
+    monkeypatch.setattr(controller, "_run_cli", fake_run)
+    result = controller.main(
+        [
+            "--provider",
+            "chatgpt",
+            "--task",
+            "Write and read a file.",
+            "--evidence",
+            str(tmp_path / "unused"),
+            "--require-write-read",
+        ]
+    )
+    assert result == 2
+    assert "unverified_completion" in capsys.readouterr().err
+
+
+def test_model_cannot_claim_readback_without_a_real_read(tmp_path: Path) -> None:
+    _require_child_loopback()
+
+    class PrematureFinish(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            history = json.loads(messages[-1]["content"])["history"]
+            if not history:
+                action = {
+                    "action": "step",
+                    "label": "write only",
+                    "prompt": "Write a disposable file.",
+                    "tool_call": {
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "proof.txt",
+                            "content": "proof\n",
+                            "overwrite": False,
+                        },
+                    },
+                    "expect": {"kind": "expected_success"},
+                }
+                reason = "write a probe"
+            else:
+                assert history[0]["observation"]["classification"] == "expected_success"
+                action = {"action": "finish"}
+                reason = "The file was written and read back successfully."
+            yield StreamChunk(
+                content=json.dumps({"decision": action, "reason": reason}),
+                is_done=True,
+                model=self.model_name,
+            )
+
+    evidence = tmp_path / "premature-finish"
+    report = asyncio.run(
+        controller.run_controller(
+            task="Write a file and verify it by reading it back.",
+            evidence=evidence,
+            seed=43,
+            provider=PrematureFinish(),
+            require_write_read=True,
+        )
+    )
+    assert report["status"] == "inconclusive"
+    assert report["finish_reason"] == "unverified_completion"
+    assert report["write_read_verified"] is False
+    assert report["classifications"] == ["expected_success"]
+    actions = [
+        json.loads(line)
+        for line in (evidence / "actions.jsonl").read_text().splitlines()
+    ]
+    assert [action["action"] for action in actions] == ["step", "finish"]
+    assert actions[0]["tool_call"]["name"] == "write_file"
+    manifest = json.loads((evidence / "manifest.json").read_text())
+    assert manifest["pending_cleanup"] is False
+    assert not Path(manifest["scratch_path"]).exists()
+
+
+def test_readback_verifier_rejects_unverified_or_stale_observations() -> None:
+    def step(
+        tool: str, path: str, classification: str, before: str | None, after: str | None
+    ):
+        return {
+            "action": {"tool_call": {"name": tool, "arguments": {"file_path": path}}},
+            "observation": {
+                "classification": classification,
+                "tool_outcome": {"success": True},
+                "target_before_sha256": before,
+                "target_after_sha256": after,
+            },
+        }
+
+    digest, changed = "a" * 64, "b" * 64
+    wrote = step("write_file", "same.txt", "expected_success", None, digest)
+    read = step("read_file", "same.txt", "expected_success", digest, digest)
+    assert controller._has_verified_write_read([wrote, read]) is True
+    assert controller._has_verified_write_read([wrote]) is False
+    assert (
+        controller._has_verified_write_read(
+            [wrote, step("read_file", "other.txt", "expected_success", digest, digest)]
+        )
+        is False
+    )
+    assert (
+        controller._has_verified_write_read(
+            [wrote, step("read_file", "same.txt", "observed", digest, digest)]
+        )
+        is False
+    )
+    assert (
+        controller._has_verified_write_read(
+            [wrote, step("read_file", "same.txt", "expected_success", digest, changed)]
+        )
+        is False
+    )
+    assert (
+        controller._has_verified_write_read(
+            [wrote, step("write_file", "same.txt", "observed", digest, changed), read]
+        )
+        is False
+    )
 
 
 def test_controller_rejects_unauthorized_model_tool_before_dispatch(
