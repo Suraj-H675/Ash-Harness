@@ -1033,6 +1033,8 @@ def _classify(
             "unexpected_failure",
             f"Ash exited with {process_status.get('exit_code')}",
         )
+    if tool_outcome is not None and tool_outcome.get("ambiguous") is True:
+        return "ambiguous_outcome", "tool dispatch outcome is ambiguous"
     if request.expectation.kind == "observed":
         return "observed", None
     if process_status.get("session_id_in_result") is not True:

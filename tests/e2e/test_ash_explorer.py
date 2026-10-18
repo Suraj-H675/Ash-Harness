@@ -103,6 +103,40 @@ def test_tool_error_without_success_field_is_a_refusal_outcome() -> None:
     assert outcome["error"] == event["error"]
 
 
+@pytest.mark.parametrize("expectation_kind", ["observed", "expected_refusal"])
+def test_ambiguous_tool_outcome_precedes_observed_and_refusal_matching(
+    expectation_kind: str,
+) -> None:
+    expectation = (
+        ExpectedOutcome("expected_refusal", "outside project scope")
+        if expectation_kind == "expected_refusal"
+        else ExpectedOutcome("observed")
+    )
+    request = StepRequest(
+        label="ambiguous refusal",
+        prompt="Read the requested path.",
+        file_path="probe.txt",
+        content="",
+        overwrite=False,
+        expectation=expectation,
+        tool_name="read_file",
+    )
+
+    assert _classify(
+        request,
+        {"exit_code": 0, "session_id_in_result": True},
+        {
+            "success": False,
+            "ambiguous": True,
+            "error": "Access denied: outside project scope",
+        },
+        None,
+        None,
+        [],
+        {},
+    ) == ("ambiguous_outcome", "tool dispatch outcome is ambiguous")
+
+
 def test_tool_result_extracted_from_actual_ash_response_wrapper() -> None:
     content = (
         '<tool_response name="write_file" call_id="call-1">\n'
@@ -404,7 +438,7 @@ def test_agent_directed_run_adapts_after_real_write_observation(
         process.stdin.flush()
         third_observation = receive()
         assert third_observation["type"] == "observation"
-        assert third_observation["classification"] == "expected_refusal"
+        assert third_observation["classification"] == "ambiguous_outcome"
 
         finish_line = b'{"action":"finish"}\n'
         process.stdin.write(finish_line)
@@ -442,6 +476,7 @@ def test_agent_directed_run_adapts_after_real_write_observation(
     assert second["target_before_sha256"] == first["target_after_sha256"]
     assert second["target_after_sha256"] == first["target_after_sha256"]
     assert third["tool_outcome"]["success"] is False
+    assert third["tool_outcome"]["ambiguous"] is True
     assert "outside project scope" in third["tool_outcome"]["error"]
     marker_hash = hashlib.sha256(b"ASH_EXPLORER_OUTSIDE_MARKER\n").hexdigest()
     assert third["target_before_sha256"] == marker_hash
@@ -505,7 +540,7 @@ def test_agent_directed_run_adapts_after_real_write_observation(
     ] == [
         "expected_success",
         "expected_success",
-        "expected_refusal",
+        "ambiguous_outcome",
     ]
     for index in ("01", "02", "03"):
         original = json.loads(
