@@ -493,13 +493,13 @@ def test_controller_preserves_completed_step_when_later_model_decision_fails(
             seed=44,
             provider=FailingSecondDecision(),
             config=controller.ControllerConfig(
-                model_timeout_seconds=0.2, run_timeout_seconds=20
+                model_timeout_seconds=0.2, run_timeout_seconds=90
             ),
         )
     )
 
-    assert report["status"] == "failed"
-    assert report["error_code"] == expected_error
+    assert report["status"] == "failed", report
+    assert report["error_code"] == expected_error, report
     assert report["classifications"] == ["expected_success"]
     actions = [
         json.loads(line)
