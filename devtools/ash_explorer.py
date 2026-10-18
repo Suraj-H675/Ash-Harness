@@ -56,9 +56,12 @@ class StepRequest:
     content: str
     overwrite: bool
     expectation: ExpectedOutcome
+    tool_name: Literal["write_file", "read_file"] = "write_file"
 
     @property
     def tool_arguments(self) -> dict[str, object]:
+        if self.tool_name == "read_file":
+            return {"file_path": self.file_path}
         return {
             "file_path": self.file_path,
             "content": self.content,
@@ -212,14 +215,18 @@ class _FixtureServer:
                     return
 
                 if number == 1:
-                    if not _request_offers_write_file(request_payload):
+                    if not _request_offers_tool(request_payload, action.tool_name):
                         with state.lock:
                             state.error = (
-                                "Ash request did not offer the write_file tool"
+                                f"Ash request did not offer the {action.tool_name} tool"
                             )
                         self._json(
                             502,
-                            {"error": {"message": "write_file tool unavailable"}},
+                            {
+                                "error": {
+                                    "message": f"{action.tool_name} tool unavailable"
+                                }
+                            },
                         )
                         return
                     self._stream(
@@ -239,7 +246,7 @@ class _FixtureServer:
                                                     "id": call_id,
                                                     "type": "function",
                                                     "function": {
-                                                        "name": "write_file",
+                                                        "name": action.tool_name,
                                                         "arguments": json.dumps(
                                                             action.tool_arguments,
                                                             ensure_ascii=False,
@@ -270,7 +277,9 @@ class _FixtureServer:
                     )
                     return
 
-                outcome = _extract_tool_outcome(request_payload, call_id)
+                outcome = _extract_tool_outcome(
+                    request_payload, call_id, action.tool_name
+                )
                 with state.lock:
                     state.tool_outcome = outcome
                     if outcome is None:
@@ -436,7 +445,7 @@ class RunState:
             event
             for event in events
             if event.get("type") in {"tool.completed", "tool.error"}
-            and event.get("tool") == "write_file"
+            and event.get("tool") == request.tool_name
         ]
         tool_outcome = _tool_outcome(tool_events, fixture_snapshot)
         result_event = next(
@@ -891,21 +900,27 @@ def _parse_action(raw_line: bytes) -> tuple[str, StepRequest | None]:
     tool_call = payload.get("tool_call")
     if not isinstance(tool_call, dict) or set(tool_call) != {"name", "arguments"}:
         raise ExplorerError("tool_call must contain only name and arguments")
-    if tool_call.get("name") != "write_file":
-        raise ExplorerError("only the write_file tool is supported")
+    tool_name = tool_call.get("name")
+    if tool_name not in {"write_file", "read_file"}:
+        raise ExplorerError("only write_file and read_file are supported")
     arguments = tool_call.get("arguments")
-    if not isinstance(arguments, dict) or set(arguments) != {
-        "file_path",
-        "content",
-        "overwrite",
-    }:
-        raise ExplorerError(
-            "write_file arguments must be file_path, content, overwrite"
-        )
+    if not isinstance(arguments, dict):
+        raise ExplorerError("tool arguments must be an object")
+    if tool_name == "write_file":
+        if set(arguments) != {"file_path", "content", "overwrite"}:
+            raise ExplorerError(
+                "write_file arguments must be file_path, content, overwrite"
+            )
+    elif set(arguments) != {"file_path"}:
+        raise ExplorerError("read_file arguments must contain only file_path")
     file_path = _bounded_string(arguments.get("file_path"), "file_path", MAX_PATH_BYTES)
     _validate_relative_path_syntax(file_path)
-    content = _bounded_string(arguments.get("content"), "content", MAX_CONTENT_BYTES)
-    overwrite = arguments.get("overwrite")
+    content = (
+        _bounded_string(arguments.get("content"), "content", MAX_CONTENT_BYTES)
+        if tool_name == "write_file"
+        else ""
+    )
+    overwrite = arguments.get("overwrite", False)
     if type(overwrite) is not bool:
         raise ExplorerError("overwrite must be a JSON boolean")
 
@@ -936,7 +951,9 @@ def _parse_action(raw_line: bytes) -> tuple[str, StepRequest | None]:
         )
     return (
         "step",
-        StepRequest(label, prompt, file_path, content, overwrite, expectation),
+        StepRequest(
+            label, prompt, file_path, content, overwrite, expectation, tool_name
+        ),
     )
 
 
@@ -1021,11 +1038,29 @@ def _classify(
     if process_status.get("session_id_in_result") is not True:
         return "driver_failure", "Ash completion omitted its session id"
     if tool_outcome is None:
-        return "unexpected_failure", "no write_file outcome was present in Ash evidence"
+        return (
+            "unexpected_failure",
+            f"no {request.tool_name} outcome was present in Ash evidence",
+        )
 
     succeeded = tool_outcome.get("success") is True
     error = tool_outcome.get("error")
     if request.expectation.kind == "expected_success":
+        if request.tool_name == "read_file":
+            output = tool_outcome.get("output")
+            if (
+                succeeded
+                and before_hash is not None
+                and before_hash == after_hash
+                and isinstance(output, str)
+                and output.startswith("[read_file metadata: ")
+                and f"; sha256={before_hash};" in output.split("\n", 1)[0]
+            ):
+                return "expected_success", None
+            return (
+                "unexpected_failure",
+                "read did not return unchanged target file metadata",
+            )
         expected_bytes_hash = hashlib.sha256(
             request.content.encode("utf-8")
         ).hexdigest()
@@ -1091,20 +1126,20 @@ def _parse_stream_events(raw: bytes) -> tuple[list[dict[str, Any]], list[int]]:
     return events, malformed
 
 
-def _request_offers_write_file(request: dict[str, Any]) -> bool:
+def _request_offers_tool(request: dict[str, Any], name: str) -> bool:
     tools = request.get("tools")
     if not isinstance(tools, list):
         return False
     return any(
         isinstance(tool, dict)
         and isinstance(tool.get("function"), dict)
-        and tool["function"].get("name") == "write_file"
+        and tool["function"].get("name") == name
         for tool in tools
     )
 
 
 def _extract_tool_outcome(
-    request: dict[str, Any], call_id: str
+    request: dict[str, Any], call_id: str, tool_name: str = "write_file"
 ) -> dict[str, object] | None:
     messages = request.get("messages")
     if not isinstance(messages, list):
@@ -1120,7 +1155,7 @@ def _extract_tool_outcome(
             or len(content.encode("utf-8")) > MAX_CONTENT_BYTES * 2
         ):
             return {"tool_call_id": call_id, "content": str(content)[:2048]}
-        prefix = f'<tool_response name="write_file" call_id="{call_id}">\n'
+        prefix = f'<tool_response name="{tool_name}" call_id="{call_id}">\n'
         suffix = "\n</tool_response>"
         body = (
             content[len(prefix) : -len(suffix)]

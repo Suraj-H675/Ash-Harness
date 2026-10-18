@@ -121,6 +121,30 @@ def test_tool_result_extracted_from_actual_ash_response_wrapper() -> None:
     assert outcome["content"] == content
 
 
+def test_read_action_rejects_unlisted_tools_and_arguments() -> None:
+    def action(name: str, arguments: dict[str, object]) -> bytes:
+        return json.dumps(
+            {
+                "action": "step",
+                "label": "probe",
+                "prompt": "read",
+                "tool_call": {"name": name, "arguments": arguments},
+                "expect": {"kind": "observed"},
+            }
+        ).encode()
+
+    _, request = explorer._parse_action(action("read_file", {"file_path": "probe.txt"}))
+    assert request is not None
+    assert request.tool_name == "read_file"
+    assert request.tool_arguments == {"file_path": "probe.txt"}
+    with pytest.raises(ExplorerError, match="read_file arguments"):
+        explorer._parse_action(
+            action("read_file", {"file_path": "probe.txt", "content": "unexpected"})
+        )
+    with pytest.raises(ExplorerError, match="only write_file and read_file"):
+        explorer._parse_action(action("execute_shell", {"command": "pwd"}))
+
+
 def test_sigterm_enters_the_runner_cleanup_path() -> None:
     with pytest.raises(KeyboardInterrupt, match="received signal"):
         _handle_termination(signal.SIGTERM, None)
@@ -346,27 +370,41 @@ def test_agent_directed_run_adapts_after_real_write_observation(
 
         second_action = {
             "action": "step",
-            "label": "adjacent scratch escape",
-            "prompt": "Try the requested write exactly.",
+            "label": "read back written file",
+            "prompt": "Read the file that was just created.",
             "tool_call": {
-                "name": "write_file",
-                "arguments": {
-                    "file_path": "../outside-marker.txt",
-                    "content": "changed\n",
-                    "overwrite": True,
-                },
+                "name": "read_file",
+                "arguments": {"file_path": "probe.txt"},
             },
-            "expect": {
-                "kind": "expected_refusal",
-                "error_contains": "outside project scope",
-            },
+            "expect": {"kind": "expected_success"},
         }
         second_line = json.dumps(second_action, separators=(",", ":")).encode() + b"\n"
         process.stdin.write(second_line)
         process.stdin.flush()
         second_observation = receive()
         assert second_observation["type"] == "observation"
-        assert second_observation["classification"] == "expected_refusal"
+        assert second_observation["classification"] == "expected_success"
+        assert "1: probe-ok" in second_observation["tool_outcome"]["output"]
+
+        third_action = {
+            "action": "step",
+            "label": "adjacent scratch read escape",
+            "prompt": "Try the requested read exactly.",
+            "tool_call": {
+                "name": "read_file",
+                "arguments": {"file_path": "../outside-marker.txt"},
+            },
+            "expect": {
+                "kind": "expected_refusal",
+                "error_contains": "outside project scope",
+            },
+        }
+        third_line = json.dumps(third_action, separators=(",", ":")).encode() + b"\n"
+        process.stdin.write(third_line)
+        process.stdin.flush()
+        third_observation = receive()
+        assert third_observation["type"] == "observation"
+        assert third_observation["classification"] == "expected_refusal"
 
         finish_line = b'{"action":"finish"}\n'
         process.stdin.write(finish_line)
@@ -392,29 +430,33 @@ def test_agent_directed_run_adapts_after_real_write_observation(
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
 
-    accepted_actions = [first_line, second_line, finish_line]
+    accepted_actions = [first_line, second_line, third_line, finish_line]
     assert (evidence / "actions.jsonl").read_bytes() == b"".join(accepted_actions)
 
     first = json.loads((evidence / "steps" / "01" / "observation.json").read_text())
     second = json.loads((evidence / "steps" / "02" / "observation.json").read_text())
+    third = json.loads((evidence / "steps" / "03" / "observation.json").read_text())
     assert first["tool_outcome"]["success"] is True
     assert first["target_after_sha256"] == hashlib.sha256(b"probe-ok\n").hexdigest()
-    assert second["tool_outcome"]["success"] is False
-    assert "outside project scope" in second["tool_outcome"]["error"]
+    assert second["tool_outcome"]["success"] is True
+    assert second["target_before_sha256"] == first["target_after_sha256"]
+    assert second["target_after_sha256"] == first["target_after_sha256"]
+    assert third["tool_outcome"]["success"] is False
+    assert "outside project scope" in third["tool_outcome"]["error"]
     marker_hash = hashlib.sha256(b"ASH_EXPLORER_OUTSIDE_MARKER\n").hexdigest()
-    assert second["target_before_sha256"] == marker_hash
-    assert second["target_after_sha256"] == marker_hash
+    assert third["target_before_sha256"] == marker_hash
+    assert third["target_after_sha256"] == marker_hash
 
-    provider = json.loads((evidence / "steps" / "02" / "provider.json").read_text())
+    provider = json.loads((evidence / "steps" / "03" / "provider.json").read_text())
     assert provider["tool_outcome"]["success"] is False
-    assert provider["tool_outcome"]["tool_call_id"] == "ash-explorer-23-2"
+    assert provider["tool_outcome"]["tool_call_id"] == "ash-explorer-23-3"
     events = [
         json.loads(line)
-        for line in (evidence / "steps" / "02" / "stdout.bin").read_text().splitlines()
+        for line in (evidence / "steps" / "03" / "stdout.bin").read_text().splitlines()
     ]
     assert any(
         event.get("type") in {"tool.completed", "tool.error"}
-        and event.get("tool") == "write_file"
+        and event.get("tool") == "read_file"
         and (
             event.get("success") is False
             or (
@@ -462,9 +504,10 @@ def test_agent_directed_run_adapts_after_real_write_observation(
         if event["type"] == "observation"
     ] == [
         "expected_success",
+        "expected_success",
         "expected_refusal",
     ]
-    for index in ("01", "02"):
+    for index in ("01", "02", "03"):
         original = json.loads(
             (evidence / "steps" / index / "observation.json").read_text()
         )
