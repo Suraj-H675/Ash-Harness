@@ -11,14 +11,19 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ash.safety.guard import SafetyGuard
+from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import (
     ScopedFileChanged,
     ScopedIOError,
     atomic_write_scoped_bytes,
     read_scoped_bytes,
 )
-from ash.tools.base import BaseTool, ToolExecutionContract, ToolResult, count_output_tokens
+from ash.tools.base import (
+    BaseTool,
+    ToolExecutionContract,
+    ToolResult,
+    count_output_tokens,
+)
 
 
 BINARY_DETECTION_BYTES = 8192
@@ -176,7 +181,10 @@ class ReadFileTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ReadFileArgs(**kwargs)
-        resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        try:
+            resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        except SafetyViolation as exc:
+            return ToolResult(success=False, output="", error=str(exc))
 
         if not resolved_path.exists():
             return ToolResult(

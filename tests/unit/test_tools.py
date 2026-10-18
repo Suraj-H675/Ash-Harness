@@ -126,6 +126,21 @@ async def test_read_file_returns_numbered_line_slice(
 
 
 @pytest.mark.asyncio
+async def test_read_file_policy_denial_is_a_completed_refusal(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    outside = project_root.parent / "outside-marker.txt"
+    outside.write_text("private marker\n", encoding="utf-8")
+
+    result = await ReadFileTool(guard).run(file_path="../outside-marker.txt")
+
+    assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert "outside project scope" in (result.error or "")
+    assert outside.read_text(encoding="utf-8") == "private marker\n"
+
+
+@pytest.mark.asyncio
 async def test_read_file_blocks_binary_null_byte(
     project_root: Path,
     guard: SafetyGuard,

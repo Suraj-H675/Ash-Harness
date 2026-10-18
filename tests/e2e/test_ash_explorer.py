@@ -438,7 +438,7 @@ def test_agent_directed_run_adapts_after_real_write_observation(
         process.stdin.flush()
         third_observation = receive()
         assert third_observation["type"] == "observation"
-        assert third_observation["classification"] == "ambiguous_outcome"
+        assert third_observation["classification"] == "expected_refusal"
 
         finish_line = b'{"action":"finish"}\n'
         process.stdin.write(finish_line)
@@ -476,7 +476,7 @@ def test_agent_directed_run_adapts_after_real_write_observation(
     assert second["target_before_sha256"] == first["target_after_sha256"]
     assert second["target_after_sha256"] == first["target_after_sha256"]
     assert third["tool_outcome"]["success"] is False
-    assert third["tool_outcome"]["ambiguous"] is True
+    assert third["tool_outcome"]["ambiguous"] is False
     assert "outside project scope" in third["tool_outcome"]["error"]
     marker_hash = hashlib.sha256(b"ASH_EXPLORER_OUTSIDE_MARKER\n").hexdigest()
     assert third["target_before_sha256"] == marker_hash
@@ -540,7 +540,7 @@ def test_agent_directed_run_adapts_after_real_write_observation(
     ] == [
         "expected_success",
         "expected_success",
-        "ambiguous_outcome",
+        "expected_refusal",
     ]
     for index in ("01", "02", "03"):
         original = json.loads(
