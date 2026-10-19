@@ -413,6 +413,9 @@ def test_chatgpt_subscription_provider_uses_existing_adapter(
                 model=None,
                 port=11434,
                 require_write_read=True,
+                require_probe=[
+                    '{"tool":"read_file","file_path":"probe.txt","classification":"expected_success"}'
+                ],
                 max_tokens=controller.DEFAULT_MAX_TOKENS,
                 model_timeout=30.0,
                 run_timeout=90.0,
@@ -424,6 +427,8 @@ def test_chatgpt_subscription_provider_uses_existing_adapter(
     assert report["selected_model"] == "gpt-6-luna"
     assert report["requested_model"] == "gpt-6-luna"
     assert report["write_read_verified"] is True
+    assert report["required_probes_satisfied"] is True
+    assert report["unmet_required_probes"] == []
     assert report["classifications"] == ["expected_success", "expected_success"]
     manifest = json.loads((evidence / "manifest.json").read_text())
     assert manifest["pending_cleanup"] is False
@@ -449,13 +454,21 @@ def test_chatgpt_provider_rejects_local_port_override() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "status, reason",
+    [("inconclusive", "unverified_completion"), ("limited", "step_budget")],
+)
 def test_unverified_model_finish_exits_nonzero(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: str,
+    reason: str,
 ) -> None:
     async def fake_run(_args: Namespace) -> dict[str, object]:
         return {
-            "status": "inconclusive",
-            "finish_reason": "unverified_completion",
+            "status": status,
+            "finish_reason": reason,
             "write_read_verified": False,
         }
 
@@ -472,7 +485,209 @@ def test_unverified_model_finish_exits_nonzero(
         ]
     )
     assert result == 2
-    assert "unverified_completion" in capsys.readouterr().err
+    assert reason in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"tool":"write_file","file_path":"x.txt","classification":"observed"}',
+        '{"tool":"write_file","file_path":"x.txt","classification":"expected_refusal"}',
+        '{"tool":"read_file","file_path":"/absolute.txt","classification":"expected_success"}',
+        '{"tool":"execute_shell","file_path":"x.txt","classification":"expected_success"}',
+        '{"tool":"read_file","file_path":"x.txt","classification":"expected_success","unexpected":true}',
+        '{"tool":"read_file","file_path":"x.txt","classification":"expected_success","tool":"write_file"}',
+        '{"tool":{},"file_path":"x.txt","classification":"expected_success"}',
+        '{"tool":"read_file","file_path":"x.txt","classification":{}}',
+    ],
+)
+def test_required_probe_contract_rejects_unsupported_or_ambiguous_terms(
+    raw: str,
+) -> None:
+    with pytest.raises(ValueError):
+        controller._parse_required_probes([raw])
+
+
+def test_required_probe_contract_distinguishes_assertions_from_observations() -> None:
+    required = controller._parse_required_probes(
+        [
+            json.dumps(
+                {
+                    "tool": "write_file",
+                    "file_path": "../outside-marker.txt",
+                    "classification": "expected_refusal",
+                    "error_contains": "outside project scope",
+                }
+            )
+        ]
+    )
+    assert len(required) == 1
+    action = {
+        "tool_call": {
+            "name": "write_file",
+            "arguments": {"file_path": "../outside-marker.txt"},
+        }
+    }
+    observation = {
+        "classification": "expected_refusal",
+        "tool_outcome": {
+            "success": False,
+            "ambiguous": False,
+            "error": "Access denied: outside project scope",
+        },
+    }
+    entry = {"action": action, "observation": observation}
+    assert controller._unmet_required_probes(required, [entry]) == []
+    assert controller._unmet_required_probes(
+        required,
+        [
+            {
+                "action": action,
+                "observation": {
+                    **observation,
+                    "tool_outcome": {
+                        **observation["tool_outcome"],
+                        "error": "Unrelated refusal",
+                    },
+                },
+            }
+        ],
+    ) == list(required)
+    for field, wrong in (
+        ("classification", "observed"),
+        ("classification", "expected_success"),
+    ):
+        assert controller._unmet_required_probes(
+            required, [{"action": action, "observation": {**observation, field: wrong}}]
+        ) == list(required)
+    assert controller._unmet_required_probes(
+        required,
+        [
+            {
+                "action": action,
+                "observation": {
+                    **observation,
+                    "tool_outcome": {**observation["tool_outcome"], "ambiguous": True},
+                },
+            }
+        ],
+    ) == list(required)
+    assert controller._unmet_required_probes(
+        required,
+        [
+            {
+                "action": {
+                    "tool_call": {
+                        "name": "write_file",
+                        "arguments": {"file_path": "different.txt"},
+                    }
+                },
+                "observation": observation,
+            }
+        ],
+    ) == list(required)
+
+
+def test_model_finish_cannot_satisfy_missing_required_probe(tmp_path: Path) -> None:
+    _require_child_loopback()
+    required = controller._parse_required_probes(
+        [
+            '{"tool":"read_file","file_path":"never-read.txt","classification":"expected_success"}'
+        ]
+    )
+    provider = FakeProvider()
+    evidence = tmp_path / "required-not-met"
+    report = asyncio.run(
+        controller.run_controller(
+            task="Write and read a probe, then inspect another file.",
+            evidence=evidence,
+            seed=49,
+            provider=provider,
+            required_probes=required,
+        )
+    )
+    assert report["status"] == "inconclusive"
+    assert report["finish_reason"] == "unverified_completion"
+    assert report["write_read_verified"] is True
+    assert report["required_probes_satisfied"] is False
+    assert report["unmet_required_probes"] == [
+        {
+            "tool": "read_file",
+            "file_path": "never-read.txt",
+            "classification": "expected_success",
+            "error_contains": None,
+        }
+    ]
+    assert all(
+        call["required_probes"] == report["unmet_required_probes"]
+        for call in provider.calls
+    )
+    manifest = json.loads((evidence / "manifest.json").read_text())
+    assert manifest["pending_cleanup"] is False
+    assert not Path(manifest["scratch_path"]).exists()
+
+
+def test_required_probe_verified_by_real_ash_refusal(tmp_path: Path) -> None:
+    _require_child_loopback()
+
+    class RefusalProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            history = json.loads(messages[-1]["content"])["history"]
+            if not history:
+                decision = {
+                    "action": "step",
+                    "label": "boundary denial",
+                    "prompt": "Attempt a boundary write.",
+                    "tool_call": {
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "../outside-marker.txt",
+                            "content": "denied\n",
+                            "overwrite": True,
+                        },
+                    },
+                    "expect": {
+                        "kind": "expected_refusal",
+                        "error_contains": "outside project scope",
+                    },
+                }
+            else:
+                assert (
+                    history[-1]["observation"]["classification"] == "expected_refusal"
+                )
+                decision = {"action": "finish"}
+            yield StreamChunk(
+                content=json.dumps(
+                    {"decision": decision, "reason": "inspect policy boundary"}
+                ),
+                is_done=True,
+                model=self.model_name,
+            )
+
+    required = controller._parse_required_probes(
+        [
+            '{"tool":"write_file","file_path":"../outside-marker.txt","classification":"expected_refusal","error_contains":"outside project scope"}'
+        ]
+    )
+    evidence = tmp_path / "required-refusal"
+    report = asyncio.run(
+        controller.run_controller(
+            task="Check disposable scratch boundary.",
+            evidence=evidence,
+            seed=50,
+            provider=RefusalProvider(),
+            required_probes=required,
+        )
+    )
+    assert report["status"] == "finished", report
+    assert report["required_probes_satisfied"] is True
+    assert report["unmet_required_probes"] == []
+    assert report["classifications"] == ["expected_refusal"]
+    observation = json.loads(
+        (evidence / "steps" / "01" / "observation.json").read_text()
+    )
+    assert observation["tool_outcome"]["dispatched"] is False
+    assert observation["target_before_sha256"] == observation["target_after_sha256"]
 
 
 def test_model_cannot_claim_readback_without_a_real_read(tmp_path: Path) -> None:

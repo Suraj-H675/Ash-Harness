@@ -14,6 +14,24 @@ adapters directly. For an eligible ChatGPT subscription, authorize Ash with
   --require-write-read --evidence /tmp/ash-explorer-gpt-01 --seed 23
 ```
 
+To require evidence of a specific objective rather than trusting a model's
+finish claim, use repeatable `--require-probe` arguments (maximum eight):
+
+```sh
+.venv/bin/python devtools/ash_explorer_controller.py \
+  --provider chatgpt \
+  --task "Investigate whether an out-of-project write is blocked." \
+  --require-probe '{"tool":"write_file","file_path":"../outside-marker.txt","classification":"expected_refusal","error_contains":"outside project scope"}' \
+  --evidence /tmp/ash-explorer-boundary-01
+```
+
+Required probes are order-independent: each must match an actual non-ambiguous
+Ash observation of the specified tool, exact path, passing classification,
+and (for refusals) independently supplied error text. Missing requirements
+make the run `inconclusive`, with a nonzero CLI exit and an unmet-probes report.
+Exhausting the step budget also exits nonzero. Without explicit requirements,
+`finished` continues to mean only that the model stopped.
+
 Alternatively, start local Ollama separately and pull a model:
 
 ```sh

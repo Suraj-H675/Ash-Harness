@@ -17,7 +17,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import httpx
@@ -41,6 +41,7 @@ DEFAULT_MAX_TOKENS = 512
 MAX_TASK_BYTES = 16 * 1024
 MAX_RUNNER_EVENT_BYTES = 1024 * 1024
 MAX_REASON_BYTES = 512
+MAX_REQUIRED_PROBES = 8
 MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 SYSTEM_INSTRUCTIONS = """You choose bounded file probes for a disposable Ash Explorer run.
@@ -119,6 +120,109 @@ class ControllerConfig:
             run_timeout_seconds=run_timeout,
             max_tokens=max(1, min(self.max_tokens, MAX_TOKENS)),
         )
+
+
+@dataclass(frozen=True)
+class RequiredProbe:
+    tool: str
+    file_path: str
+    classification: str
+    error_contains: str | None = None
+
+
+def _parse_required_probes(raw: Sequence[str]) -> tuple[RequiredProbe, ...]:
+    if len(raw) > MAX_REQUIRED_PROBES:
+        raise ValueError("too many required probes")
+    probes: list[RequiredProbe] = []
+    for item in raw:
+        if len(item.encode("utf-8")) > 2048:
+            raise ValueError("required probe exceeds size limit")
+        try:
+            payload = _strict_json_loads(item)
+        except (ValueError, ControllerError) as exc:
+            raise ValueError("required probe must be strict JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("required probe must be an object")
+        classification = payload.get("classification")
+        if not isinstance(classification, str) or classification not in {
+            "expected_success",
+            "expected_refusal",
+        }:
+            raise ValueError("required probe must have a passing classification")
+        expected_fields = {"tool", "file_path", "classification"}
+        if classification == "expected_refusal":
+            expected_fields.add("error_contains")
+        if set(payload) != expected_fields:
+            raise ValueError("invalid required probe fields")
+        if not isinstance(payload.get("tool"), str) or payload["tool"] not in {
+            "read_file",
+            "write_file",
+        }:
+            raise ValueError("invalid required probe tool")
+        path = payload.get("file_path")
+        if (
+            not isinstance(path, str)
+            or len(path.encode("utf-8")) > _runner.MAX_PATH_BYTES
+        ):
+            raise ValueError("invalid required probe path")
+        try:
+            _runner._validate_relative_path_syntax(path)
+        except _runner.ExplorerError as exc:
+            raise ValueError("invalid required probe path") from exc
+        error_contains = payload.get("error_contains")
+        if classification == "expected_refusal" and (
+            not isinstance(error_contains, str)
+            or not error_contains.strip()
+            or len(error_contains.encode("utf-8")) > _runner.MAX_REFUSAL_TEXT_BYTES
+        ):
+            raise ValueError("invalid required refusal text")
+        probe = RequiredProbe(payload["tool"], path, classification, error_contains)
+        if probe in probes:
+            raise ValueError("duplicate required probe")
+        probes.append(probe)
+    return tuple(probes)
+
+
+def _unmet_required_probes(
+    probes: Sequence[RequiredProbe], history: Sequence[dict[str, object]]
+) -> list[RequiredProbe]:
+    unmet: list[RequiredProbe] = []
+    for probe in probes:
+        matched = False
+        for entry in history:
+            action, observation = entry.get("action"), entry.get("observation")
+            if not isinstance(action, dict) or not isinstance(observation, dict):
+                continue
+            call = action.get("tool_call")
+            if not isinstance(call, dict):
+                continue
+            arguments = call.get("arguments")
+            if (
+                call.get("name") != probe.tool
+                or not isinstance(arguments, dict)
+                or arguments.get("file_path") != probe.file_path
+                or observation.get("classification") != probe.classification
+            ):
+                continue
+            outcome = observation.get("tool_outcome")
+            if not isinstance(outcome, dict) or outcome.get("ambiguous") is not False:
+                continue
+            succeeded = outcome.get("success")
+            if probe.classification == "expected_success":
+                matched = succeeded is True
+            else:
+                error = outcome.get("error")
+                matched = (
+                    succeeded is False
+                    and isinstance(error, str)
+                    and isinstance(probe.error_contains, str)
+                    and probe.error_contains in error
+                )
+            if matched:
+                break
+        if not matched:
+            unmet.append(probe)
+    return unmet
 
 
 def _bounded_number(value: float, label: str, ceiling: float) -> float:
@@ -210,6 +314,7 @@ def _messages_and_request_bytes(
     task: str,
     history: Sequence[dict[str, object]],
     observation: dict[str, object] | None,
+    required_probes: Sequence[RequiredProbe] = (),
 ) -> tuple[list[dict[str, str]], bytes]:
     task_size = len(task.encode("utf-8", errors="strict"))
     if task_size > MAX_TASK_BYTES:
@@ -219,6 +324,8 @@ def _messages_and_request_bytes(
         "history": list(history),
         "latest_observation": observation,
     }
+    if required_probes:
+        user_payload["required_probes"] = [asdict(probe) for probe in required_probes]
     user_content = _json_bytes(user_payload).decode("utf-8")
     messages = [
         {"role": "system", "content": SYSTEM_INSTRUCTIONS},
@@ -536,7 +643,10 @@ def _make_report(
     runner_exit_code: int | None,
     runner_summary: Mapping[str, object] | None,
     verified_readback: bool,
+    required_probes: Sequence[RequiredProbe],
+    history: Sequence[dict[str, object]],
 ) -> dict[str, object]:
+    unmet = _unmet_required_probes(required_probes, history)
     report: dict[str, object] = {
         "schema_version": 1,
         "status": status,
@@ -554,6 +664,9 @@ def _make_report(
         "error_code": error_code,
         "runner_exit_code": runner_exit_code,
         "write_read_verified": verified_readback,
+        "required_probe_count": len(required_probes),
+        "required_probes_satisfied": not unmet if required_probes else None,
+        "unmet_required_probes": [asdict(probe) for probe in unmet],
     }
     if runner_summary is not None:
         report["pending_cleanup"] = runner_summary.get("pending_cleanup")
@@ -645,10 +758,13 @@ async def run_controller(
     requested_model: str | None = None,
     config: ControllerConfig = ControllerConfig(),
     require_write_read: bool = False,
+    required_probes: Sequence[RequiredProbe] = (),
 ) -> dict[str, object]:
     """Run Ash Explorer and choose each subsequent action from real observations."""
 
     bounded = config.bounded()
+    if len(required_probes) > MAX_REQUIRED_PROBES:
+        raise ValueError("too many required probes")
     if seed < 0 or seed > 2**32 - 1:
         raise ValueError("seed must be in the inclusive range 0..4294967295")
     identity = _provider_identity(provider, requested_model)
@@ -717,7 +833,9 @@ async def run_controller(
             latest = history[-1]["observation"] if history else None
             if not isinstance(latest, dict):
                 latest = None
-            messages, request_bytes = _messages_and_request_bytes(task, history, latest)
+            messages, request_bytes = _messages_and_request_bytes(
+                task, history, latest, required_probes
+            )
             observation_classification = (
                 str(latest.get("classification")) if latest is not None else None
             )
@@ -882,7 +1000,9 @@ async def run_controller(
                 in_flight_action_resolved = True
                 in_flight_action_hash = None
                 in_flight_step_index = None
-                if require_write_read and not _has_verified_write_read(history):
+                if (
+                    require_write_read and not _has_verified_write_read(history)
+                ) or _unmet_required_probes(required_probes, history):
                     status = "inconclusive"
                     finish_reason = "unverified_completion"
                 break
@@ -1016,6 +1136,8 @@ async def run_controller(
                     runner_exit_code=runner_exit_code,
                     runner_summary=runner_summary,
                     verified_readback=_has_verified_write_read(history),
+                    required_probes=required_probes,
+                    history=history,
                 )
                 evidence_log.report(report)
             finally:
@@ -1036,6 +1158,8 @@ async def run_controller(
         runner_exit_code=runner_exit_code,
         runner_summary=runner_summary,
         verified_readback=_has_verified_write_read(history),
+        required_probes=required_probes,
+        history=history,
     )
 
 
@@ -1198,6 +1322,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="report an early model finish as inconclusive until a successful write/read round-trip is evidenced",
     )
+    parser.add_argument(
+        "--require-probe",
+        action="append",
+        default=[],
+        help='required observed probe as JSON: {"tool":"write_file","file_path":"probe.txt","classification":"expected_success"}; repeatable',
+    )
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--model-timeout", type=float, default=MAX_MODEL_SECONDS)
     parser.add_argument("--run-timeout", type=float, default=MAX_RUN_SECONDS)
@@ -1205,6 +1335,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def _run_cli(args: argparse.Namespace) -> dict[str, object]:
+    required_probes = _parse_required_probes(getattr(args, "require_probe", []))
     provider_name = getattr(args, "provider", "ollama")
     if provider_name not in {"ollama", "chatgpt"}:
         raise ValueError("unsupported Explorer decision provider")
@@ -1234,6 +1365,7 @@ async def _run_cli(args: argparse.Namespace) -> dict[str, object]:
             requested_model=model,
             config=config,
             require_write_read=getattr(args, "require_write_read", False),
+            required_probes=required_probes,
         )
     async with httpx.AsyncClient(
         timeout=config.model_timeout_seconds, trust_env=False
@@ -1253,6 +1385,7 @@ async def _run_cli(args: argparse.Namespace) -> dict[str, object]:
             requested_model=model,
             config=config,
             require_write_read=getattr(args, "require_write_read", False),
+            required_probes=required_probes,
         )
 
 
@@ -1265,7 +1398,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ash Explorer controller failed: {type(exc).__name__}", file=sys.stderr)
         return 2
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
-    if report.get("status") in {"failed", "inconclusive"}:
+    if report.get("status") in {"failed", "inconclusive", "limited"}:
         print(
             f"Ash Explorer controller stopped: {report.get('error_code') or report.get('finish_reason')}",
             file=sys.stderr,
