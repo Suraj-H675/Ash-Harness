@@ -49,6 +49,29 @@ does not claim success for unbounded trees or symlinks. For a required
 Ash exposes this tool through `search_tools` discovery rather than the initial
 tool palette; Explorer's synthetic fixture follows that protocol.
 
+Read-only `search_text` searches file contents using the exact arguments
+`pattern`, `directory_path="."`, `glob` (string or null), `fixed_strings=true`,
+`case_sensitive=true`, and `max_results=64`. Patterns are nonempty literals up
+to 256 UTF-8 bytes; globs are bounded relative patterns up to 128 bytes.
+Explorer independently verifies exact `(path,line,text)` results and hashes
+all selected files in a stable bounded snapshot. Symlinks, unreadable or
+unstable inputs, and scan or output cap hits make a result unverifiable. A
+required search probe names the full query, for example:
+
+```sh
+.venv/bin/python devtools/ash_explorer_controller.py \
+  --provider chatgpt \
+  --task "Find the literal needle in text files." \
+  --require-probe '{"tool":"search_text","pattern":"needle","directory_path":".","glob":"*.txt","classification":"expected_success"}' \
+  --evidence /tmp/ash-explorer-search-01
+```
+
+Search probes pass only when Ash reports explicit success and non-truncation,
+the fixture result agrees with the tool event, and the independent before and
+after snapshots prove the complete result. The controller receives the
+bounded tool observation and compact verification evidence, not a second copy
+of workspace contents.
+
 Alternatively, start local Ollama separately and pull a model:
 
 ```sh
@@ -77,7 +100,8 @@ offers a smaller local decision boundary and accepts `tools=None`.
 The model receives the task and bounded prior action/observation history. It
 must return strict JSON for `step` or `finish`; each step is passed through the
 runner's `_parse_action` before dispatch. Only `write_file`, `read_file`,
-bounded `list_dir`, and bounded `glob_files` are available.
+bounded `list_dir`, bounded `glob_files`, and fixed-string `search_text` are
+available.
 The controller makes no provider retries and caps each model call at
 30 seconds, the whole run at 600 seconds, the context and completion at 64 KiB
 each, and the run at the runner's eight steps. Configuration values are
@@ -136,7 +160,7 @@ The writable marker beside the disposable project is still inside the run's
 private scratch directory. It lets a path-scope regression be observed without
 reaching user files. A successful read must report the target's actual SHA-256
 and leave it unchanged. The runner accepts only `write_file`, `read_file`,
-bounded `list_dir`, and bounded `glob_files`;
+bounded `list_dir`, bounded `glob_files`, and fixed-string `search_text`;
 it does not accept arbitrary Ash arguments, commands, plugins, MCP servers, or
 provider URLs. An outside-scope read that fails path validation before accessing the target
 can produce a verified refusal; genuinely ambiguous post-dispatch failures

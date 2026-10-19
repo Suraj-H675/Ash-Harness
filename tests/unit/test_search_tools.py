@@ -110,7 +110,9 @@ async def test_search_text_returns_file_and_line(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_text_supports_regex_and_case_insensitive_matching(tmp_path) -> None:
+async def test_search_text_supports_regex_and_case_insensitive_matching(
+    tmp_path,
+) -> None:
     (tmp_path / "app.py").write_text("first\nAlpha123\n", encoding="utf-8")
 
     result = await SearchTextTool(SafetyGuard(tmp_path)).run(
@@ -361,7 +363,9 @@ async def test_search_text_fallback_bounds_long_line(tmp_path, monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_search_text_fallback_skips_oversized_files(tmp_path, monkeypatch) -> None:
+async def test_search_text_marks_oversized_files_incomplete(
+    tmp_path, monkeypatch
+) -> None:
     monkeypatch.setattr("ash.tools.search.MAX_SEARCH_FILE_BYTES", 32)
     (tmp_path / "large.txt").write_text("needle " + "x" * 40)
 
@@ -371,11 +375,102 @@ async def test_search_text_fallback_skips_oversized_files(tmp_path, monkeypatch)
     )
 
     assert result.success is True
-    assert result.output == ""
+    assert result.truncated is True
+    assert "workspace search incomplete" in result.output
 
 
 @pytest.mark.asyncio
-async def test_search_text_fallback_bounds_workspace_scan(tmp_path, monkeypatch) -> None:
+async def test_search_text_matches_regex_across_long_logical_line(tmp_path) -> None:
+    line = "BEGIN" + "x" * 70_000 + "END"
+    (tmp_path / "long.txt").write_text(line + "\n", encoding="utf-8")
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="BEGIN.*END",
+        fixed_strings=False,
+    )
+
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output.startswith(
+        "long.txt:1:" + line[: search_module.MAX_SEARCH_LINE_CHARS]
+    )
+    assert "[line preview truncated]" in result.output
+
+
+@pytest.mark.asyncio
+async def test_search_text_fixed_string_can_match_line_ending(tmp_path) -> None:
+    (tmp_path / "ending.txt").write_text("needle\n", encoding="utf-8")
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle\n",
+        fixed_strings=True,
+    )
+
+    assert result.success is True
+    assert result.output == "ending.txt:1:needle"
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_search_text_reports_long_line_preview_truncation(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("ash.tools.search.MAX_SEARCH_LINE_CHARS", 16)
+    (tmp_path / "long.txt").write_text("needle" + "x" * 40 + "\n", encoding="utf-8")
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle",
+        fixed_strings=True,
+    )
+
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output == "long.txt:1:needlexxxxxxxxxx [line preview truncated]"
+
+
+@pytest.mark.asyncio
+async def test_search_text_marks_depth_omissions_incomplete(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("ash.tools.search.MAX_SEARCH_DEPTH", 1)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "needle.txt").write_text("needle\n", encoding="utf-8")
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle",
+        fixed_strings=True,
+    )
+
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output == "[workspace search incomplete]"
+
+
+@pytest.mark.asyncio
+async def test_search_text_marks_directory_enumeration_errors_incomplete(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "needle.txt").write_text("needle\n", encoding="utf-8")
+
+    def fail_list(_path, _guard):
+        raise PermissionError("injected directory denial")
+
+    monkeypatch.setattr(search_module, "list_scoped_directory", fail_list)
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle",
+        fixed_strings=True,
+    )
+
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output == "[workspace search incomplete]"
+
+
+@pytest.mark.asyncio
+async def test_search_text_fallback_bounds_workspace_scan(
+    tmp_path, monkeypatch
+) -> None:
     monkeypatch.setattr("ash.tools.search.MAX_SEARCH_SCAN_ENTRIES", 2)
     for index in range(3):
         (tmp_path / f"{index}.txt").write_text(str(index))

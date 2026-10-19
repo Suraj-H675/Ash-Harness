@@ -9,7 +9,7 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import signal
 import sys
@@ -17,7 +17,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -53,13 +53,14 @@ not private chain of thought, and at most 512 UTF-8 bytes.
 The decision must be exactly one of these forms:
 {\"action\":\"finish\"}
 or a runner step with exactly these fields:
-{\"action\":\"step\",\"label\":string,\"prompt\":string,\"tool_call\":{\"name\":\"write_file\"|\"read_file\"|\"list_dir\"|\"glob_files\",\"arguments\":object},\"expect\":object}
+{\"action\":\"step\",\"label\":string,\"prompt\":string,\"tool_call\":{\"name\":\"write_file\"|\"read_file\"|\"list_dir\"|\"glob_files\"|\"search_text\",\"arguments\":object},\"expect\":object}
 
 write_file arguments are exactly {\"file_path\":string,\"content\":string,\"overwrite\":boolean};
 read_file arguments are exactly {\"file_path\":string}. Paths must be relative.
 list_dir arguments are exactly {\"directory_path\":string,\"recursive\":false,\"max_results\":64}.
 glob_files arguments are exactly {\"pattern\":string,\"directory_path\":\".\",\"max_results\":64}.
-Use only write_file, read_file, nonrecursive list_dir, and bounded glob_files. For expected success use {\"kind\":\"expected_success\"};
+search_text arguments are exactly {\"pattern\":string,\"directory_path\":\".\",\"glob\":string|null,\"fixed_strings\":true,\"case_sensitive\":true,\"max_results\":64}.
+Use only write_file, read_file, nonrecursive list_dir, bounded glob_files, and fixed-string search_text. For expected success use {\"kind\":\"expected_success\"};
 for an expected refusal use {\"kind\":\"expected_refusal\",\"error_contains\":string};
 when the result is exploratory and has no pass condition use {\"kind\":\"observed\"}.
 Ash validates each step before dispatch. Never emit commands, URLs, environment
@@ -130,6 +131,9 @@ class RequiredProbe:
     file_path: str
     classification: str
     error_contains: str | None = None
+    pattern: str | None = None
+    directory_path: str | None = None
+    glob: str | None = None
 
 
 def _parse_required_probes(raw: Sequence[str]) -> tuple[RequiredProbe, ...]:
@@ -151,6 +155,78 @@ def _parse_required_probes(raw: Sequence[str]) -> tuple[RequiredProbe, ...]:
             "expected_refusal",
         }:
             raise ValueError("required probe must have a passing classification")
+        if payload.get("tool") == "search_text":
+            expected_fields = {
+                "tool",
+                "pattern",
+                "directory_path",
+                "glob",
+                "classification",
+            }
+            if classification == "expected_refusal":
+                expected_fields.add("error_contains")
+            if set(payload) != expected_fields:
+                raise ValueError("invalid required search probe fields")
+            pattern = payload.get("pattern")
+            try:
+                pattern_size = (
+                    len(pattern.encode("utf-8", errors="strict"))
+                    if isinstance(pattern, str)
+                    else 0
+                )
+            except UnicodeEncodeError as exc:
+                raise ValueError("invalid required search query") from exc
+            if (
+                not isinstance(pattern, str)
+                or not pattern
+                or pattern_size > _runner.MAX_SEARCH_PATTERN_BYTES
+                or _runner._has_control_chars(pattern)
+                or payload.get("directory_path") != "."
+            ):
+                raise ValueError("invalid required search query")
+            glob = payload.get("glob")
+            if glob is not None:
+                try:
+                    glob_size = (
+                        len(glob.encode("utf-8", errors="strict"))
+                        if isinstance(glob, str)
+                        else 0
+                    )
+                except UnicodeEncodeError as exc:
+                    raise ValueError("invalid required search glob") from exc
+                if (
+                    not isinstance(glob, str)
+                    or not glob
+                    or glob_size > _runner.MAX_GLOB_PATTERN_BYTES
+                    or _runner._has_control_chars(glob)
+                    or ".." in Path(glob).parts
+                    or ".." in PureWindowsPath(glob).parts
+                ):
+                    raise ValueError("invalid required search glob")
+                try:
+                    _runner._validate_relative_path_syntax(glob)
+                except _runner.ExplorerError as exc:
+                    raise ValueError("invalid required search glob") from exc
+            error_contains = payload.get("error_contains")
+            if classification == "expected_refusal" and (
+                not isinstance(error_contains, str)
+                or not error_contains.strip()
+                or len(error_contains.encode("utf-8")) > _runner.MAX_REFUSAL_TEXT_BYTES
+            ):
+                raise ValueError("invalid required refusal text")
+            probe = RequiredProbe(
+                "search_text",
+                "",
+                classification,
+                error_contains,
+                pattern,
+                ".",
+                glob,
+            )
+            if probe in probes:
+                raise ValueError("duplicate required probe")
+            probes.append(probe)
+            continue
         expected_fields = {"tool", "file_path", "classification"}
         if classification == "expected_refusal":
             expected_fields.add("error_contains")
@@ -193,6 +269,27 @@ def _parse_required_probes(raw: Sequence[str]) -> tuple[RequiredProbe, ...]:
     return tuple(probes)
 
 
+def _required_probe_payload(probe: RequiredProbe) -> dict[str, object]:
+    if probe.tool == "search_text":
+        payload: dict[str, object] = {
+            "tool": probe.tool,
+            "pattern": probe.pattern,
+            "directory_path": probe.directory_path,
+            "glob": probe.glob,
+            "classification": probe.classification,
+        }
+    else:
+        payload = {
+            "tool": probe.tool,
+            "file_path": probe.file_path,
+            "classification": probe.classification,
+            "error_contains": probe.error_contains,
+        }
+    if probe.classification == "expected_refusal":
+        payload["error_contains"] = probe.error_contains
+    return payload
+
+
 def _unmet_required_probes(
     probes: Sequence[RequiredProbe], history: Sequence[dict[str, object]]
 ) -> list[RequiredProbe]:
@@ -207,17 +304,27 @@ def _unmet_required_probes(
             if not isinstance(call, dict):
                 continue
             arguments = call.get("arguments")
-            if (
-                call.get("name") != probe.tool
-                or not isinstance(arguments, dict)
-                or arguments.get(
-                    "directory_path"
-                    if probe.tool == "list_dir"
-                    else "pattern"
-                    if probe.tool == "glob_files"
-                    else "file_path"
+            if call.get("name") != probe.tool or not isinstance(arguments, dict):
+                continue
+            if probe.tool == "search_text":
+                identity_matches = (
+                    arguments.get("pattern") == probe.pattern
+                    and arguments.get("directory_path") == probe.directory_path
+                    and arguments.get("glob") == probe.glob
                 )
-                != probe.file_path
+            else:
+                identity_matches = (
+                    arguments.get(
+                        "directory_path"
+                        if probe.tool == "list_dir"
+                        else "pattern"
+                        if probe.tool == "glob_files"
+                        else "file_path"
+                    )
+                    == probe.file_path
+                )
+            if (
+                not identity_matches
                 or observation.get("classification") != probe.classification
             ):
                 continue
@@ -226,6 +333,15 @@ def _unmet_required_probes(
                 continue
             succeeded = outcome.get("success")
             if probe.classification == "expected_success":
+                if probe.tool == "search_text":
+                    verification = observation.get("search_verification")
+                    if (
+                        outcome.get("truncated") is not False
+                        or outcome.get("fixture_truncated") is not False
+                        or not isinstance(verification, dict)
+                        or verification.get("verified") is not True
+                    ):
+                        continue
                 matched = succeeded is True
             else:
                 error = outcome.get("error")
@@ -342,7 +458,9 @@ def _messages_and_request_bytes(
         "latest_observation": observation,
     }
     if required_probes:
-        user_payload["required_probes"] = [asdict(probe) for probe in required_probes]
+        user_payload["required_probes"] = [
+            _required_probe_payload(probe) for probe in required_probes
+        ]
     user_content = _json_bytes(user_payload).decode("utf-8")
     messages = [
         {"role": "system", "content": SYSTEM_INSTRUCTIONS},
@@ -441,10 +559,32 @@ def _context_observation(
                 "success",
                 "error",
                 "output",
+                "truncated",
+                "fixture_truncated",
                 "dispatched",
                 "ambiguous",
             )
             if key in tool_outcome
+        }
+    raw_search_verification = event.get("search_verification")
+    search_verification = None
+    if isinstance(raw_search_verification, dict):
+        search_verification = {
+            key: raw_search_verification[key]
+            for key in (
+                "verified",
+                "evidence_complete",
+                "before_sha256",
+                "after_sha256",
+                "expected_match_count",
+                "actual_match_count",
+                "expected_output_sha256",
+                "actual_output_sha256",
+                "event_truncated",
+                "fixture_truncated",
+                "detail",
+            )
+            if key in raw_search_verification
         }
     observation = {
         "index": index,
@@ -452,6 +592,7 @@ def _context_observation(
         "classification": classification,
         "process_status": selected_status,
         "tool_outcome": tool_outcome,
+        "search_verification": search_verification,
         "target_before_sha256": event.get("target_before_sha256"),
         "target_after_sha256": event.get("target_after_sha256"),
         "detail": event.get("detail"),
@@ -683,7 +824,7 @@ def _make_report(
         "write_read_verified": verified_readback,
         "required_probe_count": len(required_probes),
         "required_probes_satisfied": not unmet if required_probes else None,
-        "unmet_required_probes": [asdict(probe) for probe in unmet],
+        "unmet_required_probes": [_required_probe_payload(probe) for probe in unmet],
     }
     if runner_summary is not None:
         report["pending_cleanup"] = runner_summary.get("pending_cleanup")

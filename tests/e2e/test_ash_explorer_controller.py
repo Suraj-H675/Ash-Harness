@@ -590,6 +590,125 @@ def test_required_probe_contract_distinguishes_assertions_from_observations() ->
     ) == list(required)
 
 
+def test_required_search_probe_binds_full_query_and_verified_result() -> None:
+    required = controller._parse_required_probes(
+        [
+            '{"tool":"search_text","pattern":"needle","directory_path":".",'
+            '"glob":"*.txt","classification":"expected_success"}'
+        ]
+    )
+    action = {
+        "tool_call": {
+            "name": "search_text",
+            "arguments": {
+                "pattern": "needle",
+                "directory_path": ".",
+                "glob": "*.txt",
+                "fixed_strings": True,
+                "case_sensitive": True,
+                "max_results": 64,
+            },
+        }
+    }
+    observation = {
+        "classification": "expected_success",
+        "tool_outcome": {
+            "success": True,
+            "ambiguous": False,
+            "truncated": False,
+            "fixture_truncated": False,
+        },
+        "search_verification": {"verified": True, "evidence_complete": True},
+    }
+    entry = {"action": action, "observation": observation}
+    assert controller._unmet_required_probes(required, [entry]) == []
+
+    for field, wrong in (
+        ("pattern", "other"),
+        ("glob", "*.md"),
+        ("directory_path", "subdir"),
+    ):
+        changed_action = {
+            "tool_call": {
+                **action["tool_call"],
+                "arguments": {**action["tool_call"]["arguments"], field: wrong},
+            }
+        }
+        assert controller._unmet_required_probes(
+            required, [{"action": changed_action, "observation": observation}]
+        ) == list(required)
+
+    for changed_observation in (
+        {
+            **observation,
+            "tool_outcome": {**observation["tool_outcome"], "truncated": True},
+        },
+        {
+            **observation,
+            "tool_outcome": {
+                **observation["tool_outcome"],
+                "fixture_truncated": None,
+            },
+        },
+        {
+            **observation,
+            "search_verification": {"verified": False, "evidence_complete": True},
+        },
+        {
+            **observation,
+            "tool_outcome": {**observation["tool_outcome"], "ambiguous": True},
+        },
+    ):
+        assert controller._unmet_required_probes(
+            required, [{"action": action, "observation": changed_observation}]
+        ) == list(required)
+
+    with pytest.raises(ValueError):
+        controller._parse_required_probes(
+            [
+                '{"tool":"search_text","pattern":"needle","directory_path":".",'
+                '"classification":"expected_success"}'
+            ]
+        )
+
+
+def test_controller_context_carries_only_compact_search_verification() -> None:
+    event = {
+        "index": 1,
+        "label": "search",
+        "classification": "expected_success",
+        "process_status": {"exit_code": 0},
+        "tool_outcome": {
+            "success": True,
+            "truncated": False,
+            "fixture_truncated": False,
+            "ambiguous": False,
+            "fixture_result": {"output": "must not be copied twice"},
+        },
+        "search_verification": {
+            "verified": True,
+            "evidence_complete": True,
+            "before_sha256": "a" * 64,
+            "after_sha256": "a" * 64,
+            "expected_match_count": 1,
+            "actual_match_count": 1,
+            "expected_output_sha256": "b" * 64,
+            "actual_output_sha256": "b" * 64,
+            "event_truncated": False,
+            "fixture_truncated": False,
+            "workspace_contents": "must not enter controller context",
+        },
+    }
+
+    observation = controller._context_observation(event, [])
+
+    assert observation["tool_outcome"]["truncated"] is False
+    assert observation["tool_outcome"]["fixture_truncated"] is False
+    assert "fixture_result" not in observation["tool_outcome"]
+    assert observation["search_verification"]["verified"] is True
+    assert "workspace_contents" not in observation["search_verification"]
+
+
 def test_model_finish_cannot_satisfy_missing_required_probe(tmp_path: Path) -> None:
     _require_child_loopback()
     required = controller._parse_required_probes(
@@ -965,6 +1084,183 @@ def test_glob_probe_searches_real_ash_files_and_replays(tmp_path: Path) -> None:
     assert original["target_after_sha256"] == repeated["target_after_sha256"]
     for path in (evidence, tmp_path / "glob-replay"):
         manifest = json.loads((path / "manifest.json").read_text())
+        assert manifest["pending_cleanup"] is False
+        assert not Path(manifest["scratch_path"]).exists()
+
+
+def test_write_search_read_uses_real_runner_and_replays_in_fresh_workspace(
+    tmp_path: Path,
+) -> None:
+    _require_child_loopback()
+
+    class SearchProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            history = json.loads(messages[-1]["content"])["history"]
+            if not history:
+                decision = {
+                    "action": "step",
+                    "label": "write search fixture",
+                    "prompt": "Write a line containing the search text.",
+                    "tool_call": {
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "search-proof.txt",
+                            "content": "prefix needle <tag> & value\n",
+                            "overwrite": False,
+                        },
+                    },
+                    "expect": {"kind": "expected_success"},
+                }
+            elif len(history) == 1:
+                assert history[0]["observation"]["classification"] == "expected_success"
+                decision = {
+                    "action": "step",
+                    "label": "search literal",
+                    "prompt": "Find the literal needle in text files.",
+                    "tool_call": {
+                        "name": "search_text",
+                        "arguments": {
+                            "pattern": "needle",
+                            "directory_path": ".",
+                            "glob": "*.txt",
+                            "fixed_strings": True,
+                            "case_sensitive": True,
+                            "max_results": 64,
+                        },
+                    },
+                    "expect": {"kind": "expected_success"},
+                }
+            elif len(history) == 2:
+                search_observation = history[-1]["observation"]
+                assert search_observation["classification"] == "expected_success"
+                assert search_observation["search_verification"]["verified"] is True
+                assert search_observation["tool_outcome"]["truncated"] is False
+                assert search_observation["tool_outcome"]["fixture_truncated"] is False
+                assert search_observation["tool_outcome"]["output"] == (
+                    "search-proof.txt:1:prefix needle <tag> & value"
+                )
+                decision = {
+                    "action": "step",
+                    "label": "read proof",
+                    "prompt": "Read back the written file.",
+                    "tool_call": {
+                        "name": "read_file",
+                        "arguments": {"file_path": "search-proof.txt"},
+                    },
+                    "expect": {"kind": "expected_success"},
+                }
+            else:
+                assert len(history) == 3
+                read_observation = history[-1]["observation"]
+                assert read_observation["classification"] == "expected_success"
+                assert (
+                    "prefix needle <tag> & value"
+                    in read_observation["tool_outcome"]["output"]
+                )
+                decision = {"action": "finish"}
+            yield StreamChunk(
+                content=json.dumps(
+                    {"decision": decision, "reason": "verify write, search, and read"},
+                    separators=(",", ":"),
+                ),
+                is_done=True,
+                model=self.model_name,
+            )
+
+    evidence = tmp_path / "write-search-read"
+    replay_evidence = tmp_path / "write-search-read-replay"
+    required = controller._parse_required_probes(
+        [
+            '{"tool":"search_text","pattern":"needle","directory_path":".",'
+            '"glob":"*.txt","classification":"expected_success"}'
+        ]
+    )
+    report = asyncio.run(
+        controller.run_controller(
+            task="Write a line, find it with search_text, and read it back.",
+            evidence=evidence,
+            seed=73,
+            provider=SearchProvider(),
+            require_write_read=True,
+            required_probes=required,
+        )
+    )
+
+    assert report["status"] == "finished", report
+    assert report["write_read_verified"] is True
+    assert report["required_probes_satisfied"] is True
+    assert report["classifications"] == [
+        "expected_success",
+        "expected_success",
+        "expected_success",
+    ]
+    original_search = json.loads(
+        (evidence / "steps" / "02" / "observation.json").read_text("utf-8")
+    )
+    assert original_search["tool_outcome"]["output"] == (
+        "search-proof.txt:1:prefix needle <tag> & value"
+    )
+    assert original_search["search_verification"]["verified"] is True
+    assert (
+        original_search["search_verification"]["before_sha256"]
+        == (original_search["search_verification"]["after_sha256"])
+    )
+    assert original_search["tool_outcome"]["truncated"] is False
+    assert original_search["tool_outcome"]["fixture_truncated"] is False
+
+    replay = subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER_PATH),
+            "replay",
+            "--steps",
+            str(evidence / "actions.jsonl"),
+            "--evidence",
+            str(replay_evidence),
+            "--seed",
+            "73",
+        ],
+        cwd=ROOT,
+        env={
+            "PATH": os.defpath,
+            "HOME": str(tmp_path),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        capture_output=True,
+        timeout=90,
+        check=False,
+        text=True,
+    )
+    assert replay.returncode == 0, replay.stderr
+    original_classifications = report["classifications"]
+    replay_observations = [
+        json.loads(
+            (replay_evidence / "steps" / f"{index:02d}" / "observation.json").read_text(
+                "utf-8"
+            )
+        )
+        for index in range(1, 4)
+    ]
+    assert [
+        item["classification"] for item in replay_observations
+    ] == original_classifications
+    replay_search = replay_observations[1]
+    assert replay_search["search_verification"]["verified"] is True
+    assert (
+        replay_search["search_verification"]["before_sha256"]
+        == (original_search["search_verification"]["before_sha256"])
+    )
+    assert (
+        replay_search["search_verification"]["after_sha256"]
+        == (original_search["search_verification"]["after_sha256"])
+    )
+    assert (
+        replay_search["tool_outcome"]["output"]
+        == original_search["tool_outcome"]["output"]
+    )
+    for location in (evidence, replay_evidence):
+        manifest = json.loads((location / "manifest.json").read_text("utf-8"))
         assert manifest["pending_cleanup"] is False
         assert not Path(manifest["scratch_path"]).exists()
 

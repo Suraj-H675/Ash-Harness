@@ -13,6 +13,7 @@ import sys
 import threading
 from argparse import Namespace
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 import pytest
 
@@ -27,6 +28,10 @@ _spec.loader.exec_module(explorer)
 ExpectedOutcome = explorer.ExpectedOutcome
 ExplorerError = explorer.ExplorerError
 StepRequest = explorer.StepRequest
+SearchQuery = explorer.SearchQuery
+SearchSnapshot = explorer.SearchSnapshot
+_search_snapshot = explorer._search_snapshot
+_verify_search = explorer._verify_search
 _classify = explorer._classify
 _handle_termination = explorer._handle_termination
 _extract_tool_outcome = explorer._extract_tool_outcome
@@ -170,6 +175,100 @@ def test_tool_result_extracted_from_actual_ash_response_wrapper() -> None:
     assert outcome["content"] == content
 
 
+def test_search_tool_result_unescapes_only_the_xml_wrapper_body() -> None:
+    payload = {
+        "success": True,
+        "output": "notes.txt:1:<tag> & literal &amp; value",
+        "error": None,
+        "truncated": False,
+    }
+    content = (
+        '<tool_response name="search_text" call_id="call-1">\n'
+        f"{xml_escape(json.dumps(payload, ensure_ascii=False, indent=2))}\n"
+        "</tool_response>"
+    )
+    request = {
+        "messages": [{"role": "tool", "tool_call_id": "call-1", "content": content}]
+    }
+
+    outcome = _extract_tool_outcome(request, "call-1", "search_text")
+
+    assert outcome is not None
+    assert outcome["success"] is True
+    assert outcome["truncated"] is False
+    assert outcome["output"] == payload["output"]
+
+
+def test_search_fixture_xml_expansion_has_a_bounded_allowance() -> None:
+    output = "&" * explorer.MAX_SEARCH_OUTPUT_BYTES
+    payload = {
+        "success": True,
+        "output": output,
+        "error": None,
+        "truncated": False,
+    }
+    content = (
+        '<tool_response name="search_text" call_id="call-1">\n'
+        f"{xml_escape(json.dumps(payload, ensure_ascii=False))}\n"
+        "</tool_response>"
+    )
+    request = {
+        "messages": [{"role": "tool", "tool_call_id": "call-1", "content": content}]
+    }
+
+    outcome = _extract_tool_outcome(request, "call-1", "search_text")
+
+    assert outcome is not None
+    assert outcome["output"] == output
+
+
+def test_search_discovery_requires_successfully_offered_exact_schema() -> None:
+    from ash.tools.search import SearchTextArgs
+
+    schema = SearchTextArgs.model_json_schema()
+    request = {
+        "tools": [
+            {
+                "function": {
+                    "name": "search_text",
+                    "parameters": schema,
+                }
+            }
+        ]
+    }
+    discovery = json.dumps(
+        {
+            "tools": [
+                {
+                    "name": "search_text",
+                    "input_schema": schema,
+                    "schema_truncated": False,
+                }
+            ]
+        },
+        separators=(",", ":"),
+    )
+
+    assert explorer._search_discovery_matches_offered_schema(discovery, request)
+    assert not explorer._search_discovery_matches_offered_schema(
+        discovery.replace('"schema_truncated":false', '"schema_truncated":true'),
+        request,
+    )
+    changed_offer = {
+        "tools": [
+            {
+                "function": {
+                    "name": "search_text",
+                    "parameters": {**schema, "description": "changed"},
+                }
+            }
+        ]
+    }
+    assert not explorer._search_discovery_matches_offered_schema(
+        discovery, changed_offer
+    )
+
+
 def test_read_action_rejects_unlisted_tools_and_arguments() -> None:
     def action(name: str, arguments: dict[str, object]) -> bytes:
         return json.dumps(
@@ -191,9 +290,305 @@ def test_read_action_rejects_unlisted_tools_and_arguments() -> None:
             action("read_file", {"file_path": "probe.txt", "content": "unexpected"})
         )
     with pytest.raises(
-        ExplorerError, match="only write_file, read_file, list_dir, and glob_files"
+        ExplorerError,
+        match="only write_file, read_file, list_dir, glob_files, and search_text",
     ):
         explorer._parse_action(action("execute_shell", {"command": "pwd"}))
+
+
+def test_search_text_action_requires_the_exact_bounded_literal_query() -> None:
+    def parse(arguments: dict[str, object]) -> StepRequest:
+        action = {
+            "action": "step",
+            "label": "search",
+            "prompt": "Search the disposable project.",
+            "tool_call": {"name": "search_text", "arguments": arguments},
+            "expect": {"kind": "expected_success"},
+        }
+        _, request = explorer._parse_action(json.dumps(action).encode("utf-8"))
+        assert request is not None
+        return request
+
+    valid = {
+        "pattern": "literal [needle]",
+        "directory_path": ".",
+        "glob": None,
+        "fixed_strings": True,
+        "case_sensitive": True,
+        "max_results": 64,
+    }
+    request = parse(valid)
+    assert request.tool_name == "search_text"
+    assert request.search_query == SearchQuery("literal [needle]")
+    assert request.tool_arguments == valid
+    for invalid in (
+        {**valid, "pattern": ""},
+        {**valid, "pattern": "é" * 129},
+        {**valid, "pattern": "needle\n"},
+        {**valid, "directory_path": "./"},
+        {**valid, "glob": "../*.txt"},
+        {**valid, "glob": "bad\n*.txt"},
+        {**valid, "glob": "é" * 65},
+        {**valid, "fixed_strings": 1},
+        {**valid, "case_sensitive": False},
+        {**valid, "max_results": True},
+        {**valid, "max_results": 32},
+        {key: value for key, value in valid.items() if key != "glob"},
+        {**valid, "extra": "value"},
+    ):
+        with pytest.raises(ExplorerError):
+            parse(invalid)
+
+
+def test_search_snapshot_is_stable_and_hashes_all_glob_selected_files(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "keep.txt").write_bytes(b"first needle\r\nsecond\rneedle again\n")
+    (tmp_path / "also.txt").write_bytes(b"no match\n")
+    (tmp_path / "ignored.md").write_bytes(b"needle\n")
+    query = SearchQuery("needle", glob="*.txt")
+
+    first = _search_snapshot(tmp_path, query)
+    repeat = _search_snapshot(tmp_path, query)
+
+    assert first.complete is True
+    assert first.expected_matches == (
+        "keep.txt:1:first needle",
+        "keep.txt:3:needle again",
+    )
+    assert repeat.sha256 == first.sha256
+    (tmp_path / "also.txt").write_bytes(b"changed but still no match\n")
+    changed_selected_file = _search_snapshot(tmp_path, query)
+    assert changed_selected_file.sha256 != first.sha256
+    assert changed_selected_file.expected_matches == first.expected_matches
+    (tmp_path / "ignored.md").write_bytes(b"changed outside the glob\n")
+    changed_unselected_file = _search_snapshot(tmp_path, query)
+    assert changed_unselected_file.sha256 == changed_selected_file.sha256
+
+
+@pytest.mark.parametrize(
+    ("kind", "detail"),
+    [
+        ("symlink", "stable workspace"),
+        ("invalid_utf8", "stable workspace"),
+        ("long_file", "file limit"),
+        ("long_path", "safe path"),
+    ],
+)
+def test_search_snapshot_rejects_unverifiable_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, detail: str
+) -> None:
+    if kind == "symlink":
+        target = tmp_path / "target.txt"
+        target.write_text("needle\n", encoding="utf-8")
+        try:
+            (tmp_path / "link.txt").symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+    elif kind == "invalid_utf8":
+        (tmp_path / "bad.txt").write_bytes(b"\xff")
+    elif kind == "long_file":
+        monkeypatch.setattr(explorer, "MAX_SEARCH_FILE_BYTES", 2)
+        (tmp_path / "large.txt").write_text("needle", encoding="utf-8")
+    else:
+        long_path = tmp_path
+        for index in range(5):
+            long_path = long_path / (f"level-{index}-" + "x" * 220)
+        long_path.mkdir(parents=True)
+        (long_path / "needle.txt").touch()
+
+    snapshot = _search_snapshot(tmp_path, SearchQuery("needle"))
+    assert snapshot.complete is False
+    assert snapshot.sha256 is None
+    assert snapshot.expected_matches is None
+    assert detail in (snapshot.detail or "")
+
+
+def test_search_snapshot_rejects_entry_depth_and_aggregate_caps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "one.txt").write_text("needle", encoding="utf-8")
+    (tmp_path / "two.txt").write_text("needle", encoding="utf-8")
+    monkeypatch.setattr(explorer, "MAX_SEARCH_TOTAL_BYTES", 8)
+    assert "aggregate limit" in (
+        _search_snapshot(tmp_path, SearchQuery("needle")).detail or ""
+    )
+
+    monkeypatch.setattr(explorer, "MAX_SEARCH_TOTAL_BYTES", 128 * 1024)
+    monkeypatch.setattr(explorer, "MAX_SEARCH_SCAN_ENTRIES", 1)
+    assert "entry limit" in (
+        _search_snapshot(tmp_path, SearchQuery("needle")).detail or ""
+    )
+
+    monkeypatch.setattr(explorer, "MAX_SEARCH_SCAN_ENTRIES", 128)
+    monkeypatch.setattr(explorer, "MAX_SEARCH_DEPTH", 2)
+    deep = tmp_path / "deep" / "nested"
+    deep.mkdir(parents=True)
+    assert "depth limit" in (
+        _search_snapshot(tmp_path, SearchQuery("needle")).detail or ""
+    )
+
+
+def test_search_verification_requires_complete_consistent_nontruncated_evidence(
+    tmp_path: Path,
+) -> None:
+    before = SearchSnapshot("a" * 64, ("probe.txt:1:needle",), True)
+    after = SearchSnapshot("a" * 64, ("probe.txt:1:needle",), True)
+    output = "probe.txt:1:needle"
+    outcome: dict[str, object] = {
+        "event_type": "tool.completed",
+        "success": True,
+        "error": None,
+        "output": output,
+        "truncated": False,
+        "fixture_truncated": False,
+        "ambiguous": False,
+        "fixture_result": {
+            "success": True,
+            "output": output,
+            "error": None,
+            "truncated": False,
+        },
+    }
+    request = StepRequest(
+        label="search",
+        prompt="Search for the literal.",
+        file_path=".",
+        content="",
+        overwrite=False,
+        expectation=ExpectedOutcome("expected_success"),
+        tool_name="search_text",
+        search_query=SearchQuery("needle"),
+    )
+    status = {"exit_code": 0, "session_id_in_result": True}
+
+    verified = _verify_search(before, after, outcome, 1)
+    assert verified.verified is True
+    assert _classify(
+        request,
+        status,
+        outcome,
+        None,
+        None,
+        [],
+        {},
+        search_verification=verified,
+    ) == ("expected_success", None)
+
+    for changed in (
+        {**outcome, "output": "probe.txt:1:wrong"},
+        {
+            **outcome,
+            "fixture_result": {
+                **outcome["fixture_result"],
+                "output": "probe.txt:1:wrong",
+            },
+        },
+        {**outcome, "truncated": True, "fixture_truncated": True},
+        {**outcome, "truncated": None, "fixture_truncated": None},
+    ):
+        verification = _verify_search(before, after, changed, 1)
+        assert verification.verified is False
+    missing_truncation = _verify_search(
+        before,
+        after,
+        {**outcome, "truncated": None, "fixture_truncated": None},
+        1,
+    )
+    assert (
+        _classify(
+            request,
+            status,
+            {**outcome, "truncated": None, "fixture_truncated": None},
+            None,
+            None,
+            [],
+            {},
+            search_verification=missing_truncation,
+        )[0]
+        == "observed"
+    )
+
+    changed_workspace = _verify_search(
+        before, SearchSnapshot("b" * 64, before.expected_matches, True), outcome, 1
+    )
+    assert changed_workspace.verified is False
+    assert changed_workspace.evidence_complete is True
+    ambiguous = _verify_search(before, after, {**outcome, "ambiguous": True}, 1)
+    assert _classify(
+        request,
+        {"exit_code": 7},
+        {**outcome, "ambiguous": True},
+        None,
+        None,
+        [],
+        {},
+        search_verification=ambiguous,
+    ) == ("ambiguous_outcome", "tool dispatch outcome is ambiguous")
+
+
+def test_declared_search_refusal_uses_stable_snapshots_without_truncation_fields() -> (
+    None
+):
+    before = SearchSnapshot("a" * 64, (), True)
+    after = SearchSnapshot("a" * 64, (), True)
+    outcome: dict[str, object] = {
+        "event_type": "tool.denied",
+        "success": False,
+        "error": "search denied by policy",
+        "ambiguous": False,
+    }
+    request = StepRequest(
+        label="search refusal",
+        prompt="Search for a restricted query.",
+        file_path=".",
+        content="",
+        overwrite=False,
+        expectation=ExpectedOutcome("expected_refusal", "denied by policy"),
+        tool_name="search_text",
+        search_query=SearchQuery("needle"),
+    )
+    verification = _verify_search(before, after, outcome, 1)
+
+    assert verification.verified is False
+    assert verification.before_sha256 == verification.after_sha256
+    assert _classify(
+        request,
+        {"exit_code": 0, "session_id_in_result": True},
+        outcome,
+        before.sha256,
+        after.sha256,
+        [],
+        {},
+        search_verification=verification,
+    ) == ("expected_refusal", None)
+    assert (
+        _classify(
+            request,
+            {"exit_code": 0, "session_id_in_result": True},
+            {**outcome, "ambiguous": None},
+            before.sha256,
+            after.sha256,
+            [],
+            {},
+            search_verification=verification,
+        )[0]
+        == "unexpected_failure"
+    )
+    changed = _verify_search(before, SearchSnapshot("b" * 64, (), True), outcome, 1)
+    assert (
+        _classify(
+            request,
+            {"exit_code": 0, "session_id_in_result": True},
+            outcome,
+            before.sha256,
+            "b" * 64,
+            [],
+            {},
+            search_verification=changed,
+        )[0]
+        == "unexpected_failure"
+    )
 
 
 def test_list_directory_action_is_read_only_and_bounded(tmp_path: Path) -> None:
@@ -454,6 +849,75 @@ def test_interrupted_step_is_recorded_as_unknown_and_finishes_as_interrupted(
         "dispatch_pending": False,
         "outcome_unknown": True,
     }
+
+
+def test_search_driver_failure_does_not_hash_the_project_directory(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence"
+    (evidence / "steps").mkdir(parents=True)
+    scratch = tmp_path / "scratch"
+    project = scratch / "project"
+    project.mkdir(parents=True)
+    raw_line = (
+        json.dumps(
+            {
+                "action": "step",
+                "label": "search failure",
+                "prompt": "Search for the literal.",
+                "tool_call": {
+                    "name": "search_text",
+                    "arguments": {
+                        "pattern": "needle",
+                        "directory_path": ".",
+                        "glob": None,
+                        "fixed_strings": True,
+                        "case_sensitive": True,
+                        "max_results": 64,
+                    },
+                },
+                "expect": {"kind": "expected_success"},
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+    _, request = explorer._parse_action(raw_line)
+    assert request is not None
+
+    class FailingRun:
+        def __init__(self) -> None:
+            self.evidence = evidence
+            self.scratch = scratch
+            self.project = project
+            self.step_index = 0
+            self.action_accepted = False
+            self.observations: list[object] = []
+            self.accepted = bytearray()
+
+        def append_accepted_line(self, line: bytes) -> None:
+            self.accepted.extend(line)
+
+        def write_manifest(self, *, in_flight=None) -> None:
+            del in_flight
+
+        def run_step(self, _request: object, _line: bytes) -> None:
+            raise RuntimeError("fixture dispatch failed")
+
+    run = FailingRun()
+    observation, interrupted = explorer._execute_step(run, request, raw_line)
+
+    assert interrupted is False
+    assert observation.classification == "driver_failure"
+    assert observation.target_before_sha256 is None
+    assert observation.target_after_sha256 is None
+    assert run.observations == [observation]
+    assert (
+        json.loads((evidence / "steps" / "01" / "observation.json").read_text())[
+            "classification"
+        ]
+        == "driver_failure"
+    )
 
 
 def _child_loopback_bind_error(environment: dict[str, str]) -> str | None:

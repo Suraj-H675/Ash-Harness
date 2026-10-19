@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -15,11 +17,14 @@ import threading
 import time
 import tomllib
 import traceback
+import unicodedata
 import uuid
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PureWindowsPath
 from typing import Any, BinaryIO, Literal
+from xml.sax.saxutils import unescape as xml_unescape
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +40,13 @@ MAX_DIRECTORY_ENTRIES = 64
 MAX_GLOB_SCAN_ENTRIES = 128
 MAX_GLOB_DEPTH = 4
 MAX_GLOB_PATTERN_BYTES = 128
+MAX_SEARCH_PATTERN_BYTES = 256
+MAX_SEARCH_SCAN_ENTRIES = 128
+MAX_SEARCH_DEPTH = 32
+MAX_SEARCH_FILE_BYTES = 16 * 1024
+MAX_SEARCH_TOTAL_BYTES = 128 * 1024
+MAX_SEARCH_MATCHES = 64
+MAX_SEARCH_OUTPUT_BYTES = 16 * 1024
 MAX_PROVIDER_BODY_BYTES = 2 * 1024 * 1024
 MAX_CHILD_OUTPUT_BYTES = 1024 * 1024
 MAX_TRACEBACK_CHARS = 8192
@@ -54,6 +66,49 @@ class ExpectedOutcome:
 
 
 @dataclass(frozen=True)
+class SearchQuery:
+    pattern: str
+    directory_path: str = "."
+    glob: str | None = None
+    fixed_strings: bool = True
+    case_sensitive: bool = True
+    max_results: int = MAX_SEARCH_MATCHES
+
+    def as_arguments(self) -> dict[str, object]:
+        return {
+            "pattern": self.pattern,
+            "directory_path": self.directory_path,
+            "glob": self.glob,
+            "fixed_strings": self.fixed_strings,
+            "case_sensitive": self.case_sensitive,
+            "max_results": self.max_results,
+        }
+
+
+@dataclass(frozen=True)
+class SearchSnapshot:
+    sha256: str | None
+    expected_matches: tuple[str, ...] | None
+    complete: bool
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class SearchVerification:
+    verified: bool
+    evidence_complete: bool
+    before_sha256: str | None
+    after_sha256: str | None
+    expected_match_count: int | None
+    actual_match_count: int | None
+    expected_output_sha256: str | None
+    actual_output_sha256: str | None
+    event_truncated: bool | None
+    fixture_truncated: bool | None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
 class StepRequest:
     label: str
     prompt: str
@@ -61,9 +116,10 @@ class StepRequest:
     content: str
     overwrite: bool
     expectation: ExpectedOutcome
-    tool_name: Literal["write_file", "read_file", "list_dir", "glob_files"] = (
-        "write_file"
-    )
+    tool_name: Literal[
+        "write_file", "read_file", "list_dir", "glob_files", "search_text"
+    ] = "write_file"
+    search_query: SearchQuery | None = None
 
     @property
     def tool_arguments(self) -> dict[str, object]:
@@ -81,6 +137,10 @@ class StepRequest:
                 "directory_path": ".",
                 "max_results": MAX_DIRECTORY_ENTRIES,
             }
+        if self.tool_name == "search_text":
+            if self.search_query is None:
+                raise ExplorerError("search_text request is missing its query")
+            return self.search_query.as_arguments()
         return {
             "file_path": self.file_path,
             "content": self.content,
@@ -99,6 +159,7 @@ class StepObservation:
     target_after_sha256: str | None
     artifact_paths: dict[str, str]
     detail: str | None = None
+    search_verification: SearchVerification | None = None
 
 
 @dataclass
@@ -238,18 +299,24 @@ class _FixtureServer:
 
                 if number == 1:
                     if not _request_offers_tool(request_payload, action.tool_name):
-                        if action.tool_name == "glob_files" and _request_offers_tool(
-                            request_payload, "search_tools"
-                        ):
+                        if action.tool_name in {
+                            "glob_files",
+                            "search_text",
+                        } and _request_offers_tool(request_payload, "search_tools"):
                             with state.lock:
                                 state.discovery_used = True
+                            query = (
+                                "glob_files find workspace files by glob pattern"
+                                if action.tool_name == "glob_files"
+                                else "search_text find literal text in workspace files"
+                            )
                             self._emit_tool_call(
                                 state.seed,
                                 state.index,
                                 call_id + "-discover",
                                 "search_tools",
                                 {
-                                    "query": "glob_files find workspace files by glob pattern",
+                                    "query": query,
                                     "limit": 8,
                                 },
                             )
@@ -282,15 +349,26 @@ class _FixtureServer:
                     discovery_outcome = _extract_tool_outcome(
                         request_payload, call_id + "-discover", "search_tools"
                     )
-                    if (
-                        discovery_outcome is None
-                        or discovery_outcome.get("success") is not True
-                        or not _request_offers_tool(request_payload, action.tool_name)
-                    ):
-                        with state.lock:
-                            state.error = (
-                                "glob_files discovery did not activate its schema"
+                    activated = _request_offers_tool(request_payload, action.tool_name)
+                    if action.tool_name == "search_text":
+                        activated = (
+                            activated
+                            and discovery_outcome is not None
+                            and discovery_outcome.get("success") is True
+                            and discovery_outcome.get("truncated") is False
+                            and _search_discovery_matches_offered_schema(
+                                discovery_outcome.get("output"), request_payload
                             )
+                        )
+                    else:
+                        activated = (
+                            activated
+                            and discovery_outcome is not None
+                            and discovery_outcome.get("success") is True
+                        )
+                    if not activated:
+                        with state.lock:
+                            state.error = f"{action.tool_name} discovery did not activate its schema"
                         self._json(502, {"error": {"message": state.error}})
                         return
                     self._emit_tool_call(
@@ -471,12 +549,19 @@ class RunState:
         target = _target_path(
             self.scratch,
             self.project,
-            "." if request.tool_name == "glob_files" else request.file_path,
+            "."
+            if request.tool_name in {"glob_files", "search_text"}
+            else request.file_path,
         )
+        search_before: SearchSnapshot | None = None
         if request.tool_name == "glob_files":
             before_hash, _ = _glob_snapshot(target, request.file_path)
         elif request.tool_name == "list_dir":
             before_hash, _ = _directory_snapshot(target)
+        elif request.tool_name == "search_text":
+            assert request.search_query is not None
+            search_before = _search_snapshot(self.project, request.search_query)
+            before_hash = search_before.sha256
         else:
             before_hash = _hash_target(target)
         step_dir = self.evidence / "steps" / f"{index:02d}"
@@ -532,10 +617,16 @@ class RunState:
         events, malformed_lines = _parse_stream_events(bytes(stdout.data))
         fixture_snapshot = self.fixture.state.snapshot()
         _write_json(step_dir / "provider.json", fixture_snapshot)
+        search_after: SearchSnapshot | None = None
         if request.tool_name == "glob_files":
             after_hash, directory_listing = _glob_snapshot(target, request.file_path)
         elif request.tool_name == "list_dir":
             after_hash, directory_listing = _directory_snapshot(target)
+        elif request.tool_name == "search_text":
+            assert request.search_query is not None
+            search_after = _search_snapshot(self.project, request.search_query)
+            after_hash = search_after.sha256
+            directory_listing = None
         else:
             after_hash = _hash_target(target)
             directory_listing = None
@@ -547,6 +638,16 @@ class RunState:
             and event.get("tool") == request.tool_name
         ]
         tool_outcome = _tool_outcome(tool_events, fixture_snapshot)
+        search_verification = (
+            _verify_search(
+                search_before,
+                search_after,
+                tool_outcome,
+                len(tool_events),
+            )
+            if request.tool_name == "search_text"
+            else None
+        )
         result_event = next(
             (
                 event
@@ -570,6 +671,7 @@ class RunState:
             malformed_lines,
             fixture_snapshot,
             directory_listing=directory_listing,
+            search_verification=search_verification,
         )
 
         self.step_index = index
@@ -591,6 +693,7 @@ class RunState:
                 ),
             },
             detail=detail,
+            search_verification=search_verification,
         )
         self.observations.append(observation)
         _write_json(step_dir / "observation.json", asdict(observation))
@@ -1001,18 +1104,70 @@ def _parse_action(raw_line: bytes) -> tuple[str, StepRequest | None]:
     if not isinstance(tool_call, dict) or set(tool_call) != {"name", "arguments"}:
         raise ExplorerError("tool_call must contain only name and arguments")
     tool_name = tool_call.get("name")
-    if tool_name not in {"write_file", "read_file", "list_dir", "glob_files"}:
+    if tool_name not in {
+        "write_file",
+        "read_file",
+        "list_dir",
+        "glob_files",
+        "search_text",
+    }:
         raise ExplorerError(
-            "only write_file, read_file, list_dir, and glob_files are supported"
+            "only write_file, read_file, list_dir, glob_files, and search_text are supported"
         )
     arguments = tool_call.get("arguments")
     if not isinstance(arguments, dict):
         raise ExplorerError("tool arguments must be an object")
+    search_query: SearchQuery | None = None
     if tool_name == "write_file":
         if set(arguments) != {"file_path", "content", "overwrite"}:
             raise ExplorerError(
                 "write_file arguments must be file_path, content, overwrite"
             )
+    elif tool_name == "search_text":
+        required = {
+            "pattern",
+            "directory_path",
+            "glob",
+            "fixed_strings",
+            "case_sensitive",
+            "max_results",
+        }
+        if set(arguments) != required:
+            raise ExplorerError(
+                "search_text arguments must be pattern, directory_path, glob, "
+                "fixed_strings, case_sensitive, max_results"
+            )
+        pattern = _bounded_string(
+            arguments.get("pattern"), "pattern", MAX_SEARCH_PATTERN_BYTES
+        )
+        if not pattern:
+            raise ExplorerError("search_text pattern must not be empty")
+        if _has_control_chars(pattern):
+            raise ExplorerError("search_text pattern must not contain controls")
+        if arguments.get("directory_path") != ".":
+            raise ExplorerError("search_text directory_path must be '.'")
+        if arguments.get("fixed_strings") is not True:
+            raise ExplorerError("search_text requires fixed_strings=true")
+        if arguments.get("case_sensitive") is not True:
+            raise ExplorerError("search_text requires case_sensitive=true")
+        if (
+            type(arguments.get("max_results")) is not int
+            or arguments["max_results"] != MAX_SEARCH_MATCHES
+        ):
+            raise ExplorerError(
+                f"search_text requires max_results={MAX_SEARCH_MATCHES}"
+            )
+        glob_value = arguments.get("glob")
+        if glob_value is not None:
+            glob_value = _bounded_string(glob_value, "glob", MAX_GLOB_PATTERN_BYTES)
+            if (
+                _has_control_chars(glob_value)
+                or ".." in Path(glob_value).parts
+                or ".." in PureWindowsPath(glob_value).parts
+            ):
+                raise ExplorerError("search_text glob must be bounded and relative")
+            _validate_relative_path_syntax(glob_value)
+        search_query = SearchQuery(pattern=pattern, glob=glob_value)
     elif tool_name == "list_dir":
         if (
             set(arguments) != {"directory_path", "recursive", "max_results"}
@@ -1035,24 +1190,28 @@ def _parse_action(raw_line: bytes) -> tuple[str, StepRequest | None]:
             )
     elif set(arguments) != {"file_path"}:
         raise ExplorerError("read_file arguments must contain only file_path")
-    file_path = _bounded_string(
-        arguments.get(
-            "directory_path"
-            if tool_name == "list_dir"
-            else "pattern"
-            if tool_name == "glob_files"
-            else "file_path"
-        ),
-        "file_path",
-        MAX_PATH_BYTES,
-    )
-    _validate_relative_path_syntax(file_path)
-    if tool_name == "glob_files" and (
-        len(file_path.encode("utf-8")) > MAX_GLOB_PATTERN_BYTES
-        or any(ord(char) < 32 for char in file_path)
-        or ".." in Path(file_path).parts
-    ):
-        raise ExplorerError("glob_files pattern must be bounded and relative")
+    if tool_name == "search_text":
+        file_path = "."
+    else:
+        file_path = _bounded_string(
+            arguments.get(
+                "directory_path"
+                if tool_name == "list_dir"
+                else "pattern"
+                if tool_name == "glob_files"
+                else "file_path"
+            ),
+            "file_path",
+            MAX_PATH_BYTES,
+        )
+        _validate_relative_path_syntax(file_path)
+        if tool_name == "glob_files" and (
+            len(file_path.encode("utf-8")) > MAX_GLOB_PATTERN_BYTES
+            or _has_control_chars(file_path)
+            or ".." in Path(file_path).parts
+            or ".." in PureWindowsPath(file_path).parts
+        ):
+            raise ExplorerError("glob_files pattern must be bounded and relative")
     content = (
         _bounded_string(arguments.get("content"), "content", MAX_CONTENT_BYTES)
         if tool_name == "write_file"
@@ -1090,7 +1249,14 @@ def _parse_action(raw_line: bytes) -> tuple[str, StepRequest | None]:
     return (
         "step",
         StepRequest(
-            label, prompt, file_path, content, overwrite, expectation, tool_name
+            label,
+            prompt,
+            file_path,
+            content,
+            overwrite,
+            expectation,
+            tool_name,
+            search_query,
         ),
     )
 
@@ -1104,6 +1270,10 @@ def _validate_relative_path_syntax(value: str) -> None:
         raise ExplorerError("drive-qualified file_path values are not accepted")
     if value.startswith(("/", "\\")):
         raise ExplorerError("rooted file_path values are not accepted")
+
+
+def _has_control_chars(value: str) -> bool:
+    return any(unicodedata.category(char) == "Cc" for char in value)
 
 
 def _target_path(scratch: Path, project: Path, file_path: str) -> Path:
@@ -1196,6 +1366,287 @@ def _glob_snapshot(root: Path, pattern: str) -> tuple[str | None, str | None]:
     return digest, listing
 
 
+def _search_snapshot(root: Path, query: SearchQuery) -> SearchSnapshot:
+    """Build a bounded, independent proof of the fixed-string search corpus."""
+    from ash.safety.guard import SafetyGuard, SafetyViolation
+    from ash.safety.scoped_io import (
+        list_scoped_directory,
+        read_scoped_bytes,
+        stat_scoped_path,
+    )
+
+    entries: list[tuple[str, str, tuple[int, ...]]] = []
+    selected_files: list[tuple[str, Path, tuple[int, ...]]] = []
+    directories: list[tuple[Path, tuple[int, ...]]] = []
+    scanned = 0
+    total_bytes = 0
+
+    def incomplete(detail: str) -> SearchSnapshot:
+        return SearchSnapshot(None, None, False, detail)
+
+    try:
+        root_stat = os.lstat(root)
+        if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+            return incomplete("search root is not a regular directory")
+        guard = SafetyGuard(root)
+        pending: list[tuple[Path, str, int, tuple[int, ...] | None]] = [
+            (root, "", 0, None)
+        ]
+        while pending:
+            directory, relative_directory, depth, expected_directory = pending.pop()
+            _, directory_stat = stat_scoped_path(directory, guard)
+            if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(
+                directory_stat.st_mode
+            ):
+                return incomplete("search directory changed to a link or special entry")
+            before_directory = _search_stat_key(directory_stat)
+            if (
+                expected_directory is not None
+                and before_directory != expected_directory
+            ):
+                return incomplete("search directory changed before scanning")
+            directories.append((directory, before_directory))
+            _, children = list_scoped_directory(directory, guard)
+            for name, is_directory in children:
+                scanned += 1
+                if scanned > MAX_SEARCH_SCAN_ENTRIES:
+                    return incomplete("search scan exceeds entry limit")
+                relative = (
+                    f"{relative_directory}/{name}" if relative_directory else name
+                )
+                try:
+                    relative_bytes = relative.encode("utf-8", errors="strict")
+                except UnicodeEncodeError:
+                    return incomplete("search path is not valid UTF-8")
+                if len(relative_bytes) > MAX_PATH_BYTES or _has_control_chars(relative):
+                    return incomplete("search path exceeds the safe path bound")
+                path = directory / name
+                _, metadata = stat_scoped_path(path, guard)
+                metadata_key = _search_stat_key(metadata)
+                actual_directory = stat.S_ISDIR(metadata.st_mode)
+                if actual_directory != is_directory:
+                    return incomplete("search entry changed during directory listing")
+                if actual_directory:
+                    entries.append((relative, "directory", metadata_key))
+                    child_depth = depth + 1
+                    if child_depth >= MAX_SEARCH_DEPTH:
+                        return incomplete("search tree reaches the depth limit")
+                    pending.append((path, relative, child_depth, metadata_key))
+                elif stat.S_ISREG(metadata.st_mode):
+                    entries.append((relative, "file", metadata_key))
+                    if query.glob is None or fnmatch.fnmatch(relative, query.glob):
+                        selected_files.append((relative, path, metadata_key))
+                else:
+                    return incomplete("search tree contains a special entry")
+            _, after_directory = stat_scoped_path(directory, guard)
+            if _search_stat_key(after_directory) != before_directory:
+                return incomplete("search directory changed during snapshot")
+
+        file_hashes: dict[str, str] = {}
+        expected_matches: list[str] = []
+        expected_output_bytes = 0
+        for relative, path, expected_metadata in sorted(selected_files):
+            if expected_metadata[3] > MAX_SEARCH_FILE_BYTES:
+                return incomplete("selected search file exceeds the file limit")
+            _, before_file = stat_scoped_path(path, guard)
+            if _search_stat_key(before_file) != expected_metadata:
+                return incomplete("selected search file changed before reading")
+            _, content = read_scoped_bytes(
+                path,
+                guard,
+                max_bytes=MAX_SEARCH_FILE_BYTES,
+            )
+            _, after_file = stat_scoped_path(path, guard)
+            if _search_stat_key(after_file) != expected_metadata:
+                return incomplete("selected search file changed during snapshot")
+            if len(content) > MAX_SEARCH_FILE_BYTES:
+                return incomplete("selected search file exceeds the file limit")
+            total_bytes += len(content)
+            if total_bytes > MAX_SEARCH_TOTAL_BYTES:
+                return incomplete("selected search files exceed the aggregate limit")
+            file_hashes[relative] = hashlib.sha256(content).hexdigest()
+            with io.TextIOWrapper(
+                io.BytesIO(content), encoding="utf-8", errors="strict"
+            ) as handle:
+                for line_number, physical_line in enumerate(handle, start=1):
+                    text = physical_line.rstrip("\r\n")
+                    if query.pattern not in text:
+                        continue
+                    rendered = f"{relative}:{line_number}:{text}"
+                    rendered_size = len(rendered.encode("utf-8", errors="strict"))
+                    separator_size = 1 if expected_matches else 0
+                    if len(expected_matches) >= MAX_SEARCH_MATCHES:
+                        return incomplete(
+                            "search result count exceeds the result limit"
+                        )
+                    if (
+                        expected_output_bytes + separator_size + rendered_size
+                        > MAX_SEARCH_OUTPUT_BYTES
+                    ):
+                        return incomplete("search output exceeds the rendered limit")
+                    expected_matches.append(rendered)
+                    expected_output_bytes += separator_size + rendered_size
+
+        for directory, expected_metadata in directories:
+            _, current = stat_scoped_path(directory, guard)
+            if _search_stat_key(current) != expected_metadata:
+                return incomplete("search directory changed during snapshot")
+        for relative, kind, expected_metadata in entries:
+            if kind == "file":
+                path = root / relative
+                _, current = stat_scoped_path(path, guard)
+                if _search_stat_key(current) != expected_metadata:
+                    return incomplete("search entry changed during snapshot")
+
+        digest = hashlib.sha256(b"ash-explorer-search-snapshot-v1\x00")
+        digest.update(
+            json.dumps(
+                {
+                    "pattern": query.pattern,
+                    "directory_path": query.directory_path,
+                    "glob": query.glob,
+                    "fixed_strings": True,
+                    "case_sensitive": True,
+                    "max_results": MAX_SEARCH_MATCHES,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8", errors="strict")
+        )
+        for relative, kind, _metadata in sorted(entries):
+            digest.update(b"\x00entry\x00")
+            digest.update(kind.encode("ascii"))
+            digest.update(b"\x00")
+            digest.update(relative.encode("utf-8", errors="strict"))
+            digest.update(b"\x00")
+            content_hash = file_hashes.get(relative)
+            if content_hash is not None:
+                digest.update(b"content\x00")
+                digest.update(content_hash.encode("ascii"))
+        return SearchSnapshot(digest.hexdigest(), tuple(expected_matches), True, None)
+    except (OSError, SafetyViolation, UnicodeError, ValueError):
+        return incomplete("search snapshot could not read a stable workspace")
+
+
+def _search_stat_key(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _search_output_digest(output: str) -> str:
+    return hashlib.sha256(output.encode("utf-8", errors="strict")).hexdigest()
+
+
+def _verify_search(
+    before: SearchSnapshot | None,
+    after: SearchSnapshot | None,
+    outcome: dict[str, object] | None,
+    event_count: int,
+) -> SearchVerification:
+    event_truncated: bool | None = None
+    fixture_truncated: bool | None = None
+    actual_count: int | None = None
+    actual_digest: str | None = None
+    expected_count = (
+        len(before.expected_matches)
+        if before is not None and before.expected_matches is not None
+        else None
+    )
+    expected_digest = (
+        _search_output_digest("\n".join(before.expected_matches))
+        if before is not None and before.expected_matches is not None
+        else None
+    )
+
+    def make(
+        verified: bool, evidence_complete: bool, detail: str | None
+    ) -> SearchVerification:
+        return SearchVerification(
+            verified=verified,
+            evidence_complete=evidence_complete,
+            before_sha256=before.sha256 if before is not None else None,
+            after_sha256=after.sha256 if after is not None else None,
+            expected_match_count=expected_count,
+            actual_match_count=actual_count,
+            expected_output_sha256=expected_digest,
+            actual_output_sha256=actual_digest,
+            event_truncated=event_truncated,
+            fixture_truncated=fixture_truncated,
+            detail=detail,
+        )
+
+    if before is None or not before.complete:
+        return make(
+            False,
+            False,
+            before.detail if before is not None else "missing pre-snapshot",
+        )
+    if after is None or not after.complete:
+        return make(
+            False,
+            False,
+            after.detail if after is not None else "missing post-snapshot",
+        )
+    if event_count != 1 or outcome is None:
+        return make(False, False, "missing or multiple search tool events")
+    fixture_result = outcome.get("fixture_result")
+    if not isinstance(fixture_result, dict):
+        return make(False, False, "missing fixture tool result")
+
+    raw_event_truncated = outcome.get("truncated")
+    raw_fixture_truncated = outcome.get("fixture_truncated")
+    parsed_fixture_truncated = fixture_result.get("truncated")
+    if type(raw_event_truncated) is bool:
+        event_truncated = raw_event_truncated
+    if type(raw_fixture_truncated) is bool:
+        fixture_truncated = raw_fixture_truncated
+    if (
+        type(raw_event_truncated) is not bool
+        or type(raw_fixture_truncated) is not bool
+        or type(parsed_fixture_truncated) is not bool
+    ):
+        return make(False, False, "truncation metadata is missing or invalid")
+    if raw_fixture_truncated != parsed_fixture_truncated:
+        return make(False, True, "captured fixture truncation is inconsistent")
+    if outcome.get("success") is not True or fixture_result.get("success") is not True:
+        return make(False, True, "search tool did not report explicit success")
+    if outcome.get("ambiguous") is not False:
+        return make(False, False, "search outcome is not explicitly unambiguous")
+    if raw_event_truncated != raw_fixture_truncated:
+        return make(False, True, "tool event and fixture truncation disagree")
+    if raw_event_truncated is not False:
+        return make(False, True, "search result was truncated")
+    if fixture_result.get("output") != outcome.get("output") or fixture_result.get(
+        "error"
+    ) != outcome.get("error"):
+        return make(False, True, "tool event and fixture result disagree")
+    if before.sha256 != after.sha256:
+        return make(False, True, "workspace changed during search dispatch")
+    output = outcome.get("output")
+    if not isinstance(output, str):
+        return make(False, False, "search output is missing")
+    try:
+        if len(output.encode("utf-8", errors="strict")) > MAX_SEARCH_OUTPUT_BYTES:
+            return make(False, True, "search output exceeds the rendered limit")
+        actual_digest = _search_output_digest(output)
+    except UnicodeEncodeError:
+        return make(False, True, "search output is not valid UTF-8")
+    actual_records = [] if output == "" else output.split("\n")
+    actual_count = len(actual_records)
+    expected_records = before.expected_matches
+    assert expected_records is not None
+    if Counter(actual_records) != Counter(expected_records):
+        return make(False, True, "search output does not match workspace contents")
+    return make(True, True, None)
+
+
 def _classify(
     request: StepRequest,
     process_status: dict[str, object],
@@ -1206,7 +1657,14 @@ def _classify(
     fixture: dict[str, object],
     *,
     directory_listing: str | None = None,
+    search_verification: SearchVerification | None = None,
 ) -> tuple[str, str | None]:
+    if (
+        request.tool_name == "search_text"
+        and tool_outcome is not None
+        and tool_outcome.get("ambiguous") is True
+    ):
+        return "ambiguous_outcome", "tool dispatch outcome is ambiguous"
     fixture_error = fixture.get("error")
     output_truncated = bool(
         process_status.get("stdout_truncated") or process_status.get("stderr_truncated")
@@ -1254,6 +1712,23 @@ def _classify(
     succeeded = tool_outcome.get("success") is True
     error = tool_outcome.get("error")
     if request.expectation.kind == "expected_success":
+        if request.tool_name == "search_text":
+            if not succeeded:
+                return (
+                    "unexpected_failure",
+                    "search tool did not report explicit success",
+                )
+            if search_verification is None:
+                return "observed", "unverifiable: search evidence is missing"
+            if search_verification.verified:
+                return "expected_success", None
+            if not search_verification.evidence_complete:
+                reason = search_verification.detail or "search evidence is incomplete"
+                return "observed", f"unverifiable: {reason}"
+            return (
+                "unexpected_failure",
+                search_verification.detail or "search verification failed",
+            )
         if request.tool_name in {"list_dir", "glob_files"}:
             if (
                 succeeded
@@ -1308,6 +1783,24 @@ def _classify(
             "unexpected_failure",
             "tool error did not match the declared refusal text",
         )
+    if request.tool_name == "search_text":
+        if tool_outcome.get("ambiguous") is not False:
+            return (
+                "unexpected_failure",
+                "search refusal was not explicitly unambiguous",
+            )
+        if (
+            search_verification is None
+            or search_verification.before_sha256 is None
+            or search_verification.after_sha256 is None
+        ):
+            return (
+                "unexpected_failure",
+                "search workspace stability could not be verified during refusal",
+            )
+        if search_verification.before_sha256 != search_verification.after_sha256:
+            return "unexpected_failure", "workspace changed during the expected refusal"
+        return "expected_refusal", None
     if before_hash != after_hash:
         return "unexpected_failure", "target changed during the expected refusal"
     return "expected_refusal", None
@@ -1331,11 +1824,16 @@ def _tool_outcome(
     error = event.get("reason") if kind == "tool.denied" else event.get("error")
     output = event.get("output")
     fixture_outcome = fixture.get("tool_outcome")
+    fixture_truncated = (
+        fixture_outcome.get("truncated") if isinstance(fixture_outcome, dict) else None
+    )
     return {
         "event_type": event.get("type"),
         "success": succeeded,
         "error": error if isinstance(error, str) else None,
         "output": output if isinstance(output, str) else None,
+        "truncated": event.get("truncated"),
+        "fixture_truncated": fixture_truncated,
         "dispatched": False if kind == "tool.denied" else event.get("dispatched"),
         "ambiguous": False if kind == "tool.denied" else event.get("ambiguous"),
         "fixture_result": fixture_outcome,
@@ -1372,6 +1870,90 @@ def _request_offers_tool(request: dict[str, Any], name: str) -> bool:
     )
 
 
+def _offered_tool_parameters(request: dict[str, Any], name: str) -> object | None:
+    tools = request.get("tools")
+    if not isinstance(tools, list):
+        return None
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("name") == name:
+            return function.get("parameters")
+    return None
+
+
+def _valid_search_text_schema(schema: object) -> bool:
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        return False
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or set(properties) != {
+        "pattern",
+        "directory_path",
+        "glob",
+        "fixed_strings",
+        "case_sensitive",
+        "max_results",
+    }:
+        return False
+    expected_types = {
+        "pattern": "string",
+        "directory_path": "string",
+        "fixed_strings": "boolean",
+        "case_sensitive": "boolean",
+        "max_results": "integer",
+    }
+    for name, expected_type in expected_types.items():
+        value = properties.get(name)
+        if not isinstance(value, dict) or value.get("type") != expected_type:
+            return False
+    glob_schema = properties.get("glob")
+    if not isinstance(glob_schema, dict):
+        return False
+    glob_types = glob_schema.get("type")
+    glob_any_of = glob_schema.get("anyOf")
+    if not (
+        glob_types == "string"
+        or glob_types == ["string", "null"]
+        or glob_types == ["null", "string"]
+        or (
+            isinstance(glob_any_of, list)
+            and {item.get("type") for item in glob_any_of if isinstance(item, dict)}
+            == {"string", "null"}
+        )
+    ):
+        return False
+    required = schema.get("required", [])
+    return isinstance(required, list) and set(required) == {"pattern"}
+
+
+def _search_discovery_matches_offered_schema(
+    discovery_output: object, request: dict[str, Any]
+) -> bool:
+    if not isinstance(discovery_output, str):
+        return False
+    try:
+        payload = _strict_json_loads(discovery_output)
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or not isinstance(payload.get("tools"), list):
+        return False
+    discovered_schema = None
+    for tool in payload["tools"]:
+        if not isinstance(tool, dict) or tool.get("name") != "search_text":
+            continue
+        if tool.get("schema_truncated") is True:
+            return False
+        discovered_schema = tool.get("input_schema")
+        break
+    offered_schema = _offered_tool_parameters(request, "search_text")
+    return (
+        discovered_schema is not None
+        and _valid_search_text_schema(discovered_schema)
+        and discovered_schema == offered_schema
+    )
+
+
 def _extract_tool_outcome(
     request: dict[str, Any], call_id: str, tool_name: str = "write_file"
 ) -> dict[str, object] | None:
@@ -1384,18 +1966,22 @@ def _extract_tool_outcome(
         if message.get("tool_call_id") != call_id:
             continue
         content = message.get("content")
-        if (
-            not isinstance(content, str)
-            or len(content.encode("utf-8")) > MAX_CONTENT_BYTES * 2
-        ):
+        content_limit = (
+            MAX_SEARCH_OUTPUT_BYTES * 5 + 4 * 1024
+            if tool_name == "search_text"
+            else MAX_CONTENT_BYTES * 2
+        )
+        if not isinstance(content, str) or len(content.encode("utf-8")) > content_limit:
             return {"tool_call_id": call_id, "content": str(content)[:2048]}
         prefix = f'<tool_response name="{tool_name}" call_id="{call_id}">\n'
         suffix = "\n</tool_response>"
-        body = (
-            content[len(prefix) : -len(suffix)]
-            if content.startswith(prefix) and content.endswith(suffix)
-            else content
-        )
+        wrapped = content.startswith(prefix) and content.endswith(suffix)
+        body = content[len(prefix) : -len(suffix)] if wrapped else content
+        if wrapped:
+            # Ash XML-escapes the serialized JSON body. Decode one XML layer
+            # only after isolating the exact tool response wrapper so ordinary
+            # matched text such as "<tag> & value" remains JSON string data.
+            body = xml_unescape(body)
         try:
             payload = _strict_json_loads(body)
         except (ValueError, json.JSONDecodeError):
@@ -1407,6 +1993,7 @@ def _extract_tool_outcome(
             "success": payload.get("success"),
             "output": payload.get("output"),
             "error": payload.get("error"),
+            "truncated": payload.get("truncated"),
             "content": content,
         }
     return None
@@ -1613,19 +2200,26 @@ def _record_driver_failure(
     if not run.action_accepted:
         run.append_accepted_line(raw_line)
         run.action_accepted = True
-    target = _target_path(run.scratch, run.project, request.file_path)
-    current_hash = _hash_target(target)
-    try:
-        before_payload = _strict_json_loads(
-            (step_dir / "target-before.json").read_bytes()
+    if request.tool_name == "search_text":
+        # A search targets the project tree, not one hashable file. Preserve an
+        # unknown result without trying to hash the directory as a file.
+        current_hash = None
+        before_hash = None
+    else:
+        target = _target_path(run.scratch, run.project, request.file_path)
+        current_hash = _hash_target(target)
+    if request.tool_name != "search_text":
+        try:
+            before_payload = _strict_json_loads(
+                (step_dir / "target-before.json").read_bytes()
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            before_payload = None
+        before_hash = (
+            before_payload.get("sha256")
+            if isinstance(before_payload, dict)
+            else current_hash
         )
-    except (OSError, ValueError, json.JSONDecodeError):
-        before_payload = None
-    before_hash = (
-        before_payload.get("sha256")
-        if isinstance(before_payload, dict)
-        else current_hash
-    )
     run.write_manifest(
         in_flight={
             "step_index": index,

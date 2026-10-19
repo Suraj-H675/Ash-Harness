@@ -5,7 +5,7 @@ from __future__ import annotations
 import fnmatch
 import io
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -17,14 +17,18 @@ from ash.safety.scoped_io import (
     read_scoped_bytes,
     stat_scoped_path,
 )
-from ash.tools.base import BaseTool, ToolExecutionContract, ToolResult, count_output_tokens
+from ash.tools.base import (
+    BaseTool,
+    ToolExecutionContract,
+    ToolResult,
+    count_output_tokens,
+)
 
 
 DEFAULT_MAX_RESULTS = 200
 HARD_MAX_RESULTS = 2_000
 MAX_SEARCH_CAPTURE_BYTES = 2_000_000
 MAX_SEARCH_LINE_CHARS = 64 * 1024
-MAX_SEARCH_MATCH_CARRY_CHARS = 4 * 1024
 MAX_LIST_DIRECTORY_DEPTH = 4
 MAX_GLOB_SCAN_ENTRIES = 100_000
 MAX_GLOB_DEPTH = 32
@@ -39,6 +43,7 @@ def _iter_workspace_paths(
     *,
     recursive: bool,
     max_depth: int | None = None,
+    on_incomplete: Callable[[], None] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """Yield workspace entries lazily without descending through links."""
 
@@ -50,13 +55,21 @@ def _iter_workspace_paths(
             for name, is_directory in children:
                 path = directory / name
                 yield path, is_directory
-                if not recursive or (
-                    max_depth is not None and depth + 1 >= max_depth
-                ):
+                if not recursive or (max_depth is not None and depth + 1 >= max_depth):
+                    if (
+                        recursive
+                        and is_directory
+                        and max_depth is not None
+                        and depth + 1 >= max_depth
+                        and on_incomplete is not None
+                    ):
+                        on_incomplete()
                     continue
                 if is_directory:
                     yield from walk(path, depth + 1)
         except (OSError, SafetyViolation):
+            if on_incomplete is not None:
+                on_incomplete()
             return
 
     yield from walk(root, 0)
@@ -167,7 +180,9 @@ class GlobFilesTool(BaseTool):
         if match_truncated:
             output += f"\n[truncated after {args.max_results} matches]"
         elif scan_truncated:
-            output += f"\n[workspace scan truncated after {MAX_GLOB_SCAN_ENTRIES} entries]"
+            output += (
+                f"\n[workspace scan truncated after {MAX_GLOB_SCAN_ENTRIES} entries]"
+            )
         return ToolResult(
             success=True,
             output=output,
@@ -220,10 +235,7 @@ class SearchTextTool(BaseTool):
             line_number = 0
             file_bytes = 0
             while True:
-                chunks: list[str] = []
-                preview_chars = 0
-                carry = ""
-                matched = False
+                line_chunks: list[str] = []
                 saw_data = False
                 complete = False
                 while True:
@@ -234,24 +246,23 @@ class SearchTextTool(BaseTool):
                     if file_bytes > MAX_SEARCH_FILE_BYTES:
                         return
                     saw_data = True
-                    candidate = carry + chunk
-                    if not matched and regex.search(candidate):
-                        matched = True
-                    carry = candidate[-MAX_SEARCH_MATCH_CARRY_CHARS:]
-                    if preview_chars < MAX_SEARCH_LINE_CHARS:
-                        remaining = MAX_SEARCH_LINE_CHARS - preview_chars
-                        chunks.append(chunk[:remaining])
-                        preview_chars += min(len(chunk), remaining)
+                    line_chunks.append(chunk)
                     if chunk.endswith(("\n", "\r")):
                         complete = True
                         break
                 if not saw_data:
                     return
                 line_number += 1
-                preview = "".join(chunks).rstrip("\r\n")
-                if not complete:
-                    preview += "…"
-                yield line_number, preview, matched, not complete
+                scanned_line = "".join(line_chunks)
+                line = scanned_line.rstrip("\r\n")
+                clipped = len(line) > MAX_SEARCH_LINE_CHARS
+                preview = line[:MAX_SEARCH_LINE_CHARS]
+                yield (
+                    line_number,
+                    preview,
+                    bool(regex.search(scanned_line)),
+                    clipped,
+                )
                 if not complete:
                     return
 
@@ -260,12 +271,21 @@ class SearchTextTool(BaseTool):
         output_limited = False
         match_limited = False
         scan_truncated = False
+        scan_incomplete = False
+        skipped_file = False
+        preview_truncated = False
+
+        def mark_scan_incomplete() -> None:
+            nonlocal scan_incomplete
+            scan_incomplete = True
+
         scanned = 0
         for path, is_directory in _iter_workspace_paths(
             root,
             self.safety_guard,
             recursive=True,
             max_depth=MAX_SEARCH_DEPTH,
+            on_incomplete=mark_scan_incomplete,
         ):
             scanned += 1
             if scanned > MAX_SEARCH_SCAN_ENTRIES:
@@ -292,6 +312,7 @@ class SearchTextTool(BaseTool):
                         if not matched:
                             continue
                         if line_truncated:
+                            preview_truncated = True
                             text += " [line preview truncated]"
                         rendered = f"{relative}:{line_number}:{text}"
                         rendered_bytes = len(rendered.encode("utf-8"))
@@ -308,25 +329,41 @@ class SearchTextTool(BaseTool):
                         matches.append(rendered)
                         output_bytes += separator_bytes + rendered_bytes
             except (OSError, UnicodeError, SafetyViolation):
+                skipped_file = True
                 continue
             if output_limited or match_limited:
                 break
         output = "\n".join(matches)
+        separator = "\n" if output else ""
         if output_limited:
             output += (
-                f"\n[search output capture truncated after "
+                f"{separator}[search output capture truncated after "
                 f"{MAX_SEARCH_CAPTURE_BYTES} bytes]"
             )
         elif match_limited:
-            output += f"\n[truncated after {args.max_results} matches]"
+            output += f"{separator}[truncated after {args.max_results} matches]"
         elif scan_truncated:
             output += (
-                f"\n[workspace scan truncated after "
+                f"{separator}[workspace scan truncated after "
                 f"{MAX_SEARCH_SCAN_ENTRIES} entries]"
+            )
+        elif scan_incomplete:
+            output += f"{separator}[workspace search incomplete]"
+        elif skipped_file:
+            output += (
+                f"{separator}[workspace search incomplete: "
+                "skipped unreadable or invalid text files]"
             )
         return ToolResult(
             success=True,
             output=output,
             token_count=count_output_tokens(output),
-            truncated=output_limited or match_limited or scan_truncated,
+            truncated=(
+                output_limited
+                or match_limited
+                or scan_truncated
+                or scan_incomplete
+                or skipped_file
+                or preview_truncated
+            ),
         )
