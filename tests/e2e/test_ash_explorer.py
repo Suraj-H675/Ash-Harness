@@ -391,9 +391,10 @@ def test_search_snapshot_rejects_unverifiable_inputs(
         monkeypatch.setattr(explorer, "MAX_SEARCH_FILE_BYTES", 2)
         (tmp_path / "large.txt").write_text("needle", encoding="utf-8")
     else:
+        monkeypatch.setattr(explorer, "MAX_PATH_BYTES", 96)
         long_path = tmp_path
-        for index in range(5):
-            long_path = long_path / (f"level-{index}-" + "x" * 220)
+        for index in range(3):
+            long_path = long_path / (f"level-{index}-" + "x" * 30)
         long_path.mkdir(parents=True)
         (long_path / "needle.txt").touch()
 
