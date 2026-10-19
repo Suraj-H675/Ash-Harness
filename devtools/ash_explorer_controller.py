@@ -53,12 +53,13 @@ not private chain of thought, and at most 512 UTF-8 bytes.
 The decision must be exactly one of these forms:
 {\"action\":\"finish\"}
 or a runner step with exactly these fields:
-{\"action\":\"step\",\"label\":string,\"prompt\":string,\"tool_call\":{\"name\":\"write_file\"|\"read_file\"|\"list_dir\",\"arguments\":object},\"expect\":object}
+{\"action\":\"step\",\"label\":string,\"prompt\":string,\"tool_call\":{\"name\":\"write_file\"|\"read_file\"|\"list_dir\"|\"glob_files\",\"arguments\":object},\"expect\":object}
 
 write_file arguments are exactly {\"file_path\":string,\"content\":string,\"overwrite\":boolean};
 read_file arguments are exactly {\"file_path\":string}. Paths must be relative.
 list_dir arguments are exactly {\"directory_path\":string,\"recursive\":false,\"max_results\":64}.
-Use only write_file, read_file, and nonrecursive list_dir. For expected success use {\"kind\":\"expected_success\"};
+glob_files arguments are exactly {\"pattern\":string,\"directory_path\":\".\",\"max_results\":64}.
+Use only write_file, read_file, nonrecursive list_dir, and bounded glob_files. For expected success use {\"kind\":\"expected_success\"};
 for an expected refusal use {\"kind\":\"expected_refusal\",\"error_contains\":string};
 when the result is exploratory and has no pass condition use {\"kind\":\"observed\"}.
 Ash validates each step before dispatch. Never emit commands, URLs, environment
@@ -159,6 +160,7 @@ def _parse_required_probes(raw: Sequence[str]) -> tuple[RequiredProbe, ...]:
             "read_file",
             "write_file",
             "list_dir",
+            "glob_files",
         }:
             raise ValueError("invalid required probe tool")
         path = payload.get("file_path")
@@ -171,6 +173,12 @@ def _parse_required_probes(raw: Sequence[str]) -> tuple[RequiredProbe, ...]:
             _runner._validate_relative_path_syntax(path)
         except _runner.ExplorerError as exc:
             raise ValueError("invalid required probe path") from exc
+        if payload["tool"] == "glob_files" and (
+            len(path.encode("utf-8")) > _runner.MAX_GLOB_PATTERN_BYTES
+            or any(ord(char) < 32 for char in path)
+            or ".." in Path(path).parts
+        ):
+            raise ValueError("invalid required glob pattern")
         error_contains = payload.get("error_contains")
         if classification == "expected_refusal" and (
             not isinstance(error_contains, str)
@@ -203,7 +211,11 @@ def _unmet_required_probes(
                 call.get("name") != probe.tool
                 or not isinstance(arguments, dict)
                 or arguments.get(
-                    "directory_path" if probe.tool == "list_dir" else "file_path"
+                    "directory_path"
+                    if probe.tool == "list_dir"
+                    else "pattern"
+                    if probe.tool == "glob_files"
+                    else "file_path"
                 )
                 != probe.file_path
                 or observation.get("classification") != probe.classification

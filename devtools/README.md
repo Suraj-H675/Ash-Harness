@@ -40,6 +40,15 @@ listings, larger result limits, and symlink entries are rejected. Required
 list_dir probes use file_path as the directory identity in the existing
 --require-probe contract.
 
+Read-only `glob_files` searches filenames inside the disposable project using
+exact arguments `pattern` (relative, up to 128 UTF-8 bytes),
+`directory_path="."`, and `max_results=64`. Explorer verifies the result against
+an independent bounded snapshot (up to 128 scanned entries, depth four), and
+does not claim success for unbounded trees or symlinks. For a required
+`glob_files` probe, the `file_path` field denotes the exact glob pattern.
+Ash exposes this tool through `search_tools` discovery rather than the initial
+tool palette; Explorer's synthetic fixture follows that protocol.
+
 Alternatively, start local Ollama separately and pull a model:
 
 ```sh
@@ -68,7 +77,7 @@ offers a smaller local decision boundary and accepts `tools=None`.
 The model receives the task and bounded prior action/observation history. It
 must return strict JSON for `step` or `finish`; each step is passed through the
 runner's `_parse_action` before dispatch. Only `write_file`, `read_file`,
-and bounded `list_dir` are available.
+bounded `list_dir`, and bounded `glob_files` are available.
 The controller makes no provider retries and caps each model call at
 30 seconds, the whole run at 600 seconds, the context and completion at 64 KiB
 each, and the run at the runner's eight steps. Configuration values are
@@ -126,7 +135,8 @@ For example:
 The writable marker beside the disposable project is still inside the run's
 private scratch directory. It lets a path-scope regression be observed without
 reaching user files. A successful read must report the target's actual SHA-256
-and leave it unchanged. The runner accepts only `write_file`, `read_file`, and bounded `list_dir`;
+and leave it unchanged. The runner accepts only `write_file`, `read_file`,
+bounded `list_dir`, and bounded `glob_files`;
 it does not accept arbitrary Ash arguments, commands, plugins, MCP servers, or
 provider URLs. An outside-scope read that fails path validation before accessing the target
 can produce a verified refusal; genuinely ambiguous post-dispatch failures

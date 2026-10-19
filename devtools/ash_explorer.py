@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -31,6 +32,9 @@ MAX_PATH_BYTES = 1024
 MAX_CONTENT_BYTES = 16 * 1024
 MAX_REFUSAL_TEXT_BYTES = 512
 MAX_DIRECTORY_ENTRIES = 64
+MAX_GLOB_SCAN_ENTRIES = 128
+MAX_GLOB_DEPTH = 4
+MAX_GLOB_PATTERN_BYTES = 128
 MAX_PROVIDER_BODY_BYTES = 2 * 1024 * 1024
 MAX_CHILD_OUTPUT_BYTES = 1024 * 1024
 MAX_TRACEBACK_CHARS = 8192
@@ -57,7 +61,9 @@ class StepRequest:
     content: str
     overwrite: bool
     expectation: ExpectedOutcome
-    tool_name: Literal["write_file", "read_file", "list_dir"] = "write_file"
+    tool_name: Literal["write_file", "read_file", "list_dir", "glob_files"] = (
+        "write_file"
+    )
 
     @property
     def tool_arguments(self) -> dict[str, object]:
@@ -67,6 +73,12 @@ class StepRequest:
             return {
                 "directory_path": self.file_path,
                 "recursive": False,
+                "max_results": MAX_DIRECTORY_ENTRIES,
+            }
+        if self.tool_name == "glob_files":
+            return {
+                "pattern": self.file_path,
+                "directory_path": ".",
                 "max_results": MAX_DIRECTORY_ENTRIES,
             }
         return {
@@ -100,6 +112,7 @@ class _FixtureState:
     exchanges: list[dict[str, object]] = field(default_factory=list)
     tool_outcome: dict[str, object] | None = None
     error: str | None = None
+    discovery_used: bool = False
 
     def arm(self, index: int, request: StepRequest) -> None:
         with self.lock:
@@ -110,6 +123,7 @@ class _FixtureState:
             self.exchanges = []
             self.tool_outcome = None
             self.error = None
+            self.discovery_used = False
 
     def snapshot(self) -> dict[str, object]:
         with self.lock:
@@ -118,6 +132,7 @@ class _FixtureState:
                 "exchanges": list(self.exchanges),
                 "tool_outcome": self.tool_outcome,
                 "error": self.error,
+                "discovery_used": self.discovery_used,
             }
 
 
@@ -203,9 +218,9 @@ class _FixtureServer:
                     )
                     action = state.request
                     call_id = state.tool_call_id
-                    if number > 2:
+                    if number > (3 if state.discovery_used else 2):
                         state.error = (
-                            "fixture received more than two completion requests"
+                            "fixture received more than three completion requests"
                         )
                         self._json(
                             502,
@@ -223,6 +238,22 @@ class _FixtureServer:
 
                 if number == 1:
                     if not _request_offers_tool(request_payload, action.tool_name):
+                        if action.tool_name == "glob_files" and _request_offers_tool(
+                            request_payload, "search_tools"
+                        ):
+                            with state.lock:
+                                state.discovery_used = True
+                            self._emit_tool_call(
+                                state.seed,
+                                state.index,
+                                call_id + "-discover",
+                                "search_tools",
+                                {
+                                    "query": "glob_files find workspace files by glob pattern",
+                                    "limit": 8,
+                                },
+                            )
+                            return
                         with state.lock:
                             state.error = (
                                 f"Ash request did not offer the {action.tool_name} tool"
@@ -236,78 +267,124 @@ class _FixtureServer:
                             },
                         )
                         return
+                    self._emit_tool_call(
+                        state.seed,
+                        state.index,
+                        call_id,
+                        action.tool_name,
+                        action.tool_arguments,
+                    )
+                    return
+
+                with state.lock:
+                    discovery_used = state.discovery_used
+                if number == 2 and discovery_used:
+                    discovery_outcome = _extract_tool_outcome(
+                        request_payload, call_id + "-discover", "search_tools"
+                    )
+                    if (
+                        discovery_outcome is None
+                        or discovery_outcome.get("success") is not True
+                        or not _request_offers_tool(request_payload, action.tool_name)
+                    ):
+                        with state.lock:
+                            state.error = (
+                                "glob_files discovery did not activate its schema"
+                            )
+                        self._json(502, {"error": {"message": state.error}})
+                        return
+                    self._emit_tool_call(
+                        state.seed,
+                        state.index,
+                        call_id,
+                        action.tool_name,
+                        action.tool_arguments,
+                    )
+                    return
+
+                if (number == 2 and not discovery_used) or (
+                    number == 3 and discovery_used
+                ):
+                    outcome = _extract_tool_outcome(
+                        request_payload, call_id, action.tool_name
+                    )
+                    with state.lock:
+                        state.tool_outcome = outcome
+                        if outcome is None:
+                            state.error = (
+                                "Ash follow-up request omitted the fixture tool result"
+                            )
                     self._stream(
                         [
                             {
-                                "id": f"explorer-{state.seed}-{state.index}",
+                                "id": f"explorer-final-{state.seed}-{state.index}",
                                 "object": "chat.completion.chunk",
                                 "created": 1,
                                 "model": "local-model",
                                 "choices": [
                                     {
                                         "index": 0,
-                                        "delta": {
-                                            "tool_calls": [
-                                                {
-                                                    "index": 0,
-                                                    "id": call_id,
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": action.tool_name,
-                                                        "arguments": json.dumps(
-                                                            action.tool_arguments,
-                                                            ensure_ascii=False,
-                                                            separators=(",", ":"),
-                                                        ),
-                                                    },
-                                                }
-                                            ]
-                                        },
-                                        "finish_reason": None,
+                                        "delta": {"content": FIXED_FINAL_RESPONSE},
+                                        "finish_reason": "stop",
                                     }
                                 ],
-                            },
-                            {
-                                "id": f"explorer-{state.seed}-{state.index}",
-                                "object": "chat.completion.chunk",
-                                "created": 1,
-                                "model": "local-model",
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {},
-                                        "finish_reason": "tool_calls",
-                                    }
-                                ],
-                            },
+                            }
                         ]
                     )
                     return
 
-                outcome = _extract_tool_outcome(
-                    request_payload, call_id, action.tool_name
-                )
                 with state.lock:
-                    state.tool_outcome = outcome
-                    if outcome is None:
-                        state.error = (
-                            "Ash follow-up request omitted the fixture tool result"
-                        )
+                    state.error = "fixture received an invalid completion sequence"
+                self._json(502, {"error": {"message": "invalid completion sequence"}})
+
+            def _emit_tool_call(
+                self,
+                seed: int,
+                index: int,
+                call_id: str,
+                tool_name: str,
+                arguments: dict[str, object],
+            ) -> None:
                 self._stream(
                     [
                         {
-                            "id": f"explorer-final-{state.seed}-{state.index}",
+                            "id": f"explorer-{seed}-{index}",
                             "object": "chat.completion.chunk",
                             "created": 1,
                             "model": "local-model",
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": FIXED_FINAL_RESPONSE},
-                                    "finish_reason": "stop",
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": call_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": tool_name,
+                                                    "arguments": json.dumps(
+                                                        arguments,
+                                                        ensure_ascii=False,
+                                                        separators=(",", ":"),
+                                                    ),
+                                                },
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": None,
                                 }
                             ],
-                        }
+                        },
+                        {
+                            "id": f"explorer-{seed}-{index}",
+                            "object": "chat.completion.chunk",
+                            "created": 1,
+                            "model": "local-model",
+                            "choices": [
+                                {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+                            ],
+                        },
                     ]
                 )
 
@@ -391,8 +468,14 @@ class RunState:
             raise ExplorerError(f"run limit is {MAX_STEPS} steps")
 
         index = self.step_index + 1
-        target = _target_path(self.scratch, self.project, request.file_path)
-        if request.tool_name == "list_dir":
+        target = _target_path(
+            self.scratch,
+            self.project,
+            "." if request.tool_name == "glob_files" else request.file_path,
+        )
+        if request.tool_name == "glob_files":
+            before_hash, _ = _glob_snapshot(target, request.file_path)
+        elif request.tool_name == "list_dir":
             before_hash, _ = _directory_snapshot(target)
         else:
             before_hash = _hash_target(target)
@@ -449,7 +532,9 @@ class RunState:
         events, malformed_lines = _parse_stream_events(bytes(stdout.data))
         fixture_snapshot = self.fixture.state.snapshot()
         _write_json(step_dir / "provider.json", fixture_snapshot)
-        if request.tool_name == "list_dir":
+        if request.tool_name == "glob_files":
+            after_hash, directory_listing = _glob_snapshot(target, request.file_path)
+        elif request.tool_name == "list_dir":
             after_hash, directory_listing = _directory_snapshot(target)
         else:
             after_hash = _hash_target(target)
@@ -916,8 +1001,10 @@ def _parse_action(raw_line: bytes) -> tuple[str, StepRequest | None]:
     if not isinstance(tool_call, dict) or set(tool_call) != {"name", "arguments"}:
         raise ExplorerError("tool_call must contain only name and arguments")
     tool_name = tool_call.get("name")
-    if tool_name not in {"write_file", "read_file", "list_dir"}:
-        raise ExplorerError("only write_file, read_file, and list_dir are supported")
+    if tool_name not in {"write_file", "read_file", "list_dir", "glob_files"}:
+        raise ExplorerError(
+            "only write_file, read_file, list_dir, and glob_files are supported"
+        )
     arguments = tool_call.get("arguments")
     if not isinstance(arguments, dict):
         raise ExplorerError("tool arguments must be an object")
@@ -936,14 +1023,36 @@ def _parse_action(raw_line: bytes) -> tuple[str, StepRequest | None]:
             raise ExplorerError(
                 "list_dir requires directory_path, recursive=false, max_results=64"
             )
+    elif tool_name == "glob_files":
+        if (
+            set(arguments) != {"pattern", "directory_path", "max_results"}
+            or arguments.get("directory_path") != "."
+            or type(arguments.get("max_results")) is not int
+            or arguments["max_results"] != MAX_DIRECTORY_ENTRIES
+        ):
+            raise ExplorerError(
+                "glob_files requires pattern, directory_path='.', max_results=64"
+            )
     elif set(arguments) != {"file_path"}:
         raise ExplorerError("read_file arguments must contain only file_path")
     file_path = _bounded_string(
-        arguments.get("directory_path" if tool_name == "list_dir" else "file_path"),
+        arguments.get(
+            "directory_path"
+            if tool_name == "list_dir"
+            else "pattern"
+            if tool_name == "glob_files"
+            else "file_path"
+        ),
         "file_path",
         MAX_PATH_BYTES,
     )
     _validate_relative_path_syntax(file_path)
+    if tool_name == "glob_files" and (
+        len(file_path.encode("utf-8")) > MAX_GLOB_PATTERN_BYTES
+        or any(ord(char) < 32 for char in file_path)
+        or ".." in Path(file_path).parts
+    ):
+        raise ExplorerError("glob_files pattern must be bounded and relative")
     content = (
         _bounded_string(arguments.get("content"), "content", MAX_CONTENT_BYTES)
         if tool_name == "write_file"
@@ -1048,6 +1157,45 @@ def _directory_snapshot(path: Path) -> tuple[str | None, str | None]:
     return digest, listing
 
 
+def _glob_snapshot(root: Path, pattern: str) -> tuple[str | None, str | None]:
+    if not root.is_dir() or root.is_symlink():
+        return None, None
+    matches: list[str] = []
+    scanned = 0
+    directories: list[tuple[Path, int]] = [(root, 0)]
+    try:
+        while directories:
+            directory, depth = directories.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    scanned += 1
+                    if scanned > MAX_GLOB_SCAN_ENTRIES:
+                        raise ExplorerError("glob snapshot exceeds scan limit")
+                    if entry.is_symlink():
+                        raise ExplorerError("glob snapshot cannot contain symlinks")
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth >= MAX_GLOB_DEPTH:
+                            raise ExplorerError("glob snapshot exceeds depth limit")
+                        directories.append((Path(entry.path), depth + 1))
+                    elif entry.is_file(follow_symlinks=False):
+                        relative = Path(entry.path).relative_to(root).as_posix()
+                        if fnmatch.fnmatch(relative, pattern):
+                            matches.append(relative)
+                            if len(matches) > MAX_DIRECTORY_ENTRIES:
+                                raise ExplorerError("glob snapshot exceeds match limit")
+                    else:
+                        raise ExplorerError(
+                            "glob snapshot contains an unsupported entry"
+                        )
+    except OSError as exc:
+        raise ExplorerError("glob snapshot failed") from exc
+    listing = "\n".join(sorted(matches))
+    digest = hashlib.sha256(
+        b"glob_files\x00" + pattern.encode("utf-8") + b"\x00" + listing.encode("utf-8")
+    ).hexdigest()
+    return digest, listing
+
+
 def _classify(
     request: StepRequest,
     process_status: dict[str, object],
@@ -1106,7 +1254,7 @@ def _classify(
     succeeded = tool_outcome.get("success") is True
     error = tool_outcome.get("error")
     if request.expectation.kind == "expected_success":
-        if request.tool_name == "list_dir":
+        if request.tool_name in {"list_dir", "glob_files"}:
             if (
                 succeeded
                 and directory_listing is not None
@@ -1114,7 +1262,14 @@ def _classify(
                 and before_hash == after_hash
                 and tool_outcome.get("output") == directory_listing
                 and hashlib.sha256(
-                    b"list_dir\x00" + directory_listing.encode("utf-8")
+                    (
+                        b"list_dir\x00"
+                        if request.tool_name == "list_dir"
+                        else b"glob_files\x00"
+                        + request.file_path.encode("utf-8")
+                        + b"\x00"
+                    )
+                    + directory_listing.encode("utf-8")
                 ).hexdigest()
                 == after_hash
             ):

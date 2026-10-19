@@ -190,7 +190,9 @@ def test_read_action_rejects_unlisted_tools_and_arguments() -> None:
         explorer._parse_action(
             action("read_file", {"file_path": "probe.txt", "content": "unexpected"})
         )
-    with pytest.raises(ExplorerError, match="only write_file, read_file, and list_dir"):
+    with pytest.raises(
+        ExplorerError, match="only write_file, read_file, list_dir, and glob_files"
+    ):
         explorer._parse_action(action("execute_shell", {"command": "pwd"}))
 
 
@@ -270,6 +272,95 @@ def test_list_directory_snapshot_rejects_symlinks_and_excess_entries(
         (tmp_path / f"entry-{i:03}").touch()
     with pytest.raises(ExplorerError, match="entry limit"):
         explorer._directory_snapshot(tmp_path)
+
+
+def test_glob_files_requires_bounded_workspace_relative_pattern(tmp_path: Path) -> None:
+    def parse(arguments: dict[str, object]) -> StepRequest:
+        action = {
+            "action": "step",
+            "label": "find files",
+            "prompt": "Discover matching filenames.",
+            "tool_call": {"name": "glob_files", "arguments": arguments},
+            "expect": {"kind": "expected_success"},
+        }
+        _, parsed = explorer._parse_action(json.dumps(action).encode())
+        assert parsed is not None
+        return parsed
+
+    arguments = {"pattern": "*.txt", "directory_path": ".", "max_results": 64}
+    request = parse(arguments)
+    assert request.tool_name == "glob_files"
+    assert request.tool_arguments == arguments
+    for invalid in (
+        {**arguments, "directory_path": "../"},
+        {**arguments, "max_results": 65},
+        {**arguments, "max_results": True},
+        {**arguments, "pattern": "../*.txt"},
+        {**arguments, "pattern": "/tmp/*.txt"},
+        {**arguments, "pattern": "a\nb"},
+        {**arguments, "extra": "value"},
+    ):
+        with pytest.raises(ExplorerError):
+            parse(invalid)
+
+    (tmp_path / "alpha.txt").write_text("text", encoding="utf-8")
+    (tmp_path / "skip.md").write_text("text", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "beta.txt").write_text("text", encoding="utf-8")
+    digest, names = explorer._glob_snapshot(tmp_path, "*.txt")
+    assert names == "alpha.txt\nnested/beta.txt"
+    assert digest is not None
+    outcome = {"success": True, "ambiguous": False, "output": names}
+    status = {"exit_code": 0, "session_id_in_result": True}
+    assert _classify(
+        request, status, outcome, digest, digest, [], {}, directory_listing=names
+    ) == (
+        "expected_success",
+        None,
+    )
+    assert (
+        _classify(
+            request,
+            status,
+            {**outcome, "output": "alpha.txt"},
+            digest,
+            digest,
+            [],
+            {},
+            directory_listing=names,
+        )[0]
+        == "unexpected_failure"
+    )
+    assert (
+        _classify(
+            request,
+            status,
+            outcome,
+            digest,
+            "b" * 64,
+            [],
+            {},
+            directory_listing=names,
+        )[0]
+        == "unexpected_failure"
+    )
+
+
+def test_glob_snapshot_rejects_symlinks_and_unbounded_scans(tmp_path: Path) -> None:
+    (tmp_path / "safe.txt").write_text("ok", encoding="utf-8")
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(tmp_path / "safe.txt")
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    with pytest.raises(ExplorerError, match="symlinks"):
+        explorer._glob_snapshot(tmp_path, "*.txt")
+    link.unlink()
+    for i in range(explorer.MAX_GLOB_SCAN_ENTRIES):
+        (tmp_path / f"other-{i:03}.md").touch()
+    with pytest.raises(ExplorerError, match="scan limit"):
+        explorer._glob_snapshot(tmp_path, "*.txt")
 
 
 def test_sigterm_enters_the_runner_cleanup_path() -> None:

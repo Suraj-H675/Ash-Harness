@@ -499,6 +499,8 @@ def test_unverified_model_finish_exits_nonzero(
         '{"tool":"read_file","file_path":"x.txt","classification":"expected_success","tool":"write_file"}',
         '{"tool":{},"file_path":"x.txt","classification":"expected_success"}',
         '{"tool":"read_file","file_path":"x.txt","classification":{}}',
+        '{"tool":"glob_files","file_path":"../*.txt","classification":"expected_success"}',
+        '{"tool":"glob_files","file_path":"bad\\npattern","classification":"expected_success"}',
     ],
 )
 def test_required_probe_contract_rejects_unsupported_or_ambiguous_terms(
@@ -834,6 +836,135 @@ def test_list_dir_probe_discovers_real_ash_file_and_replays(tmp_path: Path) -> N
     )
     for location in (evidence, tmp_path / "directory-replay"):
         manifest = json.loads((location / "manifest.json").read_text())
+        assert manifest["pending_cleanup"] is False
+        assert not Path(manifest["scratch_path"]).exists()
+
+
+def test_glob_probe_searches_real_ash_files_and_replays(tmp_path: Path) -> None:
+    _require_child_loopback()
+
+    class GlobProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            history = json.loads(messages[-1]["content"])["history"]
+            if not history:
+                decision = {
+                    "action": "step",
+                    "label": "create clue",
+                    "prompt": "Create a file to discover.",
+                    "tool_call": {
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "clue.txt",
+                            "content": "search-evidence\n",
+                            "overwrite": False,
+                        },
+                    },
+                    "expect": {"kind": "expected_success"},
+                }
+            elif len(history) == 1:
+                assert (
+                    history[-1]["observation"]["classification"] == "expected_success"
+                )
+                decision = {
+                    "action": "step",
+                    "label": "find matching files",
+                    "prompt": "Find files matching *.txt.",
+                    "tool_call": {
+                        "name": "glob_files",
+                        "arguments": {
+                            "pattern": "*.txt",
+                            "directory_path": ".",
+                            "max_results": 64,
+                        },
+                    },
+                    "expect": {"kind": "expected_success"},
+                }
+            else:
+                assert len(history) == 2
+                assert (
+                    history[-1]["observation"]["classification"] == "expected_success"
+                )
+                assert (
+                    history[-1]["observation"]["tool_outcome"]["output"] == "clue.txt"
+                )
+                decision = {"action": "finish"}
+            yield StreamChunk(
+                content=json.dumps(
+                    {"decision": decision, "reason": "inspect verified glob evidence"}
+                ),
+                is_done=True,
+                model=self.model_name,
+            )
+
+    evidence = tmp_path / "glob-evidence"
+    required = controller._parse_required_probes(
+        [
+            '{"tool":"glob_files","file_path":"*.txt","classification":"expected_success"}'
+        ]
+    )
+    report = asyncio.run(
+        controller.run_controller(
+            task="Create then find a matching file.",
+            evidence=evidence,
+            seed=52,
+            provider=GlobProvider(),
+            required_probes=required,
+        )
+    )
+    assert report["status"] == "finished", report
+    assert report["required_probes_satisfied"] is True
+    assert report["classifications"] == ["expected_success", "expected_success"]
+    original = json.loads((evidence / "steps" / "02" / "observation.json").read_text())
+    assert original["tool_outcome"]["output"] == "clue.txt"
+    assert original["target_before_sha256"] == original["target_after_sha256"]
+    provider_evidence = json.loads(
+        (evidence / "steps" / "02" / "provider.json").read_text()
+    )
+    assert provider_evidence["discovery_used"] is True
+    requests = [
+        entry["request"]
+        for entry in provider_evidence["exchanges"]
+        if entry.get("method") == "POST"
+    ]
+    assert len(requests) == 3
+    offered = [
+        {tool["function"]["name"] for tool in request["tools"]} for request in requests
+    ]
+    assert "search_tools" in offered[0]
+    assert "glob_files" not in offered[0]
+    assert "glob_files" in offered[1]
+    replay = subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER_PATH),
+            "replay",
+            "--steps",
+            str(evidence / "actions.jsonl"),
+            "--evidence",
+            str(tmp_path / "glob-replay"),
+            "--seed",
+            "52",
+        ],
+        cwd=ROOT,
+        env={
+            "PATH": os.defpath,
+            "HOME": str(tmp_path),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert replay.returncode == 0, replay.stderr
+    repeated = json.loads(
+        (tmp_path / "glob-replay" / "steps" / "02" / "observation.json").read_text()
+    )
+    assert repeated["classification"] == "expected_success"
+    assert original["target_after_sha256"] == repeated["target_after_sha256"]
+    for path in (evidence, tmp_path / "glob-replay"):
+        manifest = json.loads((path / "manifest.json").read_text())
         assert manifest["pending_cleanup"] is False
         assert not Path(manifest["scratch_path"]).exists()
 
