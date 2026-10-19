@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
 import sys
 from pathlib import Path
@@ -31,6 +32,8 @@ from ash.ui.transcript import Transcript
 
 MAX_PATH_COMPLETION_SCAN_ENTRIES = 10_000
 MAX_PATH_COMPLETIONS = 200
+MAX_LINEAR_INPUT_BYTES = 1_000_000
+LINEAR_INPUT_READ_SIZE = 4096
 
 
 def terminal_supports_cursor_ui(
@@ -510,6 +513,11 @@ class PromptInput:
         self._surface: InlinePromptSurface | None = None
         self._completer: AshCompleter | None = None
         self._linear_input_buffer = ""
+        self._linear_input_parts: list[str] = []
+        self._linear_input_size = 0
+        self._linear_input_discarding = False
+        self._linear_input_eof = False
+        self._linear_input_decoder: codecs.IncrementalDecoder | None = None
         self._theme = theme
         self._no_color = no_color
         self.screen_reader_mode = screen_reader_mode
@@ -656,55 +664,197 @@ class PromptInput:
         """Read one cooked-terminal line without cursor-addressing redraws."""
 
         safe_prompt = terminal_safe_text(prompt, single_line=True)
-        sys.stdout.write(safe_prompt)
-        sys.stdout.flush()
+        read_size = min(LINEAR_INPUT_READ_SIZE, MAX_LINEAR_INPUT_BYTES + 1)
+        # Keep one byte of slack for a trailing CR until CRLF is resolved.
+        storage_limit = MAX_LINEAR_INPUT_BYTES + 1
 
-        newline = self._linear_input_buffer.find("\n")
-        if newline >= 0:
-            line = self._linear_input_buffer[:newline]
-            self._linear_input_buffer = self._linear_input_buffer[newline + 1 :]
-            return line.rstrip("\r")
+        def warn_oversized() -> None:
+            print(
+                "Input line exceeded the "
+                f"{MAX_LINEAR_INPUT_BYTES:,} UTF-8 byte limit and was discarded.",
+                file=sys.stderr,
+                flush=True,
+            )
 
-        try:
-            fd = self.input_stream.fileno()
-        except (AttributeError, OSError, ValueError):
-            line = self.input_stream.readline()
-            if line == "":
-                raise EOFError
-            return line.rstrip("\r\n")
+        while True:
+            sys.stdout.write(safe_prompt)
+            sys.stdout.flush()
 
-        loop = asyncio.get_running_loop()
-        completed: asyncio.Future[str] = loop.create_future()
-        encoding = getattr(self.input_stream, "encoding", None) or "utf-8"
-        def on_readable() -> None:
-            try:
-                chunk = os.read(fd, 4096)
-            except OSError as exc:
-                if not completed.done():
-                    completed.set_exception(exc)
-                return
-            if not chunk:
-                if not completed.done():
-                    if self._linear_input_buffer:
-                        line = self._linear_input_buffer
-                        self._linear_input_buffer = ""
-                        completed.set_result(line.rstrip("\r"))
-                    else:
-                        completed.set_exception(EOFError())
-                return
-            self._linear_input_buffer += chunk.decode(encoding, errors="replace")
             newline = self._linear_input_buffer.find("\n")
-            if newline < 0 or completed.done():
-                return
-            line = self._linear_input_buffer[:newline]
-            self._linear_input_buffer = self._linear_input_buffer[newline + 1 :]
-            completed.set_result(line.rstrip("\r"))
+            if newline >= 0:
+                line = self._linear_input_buffer[:newline].rstrip("\r")
+                self._linear_input_buffer = self._linear_input_buffer[newline + 1 :]
+                if len(line.encode("utf-8")) > MAX_LINEAR_INPUT_BYTES:
+                    warn_oversized()
+                    continue
+                return line
 
-        loop.add_reader(fd, on_readable)
-        try:
-            return await completed
-        finally:
-            loop.remove_reader(fd)
+            if self._linear_input_buffer:
+                buffered_size = len(self._linear_input_buffer.encode("utf-8"))
+                if (
+                    self._linear_input_discarding
+                    or self._linear_input_size + buffered_size > storage_limit
+                ):
+                    self._linear_input_parts.clear()
+                    self._linear_input_size = 0
+                    self._linear_input_discarding = True
+                else:
+                    self._linear_input_parts.append(self._linear_input_buffer)
+                    self._linear_input_size += buffered_size
+                self._linear_input_buffer = ""
+
+            if self._linear_input_eof:
+                if self._linear_input_discarding:
+                    self._linear_input_discarding = False
+                    self._linear_input_parts.clear()
+                    self._linear_input_size = 0
+                    warn_oversized()
+                    continue
+                if self._linear_input_parts:
+                    buffered_line = "".join(self._linear_input_parts).rstrip("\r")
+                    self._linear_input_parts.clear()
+                    self._linear_input_size = 0
+                    if len(buffered_line.encode("utf-8")) <= MAX_LINEAR_INPUT_BYTES:
+                        return buffered_line
+                    warn_oversized()
+                    continue
+                raise EOFError
+
+            try:
+                fd = self.input_stream.fileno()
+            except (AttributeError, OSError, ValueError):
+                parts: list[str] = []
+                line_size = 0
+                discarding = False
+                while True:
+                    chunk = self.input_stream.readline(read_size)
+                    if not chunk:
+                        if discarding:
+                            fallback_line = None
+                            break
+                        if parts:
+                            fallback_line = "".join(parts).rstrip("\r")
+                            if len(fallback_line.encode("utf-8")) <= MAX_LINEAR_INPUT_BYTES:
+                                return fallback_line
+                            break
+                        raise EOFError
+
+                    newline = chunk.find("\n")
+                    text = chunk if newline < 0 else chunk[:newline]
+                    if not discarding:
+                        text_size = len(text.encode("utf-8"))
+                        if line_size + text_size > storage_limit:
+                            parts.clear()
+                            line_size = 0
+                            discarding = True
+                        elif newline >= 0:
+                            fallback_line = ("".join(parts) + text).rstrip("\r")
+                            if (
+                                len(fallback_line.encode("utf-8"))
+                                > MAX_LINEAR_INPUT_BYTES
+                            ):
+                                fallback_line = None
+                        elif text:
+                            parts.append(text)
+                            line_size += text_size
+                    if newline >= 0:
+                        if discarding:
+                            fallback_line = None
+                        break
+
+                if fallback_line is not None:
+                    return fallback_line
+                warn_oversized()
+                continue
+
+            loop = asyncio.get_running_loop()
+            completed: asyncio.Future[str | None] = loop.create_future()
+            if self._linear_input_decoder is None:
+                encoding = getattr(self.input_stream, "encoding", None) or "utf-8"
+                decoder_type = codecs.getincrementaldecoder(encoding)
+                self._linear_input_decoder = decoder_type(errors="replace")
+            decoder = self._linear_input_decoder
+
+            def consume_text(text: str) -> tuple[bool, str | None]:
+                if self._linear_input_discarding:
+                    newline = text.find("\n")
+                    if newline < 0:
+                        return False, None
+                    self._linear_input_discarding = False
+                    self._linear_input_buffer = text[newline + 1 :]
+                    return True, None
+
+                newline = text.find("\n")
+                content = text if newline < 0 else text[:newline]
+                content_size = self._linear_input_size + len(
+                    content.encode("utf-8")
+                )
+                if newline < 0:
+                    if content_size > storage_limit:
+                        self._linear_input_parts.clear()
+                        self._linear_input_size = 0
+                        self._linear_input_discarding = True
+                    elif content:
+                        self._linear_input_parts.append(content)
+                        self._linear_input_size = content_size
+                    return False, None
+
+                line = None
+                if content_size <= storage_limit:
+                    candidate = (
+                        "".join(self._linear_input_parts) + content
+                    ).rstrip("\r")
+                    if len(candidate.encode("utf-8")) <= MAX_LINEAR_INPUT_BYTES:
+                        line = candidate
+                self._linear_input_parts.clear()
+                self._linear_input_size = 0
+                self._linear_input_buffer = text[newline + 1 :]
+                return True, line.rstrip("\r") if line is not None else None
+
+            def on_readable() -> None:
+                if completed.done():
+                    return
+                try:
+                    chunk = os.read(fd, read_size)
+                except OSError as exc:
+                    completed.set_exception(exc)
+                    return
+
+                if chunk:
+                    done, line = consume_text(decoder.decode(chunk, final=False))
+                    if done:
+                        completed.set_result(line)
+                    return
+
+                self._linear_input_eof = True
+                done, line = consume_text(decoder.decode(b"", final=True))
+                if done:
+                    completed.set_result(line)
+                elif self._linear_input_discarding:
+                    self._linear_input_discarding = False
+                    self._linear_input_parts.clear()
+                    self._linear_input_size = 0
+                    completed.set_result(None)
+                elif self._linear_input_parts:
+                    line = "".join(self._linear_input_parts).rstrip("\r")
+                    self._linear_input_parts.clear()
+                    self._linear_input_size = 0
+                    if len(line.encode("utf-8")) <= MAX_LINEAR_INPUT_BYTES:
+                        completed.set_result(line)
+                    else:
+                        completed.set_result(None)
+                else:
+                    completed.set_exception(EOFError())
+
+            loop.add_reader(fd, on_readable)
+            try:
+                completed_line = await completed
+            finally:
+                loop.remove_reader(fd)
+
+            if completed_line is not None:
+                return completed_line
+            warn_oversized()
 
     def close(self) -> None:
         if self._surface is not None:

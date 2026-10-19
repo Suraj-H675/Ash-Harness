@@ -1,8 +1,11 @@
 import asyncio
 import io
 import os
+import select
 import stat
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -22,6 +25,46 @@ from ash.ui.transcript import Transcript
 class TtyStringIO(io.StringIO):
     def isatty(self) -> bool:
         return True
+
+
+class TtyPipe:
+    encoding = "utf-8"
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return self._fd
+
+
+def _watch_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    fd: int,
+) -> tuple[asyncio.Event, list[bool]]:
+    loop = asyncio.get_running_loop()
+    registered = asyncio.Event()
+    removed: list[bool] = []
+    add_reader = loop.add_reader
+    remove_reader = loop.remove_reader
+
+    def observe_add_reader(registered_fd, callback, *args):
+        result = add_reader(registered_fd, callback, *args)
+        if registered_fd == fd:
+            registered.set()
+        return result
+
+    def observe_remove_reader(registered_fd):
+        result = remove_reader(registered_fd)
+        if registered_fd == fd:
+            removed.append(result)
+        return result
+
+    monkeypatch.setattr(loop, "add_reader", observe_add_reader)
+    monkeypatch.setattr(loop, "remove_reader", observe_remove_reader)
+    return registered, removed
 
 
 class TrackingMouseOutput(DummyOutput):
@@ -516,26 +559,82 @@ async def test_limited_terminal_uses_linear_reader_without_prompt_toolkit(
     assert output.getvalue() == "limited> "
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_screen_reader_linear_reader_works_in_a_cooked_pty(
+    tmp_path: Path,
+) -> None:
+    import pty
+
+    master, slave = pty.openpty()
+    source_root = str(Path(__file__).parents[2] / "src")
+    environment = {
+        "HOME": str(tmp_path),
+        "NO_COLOR": "1",
+        "PATH": os.defpath,
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": source_root,
+        "TERM": "dumb",
+    }
+    code = (
+        "import asyncio\n"
+        "from ash.ui.prompt import PromptInput\n"
+        "async def main():\n"
+        "    prompt = PromptInput(screen_reader_mode=True)\n"
+        "    result = await prompt.read('accessible> ')\n"
+        "    print(f'RESULT:{result}', flush=True)\n"
+        "asyncio.run(main())\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+    )
+    os.close(slave)
+    captured = bytearray()
+
+    def read_until(marker: bytes) -> None:
+        deadline = time.monotonic() + 5
+        while marker not in captured:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if select.select([master], [], [], remaining)[0]:
+                try:
+                    chunk = os.read(master, 65_536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                captured.extend(chunk)
+        assert marker in captured, bytes(captured[-3000:])
+
+    try:
+        read_until(b"accessible> ")
+        os.write(master, b"hello\r")
+        read_until(b"RESULT:hello")
+        assert process.wait(timeout=5) == 0
+        assert b"\x1b[" not in captured
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        os.close(master)
+
+
 @pytest.mark.asyncio
 async def test_screen_reader_mode_reads_linearly_without_prompt_toolkit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     read_fd, write_fd = os.pipe()
-
-    class TtyPipe:
-        encoding = "utf-8"
-
-        def isatty(self) -> bool:
-            return True
-
-        def fileno(self) -> int:
-            return read_fd
-
     output = io.StringIO()
     monkeypatch.setattr(sys, "stdout", output)
     prompt = PromptInput(
-        input_stream=TtyPipe(),
+        input_stream=TtyPipe(read_fd),
         history_path=tmp_path / "history",
         screen_reader_mode=True,
     )
@@ -547,6 +646,245 @@ async def test_screen_reader_mode_reads_linearly_without_prompt_toolkit(
         assert await pending == "hello"
         assert output.getvalue() == "accessible> "
     finally:
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+async def test_linear_reader_preserves_utf8_split_across_pipe_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    registered, _ = _watch_reader(monkeypatch, read_fd)
+    first_read = asyncio.Event()
+    chunks: list[bytes] = []
+    real_read = os.read
+
+    def observe_read(fd: int, size: int) -> bytes:
+        chunk = real_read(fd, size)
+        if fd == read_fd:
+            chunks.append(chunk)
+            if len(chunks) == 1:
+                first_read.set()
+        return chunk
+
+    monkeypatch.setattr(prompt_module.os, "read", observe_read)
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    prompt = PromptInput(
+        input_stream=TtyPipe(read_fd),
+        history_path=tmp_path / "history",
+        screen_reader_mode=True,
+    )
+    pending = asyncio.create_task(prompt.read("accessible> "))
+    try:
+        await registered.wait()
+        os.write(write_fd, b"hello-\xf0\x9f")
+        await first_read.wait()
+        assert not pending.done()
+
+        os.write(write_fd, b"\x98\x80-world\n")
+
+        assert await pending == "hello-😀-world"
+        assert chunks == [b"hello-\xf0\x9f", b"\x98\x80-world\n"]
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+async def test_linear_reader_buffers_multiple_crlf_lines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    registered, _ = _watch_reader(monkeypatch, read_fd)
+    monkeypatch.setattr(prompt_module, "MAX_LINEAR_INPUT_BYTES", 5, raising=False)
+    first_read = asyncio.Event()
+    reads: list[bytes] = []
+    real_read = os.read
+
+    def observe_read(fd: int, size: int) -> bytes:
+        chunk = real_read(fd, size)
+        if fd == read_fd:
+            reads.append(chunk)
+            if len(reads) == 1:
+                first_read.set()
+        return chunk
+
+    monkeypatch.setattr(prompt_module.os, "read", observe_read)
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    prompt = PromptInput(
+        input_stream=TtyPipe(read_fd),
+        history_path=tmp_path / "history",
+        screen_reader_mode=True,
+    )
+    pending = asyncio.create_task(prompt.read("first> "))
+    try:
+        await registered.wait()
+        os.write(write_fd, b"first\r")
+        await first_read.wait()
+        assert not pending.done()
+        os.write(write_fd, b"\nthird\n")
+
+        assert await pending == "first"
+        assert await prompt.read("third> ") == "third"
+        assert reads == [b"first\r", b"\nthird", b"\n"]
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+async def test_linear_reader_returns_final_unterminated_pipe_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    registered, _ = _watch_reader(monkeypatch, read_fd)
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    prompt = PromptInput(
+        input_stream=TtyPipe(read_fd),
+        history_path=tmp_path / "history",
+        screen_reader_mode=True,
+    )
+    pending = asyncio.create_task(prompt.read("accessible> "))
+    try:
+        await registered.wait()
+        os.write(write_fd, b"final input")
+        os.close(write_fd)
+        write_fd = -1
+
+        assert await pending == "final input"
+        with pytest.raises(EOFError):
+            await prompt.read("accessible> ")
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+async def test_linear_reader_discards_oversized_pipe_line_before_next_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    registered, _ = _watch_reader(monkeypatch, read_fd)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    read_sizes: list[int] = []
+    real_read = os.read
+
+    def observe_read(fd: int, size: int) -> bytes:
+        if fd == read_fd:
+            read_sizes.append(size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(prompt_module, "MAX_LINEAR_INPUT_BYTES", 8, raising=False)
+    monkeypatch.setattr(prompt_module.os, "read", observe_read)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    prompt = PromptInput(
+        input_stream=TtyPipe(read_fd),
+        history_path=tmp_path / "history",
+        screen_reader_mode=True,
+    )
+    pending = asyncio.create_task(prompt.read("accessible> "))
+    try:
+        await registered.wait()
+        os.write(
+            write_fd,
+            "😀😀\r\n😀😀x\nsafe\n".encode("utf-8"),
+        )
+
+        assert await pending == "😀😀"
+        assert await prompt.read("accessible> ") == "safe"
+        assert "discarded" in stderr.getvalue()
+        assert stdout.getvalue() == "accessible> accessible> accessible> "
+        assert read_sizes and all(size == 9 for size in read_sizes)
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+async def test_linear_reader_bounds_text_stream_reads_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TrackingTtyStringIO(TtyStringIO):
+        def __init__(self, value: str) -> None:
+            super().__init__(value)
+            self.readline_sizes: list[int] = []
+
+        def readline(self, size: int = -1) -> str:
+            self.readline_sizes.append(size)
+            return super().readline(size)
+
+    stream = TrackingTtyStringIO("12345\nsafe\r\n")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    monkeypatch.setattr(prompt_module, "MAX_LINEAR_INPUT_BYTES", 4, raising=False)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    prompt = PromptInput(input_stream=stream, screen_reader_mode=True)
+
+    assert await prompt.read("accessible> ") == "safe"
+    assert stream.readline_sizes
+    assert all(0 < size <= 5 for size in stream.readline_sizes)
+    assert "discarded" in stderr.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_linear_reader_removes_pipe_listener_on_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    registered, removed = _watch_reader(monkeypatch, read_fd)
+    reads: list[bytes] = []
+    real_read = os.read
+
+    def observe_read(fd: int, size: int) -> bytes:
+        chunk = real_read(fd, size)
+        if fd == read_fd:
+            reads.append(chunk)
+        return chunk
+
+    monkeypatch.setattr(prompt_module.os, "read", observe_read)
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    prompt = PromptInput(
+        input_stream=TtyPipe(read_fd),
+        history_path=tmp_path / "history",
+        screen_reader_mode=True,
+    )
+    pending = asyncio.create_task(prompt.read("accessible> "))
+    try:
+        await registered.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        assert removed == [True]
+        os.write(write_fd, b"after cancellation\n")
+        assert await prompt.read("accessible> ") == "after cancellation"
+        assert reads == [b"after cancellation\n"]
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
         os.close(write_fd)
         os.close(read_fd)
 
