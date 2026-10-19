@@ -3269,7 +3269,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     )
     repair_parser.add_argument("--json", action="store_true")
     storage_parser = subparsers.add_parser(
-        "storage", help="Check, back up, or restore the session database"
+        "storage", help="Check, back up, restore, or maintain the session database"
     )
     storage_subparsers = storage_parser.add_subparsers(
         dest="storage_action", required=True
@@ -3287,6 +3287,17 @@ def _main_impl(argv: list[str] | None = None) -> int:
     )
     storage_restore.add_argument("backup", type=Path)
     storage_restore.add_argument("--yes", action="store_true")
+    storage_redact = storage_subparsers.add_parser(
+        "redact-turn-inputs",
+        help="Replace a bounded batch of legacy prompt text in one session's journal",
+    )
+    storage_redact.add_argument(
+        "--session",
+        required=True,
+        dest="session_id",
+        help="Session whose turn-journal input values will be replaced",
+    )
+    storage_redact.add_argument("--yes", action="store_true")
     storage_debug = storage_subparsers.add_parser(
         "debug-bundle", help="Create a bounded, redacted diagnostics bundle"
     )
@@ -4617,6 +4628,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
             backup_database,
             check_database,
             create_debug_bundle,
+            redact_turn_journal_inputs,
             render_storage_check,
             restore_database,
         )
@@ -4645,6 +4657,49 @@ def _main_impl(argv: list[str] | None = None) -> int:
             except (OSError, RuntimeError) as exc:
                 return _report_cli_error(exc)
             print(f"Backup created: {backup_path}")
+            return 0
+        if args.storage_action == "redact-turn-inputs":
+            confirmed = args.yes
+            if not confirmed and not args.ci and sys.stdin.isatty():
+                confirmed = input(
+                    "Stop other Ash processes first. This irreversibly replaces up "
+                    "to 5000 logical journal values for this session; no backup is "
+                    "created and old copies may remain. Continue? [y/N] "
+                ).strip().casefold() in {"y", "yes"}
+            if not confirmed:
+                print(
+                    "Legacy turn-input redaction requires explicit confirmation "
+                    "(--yes); no journal values were changed.",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                redaction_result = redact_turn_journal_inputs(
+                    database,
+                    session_id=args.session_id,
+                )
+            except (OSError, RuntimeError) as exc:
+                return _report_cli_error(exc)
+            print(
+                f"Replaced {redaction_result.replaced_rows} turn input value(s) in the "
+                "selected session's journal."
+            )
+            if redaction_result.more_rows_remain:
+                print(
+                    "More values remain; rerun this command to process the next "
+                    "batch of up to 5000."
+                )
+            else:
+                print("No additional legacy journal input values remain for this session.")
+            if not redaction_result.wal_checkpointed:
+                print(
+                    "The logical update committed, but SQLite could not finish its "
+                    "WAL checkpoint; rerun with other Ash processes stopped."
+                )
+            print(
+                "This changes logical journal values only. Existing backups are "
+                "untouched, and SQLite remnants may retain earlier bytes."
+            )
             return 0
         confirmed = args.yes
         if not confirmed and not args.ci and sys.stdin.isatty():

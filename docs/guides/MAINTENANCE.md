@@ -62,6 +62,55 @@ Restore only after inspecting the backup and explicitly confirming:
 Backups cover the session database. They are not a replacement for backing up
 all of ~/.ash when you need a complete user-state archive.
 
+### Turn-journal prompt privacy and older data
+
+New turns keep the original prompt in memory for model execution, but the
+durable `turn_journal.user_input` field stores only `<prompt omitted>`. This
+field is recovery metadata; turn identity, status, pending calls, checkpoints,
+and usage remain available to recovery. Ash does not rewrite older journal
+rows when it starts.
+
+To replace old journal input values for one session, stop other Ash processes
+using that profile and run:
+
+    ash storage redact-turn-inputs --session SESSION_ID --yes
+
+For an older database that this release has not opened yet, run the cleanup
+before ordinary startup if you want its existing pre-migration backup to see
+the omission marker as the logical field value. That safety backup remains a
+byte copy and can still contain SQLite remnants.
+
+The command changes at most 5,000 `turn_journal.user_input` values for that
+session in one transaction. If it reports that more values remain, run it
+again until none remain. It preserves turn identities, statuses, timestamps,
+usage and recovery metadata, tool calls, checkpoints, and transcript messages.
+After each batch it attempts to checkpoint and truncate the live SQLite WAL.
+If that checkpoint cannot finish, the logical update is still committed and
+the command says to rerun it with other Ash processes stopped. The command does
+not create a backup, because that would copy the values being removed. It does
+not change the schema or invoke the automatic pre-migration backup path.
+
+This is a logical database update, not secure erasure. A successful WAL
+checkpoint can settle the live WAL, but SQLite free pages, old WAL contents,
+snapshots, and storage media may retain earlier bytes. Existing backups,
+pre-restore `.raw` files, filesystem snapshots, and other copies are left
+untouched and may contain the original prompt. A restore from an older backup
+can put the old logical values back; run the command again if that is the
+chosen retention policy. Ash does not claim any old or new backup is sanitized,
+and a later schema migration's byte-copy safety backup may still include
+SQLite remnants. The next ordinary schema upgrade keeps the existing
+backup-before-migration behavior: if old rows have not been redacted, that
+backup can contain their original journal text; after cleanup, it may still
+contain SQLite remnants.
+
+The guarantee is limited to `turn_journal.user_input`. Transcript messages
+continue to use Ash's pattern-based redaction, which is not a general detector
+for arbitrary sensitive text. Imported message content and planner-generated
+sprint records are separate persistence paths; this command does not sanitize
+them. In particular, a sprint planner can produce durable contract text that
+echoes a prompt, so do not treat journal cleanup as a complete removal of all
+prompt-derived session data.
+
 ### Recovery after suspected SQLite corruption on 0.4.0
 
 Ash 0.4.0 could release SQLite advisory locks when multiple Ash processes used

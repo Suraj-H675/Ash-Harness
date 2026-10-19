@@ -34,6 +34,7 @@ from ash.core.session import (
     Message,
     SessionStore,
     SessionStorageError,
+    TURN_JOURNAL_INPUT_OMITTED,
     ToolCallRecord,
     get_db_connection,
 )
@@ -3363,7 +3364,18 @@ async def test_dry_run_suppresses_all_hook_side_effects_and_can_be_reenabled(tmp
 async def test_resuming_session_recovers_pending_tool_and_emits_details(tmp_path):
     store = SessionStore(tmp_path / "recovery.db")
     session = store.create_session(str(tmp_path))
-    store.start_turn(session.session_id, "turn-crashed", "run")
+    marker = "sk-proj-" + "B" * 32
+    store.start_turn(
+        session.session_id,
+        "turn-crashed",
+        f"OPENAI_API_KEY={marker}",
+    )
+    journal_row = next(
+        item
+        for item in store.started_turns(session.session_id)
+        if item["turn_id"] == "turn-crashed"
+    )
+    assert journal_row["user_input"] == TURN_JOURNAL_INPUT_OMITTED
     store.save_tool_call(
         session.session_id,
         ToolCallRecord(
@@ -3395,6 +3407,7 @@ async def test_resuming_session_recovers_pending_tool_and_emits_details(tmp_path
     audit = store.list_audit_logs(session.session_id)[-1]
     assert audit.details["call_id"] == "call-command"
     assert audit.details["replayed"] is False
+    assert marker not in str(journal_row["user_input"])
 
 
 class SteeringProvider(ProviderABC):
@@ -10300,6 +10313,44 @@ class ImageCaptureProvider(ProviderABC):
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         self.messages = messages
         yield StreamChunk(content="image inspected", is_done=True)
+
+
+@pytest.mark.asyncio
+async def test_turn_prompt_reaches_provider_but_is_not_retained_in_journal(
+    tmp_path,
+):
+    provider = ImageCaptureProvider()
+    store = SessionStore(tmp_path / "prompt-journal-boundary.db")
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+    marker = "sk-proj-" + "C" * 32
+    prompt = f"Please use this key: OPENAI_API_KEY={marker}"
+
+    response = await loop.run_turn(prompt)
+
+    assert response == "image inspected"
+    provider_prompt = next(
+        message["content"]
+        for message in provider.messages
+        if message["role"] == "user"
+    )
+    assert provider_prompt == prompt
+    assert loop.current_session is not None
+    with sqlite3.connect(store.db_path) as connection:
+        journal_input = connection.execute(
+            "SELECT user_input FROM turn_journal WHERE session_id = ?",
+            (loop.current_session.session_id,),
+        ).fetchone()[0]
+    assert journal_input == TURN_JOURNAL_INPUT_OMITTED
+    persisted_user = store.load_session(loop.current_session.session_id).messages[0]
+    assert marker not in persisted_user.content
+    assert "REDACTED" in persisted_user.content
+    await loop.aclose()
 
 
 @pytest.mark.asyncio

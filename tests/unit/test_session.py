@@ -15,6 +15,7 @@ import pytest
 from ash.core.goals import GoalState
 from ash.core.session import (
     CURRENT_SCHEMA_VERSION,
+    TURN_JOURNAL_INPUT_OMITTED,
     Message,
     SessionForkConflictError,
     SessionResolutionError,
@@ -76,6 +77,26 @@ def test_terminal_tool_persistence_retry_is_idempotent_and_conflicts_are_rejecte
     preserved = store.load_session(session.session_id)
     assert preserved.tool_calls[0].result == "hello"
     assert len([m for m in preserved.messages if m.role == "tool"]) == 1
+
+
+def test_turn_journal_does_not_retain_user_input(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "turn-journal-input.db")
+    session = store.create_session(str(tmp_path))
+    marker = "sk-proj-" + "A" * 32
+
+    store.start_turn(
+        session.session_id,
+        "turn-private-input",
+        f"OPENAI_API_KEY={marker}",
+    )
+
+    row = next(
+        item
+        for item in store.started_turns(session.session_id)
+        if item["turn_id"] == "turn-private-input"
+    )
+    assert row["user_input"] == TURN_JOURNAL_INPUT_OMITTED
+    assert marker not in str(row["user_input"])
 
 
 def test_terminal_tool_persistence_can_retry_after_transaction_rollback(

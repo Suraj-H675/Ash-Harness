@@ -8,7 +8,7 @@ import platform
 import subprocess
 import sqlite3
 import stat
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +18,7 @@ from ash.core.session import (
     CURRENT_SCHEMA_VERSION,
     SessionStorageError,
     SessionStore,
+    TURN_JOURNAL_INPUT_OMITTED,
     exclusive_database_access,
 )
 from ash.core.redaction import redact_text
@@ -31,6 +32,10 @@ from ash.sandbox.process_utils import (
     prepare_scoped_process_launch,
 )
 from ash.ui.safe_text import terminal_safe_text
+from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
+
+
+MAX_TURN_JOURNAL_REDACTIONS_PER_RUN = 5_000
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,13 @@ class StorageCheck:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class TurnJournalRedactionResult:
+    replaced_rows: int
+    more_rows_remain: bool
+    wal_checkpointed: bool
 
 
 def check_database(path: str | Path) -> StorageCheck:
@@ -66,6 +78,145 @@ def check_database(path: str | Path) -> StorageCheck:
         schema_version=version,
         messages=tuple(messages or ("ok",)),
     )
+
+
+def redact_turn_journal_inputs(
+    path: str | Path,
+    *,
+    session_id: str,
+    batch_size: int = MAX_TURN_JOURNAL_REDACTIONS_PER_RUN,
+) -> TurnJournalRedactionResult:
+    """Replace one bounded batch of legacy journal prompts for one session.
+
+    This deliberately bypasses ``SessionStore`` so opening an older database
+    cannot create its normal pre-migration backup before the prompt values are
+    replaced. The operation changes only ``turn_journal.user_input`` and does
+    not create another copy of the values it removes.
+    """
+
+    if not session_id:
+        raise SessionStorageError("A session ID is required for turn-input redaction")
+    if not 1 <= batch_size <= MAX_TURN_JOURNAL_REDACTIONS_PER_RUN:
+        raise SessionStorageError(
+            "Turn-input redaction batch size must be between 1 and "
+            f"{MAX_TURN_JOURNAL_REDACTIONS_PER_RUN}"
+        )
+
+    try:
+        database = PinnedSQLiteDatabase.prepare(
+            path,
+            label="session database",
+            create=False,
+        )
+        with exclusive_database_access(database.path) as locked_database:
+            if locked_database != database.path:
+                raise SessionStorageError(
+                    "Session database coordination changed the redaction path"
+                )
+            with closing(database.connect(label="session database")) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    migration_table = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'schema_migrations'"
+                    ).fetchone()
+                    if migration_table is None:
+                        raise SessionStorageError(
+                            "Session database has no supported schema migration table"
+                        )
+                    version = int(
+                        connection.execute(
+                            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+                        ).fetchone()[0]
+                    )
+                    if version > CURRENT_SCHEMA_VERSION:
+                        raise SessionStorageError(
+                            "Session database schema is newer than this Ash version"
+                        )
+
+                    journal_column_info = {
+                        str(row["name"]): row
+                        for row in connection.execute(
+                            "PRAGMA table_info(turn_journal)"
+                        )
+                    }
+                    session_columns = {
+                        str(row["name"])
+                        for row in connection.execute("PRAGMA table_info(sessions)")
+                    }
+                    primary_key_columns = [
+                        column_name
+                        for column_name, info in journal_column_info.items()
+                        if int(info["pk"]) > 0
+                    ]
+                    if (
+                        not {"turn_id", "session_id", "user_input"}.issubset(
+                            journal_column_info
+                        )
+                        or primary_key_columns != ["turn_id"]
+                        or "session_id" not in session_columns
+                    ):
+                        raise SessionStorageError(
+                            "Session database does not contain a supported turn journal"
+                        )
+                    if connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                        "AND tbl_name = 'turn_journal' LIMIT 1"
+                    ).fetchone() is not None:
+                        raise SessionStorageError(
+                            "Refusing to redact a turn journal with custom triggers"
+                        )
+                    if connection.execute(
+                        "SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1",
+                        (session_id,),
+                    ).fetchone() is None:
+                        raise SessionStorageError("Session was not found")
+
+                    cursor = connection.execute(
+                        "UPDATE turn_journal SET user_input = ? WHERE turn_id IN ("
+                        "SELECT turn_id FROM turn_journal "
+                        "WHERE session_id = ? AND user_input IS NOT ? LIMIT ?)",
+                        (
+                            TURN_JOURNAL_INPUT_OMITTED,
+                            session_id,
+                            TURN_JOURNAL_INPUT_OMITTED,
+                            batch_size,
+                        ),
+                    )
+                    more_rows_remain = (
+                        connection.execute(
+                            "SELECT 1 FROM turn_journal WHERE session_id = ? "
+                            "AND user_input IS NOT ? LIMIT 1",
+                            (session_id, TURN_JOURNAL_INPUT_OMITTED),
+                        ).fetchone()
+                        is not None
+                    )
+                    replaced_rows = max(0, int(cursor.rowcount))
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                try:
+                    checkpoint = connection.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    ).fetchone()
+                    wal_checkpointed = checkpoint is None or int(checkpoint[0]) == 0
+                except sqlite3.Error:
+                    # The logical update is already committed. Report a failed
+                    # checkpoint separately so callers know WAL bytes may remain.
+                    wal_checkpointed = False
+        return TurnJournalRedactionResult(
+            replaced_rows=replaced_rows,
+            more_rows_remain=more_rows_remain,
+            wal_checkpointed=wal_checkpointed,
+        )
+    except SessionStorageError:
+        raise
+    except (OSError, SQLitePathError, sqlite3.Error) as exc:
+        raise SessionStorageError(
+            "Could not safely redact legacy turn-journal input values"
+        ) from exc
 
 
 def _inspect_database(connection: sqlite3.Connection) -> tuple[int, list[str]]:

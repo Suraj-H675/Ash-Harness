@@ -15,7 +15,7 @@ import weakref
 from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, Literal, Sequence, cast
+from typing import Any, AsyncIterator, Final, Iterator, Literal, Sequence, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, PrivateAttr
@@ -58,6 +58,7 @@ AuditAction = Literal[
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
 CURRENT_SCHEMA_VERSION = 20
+TURN_JOURNAL_INPUT_OMITTED: Final[str] = "<prompt omitted>"
 SQLITE_INTEGER_MAX = 2**63 - 1
 SQLITE_REAL_MAX = sys.float_info.max
 MAX_SESSION_IMPORT_BYTES = 64 * 1024 * 1024
@@ -3103,14 +3104,15 @@ class SessionStore:
         return now
 
     def start_turn(self, session_id: str, turn_id: str, user_input: str) -> None:
-        """Persist intent before provider or tool work starts."""
+        """Persist recovery intent without retaining the prompt text."""
+        # Keep the argument for source compatibility; the journal needs no prompt.
         started_at = _serialize_datetime(_utc_now())
         with closing(self._connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO turn_journal "
                 "(turn_id, session_id, status, user_input, started_at) "
                 "VALUES (?, ?, 'started', ?, ?)",
-                (turn_id, session_id, user_input, started_at),
+                (turn_id, session_id, TURN_JOURNAL_INPUT_OMITTED, started_at),
             )
             conn.execute(
                 "UPDATE sessions SET updated_at = ? WHERE session_id = ?",

@@ -8,19 +8,30 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from ash.commands.storage import (
     backup_database,
     check_database,
+    redact_turn_journal_inputs,
     render_storage_check,
     restore_database,
 )
-from ash.core.session import SessionStorageError, SessionStore
+from ash.core.session import (
+    CURRENT_SCHEMA_VERSION,
+    SessionStorageError,
+    SessionStore,
+    TURN_JOURNAL_INPUT_OMITTED,
+    ToolCallRecord,
+    get_db_connection,
+)
 from ash.cli import main
+import ash.cli as cli_module
 from ash import sqlite_utils
 
 
@@ -188,6 +199,284 @@ def test_backup_and_restore_preserve_current_database(tmp_path: Path) -> None:
     assert replacement.session_id not in {item.session_id for item in sessions}
     assert len(preserved) >= 1
     assert all(item.exists() for item in preserved)
+
+
+def test_legacy_turn_input_redaction_is_bounded_and_preserves_recovery_state(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "sessions.db"
+    store = SessionStore(database)
+    selected = store.create_session("/selected")
+    other = store.create_session("/other")
+    selected_turns = ("legacy-one", "legacy-two")
+    for turn_id in selected_turns:
+        store.start_turn(selected.session_id, turn_id, "new prompt")
+    store.start_turn(other.session_id, "other-turn", "other prompt")
+    store.save_tool_call(
+        selected.session_id,
+        ToolCallRecord(
+            call_id="legacy-pending-call",
+            tool_name="run_command",
+            arguments={"command_line": "make verify"},
+            approved=True,
+            executed=False,
+            dispatched=True,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="legacy-one",
+    )
+    markers = {
+        "legacy-one": "OPENAI_API_KEY=" + "sk-proj-" + "D" * 32,
+        "legacy-two": "OPENAI_API_KEY=" + "sk-proj-" + "E" * 32,
+        "other-turn": "OPENAI_API_KEY=" + "sk-proj-" + "F" * 32,
+    }
+    with closing(sqlite3.connect(database)) as connection, connection:
+        for turn_id, marker in markers.items():
+            connection.execute(
+                "UPDATE turn_journal SET user_input = ?, status = 'interrupted', "
+                "usage_json = ?, recovery_json = ? WHERE turn_id = ?",
+                (
+                    marker,
+                    '{"input_tokens":7}',
+                    '{"reason":"process-exit"}',
+                    turn_id,
+                ),
+            )
+        connection.commit()
+
+    with closing(get_db_connection(database)) as connection:
+        before_rows = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT turn_id, session_id, status, started_at, completed_at, "
+                "usage_json, recovery_json FROM turn_journal ORDER BY turn_id"
+            )
+        ]
+        before_tool_calls = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM tool_calls ORDER BY call_id"
+            )
+        ]
+
+    legacy_backup = backup_database(database, tmp_path / "legacy-backup.db")
+    first = redact_turn_journal_inputs(
+        database,
+        session_id=selected.session_id,
+        batch_size=1,
+    )
+    second = redact_turn_journal_inputs(
+        database,
+        session_id=selected.session_id,
+        batch_size=1,
+    )
+
+    assert first.replaced_rows == 1
+    assert first.more_rows_remain is True
+    assert first.wal_checkpointed is True
+    assert second.replaced_rows == 1
+    assert second.more_rows_remain is False
+    assert second.wal_checkpointed is True
+    with closing(get_db_connection(database)) as connection:
+        after_rows = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT turn_id, session_id, status, started_at, completed_at, "
+                "usage_json, recovery_json FROM turn_journal ORDER BY turn_id"
+            )
+        ]
+        after_tool_calls = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM tool_calls ORDER BY call_id"
+            )
+        ]
+        persisted = {
+            str(row["turn_id"]): str(row["user_input"])
+            for row in connection.execute(
+                "SELECT turn_id, user_input FROM turn_journal"
+            )
+        }
+    assert after_rows == before_rows
+    assert after_tool_calls == before_tool_calls
+    assert persisted["legacy-one"] == TURN_JOURNAL_INPUT_OMITTED
+    assert persisted["legacy-two"] == TURN_JOURNAL_INPUT_OMITTED
+    assert persisted["other-turn"] == markers["other-turn"]
+    with closing(sqlite3.connect(legacy_backup)) as connection:
+        assert connection.execute(
+            "SELECT user_input FROM turn_journal WHERE turn_id = 'legacy-one'"
+        ).fetchone()[0] == markers["legacy-one"]
+    assert not list(tmp_path.glob("sessions.db.before-v*-migration.*.backup"))
+
+    clean_backup = backup_database(database, tmp_path / "clean-backup.db")
+    restore_database(database, clean_backup, confirmed=True)
+    with closing(get_db_connection(database)) as connection:
+        restored = connection.execute(
+            "SELECT user_input FROM turn_journal WHERE turn_id = 'legacy-one'"
+        ).fetchone()[0]
+    assert restored == TURN_JOURNAL_INPUT_OMITTED
+
+    restore_database(database, legacy_backup, confirmed=True)
+    with closing(get_db_connection(database)) as connection:
+        restored_legacy = connection.execute(
+            "SELECT user_input FROM turn_journal WHERE turn_id = 'legacy-one'"
+        ).fetchone()[0]
+    assert restored_legacy == markers["legacy-one"]
+    restored_redaction = redact_turn_journal_inputs(
+        database,
+        session_id=selected.session_id,
+    )
+    assert restored_redaction.replaced_rows == 2
+    assert restored_redaction.more_rows_remain is False
+
+
+def test_legacy_turn_input_redaction_does_not_migrate_or_back_up_old_schema(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "sessions-v19.db"
+    store = SessionStore(database)
+    session = store.create_session("/legacy")
+    store.start_turn(session.session_id, "legacy-turn", "new prompt")
+    marker = "OPENAI_API_KEY=sk-proj-" + "G" * 32
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(
+            "UPDATE turn_journal SET user_input = ? WHERE turn_id = 'legacy-turn'",
+            (marker,),
+        )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version = ?",
+            (CURRENT_SCHEMA_VERSION,),
+        )
+        connection.commit()
+
+    result = redact_turn_journal_inputs(database, session_id=session.session_id)
+
+    assert result.replaced_rows == 1
+    assert result.more_rows_remain is False
+    with closing(sqlite3.connect(database)) as connection, connection:
+        version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+        stored = connection.execute(
+            "SELECT user_input FROM turn_journal WHERE turn_id = 'legacy-turn'"
+        ).fetchone()[0]
+    assert version == CURRENT_SCHEMA_VERSION - 1
+    assert stored == TURN_JOURNAL_INPUT_OMITTED
+    assert not list(tmp_path.glob("sessions-v19.db.before-v*-migration.*.backup"))
+
+
+def test_legacy_turn_input_redaction_refuses_concurrent_session_connection(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "sessions.db"
+    store = SessionStore(database)
+    session = store.create_session("/workspace")
+    store.start_turn(session.session_id, "legacy-turn", "new prompt")
+    marker = "OPENAI_API_KEY=sk-proj-" + "H" * 32
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(
+            "UPDATE turn_journal SET user_input = ? WHERE turn_id = 'legacy-turn'",
+            (marker,),
+        )
+
+    active_connection = get_db_connection(database)
+    try:
+        with pytest.raises(SessionStorageError, match="open database connection"):
+            redact_turn_journal_inputs(database, session_id=session.session_id)
+    finally:
+        active_connection.close()
+
+    with closing(get_db_connection(database)) as connection:
+        stored = connection.execute(
+            "SELECT user_input FROM turn_journal WHERE turn_id = 'legacy-turn'"
+        ).fetchone()[0]
+    assert stored == marker
+
+
+def test_legacy_turn_input_redaction_refuses_custom_journal_triggers(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "sessions.db"
+    store = SessionStore(database)
+    session = store.create_session("/workspace")
+    store.start_turn(session.session_id, "legacy-turn", "new prompt")
+    marker = "OPENAI_API_KEY=sk-proj-" + "J" * 32
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(
+            "UPDATE turn_journal SET user_input = ? WHERE turn_id = 'legacy-turn'",
+            (marker,),
+        )
+        connection.execute(
+            "CREATE TRIGGER custom_turn_journal_update "
+            "AFTER UPDATE OF user_input ON turn_journal "
+            "BEGIN UPDATE sessions SET title = 'unexpected' "
+            "WHERE session_id = NEW.session_id; END"
+        )
+
+    with pytest.raises(SessionStorageError, match="custom triggers"):
+        redact_turn_journal_inputs(database, session_id=session.session_id)
+
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute(
+            "SELECT user_input FROM turn_journal WHERE turn_id = 'legacy-turn'"
+        ).fetchone()[0] == marker
+        assert connection.execute(
+            "SELECT title FROM sessions WHERE session_id = ?",
+            (session.session_id,),
+        ).fetchone()[0] == ""
+
+
+def test_storage_cli_requires_explicit_confirmation_for_legacy_redaction(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "_load_config_or_report",
+        lambda **_kwargs: (
+            SimpleNamespace(db_directory=tmp_path),
+            0,
+        ),
+    )
+    database = tmp_path / "sessions.db"
+    store = SessionStore(database)
+    session = store.create_session("/workspace")
+    store.start_turn(session.session_id, "legacy-turn", "new prompt")
+    marker = "OPENAI_API_KEY=sk-proj-" + "I" * 32
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(
+            "UPDATE turn_journal SET user_input = ? WHERE turn_id = 'legacy-turn'",
+            (marker,),
+        )
+
+    common_args = [
+        "--db-directory",
+        str(tmp_path),
+        "storage",
+        "redact-turn-inputs",
+        "--session",
+        session.session_id,
+    ]
+    assert main(common_args) != 0
+    declined = capsys.readouterr()
+    assert marker not in declined.out + declined.err
+    assert "explicit confirmation" in declined.err
+    assert "create a backup" not in declined.err.casefold()
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute(
+            "SELECT user_input FROM turn_journal WHERE turn_id = 'legacy-turn'"
+        ).fetchone()[0] == marker
+
+    assert main([*common_args, "--yes"]) == 0
+    completed = capsys.readouterr()
+    output = completed.out
+    assert "1 turn input value" in output
+    assert marker not in completed.out + completed.err
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute(
+            "SELECT user_input FROM turn_journal WHERE turn_id = 'legacy-turn'"
+        ).fetchone()[0] == TURN_JOURNAL_INPUT_OMITTED
 
 
 def test_restore_cleans_temporary_sqlite_sidecars(tmp_path: Path) -> None:
