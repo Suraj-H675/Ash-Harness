@@ -32,6 +32,14 @@ make the run `inconclusive`, with a nonzero CLI exit and an unmet-probes report.
 Exhausting the step budget also exits nonzero. Without explicit requirements,
 `finished` continues to mean only that the model stopped.
 
+Explorer also supports read-only directory discovery with list_dir. Its exact
+tool arguments are directory_path (relative), recursive=false, and
+max_results=64. A passing listing is checked against an independent, stable
+snapshot of directory entries, not just the model's explanation. Recursive
+listings, larger result limits, and symlink entries are rejected. Required
+list_dir probes use file_path as the directory identity in the existing
+--require-probe contract.
+
 Alternatively, start local Ollama separately and pull a model:
 
 ```sh
@@ -59,8 +67,9 @@ offers a smaller local decision boundary and accepts `tools=None`.
 
 The model receives the task and bounded prior action/observation history. It
 must return strict JSON for `step` or `finish`; each step is passed through the
-runner's `_parse_action` before dispatch. Only `write_file` and `read_file` are
-available. The controller makes no provider retries, caps each model call at
+runner's `_parse_action` before dispatch. Only `write_file`, `read_file`,
+and bounded `list_dir` are available.
+The controller makes no provider retries and caps each model call at
 30 seconds, the whole run at 600 seconds, the context and completion at 64 KiB
 each, and the run at the runner's eight steps. Configuration values are
 clamped to those ceilings. Provider tool calls, reasoning fields, malformed
@@ -93,7 +102,7 @@ and broader autonomous exploration require separate live verification.
 
 Ash Explorer lets an outside Codex or Poteto agent choose a bounded probe,
 inspect Ash's real CLI result, then choose the next probe. The local provider
-fixture returns the caller's `write_file` or `read_file` call and a fixed final
+fixture returns the caller's allowlisted file or directory call and a fixed final
 answer; it does not discover scenarios. No live model or API key is used.
 
 Start a fresh run with a new evidence directory outside the checkout:
@@ -117,11 +126,11 @@ For example:
 The writable marker beside the disposable project is still inside the run's
 private scratch directory. It lets a path-scope regression be observed without
 reaching user files. A successful read must report the target's actual SHA-256
-and leave it unchanged. The runner accepts only `write_file` and `read_file`;
+and leave it unchanged. The runner accepts only `write_file`, `read_file`, and bounded `list_dir`;
 it does not accept arbitrary Ash arguments, commands, plugins, MCP servers, or
-provider URLs. An outside-scope read can return an access-denied tool error
-after dispatch, which Ash classifies as `ambiguous_outcome`; the error text and
-unchanged marker do not make it an `expected_refusal`.
+provider URLs. An outside-scope read that fails path validation before accessing the target
+can produce a verified refusal; genuinely ambiguous post-dispatch failures
+remain inconclusive even if a marker's hash is unchanged.
 
 To reproduce a recorded sequence in a new disposable run:
 

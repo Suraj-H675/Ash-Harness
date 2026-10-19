@@ -690,6 +690,154 @@ def test_required_probe_verified_by_real_ash_refusal(tmp_path: Path) -> None:
     assert observation["target_before_sha256"] == observation["target_after_sha256"]
 
 
+def test_list_dir_probe_discovers_real_ash_file_and_replays(tmp_path: Path) -> None:
+    _require_child_loopback()
+
+    class DirectoryProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            history = json.loads(messages[-1]["content"])["history"]
+            index = len(history)
+            if index == 0:
+                decision = {
+                    "action": "step",
+                    "label": "make file",
+                    "prompt": "Create a discovery file.",
+                    "tool_call": {
+                        "name": "write_file",
+                        "arguments": {
+                            "file_path": "discover.txt",
+                            "content": "directory-evidence\n",
+                            "overwrite": False,
+                        },
+                    },
+                    "expect": {"kind": "expected_success"},
+                }
+            elif index == 1:
+                assert (
+                    history[-1]["observation"]["classification"] == "expected_success"
+                )
+                decision = {
+                    "action": "step",
+                    "label": "discover file",
+                    "prompt": "List the project root.",
+                    "tool_call": {
+                        "name": "list_dir",
+                        "arguments": {
+                            "directory_path": ".",
+                            "recursive": False,
+                            "max_results": 64,
+                        },
+                    },
+                    "expect": {"kind": "expected_success"},
+                }
+            elif index == 2:
+                assert (
+                    history[-1]["observation"]["classification"] == "expected_success"
+                )
+                assert (
+                    "discover.txt"
+                    in history[-1]["observation"]["tool_outcome"]["output"]
+                )
+                decision = {
+                    "action": "step",
+                    "label": "read discovery",
+                    "prompt": "Read discovered file.",
+                    "tool_call": {
+                        "name": "read_file",
+                        "arguments": {"file_path": "discover.txt"},
+                    },
+                    "expect": {"kind": "expected_success"},
+                }
+            else:
+                assert index == 3
+                assert (
+                    history[-1]["observation"]["classification"] == "expected_success"
+                )
+                decision = {"action": "finish"}
+            yield StreamChunk(
+                content=json.dumps(
+                    {"decision": decision, "reason": "inspect actual Ash evidence"}
+                ),
+                is_done=True,
+                model=self.model_name,
+            )
+
+    evidence = tmp_path / "directory-evidence"
+    required = controller._parse_required_probes(
+        ['{"tool":"list_dir","file_path":".","classification":"expected_success"}']
+    )
+    report = asyncio.run(
+        controller.run_controller(
+            task="Create, discover, and read a file.",
+            evidence=evidence,
+            seed=51,
+            provider=DirectoryProvider(),
+            required_probes=required,
+            require_write_read=True,
+        )
+    )
+    assert report["status"] == "finished", report
+    assert report["required_probes_satisfied"] is True
+    assert report["write_read_verified"] is True
+    assert report["classifications"] == ["expected_success"] * 3
+    directory_observation = json.loads(
+        (evidence / "steps" / "02" / "observation.json").read_text()
+    )
+    assert directory_observation["tool_outcome"]["output"] == "discover.txt"
+    assert (
+        directory_observation["target_before_sha256"]
+        == directory_observation["target_after_sha256"]
+    )
+    actions = [
+        json.loads(line)
+        for line in (evidence / "actions.jsonl").read_text().splitlines()
+    ]
+    assert [a["tool_call"]["name"] for a in actions[:-1]] == [
+        "write_file",
+        "list_dir",
+        "read_file",
+    ]
+    replay = subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER_PATH),
+            "replay",
+            "--steps",
+            str(evidence / "actions.jsonl"),
+            "--evidence",
+            str(tmp_path / "directory-replay"),
+            "--seed",
+            "51",
+        ],
+        cwd=ROOT,
+        env={
+            "PATH": os.defpath,
+            "HOME": str(tmp_path),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert replay.returncode == 0, replay.stderr
+    replay_observation = json.loads(
+        (
+            tmp_path / "directory-replay" / "steps" / "02" / "observation.json"
+        ).read_text()
+    )
+    assert replay_observation["classification"] == "expected_success"
+    assert (
+        replay_observation["target_after_sha256"]
+        == directory_observation["target_after_sha256"]
+    )
+    for location in (evidence, tmp_path / "directory-replay"):
+        manifest = json.loads((location / "manifest.json").read_text())
+        assert manifest["pending_cleanup"] is False
+        assert not Path(manifest["scratch_path"]).exists()
+
+
 def test_model_cannot_claim_readback_without_a_real_read(tmp_path: Path) -> None:
     _require_child_loopback()
 

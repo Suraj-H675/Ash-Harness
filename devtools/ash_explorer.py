@@ -30,6 +30,7 @@ MAX_PROMPT_BYTES = 8 * 1024
 MAX_PATH_BYTES = 1024
 MAX_CONTENT_BYTES = 16 * 1024
 MAX_REFUSAL_TEXT_BYTES = 512
+MAX_DIRECTORY_ENTRIES = 64
 MAX_PROVIDER_BODY_BYTES = 2 * 1024 * 1024
 MAX_CHILD_OUTPUT_BYTES = 1024 * 1024
 MAX_TRACEBACK_CHARS = 8192
@@ -56,12 +57,18 @@ class StepRequest:
     content: str
     overwrite: bool
     expectation: ExpectedOutcome
-    tool_name: Literal["write_file", "read_file"] = "write_file"
+    tool_name: Literal["write_file", "read_file", "list_dir"] = "write_file"
 
     @property
     def tool_arguments(self) -> dict[str, object]:
         if self.tool_name == "read_file":
             return {"file_path": self.file_path}
+        if self.tool_name == "list_dir":
+            return {
+                "directory_path": self.file_path,
+                "recursive": False,
+                "max_results": MAX_DIRECTORY_ENTRIES,
+            }
         return {
             "file_path": self.file_path,
             "content": self.content,
@@ -385,7 +392,10 @@ class RunState:
 
         index = self.step_index + 1
         target = _target_path(self.scratch, self.project, request.file_path)
-        before_hash = _hash_target(target)
+        if request.tool_name == "list_dir":
+            before_hash, _ = _directory_snapshot(target)
+        else:
+            before_hash = _hash_target(target)
         step_dir = self.evidence / "steps" / f"{index:02d}"
         step_dir.mkdir(parents=True, mode=0o700)
         self.append_accepted_line(raw_line)
@@ -439,7 +449,11 @@ class RunState:
         events, malformed_lines = _parse_stream_events(bytes(stdout.data))
         fixture_snapshot = self.fixture.state.snapshot()
         _write_json(step_dir / "provider.json", fixture_snapshot)
-        after_hash = _hash_target(target)
+        if request.tool_name == "list_dir":
+            after_hash, directory_listing = _directory_snapshot(target)
+        else:
+            after_hash = _hash_target(target)
+            directory_listing = None
 
         tool_events = [
             event
@@ -470,6 +484,7 @@ class RunState:
             after_hash,
             malformed_lines,
             fixture_snapshot,
+            directory_listing=directory_listing,
         )
 
         self.step_index = index
@@ -901,8 +916,8 @@ def _parse_action(raw_line: bytes) -> tuple[str, StepRequest | None]:
     if not isinstance(tool_call, dict) or set(tool_call) != {"name", "arguments"}:
         raise ExplorerError("tool_call must contain only name and arguments")
     tool_name = tool_call.get("name")
-    if tool_name not in {"write_file", "read_file"}:
-        raise ExplorerError("only write_file and read_file are supported")
+    if tool_name not in {"write_file", "read_file", "list_dir"}:
+        raise ExplorerError("only write_file, read_file, and list_dir are supported")
     arguments = tool_call.get("arguments")
     if not isinstance(arguments, dict):
         raise ExplorerError("tool arguments must be an object")
@@ -911,9 +926,23 @@ def _parse_action(raw_line: bytes) -> tuple[str, StepRequest | None]:
             raise ExplorerError(
                 "write_file arguments must be file_path, content, overwrite"
             )
+    elif tool_name == "list_dir":
+        if (
+            set(arguments) != {"directory_path", "recursive", "max_results"}
+            or arguments.get("recursive") is not False
+            or type(arguments.get("max_results")) is not int
+            or arguments["max_results"] != MAX_DIRECTORY_ENTRIES
+        ):
+            raise ExplorerError(
+                "list_dir requires directory_path, recursive=false, max_results=64"
+            )
     elif set(arguments) != {"file_path"}:
         raise ExplorerError("read_file arguments must contain only file_path")
-    file_path = _bounded_string(arguments.get("file_path"), "file_path", MAX_PATH_BYTES)
+    file_path = _bounded_string(
+        arguments.get("directory_path" if tool_name == "list_dir" else "file_path"),
+        "file_path",
+        MAX_PATH_BYTES,
+    )
     _validate_relative_path_syntax(file_path)
     content = (
         _bounded_string(arguments.get("content"), "content", MAX_CONTENT_BYTES)
@@ -992,6 +1021,33 @@ def _hash_target(path: Path) -> str | None:
     return digest.hexdigest()
 
 
+def _directory_snapshot(path: Path) -> tuple[str | None, str | None]:
+    if not path.exists():
+        return None, None
+    if path.is_symlink():
+        raise ExplorerError("directory target must not be a symlink")
+    if not path.is_dir():
+        return _hash_target(path), None
+    try:
+        with os.scandir(path) as entries:
+            names = []
+            for entry in entries:
+                if entry.is_symlink():
+                    raise ExplorerError("directory snapshot cannot contain symlinks")
+                names.append(
+                    entry.name + ("/" if entry.is_dir(follow_symlinks=False) else "")
+                )
+                if len(names) > MAX_DIRECTORY_ENTRIES:
+                    raise ExplorerError(
+                        "directory snapshot exceeds Explorer entry limit"
+                    )
+    except OSError as exc:
+        raise ExplorerError("directory snapshot failed") from exc
+    listing = "\n".join(sorted(names))
+    digest = hashlib.sha256(b"list_dir\x00" + listing.encode("utf-8")).hexdigest()
+    return digest, listing
+
+
 def _classify(
     request: StepRequest,
     process_status: dict[str, object],
@@ -1000,6 +1056,8 @@ def _classify(
     after_hash: str | None,
     malformed_lines: list[int],
     fixture: dict[str, object],
+    *,
+    directory_listing: str | None = None,
 ) -> tuple[str, str | None]:
     fixture_error = fixture.get("error")
     output_truncated = bool(
@@ -1048,6 +1106,23 @@ def _classify(
     succeeded = tool_outcome.get("success") is True
     error = tool_outcome.get("error")
     if request.expectation.kind == "expected_success":
+        if request.tool_name == "list_dir":
+            if (
+                succeeded
+                and directory_listing is not None
+                and before_hash is not None
+                and before_hash == after_hash
+                and tool_outcome.get("output") == directory_listing
+                and hashlib.sha256(
+                    b"list_dir\x00" + directory_listing.encode("utf-8")
+                ).hexdigest()
+                == after_hash
+            ):
+                return "expected_success", None
+            return (
+                "unexpected_failure",
+                "directory listing did not match stable workspace entries",
+            )
         if request.tool_name == "read_file":
             output = tool_outcome.get("output")
             if (

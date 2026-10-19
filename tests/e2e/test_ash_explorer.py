@@ -190,8 +190,86 @@ def test_read_action_rejects_unlisted_tools_and_arguments() -> None:
         explorer._parse_action(
             action("read_file", {"file_path": "probe.txt", "content": "unexpected"})
         )
-    with pytest.raises(ExplorerError, match="only write_file and read_file"):
+    with pytest.raises(ExplorerError, match="only write_file, read_file, and list_dir"):
         explorer._parse_action(action("execute_shell", {"command": "pwd"}))
+
+
+def test_list_directory_action_is_read_only_and_bounded(tmp_path: Path) -> None:
+    def action(arguments: dict[str, object]) -> bytes:
+        return json.dumps(
+            {
+                "action": "step",
+                "label": "list",
+                "prompt": "Inspect the disposable project.",
+                "tool_call": {"name": "list_dir", "arguments": arguments},
+                "expect": {"kind": "expected_success"},
+            }
+        ).encode()
+
+    valid = {"directory_path": ".", "recursive": False, "max_results": 64}
+    _, request = explorer._parse_action(action(valid))
+    assert request is not None and request.tool_name == "list_dir"
+    assert request.tool_arguments == valid
+    for changed in (
+        {**valid, "recursive": True},
+        {**valid, "max_results": 200},
+        {**valid, "max_results": True},
+        {**valid, "extra": "unsafe"},
+        {**valid, "directory_path": "/tmp"},
+    ):
+        with pytest.raises(ExplorerError):
+            explorer._parse_action(action(changed))
+
+    directory = tmp_path / "project"
+    directory.mkdir()
+    (directory / "alpha.txt").write_text("alpha")
+    (directory / "subdir").mkdir()
+    digest, listing = explorer._directory_snapshot(directory)
+    assert listing == "alpha.txt\nsubdir/"
+    assert digest is not None
+    outcome = {"success": True, "ambiguous": False, "output": listing}
+    status = {"exit_code": 0, "session_id_in_result": True}
+    assert _classify(
+        request, status, outcome, digest, digest, [], {}, directory_listing=listing
+    ) == ("expected_success", None)
+    wrong = {**outcome, "output": "alpha.txt"}
+    assert (
+        _classify(
+            request, status, wrong, digest, digest, [], {}, directory_listing=listing
+        )[0]
+        == "unexpected_failure"
+    )
+    assert (
+        _classify(
+            request,
+            status,
+            outcome,
+            digest,
+            "f" * 64,
+            [],
+            {},
+            directory_listing=listing,
+        )[0]
+        == "unexpected_failure"
+    )
+
+
+def test_list_directory_snapshot_rejects_symlinks_and_excess_entries(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "safe.txt").write_text("ok")
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(tmp_path / "safe.txt")
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+    with pytest.raises(ExplorerError, match="symlinks"):
+        explorer._directory_snapshot(tmp_path)
+    link.unlink()
+    for i in range(explorer.MAX_DIRECTORY_ENTRIES + 1):
+        (tmp_path / f"entry-{i:03}").touch()
+    with pytest.raises(ExplorerError, match="entry limit"):
+        explorer._directory_snapshot(tmp_path)
 
 
 def test_sigterm_enters_the_runner_cleanup_path() -> None:
