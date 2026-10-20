@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -9,6 +11,267 @@ from ash.providers import readiness
 from ash.providers.readiness import verify_provider_connection
 
 from .provider_test_helpers import patch_catalog_client
+
+
+class _SlowLocalCatalog(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b'{"models":['
+        await asyncio.sleep(2)
+        yield b'{"name":"too-slow"}]}'
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _LocalCatalogBytes(httpx.AsyncByteStream):
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+
+    async def __aiter__(self):
+        yield self.content
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _patch_local_discovery_transport(monkeypatch, handler):
+    calls: list[httpx.Request] = []
+    client_options: list[dict[str, object]] = []
+    real_client = httpx.AsyncClient
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        response = handler(request)
+        if response.is_stream_consumed:
+            response = httpx.Response(
+                response.status_code,
+                headers=response.headers,
+                stream=_LocalCatalogBytes(response.content),
+                request=request,
+            )
+        return response
+
+    def make_client(*args, **kwargs):
+        client_options.append(dict(kwargs))
+        return real_client(
+            *args,
+            transport=httpx.MockTransport(respond),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(readiness.httpx, "AsyncClient", make_client)
+    return calls, client_options
+
+
+def test_default_local_discovery_uses_only_fixed_loopback_catalogs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.provider_catalog import BUILTIN_PROVIDERS
+
+    monkeypatch.setenv("OLLAMA_API_BASE", "https://remote.example/v1")
+    monkeypatch.setenv("LMSTUDIO_API_BASE", "https://other.example/v1")
+    monkeypatch.setenv("VLLM_API_BASE", "https://another.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-sent")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
+
+    catalogs = {
+        "/api/tags": {"models": [{"name": "llama3.1:8b"}]},
+        "/api/v1/models": {
+            "models": [
+                {"key": "embed/model", "type": "embedding"},
+                {"key": "local/llm", "type": "llm"},
+            ]
+        },
+        "/v1/models": {"data": [{"id": "served-model"}]},
+    }
+    calls, client_options = _patch_local_discovery_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json=catalogs[request.url.path],
+            headers=(
+                {"set-cookie": "session=local-secret"}
+                if request.url.path == "/api/tags"
+                else None
+            ),
+            request=request,
+        ),
+    )
+
+    discovered = readiness.discover_default_local_provider_ids()
+
+    assert [
+        (descriptor.id, descriptor.base_url)
+        for descriptor in BUILTIN_PROVIDERS
+        if descriptor.local
+    ] == [
+        ("ollama", "http://localhost:11434"),
+        ("lmstudio", "http://localhost:1234/v1"),
+        ("vllm", "http://localhost:8000/v1"),
+    ]
+    assert discovered == tuple(
+        descriptor.id for descriptor in BUILTIN_PROVIDERS if descriptor.local
+    )
+    assert [(request.url.host, request.url.port, request.url.path) for request in calls] == [
+        ("127.0.0.1", 11434, "/api/tags"),
+        ("127.0.0.1", 1234, "/api/v1/models"),
+        ("127.0.0.1", 8000, "/v1/models"),
+    ]
+    assert all(request.url.scheme == "http" for request in calls)
+    assert all(
+        not any(
+            name in request.headers
+            for name in ("authorization", "x-api-key", "x-goog-api-key", "cookie")
+        )
+        for request in calls
+    )
+    assert len(client_options) == 3
+    assert all(options["trust_env"] is False for options in client_options)
+    assert all(options["follow_redirects"] is False for options in client_options)
+    for options in client_options:
+        timeout = options["timeout"]
+        assert isinstance(timeout, httpx.Timeout)
+        assert timeout.connect == pytest.approx(0.2)
+
+
+def test_default_local_discovery_uses_ipv6_loopback_when_ipv4_has_no_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _ = _patch_local_discovery_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200 if request.url.host == "::1" else 503,
+            json={"models": [{"name": "llama3.1:8b"}]},
+            request=request,
+        )
+        if request.url.path == "/api/tags"
+        else httpx.Response(503, request=request),
+    )
+
+    assert readiness.discover_default_local_provider_ids() == ("ollama",)
+    assert [(request.url.host, request.url.port) for request in calls[:2]] == [
+        ("127.0.0.1", 11434),
+        ("::1", 11434),
+    ]
+
+
+def test_local_discovery_ignores_duplicate_or_invalid_entries_if_model_is_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_local_discovery_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "models": [
+                    {"name": "valid:latest"},
+                    {"name": "valid:latest"},
+                    {"name": " bad model "},
+                    None,
+                ]
+            },
+            request=request,
+        )
+        if request.url.path == "/api/tags"
+        else httpx.Response(503, request=request),
+    )
+
+    assert readiness.discover_default_local_provider_ids() == ("ollama",)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, json={"models": []}),
+        httpx.Response(200, content=b'{"models":[{"name":"a"}],"models":[]}'),
+        httpx.Response(200, json={"models": [{"name": " spaced model "}]}),
+        httpx.Response(503, json={"models": [{"name": "server-error"}]}),
+        httpx.Response(
+            302,
+            headers={"location": "https://remote.example/models"},
+            json={"models": [{"name": "redirect"}]},
+        ),
+    ],
+    ids=("empty", "duplicate-json-key", "invalid-model-id", "http-error", "redirect"),
+)
+def test_default_local_discovery_rejects_unusable_ollama_catalogs(
+    monkeypatch: pytest.MonkeyPatch,
+    response: httpx.Response,
+) -> None:
+    calls, client_options = _patch_local_discovery_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            content=response.content,
+            request=request,
+        )
+        if request.url.path == "/api/tags"
+        else httpx.Response(503, request=request),
+    )
+
+    assert readiness.discover_default_local_provider_ids() == ()
+    assert calls
+    assert all(request.url.host in {"127.0.0.1", "::1"} for request in calls)
+    assert client_options[0]["follow_redirects"] is False
+
+
+def test_default_local_discovery_rejects_embedding_only_lmstudio_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _ = _patch_local_discovery_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"models": [{"key": "embed/only", "type": "embedding"}]},
+            request=request,
+        )
+        if request.url.path == "/api/v1/models"
+        else httpx.Response(503, request=request),
+    )
+
+    assert readiness.discover_default_local_provider_ids() == ()
+    assert any(request.url.path == "/api/v1/models" for request in calls)
+
+
+def test_default_local_discovery_bounds_response_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.readiness import MAX_PROVIDER_CATALOG_BYTES
+
+    calls, _ = _patch_local_discovery_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            content=b" " * (MAX_PROVIDER_CATALOG_BYTES + 1),
+            request=request,
+        )
+        if request.url.path == "/api/tags"
+        else httpx.Response(503, request=request),
+    )
+
+    assert readiness.discover_default_local_provider_ids() == ()
+    assert calls
+
+
+def test_default_local_discovery_cancels_slow_catalog_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _ = _patch_local_discovery_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            stream=_SlowLocalCatalog(),
+            request=request,
+        ),
+    )
+    started = time.monotonic()
+
+    assert readiness.discover_default_local_provider_ids() == ()
+
+    assert time.monotonic() - started < 1.7
+    assert calls
 
 
 def _config(model: str) -> SimpleNamespace:

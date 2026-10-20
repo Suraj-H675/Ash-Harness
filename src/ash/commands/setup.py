@@ -924,13 +924,25 @@ def _browser_is_installed() -> bool:
 
 def select_provider_and_model(config) -> SetupOutcome:
     """Show provider list, route to provider flow, verify model."""
+    discovered_local_provider_ids: tuple[str, ...] | None = None
     while True:
         _print_header("Select your inference provider")
 
         try:
             initial_scope = None
             if not _has_provider_configured(config):
-                initial_scope = _prompt_first_run_provider_scope(config)
+                if discovered_local_provider_ids is None:
+                    from ash.providers.readiness import (
+                        discover_default_local_provider_ids,
+                    )
+
+                    discovered_local_provider_ids = (
+                        discover_default_local_provider_ids()
+                    )
+                initial_scope = _prompt_first_run_provider_scope(
+                    config,
+                    discovered_local_provider_ids=discovered_local_provider_ids,
+                )
             if not _interactive_setup_picker_enabled():
                 print(
                     "Choose by number, provider name, or provider ID. "
@@ -964,11 +976,17 @@ def select_provider_and_model(config) -> SetupOutcome:
             return SetupOutcome.CANCELLED
 
 
-def _prompt_first_run_provider_scope(config) -> list[ProviderDescriptor]:
+def _prompt_first_run_provider_scope(
+    config,
+    *,
+    discovered_local_provider_ids: tuple[str, ...] = (),
+) -> list[ProviderDescriptor]:
+    discovered_ids = frozenset(discovered_local_provider_ids)
     detected = [
         descriptor
         for descriptor in PROVIDERS
-        if _provider_is_detected_or_configured(config, descriptor)
+        if descriptor.id in discovered_ids
+        or _provider_is_detected_or_configured(config, descriptor)
     ]
     choices: list[tuple[str, list[ProviderDescriptor]]] = []
     if detected:

@@ -8,11 +8,13 @@ validated, immutable connection description.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import os
+import unicodedata
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Mapping
+from typing import TYPE_CHECKING, Literal, Mapping, TypeGuard
 from urllib.parse import urlsplit
 
 import httpx
@@ -42,6 +44,7 @@ CatalogFormat = Literal[
     "fireworks",
     "huggingface",
 ]
+LocalDiscoveryCatalogFormat = Literal["openai", "ollama", "lmstudio"]
 AuthMode = Literal[
     "bearer",
     "anthropic",
@@ -54,6 +57,16 @@ AuthMode = Literal[
 MAX_PROVIDER_CATALOG_BYTES = 2_000_000
 MAX_PROVIDER_ERROR_BYTES = 64 * 1024
 GOOGLE_API_CLIENT_HEADER = f"ash-harness-oai/{__version__}"
+_LOCAL_DISCOVERY_ADDRESSES = ("127.0.0.1", "::1")
+_LOCAL_DISCOVERY_ROUTE_TIMEOUT = 0.20
+_LOCAL_DISCOVERY_TOTAL_TIMEOUT = 1.25
+_LOCAL_DISCOVERY_ROUTES: tuple[
+    tuple[str, int, str, LocalDiscoveryCatalogFormat], ...
+] = (
+    ("ollama", 11434, "/api/tags", "ollama"),
+    ("lmstudio", 1234, "/api/v1/models", "lmstudio"),
+    ("vllm", 8000, "/v1/models", "openai"),
+)
 
 
 @dataclass(frozen=True)
@@ -107,6 +120,133 @@ class ProviderConnection:
 
 class ProviderVerificationError(RuntimeError):
     """Raised when a provider catalog cannot be verified safely."""
+
+
+def discover_default_local_provider_ids() -> tuple[str, ...]:
+    """Discover built-in local runtimes with a valid inference model catalog."""
+
+    return asyncio.run(_discover_default_local_provider_ids_async())
+
+
+async def _discover_default_local_provider_ids_async() -> tuple[str, ...]:
+    discovered: set[str] = set()
+    try:
+        async with asyncio.timeout(_LOCAL_DISCOVERY_TOTAL_TIMEOUT):
+            for provider_id, port, path, catalog_format in _LOCAL_DISCOVERY_ROUTES:
+                for address in _LOCAL_DISCOVERY_ADDRESSES:
+                    host = f"[{address}]" if ":" in address else address
+                    endpoint = f"http://{host}:{port}{path}"
+                    try:
+                        async with asyncio.timeout(_LOCAL_DISCOVERY_ROUTE_TIMEOUT):
+                            async with httpx.AsyncClient(
+                                timeout=httpx.Timeout(_LOCAL_DISCOVERY_ROUTE_TIMEOUT),
+                                trust_env=False,
+                                follow_redirects=False,
+                                headers={
+                                    "Accept": "application/json",
+                                    "Accept-Encoding": "identity",
+                                },
+                            ) as client:
+                                async with client.stream("GET", endpoint) as response:
+                                    if response.status_code != 200:
+                                        continue
+                                    payload = await _read_bounded_local_catalog(response)
+                        if _parse_local_discovery_catalog(payload, catalog_format):
+                            discovered.add(provider_id)
+                            break
+                    except (
+                        httpx.HTTPError,
+                        ProviderVerificationError,
+                        TimeoutError,
+                    ):
+                        continue
+    except TimeoutError:
+        pass
+
+    return tuple(
+        descriptor.id
+        for descriptor in BUILTIN_PROVIDERS
+        if descriptor.id in discovered
+    )
+
+
+async def _read_bounded_local_catalog(response: httpx.Response) -> bytes:
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise ProviderVerificationError(
+                "local provider catalog returned an invalid Content-Length"
+            ) from exc
+        if declared_length < 0 or declared_length > MAX_PROVIDER_CATALOG_BYTES:
+            raise ProviderVerificationError(
+                "local provider catalog response exceeds the size limit"
+            )
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_raw():
+        total += len(chunk)
+        if total > MAX_PROVIDER_CATALOG_BYTES:
+            raise ProviderVerificationError(
+                "local provider catalog response exceeds the size limit"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _parse_local_discovery_catalog(
+    raw_payload: bytes,
+    catalog_format: LocalDiscoveryCatalogFormat,
+) -> tuple[str, ...]:
+    try:
+        payload = strict_json_loads(raw_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise ProviderVerificationError(
+            f"local provider catalog verification failed ({type(exc).__name__})"
+        ) from exc
+
+    if catalog_format == "ollama":
+        collection, identifier = "models", "name"
+    elif catalog_format == "lmstudio":
+        collection, identifier = "models", "key"
+    elif catalog_format == "openai":
+        collection, identifier = "data", "id"
+    else:
+        raise ProviderVerificationError("local provider has an unsupported catalog format")
+    if not isinstance(payload, dict) or not isinstance(payload.get(collection), list):
+        raise ProviderVerificationError("local provider returned an invalid model catalog")
+
+    model_ids: list[str] = []
+    seen: set[str] = set()
+    for item in payload[collection]:
+        if not isinstance(item, dict):
+            continue
+        if catalog_format == "lmstudio" and item.get("type") == "embedding":
+            continue
+        model_id = item.get(identifier)
+        if not _is_valid_local_model_id(model_id) or model_id in seen:
+            continue
+        seen.add(model_id)
+        model_ids.append(model_id)
+    if not model_ids:
+        raise ProviderVerificationError("local provider returned no inference model IDs")
+    return tuple(model_ids)
+
+
+def _is_valid_local_model_id(value: object) -> TypeGuard[str]:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    try:
+        if len(value.encode("utf-8")) > 512:
+            return False
+    except UnicodeEncodeError:
+        return False
+    return not any(
+        character.isspace() or unicodedata.category(character).startswith("C")
+        for character in value
+    )
 
 
 def redact_provider_error(message: str, *secrets: str) -> str:

@@ -1459,6 +1459,7 @@ def test_provider_picker_accepts_name_search(
 
 def test_first_run_provider_scope_defaults_to_common_cloud_apis(
     monkeypatch: pytest.MonkeyPatch,
+    capsys,
 ) -> None:
     from ash.commands.setup import _prompt_first_run_provider_scope
 
@@ -1474,6 +1475,7 @@ def test_first_run_provider_scope_defaults_to_common_cloud_apis(
         "openai",
         "google",
     ]
+    assert "Common cloud APIs (default)" in capsys.readouterr().out
 
 
 def test_first_run_provider_scope_surfaces_detected_route_first(
@@ -1492,6 +1494,93 @@ def test_first_run_provider_scope_surfaces_detected_route_first(
     )
 
     assert [descriptor.id for descriptor in selected] == ["openai"]
+
+
+def test_first_run_provider_scope_merges_discovered_local_routes_in_catalog_order(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    from ash.commands.setup import _prompt_first_run_provider_scope
+
+    monkeypatch.setenv("OPENAI_API_KEY", "setup-test-key")
+    monkeypatch.setattr("builtins.input", _fake_input(["1"]))
+
+    selected = _prompt_first_run_provider_scope(
+        SimpleNamespace(model="", openai_auth_mode="api_key"),
+        discovered_local_provider_ids=("vllm", "ollama", "lmstudio"),
+    )
+
+    assert [descriptor.id for descriptor in selected] == [
+        "openai",
+        "ollama",
+        "lmstudio",
+        "vllm",
+    ]
+    output = capsys.readouterr().out
+    assert "Detected or configured routes (default)" in output
+    assert "Common cloud APIs" in output
+    assert "Local runtimes" in output
+
+
+def test_first_run_provider_discovery_runs_once_across_setup_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import (
+        SetupBack,
+        SetupCancelled,
+        SetupOutcome,
+        select_provider_and_model,
+    )
+
+    discovery_calls: list[None] = []
+    scopes: list[tuple[str, ...]] = []
+
+    def discover() -> tuple[str, ...]:
+        discovery_calls.append(None)
+        return ("ollama",)
+
+    def pick_provider(_config, *, initial_scope=None):
+        scopes.append(tuple(item.id for item in initial_scope or ()))
+        if len(scopes) == 1:
+            raise SetupBack
+        raise SetupCancelled
+
+    monkeypatch.setattr("ash.commands.setup._has_provider_configured", lambda _: False)
+    monkeypatch.setattr(
+        "ash.providers.readiness.discover_default_local_provider_ids",
+        discover,
+    )
+    monkeypatch.setattr("ash.commands.setup._prompt_provider", pick_provider)
+    monkeypatch.setattr("ash.commands.setup._interactive_setup_picker_enabled", lambda: False)
+    monkeypatch.setattr("builtins.input", _fake_input(["1", "1"]))
+
+    outcome = select_provider_and_model(SimpleNamespace(model=""))
+
+    assert outcome == SetupOutcome.CANCELLED
+    assert len(discovery_calls) == 1
+    assert scopes == [("ollama",), ("ollama",)]
+
+
+def test_configured_provider_selection_skips_local_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.commands.setup import SetupCancelled, SetupOutcome, select_provider_and_model
+
+    def unexpected_discovery() -> tuple[str, ...]:
+        pytest.fail("configured provider selection must not probe local runtimes")
+
+    monkeypatch.setattr("ash.commands.setup._has_provider_configured", lambda _: True)
+    monkeypatch.setattr(
+        "ash.providers.readiness.discover_default_local_provider_ids",
+        unexpected_discovery,
+    )
+    monkeypatch.setattr(
+        "ash.commands.setup._prompt_provider",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SetupCancelled),
+    )
+    monkeypatch.setattr("ash.commands.setup._interactive_setup_picker_enabled", lambda: False)
+
+    assert select_provider_and_model(SimpleNamespace(model="openai/gpt-test")) == SetupOutcome.CANCELLED
 
 
 def test_scoped_provider_picker_numbers_the_visible_scope(
