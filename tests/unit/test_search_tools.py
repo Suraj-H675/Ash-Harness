@@ -1,4 +1,7 @@
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -122,6 +125,83 @@ async def test_search_text_supports_regex_and_case_insensitive_matching(
 
     assert result.success is True
     assert result.output == "app.py:2:Alpha123"
+
+
+@pytest.mark.asyncio
+async def test_search_text_marks_aggregate_regex_budget_exhaustion(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "notes.txt").write_text("needle\nneedle\n", encoding="utf-8")
+    monkeypatch.setattr(search_module, "MAX_SEARCH_REGEX_MATCH_SECONDS", 0.05)
+    monkeypatch.setattr(search_module, "MAX_SEARCH_REGEX_TOTAL_SECONDS", 0.05)
+    clock_values = iter((1.0, 1.06))
+    monkeypatch.setattr(search_module, "monotonic", lambda: next(clock_values))
+
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(pattern="needle")
+
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output == (
+        "notes.txt:1:needle\n"
+        "[workspace search incomplete: regex time budget exhausted]"
+    )
+
+
+def test_search_text_catastrophic_regex_returns_incomplete_result(tmp_path) -> None:
+    (tmp_path / "hostile.txt").write_text("a" * 128 + "!\n", encoding="utf-8")
+    child = """
+import asyncio, json, sys
+from pathlib import Path
+from ash.safety.guard import SafetyGuard
+from ash.tools.search import SearchTextTool
+result = asyncio.run(SearchTextTool(SafetyGuard(Path(sys.argv[1]))).run(pattern=r'(a|aa)+$'))
+print(json.dumps({"success": result.success, "truncated": result.truncated, "output": result.output}))
+"""
+    source_root = str(Path(__file__).resolve().parents[2] / "src")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (source_root, env.get("PYTHONPATH")) if part
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", child, str(tmp_path)],
+        capture_output=True,
+        check=True,
+        env=env,
+        text=True,
+        timeout=3,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["success"] is True
+    assert payload["output"] in {
+        "",
+        "[workspace search incomplete: regex time budget exhausted]",
+    }
+    assert payload["truncated"] is bool(payload["output"])
+
+
+@pytest.mark.asyncio
+async def test_search_text_reports_per_match_timeout_without_losing_earlier_results(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "notes.txt").write_text("needle\nslow\n", encoding="utf-8")
+
+    class TimedMatcher:
+        def search(self, line: str, *, timeout: float):
+            if line.startswith("slow"):
+                raise TimeoutError
+            return True
+
+    monkeypatch.setattr(search_module.regex_engine, "compile", lambda *_: TimedMatcher())
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(pattern="needle")
+
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output == (
+        "notes.txt:1:needle\n"
+        "[workspace search incomplete: regex time budget exhausted]"
+    )
 
 
 @pytest.mark.asyncio

@@ -5,10 +5,12 @@ from __future__ import annotations
 import fnmatch
 import io
 import stat
+from time import monotonic
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, TextIO
 
+import regex as regex_engine
 from pydantic import BaseModel, Field
 
 from ash.safety.guard import SafetyGuard, SafetyViolation
@@ -35,6 +37,8 @@ MAX_GLOB_DEPTH = 32
 MAX_SEARCH_SCAN_ENTRIES = 100_000
 MAX_SEARCH_DEPTH = 32
 MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024
+MAX_SEARCH_REGEX_MATCH_SECONDS = 0.05
+MAX_SEARCH_REGEX_TOTAL_SECONDS = 1.0
 
 
 def _iter_workspace_paths(
@@ -220,18 +224,24 @@ class SearchTextTool(BaseTool):
         root: Path,
         args: SearchTextArgs,
     ) -> ToolResult:
-        import re
-
-        flags = 0 if args.case_sensitive else re.IGNORECASE
-        expression = re.escape(args.pattern) if args.fixed_strings else args.pattern
+        flags = regex_engine.VERSION0
+        if not args.case_sensitive:
+            flags |= regex_engine.IGNORECASE
+        expression = (
+            regex_engine.escape(args.pattern) if args.fixed_strings else args.pattern
+        )
         try:
-            regex = re.compile(expression, flags)
-        except re.error as exc:
+            regex = regex_engine.compile(expression, flags)
+        except regex_engine.error as exc:
             return ToolResult(success=False, output="", error=f"Invalid regex: {exc}")
+
+        regex_time_remaining = MAX_SEARCH_REGEX_TOTAL_SECONDS
+        regex_incomplete = False
 
         def bounded_lines(
             handle: TextIO,
         ) -> Iterator[tuple[int, str, bool, bool]]:
+            nonlocal regex_time_remaining, regex_incomplete
             line_number = 0
             file_bytes = 0
             while True:
@@ -257,10 +267,30 @@ class SearchTextTool(BaseTool):
                 line = scanned_line.rstrip("\r\n")
                 clipped = len(line) > MAX_SEARCH_LINE_CHARS
                 preview = line[:MAX_SEARCH_LINE_CHARS]
+                if regex_time_remaining <= 0:
+                    regex_incomplete = True
+                    return
+                started_at = monotonic()
+                try:
+                    matched = regex.search(
+                        scanned_line,
+                        timeout=min(
+                            MAX_SEARCH_REGEX_MATCH_SECONDS,
+                            regex_time_remaining,
+                        ),
+                    )
+                except TimeoutError:
+                    regex_incomplete = True
+                    return
+                finally:
+                    regex_time_remaining = max(
+                        0.0,
+                        regex_time_remaining - (monotonic() - started_at),
+                    )
                 yield (
                     line_number,
                     preview,
-                    bool(regex.search(scanned_line)),
+                    bool(matched),
                     clipped,
                 )
                 if not complete:
@@ -331,11 +361,18 @@ class SearchTextTool(BaseTool):
             except (OSError, UnicodeError, SafetyViolation):
                 skipped_file = True
                 continue
+            if regex_incomplete:
+                break
             if output_limited or match_limited:
                 break
         output = "\n".join(matches)
         separator = "\n" if output else ""
-        if output_limited:
+        if regex_incomplete:
+            output += (
+                f"{separator}[workspace search incomplete: "
+                "regex time budget exhausted]"
+            )
+        elif output_limited:
             output += (
                 f"{separator}[search output capture truncated after "
                 f"{MAX_SEARCH_CAPTURE_BYTES} bytes]"
@@ -359,7 +396,8 @@ class SearchTextTool(BaseTool):
             output=output,
             token_count=count_output_tokens(output),
             truncated=(
-                output_limited
+                regex_incomplete
+                or output_limited
                 or match_limited
                 or scan_truncated
                 or scan_incomplete
