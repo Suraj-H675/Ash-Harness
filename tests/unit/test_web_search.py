@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
@@ -8,6 +10,25 @@ import pytest
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.tools.web_search import WebSearchTool
+
+
+class _SyntheticStream(httpx.AsyncByteStream):
+    def __init__(self, *, drip: bool = False) -> None:
+        self.started = asyncio.Event()
+        self.closed = False
+        self.drip = drip
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while True:
+            self.started.set()
+            yield b"x"
+            if self.drip:
+                await asyncio.sleep(0)
+            else:
+                await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 @pytest.mark.asyncio
@@ -173,6 +194,12 @@ async def test_web_search_provider_uses_public_dns_pinned_transport(
         def handler(request: httpx.Request) -> httpx.Response:
             assert request.url.host == "api.search.brave.com"
             assert request.headers["x-subscription-token"] == "brave-test-key"
+            assert request.extensions["timeout"] == {
+                "connect": 12.0,
+                "read": 12.0,
+                "write": 12.0,
+                "pool": 12.0,
+            }
             return httpx.Response(
                 200,
                 headers={"content-type": "application/json"},
@@ -223,6 +250,17 @@ async def test_web_search_provider_dns_policy_fails_closed_before_dispatch(
         rejected,
     )
 
+    from ash.tools import web_search
+
+    constructed: list[bool] = []
+
+    def unexpected_transport(*, pinned_addresses: tuple[str, ...]):
+        del pinned_addresses
+        constructed.append(True)
+        raise AssertionError("transport must not be constructed after DNS rejection")
+
+    monkeypatch.setattr(web_search, "_PinnedPublicTransport", unexpected_transport)
+
     result = await WebSearchTool(
         SafetyGuard(tmp_path),
         provider="brave",
@@ -231,6 +269,230 @@ async def test_web_search_provider_dns_policy_fails_closed_before_dispatch(
     assert result.success is False
     assert "public-network validation" in (result.error or "")
     assert "brave-test-key" not in (result.error or "")
+    assert constructed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_kind", ["aggregate", "resolver"])
+async def test_web_search_dns_deadlines_fail_before_transport_construction(
+    tmp_path,
+    monkeypatch,
+    timeout_kind: str,
+) -> None:
+    from ash.tools import web_search
+    from ash.tools.web import _DNSResolutionTimeout
+
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-timeout-secret")
+    constructed: list[bool] = []
+
+    async def stalled_dns(
+        hostname: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, ...]:
+        del hostname, timeout_seconds
+        if timeout_kind == "resolver":
+            raise _DNSResolutionTimeout(
+                "DNS resolution timed out for host provider.example"
+            )
+        await asyncio.Event().wait()
+        return ("93.184.216.34",)
+
+    def unexpected_transport(*, pinned_addresses: tuple[str, ...]):
+        del pinned_addresses
+        constructed.append(True)
+        raise AssertionError("transport must not be constructed before DNS completes")
+
+    monkeypatch.setattr(web_search, "_resolve_public_addresses_with_timeout", stalled_dns)
+    monkeypatch.setattr(web_search, "_PinnedPublicTransport", unexpected_transport)
+    tool = WebSearchTool(SafetyGuard(tmp_path), provider="brave", timeout=1)
+    if timeout_kind == "aggregate":
+        tool.timeout = 0.01
+
+    result = await asyncio.wait_for(tool.run(query="search-secret-marker"), timeout=0.2)
+
+    assert result.success is False
+    assert result.output == ""
+    assert result.error == "web search failed: brave timed out"
+    assert "search-secret-marker" not in (result.error or "")
+    assert "brave-timeout-secret" not in (result.error or "")
+    assert "api.search.brave.com" not in (result.error or "")
+    assert "provider.example" not in (result.error or "")
+    assert constructed == []
+
+
+@pytest.mark.asyncio
+async def test_web_search_times_out_drip_stream_with_safe_error_and_cleanup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-timeout-secret")
+    stream = _SyntheticStream(drip=True)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=stream,
+            request=request,
+        )
+
+    tool = WebSearchTool(
+        SafetyGuard(tmp_path),
+        provider="brave",
+        transport=httpx.MockTransport(handler),
+        timeout=1,
+    )
+    tool.timeout = 0.01
+    result = await asyncio.wait_for(
+        tool.run(query="search-secret-marker"),
+        timeout=0.2,
+    )
+
+    assert stream.started.is_set()
+    assert stream.closed is True
+    assert result.success is False
+    assert result.output == ""
+    assert result.citations == []
+    assert result.error == "web search failed: brave timed out"
+    assert "search-secret-marker" not in (result.error or "")
+    assert "brave-timeout-secret" not in (result.error or "")
+    assert "api.search.brave.com" not in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_auto_search_falls_back_after_timed_out_provider_and_closes_stream(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-fake-secret")
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-fake-secret")
+    stream = _SyntheticStream(drip=True)
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.host)
+        if request.url.host == "api.search.brave.com":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=stream,
+                request=request,
+            )
+        assert request.url.host == "api.tavily.com"
+        assert stream.closed is True
+        return httpx.Response(
+            200,
+            json={"results": [{"title": "Fallback", "url": "https://example.com"}]},
+            request=request,
+        )
+
+    tool = WebSearchTool(
+        SafetyGuard(tmp_path),
+        transport=httpx.MockTransport(handler),
+        timeout=1,
+    )
+    tool.timeout = 0.01
+    result = await asyncio.wait_for(tool.run(query="fallback test"), timeout=0.3)
+
+    assert result.success is True
+    assert json.loads(result.output)["provider"] == "tavily"
+    assert requests == ["api.search.brave.com", "api.tavily.com"]
+    assert stream.closed is True
+    assert "brave-fake-secret" not in result.output
+    assert "tavily-fake-secret" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_web_search_caller_cancellation_propagates_and_closes_stream(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-test-key")
+    stream = _SyntheticStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=stream,
+            request=request,
+        )
+
+    tool = WebSearchTool(
+        SafetyGuard(tmp_path),
+        provider="brave",
+        transport=httpx.MockTransport(handler),
+        timeout=120,
+    )
+    task = asyncio.create_task(tool.run(query="anything"))
+    await asyncio.wait_for(stream.started.wait(), timeout=0.2)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_web_search_budget_bounds_sequential_pinned_address_attempts(
+    monkeypatch,
+) -> None:
+    from ash.tools import web_search
+    from ash.tools.web import _PinnedPublicTransport
+    from ash.tools.web_search import WebSearchBackendError, _request_json
+
+    addresses = tuple(f"93.184.216.{value}" for value in range(1, 41))
+    attempts = 0
+
+    class FailingTransport(httpx.AsyncBaseTransport):
+        closed = False
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            await asyncio.sleep(0.005)
+            raise httpx.ConnectTimeout("synthetic connect timeout", request=request)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    failing_transport = FailingTransport()
+    pinned_transports: list[_PinnedPublicTransport] = []
+
+    class TrackingPinnedTransport(_PinnedPublicTransport):
+        def __init__(self, *, pinned_addresses: tuple[str, ...]) -> None:
+            super().__init__(pinned_addresses=pinned_addresses)
+            self._transport = failing_transport
+            pinned_transports.append(self)
+
+    async def resolved(
+        hostname: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, ...]:
+        del hostname, timeout_seconds
+        return addresses
+
+    monkeypatch.setattr(web_search, "_resolve_public_addresses_with_timeout", resolved)
+    monkeypatch.setattr(web_search, "_PinnedPublicTransport", TrackingPinnedTransport)
+
+    with pytest.raises(WebSearchBackendError, match="brave timed out"):
+        await asyncio.wait_for(
+            _request_json(
+                "brave",
+                "GET",
+                "https://api.search.brave.com/search",
+                timeout=0.02,
+                transport=None,
+                headers={"x-subscription-token": "synthetic-secret"},
+            ),
+            timeout=0.2,
+        )
+
+    assert 1 <= attempts < len(addresses)
+    assert len(pinned_transports) == 1
+    assert failing_transport.closed is True
 
 
 @pytest.mark.asyncio

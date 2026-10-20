@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
 import hashlib
+import json
 import os
 import re
 from abc import ABC, abstractmethod
@@ -21,6 +22,7 @@ from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.web import (
     DNS_TIMEOUT_SECONDS,
+    _DNSResolutionTimeout,
     _PinnedPublicTransport,
     _host_allowed,
     _normalize_allowed_domains,
@@ -216,76 +218,89 @@ async def _request_json(
     transport: httpx.AsyncBaseTransport | None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    effective_transport = transport
-    if effective_transport is None:
-        hostname = urlparse(url).hostname
-        if not hostname:
-            raise WebSearchBackendError(f"{provider} has an invalid endpoint")
-        try:
-            addresses = await _resolve_public_addresses_with_timeout(
-                hostname,
-                timeout_seconds=min(timeout, DNS_TIMEOUT_SECONDS),
-            )
-            effective_transport = _PinnedPublicTransport(
-                pinned_addresses=addresses
-            )
-        except ValueError as exc:
-            raise WebSearchBackendError(
-                f"{provider} endpoint failed public-network validation"
-            ) from exc
+    timeout_scope = asyncio.timeout(timeout)
     try:
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            transport=effective_transport,
-            trust_env=False,
-        ) as client:
-            async with client.stream(method, url, **kwargs) as response:
-                if response.status_code == 401:
-                    raise WebSearchBackendError(
-                        f"{provider} rejected its configured credential"
+        async with timeout_scope:
+            effective_transport = transport
+            if effective_transport is None:
+                hostname = urlparse(url).hostname
+                if not hostname:
+                    raise WebSearchBackendError(f"{provider} has an invalid endpoint")
+                try:
+                    addresses = await _resolve_public_addresses_with_timeout(
+                        hostname,
+                        timeout_seconds=min(timeout, DNS_TIMEOUT_SECONDS),
                     )
-                if response.status_code == 429:
-                    raise WebSearchBackendError(f"{provider} is rate limited")
-                if response.status_code >= 400:
-                    raise WebSearchBackendError(
-                        f"{provider} returned HTTP {response.status_code}"
+                    effective_transport = _PinnedPublicTransport(
+                        pinned_addresses=addresses
                     )
-                content_type = response.headers.get("content-type", "").casefold()
-                if content_type and "json" not in content_type:
+                except _DNSResolutionTimeout:
+                    raise WebSearchBackendError(f"{provider} timed out") from None
+                except ValueError as exc:
                     raise WebSearchBackendError(
-                        f"{provider} returned a non-JSON content type"
-                    )
-                content_length = response.headers.get("content-length")
-                if content_length:
-                    try:
-                        declared_length = int(content_length)
-                    except ValueError as exc:
-                        raise WebSearchBackendError(
-                            f"{provider} returned an invalid Content-Length"
-                        ) from exc
-                    if declared_length < 0:
-                        raise WebSearchBackendError(
-                            f"{provider} returned an invalid Content-Length"
-                        )
-                    if declared_length > MAX_SEARCH_RESPONSE_BYTES:
-                        raise WebSearchBackendError(
-                            f"{provider} response is larger than 2 MB"
-                        )
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in response.aiter_bytes():
-                    total += len(chunk)
-                    if total > MAX_SEARCH_RESPONSE_BYTES:
-                        raise WebSearchBackendError(
-                            f"{provider} response is larger than 2 MB"
-                        )
-                    chunks.append(chunk)
-                raw_response = b"".join(chunks)
-    except (httpx.TimeoutException, httpx.RequestError) as exc:
-        reason = (
-            "timed out" if isinstance(exc, httpx.TimeoutException) else "is unreachable"
-        )
-        raise WebSearchBackendError(f"{provider} {reason}") from exc
+                        f"{provider} endpoint failed public-network validation"
+                    ) from exc
+            try:
+                async with httpx.AsyncClient(
+                    timeout=timeout,
+                    transport=effective_transport,
+                    trust_env=False,
+                ) as client:
+                    async with client.stream(method, url, **kwargs) as response:
+                        if response.status_code == 401:
+                            raise WebSearchBackendError(
+                                f"{provider} rejected its configured credential"
+                            )
+                        if response.status_code == 429:
+                            raise WebSearchBackendError(f"{provider} is rate limited")
+                        if response.status_code >= 400:
+                            raise WebSearchBackendError(
+                                f"{provider} returned HTTP {response.status_code}"
+                            )
+                        content_type = response.headers.get(
+                            "content-type", ""
+                        ).casefold()
+                        if content_type and "json" not in content_type:
+                            raise WebSearchBackendError(
+                                f"{provider} returned a non-JSON content type"
+                            )
+                        content_length = response.headers.get("content-length")
+                        if content_length:
+                            try:
+                                declared_length = int(content_length)
+                            except ValueError as exc:
+                                raise WebSearchBackendError(
+                                    f"{provider} returned an invalid Content-Length"
+                                ) from exc
+                            if declared_length < 0:
+                                raise WebSearchBackendError(
+                                    f"{provider} returned an invalid Content-Length"
+                                )
+                            if declared_length > MAX_SEARCH_RESPONSE_BYTES:
+                                raise WebSearchBackendError(
+                                    f"{provider} response is larger than 2 MB"
+                                )
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total > MAX_SEARCH_RESPONSE_BYTES:
+                                raise WebSearchBackendError(
+                                    f"{provider} response is larger than 2 MB"
+                                )
+                            chunks.append(chunk)
+                        raw_response = b"".join(chunks)
+            except (httpx.TimeoutException, httpx.RequestError) as exc:
+                reason = (
+                    "timed out"
+                    if isinstance(exc, httpx.TimeoutException)
+                    else "is unreachable"
+                )
+                raise WebSearchBackendError(f"{provider} {reason}") from exc
+    except TimeoutError:
+        if not timeout_scope.expired():
+            raise
+        raise WebSearchBackendError(f"{provider} timed out") from None
     try:
         payload = strict_json_loads(raw_response)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:

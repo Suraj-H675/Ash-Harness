@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import socket
 import threading
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
@@ -15,6 +17,25 @@ from ash.tools.web import (
     _resolve_public_addresses_with_timeout,
     _validate_public_url,
 )
+
+
+class _SyntheticStream(httpx.AsyncByteStream):
+    def __init__(self, *, drip: bool = False) -> None:
+        self.started = asyncio.Event()
+        self.closed = False
+        self.drip = drip
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while True:
+            self.started.set()
+            yield b"x"
+            if self.drip:
+                await asyncio.sleep(0)
+            else:
+                await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 @pytest.fixture
@@ -394,6 +415,8 @@ async def test_web_fetch_dns_timeout_fails_before_transport_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     guard,
 ) -> None:
+    from ash.tools import web
+
     dispatched = False
 
     async def timed_out(
@@ -402,7 +425,9 @@ async def test_web_fetch_dns_timeout_fails_before_transport_dispatch(
         timeout_seconds: float,
     ) -> tuple[str, ...]:
         del timeout_seconds
-        raise ValueError(f"DNS resolution timed out for host {hostname!r}")
+        raise web._DNSResolutionTimeout(
+            f"DNS resolution timed out for host {hostname!r}"
+        )
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal dispatched
@@ -418,8 +443,137 @@ async def test_web_fetch_dns_timeout_fails_before_transport_dispatch(
     result = await tool.run(url="https://stalled.example/page")
 
     assert result.success is False
-    assert "DNS resolution timed out" in (result.error or "")
+    assert result.error == "web_fetch timed out"
     assert dispatched is False
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_reports_httpx_timeout_without_echoing_request_url(
+    monkeypatch: pytest.MonkeyPatch,
+    guard,
+) -> None:
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(
+            f"request to {request.url} timed out",
+            request=request,
+        )
+
+    result = await WebFetchTool(
+        guard,
+        transport=httpx.MockTransport(handler),
+    ).run(url="https://example.com/page?token=fetch-secret")
+
+    assert result.success is False
+    assert result.output == ""
+    assert result.error == "web_fetch timed out"
+    assert "fetch-secret" not in (result.error or "")
+    assert "https://" not in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_bounds_never_ending_response_and_closes_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    guard,
+) -> None:
+    from ash.tools import web
+
+    monkeypatch.setattr(web, "WEB_FETCH_TOTAL_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(web, "_resolve_public_addresses_with_timeout", _allow_public_dns)
+    stream = _SyntheticStream(drip=True)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            stream=stream,
+            request=request,
+        )
+
+    tool = WebFetchTool(guard, transport=httpx.MockTransport(handler))
+    result = await asyncio.wait_for(
+        tool.run(url="https://example.com/page?token=fetch-secret"),
+        timeout=0.2,
+    )
+
+    assert stream.started.is_set()
+    assert stream.closed is True
+    assert result.success is False
+    assert result.output == ""
+    assert result.citations == []
+    assert result.error == "web_fetch timed out"
+    assert "fetch-secret" not in (result.error or "")
+    assert "https://" not in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_redirect_dns_stall_uses_one_total_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    guard,
+) -> None:
+    from ash.tools import web
+
+    monkeypatch.setattr(web, "WEB_FETCH_TOTAL_TIMEOUT_SECONDS", 0.01)
+    dispatched: list[str] = []
+
+    async def resolve(hostname: str, *, timeout_seconds: float) -> tuple[str, ...]:
+        del timeout_seconds
+        if hostname == "redirect.example":
+            await asyncio.Event().wait()
+        return ("93.184.216.34",)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        dispatched.append(request.url.host)
+        return httpx.Response(
+            302,
+            headers={"location": "https://redirect.example/final"},
+            request=request,
+        )
+
+    monkeypatch.setattr(web, "_resolve_public_addresses_with_timeout", resolve)
+    tool = WebFetchTool(guard, transport=httpx.MockTransport(handler))
+    result = await asyncio.wait_for(
+        tool.run(url="https://example.com/start?token=fetch-secret"),
+        timeout=0.2,
+    )
+
+    assert result.success is False
+    assert result.error == "web_fetch timed out"
+    assert "fetch-secret" not in (result.error or "")
+    assert "redirect.example" not in (result.error or "")
+    assert dispatched == ["example.com"]
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_caller_cancellation_propagates_and_closes_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    guard,
+) -> None:
+    from ash.tools import web
+
+    monkeypatch.setattr(web, "_resolve_public_addresses_with_timeout", _allow_public_dns)
+    stream = _SyntheticStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            stream=stream,
+            request=request,
+        )
+
+    tool = WebFetchTool(guard, transport=httpx.MockTransport(handler))
+    task = asyncio.create_task(tool.run(url="https://example.com/page"))
+    await asyncio.wait_for(stream.started.wait(), timeout=0.2)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stream.closed is True
 
 
 @pytest.mark.asyncio

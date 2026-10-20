@@ -21,6 +21,7 @@ MAX_FETCH_BYTES = 1_000_000
 DEFAULT_MAX_CHARS = 20_000
 MAX_REDIRECTS = 5
 DNS_TIMEOUT_SECONDS = 5.0
+WEB_FETCH_TOTAL_TIMEOUT_SECONDS = 30.0
 TEXT_CONTENT_TYPES = (
     "text/",
     "application/json",
@@ -28,6 +29,10 @@ TEXT_CONTENT_TYPES = (
     "application/xhtml+xml",
     "application/rss+xml",
 )
+
+
+class _DNSResolutionTimeout(ValueError):
+    pass
 
 
 class WebFetchArgs(BaseModel):
@@ -61,12 +66,22 @@ class WebFetchTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = WebFetchArgs(**kwargs)
+        timeout_scope = asyncio.timeout(WEB_FETCH_TOTAL_TIMEOUT_SECONDS)
         try:
-            final_url, status_code, content_type, body = await _fetch_public_text(
-                args.url,
-                transport=self._transport,
-                allowed_domains=self._allowed_domains,
-            )
+            async with timeout_scope:
+                final_url, status_code, content_type, body = await _fetch_public_text(
+                    args.url,
+                    transport=self._transport,
+                    allowed_domains=self._allowed_domains,
+                )
+        except TimeoutError:
+            if not timeout_scope.expired():
+                raise
+            return ToolResult(success=False, output="", error="web_fetch timed out")
+        except httpx.TimeoutException:
+            return ToolResult(success=False, output="", error="web_fetch timed out")
+        except _DNSResolutionTimeout:
+            return ToolResult(success=False, output="", error="web_fetch timed out")
         except (ValueError, httpx.HTTPError) as exc:
             return ToolResult(
                 success=False,
@@ -352,7 +367,9 @@ async def _resolve_public_addresses_with_timeout(
             return await future
     except TimeoutError as exc:
         future.cancel()
-        raise ValueError(f"DNS resolution timed out for host {hostname!r}") from exc
+        raise _DNSResolutionTimeout(
+            f"DNS resolution timed out for host {hostname!r}"
+        ) from exc
 
 
 def _resolve_public_addresses(hostname: str) -> tuple[str, ...]:
