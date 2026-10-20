@@ -36,6 +36,52 @@ async def test_list_directory_caps_recursive_depth(tmp_path) -> None:
     assert result.success is True
     assert "one/two/three/four/" in result.output
     assert "one/two/three/four/five.txt" not in result.output
+    assert result.truncated is True
+    assert "[workspace directory listing incomplete]" in result.output
+
+
+@pytest.mark.asyncio
+async def test_list_directory_marks_unreadable_descendants_incomplete(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "hidden.txt").write_text("hidden")
+    original = search_module.list_scoped_directory
+
+    def list_with_denial(directory, guard):
+        if directory == tmp_path / "nested":
+            raise PermissionError("no access to nested directory")
+        return original(directory, guard)
+
+    monkeypatch.setattr(search_module, "list_scoped_directory", list_with_denial)
+    result = await ListDirectoryTool(SafetyGuard(tmp_path)).run(recursive=True)
+    assert result.success is True
+    assert result.truncated is True
+    assert "[workspace directory listing incomplete]" in result.output
+    assert "nested/hidden.txt" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_recursive_list_directory_allows_other_tasks_to_run(tmp_path) -> None:
+    for index in range(200):
+        (tmp_path / f"file_{index:03}.txt").write_text("content")
+
+    other_task_ran = asyncio.Event()
+
+    async def other_task() -> None:
+        await asyncio.sleep(0)
+        other_task_ran.set()
+
+    observer = asyncio.create_task(other_task())
+    result = await ListDirectoryTool(SafetyGuard(tmp_path)).run(
+        recursive=True, max_results=200
+    )
+    progressed_during_scan = other_task_ran.is_set()
+    await observer
+
+    assert result.success is True
+    assert result.truncated is False
+    assert progressed_during_scan
 
 
 @pytest.mark.asyncio
@@ -84,6 +130,57 @@ async def test_glob_files_returns_relative_matches(tmp_path) -> None:
     (tmp_path / "README.md").write_text("readme")
     result = await GlobFilesTool(SafetyGuard(tmp_path)).run(pattern="**/*.py")
     assert result.output == "src/app.py"
+
+
+@pytest.mark.asyncio
+async def test_double_star_glob_includes_top_level_and_nested_files(tmp_path) -> None:
+    (tmp_path / "root.py").write_text("needle\n")
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "nested.py").write_text("needle\n")
+    guard = SafetyGuard(tmp_path)
+
+    glob_result = await GlobFilesTool(guard).run(pattern="**/*.py")
+    search_result = await SearchTextTool(guard).run(
+        pattern="needle", glob="**/*.py", fixed_strings=True
+    )
+
+    assert glob_result.output == "pkg/nested.py\nroot.py"
+    assert glob_result.truncated is False
+    assert search_result.output == "pkg/nested.py:1:needle\nroot.py:1:needle"
+    assert search_result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_glob_files_reports_depth_limit_incomplete(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "hidden.py").write_text("needle")
+    monkeypatch.setattr(search_module, "MAX_GLOB_DEPTH", 1)
+
+    result = await GlobFilesTool(SafetyGuard(tmp_path)).run(pattern="**/*.py")
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output == "[workspace glob incomplete]"
+
+
+@pytest.mark.asyncio
+async def test_glob_files_marks_unreadable_file_metadata_incomplete(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "unreadable.py").write_text("content")
+    original = search_module.stat_scoped_path
+
+    def stat_with_denial(path, guard):
+        if path == tmp_path / "unreadable.py":
+            raise PermissionError("unable to stat file")
+        return original(path, guard)
+
+    monkeypatch.setattr(search_module, "stat_scoped_path", stat_with_denial)
+    result = await GlobFilesTool(SafetyGuard(tmp_path)).run(pattern="**/*.py")
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output == "[workspace glob incomplete]"
 
 
 @pytest.mark.asyncio

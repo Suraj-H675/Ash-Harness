@@ -89,6 +89,13 @@ def _is_scoped_directory(path: Path, guard: SafetyGuard) -> bool:
     return stat.S_ISDIR(metadata.st_mode)
 
 
+def _matches_workspace_glob(relative_path: str, pattern: str) -> bool:
+    return fnmatch.fnmatchcase(relative_path, pattern) or (
+        pattern.startswith("**/")
+        and fnmatch.fnmatchcase(relative_path, pattern[3:])
+    )
+
+
 class ListDirectoryArgs(BaseModel):
     directory_path: str = "."
     recursive: bool = False
@@ -110,26 +117,39 @@ class ListDirectoryTool(BaseTool):
             )
         entries: list[str] = []
         truncated = False
+        scan_incomplete = False
+
+        def mark_incomplete() -> None:
+            nonlocal scan_incomplete
+            scan_incomplete = True
+
+        scanned = 0
         for path, is_directory in _iter_workspace_paths(
             root,
             self.safety_guard,
             recursive=args.recursive,
             max_depth=MAX_LIST_DIRECTORY_DEPTH,
+            on_incomplete=mark_incomplete if args.recursive else None,
         ):
+            scanned += 1
             if len(entries) >= args.max_results:
                 truncated = True
                 break
+            if scanned % WORKSPACE_SCAN_YIELD_INTERVAL == 0:
+                await asyncio.sleep(0)
             relative = path.relative_to(root).as_posix()
             entries.append(relative + ("/" if is_directory else ""))
         entries.sort()
         output = "\n".join(entries)
         if truncated:
             output += f"\n[truncated after {args.max_results} entries]"
+        elif scan_incomplete:
+            output += ("\n" if output else "") + "[workspace directory listing incomplete]"
         return ToolResult(
             success=True,
             output=output,
             token_count=count_output_tokens(output),
-            truncated=truncated,
+            truncated=truncated or scan_incomplete,
         )
 
 
@@ -155,12 +175,19 @@ class GlobFilesTool(BaseTool):
         matches: list[str] = []
         match_truncated = False
         scan_truncated = False
+        scan_incomplete = False
+
+        def mark_incomplete() -> None:
+            nonlocal scan_incomplete
+            scan_incomplete = True
+
         scanned = 0
         for path, is_directory in _iter_workspace_paths(
             root,
             self.safety_guard,
             recursive=True,
             max_depth=MAX_GLOB_DEPTH,
+            on_incomplete=mark_incomplete,
         ):
             scanned += 1
             if scanned > MAX_GLOB_SCAN_ENTRIES:
@@ -175,9 +202,10 @@ class GlobFilesTool(BaseTool):
                 if not stat.S_ISREG(metadata.st_mode):
                     continue
             except (OSError, SafetyViolation):
+                scan_incomplete = True
                 continue
             relative = path.relative_to(root).as_posix()
-            if not fnmatch.fnmatch(relative, args.pattern):
+            if not _matches_workspace_glob(relative, args.pattern):
                 continue
             if len(matches) >= args.max_results:
                 match_truncated = True
@@ -191,11 +219,13 @@ class GlobFilesTool(BaseTool):
             output += (
                 f"\n[workspace scan truncated after {MAX_GLOB_SCAN_ENTRIES} entries]"
             )
+        elif scan_incomplete:
+            output += ("\n" if output else "") + "[workspace glob incomplete]"
         return ToolResult(
             success=True,
             output=output,
             token_count=count_output_tokens(output),
-            truncated=match_truncated or scan_truncated,
+            truncated=match_truncated or scan_truncated or scan_incomplete,
         )
 
 
@@ -330,7 +360,7 @@ class SearchTextTool(BaseTool):
             if is_directory:
                 continue
             relative = path.relative_to(root).as_posix()
-            if args.glob and not fnmatch.fnmatch(relative, args.glob):
+            if args.glob and not _matches_workspace_glob(relative, args.glob):
                 continue
             try:
                 _, content = read_scoped_bytes(
