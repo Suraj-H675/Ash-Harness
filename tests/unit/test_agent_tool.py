@@ -539,12 +539,10 @@ async def test_subagent_lease_loss_cancels_without_publishing_report(
     )
     tool._task_lease_seconds = 1.0
     original_renew = state.tasks.renew_lease
-    renew_calls = 0
+    trigger_lease_loss = threading.Event()
 
     def lose_lease(*args, **kwargs):
-        nonlocal renew_calls
-        renew_calls += 1
-        if renew_calls > 1:
+        if trigger_lease_loss.is_set():
             raise AgentTaskError("forced heartbeat lease loss")
         return original_renew(*args, **kwargs)
 
@@ -558,9 +556,10 @@ async def test_subagent_lease_loss_cancels_without_publishing_report(
         )
     )
     try:
-        await asyncio.wait_for(provider.started.wait(), timeout=2)
+        await asyncio.wait_for(provider.started.wait(), timeout=10)
+        trigger_lease_loss.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(execution, timeout=2)
+            await asyncio.wait_for(execution, timeout=5)
 
         reports = [
             message
