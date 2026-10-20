@@ -23,6 +23,7 @@ from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 from ash.tools.web import (
     DNS_TIMEOUT_SECONDS,
     _DNSResolutionTimeout,
+    _DNSResolverCapacityExhausted,
     _PinnedPublicTransport,
     _host_allowed,
     _normalize_allowed_domains,
@@ -236,6 +237,10 @@ async def _request_json(
                     )
                 except _DNSResolutionTimeout:
                     raise WebSearchBackendError(f"{provider} timed out") from None
+                except _DNSResolverCapacityExhausted:
+                    raise WebSearchBackendError(
+                        f"{provider} public DNS resolver capacity exhausted"
+                    ) from None
                 except ValueError as exc:
                     raise WebSearchBackendError(
                         f"{provider} endpoint failed public-network validation"

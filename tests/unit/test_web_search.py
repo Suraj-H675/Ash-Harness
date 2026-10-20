@@ -273,6 +273,32 @@ async def test_web_search_provider_dns_policy_fails_closed_before_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_web_search_reports_dns_capacity_as_resource_failure(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.tools.web import _DNSResolverCapacityExhausted
+
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-fake-key")
+
+    async def exhausted(hostname: str, *, timeout_seconds: float) -> tuple[str, ...]:
+        del hostname, timeout_seconds
+        raise _DNSResolverCapacityExhausted("Public DNS resolver capacity exhausted")
+
+    monkeypatch.setattr(
+        "ash.tools.web_search._resolve_public_addresses_with_timeout", exhausted
+    )
+    result = await WebSearchTool(
+        SafetyGuard(tmp_path), provider="brave"
+    ).run(query="example")
+
+    assert result.success is False
+    assert result.error == (
+        "web search failed: brave public DNS resolver capacity exhausted"
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("timeout_kind", ["aggregate", "resolver"])
 async def test_web_search_dns_deadlines_fail_before_transport_construction(
     tmp_path,

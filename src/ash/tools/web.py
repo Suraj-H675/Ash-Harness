@@ -21,6 +21,7 @@ MAX_FETCH_BYTES = 1_000_000
 DEFAULT_MAX_CHARS = 20_000
 MAX_REDIRECTS = 5
 DNS_TIMEOUT_SECONDS = 5.0
+MAX_OUTSTANDING_DNS_RESOLVERS = 16
 WEB_FETCH_TOTAL_TIMEOUT_SECONDS = 30.0
 TEXT_CONTENT_TYPES = (
     "text/",
@@ -33,6 +34,13 @@ TEXT_CONTENT_TYPES = (
 
 class _DNSResolutionTimeout(ValueError):
     pass
+
+
+class _DNSResolverCapacityExhausted(ValueError):
+    pass
+
+
+_DNS_RESOLVER_SLOTS = threading.BoundedSemaphore(MAX_OUTSTANDING_DNS_RESOLVERS)
 
 
 class WebFetchArgs(BaseModel):
@@ -357,11 +365,25 @@ async def _resolve_public_addresses_with_timeout(
             except RuntimeError:
                 pass
 
-    threading.Thread(
-        target=resolve,
-        name="ash-public-dns",
-        daemon=True,
-    ).start()
+    slots = _DNS_RESOLVER_SLOTS
+    if not slots.acquire(blocking=False):
+        raise _DNSResolverCapacityExhausted("Public DNS resolver capacity exhausted")
+
+    def bounded_resolve() -> None:
+        try:
+            resolve()
+        finally:
+            slots.release()
+
+    try:
+        threading.Thread(
+            target=bounded_resolve,
+            name="ash-public-dns",
+            daemon=True,
+        ).start()
+    except BaseException:
+        slots.release()
+        raise
     try:
         async with asyncio.timeout(float(timeout_seconds)):
             return await future

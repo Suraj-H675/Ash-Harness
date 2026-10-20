@@ -411,6 +411,58 @@ async def test_public_dns_resolution_timeout_does_not_block_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_public_dns_stalled_resolvers_have_bounded_thread_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.tools import web
+
+    slots = threading.BoundedSemaphore(2)
+    monkeypatch.setattr(web, "_DNS_RESOLVER_SLOTS", slots)
+    release = threading.Event()
+    both_started = threading.Event()
+    entered = 0
+    lock = threading.Lock()
+
+    def stalled_resolver(hostname: str) -> tuple[str, ...]:
+        nonlocal entered
+        del hostname
+        with lock:
+            entered += 1
+            if entered == 2:
+                both_started.set()
+        release.wait(1)
+        return ("93.184.216.34",)
+
+    monkeypatch.setattr(web, "_resolve_public_addresses", stalled_resolver)
+    first = asyncio.create_task(
+        _resolve_public_addresses_with_timeout("first.example", timeout_seconds=0.05)
+    )
+    second = asyncio.create_task(
+        _resolve_public_addresses_with_timeout("second.example", timeout_seconds=0.05)
+    )
+    try:
+        assert await asyncio.to_thread(both_started.wait, 0.5)
+        with pytest.raises(ValueError, match="DNS resolver capacity exhausted"):
+            await _resolve_public_addresses_with_timeout(
+                "third.example", timeout_seconds=0.05
+            )
+        assert entered == 2
+        for task in (first, second):
+            with pytest.raises(ValueError, match="DNS resolution timed out"):
+                await task
+    finally:
+        release.set()
+
+    for _ in range(2):
+        assert await asyncio.to_thread(slots.acquire, timeout=1.0)
+    slots.release()
+    slots.release()
+    assert await _resolve_public_addresses_with_timeout(
+        "recovered.example", timeout_seconds=0.5
+    ) == ("93.184.216.34",)
+
+
+@pytest.mark.asyncio
 async def test_web_fetch_dns_timeout_fails_before_transport_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     guard,
