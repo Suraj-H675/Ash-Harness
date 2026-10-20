@@ -16,6 +16,7 @@ from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
+from ash.tools.automation import ListAutomationsTool, ManageAutomationTool
 from ash.tools.tool_search import ESSENTIAL_TOOL_NAMES, SearchToolsTool
 from ash.ui.headless import HeadlessUI
 
@@ -54,6 +55,38 @@ def test_large_catalog_keeps_compact_core_and_searchable_remainder(tmp_path) -> 
     assert set(visible) == {*ESSENTIAL_TOOL_NAMES, search.name}
     assert len(visible) == 10
     assert len(visible) < len(catalog)
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("schedule a reminder", "manage_automation"),
+        ("pause a reminder", "manage_automation"),
+        ("list scheduled tasks", "list_automations"),
+        ("list upcoming reminders", "list_automations"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_automation_tools_are_discoverable_by_common_task_intents(
+    tmp_path, query: str, expected: str
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=1)
+    catalog.update(
+        {
+            search.name: search,
+            "list_automations": ListAutomationsTool(guard, tmp_path / "automations.db"),
+            "manage_automation": ManageAutomationTool(guard, tmp_path / "automations.db"),
+        }
+    )
+
+    assert set(search.visible_tools(catalog)) == {"search_tools"}
+    result = await search.run(query=query, limit=3)
+    names = [item["name"] for item in json.loads(result.output)["tools"]]
+
+    assert expected in names
+    assert expected in search.visible_tools(catalog)
 
 
 @pytest.mark.asyncio

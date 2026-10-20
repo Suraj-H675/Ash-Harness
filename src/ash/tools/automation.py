@@ -43,8 +43,9 @@ class ListAutomationsArgs(BaseModel):
 class ListAutomationsTool(BaseTool):
     name = "list_automations"
     description = (
-        "List durable schedules for the current workspace, or inspect one by its "
-        "job ID or name. For inspection, pass job and optional history_limit "
+        "List upcoming reminders, scheduled tasks, and durable automation jobs "
+        "for the current workspace, or inspect one by its job ID or name. "
+        "For inspection, pass job and optional history_limit "
         "(1–20; default 5). A targeted row includes run and webhook delivery "
         "histories separately, with more_runs and more_deliveries flags. Removed "
         "schedules can be inspected by ID. This is a read-only view."
@@ -221,7 +222,9 @@ class ManageAutomationArgs(BaseModel):
 class ManageAutomationTool(BaseTool):
     name = "manage_automation"
     description = (
-        "Create, pause, resume, or remove a durable unattended Ash schedule. "
+        "Schedule a one-time reminder prompt or recurring automation task; "
+        "create, pause, resume, or remove durable scheduled jobs. "
+        "Execution requires a running automation worker. "
         "Changes require ordinary tool approval; creation and resume also require "
         "a trusted workspace."
     )
