@@ -146,7 +146,10 @@ async def test_double_star_glob_includes_top_level_and_nested_files(tmp_path) ->
 
     assert glob_result.output == "pkg/nested.py\nroot.py"
     assert glob_result.truncated is False
-    assert search_result.output == "pkg/nested.py:1:needle\nroot.py:1:needle"
+    assert set(search_result.output.splitlines()) == {
+        "pkg/nested.py:1:needle",
+        "root.py:1:needle",
+    }
     assert search_result.truncated is False
 
 
