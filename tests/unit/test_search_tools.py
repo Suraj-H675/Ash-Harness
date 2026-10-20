@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import subprocess
@@ -99,6 +100,38 @@ async def test_glob_files_bounds_workspace_scan(tmp_path, monkeypatch) -> None:
     assert result.success is True
     assert result.truncated is True
     assert "workspace scan truncated after 2 entries" in result.output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_type", "arguments"),
+    [
+        (GlobFilesTool, {"pattern": "*.absent"}),
+        (SearchTextTool, {"pattern": "missing-token", "fixed_strings": True}),
+    ],
+    ids=["glob_files", "search_text"],
+)
+async def test_workspace_scans_allow_other_tasks_to_run(
+    tmp_path, tool_type, arguments
+) -> None:
+    for index in range(200):
+        (tmp_path / f"file_{index:03}.txt").write_text("ordinary text\n")
+
+    other_task_ran = asyncio.Event()
+
+    async def other_task() -> None:
+        await asyncio.sleep(0)
+        other_task_ran.set()
+
+    observer = asyncio.create_task(other_task())
+    result = await tool_type(SafetyGuard(tmp_path)).run(**arguments)
+    progressed_during_scan = other_task_ran.is_set()
+    await observer
+
+    assert result.success is True
+    assert result.truncated is False
+    assert result.output == ""
+    assert progressed_during_scan
 
 
 @pytest.mark.asyncio

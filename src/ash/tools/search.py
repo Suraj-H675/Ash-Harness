@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import io
 import stat
@@ -37,6 +38,7 @@ MAX_GLOB_DEPTH = 32
 MAX_SEARCH_SCAN_ENTRIES = 100_000
 MAX_SEARCH_DEPTH = 32
 MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024
+WORKSPACE_SCAN_YIELD_INTERVAL = 64
 MAX_SEARCH_REGEX_MATCH_SECONDS = 0.05
 MAX_SEARCH_REGEX_TOTAL_SECONDS = 1.0
 
@@ -164,6 +166,8 @@ class GlobFilesTool(BaseTool):
             if scanned > MAX_GLOB_SCAN_ENTRIES:
                 scan_truncated = True
                 break
+            if scanned % WORKSPACE_SCAN_YIELD_INTERVAL == 0:
+                await asyncio.sleep(0)
             if is_directory:
                 continue
             try:
@@ -321,6 +325,8 @@ class SearchTextTool(BaseTool):
             if scanned > MAX_SEARCH_SCAN_ENTRIES:
                 scan_truncated = True
                 break
+            if scanned % WORKSPACE_SCAN_YIELD_INTERVAL == 0:
+                await asyncio.sleep(0)
             if is_directory:
                 continue
             relative = path.relative_to(root).as_posix()
