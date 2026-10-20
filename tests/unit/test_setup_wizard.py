@@ -1502,7 +1502,10 @@ def test_first_run_provider_scope_merges_discovered_local_routes_in_catalog_orde
 ) -> None:
     from ash.commands.setup import _prompt_first_run_provider_scope
 
-    monkeypatch.setenv("OPENAI_API_KEY", "setup-test-key")
+    monkeypatch.setattr(
+        "ash.commands.setup._provider_is_detected_or_configured",
+        lambda _config, descriptor: descriptor.id == "openai",
+    )
     monkeypatch.setattr("builtins.input", _fake_input(["1"]))
 
     selected = _prompt_first_run_provider_scope(
@@ -1546,6 +1549,10 @@ def test_first_run_provider_discovery_runs_once_across_setup_back(
         raise SetupCancelled
 
     monkeypatch.setattr("ash.commands.setup._has_provider_configured", lambda _: False)
+    monkeypatch.setattr(
+        "ash.commands.setup._provider_is_detected_or_configured",
+        lambda _config, _descriptor: False,
+    )
     monkeypatch.setattr(
         "ash.providers.readiness.discover_default_local_provider_ids",
         discover,
