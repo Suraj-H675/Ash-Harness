@@ -528,28 +528,35 @@ async def test_read_file_supports_bom_tagged_unicode(
         ("utf-32-be", codecs.BOM_UTF32_BE),
     ],
 )
+@pytest.mark.parametrize(
+    "tool_type",
+    [ReplaceFileContentTool, ReplaceFileEditsTool],
+    ids=["single_edit", "multi_edit"],
+)
 @pytest.mark.asyncio
-async def test_replace_file_content_preserves_bom_encoding(
+async def test_replace_file_tools_preserve_bom_encoding_and_crlf(
     project_root: Path,
     guard: SafetyGuard,
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
     codec: str,
     bom: bytes,
 ) -> None:
     target = project_root / "unicode.txt"
-    target.write_bytes(bom + "one\ntwo\n".encode(codec))
+    original = bom + "one\r\ntwo\r\n".encode(codec)
+    target.write_bytes(original)
 
-    result = await ReplaceFileContentTool(guard).run(
+    result = await _run_single_range_edit(
+        tool_type,
+        guard,
         file_path="unicode.txt",
         start_line=2,
         end_line=2,
-        target_content="two",
+        target_content="two\n",
         replacement_content="TWO",
     )
 
     assert result.success is True
-    raw = target.read_bytes()
-    assert raw.startswith(bom)
-    assert raw[len(bom) :].decode(codec) == "one\nTWO\n"
+    assert target.read_bytes() == bom + "one\r\nTWO\r\n".encode(codec)
 
 
 @pytest.mark.asyncio
@@ -694,25 +701,310 @@ async def test_atomic_overwrite_preserves_executable_mode(
     assert target.stat().st_mode & 0o777 == 0o755
 
 
+async def _run_single_range_edit(
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
+    guard: SafetyGuard,
+    *,
+    file_path: str,
+    start_line: int,
+    end_line: int,
+    target_content: str,
+    replacement_content: str,
+) -> ToolResult:
+    if tool_type is ReplaceFileContentTool:
+        return await tool_type(guard).run(
+            file_path=file_path,
+            start_line=start_line,
+            end_line=end_line,
+            target_content=target_content,
+            replacement_content=replacement_content,
+        )
+    return await tool_type(guard).run(
+        file_path=file_path,
+        edits=[
+            {
+                "start_line": start_line,
+                "end_line": end_line,
+                "target_content": target_content,
+                "replacement_content": replacement_content,
+            }
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [ReplaceFileContentTool, ReplaceFileEditsTool],
+    ids=["single_edit", "multi_edit"],
+)
+@pytest.mark.parametrize("line_ending", ["\r\n", "\r"], ids=["crlf", "cr"])
 @pytest.mark.asyncio
-async def test_replace_file_content_confined_to_line_bounds_and_normalizes_crlf(
+async def test_replace_file_tools_preserve_crlf_and_cr_line_endings(
     project_root: Path,
     guard: SafetyGuard,
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
+    line_ending: str,
 ) -> None:
     target = project_root / "doc.txt"
-    target.write_bytes(b"one\r\ntwo\r\nthree\r\n")
+    target.write_bytes(f"one{line_ending}two{line_ending}three{line_ending}".encode())
 
-    result = await ReplaceFileContentTool(guard).run(
+    result = await _run_single_range_edit(
+        tool_type,
+        guard,
         file_path="doc.txt",
         start_line=2,
         end_line=2,
-        target_content="two\r\n",
+        target_content="two\n",
         replacement_content="TWO",
     )
 
     assert result.success is True
-    assert target.read_text(encoding="utf-8") == "one\nTWO\nthree\n"
+    assert target.read_bytes() == f"one{line_ending}TWO{line_ending}three{line_ending}".encode()
     assert list(target.parent.glob(".doc.txt.*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [ReplaceFileContentTool, ReplaceFileEditsTool],
+    ids=["single_edit", "multi_edit"],
+)
+@pytest.mark.asyncio
+async def test_replace_file_tools_leave_mixed_unedited_endings_unchanged(
+    project_root: Path,
+    guard: SafetyGuard,
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_bytes(b"before\r\nold\rnext\nlast")
+
+    result = await _run_single_range_edit(
+        tool_type,
+        guard,
+        file_path="doc.txt",
+        start_line=3,
+        end_line=3,
+        target_content="next\n",
+        replacement_content="NEXT",
+    )
+
+    assert result.success is True
+    assert target.read_bytes() == b"before\r\nold\rNEXT\nlast"
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [ReplaceFileContentTool, ReplaceFileEditsTool],
+    ids=["single_edit", "multi_edit"],
+)
+@pytest.mark.parametrize(
+    ("source", "end_line", "target_content", "expected"),
+    [
+        (
+            b"head\r\none\r\ntwo\rtail",
+            3,
+            "one\ntwo",
+            b"head\r\nnew-a\r\nnew-b\rtail",
+        ),
+        (
+            b"head\r\none\r\ntwo\rthree\rtail",
+            4,
+            "one\ntwo\nthree",
+            b"head\r\nnew-a\rnew-b\rtail",
+        ),
+    ],
+    ids=["first-ending-breaks-tie", "majority-ending-wins"],
+)
+@pytest.mark.asyncio
+async def test_replace_file_tools_choose_local_ending_for_mixed_spans(
+    project_root: Path,
+    guard: SafetyGuard,
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
+    source: bytes,
+    end_line: int,
+    target_content: str,
+    expected: bytes,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_bytes(source)
+
+    result = await _run_single_range_edit(
+        tool_type,
+        guard,
+        file_path="doc.txt",
+        start_line=2,
+        end_line=end_line,
+        target_content=target_content,
+        replacement_content="new-a\nnew-b",
+    )
+
+    assert result.success is True
+    assert target.read_bytes() == expected
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [ReplaceFileContentTool, ReplaceFileEditsTool],
+    ids=["single_edit", "multi_edit"],
+)
+@pytest.mark.asyncio
+async def test_replace_file_tools_expand_multiline_replacement_locally(
+    project_root: Path,
+    guard: SafetyGuard,
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_bytes(b"head\r\nold\r\ntail\r\nlast")
+
+    result = await _run_single_range_edit(
+        tool_type,
+        guard,
+        file_path="doc.txt",
+        start_line=2,
+        end_line=2,
+        target_content="old",
+        replacement_content="new-a\nnew-b\nnew-c",
+    )
+
+    assert result.success is True
+    assert target.read_bytes() == b"head\r\nnew-a\r\nnew-b\r\nnew-c\r\ntail\r\nlast"
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [ReplaceFileContentTool, ReplaceFileEditsTool],
+    ids=["single_edit", "multi_edit"],
+)
+@pytest.mark.parametrize(
+    ("replacement", "expected"),
+    [
+        ("last\nnext", b"head\r\nlast\r\nnext"),
+        ("last\nnext\n", b"head\r\nlast\r\nnext\r\n"),
+    ],
+    ids=["preserve-unterminated-eof", "explicit-final-newline"],
+)
+@pytest.mark.asyncio
+async def test_replace_file_tools_preserve_or_explicitly_add_final_newline(
+    project_root: Path,
+    guard: SafetyGuard,
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
+    replacement: str,
+    expected: bytes,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_bytes(b"head\r\nlast")
+
+    result = await _run_single_range_edit(
+        tool_type,
+        guard,
+        file_path="doc.txt",
+        start_line=2,
+        end_line=2,
+        target_content="last",
+        replacement_content=replacement,
+    )
+
+    assert result.success is True
+    assert target.read_bytes() == expected
+
+
+@pytest.mark.parametrize(
+    ("replacement", "expected"),
+    [
+        ("new\r\nnext", b"head\nnew\r\nnext\nfoot\n"),
+        ("new\rnext", b"head\nnew\rnext\nfoot\n"),
+    ],
+    ids=["explicit-crlf", "explicit-cr"],
+)
+@pytest.mark.parametrize(
+    "tool_type",
+    [ReplaceFileContentTool, ReplaceFileEditsTool],
+    ids=["single_edit", "multi_edit"],
+)
+@pytest.mark.asyncio
+async def test_replace_file_tools_retain_explicit_replacement_endings(
+    project_root: Path,
+    guard: SafetyGuard,
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
+    replacement: str,
+    expected: bytes,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_bytes(b"head\nold\nfoot\n")
+
+    result = await _run_single_range_edit(
+        tool_type,
+        guard,
+        file_path="doc.txt",
+        start_line=2,
+        end_line=2,
+        target_content="old",
+        replacement_content=replacement,
+    )
+
+    assert result.success is True
+    assert target.read_bytes() == expected
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [ReplaceFileContentTool, ReplaceFileEditsTool],
+    ids=["single_edit", "multi_edit"],
+)
+@pytest.mark.asyncio
+async def test_replace_file_tools_delete_unterminated_final_line_without_rewriting_prefix(
+    project_root: Path,
+    guard: SafetyGuard,
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_bytes(b"first\r\nlast")
+
+    result = await _run_single_range_edit(
+        tool_type,
+        guard,
+        file_path="doc.txt",
+        start_line=2,
+        end_line=2,
+        target_content="last",
+        replacement_content="",
+    )
+
+    assert result.success is True
+    assert target.read_bytes() == b"first\r\n"
+
+
+@pytest.mark.parametrize(
+    "tool_type",
+    [ReplaceFileContentTool, ReplaceFileEditsTool],
+    ids=["single_edit", "multi_edit"],
+)
+@pytest.mark.asyncio
+async def test_replace_file_tools_check_encoded_size_and_leave_source_unchanged(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
+) -> None:
+    from ash.tools import filesystem
+
+    original = codecs.BOM_UTF16_LE + "a\n".encode("utf-16-le")
+    target = project_root / "doc.txt"
+    target.write_bytes(original)
+    monkeypatch.setattr(filesystem, "MAX_TEXT_FILE_BYTES", 8)
+
+    result = await _run_single_range_edit(
+        tool_type,
+        guard,
+        file_path="doc.txt",
+        start_line=1,
+        end_line=1,
+        target_content="a",
+        replacement_content="longer",
+    )
+
+    assert result.success is False
+    assert result.error == "Error: content exceeds 8 bytes"
+    assert target.read_bytes() == original
 
 
 @pytest.mark.asyncio
@@ -767,7 +1059,7 @@ async def test_replace_file_edits_applies_multiple_ranges_atomically(
     guard: SafetyGuard,
 ) -> None:
     target = project_root / "doc.txt"
-    target.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+    target.write_bytes(b"one\r\ntwo\rthree\nfour")
 
     result = await ReplaceFileEditsTool(guard).run(
         file_path="doc.txt",
@@ -788,7 +1080,7 @@ async def test_replace_file_edits_applies_multiple_ranges_atomically(
     )
 
     assert result.success is True
-    assert target.read_text(encoding="utf-8") == "ONE\ntwo\nTHREE\nFOUR\n"
+    assert target.read_bytes() == b"ONE\r\ntwo\rTHREE\nFOUR"
 
 
 @pytest.mark.asyncio

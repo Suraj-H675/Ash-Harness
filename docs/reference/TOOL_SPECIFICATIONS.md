@@ -124,20 +124,29 @@ Performs structured Search and Replace operations on a contiguous block of text.
         start_line: int = Field(..., description="Start of block range containing target content (1-indexed, inclusive).")
         end_line: int = Field(..., description="End of block range containing target content (1-indexed, inclusive).")
         target_content: str = Field(..., description="Exact string of characters to search for. Must match target range exactly, including leading spaces and tabs.")
-        replacement_content: str = Field(..., description="The content to replace the target_content with.")
+        replacement_content: str = Field(
+            ...,
+            description=(
+                "Replacement content. LF-only separators follow the replaced range's "
+                "local style; replacements containing CR keep their supplied separators."
+            ),
+        )
     ```
 *   **Implementation Match & Write Algorithm**:
     1.  **Resolve & Read**: Resolve path using path-scoping rules. Read the entire target file as lines.
-    2.  **Scope Verification**: Extract lines from index `start_line - 1` to `end_line` (inclusive).
-    3.  **Normalize Line Endings**: Normalize carriage returns inside both the extracted file segment and `target_content` by converting all `\r\n` to standard `\n`. Strip any trailing newline characters strictly for comparison.
+    2.  **Scope Verification**: Extract lines from index `start_line - 1` to `end_line` (inclusive), retaining each source line's terminator.
+    3.  **Normalize for Matching Only**: Normalize CRLF and lone CR inside the extracted file segment and `target_content` to `\n`. Strip trailing newline characters strictly for comparison. Do not normalize the source file before reassembly.
     4.  **Exact Matching**: Compare normalized strings.
         -   If they do NOT match exactly, raise an error immediately. Return a line-by-line diff comparison showing exactly where spacing or content mismatches occur.
         -   The match must be constrained *strictly* within the specified line range bounds. Do not search outside the specified range.
-    5.  **Atomic Write Commit**:
-        -   Re-assemble the full file content by substituting the targeted range with the `replacement_content` (ensuring the target's newline layout is preserved or normalized).
-        -   Write the new content to a temporary companion file (e.g. `file_path.tmp`) in the same folder.
-        -   Atomic replace: Rename the temporary file to overwrite the original `file_path` to prevent file corruption in case of terminal process interrupts (like Ctrl+C).
-        -   Remove any left-over temporary files on completion.
+    5.  **Choose Replacement Terminators**:
+        -   Treat LF-only replacement separators as newline-neutral and map them to the most common terminator in the replaced range. Break ties by first occurrence. If the range has none, use the nearest surrounding CRLF, CR, or LF terminator, preferring the preceding line on a tie, or LF when none exists.
+        -   If the replacement contains CR, preserve its supplied CRLF, CR, and LF separators as explicit. Unchanged source lines keep their original terminators.
+        -   If nonempty replacement content omits a trailing terminator and the replaced range had one, carry that exact outgoing terminator forward. An explicit trailing terminator can change the boundary; an empty replacement removes the selected lines and their terminators.
+    6.  **Atomic Write Commit**:
+        -   Re-assemble the full file content by substituting only the targeted range. `replace_file_edits` uses the same matching and replacement rules for each non-overlapping range.
+        -   Encode using the source file's detected encoding and BOM, then enforce the byte-size limit.
+        -   Write through the scoped atomic writer with the original file digest as its compare-and-swap expectation; remove any temporary file on completion or failure.
 
 ### 2.4 `list_dir`
 Scans workspace contents.

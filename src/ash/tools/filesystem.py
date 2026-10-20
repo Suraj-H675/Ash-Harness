@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import difflib
 import hashlib
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -109,7 +110,10 @@ class ReplaceFileContentArgs(BaseModel):
     replacement_content: str = Field(
         ...,
         max_length=MAX_TEXT_ARGUMENT_CHARS,
-        description="The content to replace the target_content with.",
+        description=(
+            "Replacement content. LF-only separators follow the replaced range's "
+            "local style; replacements containing CR keep their supplied separators."
+        ),
     )
     expected_sha256: str | None = Field(
         None,
@@ -139,7 +143,10 @@ class ReplacementEdit(BaseModel):
     replacement_content: str = Field(
         ...,
         max_length=MAX_TEXT_ARGUMENT_CHARS,
-        description="Replacement content for this line range.",
+        description=(
+            "Replacement content. LF-only separators follow the replaced range's "
+            "local style; replacements containing CR keep their supplied separators."
+        ),
     )
 
 
@@ -351,8 +358,7 @@ class ReplaceFileContentTool(BaseTool):
         stale_error = _validate_expected_sha256(args.expected_sha256, actual_sha256)
         if stale_error is not None:
             return ToolResult(success=False, output="", error=stale_error)
-        normalized_text = _normalize_line_endings(original_text)
-        lines = normalized_text.splitlines(keepends=True)
+        lines = original_text.splitlines(keepends=True)
 
         start_index = args.start_line - 1
         end_index = args.end_line
@@ -376,10 +382,9 @@ class ReplaceFileContentTool(BaseTool):
                 error=_build_mismatch_error(normalized_target, normalized_segment),
             )
 
-        replacement = _normalize_line_endings(args.replacement_content)
-        if segment.endswith("\n") and replacement and not replacement.endswith("\n"):
-            replacement = f"{replacement}\n"
-        replacement_lines = replacement.splitlines(keepends=True)
+        replacement_lines = _replacement_lines_for_span(
+            lines, start_index, end_index, args.replacement_content
+        )
         new_text = "".join(lines[:start_index] + replacement_lines + lines[end_index:])
 
         try:
@@ -450,8 +455,7 @@ class ReplaceFileEditsTool(BaseTool):
         if stale_error is not None:
             return ToolResult(success=False, output="", error=stale_error)
 
-        normalized_text = _normalize_line_endings(original_text)
-        lines = normalized_text.splitlines(keepends=True)
+        lines = original_text.splitlines(keepends=True)
         validation_error = _validate_non_overlapping_edits(args.edits, len(lines))
         if validation_error is not None:
             return ToolResult(success=False, output="", error=validation_error)
@@ -477,16 +481,10 @@ class ReplaceFileEditsTool(BaseTool):
 
         new_lines = list(lines)
         for edit in sorted(args.edits, key=lambda item: item.start_line, reverse=True):
-            segment = "".join(lines[edit.start_line - 1 : edit.end_line])
-            replacement = _normalize_line_endings(edit.replacement_content)
-            if (
-                segment.endswith("\n")
-                and replacement
-                and not replacement.endswith("\n")
-            ):
-                replacement = f"{replacement}\n"
-            new_lines[edit.start_line - 1 : edit.end_line] = replacement.splitlines(
-                keepends=True
+            start_index = edit.start_line - 1
+            end_index = edit.end_line
+            new_lines[start_index:end_index] = _replacement_lines_for_span(
+                lines, start_index, end_index, edit.replacement_content
             )
         try:
             atomic_write_scoped_bytes(
@@ -617,6 +615,67 @@ def _encode_for_write(
 
 def _normalize_line_endings(content: str) -> str:
     return content.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _line_ending_suffix(line: str) -> str:
+    if line.endswith("\r\n"):
+        return "\r\n"
+    if line.endswith("\r"):
+        return "\r"
+    if line.endswith("\n"):
+        return "\n"
+    return ""
+
+
+def _preferred_line_ending(
+    lines: list[str], start_index: int, end_index: int
+) -> str:
+    endings = [
+        ending
+        for index in range(start_index, end_index)
+        if (ending := _line_ending_suffix(lines[index]))
+    ]
+    if endings:
+        counts = Counter(endings)
+        most_common_count = max(counts.values())
+        return next(ending for ending in endings if counts[ending] == most_common_count)
+
+    search_limit = max(start_index, len(lines) - end_index)
+    for distance in range(1, search_limit + 1):
+        previous_index = start_index - distance
+        if previous_index >= 0:
+            ending = _line_ending_suffix(lines[previous_index])
+            if ending:
+                return ending
+
+        next_index = end_index + distance - 1
+        if next_index < len(lines):
+            ending = _line_ending_suffix(lines[next_index])
+            if ending:
+                return ending
+
+    return "\n"
+
+
+def _replacement_lines_for_span(
+    lines: list[str],
+    start_index: int,
+    end_index: int,
+    replacement_content: str,
+) -> list[str]:
+    local_ending = _preferred_line_ending(lines, start_index, end_index)
+    if "\r" not in replacement_content:
+        replacement_content = replacement_content.replace("\n", local_ending)
+
+    source_boundary = _line_ending_suffix(lines[end_index - 1])
+    if (
+        source_boundary
+        and replacement_content
+        and not _line_ending_suffix(replacement_content)
+    ):
+        replacement_content += source_boundary
+
+    return replacement_content.splitlines(keepends=True)
 
 
 def _strip_trailing_newlines(content: str) -> str:
