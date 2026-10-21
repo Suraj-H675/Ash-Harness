@@ -655,6 +655,97 @@ async def test_background_process_limits_running_job_count_and_argument_size(
 
 
 @pytest.mark.asyncio
+async def test_background_process_concurrent_starts_respect_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.tools.process as process_module
+
+    monkeypatch.setattr(process_module, "MAX_BACKGROUND_JOBS", 1)
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    original_spawn = process_module.spawn_process_tree
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    launches = 0
+
+    async def delayed_spawn(*args, **kwargs):
+        nonlocal launches
+        launches += 1
+        if launches == 1:
+            entered.set()
+            await release.wait()
+        return await original_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(process_module, "spawn_process_tree", delayed_spawn)
+    command = _python_shell_command("import time;time.sleep(30)")
+    tasks: list[asyncio.Task] = []
+    try:
+        first = asyncio.create_task(tool.run(action="start", command=command))
+        tasks.append(first)
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        second = asyncio.create_task(tool.run(action="start", command=command))
+        tasks.append(second)
+        await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+
+        assert sum(result.success for result in results) == 1
+        assert launches == 1
+        assert len(tool.jobs) == 1
+        assert "running background jobs reached" in next(
+            result.error or "" for result in results if not result.success
+        )
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_shutdown_owns_inflight_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.tools.process as process_module
+
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    original_spawn = process_module.spawn_process_tree
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_spawn(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(process_module, "spawn_process_tree", delayed_spawn)
+    command = _python_shell_command("import time;time.sleep(30)")
+    started_task: asyncio.Task | None = None
+    close_task: asyncio.Task | None = None
+    try:
+        started_task = asyncio.create_task(tool.run(action="start", command=command))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        close_task = asyncio.create_task(tool.aclose())
+        await asyncio.sleep(0)
+        release.set()
+        started, _ = await asyncio.wait_for(
+            asyncio.gather(started_task, close_task), timeout=6
+        )
+        assert started.success is True
+        job = tool.jobs[started.output.split()[1]]
+        assert job.process.returncode is not None
+        assert all(reader.done() for reader in job.readers)
+        rejected = await tool.run(action="start", command=command)
+        assert rejected.success is False
+        assert "closed" in (rejected.error or "")
+    finally:
+        release.set()
+        if started_task is not None:
+            await asyncio.gather(started_task, return_exceptions=True)
+        if close_task is not None:
+            await asyncio.gather(close_task, return_exceptions=True)
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_finished_background_jobs_remain_pollable_without_consuming_capacity(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

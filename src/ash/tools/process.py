@@ -180,6 +180,8 @@ class BackgroundProcessTool(BaseTool):
     ) -> None:
         super().__init__(safety_guard)
         self.jobs: dict[str, Job] = {}
+        self._start_lock = asyncio.Lock()
+        self._closed = False
         self._project_root_identity = _directory_identity(
             self.safety_guard.project_root
         )
@@ -189,7 +191,14 @@ class BackgroundProcessTool(BaseTool):
     async def run(self, **kwargs: Any) -> ToolResult:
         args = BackgroundProcessArgs(**kwargs)
         if args.action == "start":
-            return await self._start(args)
+            async with self._start_lock:
+                if self._closed:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error="Background process tool is closed",
+                    )
+                return await self._start(args)
         if args.action == "list":
             lines = [self._status(job) for job in self.jobs.values()]
             return self._result("\n".join(lines) or "No background jobs.")
@@ -563,7 +572,9 @@ class BackgroundProcessTool(BaseTool):
         )
 
     async def aclose(self) -> None:
-        jobs = tuple(self.jobs.values())
+        async with self._start_lock:
+            self._closed = True
+            jobs = tuple(self.jobs.values())
         _, grace_error, grace_cancelled = await _settle_cleanup(
             asyncio.gather(
                 *(
