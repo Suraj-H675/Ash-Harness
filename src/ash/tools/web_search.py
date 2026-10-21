@@ -25,9 +25,9 @@ from ash.tools.web import (
     _DNSResolutionTimeout,
     _DNSResolverCapacityExhausted,
     _PinnedPublicTransport,
-    _host_allowed,
     _normalize_allowed_domains,
     _resolve_public_addresses_with_timeout,
+    _validate_public_url_syntax,
 )
 
 
@@ -483,17 +483,15 @@ class WebSearchTool(BaseTool):
 
 
 def _result_url_allowed(url: str, allowed_domains: tuple[str, ...]) -> bool:
-    parsed = urlparse(url)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or len(url) > MAX_RESULT_URL_CHARS
-        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in url)
+    if len(url) > MAX_RESULT_URL_CHARS or any(
+        ord(character) < 0x20 or ord(character) == 0x7F for character in url
     ):
         return False
-    return not allowed_domains or _host_allowed(parsed.hostname, allowed_domains)
+    try:
+        _validate_public_url_syntax(url, allowed_domains=allowed_domains)
+    except ValueError:
+        return False
+    return True
 
 
 def _normalize_search_hit(

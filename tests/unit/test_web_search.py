@@ -729,6 +729,54 @@ async def test_web_search_drops_embedded_credential_result_urls(
 
 
 @pytest.mark.asyncio
+async def test_web_search_discards_malformed_provider_urls_without_losing_valid_hits(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-test-key")
+    bad_urls = [
+        "https://[invalid/path",
+        "https://example.com:bad/path",
+        "https://example.com:99999/path",
+        "https://exa\nmple.com/path",
+        "https://@example.com/private",
+    ]
+    valid_url = "https://example.com/team@work"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "web": {
+                    "results": [
+                        {"title": "unsafe", "url": url, "description": "unusable"}
+                        for url in bad_urls
+                    ]
+                    + [{"title": "safe", "url": valid_url, "description": "useful"}]
+                }
+            },
+        )
+
+    result = await WebSearchTool(
+        SafetyGuard(tmp_path),
+        provider="brave",
+        transport=httpx.MockTransport(handler),
+    ).run(query="anything", limit=6)
+
+    assert result.success is True
+    assert json.loads(result.output)["results"] == [
+        {
+            "title": "safe",
+            "url": valid_url,
+            "snippet": "useful",
+            "published_at": "",
+        }
+    ]
+    assert result.citations is not None
+    assert [citation["url"] for citation in result.citations] == [valid_url]
+
+
+@pytest.mark.asyncio
 async def test_web_search_bounds_provider_result_fields(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-test-key")
 
