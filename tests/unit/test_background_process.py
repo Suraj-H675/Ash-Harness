@@ -192,6 +192,88 @@ async def test_background_process_pty_is_interactive_controlling_terminal(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.parametrize("failure", [TimeoutError(), OSError("simulated PTY failure")])
+@pytest.mark.asyncio
+async def test_background_process_pty_uncertain_write_blocks_further_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    started = await tool.run(
+        action="start",
+        command=_python_shell_command("import time; time.sleep(30)"),
+        pty=True,
+    )
+    assert started.success
+    job_id = started.output.split()[1]
+    job = tool.jobs[job_id]
+    calls = 0
+
+    async def partial_write(fd: int, data: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        assert fd == job.pty_master_fd
+        assert data == b"first\n"
+        os.write(fd, b"f")
+        raise failure
+
+    monkeypatch.setattr("ash.tools.process.write_pty_input", partial_write)
+    try:
+        first = await tool.run(action="write", job_id=job_id, input="first\n")
+        assert first.success is False
+        assert first.outcome == ToolExecutionOutcome.UNKNOWN
+        assert "partially delivered" in (first.error or "")
+        assert job.pty_master_fd is not None
+
+        second = await tool.run(action="write", job_id=job_id, input="second\n")
+        assert second.success is False
+        assert "PTY input is unavailable" in (second.error or "")
+        assert calls == 1
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
+@pytest.mark.asyncio
+async def test_background_process_pty_cancelled_write_disables_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    started = await tool.run(
+        action="start",
+        command=_python_shell_command("import time; time.sleep(30)"),
+        pty=True,
+    )
+    assert started.success
+    job_id = started.output.split()[1]
+    entered = asyncio.Event()
+
+    async def interrupted_write(fd: int, data: bytes) -> None:
+        del fd, data
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("ash.tools.process.write_pty_input", interrupted_write)
+    try:
+        pending = asyncio.create_task(
+            tool.run(action="write", job_id=job_id, input="first\n")
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        job = tool.jobs[job_id]
+        assert job.pty_master_fd is not None
+        second = await tool.run(action="write", job_id=job_id, input="second\n")
+        assert second.success is False
+        assert "PTY input is unavailable" in (second.error or "")
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
 @pytest.mark.asyncio
 async def test_background_process_pty_preflight_fails_before_fd_allocation(
     tmp_path: Path,

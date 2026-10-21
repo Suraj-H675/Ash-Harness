@@ -143,6 +143,7 @@ class Job:
     stderr_redactor: StreamingRedactor = field(default_factory=StreamingRedactor)
     pty_master_fd: int | None = None
     pty_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    pty_input_enabled: bool = True
     stdin_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -211,20 +212,37 @@ class BackgroundProcessTool(BaseTool):
                 )
             payload = args.input.encode()
             if job.pty_master_fd is not None:
-                try:
-                    async with job.pty_write_lock:
-                        if job.pty_master_fd is None:
-                            raise OSError("PTY input closed")
+                async with job.pty_write_lock:
+                    if job.pty_master_fd is None or not job.pty_input_enabled:
+                        return ToolResult(
+                            success=False,
+                            output="",
+                            error="Job PTY input is unavailable",
+                        )
+                    try:
                         await write_pty_input(
                             job.pty_master_fd,
                             payload,
                         )
-                except (OSError, asyncio.TimeoutError):
-                    return ToolResult(
-                        success=False,
-                        output="",
-                        error="Job PTY input is unavailable",
-                    )
+                    except asyncio.CancelledError:
+                        job.pty_input_enabled = False
+                        raise
+                    except (OSError, asyncio.TimeoutError) as exc:
+                        job.pty_input_enabled = False
+                        failure = (
+                            "timed out"
+                            if isinstance(exc, asyncio.TimeoutError)
+                            else "failed"
+                        )
+                        return ToolResult(
+                            success=False,
+                            output="",
+                            error=(
+                                f"Job PTY input write {failure}; input may have been "
+                                "partially delivered"
+                            ),
+                            outcome=ToolExecutionOutcome.UNKNOWN,
+                        )
             else:
                 writer = job.process.stdin
                 if writer is None or writer.is_closing():
