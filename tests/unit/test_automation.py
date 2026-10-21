@@ -2829,6 +2829,79 @@ async def test_webhook_sender_does_not_follow_redirects() -> None:
 
 
 @pytest.mark.asyncio
+async def test_webhook_sender_bounds_stalled_dispatch_and_closes_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation import delivery
+
+    monkeypatch.setattr(delivery, "WEBHOOK_TIMEOUT_SECONDS", 0.03)
+
+    class StalledTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.closed = False
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.started.set()
+            await asyncio.Event().wait()
+            return httpx.Response(204, request=request)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    transport = StalledTransport()
+    prepared = PreparedWebhook(
+        url="https://example.com/hook",
+        body=b'{"result":"safe"}',
+        headers={"Idempotency-Key": "synthetic-id"},
+    )
+
+    with pytest.raises(WebhookDeliveryError, match="did not produce a provable"):
+        await asyncio.wait_for(post_webhook(prepared, transport=transport), timeout=0.3)
+
+    assert transport.started.is_set()
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_webhook_sender_caller_cancellation_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation import delivery
+
+    monkeypatch.setattr(delivery, "WEBHOOK_TIMEOUT_SECONDS", 1.0)
+    started = asyncio.Event()
+    closed = False
+
+    class StalledTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            started.set()
+            await asyncio.Event().wait()
+            return httpx.Response(204, request=request)
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    task = asyncio.create_task(
+        post_webhook(
+            PreparedWebhook(
+                url="https://example.com/hook",
+                body=b"{}",
+                headers={"Idempotency-Key": "synthetic-id"},
+            ),
+            transport=StalledTransport(),
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=0.3)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert closed is True
+
+
+@pytest.mark.asyncio
 async def test_worker_fences_webhook_before_network_dispatch(
     tmp_path: Path,
     store: AutomationStore,
@@ -2927,6 +3000,71 @@ async def test_worker_marks_uncertain_webhook_transport_ambiguous(
         )
         == []
     )
+
+
+@pytest.mark.asyncio
+async def test_worker_webhook_dispatch_deadline_is_ambiguous_not_replayed(
+    tmp_path: Path,
+    store: AutomationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.automation import delivery, worker
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    job = store.create_job(
+        name="stalled webhook",
+        prompt="Deliver",
+        workspace=workspace,
+        schedule=build_schedule(every="1h"),
+        enabled=False,
+        webhook_url="https://example.com/hook",
+    )
+    run = store.claim_manual(job.job_id, workspace=workspace, worker_id="runner")
+    store.finish_run(run.run.run_id, run.token, status="succeeded")
+    claim = store.claim_pending_deliveries(
+        workspace=workspace, worker_id="delivery-worker"
+    )[0]
+    monkeypatch.setattr(delivery, "WEBHOOK_TIMEOUT_SECONDS", 0.03)
+    monkeypatch.setattr(
+        worker,
+        "prepare_webhook",
+        AsyncMock(
+            return_value=PreparedWebhook(
+                url="https://example.com/hook",
+                body=b"{}",
+                headers={"Idempotency-Key": claim.delivery.delivery_id},
+            )
+        ),
+    )
+
+    class StalledTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await asyncio.Event().wait()
+            return httpx.Response(204, request=request)
+
+    requests = 0
+
+    async def stalled_post(prepared: PreparedWebhook) -> int:
+        nonlocal requests
+        requests += 1
+        return await post_webhook(prepared, transport=StalledTransport())
+
+    monkeypatch.setattr(worker, "post_webhook", stalled_post)
+    await asyncio.wait_for(
+        AutomationWorkerService(store, workspace)._deliver_webhook(claim),
+        timeout=0.3,
+    )
+
+    finished = store.get_delivery(claim.delivery.delivery_id, workspace=workspace)
+    assert requests == 1
+    assert finished is not None
+    assert finished.status == "ambiguous"
+    assert finished.recovery_safe is False
+    assert "did not produce a provable HTTP response" in (finished.last_error or "")
+    assert store.claim_pending_deliveries(
+        workspace=workspace, worker_id="another-worker"
+    ) == []
 
 
 @pytest.mark.asyncio

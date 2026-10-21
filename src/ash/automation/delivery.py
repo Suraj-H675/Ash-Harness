@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -220,19 +221,27 @@ async def post_webhook(
         )
     else:
         effective_transport = transport
+    timeout_scope = asyncio.timeout(WEBHOOK_TIMEOUT_SECONDS)
     try:
-        async with httpx.AsyncClient(
-            timeout=WEBHOOK_TIMEOUT_SECONDS,
-            transport=effective_transport,
-            follow_redirects=False,
-        ) as client:
-            async with client.stream(
-                "POST",
-                prepared.url,
-                content=prepared.body,
-                headers=prepared.headers,
-            ) as response:
-                return int(response.status_code)
+        async with timeout_scope:
+            async with httpx.AsyncClient(
+                timeout=WEBHOOK_TIMEOUT_SECONDS,
+                transport=effective_transport,
+                follow_redirects=False,
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    prepared.url,
+                    content=prepared.body,
+                    headers=prepared.headers,
+                ) as response:
+                    return int(response.status_code)
+    except TimeoutError as exc:
+        if not timeout_scope.expired():
+            raise
+        raise WebhookDeliveryError(
+            "automation webhook dispatch did not produce a provable HTTP response"
+        ) from exc
     except (httpx.TimeoutException, httpx.RequestError) as exc:
         raise WebhookDeliveryError(
             "automation webhook dispatch did not produce a provable HTTP response"
