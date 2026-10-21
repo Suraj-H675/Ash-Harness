@@ -20,6 +20,7 @@ from ash.sandbox import (
 )
 from ash.sandbox.process_utils import ProcessTreePlan
 from ash.core.redaction import LONG_TOKEN_WITHHELD_MARKER
+from ash.tools.base import ToolExecutionOutcome
 from ash.tools.process import (
     BACKGROUND_OUTPUT_TRUNCATION_MARKER,
     MAX_BACKGROUND_COMMAND_CHARS,
@@ -65,6 +66,86 @@ async def test_background_process_start_poll_and_close(tmp_path) -> None:
     listed = await tool.run(action="list")
     assert job_id in listed.output
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_pipe_write_timeout_fails_without_hanging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("ash.tools.process.BACKGROUND_STDIN_WRITE_TIMEOUT_SECONDS", 0.04, raising=False)
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    started = await tool.run(
+        action="start",
+        command=_python_shell_command("import time; time.sleep(30)"),
+    )
+    assert started.success is True
+    job_id = started.output.split()[1]
+    try:
+        result = await asyncio.wait_for(
+            tool.run(action="write", job_id=job_id, input="x" * 1_000_000),
+            timeout=0.5,
+        )
+        assert result.success is False
+        assert "timed out" in (result.error or "")
+        assert result.outcome == ToolExecutionOutcome.UNKNOWN
+        assert tool.jobs[job_id].process.stdin is not None
+        assert tool.jobs[job_id].process.stdin.is_closing()
+        repeated = await tool.run(action="write", job_id=job_id, input="again")
+        assert repeated.success is False
+        assert "stdin is unavailable" in (repeated.error or "")
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_pipe_write_reports_encoded_bytes(
+    tmp_path: Path,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    started = await tool.run(
+        action="start",
+        command=_python_shell_command(
+            "import sys; print(len(sys.stdin.buffer.readline()), flush=True)"
+        ),
+    )
+    assert started.success is True
+    job_id = started.output.split()[1]
+    try:
+        result = await tool.run(action="write", job_id=job_id, input="é\n")
+        assert result.success is True
+        assert "Wrote 3 bytes" in result.output
+        job = tool.jobs[job_id]
+        await asyncio.wait_for(job.process.wait(), timeout=2)
+        await asyncio.wait_for(asyncio.gather(*job.readers), timeout=2)
+        output = await tool.run(action="poll", job_id=job_id)
+        assert "3" in output.output
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_pipe_write_cancellation_closes_input(
+    tmp_path: Path,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    started = await tool.run(
+        action="start", command=_python_shell_command("import time; time.sleep(30)")
+    )
+    assert started.success is True
+    job_id = started.output.split()[1]
+    try:
+        pending = asyncio.create_task(
+            tool.run(action="write", job_id=job_id, input="x" * 1_000_000)
+        )
+        await asyncio.sleep(0.03)
+        assert not pending.done()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert tool.jobs[job_id].process.stdin is not None
+        assert tool.jobs[job_id].process.stdin.is_closing()
+    finally:
+        await tool.aclose()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")

@@ -20,6 +20,7 @@ from ash.core.redaction import (
 )
 from ash.safety.guard import SafetyGuard
 from ash.sandbox.process_utils import (
+    PTY_WRITE_TIMEOUT_SECONDS,
     ProcessTreeError,
     ProcessTreePlan,
     ProcessTreeUnavailable,
@@ -39,7 +40,7 @@ from ash.sandbox import (
     SandboxInvocation,
     SandboxManager,
 )
-from ash.tools.base import BaseTool, ToolResult, count_output_tokens
+from ash.tools.base import BaseTool, ToolExecutionOutcome, ToolResult, count_output_tokens
 from ash.tools.command import build_scrubbed_command_env
 
 
@@ -56,6 +57,7 @@ MAX_BACKGROUND_JOBS = 32
 MAX_BACKGROUND_HISTORY_JOBS = 32
 MAX_BACKGROUND_COMMAND_CHARS = 100_000
 MAX_BACKGROUND_INPUT_CHARS = 1_000_000
+BACKGROUND_STDIN_WRITE_TIMEOUT_SECONDS = PTY_WRITE_TIMEOUT_SECONDS
 MAX_BACKGROUND_JOB_ID_CHARS = 128
 MAX_BACKGROUND_CWD_CHARS = 4_096
 BACKGROUND_CLOSE_REAP_GRACE_SECONDS = 0.5
@@ -141,6 +143,7 @@ class Job:
     stderr_redactor: StreamingRedactor = field(default_factory=StreamingRedactor)
     pty_master_fd: int | None = None
     pty_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    stdin_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class BackgroundProcessArgs(BaseModel):
@@ -206,6 +209,7 @@ class BackgroundProcessTool(BaseTool):
                 return ToolResult(
                     success=False, output="", error="Job stdin is unavailable"
                 )
+            payload = args.input.encode()
             if job.pty_master_fd is not None:
                 try:
                     async with job.pty_write_lock:
@@ -213,7 +217,7 @@ class BackgroundProcessTool(BaseTool):
                             raise OSError("PTY input closed")
                         await write_pty_input(
                             job.pty_master_fd,
-                            args.input.encode(),
+                            payload,
                         )
                 except (OSError, asyncio.TimeoutError):
                     return ToolResult(
@@ -222,13 +226,42 @@ class BackgroundProcessTool(BaseTool):
                         error="Job PTY input is unavailable",
                     )
             else:
-                if job.process.stdin is None:
+                writer = job.process.stdin
+                if writer is None or writer.is_closing():
                     return ToolResult(
                         success=False, output="", error="Job stdin is unavailable"
                     )
-                job.process.stdin.write(args.input.encode())
-                await job.process.stdin.drain()
-            return self._result(f"Wrote {len(args.input)} bytes to {job.job_id}.")
+                async with job.stdin_write_lock:
+                    if writer.is_closing() or job.process.returncode is not None:
+                        return ToolResult(
+                            success=False, output="", error="Job stdin is unavailable"
+                        )
+                    try:
+                        writer.write(payload)
+                        await asyncio.wait_for(
+                            writer.drain(),
+                            timeout=BACKGROUND_STDIN_WRITE_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.CancelledError:
+                        writer.close()
+                        raise
+                    except (OSError, asyncio.TimeoutError) as exc:
+                        writer.close()
+                        failure = (
+                            "timed out"
+                            if isinstance(exc, asyncio.TimeoutError)
+                            else "failed"
+                        )
+                        return ToolResult(
+                            success=False,
+                            output="",
+                            error=(
+                                f"Job stdin write {failure}; input may have been "
+                                "partially delivered"
+                            ),
+                            outcome=ToolExecutionOutcome.UNKNOWN,
+                        )
+            return self._result(f"Wrote {len(payload)} bytes to {job.job_id}.")
         _, cleanup_error, cancelled = await _settle_cleanup(
             terminate_process_tree(job.process, plan=job.process_tree_plan)
         )
