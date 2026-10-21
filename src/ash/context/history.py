@@ -817,6 +817,20 @@ def _without_image_data(
                 else:
                     blocks.append(block)
             copied["content"] = blocks
+        tool_result_images = copied.get("tool_result_images")
+        if isinstance(tool_result_images, list):
+            sanitized_tool_result_images: list[Any] = []
+            for block in tool_result_images:
+                if isinstance(block, dict) and block.get("type") == "image":
+                    image_count += 1
+                    sanitized_block = dict(block)
+                    sanitized_block["data"] = (
+                        "[binary image omitted from token estimate]"
+                    )
+                    sanitized_tool_result_images.append(sanitized_block)
+                else:
+                    sanitized_tool_result_images.append(block)
+            copied["tool_result_images"] = sanitized_tool_result_images
         sanitized.append(copied)
     return sanitized, image_count
 

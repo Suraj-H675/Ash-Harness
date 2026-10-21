@@ -128,11 +128,21 @@ def prepare_openai_responses_input(
                 )
             continue
         if role == "tool":
+            output: Any = str(content)
+            tool_result_images = message.get("tool_result_images")
+            if isinstance(tool_result_images, list) and tool_result_images:
+                output_blocks = (
+                    [{"type": "text", "text": str(content)}]
+                    if content
+                    else []
+                )
+                output_blocks.extend(_responses_user_content(tool_result_images))
+                output = output_blocks
             items.append(
                 {
                     "type": "function_call_output",
                     "call_id": message["tool_call_id"],
-                    "output": str(content),
+                    "output": output,
                 }
             )
             continue

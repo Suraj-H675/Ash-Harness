@@ -465,6 +465,28 @@ def test_image_payload_uses_fixed_token_estimate() -> None:
     assert IMAGE_TOKEN_ESTIMATE <= result.estimated_tokens < IMAGE_TOKEN_ESTIMATE + 50
 
 
+def test_tool_result_image_sidecar_is_counted_without_base64() -> None:
+    image_data = "cG5nLWRhdGE="
+    counted_inputs: list[str] = []
+    tool_result = {
+        "role": "tool",
+        "tool_call_id": "call-screenshot",
+        "content": "screenshot attachment",
+        "tool_result_images": [
+            {"type": "image", "media_type": "image/png", "data": image_data}
+        ],
+    }
+
+    estimated = HistoryCompactor._count(
+        [tool_result],
+        lambda text: counted_inputs.append(text) or count_words(text),
+    )
+
+    assert IMAGE_TOKEN_ESTIMATE <= estimated < IMAGE_TOKEN_ESTIMATE + 50
+    assert image_data not in counted_inputs[0]
+    assert "binary image omitted" in counted_inputs[0]
+
+
 def test_compaction_summary_never_contains_image_base64() -> None:
     secret_payload = "SENSITIVE_BASE64_PAYLOAD"
     messages = [

@@ -9,13 +9,26 @@ canonical shape to their provider SDK.
 - `system`: text content only.
 - `user`: text or typed text/image blocks.
 - `assistant`: text or text blocks, plus optional canonical tool calls.
-- `tool`: text content and a required `tool_call_id`.
+- `tool`: text content and a required `tool_call_id`; a request may also carry
+  transient `tool_result_images` returned by that tool call.
 
 Image blocks accept PNG, JPEG, GIF, or WebP media types and bounded valid base64
-data. Images are user input only. Tool calls require a non-empty `call_id` and
-name plus strictly JSON-serializable arguments. Orphaned tool results,
-provider-specific extra fields, invalid role/field combinations, invalid media,
-and histories above 10,000 messages fail before network I/O.
+data. Image blocks in `content` are user input only. `tool_result_images` is a
+separate, validated sidecar allowed only on text-only tool messages with a
+`tool_call_id`; Ash attaches it only to the matching tool result from the active
+turn. These raw image blocks are request-only and are never written to durable
+session messages, events, audit records, or context summaries.
+
+Provider adapters must translate `tool_result_images` according to their wire
+contract, preserving its tool-output provenance where supported. A provider
+that cannot represent tool-result images must reject the sidecar or use a
+clearly labeled untrusted image input shape; it must not silently drop the
+images or forward the Ash-only field as an unknown provider key. Provider
+authors whose adapters advertise vision support must implement this behavior.
+Tool calls require a non-empty `call_id` and name plus strictly
+JSON-serializable arguments. Orphaned tool results, provider-specific extra
+fields, invalid role/field combinations, invalid media, and histories above
+10,000 messages fail before network I/O.
 
 The public models are exported from `ash.providers`:
 

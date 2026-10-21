@@ -35,7 +35,8 @@ class GoogleThoughtSignatureReplay:
         model_name: str,
     ) -> list[dict[str, Any]]:
         normalized = normalize_messages(messages)
-        for source, item in zip(normalized, prepared, strict=True):
+        signature_groups: list[dict[str, str]] = []
+        for source in normalized:
             if source.get("role") != "assistant" or not source.get("tool_calls"):
                 continue
             signatures = self._replay_signatures(source)
@@ -45,10 +46,16 @@ class GoogleThoughtSignatureReplay:
                         "Google Gemini tool-call history is missing required "
                         "thought-signature replay state"
                     )
-                continue
-            wire_calls = item.get("tool_calls")
-            if not isinstance(wire_calls, list):
-                continue
+            signature_groups.append(signatures)
+        prepared_groups = [
+            item
+            for item in prepared
+            if item.get("role") == "assistant" and item.get("tool_calls")
+        ]
+        if len(prepared_groups) != len(signature_groups):
+            raise RuntimeError("Google Gemini tool-call replay alignment changed")
+        for item, signatures in zip(prepared_groups, signature_groups, strict=True):
+            wire_calls = item["tool_calls"]
             for call in wire_calls:
                 if not isinstance(call, dict):
                     continue

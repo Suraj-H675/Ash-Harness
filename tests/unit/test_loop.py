@@ -52,6 +52,7 @@ from ash.ui.terminal import TerminalUI
 from ash.tools.command import RunCommandTool
 from ash.tools.browser import (
     BrowserSession,
+    BrowserScreenshotTool,
     BrowserTypeTool,
     BrowserUnavailableError,
     build_browser_tools,
@@ -4819,6 +4820,130 @@ async def test_structured_tool_result_survives_execution_and_redaction(tmp_path)
     assert "signed-marker" not in tool_message.content
     assert "image_blocks" not in tool_message.content
     assert "cG5nLWRhdGE=" not in tool_message.content
+
+
+@pytest.mark.asyncio
+async def test_browser_screenshot_reaches_only_the_current_provider_turn(
+    tmp_path, monkeypatch
+) -> None:
+    from ash.providers.messages import normalize_messages
+
+    image_data = "cG5nLWRhdGE="
+
+    class ScreenshotSession:
+        calls = 0
+
+        async def screenshot(self, *, max_bytes: int):
+            assert max_bytes == 1_000_000
+            self.calls += 1
+            return SimpleNamespace(
+                media_type="image/png",
+                data=image_data,
+                sha256="a" * 64,
+            )
+
+        async def close(self) -> None:
+            return None
+
+    class ScreenshotProvider(ProviderABC):
+        model_name = "screenshot-vision-test"
+        _ash_declared_capabilities = ProviderCapabilities(vision=True)
+
+        def __init__(self) -> None:
+            self.requests: list[list[dict[str, Any]]] = []
+            self.token_inputs: list[str] = []
+
+        def count_tokens(self, text: str) -> int:
+            self.token_inputs.append(text)
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del temperature, tools
+            self.requests.append(normalize_messages(messages))
+            if len(self.requests) == 1:
+                yield StreamChunk(
+                    tool_call_delta=(
+                        '<call_tool name="browser_screenshot">'
+                        '<arg name="max_bytes">1000000</arg>'
+                        "</call_tool>"
+                    ),
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(
+                    content=(
+                        "Screenshot inspected."
+                        if len(self.requests) == 2
+                        else "Later turn completed."
+                    ),
+                    is_done=True,
+                )
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    guard = SafetyGuard(tmp_path)
+    provider = ScreenshotProvider()
+    browser_session = ScreenshotSession()
+    store = SessionStore(tmp_path / "screenshot-turn.db")
+    loop = AshLoop(
+        store,
+        provider,
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={
+            "browser_screenshot": BrowserScreenshotTool(
+                guard,
+                browser_session,  # type: ignore[arg-type]
+            )
+        },
+        safety_tier="auto_approve",
+        config=AshConfig(
+            model="custom/screenshot-vision-test",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+        ),
+    )
+
+    try:
+        session = await loop.start_session()
+        assert await loop.run_turn("Inspect the current browser page.") == (
+            "Screenshot inspected."
+        )
+        assert browser_session.calls == 1
+
+        screenshot_request = provider.requests[1]
+        tool_message = next(
+            message
+            for message in screenshot_request
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") is not None
+        )
+        assert tool_message.get("tool_result_images") == [
+            {"type": "image", "media_type": "image/png", "data": image_data}
+        ]
+
+        persisted = store.load_session(session.session_id)
+        assert image_data not in repr(persisted.model_dump(mode="python"))
+        assert image_data not in persisted.context_summary
+        assert image_data not in repr(loop.ui.events)
+        assert image_data not in repr(persisted.tool_calls)
+        assert image_data not in repr(store.list_runtime_events(session.session_id))
+        assert image_data not in repr(store.list_audit_logs(session.session_id))
+        assert image_data not in repr(provider.token_inputs)
+
+        assert await loop.run_turn("Continue without using the old screenshot.") == (
+            "Later turn completed."
+        )
+        assert all(
+            "tool_result_images" not in message
+            for message in provider.requests[2]
+        )
+        assert image_data not in repr(provider.requests[2])
+    finally:
+        await loop.aclose()
 
 
 def test_tool_response_renderer_bounds_json_expansion(

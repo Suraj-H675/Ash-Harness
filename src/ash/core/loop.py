@@ -26,7 +26,7 @@ import json
 import os
 import stat
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -92,11 +92,13 @@ from ash.providers.failover import FailoverProvider
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.identifiers import parse_model_string
 from ash.providers.messages import (
+    MAX_CANONICAL_CONTENT_BLOCKS,
     MAX_CANONICAL_CONTENT_BYTES,
     MAX_TOOL_CALL_ARGUMENT_BYTES,
     MAX_TOOL_CALL_ID_BYTES,
     CanonicalMessage,
     CanonicalToolCall,
+    ImageContentBlock,
     normalize_messages,
     validate_provider_tool_name,
 )
@@ -131,6 +133,7 @@ from ash.tools.base import (
     count_output_tokens,
     redact_tool_arguments,
 )
+from ash.tools.base import MAX_TOOL_RESULT_IMAGE_DATA_BYTES
 from ash.tools.git import auto_commit_turn, git_dirty_paths
 from ash.ui.parser import Event, StreamingXMLParser
 from rich.console import Console
@@ -149,6 +152,60 @@ MAX_BACKGROUND_AGENT_REPORT_SUMMARY_BYTES = 16_384
 MAX_BACKGROUND_AGENT_REPORT_TASK_BYTES = 4_096
 MAX_SCHEDULED_HOOK_LIFECYCLE_TASKS = 32
 HOOK_LIFECYCLE_SHUTDOWN_GRACE_SECONDS = 5.0
+
+
+class _TurnToolResultImages:
+    """Bounded image data returned by tools during one provider turn."""
+
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = enabled
+        self._by_call_id: dict[str, tuple[ImageContentBlock, ...]] = {}
+        self._image_bytes = 0
+        self._image_count = 0
+
+    def capture(
+        self,
+        call_id: str,
+        image_blocks: Sequence[Mapping[str, str]],
+    ) -> None:
+        if not self.enabled or not image_blocks:
+            return
+        if call_id in self._by_call_id:
+            raise ValueError("tool-result images contain a duplicate tool call ID")
+        canonical = CanonicalMessage(
+            role="tool",
+            content="",
+            tool_call_id=call_id,
+            tool_result_images=[
+                ImageContentBlock.model_validate(dict(block))
+                for block in image_blocks
+            ],
+        )
+        validated = tuple(canonical.tool_result_images or ())
+        added_bytes = sum(len(block.data.encode("utf-8")) for block in validated)
+        if self._image_bytes + added_bytes > MAX_TOOL_RESULT_IMAGE_DATA_BYTES:
+            raise ValueError(
+                "tool-result images for one turn exceed "
+                f"{MAX_TOOL_RESULT_IMAGE_DATA_BYTES} UTF-8 bytes"
+            )
+        if self._image_count + len(validated) > MAX_CANONICAL_CONTENT_BLOCKS:
+            raise ValueError(
+                "tool-result images for one turn exceed "
+                f"{MAX_CANONICAL_CONTENT_BLOCKS} image blocks"
+            )
+        self._by_call_id[call_id] = validated
+        self._image_bytes += added_bytes
+        self._image_count += len(validated)
+
+    def for_call(self, call_id: str) -> list[dict[str, str]] | None:
+        blocks = self._by_call_id.get(call_id)
+        if blocks is None:
+            return None
+        return [block.model_dump(mode="python") for block in blocks]
+
+    @property
+    def has_images(self) -> bool:
+        return bool(self._by_call_id)
 
 if TYPE_CHECKING:
     from ash.config import AshConfig
@@ -3731,6 +3788,9 @@ class AshLoop:
         if self.current_session is None:
             raise RuntimeError("turn started without an active session")
         session = self.current_session
+        tool_result_images = _TurnToolResultImages(
+            enabled=_provider_capabilities(self.provider).vision
+        )
 
         # Workspace files can change outside Ash between user turns.
         if callable(getattr(self.repo_map, "refresh", None)):
@@ -3998,6 +4058,7 @@ class AshLoop:
             try:
                 messages = self._build_messages(
                     session,
+                    tool_result_images=tool_result_images,
                     request_budget=request_budget,
                     provider_tools=iteration_tools,
                     tool_schema_payload=iteration_tool_schema,
@@ -4290,6 +4351,7 @@ class AshLoop:
                     session,
                     tools_snapshot=iteration_tools,
                     persist_tool_messages=True,
+                    tool_result_images=tool_result_images,
                 )
             except CircuitBreakerError:
                 _log.warning("circuit breaker tripped — halting turn")
@@ -5678,6 +5740,7 @@ class AshLoop:
         *,
         tools_snapshot: dict[str, BaseTool] | None = None,
         persist_tool_messages: bool = False,
+        tool_result_images: _TurnToolResultImages | None = None,
         _defer_terminal_persistence: bool = False,
     ) -> list[dict[str, Any]]:
         """Execute approved tool calls, gating each on the safety guard."""
@@ -5761,6 +5824,7 @@ class AshLoop:
                         session=session,
                         call=call,
                         result=result,
+                        tool_result_images=tool_result_images,
                     )
             return flattened
 
@@ -6345,6 +6409,7 @@ class AshLoop:
                     session=session,
                     call=call,
                     result=result_payload,
+                    tool_result_images=tool_result_images,
                 )
             results.append(result_payload)
             if not tool_result.success:
@@ -6409,6 +6474,7 @@ class AshLoop:
         session: Session,
         call: dict[str, Any],
         result: dict[str, Any],
+        tool_result_images: _TurnToolResultImages | None = None,
     ) -> None:
         record = result.get("_terminal_record")
         if not isinstance(record, ToolCallRecord):
@@ -6437,6 +6503,13 @@ class AshLoop:
         result.pop("_terminal_record", None)
         if created:
             session.messages.append(tool_message)
+            if (
+                tool_result_images is not None
+                and visible_result.get("success") is True
+            ):
+                image_blocks = visible_result.get("image_blocks")
+                if isinstance(image_blocks, list):
+                    tool_result_images.capture(call["call_id"], image_blocks)
 
     def _remember_repo_file(self, path: Path) -> None:
         """Keep a bounded least-recently-used list of files relevant to context."""
@@ -6910,6 +6983,7 @@ class AshLoop:
         self,
         session: Session,
         *,
+        tool_result_images: _TurnToolResultImages | None = None,
         request_budget: RequestTokenBudget | None = None,
         force_compaction: bool = False,
         provider_tools: dict[str, BaseTool] | None = None,
@@ -6918,6 +6992,14 @@ class AshLoop:
     ) -> list[dict[str, Any]]:
         """Build the messages payload for the provider."""
 
+        if (
+            tool_result_images is not None
+            and tool_result_images.has_images
+            and not _provider_capabilities(self.provider).vision
+        ):
+            raise ProviderCapabilityError(
+                "active provider does not support vision for tool-result images"
+            )
         self._refresh_additional_instructions()
         system_content = self.system_prompt
         skill_content = ""
@@ -7187,7 +7269,10 @@ class AshLoop:
                 {"role": "system", "content": system_content}
             ]
             protected_history_index: int | None = None
+            active_turn_message_seen = False
             for message in session.messages:
+                if message is self._active_turn_user_message:
+                    active_turn_message_seen = True
                 msg_dict: dict[str, Any] = {
                     "role": message.role,
                     "content": _canonical_message_content(message),
@@ -7202,7 +7287,16 @@ class AshLoop:
                     msg_dict["provider_state"] = message.metadata["provider_state"]
                 # OpenAI requires tool_call_id on role=tool messages.
                 if message.role == "tool" and message.metadata.get("call_id"):
-                    msg_dict["tool_call_id"] = message.metadata["call_id"]
+                    call_id = message.metadata["call_id"]
+                    msg_dict["tool_call_id"] = call_id
+                    if (
+                        active_turn_message_seen
+                        and tool_result_images is not None
+                        and _provider_capabilities(self.provider).vision
+                    ):
+                        image_blocks = tool_result_images.for_call(call_id)
+                        if image_blocks:
+                            msg_dict["tool_result_images"] = image_blocks
                 if message.is_runtime_only:
                     msg_dict[RUNTIME_ONLY_HISTORY_KEY] = True
                 messages.append(msg_dict)
@@ -7392,7 +7486,10 @@ class AshLoop:
                 messages[0]["content"] = (
                     f"{messages[0]['content']}\n\n{tool_schema_content}"
                 )
+        active_turn_message_seen = False
         for message in session.messages:
+            if message is self._active_turn_user_message:
+                active_turn_message_seen = True
             msg_dict = {
                 "role": message.role,
                 "content": _canonical_message_content(message),
@@ -7406,7 +7503,16 @@ class AshLoop:
             ):
                 msg_dict["provider_state"] = message.metadata["provider_state"]
             if message.role == "tool" and message.metadata.get("call_id"):
-                msg_dict["tool_call_id"] = message.metadata["call_id"]
+                call_id = message.metadata["call_id"]
+                msg_dict["tool_call_id"] = call_id
+                if (
+                    active_turn_message_seen
+                    and tool_result_images is not None
+                    and _provider_capabilities(self.provider).vision
+                ):
+                    image_blocks = tool_result_images.for_call(call_id)
+                    if image_blocks:
+                        msg_dict["tool_result_images"] = image_blocks
             messages.append(msg_dict)
         return messages
 

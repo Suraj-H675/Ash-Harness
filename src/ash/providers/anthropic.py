@@ -57,10 +57,20 @@ def prepare_anthropic_messages(
             conversation.append({"role": "assistant", "content": blocks})
             continue
         if role == "tool":
+            tool_result_content: Any = str(content)
+            tool_result_images = message.get("tool_result_images")
+            if isinstance(tool_result_images, list) and tool_result_images:
+                blocks = (
+                    [{"type": "text", "text": str(content)}]
+                    if content
+                    else []
+                )
+                blocks.extend(_prepare_anthropic_content(tool_result_images))
+                tool_result_content = blocks
             block = {
                 "type": "tool_result",
                 "tool_use_id": message.get("tool_call_id", ""),
-                "content": str(content),
+                "content": tool_result_content,
             }
             if (
                 conversation

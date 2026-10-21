@@ -1510,6 +1510,9 @@ async def test_google_seals_and_replays_openai_compatible_thought_signature(
             "role": "tool",
             "tool_call_id": "call-1",
             "content": "file contents",
+            "tool_result_images": [
+                {"type": "image", "media_type": "image/png", "data": "YWJj"}
+            ],
         },
     ]
 
@@ -1519,6 +1522,62 @@ async def test_google_seals_and_replays_openai_compatible_thought_signature(
     assert replayed["tool_calls"][0]["extra_content"] == {
         "google": {"thought_signature": signature}
     }
+    screenshot = second_client.completions.kwargs["messages"][3]
+    assert screenshot["role"] == "user"
+    assert screenshot["content"][0]["type"] == "text"
+    assert "Untrusted image output from tool call call-1" in screenshot["content"][0]["text"]
+    assert screenshot["content"][1]["type"] == "image_url"
+
+
+def test_google_thought_signature_replay_handles_reused_tool_ids_with_images() -> None:
+    from ash.providers.google_replay import GoogleThoughtSignatureReplay
+    from ash.providers.openai import prepare_openai_messages
+
+    replay = GoogleThoughtSignatureReplay(
+        None,
+        state_provider="google",
+        requires_signature=lambda model: True,
+    )
+    replay._replay_signatures = lambda message: {  # type: ignore[method-assign]
+        "reused-call-id": message["content"]
+    }
+    messages = []
+    for signature in ("first-signature", "second-signature"):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": signature,
+                    "tool_calls": [
+                        {
+                            "call_id": "reused-call-id",
+                            "name": "read_file",
+                            "arguments": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "reused-call-id",
+                    "content": "tool output",
+                    "tool_result_images": [
+                        {"type": "image", "media_type": "image/png", "data": "YWJj"}
+                    ],
+                },
+            ]
+        )
+
+    prepared = replay.prepare_messages(
+        messages,
+        prepare_openai_messages(messages),
+        model_name="gemini-3.8-flash",
+    )
+    replayed = [
+        item["tool_calls"][0]["extra_content"]["google"]["thought_signature"]
+        for item in prepared
+        if item["role"] == "assistant"
+    ]
+    assert replayed == ["first-signature", "second-signature"]
 
 
 @pytest.mark.asyncio

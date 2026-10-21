@@ -25,6 +25,17 @@ MAX_OLLAMA_STREAM_BYTES = 16_000_000
 MAX_OLLAMA_ERROR_BYTES = 64 * 1024
 
 
+def prepare_ollama_messages(messages: Sequence[MessageInput]) -> list[dict[str, Any]]:
+    """Translate canonical tool-result images to Ollama's message image field."""
+
+    prepared = normalize_messages(messages)
+    for message in prepared:
+        tool_result_images = message.pop("tool_result_images", None)
+        if isinstance(tool_result_images, list) and tool_result_images:
+            message["images"] = [block["data"] for block in tool_result_images]
+    return prepared
+
+
 class OllamaProvider(ProviderABC):
     provider_family = "ollama"
     _dynamic_capabilities: ProviderCapabilities | None = None
@@ -182,7 +193,7 @@ class OllamaProvider(ProviderABC):
             options["num_predict"] = self._max_tokens
         payload = {
             "model": self._model_name,
-            "messages": normalize_messages(messages),
+            "messages": prepare_ollama_messages(messages),
             "stream": True,
             "options": options,
         }

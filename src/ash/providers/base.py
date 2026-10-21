@@ -347,7 +347,9 @@ class ProviderABC(ABC):
     The loop uses :meth:`stream_chat` to receive an async stream of
     :class:`StreamChunk` objects. ``messages`` uses Ash's validated canonical
     shape so the loop does not need provider-specific message encoding.
-    Mapping inputs remain supported for compatibility.
+    Mapping inputs remain supported for compatibility. Vision-capable adapters
+    must translate ``tool_result_images`` on tool messages or reject it; the
+    Ash-only field must never be forwarded as an unknown provider key.
     """
 
     provider_family = "custom"

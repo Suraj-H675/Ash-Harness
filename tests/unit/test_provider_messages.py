@@ -200,6 +200,133 @@ def test_first_party_encoders_support_image_only_user_content() -> None:
     ]
 
 
+def test_tool_result_images_keep_tool_provenance_in_provider_adapters() -> None:
+    from ash.providers.ollama import prepare_ollama_messages
+    from ash.providers.openai_responses import prepare_openai_responses_input
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "call-1", "name": "capture", "arguments": {}},
+                {"call_id": "call-2", "name": "capture", "arguments": {}},
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "first result",
+            "tool_result_images": [
+                {"type": "image", "media_type": "image/png", "data": "YWJj"}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "content": "second result",
+            "tool_result_images": [
+                {"type": "image", "media_type": "image/jpeg", "data": "ZGVm"}
+            ],
+        },
+    ]
+
+    openai_messages = prepare_openai_messages(messages)
+    assert [message["role"] for message in openai_messages] == [
+        "assistant",
+        "tool",
+        "tool",
+        "user",
+        "user",
+    ]
+    assert [
+        message["tool_call_id"]
+        for message in openai_messages
+        if message["role"] == "tool"
+    ] == ["call-1", "call-2"]
+    assert "Untrusted image output from tool call call-1" in (
+        openai_messages[3]["content"][0]["text"]
+    )
+    assert openai_messages[3]["content"][1]["image_url"]["url"] == (
+        "data:image/png;base64,YWJj"
+    )
+    assert "tool_result_images" not in repr(openai_messages)
+
+    _, anthropic_messages = prepare_anthropic_messages(messages)
+    anthropic_tool_results = [
+        block
+        for message in anthropic_messages
+        for block in message["content"]
+        if block.get("type") == "tool_result"
+    ]
+    assert [block["tool_use_id"] for block in anthropic_tool_results] == [
+        "call-1",
+        "call-2",
+    ]
+    assert anthropic_tool_results[0]["content"][1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "YWJj"},
+    }
+
+    _, response_items = prepare_openai_responses_input(messages)
+    response_tool_outputs = [
+        item for item in response_items if item.get("type") == "function_call_output"
+    ]
+    assert response_tool_outputs[0]["output"][1] == {
+        "type": "input_image",
+        "detail": "auto",
+        "image_url": "data:image/png;base64,YWJj",
+    }
+
+    ollama_messages = prepare_ollama_messages(messages)
+    ollama_tool_results = [
+        message for message in ollama_messages if message.get("role") == "tool"
+    ]
+    assert [message["images"] for message in ollama_tool_results] == [
+        ["YWJj"],
+        ["ZGVm"],
+    ]
+    assert all("tool_result_images" not in message for message in ollama_messages)
+
+
+def test_canonical_tool_result_images_are_bounded_and_role_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.providers.messages as messages_module
+
+    tool_message = CanonicalMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="result",
+        tool_result_images=[
+            ImageContentBlock(media_type="image/png", data="YWJj")
+        ],
+    )
+    assert normalize_messages([tool_message])[0]["tool_result_images"] == [
+        {"type": "image", "media_type": "image/png", "data": "YWJj"}
+    ]
+
+    with pytest.raises(ValueError, match="only on tool messages"):
+        CanonicalMessage(
+            role="user",
+            content="user content",
+            tool_result_images=[
+                ImageContentBlock(media_type="image/png", data="YWJj")
+            ],
+        )
+
+    monkeypatch.setattr(messages_module, "MAX_CANONICAL_CONTENT_BYTES", 3)
+    with pytest.raises(ValueError, match="tool-result image data exceeds 3"):
+        CanonicalMessage(
+            role="tool",
+            tool_call_id="call-2",
+            content="ok",
+            tool_result_images=[
+                ImageContentBlock(media_type="image/png", data="YWJj")
+            ],
+        )
+
+
 @pytest.mark.parametrize(
     ("message", "match"),
     [

@@ -162,6 +162,10 @@ class CanonicalMessage(BaseModel):
     content: str | list[ContentBlock] = ""
     name: str | None = None
     tool_call_id: str | None = None
+    tool_result_images: list[ImageContentBlock] | None = Field(
+        default=None,
+        max_length=MAX_CANONICAL_CONTENT_BLOCKS,
+    )
     tool_calls: list[CanonicalToolCall] | None = None
     provider_state: list[dict[str, Any]] | None = None
 
@@ -222,6 +226,14 @@ class CanonicalMessage(BaseModel):
     def validate_tool_call_id(cls, value: str | None) -> str | None:
         return None if value is None else _validate_tool_call_id(value)
 
+    @field_validator("tool_result_images")
+    @classmethod
+    def omit_empty_tool_result_images(
+        cls,
+        value: list[ImageContentBlock] | None,
+    ) -> list[ImageContentBlock] | None:
+        return value or None
+
     @model_validator(mode="after")
     def validate_role_contract(self) -> "CanonicalMessage":
         if self.role == "tool":
@@ -231,6 +243,17 @@ class CanonicalMessage(BaseModel):
                 raise ValueError("tool message content must be text")
         elif self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only on tool messages")
+        if self.tool_result_images is not None:
+            if self.role != "tool":
+                raise ValueError("tool_result_images are valid only on tool messages")
+            total_image_bytes = sum(
+                len(block.data.encode("utf-8")) for block in self.tool_result_images
+            )
+            if total_image_bytes > MAX_CANONICAL_CONTENT_BYTES:
+                raise ValueError(
+                    "tool-result image data exceeds "
+                    f"{MAX_CANONICAL_CONTENT_BYTES} UTF-8 bytes"
+                )
         if self.tool_calls and self.role != "assistant":
             raise ValueError("tool_calls are valid only on assistant messages")
         if self.provider_state is not None:
