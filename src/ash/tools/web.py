@@ -233,12 +233,17 @@ def _validate_public_url_syntax(
     *,
     allowed_domains: tuple[str, ...] = (),
 ) -> str:
-    parsed = urlparse(raw_url)
+    try:
+        parsed = urlparse(raw_url)
+        httpx.URL(raw_url)
+        _ = parsed.port
+    except (ValueError, httpx.InvalidURL) as exc:
+        raise ValueError("Invalid HTTP(S) URL") from exc
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("Only http and https URLs are supported")
     if not parsed.hostname:
         raise ValueError("URL must include a hostname")
-    if parsed.username or parsed.password:
+    if parsed.username is not None or parsed.password is not None:
         raise ValueError("URLs cannot contain embedded credentials")
     if allowed_domains and not _host_allowed(parsed.hostname, allowed_domains):
         raise ValueError(f"Host {parsed.hostname!r} is not in allowed_web_domains")

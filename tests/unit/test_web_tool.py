@@ -383,6 +383,72 @@ def test_web_fetch_rejects_private_and_non_http_hosts(monkeypatch) -> None:
         _validate_public_url("https://private.example")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("url", "expected_error"),
+    [
+        ("https://@example.com/path", "URLs cannot contain embedded credentials"),
+        ("https://:@example.com/path", "URLs cannot contain embedded credentials"),
+        ("https://example.com:invalid/path", "Invalid HTTP(S) URL"),
+        ("https://example.com:99999/path", "Invalid HTTP(S) URL"),
+        ("https://exa\nmple.com/path", "Invalid HTTP(S) URL"),
+    ],
+)
+async def test_web_fetch_rejects_malformed_authorities_before_dns_or_dispatch(
+    monkeypatch, guard, url: str, expected_error: str
+) -> None:
+    requests: list[httpx.Request] = []
+    lookups: list[str] = []
+
+    async def lookup(hostname: str, *, timeout_seconds: float) -> tuple[str, ...]:
+        del timeout_seconds
+        lookups.append(hostname)
+        return ("93.184.216.34",)
+
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout", lookup
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200)
+
+    tool = WebFetchTool(
+        guard,
+        transport=httpx.MockTransport(handler),
+    )
+    result = await tool.run(url=url)
+
+    assert result.success is False
+    assert result.output == ""
+    assert result.error == expected_error
+    assert lookups == []
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_accepts_at_sign_outside_url_authority(
+    monkeypatch, guard
+) -> None:
+    monkeypatch.setattr(
+        "ash.tools.web._resolve_public_addresses_with_timeout",
+        _allow_public_dns,
+    )
+    url = "https://example.com/team@work?contact=user@example.com"
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(200, text="ok")
+
+    result = await WebFetchTool(
+        guard, transport=httpx.MockTransport(handler)
+    ).run(url=url)
+
+    assert result.success is True
+    assert requests == [url]
+
+
 @pytest.mark.parametrize("literal", ["100.64.0.1", "100.127.255.254"])
 def test_web_fetch_rejects_shared_address_space(literal: str) -> None:
     with pytest.raises(ValueError, match="non-public"):

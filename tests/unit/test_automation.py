@@ -32,6 +32,7 @@ from ash.automation.models import AutomationJob, AutomationWorkerSummary, Schedu
 from ash.automation.delivery import (
     PreparedWebhook,
     WebhookDeliveryError,
+    normalize_webhook_settings,
     post_webhook,
     prepare_webhook,
 )
@@ -2768,6 +2769,18 @@ async def test_webhook_preflight_builds_stable_signed_payload(
     assert payload["run"]["prompt_tokens"] == 7
     assert "prompt" not in payload["job"]
     assert "workspace" not in payload["job"]
+
+
+@pytest.mark.parametrize(
+    "url", ["https://@example.com/hook", "https://:@example.com/hook"]
+)
+def test_webhook_rejects_empty_embedded_userinfo(url: str) -> None:
+    with pytest.raises(ValueError, match="embedded credentials"):
+        normalize_webhook_settings(url, None)
+
+    assert normalize_webhook_settings("https://example.com/hook@v1", None)[0] == (
+        "https://example.com/hook@v1"
+    )
 
 
 @pytest.mark.asyncio

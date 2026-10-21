@@ -70,7 +70,7 @@ def normalize_webhook_settings(
         raise ValueError("webhook_url must use https")
     if not parsed.hostname:
         raise ValueError("webhook_url must include a hostname")
-    if parsed.username or parsed.password:
+    if parsed.username is not None or parsed.password is not None:
         raise ValueError("webhook_url cannot contain embedded credentials")
     if parsed.query:
         raise ValueError("webhook_url cannot contain a query string")
