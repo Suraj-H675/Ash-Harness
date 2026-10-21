@@ -885,6 +885,38 @@ def test_provider_test_human_rendering_distinguishes_completion_failure() -> Non
     assert "Catalog: 1 model(s); selected model available" in rendered
     assert "Completion: failed: chat endpoint failed" in rendered
     assert "model is available, but a completion could not be verified" in rendered
+    assert "Next:" not in rendered
+
+
+@pytest.mark.parametrize(
+    "model_override",
+    [None, "openrouter/test-model"],
+)
+def test_providers_test_guides_recovery_when_selected_model_is_unavailable(
+    monkeypatch, capsys, model_override: str | None
+) -> None:
+    from ash import cli
+    from ash.commands import providers
+
+    monkeypatch.setattr(cli, "_load_config_or_report", lambda **_kwargs: (object(), 0))
+    monkeypatch.setattr(
+        providers,
+        "test_provider",
+        lambda *_args, **_kwargs: _provider_verification(selected=False),
+    )
+
+    exit_code = cli.main(
+        ["providers", "test", *([model_override] if model_override else [])]
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Result: endpoint is reachable, but the selected model is unavailable" in output
+    assert (
+        "Next: Run 'ash setup model' to update the saved route. If ASH_MODEL is set "
+        "or you passed a model argument to 'ash providers test', correct that "
+        "override instead (provider/model format). Retest the corrected route."
+    ) in output
 
 
 @pytest.mark.parametrize("json_output", [False, True])

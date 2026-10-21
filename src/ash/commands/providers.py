@@ -313,6 +313,19 @@ def render_provider_test(
                 )
                 else "Result: model is available, but a completion could not be verified"
             ),
+            *(
+                [
+                    "Next: Run 'ash setup model' to update the saved route. If ASH_MODEL "
+                    "is set or you passed a model argument to 'ash providers test', "
+                    "correct that override instead (provider/model format). "
+                    "Retest the corrected route."
+                ]
+                if (
+                    verification.catalog_authoritative
+                    and not verification.selected_model_available
+                )
+                else []
+            ),
         ]
     )
 
