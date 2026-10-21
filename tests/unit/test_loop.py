@@ -8561,6 +8561,88 @@ async def test_invalid_known_tool_arguments_are_rejected_before_approval(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "replace_file_content",
+            {
+                "file_path": "../outside.txt",
+                "start_line": 1,
+                "end_line": 1,
+                "target_content": "before",
+                "replacement_content": "after",
+            },
+        ),
+        (
+            "replace_file_edits",
+            {
+                "file_path": "../outside.txt",
+                "edits": [
+                    {
+                        "start_line": 1,
+                        "end_line": 1,
+                        "target_content": "before",
+                        "replacement_content": "after",
+                    }
+                ],
+            },
+        ),
+        ("whole_edit", {"file_path": "../outside.txt", "content": "after"}),
+    ],
+)
+async def test_out_of_scope_file_edits_are_denied_before_approval(
+    tmp_path, tool_name: str, arguments: dict
+) -> None:
+    from ash.tools.filesystem import (
+        ReplaceFileContentTool,
+        ReplaceFileEditsTool,
+        WholeEditTool,
+    )
+
+    guard = SafetyGuard(tmp_path)
+    approvals: list[str] = []
+
+    async def approve(name: str, params: dict) -> bool:
+        del params
+        approvals.append(name)
+        return True
+
+    tools = {
+        tool.name: tool
+        for tool in (
+            ReplaceFileContentTool(guard),
+            ReplaceFileEditsTool(guard),
+            WholeEditTool(guard),
+        )
+    }
+    loop = AshLoop(
+        SessionStore(tmp_path / "out-of-scope-edits.db"),
+        MockProvider(),
+        guard,
+        EventUI(),
+        tmp_path,
+        tools=tools,
+        on_tool_approval=approve,
+    )
+    try:
+        await loop.start_session()
+        result = await loop.execute_tool(tool_name, arguments)
+
+        assert approvals == []
+        assert result["success"] is False
+        assert "outside project scope" in result["error"]
+        record = loop.session_store.load_session(
+            loop.current_session.session_id
+        ).tool_calls[-1]
+        assert record.approved is False
+        assert record.dispatched is False
+        assert record.executed is False
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_is_rejected_before_requesting_approval(tmp_path):
     approvals: list[str] = []
 

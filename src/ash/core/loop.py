@@ -5908,7 +5908,12 @@ class AshLoop:
             decision = self.permission_policy.evaluate(
                 tool_name, deepcopy(arguments)
             )
-            if tool_name == "write_file" and decision.action != PolicyAction.DENY:
+            if tool_name in {
+                "write_file",
+                "replace_file_content",
+                "replace_file_edits",
+                "whole_edit",
+            } and decision.action != PolicyAction.DENY:
                 path = arguments.get("file_path")
                 if isinstance(path, str):
                     try:
