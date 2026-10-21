@@ -53,6 +53,7 @@ jobs:
           uv venv .smoke-venv-314 --python 3.14
           uv pip install --python .smoke-venv-314 dist/*.whl
           .smoke-venv-314/bin/ash --version
+          .smoke-venv-314/bin/python tests/packaging/smoke_minimal_install.py
       - name: Installed sdist smoke test
         shell: bash
         run: |
