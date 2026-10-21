@@ -181,7 +181,9 @@ class BackgroundProcessTool(BaseTool):
         super().__init__(safety_guard)
         self.jobs: dict[str, Job] = {}
         self._start_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
         self._closed = False
+        self._close_complete = False
         self._project_root_identity = _directory_identity(
             self.safety_guard.project_root
         )
@@ -572,6 +574,13 @@ class BackgroundProcessTool(BaseTool):
         )
 
     async def aclose(self) -> None:
+        async with self._close_lock:
+            if self._close_complete:
+                return
+            await self._close_owned()
+            self._close_complete = True
+
+    async def _close_owned(self) -> None:
         async with self._start_lock:
             self._closed = True
             jobs = tuple(self.jobs.values())

@@ -18,7 +18,7 @@ from ash.sandbox import (
     SandboxManager,
     has_bwrap,
 )
-from ash.sandbox.process_utils import ProcessTreePlan
+from ash.sandbox.process_utils import ProcessTreeError, ProcessTreePlan
 from ash.core.redaction import LONG_TOKEN_WITHHELD_MARKER
 from ash.tools.base import ToolExecutionOutcome
 from ash.tools.process import (
@@ -408,6 +408,91 @@ async def test_background_process_close_cancellation_waits_for_tree_cleanup(
 
     assert job.process.returncode is not None
     assert all(reader.done() for reader in job.readers)
+
+
+@pytest.mark.asyncio
+async def test_background_process_concurrent_closes_terminate_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.process as process_module
+
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    started = await tool.run(
+        action="start",
+        command=_python_shell_command("import time;time.sleep(30)"),
+    )
+    assert started.success
+    job = tool.jobs[started.output.split()[1]]
+    terminate_original = process_module._terminate_background_jobs
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def counted_terminate(jobs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return await terminate_original(jobs)
+
+    monkeypatch.setattr(process_module, "_terminate_background_jobs", counted_terminate)
+    closers: list[asyncio.Task] = []
+    try:
+        closers.append(asyncio.create_task(tool.aclose()))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        closers.append(asyncio.create_task(tool.aclose()))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*closers), timeout=5)
+        await tool.aclose()
+
+        assert calls == 1
+        assert job.process.returncode is not None
+        assert all(reader.done() for reader in job.readers)
+    finally:
+        release.set()
+        await asyncio.gather(*closers, return_exceptions=True)
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_failed_close_remains_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.process as process_module
+
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    started = await tool.run(
+        action="start",
+        command=_python_shell_command("import time;time.sleep(30)"),
+    )
+    assert started.success
+    job = tool.jobs[started.output.split()[1]]
+    original_terminate = process_module._terminate_background_jobs
+    calls = 0
+
+    async def fail_once(jobs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [ProcessTreeError("simulated cleanup failure")]
+        return await original_terminate(jobs)
+
+    monkeypatch.setattr(process_module, "_terminate_background_jobs", fail_once)
+    try:
+        with pytest.raises(ProcessTreeError, match="simulated cleanup failure"):
+            await tool.aclose()
+        assert tool._close_complete is False
+        assert job.process.returncode is None
+
+        await asyncio.wait_for(tool.aclose(), timeout=5)
+        assert calls == 2
+        assert job.process.returncode is not None
+        assert tool._close_complete is True
+    finally:
+        await tool.aclose()
 
 
 @pytest.mark.asyncio
