@@ -266,7 +266,7 @@ class BackgroundProcessTool(BaseTool):
         if not args.command:
             return ToolResult(success=False, output="", error="start requires command")
         running_jobs = sum(
-            1 for job in self.jobs.values() if job.process.returncode is None
+            1 for job in self.jobs.values() if self._has_active_readers_or_root(job)
         )
         if running_jobs >= MAX_BACKGROUND_JOBS:
             return ToolResult(
@@ -437,11 +437,17 @@ class BackgroundProcessTool(BaseTool):
         terminal_ids = [
             job_id
             for job_id, job in self.jobs.items()
-            if job.process.returncode is not None
+            if not self._has_active_readers_or_root(job)
         ]
         excess = len(terminal_ids) - MAX_BACKGROUND_HISTORY_JOBS + 1
         for job_id in terminal_ids[: max(0, excess)]:
             self.jobs.pop(job_id, None)
+
+    @staticmethod
+    def _has_active_readers_or_root(job: Job) -> bool:
+        return job.process.returncode is None or any(
+            not reader.done() for reader in job.readers
+        )
 
     async def _read(
         self,

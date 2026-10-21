@@ -538,6 +538,57 @@ async def test_background_process_prunes_oldest_terminal_history(
     await tool.aclose()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group semantics")
+@pytest.mark.parametrize(
+    ("job_limit", "second_start_allowed"), [(1, False), (2, True)]
+)
+@pytest.mark.asyncio
+async def test_background_process_retains_exited_root_with_live_descendants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    job_limit: int,
+    second_start_allowed: bool,
+) -> None:
+    monkeypatch.setattr("ash.tools.process.MAX_BACKGROUND_HISTORY_JOBS", 1)
+    monkeypatch.setattr("ash.tools.process.MAX_BACKGROUND_JOBS", job_limit)
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    script = (
+        "import subprocess,sys; "
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
+        "print(child.pid,flush=True)"
+    )
+    root_job: Job | None = None
+    child_pid: int | None = None
+    try:
+        started = await tool.run(action="start", command=_python_shell_command(script))
+        assert started.success is True
+        root_job = tool.jobs[started.output.split()[1]]
+        for _ in range(200):
+            if root_job.process.returncode is not None and root_job.output:
+                break
+            await asyncio.sleep(0.01)
+        assert root_job.process.returncode == 0
+        assert any(not reader.done() for reader in root_job.readers)
+        child_pid = int("".join(root_job.output).strip().splitlines()[0])
+
+        second = await tool.run(action="start", command=_successful_shell_command())
+        assert second.success is second_start_allowed
+        if not second_start_allowed:
+            assert "running background jobs reached" in (second.error or "")
+        assert root_job.job_id in tool.jobs
+
+        await asyncio.wait_for(tool.aclose(), timeout=4)
+        assert all(reader.done() for reader in root_job.readers)
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        if root_job is not None:
+            try:
+                os.killpg(root_job.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 @pytest.mark.asyncio
 async def test_stopped_background_job_does_not_consume_running_capacity(
     tmp_path, monkeypatch: pytest.MonkeyPatch
