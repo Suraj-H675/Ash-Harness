@@ -2714,12 +2714,10 @@ class SpawnAgentTool(BaseTool):
         )
         try:
             while True:
-                current = self._shared_state.tasks.get_task(durable_task_id)
-                if (
-                    current is None
-                    or current.state not in {"leased", "running"}
-                    or current.owner_agent_id != agent_id
-                    or current.attempt != attempt
+                if not self._shared_state.is_current_approval_attempt(
+                    task_id=durable_task_id,
+                    attempt=attempt,
+                    agent_id=agent_id,
                 ):
                     self._shared_state.mark_delivered([request_message_id])
                     return "Approval request is no longer active."
@@ -2742,6 +2740,13 @@ class SpawnAgentTool(BaseTool):
                         ):
                             stale_responses.append(message.message_id)
                         continue
+                    if not self._shared_state.is_current_approval_attempt(
+                        task_id=durable_task_id,
+                        attempt=attempt,
+                        agent_id=agent_id,
+                    ):
+                        self._shared_state.mark_delivered([request_message_id])
+                        return "Approval request is no longer active."
                     valid = (
                         content.get("task_id") == durable_task_id
                         and content.get("agent_id") == agent_id

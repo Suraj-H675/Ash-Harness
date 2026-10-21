@@ -201,29 +201,15 @@ def list_agent_approvals(
         raise ValueError("limit must be positive")
     with SharedState(db_path, workspace=workspace) as state:
         approvals: list[dict[str, Any]] = []
-        for message in state.fetch_messages(
-            "lead",
-            undelivered_only=pending_only,
+        for request in state.list_approval_requests(
+            pending_only=pending_only,
             limit=limit,
-            message_type="approval_request",
         ):
+            message = request.message
             content = message.content
             task_id = content.get("task_id")
             attempt = content.get("attempt")
             agent_id = content.get("agent_id")
-            task = (
-                state.tasks.get_task(task_id, workspace=workspace)
-                if isinstance(task_id, str)
-                else None
-            )
-            active = bool(
-                not message.delivered
-                and task is not None
-                and task.state in {"leased", "running"}
-                and task.owner_agent_id == agent_id
-                and task.attempt == attempt
-            )
-            status = "pending" if active else ("resolved" if message.delivered else "stale")
             approvals.append(
                 {
                     "request_id": message.message_id,
@@ -235,7 +221,7 @@ def list_agent_approvals(
                     "arguments_sha256": content.get("arguments_sha256"),
                     "requested_at": content.get("requested_at")
                     or message.timestamp.isoformat(),
-                    "status": status,
+                    "status": request.status,
                 }
             )
         return approvals

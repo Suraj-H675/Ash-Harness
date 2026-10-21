@@ -45,6 +45,7 @@ from ash.sqlite_utils import (
 
 AgentStatusValue = str  # one of {"idle", "working", "failed", "completed"}
 SprintStateValue = str  # one of {"planning", "active", "complete", "aborted"}
+AgentApprovalStatus = Literal["pending", "resolved", "stale"]
 MAX_IPC_MESSAGE_BYTES = 512 * 1024
 MAX_PENDING_IPC_MESSAGES_PER_RECIPIENT = 1000
 MAX_DELIVERED_IPC_HISTORY_PER_WORKSPACE = 10_000
@@ -75,6 +76,12 @@ class IPCMessage:
     content: dict[str, Any]
     delivered: bool
     timestamp: datetime
+
+
+@dataclass(frozen=True)
+class ApprovalRequestView:
+    message: IPCMessage
+    status: AgentApprovalStatus
 
 
 @dataclass(frozen=True)
@@ -639,6 +646,130 @@ class SharedState:
             rows = cur.execute(sql, params).fetchall()
         return [self._row_to_ipc(r) for r in rows]
 
+    def list_approval_requests(
+        self,
+        *,
+        pending_only: bool = True,
+        limit: int = 50,
+    ) -> list[ApprovalRequestView]:
+        """List approval requests with their current task-attempt status."""
+
+        if type(limit) is not int or not 1 <= limit <= MAX_IPC_FETCH_MESSAGES:
+            raise ValueError(
+                "IPC message fetch limit must be between 1 and "
+                f"{MAX_IPC_FETCH_MESSAGES}"
+            )
+        with self._conn_lock:
+            now = time.time()
+            messages = self.fetch_messages(
+                "lead",
+                undelivered_only=pending_only,
+                limit=limit,
+                message_type="approval_request",
+            )
+            requests: list[ApprovalRequestView] = []
+            for message in messages:
+                if message.delivered:
+                    status: AgentApprovalStatus = (
+                        "resolved"
+                        if self._approval_request_has_response_locked(message)
+                        else "stale"
+                    )
+                else:
+                    active = self._approval_attempt_is_current_locked(
+                        task_id=message.content.get("task_id"),
+                        attempt=message.content.get("attempt"),
+                        agent_id=message.content.get("agent_id"),
+                        now=now,
+                    )
+                    status = "pending" if active else "stale"
+                requests.append(ApprovalRequestView(message, status))
+            return requests
+
+    def _approval_request_has_response_locked(self, request: IPCMessage) -> bool:
+        agent_id = request.content.get("agent_id")
+        if (
+            request.message_type != "approval_request"
+            or request.recipient_id != "lead"
+            or not isinstance(agent_id, str)
+            or request.sender_id != agent_id
+        ):
+            return False
+        response = self._conn.execute(
+            """
+            SELECT 1 FROM ipc_messages
+            WHERE recipient_id = ?
+              AND message_type = 'approval_response'
+              AND json_extract(content_json, '$.request_message_id') = ?
+            LIMIT 1
+            """,
+            (self._scope_agent_id(agent_id), request.message_id),
+        ).fetchone()
+        return response is not None
+
+    def is_current_approval_attempt(
+        self,
+        *,
+        task_id: object,
+        attempt: object,
+        agent_id: object,
+    ) -> bool:
+        """Return whether an approval's exact task attempt still holds its lease."""
+
+        with self._conn_lock:
+            return self._approval_attempt_is_current_locked(
+                task_id=task_id,
+                attempt=attempt,
+                agent_id=agent_id,
+                now=time.time(),
+            )
+
+    def _approval_attempt_is_current_locked(
+        self,
+        *,
+        task_id: object,
+        attempt: object,
+        agent_id: object,
+        now: float,
+    ) -> bool:
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or type(attempt) is not int
+            or attempt < 1
+            or not isinstance(agent_id, str)
+            or not agent_id
+        ):
+            return False
+        if self.workspace is None:
+            task_row = self._conn.execute(
+                """
+                SELECT state, owner_agent_id, attempt, lease_expires_at
+                FROM agent_tasks
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        else:
+            task_row = self._conn.execute(
+                """
+                SELECT state, owner_agent_id, attempt, lease_expires_at
+                FROM agent_tasks
+                WHERE task_id = ?
+                  AND json_extract(metadata_json, '$.workspace') = ?
+                """,
+                (task_id, self.workspace),
+            ).fetchone()
+        if (
+            task_row is None
+            or task_row["state"] not in {"leased", "running"}
+            or task_row["owner_agent_id"] != agent_id
+            or task_row["attempt"] != attempt
+        ):
+            return False
+        lease_expires_at = task_row["lease_expires_at"]
+        return isinstance(lease_expires_at, (int, float)) and lease_expires_at > now
+
     def mark_delivered(self, message_ids: Iterable[int]) -> int:
         """Mark messages as delivered. Returns the row count affected."""
 
@@ -726,30 +857,11 @@ class SharedState:
                     raise ValueError(
                         f"approval request {request_message_id} is malformed"
                     )
-                if self.workspace is None:
-                    task_row = self._conn.execute(
-                        """
-                        SELECT state, owner_agent_id, attempt
-                        FROM agent_tasks
-                        WHERE task_id = ?
-                        """,
-                        (task_id,),
-                    ).fetchone()
-                else:
-                    task_row = self._conn.execute(
-                        """
-                        SELECT state, owner_agent_id, attempt
-                        FROM agent_tasks
-                        WHERE task_id = ?
-                          AND json_extract(metadata_json, '$.workspace') = ?
-                        """,
-                        (task_id, self.workspace),
-                    ).fetchone()
-                if (
-                    task_row is None
-                    or task_row["state"] not in {"leased", "running"}
-                    or task_row["owner_agent_id"] != agent_id
-                    or int(task_row["attempt"]) != attempt
+                if not self._approval_attempt_is_current_locked(
+                    task_id=task_id,
+                    attempt=attempt,
+                    agent_id=agent_id,
+                    now=time.time(),
                 ):
                     raise ValueError(
                         f"approval request {request_message_id} is stale"
@@ -809,6 +921,7 @@ class SharedState:
         retired: list[int] = []
         with self._conn_lock, self._conn:
             scoped_lead = self._scope_agent_id("lead")
+            now = time.time()
             rows = self._conn.execute(
                 """
                 SELECT * FROM ipc_messages
@@ -826,33 +939,11 @@ class SharedState:
                 task_id = content.get("task_id")
                 attempt = content.get("attempt")
                 agent_id = content.get("agent_id")
-                if not isinstance(task_id, str):
-                    task_row = None
-                elif self.workspace is None:
-                    task_row = self._conn.execute(
-                        """
-                        SELECT state, owner_agent_id, attempt
-                        FROM agent_tasks
-                        WHERE task_id = ?
-                        """,
-                        (task_id,),
-                    ).fetchone()
-                else:
-                    task_row = self._conn.execute(
-                        """
-                        SELECT state, owner_agent_id, attempt
-                        FROM agent_tasks
-                        WHERE task_id = ?
-                          AND json_extract(metadata_json, '$.workspace') = ?
-                        """,
-                        (task_id, self.workspace),
-                    ).fetchone()
-                active = bool(
-                    task_row is not None
-                    and task_row["state"] in {"leased", "running"}
-                    and task_row["owner_agent_id"] == agent_id
-                    and type(attempt) is int
-                    and int(task_row["attempt"]) == attempt
+                active = self._approval_attempt_is_current_locked(
+                    task_id=task_id,
+                    attempt=attempt,
+                    agent_id=agent_id,
+                    now=now,
                 )
                 if active:
                     continue

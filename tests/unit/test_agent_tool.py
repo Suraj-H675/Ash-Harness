@@ -2980,6 +2980,124 @@ async def test_cancelled_approval_send_retires_committed_request(
 
 
 @pytest.mark.asyncio
+async def test_durable_approval_is_not_consumed_after_lease_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "approval-workspace"
+    workspace.mkdir()
+    state = SharedState(
+        tmp_path / "expired-approval" / "agents.db", workspace=workspace
+    )
+    task_id = "expired-approval-task"
+    agent_id = "expired-approval-worker"
+    state.tasks.create_task(
+        "wait for approval",
+        task_id=task_id,
+        metadata={"workspace": str(workspace.resolve())},
+    )
+    lease = state.tasks.claim_task(agent_id, task_id=task_id)
+    assert lease is not None
+    state.tasks.start_task(task_id, lease.token)
+    tool = SpawnAgentTool(SafetyGuard(workspace), state, FakeProvider)
+
+    async def approve_then_expire(
+        sender_id: str,
+        recipient_id: str,
+        message_type: str,
+        content: dict[str, Any],
+    ) -> int:
+        request_id = state.send_message(
+            sender_id, recipient_id, message_type, content
+        )
+        state.resolve_approval_request(request_id, approved=True)
+        state._conn.execute(
+            "UPDATE agent_tasks SET lease_expires_at = 0 WHERE task_id = ?",
+            (task_id,),
+        )
+        state._conn.commit()
+        return request_id
+
+    monkeypatch.setattr(state, "send_message_async", approve_then_expire)
+    try:
+        result = await tool._await_durable_approval(
+            agent_id=agent_id,
+            durable_task_id=task_id,
+            attempt=lease.task.attempt,
+            tool_name="write_file",
+            arguments={"file_path": "expired.txt", "content": "must not run"},
+        )
+
+        assert result == "Approval request is no longer active."
+        assert state.tasks.get_task(task_id).state == "running"
+    finally:
+        await tool.aclose()
+        state.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_approval_expiring_during_response_fetch_is_not_consumed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "approval-workspace"
+    workspace.mkdir()
+    state = SharedState(
+        tmp_path / "fetch-expired-approval" / "agents.db", workspace=workspace
+    )
+    task_id = "fetch-expired-task"
+    agent_id = "fetch-expired-worker"
+    state.tasks.create_task(
+        "wait for approval",
+        task_id=task_id,
+        metadata={"workspace": str(workspace.resolve())},
+    )
+    lease = state.tasks.claim_task(agent_id, task_id=task_id)
+    assert lease is not None
+    state.tasks.start_task(task_id, lease.token)
+    tool = SpawnAgentTool(SafetyGuard(workspace), state, FakeProvider)
+
+    async def approve_request(
+        sender_id: str,
+        recipient_id: str,
+        message_type: str,
+        content: dict[str, Any],
+    ) -> int:
+        request_id = state.send_message(
+            sender_id, recipient_id, message_type, content
+        )
+        state.resolve_approval_request(request_id, approved=True)
+        return request_id
+
+    original_fetch = state.fetch_messages
+
+    def fetch_then_expire(recipient_id: str, **kwargs: Any):
+        messages = original_fetch(recipient_id, **kwargs)
+        if recipient_id == agent_id and messages:
+            state._conn.execute(
+                "UPDATE agent_tasks SET lease_expires_at = 0 WHERE task_id = ?",
+                (task_id,),
+            )
+            state._conn.commit()
+        return messages
+
+    monkeypatch.setattr(state, "send_message_async", approve_request)
+    monkeypatch.setattr(state, "fetch_messages", fetch_then_expire)
+    try:
+        result = await tool._await_durable_approval(
+            agent_id=agent_id,
+            durable_task_id=task_id,
+            attempt=lease.task.attempt,
+            tool_name="write_file",
+            arguments={"file_path": "expired.txt", "content": "must not run"},
+        )
+        assert result == "Approval request is no longer active."
+    finally:
+        await tool.aclose()
+        state.close()
+
+
+@pytest.mark.asyncio
 async def test_stopping_background_agent_retires_pending_approval(tmp_path) -> None:
     class WritingProvider(FakeProvider):
         async def stream_chat(self, messages, temperature=0.0, tools=None):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -382,6 +383,8 @@ def test_agent_approval_resolution_is_atomic_and_correlated(tmp_path: Path) -> N
     assert resolution["agent_id"] == "approval-worker"
     assert resolution["attempt"] == attempt
     assert resolution["approved"] is True
+    resolved = list_agent_approvals(db_path, pending_only=False)
+    assert resolved[0]["status"] == "resolved"
 
     state = SharedState(db_path)
     try:
@@ -525,6 +528,64 @@ def test_agents_cli_lists_and_resolves_background_approvals(
 
     assert main(["agents", "approve", str(request_id), "--json"]) == 2
     assert "already resolved" in capsys.readouterr().err
+
+
+def test_agents_cli_rejects_expired_approval_without_recovering_task(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_dir = tmp_path / "db-expired-approval"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    db_path = db_dir / "agents.db"
+    request_id, _, _ = _seed_agent_approval(db_path, workspace=workspace)
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "UPDATE agent_tasks SET lease_expires_at = 0 WHERE task_id = ?",
+            ("approval-task",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    monkeypatch.setenv("ASH_MODEL", "ollama/test-model")
+    monkeypatch.setenv("ASH_DB_DIRECTORY", str(db_dir))
+    monkeypatch.setenv("ASH_WORKSPACE_ROOT", str(workspace))
+
+    assert main(["agents", "approvals", "--json"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["approvals"][0]["request_id"] == request_id
+    assert listed["approvals"][0]["status"] == "stale"
+
+    assert main(["agents", "approve", str(request_id), "--json"]) == 2
+    assert "stale" in capsys.readouterr().err
+
+    state = SharedState(db_path, workspace=workspace)
+    try:
+        task = state.tasks.get_task("approval-task")
+        assert task is not None
+        assert task.state == "running"
+        assert (
+            state.fetch_messages(
+                "approval-worker",
+                undelivered_only=True,
+                message_type="approval_response",
+            )
+            == []
+        )
+        assert state.retire_stale_approval_requests() == [request_id]
+        task = state.tasks.get_task("approval-task")
+        assert task is not None
+        assert task.state == "running"
+    finally:
+        state.close()
+
+    assert main(["agents", "approvals", "--json", "--all"]) == 0
+    all_listed = json.loads(capsys.readouterr().out)
+    assert all_listed["approvals"][0]["request_id"] == request_id
+    assert all_listed["approvals"][0]["status"] == "stale"
 
 
 def test_agents_cli_lists_persisted_statuses(
