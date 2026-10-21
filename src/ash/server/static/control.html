@@ -29,6 +29,24 @@
       <span class="hint">Kept in this page's memory only.</span>
     </section>
 
+    <aside
+      id="pending-approval-bar"
+      class="pending-approval-bar"
+      aria-label="Pending tool approvals"
+      hidden
+    >
+      <span id="pending-approval-summary"></span>
+      <button
+        id="review-approvals"
+        type="button"
+        aria-controls="approval-review"
+        aria-describedby="pending-approval-summary"
+        hidden
+      >
+        Review approvals
+      </button>
+    </aside>
+
     <main class="workspace" aria-label="Ash remote workspace">
       <section class="conversation" aria-label="Conversation">
         <div id="transcript" class="transcript" aria-live="polite"></div>
@@ -58,8 +76,12 @@
           <button id="refresh-sessions" type="button" disabled>Refresh sessions</button>
         </section>
 
-        <section>
-          <h2>Approvals</h2>
+        <section
+          id="approval-review"
+          tabindex="-1"
+          aria-labelledby="approval-heading"
+        >
+          <h2 id="approval-heading">Approvals</h2>
           <div id="approvals" class="approvals">
             <p class="empty">No pending approvals.</p>
           </div>
@@ -72,6 +94,14 @@
       </aside>
     </main>
 
+    <div
+      id="approval-announcements"
+      class="sr-only"
+      role="log"
+      aria-live="polite"
+      aria-atomic="false"
+      aria-relevant="additions"
+    ></div>
     <div id="notice" class="notice" role="status" aria-live="polite"></div>
     <script src="/ui/control.js" defer></script>
   </body>

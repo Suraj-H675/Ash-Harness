@@ -196,7 +196,9 @@ class _RemoteUIClient:
 
 
 @pytest.mark.asyncio
-async def test_remote_control_ui_uses_real_app_for_sessions_stream_steer_and_approval() -> None:
+async def test_remote_control_ui_uses_real_app_for_sessions_stream_steer_and_approval(
+    tmp_path: Path,
+) -> None:
     client = _RemoteUIClient()
     approval_broker = HTTPApprovalBroker(timeout_seconds=10)
     approval_task = asyncio.create_task(
@@ -239,7 +241,15 @@ async def test_remote_control_ui_uses_real_app_for_sessions_stream_steer_and_app
             await page.wait_for_function(
                 "() => document.querySelector('#approvals').textContent.includes('write_file')"
             )
-            await page.get_by_role("button", name="Approve").click()
+            await page.wait_for_function(
+                "() => !document.querySelector('#pending-approval-bar').hidden"
+            )
+            await page.get_by_role("button", name="Review approvals").click()
+            await page.wait_for_function(
+                "() => document.activeElement.id === 'approval-review'"
+            )
+            await page.screenshot(path=str(tmp_path / "approval-desktop-review.png"))
+            await page.get_by_role("button", name="Approve write_file call").click()
             assert await asyncio.wait_for(approval_task, timeout=2) is True
 
             await page.locator("#prompt").fill("hello")
@@ -347,3 +357,146 @@ async def test_remote_control_ui_restores_real_durable_sessions_and_streams_sdk_
             await browser.close()
         await approval_broker.close()
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_approvals_are_visible_and_stable_on_mobile(
+    tmp_path: Path,
+) -> None:
+    client = _RemoteUIClient()
+    approval_broker = HTTPApprovalBroker(timeout_seconds=10)
+    app = create_app(
+        client,  # type: ignore[arg-type]
+        bearer_token="0123456789abcdef",
+        requests_per_minute=120,
+        approval_broker=approval_broker,
+    )
+    browser = None
+    approval_task: asyncio.Task[bool] | None = None
+    external_approval_task: asyncio.Task[bool] | None = None
+    try:
+        async with _serve_app(app) as base_url, async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 390, "height": 844})
+            await page.goto(f"{base_url}/ui")
+            await page.locator("#token").fill("0123456789abcdef")
+            await page.locator("#connect").click()
+            await page.wait_for_function(
+                "() => document.querySelector('#connection-state').textContent === 'Connected'"
+            )
+            await page.wait_for_function("() => document.activeElement.id === 'prompt'")
+
+            approval_task = asyncio.create_task(
+                approval_broker.request(
+                    "write_file",
+                    {
+                        "path": "<img src=x onerror=alert(1)>",
+                        "token": "browser-secret",
+                    },
+                )
+            )
+            await asyncio.sleep(0)
+
+            approval_bar = page.locator("#pending-approval-bar")
+            await page.wait_for_function(
+                "() => !document.querySelector('#pending-approval-bar').hidden"
+            )
+            assert await page.locator("#review-approvals").is_visible()
+            assert await page.evaluate("document.activeElement.id") == "prompt"
+            assert (
+                await page.locator("#approval-announcements").get_attribute("aria-live")
+                == "polite"
+            )
+            assert (
+                await page.locator("#approval-announcements [data-approval-id]").count()
+                == 1
+            )
+
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_function(
+                "() => document.querySelector('#pending-approval-bar').getBoundingClientRect().top <= 1"
+            )
+            bar_box = await approval_bar.bounding_box()
+            assert bar_box is not None and bar_box["y"] <= 1
+            assert "1 tool call needs review" in await approval_bar.inner_text()
+
+            await page.get_by_role("button", name="Review approvals").click()
+            await page.wait_for_function(
+                "() => document.activeElement.id === 'approval-review'"
+            )
+            request_card = page.locator(".approval")
+            arguments = request_card.locator("pre")
+            rendered_arguments = await arguments.inner_text()
+            assert "<img src=x onerror=alert(1)>" in rendered_arguments
+            assert "browser-secret" not in rendered_arguments
+            assert "[REDACTED]" in rendered_arguments
+            assert await arguments.locator("img").count() == 0
+            await page.screenshot(path=str(tmp_path / "approval-mobile-review.png"))
+
+            deny = request_card.get_by_role("button", name="Deny write_file call")
+            await deny.focus()
+            await deny.evaluate(
+                "element => { window.__focusedApprovalAction = element; }"
+            )
+            await page.wait_for_timeout(4500)
+            assert await page.evaluate(
+                "window.__focusedApprovalAction === document.activeElement"
+            )
+            assert (
+                await page.locator("#approval-announcements [data-approval-id]").count()
+                == 1
+            )
+
+            await deny.click()
+            assert await asyncio.wait_for(approval_task, timeout=2) is False
+            await page.wait_for_function(
+                "() => document.activeElement.id === 'approval-review'"
+            )
+            await page.wait_for_function(
+                "() => document.querySelector('#pending-approval-bar').hidden",
+                timeout=5000,
+            )
+
+            external_approval_task = asyncio.create_task(
+                approval_broker.request("write_file", {"path": "CONTRIBUTING.md"})
+            )
+            await asyncio.sleep(0)
+            await page.wait_for_function(
+                "() => !document.querySelector('#pending-approval-bar').hidden"
+            )
+            assert (
+                await page.locator("#approval-announcements [data-approval-id]").count()
+                == 1
+            )
+            await page.locator("#review-approvals").focus()
+            pending = await approval_broker.list_pending()
+            request_id = pending[0]["id"]
+            response = await page.request.post(
+                f"{base_url}/v1/approvals/{request_id}",
+                headers={"Authorization": "Bearer 0123456789abcdef"},
+                data={"approved": False},
+            )
+            assert response.ok
+            assert await asyncio.wait_for(external_approval_task, timeout=2) is False
+            await page.wait_for_function(
+                "() => document.activeElement.id === 'approval-review'"
+            )
+            await page.wait_for_function(
+                "() => document.querySelector('#pending-approval-bar').hidden",
+                timeout=5000,
+            )
+            await page.screenshot(path=str(tmp_path / "approval-mobile-resolved.png"))
+            await browser.close()
+            browser = None
+            # Wake any in-flight approval long-poll before stopping Uvicorn.
+            await approval_broker.close()
+    finally:
+        if browser is not None:
+            await browser.close()
+        await approval_broker.close()
+        if approval_task is not None and not approval_task.done():
+            approval_task.cancel()
+            await asyncio.gather(approval_task, return_exceptions=True)
+        if external_approval_task is not None and not external_approval_task.done():
+            external_approval_task.cancel()
+            await asyncio.gather(external_approval_task, return_exceptions=True)

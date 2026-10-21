@@ -90,6 +90,29 @@ select:disabled {
   background: #efefec;
 }
 
+.pending-approval-bar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  min-height: 3rem;
+  padding: 0.45rem 1rem;
+  border-bottom: 1px solid #b8b8b3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  background: #efefec;
+}
+
+.pending-approval-bar[hidden],
+.pending-approval-bar button[hidden] {
+  display: none;
+}
+
+.pending-approval-bar button {
+  min-height: 2.5rem;
+}
+
 .connect-panel input {
   width: min(28rem, 45vw);
   min-height: 2.25rem;
@@ -248,6 +271,15 @@ select:disabled {
   gap: 0.45rem;
 }
 
+#approval-review {
+  scroll-margin-top: 4rem;
+}
+
+#approval-review:focus {
+  outline: 2px solid currentColor;
+  outline-offset: -2px;
+}
+
 .empty,
 .details {
   margin: 0;
@@ -314,6 +346,17 @@ select:disabled {
     flex-direction: column;
   }
 
+  .pending-approval-bar {
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding-inline: 0.75rem;
+  }
+
+  .pending-approval-bar button {
+    min-height: 2.75rem;
+  }
+
   .connect-panel input {
     width: 100%;
   }
@@ -350,6 +393,10 @@ select:disabled {
     background: #292926;
   }
 
+  .pending-approval-bar {
+    background: #292926;
+  }
+
   button,
   input,
   textarea,
@@ -361,6 +408,7 @@ select:disabled {
 
   .topbar,
   .connect-panel,
+  .pending-approval-bar,
   .composer,
   .sidebar,
   .sidebar section,

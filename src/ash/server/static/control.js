@@ -13,7 +13,13 @@ const els = {
   sessions: document.querySelector("#sessions"),
   refreshSessions: document.querySelector("#refresh-sessions"),
   newSession: document.querySelector("#new-session"),
+  approvalBar: document.querySelector("#pending-approval-bar"),
+  approvalSummary: document.querySelector("#pending-approval-summary"),
+  reviewApprovals: document.querySelector("#review-approvals"),
+  approvalReview: document.querySelector("#approval-review"),
   approvals: document.querySelector("#approvals"),
+  approvalEmpty: document.querySelector("#approvals .empty"),
+  approvalAnnouncements: document.querySelector("#approval-announcements"),
   notice: document.querySelector("#notice"),
 };
 
@@ -24,6 +30,7 @@ let turnController = null;
 let approvalGeneration = 0;
 let noticeTimer = null;
 let currentSessionId = null;
+let approvalsEnabled = null;
 const MAX_SSE_BUFFER_CHARS = 8 * 1024 * 1024;
 const MAX_TRANSCRIPT_ENTRIES = 300;
 
@@ -79,7 +86,7 @@ function setConnected(value) {
     els.summary.textContent = "";
     els.details.replaceChildren();
     els.sessions.replaceChildren();
-    renderApprovals([]);
+    clearApprovalView();
   }
 }
 
@@ -238,37 +245,202 @@ function renderSessionMessages(messages) {
   }
 }
 
-function renderApprovals(items) {
-  els.approvals.replaceChildren();
-  if (!items.length) {
-    const empty = document.createElement("p");
-    empty.className = "empty";
-    empty.textContent = "No pending approvals.";
-    els.approvals.append(empty);
-    return;
+function readApprovalSnapshot(payload) {
+  if (
+    payload === null ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    typeof payload.enabled !== "boolean" ||
+    !Array.isArray(payload.approvals)
+  ) {
+    throw new Error("Ash returned an invalid approvals response.");
   }
+  const seenIds = new Set();
+  for (const item of payload.approvals) {
+    if (
+      item === null ||
+      typeof item !== "object" ||
+      Array.isArray(item) ||
+      typeof item.id !== "string" ||
+      item.id.length === 0 ||
+      typeof item.tool !== "string" ||
+      item.arguments === null ||
+      typeof item.arguments !== "object" ||
+      Array.isArray(item.arguments) ||
+      seenIds.has(item.id)
+    ) {
+      throw new Error("Ash returned an invalid approvals response.");
+    }
+    seenIds.add(item.id);
+  }
+  if (!payload.enabled && payload.approvals.length > 0) {
+    throw new Error("Ash returned an invalid approvals response.");
+  }
+  return {enabled: payload.enabled, items: payload.approvals};
+}
+
+function renderApprovalSummary(pendingCount) {
+  const unavailable = approvalsEnabled === false;
+  const available = approvalsEnabled === true;
+  const hasPending = pendingCount > 0;
+  els.approvalBar.hidden =
+    !connected || (!unavailable && (!available || !hasPending));
+  els.reviewApprovals.hidden = !available || !hasPending;
+  if (unavailable) {
+    els.approvalSummary.textContent = "Remote approvals are unavailable.";
+  } else if (available) {
+    els.approvalSummary.textContent =
+      pendingCount === 1
+        ? "1 tool call needs review."
+        : `${pendingCount} tool calls need review.`;
+  } else {
+    els.approvalSummary.textContent = "";
+  }
+}
+
+function createApprovalCard(item) {
+  const block = document.createElement("article");
+  block.className = "approval";
+  block.dataset.approvalId = item.id;
+  block.setAttribute("role", "group");
+  block.setAttribute("aria-label", "Tool approval request");
+  const tool = document.createElement("div");
+  tool.className = "approval-tool";
+  tool.textContent = item.tool;
+  const args = document.createElement("pre");
+  args.textContent = JSON.stringify(item.arguments, null, 2);
+  const argumentGroup = document.createElement("div");
+  argumentGroup.setAttribute("role", "group");
+  argumentGroup.setAttribute("aria-label", "Redacted tool arguments");
+  argumentGroup.append(args);
+  const actions = document.createElement("div");
+  actions.className = "approval-actions";
+  const approve = document.createElement("button");
+  approve.type = "button";
+  approve.textContent = "Approve";
+  approve.setAttribute("aria-label", `Approve ${item.tool} call`);
+  approve.addEventListener("click", () => resolveApproval(item.id, true));
+  const deny = document.createElement("button");
+  deny.type = "button";
+  deny.textContent = "Deny";
+  deny.setAttribute("aria-label", `Deny ${item.tool} call`);
+  deny.addEventListener("click", () => resolveApproval(item.id, false));
+  actions.append(approve, deny);
+  block.append(tool, argumentGroup, actions);
+  return block;
+}
+
+function updateApprovalCard(block, item) {
+  const tool = block.querySelector(".approval-tool");
+  if (tool.textContent !== item.tool) {
+    tool.textContent = item.tool;
+  }
+  const args = block.querySelector("pre");
+  const serializedArguments = JSON.stringify(item.arguments, null, 2);
+  if (args.textContent !== serializedArguments) {
+    args.textContent = serializedArguments;
+  }
+  const approve = block.querySelector(".approval-actions button:first-child");
+  const deny = block.querySelector(".approval-actions button:last-child");
+  const approveLabel = `Approve ${item.tool} call`;
+  const denyLabel = `Deny ${item.tool} call`;
+  if (approve.getAttribute("aria-label") !== approveLabel) {
+    approve.setAttribute("aria-label", approveLabel);
+  }
+  if (deny.getAttribute("aria-label") !== denyLabel) {
+    deny.setAttribute("aria-label", denyLabel);
+  }
+}
+
+function announceNewApprovals(items) {
   for (const item of items) {
-    const block = document.createElement("div");
-    block.className = "approval";
-    const tool = document.createElement("div");
-    tool.className = "approval-tool";
-    tool.textContent = item.tool || "tool";
-    const args = document.createElement("pre");
-    args.textContent = JSON.stringify(item.arguments || {}, null, 2);
-    const actions = document.createElement("div");
-    actions.className = "approval-actions";
-    const approve = document.createElement("button");
-    approve.type = "button";
-    approve.textContent = "Approve";
-    approve.addEventListener("click", () => resolveApproval(item.id, true));
-    const deny = document.createElement("button");
-    deny.type = "button";
-    deny.textContent = "Deny";
-    deny.addEventListener("click", () => resolveApproval(item.id, false));
-    actions.append(approve, deny);
-    block.append(tool, args, actions);
-    els.approvals.append(block);
+    const entry = document.createElement("p");
+    entry.dataset.approvalId = item.id;
+    entry.textContent =
+      "A tool call needs review. Open Review approvals to inspect its arguments before deciding.";
+    els.approvalAnnouncements.append(entry);
   }
+}
+
+function announceApprovalsUnavailable() {
+  const entry = document.createElement("p");
+  entry.textContent = "Remote approvals are unavailable.";
+  els.approvalAnnouncements.append(entry);
+}
+
+function reconcileApprovalSnapshot(snapshot) {
+  const existing = new Map(
+    Array.from(els.approvals.querySelectorAll(".approval[data-approval-id]"))
+      .map((card) => [card.dataset.approvalId, card]),
+  );
+  const nextIds = new Set(snapshot.items.map((item) => item.id));
+  const activeElement = document.activeElement;
+  const focusedCard =
+    activeElement instanceof HTMLElement
+      ? activeElement.closest(".approval[data-approval-id]")
+      : null;
+  const focusedId = focusedCard?.dataset.approvalId;
+  const focusedReviewControlWillHide =
+    activeElement === els.reviewApprovals &&
+    (!snapshot.enabled || nextIds.size === 0);
+  const focusWasRemoved =
+    (focusedId !== undefined && !nextIds.has(focusedId)) ||
+    focusedReviewControlWillHide;
+  const becameUnavailable = !snapshot.enabled && approvalsEnabled !== false;
+  const arrivals = [];
+
+  for (const item of snapshot.items) {
+    const current = existing.get(item.id);
+    if (current) {
+      updateApprovalCard(current, item);
+      continue;
+    }
+    const card = createApprovalCard(item);
+    els.approvals.insertBefore(card, els.approvalEmpty);
+    existing.set(item.id, card);
+    arrivals.push(item);
+  }
+
+  for (const [id, card] of existing) {
+    if (nextIds.has(id)) continue;
+    card.remove();
+    for (const entry of els.approvalAnnouncements.querySelectorAll(
+      "[data-approval-id]",
+    )) {
+      if (entry.dataset.approvalId === id) entry.remove();
+    }
+  }
+
+  approvalsEnabled = snapshot.enabled;
+  els.approvalEmpty.hidden = nextIds.size > 0;
+  els.approvalEmpty.textContent = approvalsEnabled
+    ? "No pending approvals."
+    : "Remote approvals are unavailable.";
+  renderApprovalSummary(nextIds.size);
+  announceNewApprovals(arrivals);
+  if (becameUnavailable) {
+    announceApprovalsUnavailable();
+  }
+
+  if (focusWasRemoved) {
+    els.approvalReview.focus();
+  }
+}
+
+function clearApprovalView() {
+  for (const card of els.approvals.querySelectorAll(".approval")) {
+    card.remove();
+  }
+  els.approvalAnnouncements.replaceChildren();
+  els.approvalEmpty.hidden = false;
+  els.approvalEmpty.textContent = "No pending approvals.";
+  approvalsEnabled = null;
+  renderApprovalSummary(0);
+}
+
+function openApprovalQueue() {
+  els.approvalReview.scrollIntoView({block: "start"});
+  els.approvalReview.focus({preventScroll: true});
 }
 
 async function resolveApproval(id, approved) {
@@ -288,11 +460,16 @@ async function resolveApproval(id, approved) {
 async function approvalLoop(generation) {
   while (connected && generation === approvalGeneration) {
     try {
-      const payload = await api("/v1/approvals?wait_seconds=25");
+      // A known pending decision must be rechecked promptly after resolution;
+      // a long poll for an empty queue can otherwise show stale actions for 25s.
+      const pendingVisible = els.approvals.querySelector(".approval") !== null;
+      const payload = await api(
+        `/v1/approvals?wait_seconds=${pendingVisible ? 0 : 25}`,
+      );
       if (generation !== approvalGeneration) return;
-      const approvals = Array.isArray(payload.approvals) ? payload.approvals : [];
-      renderApprovals(approvals);
-      if (approvals.length > 0) {
+      const snapshot = readApprovalSnapshot(payload);
+      reconcileApprovalSnapshot(snapshot);
+      if (snapshot.items.length > 0) {
         await new Promise((resolve) => window.setTimeout(resolve, 2000));
       }
     } catch (error) {
@@ -458,6 +635,7 @@ async function connect() {
 }
 
 els.connect.addEventListener("click", () => void connect());
+els.reviewApprovals.addEventListener("click", () => openApprovalQueue());
 els.send.addEventListener("click", () => void submit());
 els.stop.addEventListener("click", () => {
   if (turnController !== null) {
