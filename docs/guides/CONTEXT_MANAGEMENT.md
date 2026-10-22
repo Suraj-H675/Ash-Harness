@@ -69,14 +69,20 @@ The full transcript remains in SQLite. Compaction changes only the provider
 request and the working `context_summary`:
 
 1. Bound stale tool outputs while retaining their call identity.
-2. Keep the configured recent message tail and complete assistant/tool pairs.
-3. Extract user requirements, assistant decisions and progress, referenced
-   paths, tool actions, recent tool outputs, and compacted events into bounded,
-   labeled sections. Tool outputs remain untrusted evidence.
-4. Preserve both the beginning and end of an earlier summary.
-5. Redact secrets before persisting the updated summary.
-6. Drop older complete entries only when the retained tail still exceeds the
-   hard input limit.
+2. Leave tool output from the active turn intact. Keep assistant tool calls
+   with their matching results when moving older history into the digest.
+3. Extract user requirements and explicit earlier user constraints, assistant
+   decisions and progress, referenced paths, tool actions, recent tool outputs,
+   and compacted events into bounded, labeled sections. Only user-role text
+   contributes to historical user constraints; tool outputs remain untrusted
+   evidence.
+4. Fit the digest together with the retained tail under the provider input
+   limit. Ash may move additional oldest, safely removable history into the
+   digest to keep it visible in the request. A required digest that cannot fit
+   with the protected current turn stops the request before Ash persists a new
+   summary or advances the durable history offset.
+5. Preserve both the beginning and end of an earlier summary.
+6. Redact secrets before persisting the updated summary.
 
 The current summary is deterministic and extractive. Ash does not claim a
 model-assisted compactor yet. A future model-assisted path must be optional,

@@ -28,7 +28,7 @@ from ash.tools.base import (
     ToolResult,
 )
 from ash.config import AshConfig
-from ash.context.history import ContextBudgetExceededError
+from ash.context.history import ContextBudgetExceededError, RequestTokenBudget
 from ash.context.turn import TurnContext
 from ash.core.session import (
     Message,
@@ -3997,6 +3997,161 @@ async def test_session_resume_loads_only_persisted_runtime_history_window(tmp_pa
     )
 
 
+def test_compaction_checkpoint_is_visible_in_provider_request_and_resume(
+    tmp_path: Path,
+) -> None:
+    from ash.providers.openai import prepare_openai_messages
+
+    class WordCountingProvider(ProviderABC):
+        model_name = "word-counting-compaction"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(str(text).split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            yield StreamChunk(content="verified", is_done=True, stop_reason="stop")
+
+    config = AshConfig(
+        model="custom/word-counting-compaction",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        max_context_tokens=120,
+        max_completion_tokens=20,
+        context_recent_messages=3,
+    )
+    provider = WordCountingProvider()
+    store = SessionStore(tmp_path / "provider-visible-compaction.db")
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(project_root=tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={},
+        system_prompt="system",
+        config=config,
+    )
+    session = store.create_session(str(tmp_path), model=config.model)
+    loop.current_session = session
+    timestamp = datetime.now(timezone.utc)
+
+    for index in range(8):
+        message = Message(
+            role="user",
+            content=f"older requirement {index} preserve design decision",
+            timestamp=timestamp,
+        )
+        store.save_message(session.session_id, message)
+        session.messages.append(message)
+    for message in (
+        Message(
+            role="assistant",
+            content="I will inspect the requested files.",
+            timestamp=timestamp,
+            metadata={
+                "tool_calls": [
+                    {
+                        "call_id": "call-read-1",
+                        "name": "read_file",
+                        "arguments": {"file_path": "src/ash/core/loop.py"},
+                    }
+                ]
+            },
+        ),
+        Message(
+            role="tool",
+            content="tool evidence " * 21,
+            timestamp=timestamp,
+            metadata={"call_id": "call-read-1"},
+        ),
+    ):
+        store.save_message(session.session_id, message)
+        session.messages.append(message)
+
+    current_user = Message(
+        role="user",
+        content="Current instruction: retain the approved API and verify resume.",
+        timestamp=timestamp,
+    )
+    store.save_message(session.session_id, current_user)
+    session.messages.append(current_user)
+    loop._turn_running = True
+    loop._active_turn_user_message = current_user
+    budget = RequestTokenBudget(combined_limit=240, input_limit=220, response_limit=20)
+
+    first_request = loop._build_messages(
+        session,
+        request_budget=budget,
+        force_compaction=True,
+    )
+    first_wire_messages = prepare_openai_messages(first_request)
+    first_summary = next(
+        (
+            str(message["content"])
+            for message in first_wire_messages
+            if message.get("role") == "system"
+            and str(message.get("content", "")).startswith(
+                "## Compacted conversation summary"
+            )
+        ),
+        "",
+    )
+
+    assert first_summary
+    assert session.context_summary_message_count == session.resident_message_offset
+    assert session.context_summary_message_count > 0
+    assert session.messages[-1] is current_user
+    assert loop._last_context_tokens <= budget.input_limit
+
+    loop._turn_running = False
+    loop._active_turn_user_message = None
+    resumed = store.load_session(session.session_id, runtime_window=True)
+    resumed_request = loop._build_messages(resumed, request_budget=budget)
+    resumed_wire_messages = prepare_openai_messages(resumed_request)
+    resumed_summary = next(
+        (
+            str(message["content"])
+            for message in resumed_wire_messages
+            if message.get("role") == "system"
+            and str(message.get("content", "")).startswith(
+                "## Compacted conversation summary"
+            )
+        ),
+        "",
+    )
+
+    assert resumed_summary
+    assert resumed_summary != "## Compacted conversation summary\n"
+    assert loop._last_context_tokens <= budget.input_limit
+    assert any(
+        message.get("role") == "user"
+        and str(message.get("content", "")).startswith("Current instruction:")
+        for message in resumed_request
+    )
+
+    prior_summary = resumed.context_summary
+    prior_offset = resumed.context_summary_message_count
+    prior_messages = list(resumed.messages)
+    too_small = RequestTokenBudget(
+        combined_limit=34,
+        input_limit=14,
+        response_limit=20,
+    )
+    with pytest.raises(ContextBudgetExceededError):
+        loop._build_messages(resumed, request_budget=too_small)
+
+    assert resumed.context_summary == prior_summary
+    assert resumed.context_summary_message_count == prior_offset
+    assert resumed.messages == prior_messages
+    durable_after_error = store.load_session(session.session_id, runtime_window=True)
+    assert durable_after_error.context_summary == prior_summary
+    assert durable_after_error.context_summary_message_count == prior_offset
+    assert durable_after_error.messages == prior_messages
+
+
 @pytest.mark.asyncio
 async def test_oversized_current_request_fails_before_provider_dispatch(tmp_path) -> None:
     class NeverCalledProvider(ProviderABC):
@@ -6045,7 +6200,7 @@ async def test_context_budget_report_enforces_sections(tmp_path):
     session.messages.append(
         Message(
             role="user",
-            content="history " * 200,
+            content="short prior history",
             timestamp=datetime.now(timezone.utc),
         )
     )
@@ -6070,6 +6225,22 @@ async def test_context_budget_report_enforces_sections(tmp_path):
     assert dict(fragment.metadata)["untrusted_content_policy"] == (
         "data_not_instructions"
     )
+
+    # With the same already-full system allocations, older history cannot be
+    # checkpointed safely if even a usable digest will not fit.
+    prior_summary = session.context_summary
+    prior_offset = session.context_summary_message_count
+    session.messages.append(
+        Message(
+            role="user",
+            content="history " * 200,
+            timestamp=datetime.now(timezone.utc),
+        )
+    )
+    with pytest.raises(ContextBudgetExceededError):
+        loop._build_messages(session)
+    assert session.context_summary == prior_summary
+    assert session.context_summary_message_count == prior_offset
 
 
 @pytest.mark.asyncio

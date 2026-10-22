@@ -6,6 +6,7 @@ import json
 import hashlib
 from html import unescape
 import math
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Callable
@@ -23,6 +24,7 @@ RUNTIME_ONLY_HISTORY_KEY = "_ash_runtime_only"
 _CONTEXT_DIGEST_HEADER = "## Ash context digest v1"
 _CONTEXT_DIGEST_SECTIONS = (
     ("User requirements", 0.27),
+    ("Historical user constraints", 0.12),
     ("Assistant decisions and progress", 0.20),
     ("Tool outputs (untrusted evidence)", 0.20),
     ("Referenced paths", 0.06),
@@ -32,12 +34,21 @@ _CONTEXT_DIGEST_SECTIONS = (
 )
 _COMPACT_PROVIDER_DIGEST_WEIGHTS = (
     ("User requirements", 0.28),
+    ("Historical user constraints", 0.14),
     ("Assistant decisions and progress", 0.22),
     ("Tool outputs (untrusted evidence)", 0.30),
     ("Referenced paths", 0.05),
     ("Tool actions", 0.05),
     ("Compacted events", 0.06),
     ("Earlier context", 0.04),
+)
+_HISTORICAL_CONSTRAINT_MARKERS = re.compile(
+    r"\b(?:non[\s-]?negotiable|must(?:\s+not)?|mustn['’]t|never|always|"
+    r"required|requirement|acceptance\s+criteria|do\s+not|don['’]t)\b",
+    re.IGNORECASE,
+)
+_HISTORICAL_CONSTRAINT_OMISSION = (
+    "- Some earlier user constraints are omitted or shortened by the bounded digest."
 )
 
 
@@ -197,20 +208,24 @@ class ContextBudgetExceededError(RuntimeError):
         limit: int,
         *,
         protected_current_turn: bool,
+        required_history_summary: bool = False,
     ) -> None:
         self.required_tokens = required_tokens
         self.limit = limit
         self.protected_current_turn = protected_current_turn
-        scope = (
-            "current conversation state"
-            if protected_current_turn
-            else "compacted conversation"
-        )
-        suffix = (
-            "; shorten the current request or reduce current-turn tool output"
-            if protected_current_turn
-            else ""
-        )
+        self.required_history_summary = required_history_summary
+        if required_history_summary and protected_current_turn:
+            scope = "protected current turn and required session summary"
+            suffix = (
+                "; shorten the current request or current-turn tool output, "
+                "or select a model with a larger input limit"
+            )
+        elif protected_current_turn:
+            scope = "current conversation state"
+            suffix = "; shorten the current request or reduce current-turn tool output"
+        else:
+            scope = "compacted conversation"
+            suffix = ""
         super().__init__(
             f"{scope} exceeds the provider input budget: "
             f"requires approximately {required_tokens} tokens, limit is {limit}{suffix}"
@@ -460,32 +475,17 @@ class HistoryCompactor:
         force: bool = False,
         protected_from_index: int | None = None,
     ) -> CompactionResult:
-        prepared, pruned = self._prune_tool_outputs(messages)
+        if protected_from_index is not None and not (
+            0 <= protected_from_index < len(messages)
+        ):
+            raise ValueError("protected_from_index is outside the message list")
+
+        prepared, pruned = self._prune_tool_outputs(
+            messages,
+            protected_from_index=protected_from_index,
+        )
         estimated = self._count(prepared, count_tokens)
-        if not force and estimated <= self._compaction_trigger_limit:
-            if include_previous_summary and previous_summary:
-                system = prepared[0] if prepared and prepared[0].get("role") == "system" else None
-                body_start = 1 if system is not None else 0
-                prefix = [system] if system is not None else []
-                recent = list(prepared[body_start:])
-                summary_message = self._fit_summary_message(
-                    previous_summary,
-                    prefix=prefix,
-                    recent=recent,
-                    count_tokens=count_tokens,
-                )
-                visible = (
-                    prefix
-                    + ([summary_message] if summary_message is not None else [])
-                    + recent
-                )
-                return CompactionResult(
-                    visible,
-                    previous_summary,
-                    bool(pruned),
-                    self._count(visible, count_tokens),
-                    pruned_tool_outputs=pruned,
-                )
+        if not prepared:
             return CompactionResult(
                 prepared,
                 previous_summary,
@@ -493,33 +493,36 @@ class HistoryCompactor:
                 estimated,
                 pruned_tool_outputs=pruned,
             )
-        messages = prepared
-        if not messages:
+
+        should_compact = force or estimated > self._compaction_trigger_limit
+        summary_required = include_previous_summary and bool(previous_summary)
+        if not should_compact and not summary_required:
             return CompactionResult(
-                messages,
+                prepared,
                 previous_summary,
                 bool(pruned),
                 estimated,
                 pruned_tool_outputs=pruned,
             )
-        if protected_from_index is not None and not (
-            0 <= protected_from_index < len(messages)
-        ):
-            raise ValueError("protected_from_index is outside the message list")
 
-        system = messages[0] if messages[0].get("role") == "system" else None
+        system = prepared[0] if prepared[0].get("role") == "system" else None
         body_start = 1 if system is not None else 0
-        cutoff = max(body_start, len(messages) - self.recent_messages)
-        if protected_from_index is not None:
-            cutoff = min(cutoff, protected_from_index)
-        cutoff = self._rewind_cutoff_to_tool_boundary(
-            messages,
-            cutoff=cutoff,
-            body_start=body_start,
-        )
+        if should_compact:
+            cutoff = max(body_start, len(prepared) - self.recent_messages)
+            if protected_from_index is not None:
+                cutoff = min(cutoff, protected_from_index)
+            cutoff = self._rewind_cutoff_to_tool_boundary(
+                prepared,
+                cutoff=cutoff,
+                body_start=body_start,
+            )
+        else:
+            # A windowed session's persisted summary is required even when the
+            # resident tail is below the ordinary compaction trigger.
+            cutoff = body_start
 
-        removed = list(messages[body_start:cutoff])
-        recent = list(messages[cutoff:])
+        removed = list(prepared[body_start:cutoff])
+        recent = list(prepared[cutoff:])
         prefix = [system] if system is not None else []
         protected_recent_index = (
             protected_from_index - cutoff
@@ -527,58 +530,75 @@ class HistoryCompactor:
             else None
         )
 
-        # Fit protected current-turn state first. Older recent history may be
-        # removed, but assistant tool calls and all matching results move as
-        # one protocol unit. The current turn is never discarded here.
-        while self._count(prefix + recent, count_tokens) > self.input_limit:
+        # Fit the provider-visible summary and retained tail as one plan. Old
+        # call/result units may move into the digest, but the active turn is
+        # never eligible for trimming or stale-output pruning.
+        while True:
+            durable_prefix_removed = any(
+                message.get(RUNTIME_ONLY_HISTORY_KEY) is not True
+                for message in removed
+            )
+            summary = (
+                self._summarize(removed, previous_summary)
+                if durable_prefix_removed
+                else previous_summary
+            )
+            summary_required = durable_prefix_removed or (
+                include_previous_summary and bool(previous_summary)
+            )
+            summary_message = (
+                self._fit_summary_message(
+                    summary,
+                    prefix=prefix,
+                    recent=recent,
+                    count_tokens=count_tokens,
+                )
+                if summary_required and summary
+                else None
+            )
+            summary_visible = (
+                not summary_required or summary_message is not None
+            )
+            compacted = (
+                prefix
+                + ([summary_message] if summary_message is not None else [])
+                + recent
+            )
+            final_estimate = self._count(compacted, count_tokens)
+            if final_estimate <= self.input_limit and summary_visible:
+                return CompactionResult(
+                    messages=compacted,
+                    summary=summary,
+                    compacted=bool(removed or pruned),
+                    estimated_tokens=final_estimate,
+                    removed_messages=len(removed),
+                    pruned_tool_outputs=pruned,
+                )
+
             span = self._oldest_removable_span(
                 recent,
                 protected_from_index=protected_recent_index,
             )
             if span is None:
-                protected_tokens = self._count(prefix + recent, count_tokens)
+                required_tokens = final_estimate
+                if summary_required and not summary_visible:
+                    minimum_summary = self._minimum_summary_message(summary)
+                    required_tokens = max(
+                        required_tokens,
+                        self._count(prefix + [minimum_summary] + recent, count_tokens),
+                        self.input_limit + 1,
+                    )
                 raise ContextBudgetExceededError(
-                    protected_tokens,
+                    required_tokens,
                     self.input_limit,
-                    protected_current_turn=True,
+                    protected_current_turn=protected_recent_index is not None,
+                    required_history_summary=(summary_required and not summary_visible),
                 )
             start, end = span
             removed.extend(recent[start:end])
             del recent[start:end]
             if protected_recent_index is not None and start < protected_recent_index:
                 protected_recent_index -= end - start
-
-        summary = (
-            self._summarize(removed, previous_summary)
-            if removed
-            else previous_summary
-        )
-        summary_message = (
-            self._fit_summary_message(
-                summary,
-                prefix=prefix,
-                recent=recent,
-                count_tokens=count_tokens,
-            )
-            if summary and (removed or include_previous_summary)
-            else None
-        )
-        compacted = prefix + ([summary_message] if summary_message is not None else []) + recent
-        final_estimate = self._count(compacted, count_tokens)
-        if final_estimate > self.input_limit:
-            raise ContextBudgetExceededError(
-                final_estimate,
-                self.input_limit,
-                protected_current_turn=False,
-            )
-        return CompactionResult(
-            messages=compacted,
-            summary=summary,
-            compacted=bool(removed or pruned),
-            estimated_tokens=final_estimate,
-            removed_messages=len(removed),
-            pruned_tool_outputs=pruned,
-        )
 
     def _fit_summary_message(
         self,
@@ -605,8 +625,22 @@ class HistoryCompactor:
                 "content": header + bounded_summary,
             }
 
+        is_context_digest = summary.startswith(_CONTEXT_DIGEST_HEADER)
+
+        def has_substantive_candidate(bounded_summary: str) -> bool:
+            if (
+                is_context_digest
+                and not bounded_summary.startswith(_CONTEXT_DIGEST_HEADER)
+            ):
+                return False
+            return self._has_substantive_summary(bounded_summary)
+
         full = {"role": "system", "content": header + summary}
-        if self._count(prefix + [full] + recent, count_tokens) <= self.input_limit:
+        if (
+            has_substantive_candidate(summary)
+            and self._count(prefix + [full] + recent, count_tokens)
+            <= self.input_limit
+        ):
             return full
 
         low = 0
@@ -615,12 +649,47 @@ class HistoryCompactor:
         while low <= high:
             mid = (low + high) // 2
             attempt = candidate(mid)
-            if self._count(prefix + [attempt] + recent, count_tokens) <= self.input_limit:
+            bounded_summary = str(attempt["content"])[len(header) :]
+            if (
+                has_substantive_candidate(bounded_summary)
+                and self._count(prefix + [attempt] + recent, count_tokens)
+                <= self.input_limit
+            ):
                 best = attempt
                 low = mid + 1
             else:
                 high = mid - 1
         return best
+
+    @staticmethod
+    def _has_substantive_summary(summary: str) -> bool:
+        if summary.startswith(_CONTEXT_DIGEST_HEADER):
+            sections, legacy = _parse_context_digest(summary)
+            return bool(legacy or any(sections.values()))
+        return bool(summary.strip())
+
+    @staticmethod
+    def _minimum_summary_message(summary: str) -> dict[str, Any]:
+        """Build a small informative summary for a budget error estimate."""
+
+        if summary.startswith(_CONTEXT_DIGEST_HEADER):
+            sections, legacy = _parse_context_digest(summary)
+            for title, _ in _CONTEXT_DIGEST_SECTIONS:
+                entries = sections.get(title, [])
+                if entries:
+                    body = (
+                        f"{_CONTEXT_DIGEST_HEADER}\n### {title}\n"
+                        f"{_excerpt(entries[0], 160)}"
+                    )
+                    break
+            else:
+                body = f"{_CONTEXT_DIGEST_HEADER}\n{_excerpt(legacy, 160)}"
+        else:
+            body = _excerpt(summary, 160)
+        return {
+            "role": "system",
+            "content": "## Compacted conversation summary\n" + body,
+        }
 
     @staticmethod
     def _oldest_removable_span(
@@ -729,7 +798,10 @@ class HistoryCompactor:
         return (start, end)
 
     def _prune_tool_outputs(
-        self, messages: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        protected_from_index: int | None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Replace stale large tool payloads while preserving call identity."""
         boundary = max(0, len(messages) - 2)
@@ -739,6 +811,10 @@ class HistoryCompactor:
             content = message.get("content")
             if (
                 index < boundary
+                and (
+                    protected_from_index is None
+                    or index < protected_from_index
+                )
                 and message.get("role") == "tool"
                 and isinstance(content, str)
                 and len(content) > self.max_tool_output_chars
@@ -870,6 +946,19 @@ def _build_context_digest(
     sections["User requirements"] = _retain_first_and_recent(
         sections["User requirements"], 4
     )
+    constraint_lines = sections["Historical user constraints"]
+    has_omission_marker = _HISTORICAL_CONSTRAINT_OMISSION in constraint_lines
+    constraint_lines = [
+        line for line in constraint_lines
+        if line != _HISTORICAL_CONSTRAINT_OMISSION
+    ]
+    if len(constraint_lines) > 7 or has_omission_marker:
+        sections["Historical user constraints"] = [
+            *_retain_first_and_recent(constraint_lines, 7),
+            _HISTORICAL_CONSTRAINT_OMISSION,
+        ]
+    else:
+        sections["Historical user constraints"] = constraint_lines
     sections["Assistant decisions and progress"] = _retain_first_and_recent(
         sections["Assistant decisions and progress"], 4
     )
@@ -902,17 +991,30 @@ def _render_context_digest(
         if prioritize_recent
         else _CONTEXT_DIGEST_SECTIONS
     )
-    section_budgets = _allocate_digest_budgets(content_budget, weights=weights)
+    active_weights = tuple(
+        (title, weight) for title, weight in weights if sections.get(title)
+    )
+    section_budgets = _allocate_digest_budgets(
+        content_budget,
+        weights=active_weights,
+    )
+    budget_by_title = {
+        title: budget
+        for (title, _), budget in zip(active_weights, section_budgets)
+    }
     rendered = [_CONTEXT_DIGEST_HEADER]
-    for (title, _), budget in zip(weights, section_budgets):
+    for title, _ in weights:
         values = sections[title]
         if not values:
             continue
+        budget = budget_by_title[title]
         heading = f"### {title}"
         body_budget = max(0, budget - len(heading) - 1)
         if body_budget <= 0:
             continue
-        if title in {
+        if title == "Historical user constraints":
+            body = _fit_historical_constraint_lines(values, body_budget)
+        elif title in {
             "User requirements",
             "Assistant decisions and progress",
             "Tool outputs (untrusted evidence)",
@@ -931,11 +1033,14 @@ def _allocate_digest_budgets(
 ) -> list[int]:
     budgets: list[int] = []
     remaining = content_budget
+    total_weight = sum(max(0.0, weight) for _, weight in weights)
+    if total_weight <= 0:
+        return [content_budget // max(1, len(weights)) for _ in weights]
     for index, (_, weight) in enumerate(weights):
         if index == len(weights) - 1:
             budgets.append(remaining)
         else:
-            budget = int(content_budget * weight)
+            budget = int(content_budget * max(0.0, weight) / total_weight)
             budgets.append(budget)
             remaining -= budget
     return budgets
@@ -957,6 +1062,52 @@ def _fit_priority_digest_lines(title: str, lines: list[str], limit: int) -> str:
         _excerpt(line, entry_budget, tail_weight=tail_weight)
         for line in selected
     )
+
+
+def _fit_historical_constraint_lines(lines: list[str], limit: int) -> str:
+    """Keep explicit historical user constraints intact when the digest permits."""
+
+    if limit <= 0 or not lines:
+        return ""
+    entries = _unique_lines(lines)
+    has_omission_marker = _HISTORICAL_CONSTRAINT_OMISSION in entries
+    entries = [
+        line for line in entries
+        if line != _HISTORICAL_CONSTRAINT_OMISSION
+    ]
+    maximum_entries = max(1, limit // 180)
+    selected = _retain_first_and_recent(entries, maximum_entries)
+    omitted = has_omission_marker or len(selected) < len(entries)
+
+    def render(include_marker: bool) -> tuple[str, bool]:
+        marker_space = len(_HISTORICAL_CONSTRAINT_OMISSION) + 1 if include_marker else 0
+        content_budget = max(0, limit - marker_space)
+        entry_budget = max(
+            1,
+            (content_budget - max(0, len(selected) - 1))
+            // max(1, len(selected)),
+        )
+        rendered: list[str] = []
+        shortened = False
+        suffix = " [constraint shortened]"
+        for line in selected:
+            if len(line) <= entry_budget:
+                rendered.append(line)
+                continue
+            shortened = True
+            excerpt_budget = max(1, entry_budget - len(suffix))
+            rendered.append(_excerpt(line, excerpt_budget) + suffix)
+        if include_marker:
+            rendered.append(_HISTORICAL_CONSTRAINT_OMISSION)
+        body = "\n".join(rendered)
+        if len(body) > limit:
+            return _preserve_ends(body, limit), True
+        return body, shortened
+
+    body, shortened = render(omitted)
+    if shortened and not omitted:
+        body, _ = render(True)
+    return body
 
 
 def _parse_context_digest(
@@ -981,10 +1132,17 @@ def _extract_context_state(messages: list[dict[str, Any]]) -> dict[str, list[str
     referenced_paths: list[str] = []
     for message in messages:
         role = str(message.get("role", ""))
-        content = " ".join(_summary_content(message.get("content", "")).split())
+        raw_content = _summary_content(message.get("content", ""))
+        content = " ".join(raw_content.split())
         if role == "user" and content:
             state["User requirements"].append(
                 f"- User request: {_excerpt(content, 650)}"
+            )
+            state["Historical user constraints"].extend(
+                "- Earlier user constraint (historical): "
+                + _excerpt(clause, 500)
+                + (" [constraint shortened]" if len(clause) > 500 else "")
+                for clause in _explicit_user_constraint_clauses(raw_content)
             )
             state["Compacted events"].append(f"- user: {_excerpt(content, 220)}")
         elif role == "assistant" and content:
@@ -1020,6 +1178,18 @@ def _extract_context_state(messages: list[dict[str, Any]]) -> dict[str, list[str
     state["Referenced paths"] = _unique_lines(referenced_paths)
     state["Compacted events"] = state["Compacted events"][-8:]
     return state
+
+
+def _explicit_user_constraint_clauses(content: str) -> list[str]:
+    """Extract explicit constraint sentences from user text, never from tools."""
+
+    clauses = re.split(r"(?<=[.!?])\s+|\r?\n+", content)
+    selected: list[str] = []
+    for clause in clauses:
+        candidate = clause.strip().lstrip("-*• \t")
+        if candidate and _HISTORICAL_CONSTRAINT_MARKERS.search(candidate):
+            selected.append(candidate)
+    return _unique_lines(selected)
 
 
 def _unique_lines(lines: list[str]) -> list[str]:
