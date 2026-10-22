@@ -71,8 +71,14 @@ internals. See [Plugin API v1](../reference/PLUGIN_API_V1.md).
 
 ### Instruction skills
 
-Skills follow the Agent Skills `SKILL.md` format and are loaded progressively.
-The directory name must match the skill name:
+Skills use the Agent Skills `SKILL.md` package format and load progressively.
+Ash discovers direct skills in these roots:
+
+- User: `~/.ash/skills/` and `~/.agents/skills/`.
+- Project: `<workspace>/.ash/skills/` and `<workspace>/.agents/skills/`.
+
+Trust the workspace with `ash trust add` to enable project roots. The directory
+name must match the skill name:
 
 ```markdown
 ---
@@ -83,9 +89,12 @@ description: Review a change for correctness and regressions
 Review the requested change. Prefer concrete repository evidence.
 ```
 
-Plugin skills are exposed as `plugin-name:skill-name`. Standalone user skills
-live under `~/.ash/skills/`; trusted project skills live under
-`.ash/skills/`.
+Plugin skills are exposed as `plugin-name:skill-name`. User skills from both
+roots are available in every workspace. Project skills from both roots are
+available only in a trusted workspace. Use `/skills [query]` to list matching
+skills. Ash gives the model each skill's name and description, then loads its
+instructions when the model calls `activate_skill`. Run `/reload-plugins` after
+adding a skill to a live session.
 
 Executable Python/Markdown legacy skills are not part of the normal extension
 workflow. They remain an explicit unsafe compatibility API.

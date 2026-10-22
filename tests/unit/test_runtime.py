@@ -1200,6 +1200,106 @@ def test_runtime_activates_nested_instructions_after_reading_scoped_file(
     assert "SIBLING_WEB_RULE_MUST_NOT_LOAD_44D2" not in provider.system_prompts[1]
 
 
+def test_runtime_activates_shared_agent_skill_from_natural_language(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SharedSkillProvider(ProviderABC):
+        model_name = "shared-agent-skill-model"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.messages: list[list[dict[str, object]]] = []
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            self.messages.append(messages)
+            if self.calls == 1:
+                yield StreamChunk(
+                    native_tool_calls=[
+                        {
+                            "id": "activate-portable-review",
+                            "name": "activate_skill",
+                            "arguments": {"name": "portable-review"},
+                        }
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk(
+                    content="Applied the portable review guidance.",
+                    is_done=True,
+                )
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    skill = home / ".agents" / "skills" / "portable-review"
+    skill.mkdir(parents=True)
+    resources = skill / "references"
+    resources.mkdir()
+    (skill / "SKILL.md").write_text(
+        "---\nname: portable-review\ndescription: Review changes for regressions\n"
+        "---\nSHARED_AGENT_SKILL_BODY_85D2\n",
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside-secret.md"
+    outside.write_text("SHARED_SKILL_OUTSIDE_SECRET", encoding="utf-8")
+    linked_resource = resources / "outside.md"
+    try:
+        linked_resource.symlink_to(outside)
+    except OSError:
+        linked_resource = None
+
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workspace)
+    provider = SharedSkillProvider()
+    config = AshConfig(
+        model="ollama/shared-agent-skill-model",
+        workspace_root=workspace,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+        automation_enabled=False,
+        lsp_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=provider,
+        workspace_trusted=False,
+        run_maintenance=False,
+    )
+
+    async def exercise() -> None:
+        response = await runtime.loop.run_turn(
+            "Review this change using the portable regression checklist."
+        )
+        assert response == "Applied the portable review guidance."
+        read_resource = runtime.loop.tools["read_skill_resource"]
+        if linked_resource is not None:
+            result = await read_resource.run(
+                name="portable-review",
+                path="references/outside.md",
+            )
+            assert result.success is False
+            assert "SHARED_SKILL_OUTSIDE_SECRET" not in result.output
+        await runtime.loop.aclose()
+
+    asyncio.run(exercise())
+
+    assert provider.calls == 2
+    assert "portable-review" in str(provider.messages[0][0]["content"])
+    assert "SHARED_AGENT_SKILL_BODY_85D2" not in str(
+        provider.messages[0][0]["content"]
+    )
+    assert "SHARED_AGENT_SKILL_BODY_85D2" in str(provider.messages[1])
+
+
 def test_runtime_combines_parallel_nested_instruction_scopes_then_narrows(
     tmp_path, monkeypatch
 ) -> None:

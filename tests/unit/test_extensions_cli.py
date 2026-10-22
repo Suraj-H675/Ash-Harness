@@ -107,6 +107,84 @@ def test_extensions_cli_respects_project_trust(
     assert trusted["skills"][0]["name"] == "project-review"
 
 
+def test_extensions_cli_discovers_shared_agent_skills_with_workspace_trust(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "repo"
+    nested = workspace / "packages" / "api"
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    nested.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(nested)
+
+    _write_skill(home / ".ash" / "skills", "shared-helper", "Ash home skill")
+    _write_skill(
+        home / ".agents" / "skills", "shared-helper", "Shared duplicate"
+    )
+    _write_skill(home / ".agents" / "skills", "portable-user", "User skill")
+    _write_skill(
+        workspace / ".ash" / "skills", "ash-project", "Ash project skill"
+    )
+    _write_skill(
+        workspace / ".agents" / "skills", "portable-project", "Project skill"
+    )
+    outside_skills = tmp_path / "outside-skills"
+    _write_skill(outside_skills, "linked-project", "External linked skill")
+    linked_skill = workspace / ".agents" / "skills" / "linked-project"
+    try:
+        linked_skill.symlink_to(
+            outside_skills / "linked-project",
+            target_is_directory=True,
+        )
+    except OSError:
+        linked_skill = None
+    malformed = home / ".agents" / "skills" / "malformed"
+    malformed.mkdir(parents=True)
+    (malformed / "SKILL.md").write_text(
+        "---\nname: malformed\ndescription: [invalid\n---\n",
+        encoding="utf-8",
+    )
+
+    assert main(["extensions", "skills", "--json"]) == 0
+    untrusted = json.loads(capsys.readouterr().out)
+    assert untrusted["project_trusted"] is False
+    assert {skill["name"] for skill in untrusted["skills"]} == {
+        "shared-helper",
+        "portable-user",
+    }
+    assert any("Invalid skill" in error for error in untrusted["errors"])
+    assert any(
+        "duplicate skill name 'shared-helper'" in error
+        for error in untrusted["errors"]
+    )
+
+    assert main(["trust", "add", str(workspace)]) == 0
+    capsys.readouterr()
+    assert main(["extensions", "skills", "--json"]) == 0
+    trusted = json.loads(capsys.readouterr().out)
+    assert trusted["project_trusted"] is True
+    assert {skill["name"] for skill in trusted["skills"]} == {
+        "shared-helper",
+        "portable-user",
+        "ash-project",
+        "portable-project",
+    }
+    if linked_skill is not None:
+        assert "linked-project" not in {
+            skill["name"] for skill in trusted["skills"]
+        }
+    assert any("Invalid skill" in error for error in trusted["errors"])
+    assert any(
+        "duplicate skill name 'shared-helper'" in error
+        for error in trusted["errors"]
+    )
+
+
 def test_extensions_cli_reports_invalid_hook_config(
     tmp_path: Path,
     monkeypatch,

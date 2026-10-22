@@ -130,6 +130,7 @@ def build_tools(
         ReadSkillResourceTool,
         SkillCatalog,
         SkillSource,
+        skill_sources_for_workspace,
     )
     from ash.plugins.runtime import build_plugin_runtime_tools
     from ash.tools.agent import SpawnAgentTool
@@ -164,12 +165,15 @@ def build_tools(
             root, include_project=allow_project_extensions
         )
 
-    skill_roots: list[Path | SkillSource] = [Path.home() / ".ash" / "skills"]
-    if allow_project_extensions:
-        skill_roots.append(root / ".ash" / "skills")
-    skill_roots.extend(
+    plugin_skill_sources = tuple(
         SkillSource(paths=plugin.skill_paths(), namespace=plugin.manifest.name)
         for plugin in plugins
+    )
+    skill_roots = skill_sources_for_workspace(
+        Path.home(),
+        root,
+        include_project=allow_project_extensions,
+        plugin_sources=plugin_skill_sources,
     )
 
     agent_sources: list[Path | AgentSource] = [Path.home() / ".ash" / "agents"]

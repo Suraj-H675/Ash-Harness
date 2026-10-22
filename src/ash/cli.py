@@ -1006,6 +1006,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             ReadSkillResourceTool,
             SkillCatalog,
             SkillSource,
+            skill_sources_for_workspace,
         )
         from ash.plugins.runtime import build_plugin_runtime_tools
         from ash.tools.agent import SpawnAgentTool
@@ -1044,12 +1045,10 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         if next_commands.errors:
             raise ValueError(next(iter(next_commands.errors.values())))
 
-        skill_sources: list[Path | SkillSource] = [Path.home() / ".ash" / "skills"]
         agent_sources: list[Path | AgentSource] = [Path.home() / ".ash" / "agents"]
         if trusted:
-            skill_sources.append(loop.project_root / ".ash" / "skills")
             agent_sources.append(loop.project_root / ".ash" / "agents")
-        skill_sources.extend(
+        plugin_skill_sources = tuple(
             SkillSource(plugin.skill_paths(), plugin.manifest.name)
             for plugin in plugins
         )
@@ -1057,7 +1056,14 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             AgentSource(plugin.agent_paths(), plugin.manifest.name)
             for plugin in plugins
         )
-        next_skills = SkillCatalog(tuple(skill_sources))
+        next_skills = SkillCatalog(
+            skill_sources_for_workspace(
+                Path.home(),
+                loop.project_root,
+                include_project=trusted,
+                plugin_sources=plugin_skill_sources,
+            )
+        )
         discovered_skills = next_skills.discover()
         if next_skills.errors:
             raise ValueError(next(iter(next_skills.errors.values())))

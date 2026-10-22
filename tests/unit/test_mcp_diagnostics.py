@@ -748,13 +748,29 @@ async def test_repl_mcp_reload_exception_commits_other_plugin_state_and_reports_
     monkeypatch: pytest.MonkeyPatch,
     capsys,
 ) -> None:
-    commands = iter(("/reload-plugins", "/exit"))
+    commands = iter(
+        (
+            "/skills added-after-start",
+            "/reload-plugins",
+            "/skills added-after-start",
+            "/exit",
+        )
+    )
     FakeTerminalUI = _install_fake_repl_frontend(monkeypatch, commands)
     monkeypatch.setattr("ash.safety.trust.is_workspace_trusted", lambda root: False)
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
 
     guard = SafetyGuard(tmp_path)
-    old_catalog = SkillCatalog(())
+    old_catalog = SkillCatalog((home / ".ash" / "skills",))
+    assert old_catalog.discover() == []
+    added_skill = home / ".agents" / "skills" / "added-after-start"
+    added_skill.mkdir(parents=True)
+    (added_skill / "SKILL.md").write_text(
+        "---\nname: added-after-start\ndescription: Added during the session\n"
+        "---\nUse this guidance.\n",
+        encoding="utf-8",
+    )
     list_skills = ListSkillsTool(guard, old_catalog)
     activate_skill = ActivateSkillTool(guard, old_catalog)
     read_skill = ReadSkillResourceTool(guard, old_catalog)
@@ -808,10 +824,16 @@ async def test_repl_mcp_reload_exception_commits_other_plugin_state_and_reports_
 
     captured = capsys.readouterr()
     assert "Reloaded 0 plugin(s)" in captured.out
+    assert "1 skills" in captured.out
+    assert captured.out.count("No matching skills.") == 1
+    assert "added-after-start: Added during the session" in captured.out
     assert "injected MCP reload failure" in captured.err
     assert list_skills.catalog is not old_catalog
     assert activate_skill.catalog is list_skills.catalog
     assert read_skill.catalog is list_skills.catalog
+    assert [skill.name for skill in list_skills.catalog.list()] == [
+        "added-after-start"
+    ]
     assert loop.hooks is not old_hooks
     assert loop._mcp_runtime is old_mcp_runtime
 

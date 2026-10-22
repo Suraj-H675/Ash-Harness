@@ -139,6 +139,30 @@ class SkillSource:
     namespace: str = ""
 
 
+def skill_sources_for_workspace(
+    user_home: Path,
+    workspace_root: Path,
+    *,
+    include_project: bool,
+    plugin_sources: tuple[SkillSource, ...] = (),
+) -> tuple[Path | SkillSource, ...]:
+    """Return ordered built-in and plugin skill sources for one workspace."""
+
+    sources: list[Path | SkillSource] = [
+        user_home / ".ash" / "skills",
+        user_home / ".agents" / "skills",
+    ]
+    if include_project:
+        sources.extend(
+            (
+                workspace_root / ".ash" / "skills",
+                workspace_root / ".agents" / "skills",
+            )
+        )
+    sources.extend(plugin_sources)
+    return tuple(sources)
+
+
 class SkillCatalog:
     def __init__(self, roots: tuple[Path | SkillSource, ...]) -> None:
         self.sources = tuple(

@@ -21,7 +21,11 @@ from ash.plugins.lifecycle import recover_plugin_lifecycle
 from ash.plugins.state import load_extension_state
 from ash.plugins.manifest import namespaced_plugin_tool_name
 from ash.plugins.registry import PluginCatalog
-from ash.plugins.skills import SkillCatalog, SkillSource
+from ash.plugins.skills import (
+    SkillCatalog,
+    SkillSource,
+    skill_sources_for_workspace,
+)
 from ash.safe_io import read_bounded_bytes
 from ash.safety.trust import canonical_workspace, is_workspace_trusted
 
@@ -119,7 +123,6 @@ class ExtensionInventory:
 
 def discover_extensions(workspace: Path) -> ExtensionInventory:
     trusted = is_workspace_trusted(workspace)
-    user_skill_root = Path.home() / ".ash" / "skills"
     plugin_roots = [(Path.home() / ".ash" / "plugins", "user")]
     hook_paths = [(Path.home() / ".ash" / "hooks.json", "user")]
     if trusted:
@@ -157,10 +160,7 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
         if plugin.enabled
         for path in plugin.hook_paths()
     )
-    skill_roots: list[Path | SkillSource] = [user_skill_root]
-    if trusted:
-        skill_roots.append(workspace / ".ash" / "skills")
-    skill_roots.extend(
+    plugin_skill_sources = tuple(
         SkillSource(
             paths=plugin.skill_paths(),
             namespace=plugin.manifest.name,
@@ -168,7 +168,14 @@ def discover_extensions(workspace: Path) -> ExtensionInventory:
         for plugin in discovered_plugins
         if plugin.enabled
     )
-    skill_catalog = SkillCatalog(tuple(skill_roots))
+    skill_catalog = SkillCatalog(
+        skill_sources_for_workspace(
+            Path.home(),
+            workspace,
+            include_project=trusted,
+            plugin_sources=plugin_skill_sources,
+        )
+    )
     discovered_skills = skill_catalog.discover()
     command_sources: list[tuple[Path, str] | CommandSource] = [
         (Path.home() / ".ash" / "commands", "user")
