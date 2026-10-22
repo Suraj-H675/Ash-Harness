@@ -243,6 +243,7 @@ def test_recovery_renderer_explains_attention_items() -> None:
             "turn_id": "turn-1",
             "status": "needs_attention",
             "compensated_calls": ["call-edit"],
+            "compensated_files": ["src/old.py"],
             "unknown_calls": [
                 {"call_id": "call-command", "tool": "run_command"},
             ],
@@ -263,7 +264,12 @@ def test_recovery_renderer_explains_attention_items() -> None:
 
     assert "needs_attention" in rendered
     assert "Compensated tool calls: 1" in rendered
-    assert "inspect the external system before retrying" in rendered
+    assert "Files restored:" in rendered
+    assert "src/old.py" in rendered
+    assert (
+        "inspect the workspace and any affected external systems before deciding "
+        "whether to retry"
+    ) in rendered
     assert "src/app.py" in rendered
     assert "inspect the items above before manually retrying" in rendered
 

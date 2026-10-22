@@ -323,7 +323,10 @@ versioned SQLite storage. Ash supports:
 - parent/root lineage, forks, conversation trees, and branch summaries;
 - complete-turn transcript rewind;
 - optional conflict-aware restoration of checkpointed file edits;
-- per-turn file checkpoints, hashes, and undo protection;
+- per-turn checkpoints for Ash's direct file-edit tools; shell, Git, and hand
+  edits stay outside `/undo` and `/rewind --files`; new checkpoints save file
+  modes, restoration checks file hashes, and hash-proven partial restores can
+  be retried;
 - redacted JSONL and Markdown session export; validated JSONL import treats exported
   model metadata as non-authoritative and rejects system-role instructions;
 - configurable retention, pruning, vacuum, backups, restore, and integrity

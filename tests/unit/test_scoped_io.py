@@ -249,6 +249,7 @@ def test_scoped_restore_and_remove_check_state_and_mode(tmp_path, fallback: bool
             b"restored",
             guard,
             expected_sha256=hashlib.sha256(b"current").hexdigest(),
+            expected_mode=0o600,
             mode=0o640,
         )
         assert target.read_bytes() == b"restored"
@@ -262,6 +263,19 @@ def test_scoped_restore_and_remove_check_state_and_mode(tmp_path, fallback: bool
                 expected_sha256=hashlib.sha256(b"current").hexdigest(),
                 mode=0o600,
             )
+
+        target.chmod(0o600)
+        with pytest.raises(ScopedFileChanged, match="permissions changed"):
+            restore_scoped_file(
+                target,
+                b"must-not-write",
+                guard,
+                expected_sha256=hashlib.sha256(b"restored").hexdigest(),
+                expected_mode=0o640,
+                mode=0o640,
+            )
+        assert target.read_bytes() == b"restored"
+        assert target.stat().st_mode & 0o777 == 0o600
 
         restore_scoped_file(
             created,
@@ -356,12 +370,15 @@ def test_missing_restore_and_remove_preserve_new_file(
     target.unlink()
     original_digest = scoped_io._entry_digest
 
-    def appear_after_missing(parent_fd, name, path, *, max_bytes):
+    def appear_after_missing(
+        parent_fd, name, path, *, max_bytes, expected_mode
+    ):
         digest = original_digest(
             parent_fd,
             name,
             path,
             max_bytes=max_bytes,
+            expected_mode=expected_mode,
         )
         if digest == "missing":
             target.write_bytes(b"external")
@@ -370,11 +387,14 @@ def test_missing_restore_and_remove_preserve_new_file(
     if fallback:
         original_fallback_digest = scoped_io._fallback_entry_digest
 
-        def fallback_appear_after_missing(path, file_guard, *, max_bytes):
+        def fallback_appear_after_missing(
+            path, file_guard, *, max_bytes, expected_mode
+        ):
             digest = original_fallback_digest(
                 path,
                 file_guard,
                 max_bytes=max_bytes,
+                expected_mode=expected_mode,
             )
             if digest == "missing":
                 target.write_bytes(b"external")

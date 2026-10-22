@@ -366,6 +366,7 @@ def restore_scoped_file(
     guard: SafetyGuard,
     *,
     expected_sha256: str,
+    expected_mode: int | None = None,
     mode: int | None,
     max_bytes: int | None = None,
 ) -> Path:
@@ -381,6 +382,7 @@ def restore_scoped_file(
                 payload,
                 guard,
                 expected_sha256=expected_sha256,
+                expected_mode=expected_mode,
                 mode=mode,
                 max_bytes=max_bytes,
             )
@@ -390,6 +392,7 @@ def restore_scoped_file(
                 payload,
                 guard,
                 expected_sha256=expected_sha256,
+                expected_mode=expected_mode,
                 mode=mode,
                 max_bytes=max_bytes,
             )
@@ -401,6 +404,7 @@ def remove_scoped_file(
     guard: SafetyGuard,
     *,
     expected_sha256: str,
+    expected_mode: int | None = None,
     max_bytes: int | None = None,
 ) -> Path:
     """Remove a file only after an anchored expected-state check."""
@@ -414,6 +418,7 @@ def remove_scoped_file(
                 target,
                 guard,
                 expected_sha256=expected_sha256,
+                expected_mode=expected_mode,
                 max_bytes=max_bytes,
             )
         else:
@@ -421,6 +426,7 @@ def remove_scoped_file(
                 target,
                 guard,
                 expected_sha256=expected_sha256,
+                expected_mode=expected_mode,
                 max_bytes=max_bytes,
             )
     return target
@@ -611,13 +617,20 @@ def _anchored_restore(
     guard: SafetyGuard,
     *,
     expected_sha256: str,
+    expected_mode: int | None,
     mode: int | None,
     max_bytes: int | None,
 ) -> None:
     with _open_parent(target, guard, create=True) as (parent_fd, name):
         existing = _stat_entry(parent_fd, name)
         _require_expected(
-            _entry_digest(parent_fd, name, target, max_bytes=max_bytes),
+            _entry_digest(
+                parent_fd,
+                name,
+                target,
+                max_bytes=max_bytes,
+                expected_mode=expected_mode,
+            ),
             expected_sha256,
             target,
         )
@@ -645,7 +658,13 @@ def _anchored_restore(
             os.close(temp_fd)
             temp_fd = -1
             _require_expected(
-                _entry_digest(parent_fd, name, target, max_bytes=max_bytes),
+                _entry_digest(
+                    parent_fd,
+                    name,
+                    target,
+                    max_bytes=max_bytes,
+                    expected_mode=expected_mode,
+                ),
                 expected_sha256,
                 target,
             )
@@ -687,12 +706,19 @@ def _anchored_remove(
     guard: SafetyGuard,
     *,
     expected_sha256: str,
+    expected_mode: int | None,
     max_bytes: int | None,
 ) -> None:
     try:
         with _open_parent(target, guard, create=False) as (parent_fd, name):
             _require_expected(
-                _entry_digest(parent_fd, name, target, max_bytes=max_bytes),
+                _entry_digest(
+                    parent_fd,
+                    name,
+                    target,
+                    max_bytes=max_bytes,
+                    expected_mode=expected_mode,
+                ),
                 expected_sha256,
                 target,
             )
@@ -711,11 +737,34 @@ def _entry_digest(
     target: Path,
     *,
     max_bytes: int | None,
+    expected_mode: int | None,
 ) -> str:
     existing = _stat_entry(parent_fd, name)
     if existing is None:
+        if expected_mode is not None:
+            raise ScopedFileChanged(f"file permissions changed before checkpoint restore: {target}")
         return "missing"
-    return _hash_entry(parent_fd, name, target, max_bytes=max_bytes)
+    _require_expected_mode(existing.st_mode, expected_mode, target)
+    digest = _hash_entry(parent_fd, name, target, max_bytes=max_bytes)
+    current = _stat_entry(parent_fd, name)
+    if not _same_optional_snapshot(existing, current):
+        raise ScopedFileChanged(f"file changed before checkpoint restore: {target}")
+    return digest
+
+
+def _require_expected_mode(
+    actual_mode: int | None,
+    expected_mode: int | None,
+    target: Path,
+) -> None:
+    if expected_mode is None:
+        return
+    if actual_mode is None or stat.S_IMODE(actual_mode) != stat.S_IMODE(expected_mode):
+        actual = "missing" if actual_mode is None else oct(stat.S_IMODE(actual_mode))
+        raise ScopedFileChanged(
+            "file permissions changed before checkpoint restore: "
+            f"expected {oct(stat.S_IMODE(expected_mode))}, got {actual}: {target}"
+        )
 
 
 def _require_expected(actual: str, expected: str, target: Path) -> None:
@@ -830,6 +879,7 @@ def _fallback_restore(
     guard: SafetyGuard,
     *,
     expected_sha256: str,
+    expected_mode: int | None,
     mode: int | None,
     max_bytes: int | None,
 ) -> None:
@@ -837,7 +887,12 @@ def _fallback_restore(
     target.parent.mkdir(parents=True, exist_ok=True)
     existing = _fallback_identity(target, missing_ok=True)
     _require_expected(
-        _fallback_entry_digest(target, guard, max_bytes=max_bytes),
+        _fallback_entry_digest(
+            target,
+            guard,
+            max_bytes=max_bytes,
+            expected_mode=expected_mode,
+        ),
         expected_sha256,
         target,
     )
@@ -859,7 +914,12 @@ def _fallback_restore(
             os.close(fd)
         guard.validate_mutation_path(target)
         _require_expected(
-            _fallback_entry_digest(target, guard, max_bytes=max_bytes),
+            _fallback_entry_digest(
+                target,
+                guard,
+                max_bytes=max_bytes,
+                expected_mode=expected_mode,
+            ),
             expected_sha256,
             target,
         )
@@ -885,11 +945,17 @@ def _fallback_remove(
     guard: SafetyGuard,
     *,
     expected_sha256: str,
+    expected_mode: int | None,
     max_bytes: int | None,
 ) -> None:
     guard.validate_mutation_path(target)
     _require_expected(
-        _fallback_entry_digest(target, guard, max_bytes=max_bytes),
+        _fallback_entry_digest(
+            target,
+            guard,
+            max_bytes=max_bytes,
+            expected_mode=expected_mode,
+        ),
         expected_sha256,
         target,
     )
@@ -905,15 +971,21 @@ def _fallback_entry_digest(
     guard: SafetyGuard,
     *,
     max_bytes: int | None,
+    expected_mode: int | None,
 ) -> str:
     existing = _fallback_identity(target, missing_ok=True)
     if existing is None:
+        if expected_mode is not None:
+            raise ScopedFileChanged(f"file permissions changed before checkpoint restore: {target}")
         return "missing"
     if not stat.S_ISREG(existing.st_mode):
         raise ScopedIOError(f"destination is not a regular file: {target}")
-    return hashlib.sha256(
-        _fallback_read(target, guard, max_bytes=max_bytes)
-    ).hexdigest()
+    _require_expected_mode(existing.st_mode, expected_mode, target)
+    digest = hashlib.sha256(_fallback_read(target, guard, max_bytes=max_bytes)).hexdigest()
+    current = _fallback_identity(target, missing_ok=True)
+    if not _same_optional_snapshot(existing, current):
+        raise ScopedFileChanged(f"file changed before checkpoint restore: {target}")
+    return digest
 
 
 def _stat_entry(parent_fd: int, name: str) -> os.stat_result | None:
@@ -1004,9 +1076,11 @@ def _same_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
     return _same_file(left, right) and (
         left.st_size,
         left.st_mtime_ns,
+        stat.S_IMODE(left.st_mode),
     ) == (
         right.st_size,
         right.st_mtime_ns,
+        stat.S_IMODE(right.st_mode),
     )
 
 

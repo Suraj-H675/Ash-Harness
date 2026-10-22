@@ -990,7 +990,8 @@ def test_v19_session_database_migrates_without_losing_active_mcp_tasks(
     with closing(get_db_connection(db_path)) as conn, conn:
         conn.execute("DROP INDEX idx_mcp_task_handles_session_archived")
         conn.execute("DROP TABLE mcp_task_handles")
-        conn.execute("DELETE FROM schema_migrations WHERE version = 20")
+        conn.execute("ALTER TABLE file_checkpoints DROP COLUMN after_mode")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 20")
 
     migrated = SessionStore(db_path)
 
@@ -1005,6 +1006,49 @@ def test_v19_session_database_migrates_without_losing_active_mcp_tasks(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'mcp_task_handles'"
         ).fetchone()
+
+
+def test_v20_migration_adds_checkpoint_after_mode_without_losing_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v20.db"
+    store = SessionStore(db_path)
+    session = store.create_session(str(tmp_path))
+    store.save_file_checkpoint(
+        session.session_id,
+        "turn-1",
+        "whole_edit",
+        str(tmp_path / "file.txt"),
+        existed=True,
+        before_content=b"before",
+        before_mode=0o100640,
+        call_id="call-1",
+    )
+    with closing(get_db_connection(db_path)) as conn, conn:
+        conn.execute("ALTER TABLE file_checkpoints DROP COLUMN after_mode")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 21")
+
+    migrated = SessionStore(db_path)
+
+    with closing(get_db_connection(db_path)) as conn:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(file_checkpoints)")
+        }
+        row = conn.execute(
+            "SELECT before_content, before_mode, after_mode FROM file_checkpoints "
+            "WHERE session_id = ?",
+            (session.session_id,),
+        ).fetchone()
+        version = conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+
+    assert "after_mode" in columns
+    assert bytes(row["before_content"]) == b"before"
+    assert row["before_mode"] == 0o100640
+    assert row["after_mode"] is None
+    assert version == CURRENT_SCHEMA_VERSION
+    assert migrated.load_session(session.session_id).session_id == session.session_id
 
 
 def test_mcp_task_durable_state_has_count_and_payload_limits(

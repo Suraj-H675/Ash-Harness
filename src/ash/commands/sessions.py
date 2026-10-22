@@ -275,9 +275,18 @@ def render_recovery_reports(
         if isinstance(compensated, list) and compensated:
             lines.append(f"  Compensated tool calls: {len(compensated)}")
 
+        compensated_files = report.get("compensated_files")
+        if isinstance(compensated_files, list) and compensated_files:
+            lines.append("  Files restored:")
+            for path in compensated_files:
+                lines.append(
+                    "    - "
+                    + terminal_safe_text(str(path), single_line=True)
+                )
+
         unknown = report.get("unknown_calls")
         if isinstance(unknown, list) and unknown:
-            lines.append("  Unknown external outcomes:")
+            lines.append("  Unknown outcomes needing inspection:")
             for item in unknown:
                 if not isinstance(item, dict):
                     continue
@@ -289,9 +298,17 @@ def render_recovery_reports(
                     str(item.get("call_id", "")),
                     single_line=True,
                 )
+                if tool == "run_command":
+                    inspection = (
+                        "inspect the workspace and any affected external systems"
+                    )
+                elif tool.startswith("mcp__"):
+                    inspection = "inspect the remote service"
+                else:
+                    inspection = "inspect the affected system"
                 lines.append(
-                    f"    - {tool} ({call_id}): inspect the external system "
-                    "before retrying."
+                    f"    - {tool} ({call_id}): {inspection} before deciding "
+                    "whether to retry; Ash did not replay the call."
                 )
 
         unresolved = report.get("unresolved_files")

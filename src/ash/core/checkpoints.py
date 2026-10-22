@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import stat
 from itertools import islice
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from ash.safety.scoped_io import (
     remove_scoped_file,
     restore_scoped_file,
     snapshot_scoped_file,
+    stat_scoped_path,
     workspace_mutation_lock,
 )
 from ash.tools.base import BaseTool, ToolMiddleware, ToolResult
@@ -107,18 +109,24 @@ class FileCheckpointMiddleware(ToolMiddleware):
         if context is None or tool_name not in EDIT_TOOLS:
             return
         session_id, turn_id, call_id = _checkpoint_context(context)
-        for path in self._paths(tool_name, arguments):
-            _, snapshot = _checkpoint_snapshot(path, self.guard)
-            self.store.save_file_checkpoint(
-                session_id,
-                turn_id,
-                tool_name,
-                str(path),
-                existed=snapshot.exists,
-                before_content=snapshot.content if snapshot.exists else None,
-                before_mode=snapshot.mode,
-                call_id=call_id,
-            )
+
+        def checkpoint_states() -> Iterable[tuple[str, bool, bytes | None, int | None]]:
+            for path in self._paths(tool_name, arguments):
+                _, snapshot = _checkpoint_snapshot(path, self.guard)
+                yield (
+                    str(path),
+                    snapshot.exists,
+                    snapshot.content if snapshot.exists else None,
+                    snapshot.mode,
+                )
+
+        self.store.save_file_checkpoints(
+            session_id,
+            turn_id,
+            tool_name,
+            checkpoint_states(),
+            call_id=call_id,
+        )
 
     async def after_tool(
         self, tool_name: str, arguments: dict[str, Any], result: ToolResult
@@ -129,12 +137,13 @@ class FileCheckpointMiddleware(ToolMiddleware):
         try:
             session_id, turn_id, call_id = _checkpoint_context(context)
             for path in self._paths(tool_name, arguments):
-                digest = _digest(path, self.guard)
+                digest, mode = _digest_and_mode(path, self.guard)
                 self.store.finish_file_checkpoint(
                     session_id,
                     turn_id,
                     str(path),
                     digest,
+                    after_mode=mode,
                     call_id=call_id,
                 )
         except Exception as exc:
@@ -204,6 +213,7 @@ def _recover_interrupted_turns_locked(
         call_errors: dict[str, str] = {}
         restored_checkpoint_ids: list[int] = []
         turn_compensated: list[str] = []
+        turn_compensated_files: list[str] = []
         turn_unknown: list[dict[str, str]] = []
         turn_unresolved: list[str] = []
         turn_recovered: list[RecoveredToolCall] = []
@@ -278,20 +288,36 @@ def _recover_interrupted_turns_locked(
                 continue
             safe_rows: list[tuple[Any, Path]] = []
             conflicts: list[Path] = []
+            current_states: dict[Path, tuple[str, int | None]] = {}
             for row in rows:
                 raw_path = Path(str(row["path"]))
                 try:
                     path = guard.validate_mutation_path(raw_path)
                     before_digest = _checkpoint_before_digest(row)
-                    current_digest = _digest(path, guard)
+                    current_digest, current_mode = _digest_and_mode(path, guard)
                 except (OSError, SafetyViolation):
                     conflicts.append(raw_path)
                     continue
+                current_states[path] = (current_digest, current_mode)
                 after_digest = row["after_sha256"]
-                if _digests_match(current_digest, before_digest):
+                before_mode = (
+                    int(row["before_mode"]) if row["before_mode"] is not None else None
+                )
+                after_mode = (
+                    int(row["after_mode"]) if row["after_mode"] is not None else None
+                )
+                if _checkpoint_state_matches(
+                    current_digest,
+                    current_mode,
+                    before_digest,
+                    before_mode,
+                ):
                     safe_rows.append((row, path))
-                elif after_digest is not None and _digests_match(
-                    current_digest, after_digest
+                elif after_digest is not None and _checkpoint_state_matches(
+                    current_digest,
+                    current_mode,
+                    str(after_digest),
+                    after_mode,
                 ):
                     safe_rows.append((row, path))
                 else:
@@ -320,13 +346,15 @@ def _recover_interrupted_turns_locked(
 
             rows_to_restore: list[tuple[Any, Path]] = []
             for row, path in safe_rows:
-                try:
-                    current_digest = _digest(path, guard)
-                except (OSError, SafetyViolation):
-                    conflicts.append(path)
-                    continue
-                if not _digests_match(
-                    current_digest, _checkpoint_before_digest(row)
+                current_digest, current_mode = current_states[path]
+                before_mode = (
+                    int(row["before_mode"]) if row["before_mode"] is not None else None
+                )
+                if not _checkpoint_state_matches(
+                    current_digest,
+                    current_mode,
+                    _checkpoint_before_digest(row),
+                    before_mode,
                 ):
                     rows_to_restore.append((row, path))
             if conflicts:
@@ -378,6 +406,10 @@ def _recover_interrupted_turns_locked(
             compensated_calls.append(f"{tool_name} ({call_id})")
             turn_compensated.append(call_id)
             compensated_files.extend(path for _, path in rows_to_restore)
+            turn_compensated_files.extend(
+                _relative_display(path, guard.project_root)
+                for _, path in rows_to_restore
+            )
             call_errors[call_id] = (
                 "Interrupted file edit was rolled back during startup recovery."
             )
@@ -522,6 +554,7 @@ def _recover_interrupted_turns_locked(
             "turn_id": turn_id,
             "status": status,
             "compensated_calls": turn_compensated,
+            "compensated_files": list(dict.fromkeys(turn_compensated_files)),
             "unknown_calls": turn_unknown,
             "unresolved_files": list(dict.fromkeys(turn_unresolved)),
             "recovered_calls": [
@@ -566,7 +599,7 @@ def _restore_checkpoint_rows(
     rows: list[tuple[Any, Path]], guard: SafetyGuard
 ) -> None:
     originals = _capture_file_states((path for _, path in rows), guard)
-    rollback_expected: dict[Path, set[str]] = {}
+    rollback_expected: dict[Path, set[tuple[str, int | None]]] = {}
     try:
         _apply_checkpoint_rows(rows, guard, originals, rollback_expected)
     except Exception as primary:
@@ -578,6 +611,81 @@ def _restore_checkpoint_rows(
                 f"({primary}) and file rollback was incomplete: {rollback_error}"
             ) from rollback_error
         raise
+
+
+def _plan_checkpoint_restore(
+    rows: list[Any],
+    paths: list[Path],
+    guard: SafetyGuard,
+    *,
+    operation: str,
+) -> tuple[list[tuple[Any, Path]], dict[Path, ScopedFileSnapshot]]:
+    """Preflight a durable checkpoint chain and skip states already restored."""
+
+    originals = _capture_file_states(paths, guard)
+    grouped: dict[Path, list[Any]] = {}
+    for row, path in zip(rows, paths, strict=True):
+        grouped.setdefault(path, []).append(row)
+
+    restore_after: dict[Path, int] = {}
+    conflicts: list[str] = []
+    for path, path_rows in grouped.items():
+        boundaries: list[tuple[str, int | None]] = []
+        for index, row in enumerate(path_rows):
+            after_sha256 = row["after_sha256"]
+            if after_sha256 is None:
+                raise RuntimeError(
+                    f"{operation} refused because a checkpoint is incomplete: {path}"
+                )
+            after_mode = (
+                int(row["after_mode"]) if row["after_mode"] is not None else None
+            )
+            if index and not _checkpoint_state_matches(
+                boundaries[-1][0],
+                boundaries[-1][1],
+                str(after_sha256),
+                after_mode,
+            ):
+                conflicts.append(str(path))
+                break
+            if not index:
+                boundaries.append((str(after_sha256), after_mode))
+            before_mode = (
+                int(row["before_mode"]) if row["before_mode"] is not None else None
+            )
+            boundaries.append((_checkpoint_before_digest(row), before_mode))
+        else:
+            current = originals[path]
+            matching_boundaries = [
+                index
+                for index, (expected_digest, expected_mode) in enumerate(boundaries)
+                if _checkpoint_state_matches(
+                    current.sha256,
+                    current.mode,
+                    expected_digest,
+                    expected_mode,
+                )
+            ]
+            if not matching_boundaries:
+                conflicts.append(str(path))
+            else:
+                restore_after[path] = max(matching_boundaries)
+
+    if conflicts:
+        raise RuntimeError(
+            f"{operation} refused because files changed after Ash's edit "
+            "or permissions changed: "
+            + ", ".join(dict.fromkeys(conflicts))
+        )
+
+    seen: dict[Path, int] = {}
+    restore_rows: list[tuple[Any, Path]] = []
+    for row, path in zip(rows, paths, strict=True):
+        index = seen.get(path, 0)
+        if index >= restore_after[path]:
+            restore_rows.append((row, path))
+        seen[path] = index + 1
+    return restore_rows, originals
 
 
 def _capture_file_states(
@@ -595,19 +703,29 @@ def _apply_checkpoint_rows(
     rows: list[tuple[Any, Path]],
     guard: SafetyGuard,
     originals: dict[Path, ScopedFileSnapshot],
-    rollback_expected: dict[Path, set[str]],
+    rollback_expected: dict[Path, set[tuple[str, int | None]]],
 ) -> None:
     current_digests = {path: snapshot.sha256 for path, snapshot in originals.items()}
     for row, path in rows:
         expected = str(row["after_sha256"] or current_digests[path])
+        expected_mode = (
+            int(row["after_mode"]) if row["after_mode"] is not None else None
+        )
         resulting = _checkpoint_before_digest(row)
-        rollback_expected[path] = {expected, resulting}
+        resulting_mode = (
+            int(row["before_mode"]) if row["before_mode"] is not None else None
+        )
+        rollback_expected[path] = {
+            (expected, expected_mode),
+            (resulting, resulting_mode),
+        }
         if bool(row["existed"]):
             restore_scoped_file(
                 path,
                 _checkpoint_content(row),
                 guard,
                 expected_sha256=expected,
+                expected_mode=expected_mode,
                 mode=(
                     int(row["before_mode"])
                     if row["before_mode"] is not None
@@ -620,25 +738,43 @@ def _apply_checkpoint_rows(
                 path,
                 guard,
                 expected_sha256=expected,
+                expected_mode=expected_mode,
                 max_bytes=MAX_CHECKPOINT_BYTES,
             )
         current_digests[path] = resulting
-        rollback_expected[path] = {resulting}
+        rollback_expected[path] = {(resulting, resulting_mode)}
 
 
 def _rollback_file_states(
     originals: dict[Path, ScopedFileSnapshot],
     guard: SafetyGuard,
-    rollback_expected: dict[Path, set[str]],
+    rollback_expected: dict[Path, set[tuple[str, int | None]]],
 ) -> None:
     rollback_errors: list[str] = []
-    for path, allowed_digests in rollback_expected.items():
+    for path, allowed_states in rollback_expected.items():
         original = originals[path]
         try:
             _, current = _checkpoint_snapshot(path, guard)
-            if current.sha256 == original.sha256:
+            matches_original = _checkpoint_state_matches(
+                current.sha256,
+                current.mode,
+                original.sha256,
+                original.mode,
+            )
+            if matches_original:
                 continue
-            if current.sha256 not in allowed_digests:
+            matches_operation_state = any(
+                _checkpoint_state_matches(
+                    current.sha256,
+                    current.mode,
+                    expected_digest,
+                    expected_mode,
+                )
+                for expected_digest, expected_mode in allowed_states
+            )
+            if current.sha256 == original.sha256 and not matches_operation_state:
+                continue
+            if not matches_operation_state:
                 raise ScopedFileChanged(
                     "file changed after the failed checkpoint operation; "
                     "rollback refused"
@@ -649,6 +785,7 @@ def _rollback_file_states(
                     original.content,
                     guard,
                     expected_sha256=current.sha256,
+                    expected_mode=current.mode,
                     mode=original.mode,
                     max_bytes=MAX_CHECKPOINT_BYTES,
                 )
@@ -657,6 +794,7 @@ def _rollback_file_states(
                     path,
                     guard,
                     expected_sha256=current.sha256,
+                    expected_mode=current.mode,
                     max_bytes=MAX_CHECKPOINT_BYTES,
                 )
         except (OSError, SafetyViolation, ScopedIOError, ValueError) as exc:
@@ -681,17 +819,16 @@ def _undo_latest_checkpoint_locked(
     if not rows:
         return []
     paths = [guard.validate_mutation_path(row["path"]) for row in rows]
-    conflicts = _checkpoint_chain_conflicts(rows, paths, guard)
-    if conflicts:
-        raise RuntimeError(
-            "Undo refused because files changed after Ash's edit: "
-            + ", ".join(conflicts)
-        )
-    originals = _capture_file_states(paths, guard)
-    rollback_expected: dict[Path, set[str]] = {}
+    restore_rows, originals = _plan_checkpoint_restore(
+        rows,
+        paths,
+        guard,
+        operation="Undo",
+    )
+    rollback_expected: dict[Path, set[tuple[str, int | None]]] = {}
     try:
         _apply_checkpoint_rows(
-            list(zip(rows, paths, strict=True)),
+            restore_rows,
             guard,
             originals,
             rollback_expected,
@@ -741,34 +878,17 @@ def _rewind_session_with_files_locked(
     )
     rows = store.file_checkpoints_for_turns(session_id, turn_ids)
     paths = [guard.validate_mutation_path(row["path"]) for row in rows]
-    simulated: dict[Path, str] = {}
-    conflicts: list[str] = []
-    for row, path in zip(rows, paths, strict=True):
-        after_sha256 = row["after_sha256"]
-        if after_sha256 is None:
-            raise RuntimeError(
-                f"Combined rewind refused because a checkpoint is incomplete: {path}"
-            )
-        current = simulated.setdefault(path, _digest(path, guard))
-        if current != after_sha256:
-            conflicts.append(str(path))
-        simulated[path] = (
-            hashlib.sha256(_checkpoint_content(row)).hexdigest()
-            if bool(row["existed"])
-            else "missing"
-        )
-    if conflicts:
-        raise RuntimeError(
-            "Combined rewind refused because files changed after Ash's edit: "
-            + ", ".join(dict.fromkeys(conflicts))
-        )
-
-    originals = _capture_file_states(paths, guard)
-    rollback_expected: dict[Path, set[str]] = {}
+    restore_rows, originals = _plan_checkpoint_restore(
+        rows,
+        paths,
+        guard,
+        operation="Combined rewind",
+    )
+    rollback_expected: dict[Path, set[tuple[str, int | None]]] = {}
 
     try:
         _apply_checkpoint_rows(
-            list(zip(rows, paths, strict=True)),
+            restore_rows,
             guard,
             originals,
             rollback_expected,
@@ -813,16 +933,33 @@ def diff_latest_checkpoint(
     lines: list[str] = []
     truncated = False
     earliest_by_path: dict[Path, Any] = {}
+    latest_by_path: dict[Path, Any] = {}
     for row, path in zip(rows, paths, strict=True):
+        latest_by_path.setdefault(path, row)
         earliest_by_path[path] = row
     for path, row in earliest_by_path.items():
         before = _checkpoint_content(row) if bool(row["existed"]) else b""
         _, snapshot = _checkpoint_snapshot(path, guard)
         after = snapshot.content if snapshot.exists else b""
+        before_mode = (
+            int(row["before_mode"]) if row["before_mode"] is not None else None
+        )
+        latest_mode = latest_by_path[path]["after_mode"]
+        after_mode = int(latest_mode) if latest_mode is not None else None
+        relative = _relative_display(path, guard.project_root)
+        if (
+            before_mode is not None
+            and after_mode is not None
+            and stat.S_IMODE(before_mode) != stat.S_IMODE(after_mode)
+        ):
+            lines.append(
+                f"File mode changed: {relative} "
+                f"{oct(stat.S_IMODE(before_mode))} -> "
+                f"{oct(stat.S_IMODE(after_mode))}"
+            )
         if _looks_binary(before) or _looks_binary(after):
             lines.append(f"Binary file changed: {path}")
             continue
-        relative = _relative_display(path, guard.project_root)
         before_lines = before.decode("utf-8", errors="replace").splitlines()
         after_lines = after.decode("utf-8", errors="replace").splitlines()
         remaining = max_lines - len(lines)
@@ -852,15 +989,26 @@ def diff_latest_checkpoint(
 def _checkpoint_chain_conflicts(
     rows: list[Any], paths: list[Path], guard: SafetyGuard
 ) -> list[str]:
-    simulated: dict[Path, str] = {}
+    simulated: dict[Path, tuple[str, int | None]] = {}
     conflicts: list[str] = []
     for row, path in zip(rows, paths, strict=True):
-        current = simulated.setdefault(path, _digest(path, guard))
-        if row["after_sha256"] is None or not _digests_match(
-            current, row["after_sha256"]
+        current = simulated.get(path)
+        if current is None:
+            current = _digest_and_mode(path, guard)
+        expected_mode = (
+            int(row["after_mode"]) if row["after_mode"] is not None else None
+        )
+        if row["after_sha256"] is None or not _checkpoint_state_matches(
+            current[0],
+            current[1],
+            str(row["after_sha256"]),
+            expected_mode,
         ):
             conflicts.append(str(path))
-        simulated[path] = _checkpoint_before_digest(row)
+        before_mode = (
+            int(row["before_mode"]) if row["before_mode"] is not None else None
+        )
+        simulated[path] = (_checkpoint_before_digest(row), before_mode)
     return list(dict.fromkeys(conflicts))
 
 
@@ -883,6 +1031,10 @@ def _checkpoint_snapshot(
 
 
 def _digest(path: Path, guard: SafetyGuard) -> str:
+    return _digest_and_mode(path, guard)[0]
+
+
+def _digest_and_mode(path: Path, guard: SafetyGuard) -> tuple[str, int | None]:
     try:
         _, snapshot = snapshot_scoped_file(
             path,
@@ -891,9 +1043,25 @@ def _digest(path: Path, guard: SafetyGuard) -> str:
         )
     except ScopedIOError as exc:
         if str(exc).startswith("file exceeds "):
-            return OVERSIZED_DIGEST
+            _, metadata = stat_scoped_path(path, guard)
+            return OVERSIZED_DIGEST, metadata.st_mode
         raise
-    return snapshot.sha256
+    return snapshot.sha256, snapshot.mode
+
+
+def _checkpoint_state_matches(
+    actual_digest: str,
+    actual_mode: int | None,
+    expected_digest: str,
+    expected_mode: int | None,
+) -> bool:
+    return _digests_match(actual_digest, expected_digest) and (
+        expected_mode is None
+        or (
+            actual_mode is not None
+            and stat.S_IMODE(actual_mode) == stat.S_IMODE(expected_mode)
+        )
+    )
 
 
 def _digests_match(left: str, right: str) -> bool:

@@ -15,7 +15,7 @@ import weakref
 from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Final, Iterator, Literal, Sequence, cast
+from typing import Any, AsyncIterator, Final, Iterable, Iterator, Literal, Sequence, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, PrivateAttr
@@ -57,7 +57,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 20
+CURRENT_SCHEMA_VERSION = 21
 TURN_JOURNAL_INPUT_OMITTED: Final[str] = "<prompt omitted>"
 SQLITE_INTEGER_MAX = 2**63 - 1
 SQLITE_REAL_MAX = sys.float_info.max
@@ -1310,6 +1310,8 @@ class SessionStore:
                 self._migrate_v19(conn)
             if from_version < 20:
                 self._migrate_v20(conn)
+            if from_version < 21:
+                self._migrate_v21(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -1888,6 +1890,17 @@ class SessionStore:
             (20, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v21(self, conn: sqlite3.Connection) -> None:
+        """Record file modes so checkpoint restore can detect permission edits."""
+
+        if not _column_exists(conn, "file_checkpoints", "after_mode"):
+            conn.execute("ALTER TABLE file_checkpoints ADD COLUMN after_mode INTEGER")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (21, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -2158,6 +2171,7 @@ class SessionStore:
                     before_content BLOB,
                     before_mode INTEGER,
                     after_sha256 TEXT,
+                    after_mode INTEGER,
                     restored INTEGER NOT NULL DEFAULT 0 CHECK(restored IN (0, 1)),
                     created_at TIMESTAMP NOT NULL,
                     call_id TEXT NOT NULL DEFAULT '',
@@ -3941,8 +3955,27 @@ class SessionStore:
         call_id: str = "",
     ) -> None:
         """Save the first pre-edit state for one path in a turn."""
+        self.save_file_checkpoints(
+            session_id,
+            turn_id,
+            tool_name,
+            ((path, existed, before_content, before_mode),),
+            call_id=call_id,
+        )
+
+    def save_file_checkpoints(
+        self,
+        session_id: str,
+        turn_id: str,
+        tool_name: str,
+        checkpoints: Iterable[tuple[str, bool, bytes | None, int | None]],
+        *,
+        call_id: str = "",
+    ) -> None:
+        """Save one tool call's pre-edit states atomically."""
+        created_at = _serialize_datetime(_utc_now())
         with closing(self._connect()) as conn, conn:
-            conn.execute(
+            conn.executemany(
                 """
                 INSERT OR IGNORE INTO file_checkpoints
                     (session_id, turn_id, tool_name, path, existed,
@@ -3950,15 +3983,18 @@ class SessionStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    session_id,
-                    turn_id,
-                    tool_name,
-                    path,
-                    int(existed),
-                    before_content,
-                    before_mode,
-                    _serialize_datetime(_utc_now()),
-                    call_id,
+                    (
+                        session_id,
+                        turn_id,
+                        tool_name,
+                        path,
+                        int(existed),
+                        before_content,
+                        before_mode,
+                        created_at,
+                        call_id,
+                    )
+                    for path, existed, before_content, before_mode in checkpoints
                 ),
             )
 
@@ -3969,13 +4005,14 @@ class SessionStore:
         path: str,
         after_sha256: str,
         *,
+        after_mode: int | None = None,
         call_id: str = "",
     ) -> None:
         with closing(self._connect()) as conn, conn:
             conn.execute(
-                "UPDATE file_checkpoints SET after_sha256 = ? "
+                "UPDATE file_checkpoints SET after_sha256 = ?, after_mode = ? "
                 "WHERE session_id = ? AND turn_id = ? AND call_id = ? AND path = ?",
-                (after_sha256, session_id, turn_id, call_id, path),
+                (after_sha256, after_mode, session_id, turn_id, call_id, path),
             )
 
     def latest_file_checkpoints(self, session_id: str) -> list[sqlite3.Row]:
