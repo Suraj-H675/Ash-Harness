@@ -1,7 +1,7 @@
 """Tests for the streaming XML parser state machine (Sprint 7)."""
 
 from typing import Iterable
-
+from xml.sax.saxutils import escape as xml_escape
 
 import pytest
 
@@ -215,7 +215,33 @@ def test_special_characters_in_arg_value_are_preserved() -> None:
     payload = events[0][1]
     assert isinstance(payload, dict)
     assert payload["name"] == "run_command"
-    assert payload["arguments"]["command_line"] == 'echo "hi &amp; bye" | grep hi'
+    assert payload["arguments"]["command_line"] == 'echo "hi & bye" | grep hi'
+
+
+def test_xml_escaped_code_arg_round_trips_across_stream_chunks() -> None:
+    parser = StreamingXMLParser()
+    source = (
+        "def is_billable(amount: int, limit: int) -> bool:\n"
+        '    return amount >= limit and "<call_tool>" not in str(amount)\n'
+        "    # Numeric references: → …; invalid uppercase: &#X2192;.\n"
+        "    # Keep literal entity: &lt;call_tool&gt;\n"
+    )
+    payload = (
+        '<call_tool name="write_file"><arg name="content">'
+        f"{xml_escape(source).replace('→', '&#x2192;').replace('…', '&#8230;')}"
+        "</arg></call_tool>"
+    )
+
+    events: list[tuple[str, object]] = []
+    for character in payload:
+        events.extend(parser.feed(character))
+
+    assert events == [
+        (
+            "tool_call",
+            {"name": "write_file", "arguments": {"content": source}},
+        )
+    ]
 
 
 def test_incomplete_tool_call_buffers_until_close() -> None:

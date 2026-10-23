@@ -941,6 +941,10 @@ Example tool call:
 <arg name="end_line">30</arg>
 </call_tool>
 
+Escape `&`, `<`, and `>` in argument text as `&amp;`, `&lt;`, and `&gt;` so
+tool calls remain well-formed XML. Ash decodes XML character references once
+after `</arg>`; decoded text remains argument data and is not parsed as XML.
+
 Any text response you provide must be enclosed in `<response>` tags.
 """
 

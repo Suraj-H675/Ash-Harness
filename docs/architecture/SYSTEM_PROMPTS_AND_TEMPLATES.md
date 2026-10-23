@@ -42,6 +42,12 @@ Providers that do not declare native tools receive this fallback shape:
 </call_tool>
 ```
 
+Escape `&`, `<`, and `>` in argument text as `&amp;`, `&lt;`, and `&gt;` so tool
+calls remain well-formed XML. The parser decodes the five predefined entities
+and valid XML 1.0 numeric character references once, after the closing
+`</arg>`; decoded markup remains argument data and is not parsed as another
+protocol element.
+
 Final user-facing text may be wrapped in `<response>`, and reasoning may use
 `<thought>`. The streaming parser emits text and reasoning incrementally,
 assembles complete tool calls, preserves literal unknown markup at end of

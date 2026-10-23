@@ -18,6 +18,48 @@ class _State(StrEnum):
 EventType = Literal["token", "thought", "tool_call"]
 Event = tuple[EventType, str | dict[str, Any]]
 
+_XML_ENTITY_PATTERN = re.compile(
+    r"&(?P<entity>amp|lt|gt|quot|apos|#(?:[0-9]+|x[0-9a-fA-F]+));"
+)
+_XML_NAMED_ENTITIES = {
+    "amp": "&",
+    "lt": "<",
+    "gt": ">",
+    "quot": '"',
+    "apos": "'",
+}
+
+
+def _xml_character(codepoint: int, original: str) -> str:
+    """Decode only XML 1.0 character references with valid code points."""
+
+    if not (
+        codepoint in {0x9, 0xA, 0xD}
+        or 0x20 <= codepoint <= 0xD7FF
+        or 0xE000 <= codepoint <= 0xFFFD
+        or 0x10000 <= codepoint <= 0x10FFFF
+    ):
+        return original
+    return chr(codepoint)
+
+
+def _decode_xml_entities(value: str) -> str:
+    """Decode XML text entities once, after the argument boundary is known."""
+
+    def replace(match: re.Match[str]) -> str:
+        entity = match.group("entity")
+        if entity in _XML_NAMED_ENTITIES:
+            return _XML_NAMED_ENTITIES[entity]
+        try:
+            codepoint = (
+                int(entity[2:], 16) if entity[1:2] == "x" else int(entity[1:], 10)
+            )
+        except ValueError:
+            return match.group(0)
+        return _xml_character(codepoint, match.group(0))
+
+    return _XML_ENTITY_PATTERN.sub(replace, value)
+
 
 class StreamingXMLParseError(ValueError):
     """Raised when a fallback-model stream ends inside a control element."""
@@ -234,7 +276,9 @@ class StreamingXMLParser:
             val, post = self._buffer.split("</arg>", 1)
             self._accumulated_text += val
             if self._current_arg_name is not None:
-                self._current_args[self._current_arg_name] = self._accumulated_text
+                self._current_args[self._current_arg_name] = _decode_xml_entities(
+                    self._accumulated_text
+                )
             self._state = _State.TOOL
             self._buffer = post
             self._current_arg_name = None
