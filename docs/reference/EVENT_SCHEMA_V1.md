@@ -59,6 +59,10 @@ Every terminal `tool.error` includes these stable fields:
 | `replay_policy` | string | Current automatic replay policy, `never`. |
 | `recovered` | boolean, optional | Present and true when crash/cancellation recovery produced this terminal state. |
 
+When a `run_command` result has a known process status, its terminal event also
+includes the integer `exit_code`. Ash omits that field when the command timed
+out or its outcome is unknown.
+
 Recovery emits one terminal `tool.error` per unfinished call before the
 aggregate `session.recovery` event. A recovered record with `dispatched: false`
 is a confirmed unstarted call and therefore has `ambiguous: false`.

@@ -302,6 +302,7 @@ async def test_run_command_pty_timeout_after_effect_is_unknown(
     assert result.success is False
     assert result.error == "Error: Command timed out after 1 seconds."
     assert result.outcome is ToolExecutionOutcome.UNKNOWN
+    assert result.exit_code is None
 
 
 @pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
@@ -324,6 +325,7 @@ async def test_run_command_pty_enforces_output_capture_limit(
     assert len(result.output) < 256
     assert "Process output capture limit reached" in result.output
     assert result.outcome is ToolExecutionOutcome.UNKNOWN
+    assert result.exit_code is None
 
 
 @pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
@@ -1293,6 +1295,7 @@ async def test_run_command_handles_output_capture_limit_without_escaping(
     assert result.truncated is True
     assert "Process output capture limit reached" in result.output
     assert result.outcome is ToolExecutionOutcome.UNKNOWN
+    assert result.exit_code is None
 
 
 @pytest.mark.asyncio
@@ -1437,6 +1440,7 @@ async def test_run_command_timeout_after_effect_is_unknown(
     assert result.success is False
     assert result.error == "Error: Command timed out after 1 seconds."
     assert result.outcome is ToolExecutionOutcome.UNKNOWN
+    assert result.exit_code is None
 
 
 @pytest.mark.asyncio

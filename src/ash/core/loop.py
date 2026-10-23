@@ -382,6 +382,7 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
         {
             "tool",
             "success",
+            "exit_code",
             "truncated",
             "dispatched",
             "ambiguous",
@@ -393,6 +394,7 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
         {
             "tool",
             "success",
+            "exit_code",
             "truncated",
             "dispatched",
             "ambiguous",
@@ -522,6 +524,9 @@ def _runtime_event_preview(
         value = payload.get(key)
         if isinstance(value, (bool, int)) or value is None:
             preview[key] = value
+    exit_code = payload.get("exit_code")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+        preview["exit_code"] = exit_code
     for field in RUNTIME_EVENT_TEXT_FIELDS:
         value = payload.get(field)
         if not isinstance(value, str):
@@ -1014,6 +1019,11 @@ def _render_tool_response(call_id: str, tool_name: str, result: dict[str, Any]) 
         "error": result.get("error"),
         "truncated": result.get("truncated", False),
         "token_count": result.get("token_count", 0),
+        **(
+            {"exit_code": result["exit_code"]}
+            if result.get("exit_code") is not None
+            else {}
+        ),
         **({"diagnostics": result["diagnostics"]} if result.get("diagnostics") else {}),
         **(
             {"diagnostic_summary": result["diagnostic_summary"]}
@@ -1061,6 +1071,8 @@ def _render_tool_response(call_id: str, tool_name: str, result: dict[str, Any]) 
         "structured_metadata_truncated": had_structured,
         "token_count": payload["token_count"],
     }
+    if payload.get("exit_code") is not None:
+        compact["exit_code"] = payload["exit_code"]
     rendered = render(compact)
     if len(rendered.encode("utf-8")) > MAX_CANONICAL_CONTENT_BYTES:
         raise ValueError(
@@ -6180,6 +6192,7 @@ class AshLoop:
                         success=result_dict["success"],
                         output=result_dict["output"],
                         error=result_dict["error"],
+                        exit_code=result_dict.get("exit_code"),
                         truncated=result_dict.get("truncated", False),
                         token_count=result_dict.get("token_count", 0),
                         outcome=result_dict.get(
@@ -6347,6 +6360,11 @@ class AshLoop:
                     "success": tool_result.success,
                     "output": redact_text(tool_result.output),
                     "error": redact_text(tool_result.error or ""),
+                    **(
+                        {"exit_code": tool_result.exit_code}
+                        if tool_result.exit_code is not None
+                        else {}
+                    ),
                     "truncated": tool_result.truncated,
                     "dispatched": dispatched,
                     "ambiguous": ambiguous,
@@ -6368,6 +6386,11 @@ class AshLoop:
                     "success": tool_result.success,
                     "output": tool_result.output,
                     "error": tool_result.error,
+                    **(
+                        {"exit_code": tool_result.exit_code}
+                        if tool_result.exit_code is not None
+                        else {}
+                    ),
                     "truncated": tool_result.truncated,
                     "dispatched": dispatched,
                     "ambiguous": ambiguous,
@@ -6380,6 +6403,11 @@ class AshLoop:
                     "success": tool_result.success,
                     "output": tool_result.output,
                     "error": tool_result.error,
+                    **(
+                        {"exit_code": tool_result.exit_code}
+                        if tool_result.exit_code is not None
+                        else {}
+                    ),
                     "truncated": tool_result.truncated,
                     **(
                         {"diagnostics": tool_result.diagnostics}
@@ -7928,6 +7956,7 @@ async def _execute_tool_once(
         "success": tool_result.success,
         "output": tool_result.output,
         "error": tool_result.error,
+        "exit_code": tool_result.exit_code,
         "truncated": tool_result.truncated,
         "token_count": tool_result.token_count,
         "outcome": tool_result.outcome,

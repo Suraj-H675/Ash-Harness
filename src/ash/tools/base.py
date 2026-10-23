@@ -34,6 +34,7 @@ class ToolResult(BaseModel):
     success: bool
     output: str
     error: str | None = None
+    exit_code: int | None = None
     token_count: int = 0
     truncated: bool = False
     outcome: ToolExecutionOutcome = ToolExecutionOutcome.COMPLETED

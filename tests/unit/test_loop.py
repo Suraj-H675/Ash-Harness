@@ -2250,6 +2250,21 @@ async def test_runtime_event_observer_receives_content_free_projection(tmp_path)
     assert observer.closed == 1
 
 
+def test_run_command_exit_code_survives_content_free_event_projection() -> None:
+    event = loop_module._observer_event_projection(
+        {
+            "type": "tool.completed",
+            "tool": "run_command",
+            "success": False,
+            "exit_code": 23,
+            "output": "private command output",
+        }
+    )
+
+    assert event["exit_code"] == 23
+    assert "output" not in event
+
+
 @pytest.mark.asyncio
 async def test_provider_replay_state_persists_and_returns_to_next_request(tmp_path):
     class ReplayStateProvider(ProviderABC):
@@ -3057,11 +3072,34 @@ async def test_runtime_event_oversized_structured_payload_becomes_bounded_previe
             "payload": {"blob": "x" * 2000},
         }
     )
+    original_event = ui.events[-1]
+    assert original_event["type"] == "custom.large"
+    assert original_event["call_id"] == "call-large-event"
+    assert original_event["tool"] == "capture"
+    assert original_event["text"] == "useful preview"
+    assert original_event["event_payload_truncated"] is True
+    assert "event_payload_invalid" not in original_event
+    assert "payload" not in original_event
+    assert loop._pending_runtime_events[-1] == original_event
+
+    loop._emit_event(
+        {
+            "type": "tool.completed",
+            "call_id": "call-large-event",
+            "tool": "run_command",
+            "success": False,
+            "exit_code": 23,
+            "text": "useful preview",
+            "payload": {"blob": "x" * 2000},
+        }
+    )
 
     event = ui.events[-1]
-    assert event["type"] == "custom.large"
+    assert event["type"] == "tool.completed"
     assert event["call_id"] == "call-large-event"
-    assert event["tool"] == "capture"
+    assert event["tool"] == "run_command"
+    assert event["success"] is False
+    assert event["exit_code"] == 23
     assert event["text"] == "useful preview"
     assert event["event_payload_truncated"] is True
     assert "event_payload_invalid" not in event
@@ -5109,9 +5147,10 @@ def test_tool_response_renderer_bounds_json_expansion(
         "call-large",
         "capture",
         {
-            "success": True,
+            "success": False,
             "output": "\x01" * 5000,
             "error": None,
+            "exit_code": 23,
             "truncated": False,
             "token_count": 5000,
             "diagnostics": [{"message": "x" * 500}],
@@ -5123,6 +5162,7 @@ def test_tool_response_renderer_bounds_json_expansion(
     assert '"truncated": true' in rendered
     assert '"tool_response_truncated": true' in rendered
     assert '"structured_metadata_truncated": true' in rendered
+    assert '"exit_code": 23' in rendered
     assert '"diagnostics"' not in rendered
     assert '"citations"' not in rendered
 

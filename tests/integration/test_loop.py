@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
+import shlex
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, AsyncGenerator
+from xml.sax.saxutils import escape
 
 import pytest
 from pydantic import BaseModel
@@ -17,7 +23,10 @@ from ash.core.session import SessionStorageError, SessionStore
 from ash.providers.base import StreamChunk
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import BaseTool, ToolResult
+from ash.tools.command import RunCommandTool
+from ash.tools.filesystem import ReadFileTool
 from ash.tools.goals import UpdateGoalTool
+from ash.tools.patch import ApplyPatchTool
 from ash.ui.terminal import TerminalUI
 
 
@@ -60,6 +69,9 @@ class FakeProvider:
         for fragment in script:
             yield StreamChunk(content=fragment)
         yield StreamChunk(content="", is_done=True)
+
+    async def aclose(self) -> None:
+        return None
 
 
 class ReadArgs(BaseModel):
@@ -243,6 +255,171 @@ def test_tool_call_turn_executes_and_loops_back_to_provider(
     tool_response = session.messages[2].content
     assert '<tool_response name="read_file"' in tool_response
     assert "FILE CONTENT" in tool_response
+
+
+@pytest.mark.asyncio
+async def test_quiet_command_exit_code_reaches_provider_during_repair(
+    tmp_workspace: Path,
+    safety_guard: SafetyGuard,
+    session_store: SessionStore,
+) -> None:
+    (tmp_workspace / "mathlib.py").write_text(
+        "def double(value):\n    return value\n\n", encoding="utf-8"
+    )
+    (tmp_workspace / "quiet_check.py").write_text(
+        "import io\n"
+        "import unittest\n"
+        "from mathlib import double\n\n"
+        "class TestDouble(unittest.TestCase):\n"
+        "    def test_double(self):\n"
+        "        self.assertEqual(double(4), 8)\n\n"
+        "result = unittest.TextTestRunner(\n"
+        "    stream=io.StringIO(), verbosity=0\n"
+        ").run(unittest.defaultTestLoader.loadTestsFromTestCase(TestDouble))\n"
+        "raise SystemExit(0 if result.wasSuccessful() else 23)\n",
+        encoding="utf-8",
+    )
+    git_init = subprocess.run(
+        ["git", "init", "-q"],
+        cwd=tmp_workspace,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert git_init.returncode == 0, git_init.stderr
+
+    command = f"{shlex.quote(sys.executable)} -B quiet_check.py"
+    patch = (
+        "--- a/mathlib.py\n"
+        "+++ b/mathlib.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " def double(value):\n"
+        "-    return value\n"
+        "+    return value * 2\n"
+        " \n"
+    )
+    provider = FakeProvider(
+        scripts=[
+            [
+                '<call_tool name="run_command"><arg name="command_line">'
+                + escape(command)
+                + "</arg></call_tool>"
+            ],
+            [
+                '<call_tool name="read_file"><arg name="file_path">'
+                "quiet_check.py</arg></call_tool>"
+            ],
+            [
+                '<call_tool name="read_file"><arg name="file_path">'
+                "mathlib.py</arg></call_tool>"
+            ],
+            [
+                '<call_tool name="apply_patch"><arg name="patch">'
+                + escape(patch)
+                + "</arg></call_tool>"
+            ],
+            [
+                '<call_tool name="run_command"><arg name="command_line">'
+                + escape(command)
+                + "</arg></call_tool>"
+            ],
+            ["The quiet check passes after fixing double."],
+        ]
+    )
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=tmp_workspace,
+        tools={
+            "read_file": ReadFileTool(safety_guard),
+            "apply_patch": ApplyPatchTool(safety_guard),
+            "run_command": RunCommandTool(
+                safety_guard,
+                project_root=tmp_workspace,
+            ),
+        },
+        safety_tier="auto_approve",
+    )
+    events: list[dict[str, Any]] = []
+    original_emit_event = loop.ui.emit_event
+
+    def capture_event(event: dict[str, Any]) -> None:
+        events.append(event.copy())
+        original_emit_event(event)
+
+    loop.ui.emit_event = capture_event  # type: ignore[method-assign]
+
+    try:
+        response = await loop.run_turn(
+            "Fix the bug in double and run the quiet regression check."
+        )
+        failure_message = next(
+            message
+            for message in provider.received_messages[1]
+            if message.get("role") == "tool"
+            and '<tool_response name="run_command"' in str(message.get("content"))
+        )
+        failure_payload = json.loads(
+            ET.fromstring(str(failure_message["content"])).text or "{}"
+        )
+        assert failure_payload["success"] is False
+        assert failure_payload["output"] == ""
+        assert failure_payload["error"] is None
+        assert failure_payload.get("exit_code") == 23
+
+        latest_command_result = next(
+            message
+            for message in reversed(provider.received_messages[-1])
+            if message.get("role") == "tool"
+            and '<tool_response name="run_command"' in str(message.get("content"))
+        )
+        final_payload = json.loads(
+            ET.fromstring(str(latest_command_result["content"])).text or "{}"
+        )
+        assert final_payload["success"] is True
+        assert final_payload.get("exit_code") == 0
+        command_events = [
+            event
+            for event in events
+            if event.get("type") == "tool.completed"
+            and event.get("tool") == "run_command"
+        ]
+        assert [event.get("exit_code") for event in command_events] == [23, 0]
+        assert response == "The quiet check passes after fixing double."
+        assert (tmp_workspace / "mathlib.py").read_text(encoding="utf-8") == (
+            "def double(value):\n    return value * 2\n\n"
+        )
+        final_test = subprocess.run(
+            [sys.executable, "-B", "quiet_check.py"],
+            cwd=tmp_workspace,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        assert final_test.returncode == 0, final_test.stderr
+
+        session = session_store.load_session(loop.current_session.session_id)
+        assert len(session.tool_calls) == 5
+        assert all(
+            call.approved and call.executed and call.dispatched
+            for call in session.tool_calls
+        )
+        command_audits = [
+            entry
+            for entry in session_store.list_audit_logs(session.session_id)
+            if entry.action_type == "command_run"
+        ]
+        assert [entry.details.get("exit_code") for entry in command_audits] == [
+            23,
+            0,
+        ]
+        assert session_store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
 
 
 def _attach_goal_tool(loop: AshLoop, safety_guard: SafetyGuard) -> None:

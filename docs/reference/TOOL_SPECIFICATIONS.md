@@ -179,6 +179,11 @@ Executes user-approved commands in a subprocess shell.
     3.  If command contains blacklisted patterns, raise `SafetyViolation` immediately.
     4.  All commands run with standard output buffering. Max output size is limited to 100,000 characters.
 
+Tool results report `success` separately from process output and include an
+`exit_code` when the process completed with a known status. Timeouts and other
+unknown outcomes omit the code so a termination status is not presented as a
+completed command result.
+
 ### 2.6 `git_status` / `git_diff` / `git_log` / `auto_commit`
 
 The read-only Git tools expose bounded status, diff, and recent-log inspection.

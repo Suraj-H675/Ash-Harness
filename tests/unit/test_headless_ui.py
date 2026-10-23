@@ -336,10 +336,24 @@ def test_stream_json_emits_tool_lifecycle_events() -> None:
     unsubscribe = ui.subscribe(observed.append)
 
     ui.emit_event({"type": "tool.started", "call_id": "c1", "tool": "read_file"})
+    ui.emit_event(
+        {
+            "type": "tool.completed",
+            "call_id": "c2",
+            "tool": "run_command",
+            "success": False,
+            "exit_code": 23,
+        }
+    )
     unsubscribe()
 
-    assert json.loads(stream.getvalue())["type"] == "tool.started"
-    assert len(observed) == 1
+    rendered_events = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert [event["type"] for event in rendered_events] == [
+        "tool.started",
+        "tool.completed",
+    ]
+    assert rendered_events[1]["exit_code"] == 23
+    assert len(observed) == 2
     _assert_envelope(observed[0])
     assert observed[0]["type"] == "tool.started"
     assert observed[0]["call_id"] == "c1"
