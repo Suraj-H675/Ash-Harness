@@ -16,6 +16,9 @@ Start with:
 The plain doctor is local-only. The connect form additionally checks the
 configured provider route/catalog without making a model completion. Use
 ash providers test when you explicitly want one bounded real completion.
+Routes without a supported model catalog produce an unverified warning in
+doctor --connect, not a connectivity failure. Use ash providers test to check
+those routes; a real completion may incur provider charges.
 
 ## Update
 

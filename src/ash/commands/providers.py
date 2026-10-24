@@ -269,6 +269,18 @@ def render_provider_test(
         tool_probe = "failed: " + terminal_safe_text(detail, single_line=True)
     else:
         tool_probe = "not attempted"
+    if verification.requested_checks_passed:
+        result = "Result: ready to use"
+    elif verification.ready_to_use:
+        result = "Result: completion works, but native tool calling was not verified"
+    elif (
+        verification.catalog_authoritative and not verification.selected_model_available
+    ):
+        result = "Result: endpoint is reachable, but the selected model is unavailable"
+    elif verification.catalog_authoritative:
+        result = "Result: model is available, but a completion could not be verified"
+    else:
+        result = "Result: completion could not be verified"
     return "\n".join(
         [
             "Provider: "
@@ -301,18 +313,7 @@ def render_provider_test(
                 if verification.native_tool_probe_failure_kind in _NATIVE_TOOL_FAILURE_GUIDANCE
                 else []
             ),
-            (
-                "Result: ready to use"
-                if verification.requested_checks_passed
-                else "Result: completion works, but native tool calling was not verified"
-                if verification.ready_to_use
-                else "Result: endpoint is reachable, but the selected model is unavailable"
-                if (
-                    verification.catalog_authoritative
-                    and not verification.selected_model_available
-                )
-                else "Result: model is available, but a completion could not be verified"
-            ),
+            result,
             *(
                 [
                     "Next: Run 'ash setup model' to update the saved route. If ASH_MODEL "

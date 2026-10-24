@@ -588,6 +588,16 @@ async def _check_connectivity(config: AshConfig) -> DoctorCheck:
         if config.provider == "openai" and config.openai_auth_mode == "chatgpt":
             verification = await verify_chatgpt_plan_connection(config)
         else:
+            connection = await asyncio.to_thread(resolve_provider_connection, config)
+            if not connection.catalog_endpoint:
+                return DoctorCheck(
+                    "connectivity",
+                    "warn",
+                    f"{connection.provider}/{connection.model_name}: no supported live model catalog; "
+                    "endpoint and model not verified",
+                    "Run ash providers test for a bounded real completion check "
+                    "(which may incur provider charges).",
+                )
             verification = await asyncio.to_thread(
                 verify_provider_connection,
                 config,

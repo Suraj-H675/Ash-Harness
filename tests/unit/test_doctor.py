@@ -223,6 +223,32 @@ async def test_connectivity_fails_when_selected_model_is_not_advertised(
 
 
 @pytest.mark.asyncio
+async def test_connectivity_without_catalog_reports_unverified_not_failed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "ash.commands.doctor.verify_provider_connection",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("no catalog request should be attempted")
+        ),
+    )
+
+    check = await _check_connectivity(
+        AshConfig(
+            model="vertex/gemini-test",
+            vertex_project="fictional-project",
+            vertex_location="us-central1",
+            workspace_root=tmp_path,
+        )
+    )
+
+    assert check.status == "warn"
+    assert "endpoint and model not verified" in check.message
+    assert "ash providers test" in check.remedy
+    assert "charges" in check.remedy
+
+
+@pytest.mark.asyncio
 async def test_connectivity_verification_failure_has_direct_remedy(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

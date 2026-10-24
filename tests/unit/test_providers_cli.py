@@ -888,6 +888,35 @@ def test_provider_test_human_rendering_distinguishes_completion_failure() -> Non
     assert "Next:" not in rendered
 
 
+def test_provider_test_human_rendering_does_not_overstate_non_authoritative_model(
+) -> None:
+    from ash.commands.providers import render_provider_test
+
+    verification = ProviderVerification(
+        connection=ProviderConnection(
+            provider="vertex",
+            model_name="gemini-test",
+            base_url="https://us-central1-aiplatform.googleapis.com/v1/projects/project/locations/us-central1/endpoints/openapi",
+            catalog_endpoint="",
+            catalog_format="openai",
+            auth_mode="adc",
+        ),
+        models=("gemini-test",),
+        selected_model_available=False,
+        catalog_authoritative=False,
+        completion_attempted=True,
+        completion_verified=False,
+        completion_error="deployment was not found",
+    )
+
+    rendered = render_provider_test(verification)
+
+    assert "Catalog: 1 candidate model(s); not authoritative for this route" in rendered
+    assert "Completion: failed: deployment was not found" in rendered
+    assert "Result: completion could not be verified" in rendered
+    assert "model is available" not in rendered
+
+
 @pytest.mark.parametrize(
     "model_override",
     [None, "openrouter/test-model"],
