@@ -5,10 +5,11 @@ import inspect
 from pathlib import Path
 
 import ash.cli as cli_module
+import ash.cli_parser as cli_parser_module
 
 
 def test_every_cli_subparser_declares_discovery_help() -> None:
-    source_path = Path(inspect.getsourcefile(cli_module) or "")
+    source_path = Path(inspect.getsourcefile(cli_parser_module) or "")
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     missing: list[str] = []
 
@@ -26,12 +27,14 @@ def test_every_cli_subparser_declares_discovery_help() -> None:
 
 
 def test_every_top_level_cli_command_has_a_dispatch_handler() -> None:
-    source_path = Path(inspect.getsourcefile(cli_module) or "")
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    parser_source_path = Path(inspect.getsourcefile(cli_parser_module) or "")
+    cli_source_path = Path(inspect.getsourcefile(cli_module) or "")
+    parser_tree = ast.parse(parser_source_path.read_text(encoding="utf-8"))
+    cli_tree = ast.parse(cli_source_path.read_text(encoding="utf-8"))
     registered: set[str] = set()
     handled: set[str] = set()
 
-    for node in ast.walk(tree):
+    for node in ast.walk(parser_tree):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -43,7 +46,8 @@ def test_every_top_level_cli_command_has_a_dispatch_handler() -> None:
             and isinstance(node.args[0].value, str)
         ):
             registered.add(node.args[0].value)
-            continue
+
+    for node in ast.walk(cli_tree):
         if not isinstance(node, ast.Compare):
             continue
         left = node.left
