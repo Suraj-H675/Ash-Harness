@@ -430,8 +430,11 @@ def test_apply_update_json_success_is_machine_readable(capsys) -> None:
 def test_json_install_commands_keep_subprocess_progress_off_stdout(
     operation: str, capfd: pytest.CaptureFixture[str]
 ) -> None:
-    def installer(*, ref: str | None = None) -> InstallResult:
+    def installer(
+        *, ref: str | None = None, force_reinstall: bool = False
+    ) -> InstallResult:
         assert ref == "ash-v0.4.4"
+        assert force_reinstall is (operation == "repair")
         _run_streaming(
             [
                 sys.executable,
@@ -490,17 +493,17 @@ def test_apply_update_json_noop_stays_machine_readable(capsys) -> None:
 def test_repair_reinstalls_exact_current_release_and_preserves_user_state_claim(
     capsys,
 ) -> None:
-    calls: list[str | None] = []
+    calls: list[tuple[str | None, bool]] = []
 
-    def installer(*, ref: str | None = None):
-        calls.append(ref)
+    def installer(*, ref: str | None = None, force_reinstall: bool = False):
+        calls.append((ref, force_reinstall))
         return InstallResult("pipx", "/isolated/bin/ash", "ash 0.2.0")
 
     assert repair_installation(
         current_version="0.2.0",
         installer=installer,
     ) == 0
-    assert calls == ["ash-v0.2.0"]
+    assert calls == [("ash-v0.2.0", True)]
     output = capsys.readouterr().out
     assert "repaired successfully" in output
     assert "configuration, profiles, sessions, and extensions were preserved" in output
@@ -508,8 +511,9 @@ def test_repair_reinstalls_exact_current_release_and_preserves_user_state_claim(
 
 
 def test_repair_json_is_machine_readable(capsys) -> None:
-    def installer(*, ref: str | None = None):
+    def installer(*, ref: str | None = None, force_reinstall: bool = False):
         assert ref == "ash-v0.2.0"
+        assert force_reinstall is True
         return InstallResult("uv", "/isolated/bin/ash", "ash 0.2.0")
 
     assert repair_installation(

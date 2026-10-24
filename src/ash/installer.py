@@ -383,6 +383,7 @@ def install(
     *,
     extras: Sequence[str] = (),
     ref: str | None = None,
+    force_reinstall: bool = False,
     runtime_python: str | None = None,
     host_platform: str = sys.platform,
     runner: Callable[..., Any] = subprocess.run,
@@ -418,6 +419,7 @@ def install(
             uv,
             extras=requested_extras,
             ref=ref,
+            force_reinstall=force_reinstall,
             runtime_python=runtime_python,
             runner=runner,
             environment=environment,
@@ -480,6 +482,7 @@ def install(
                 uv,
                 extras=requested_extras,
                 ref=ref,
+                force_reinstall=force_reinstall,
                 runtime_python=runtime_python,
                 runner=runner,
                 environment=environment,
@@ -500,7 +503,7 @@ def install(
     launcher_directory = None
     existing_executable = None
     current_version = None
-    if previous.installed and ref is not None:
+    if previous.installed and ref is not None and not force_reinstall:
         launcher_directory = _pipx_bin_directory(
             pipx,
             runner=runner,
@@ -703,6 +706,7 @@ def _install_with_uv(
     *,
     extras: Sequence[str],
     ref: str | None,
+    force_reinstall: bool,
     runtime_python: str | None,
     runner: Callable[..., Any],
     environment: Mapping[str, str],
@@ -716,7 +720,7 @@ def _install_with_uv(
     launcher_directory = None
     existing_executable = None
     current_version = None
-    if previous.installed and ref is not None:
+    if previous.installed and ref is not None and not force_reinstall:
         launcher_directory = _uv_bin_directory(
             uv,
             runner=runner,

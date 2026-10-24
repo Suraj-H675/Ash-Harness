@@ -304,7 +304,7 @@ def repair_installation(
         )
     release_tag = f"ash-v{current}"
     try:
-        result = installer(ref=release_tag)
+        result = installer(ref=release_tag, force_reinstall=True)
     except InstallError as exc:
         raise ValueError(str(exc)) from exc
     except OSError as exc:

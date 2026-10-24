@@ -586,6 +586,84 @@ def test_existing_uv_release_install_skips_reinstall_when_already_current() -> N
     assert not any(command[1:3] == ["tool", "install"] for command in calls)
 
 
+@pytest.mark.parametrize("manager", ["uv", "pipx"])
+def test_force_reinstall_replaces_matching_release_and_preserves_extras(
+    manager: str,
+) -> None:
+    calls: list[list[str]] = []
+    requirement = (
+        "ash-ai[browser] @ "
+        f"file:///tmp/ash_ai-0.2.0-py3-none-any.whl#sha256={_TEST_RELEASE_SHA256}"
+    )
+    pipx_listing = json.dumps(
+        {
+            "venvs": {
+                "ash-ai": {
+                    "metadata": {
+                        "python_version": "Python 3.14.7",
+                        "main_package": {
+                            "package_or_url": requirement,
+                            "package_version": "0.2.0",
+                            "app_paths": [{"__Path__": "/isolated/bin/ash"}],
+                        },
+                    }
+                }
+            }
+        }
+    )
+    uv_listing = (
+        f"ash-ai v0.2.0 [required: {requirement}] "
+        "[extras: browser] [CPython 3.14.7] (/isolated/tools/ash-ai)\n"
+        "- ash (/isolated/bin/ash)\n"
+    )
+
+    def runner(command, **kwargs):
+        del kwargs
+        calls.append(list(command))
+        if command[1:] == ["list", "--json"]:
+            return _completed(stdout=pipx_listing)
+        if command[1:] == [
+            "tool",
+            "list",
+            "--show-paths",
+            "--show-version-specifiers",
+            "--show-extras",
+            "--show-python",
+        ]:
+            return _completed(stdout=uv_listing)
+        if command[1:] == ["tool", "dir", "--bin"]:
+            return _completed(stdout="/isolated/bin\n")
+        if command == ["/isolated/bin/ash", "--version"]:
+            return _completed(stdout="ash 0.2.0\n")
+        if command[1:3] in (["tool", "install"], ["install", "--force"]):
+            return _completed()
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = install(
+        ref="ash-v0.2.0",
+        force_reinstall=True,
+        runner=runner,
+        which=lambda name: f"/usr/bin/{name}" if name == manager else None,
+        environ={
+            "PATH": f"/isolated/bin{os.pathsep}/usr/bin",
+            "PIPX_BIN_DIR": "/isolated/bin",
+        },
+        release_opener=_release_opener(),
+    )
+
+    install_commands = [
+        command
+        for command in calls
+        if command[1:3] in (["tool", "install"], ["install", "--force"])
+    ]
+    assert len(install_commands) == 1
+    assert install_commands[0][-1].startswith("ash-ai[browser] @ file://")
+    assert install_commands[0][-1].endswith(f"#sha256={_TEST_RELEASE_SHA256}")
+    assert result.manager == manager
+    assert result.version == "ash 0.2.0"
+    assert result.changed is True
+
+
 def test_same_version_source_install_is_repaired_to_verified_release() -> None:
     calls: list[list[str]] = []
     list_calls = 0
