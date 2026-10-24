@@ -45,9 +45,12 @@ Event-specific fields remain at the top level. For example:
 
 `tool.started` is emitted only after Ash has durably recorded that dispatch is
 beginning. Exactly one terminal event then follows for that call:
-`tool.completed` for a completed invocation, `tool.error` for a failure or
-ambiguous result, or `tool.skipped` when pre-execution middleware stopped the
-call before dispatch.
+`tool.completed` when an invocation returns a known result (including an
+unsuccessful result), `tool.error` for execution errors or ambiguous outcomes,
+or `tool.skipped` when pre-execution middleware stopped the call before dispatch.
+Consumers must inspect `success` rather than treating `tool.completed` as proof
+of success. For example, a `run_command` that exits with status 23 emits
+`tool.completed` with `success: false` and `exit_code: 23`.
 
 Every terminal `tool.error` includes these stable fields:
 
@@ -86,6 +89,12 @@ These events make retry/failover behavior observable without requiring
 consumers to infer provider attempts from assistant deltas.
 
 ## Turn completion identity
+
+`turn.completed` means the Ash turn reached its terminal boundary, not that
+the user's task passed verification. In particular, a provider may produce a
+normal terminal response with empty text. Automation must inspect the response,
+`stop_reason`, and relevant tool outcomes or independent verification evidence
+before claiming that the requested work is complete.
 
 `turn.completed` preserves the legacy model-only `model` field and may also
 include `model_id`, the canonical `provider/model` identity of the provider that
