@@ -6,6 +6,38 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Added Agent Skills discovery from shared user and trusted-workspace skill
+  directories.
+
+### Development tooling
+- Added checkout-only Ash Explorer for bounded CLI probes and
+  evidence-verified model-directed runs. It is not included in the release wheel.
+
+### Changed
+- Added bounded directory listing, filename globbing, and literal text search
+  to coding tools. Command results now report exit status for failure recovery.
+- File checkpoints now record post-edit permission modes. Recovery checks
+  those modes for new checkpoints while preserving hash-based behavior for
+  existing checkpoints.
+- New turn-journal rows omit raw prompt text, and durable compaction preserves
+  provider-visible context.
+
+### Fixed
+- Preserved completed file work during interruption and recovery, and bounded
+  searches, public web operations, and automation webhook dispatch.
+- Improved provider result handling, URL validation, and streamed secret
+  redaction.
+
+### Security
+- Updated dependencies to patched security releases.
+
+### Upgrade notes
+- A 0.4.6 session database uses schema v20. The planned 0.5.0 release advances it to
+  v21 and creates a `before-v21-migration` backup before adding the nullable
+  `file_checkpoints.after_mode` column. See [Maintenance and recovery](docs/guides/MAINTENANCE.md#roll-back-across-a-session-schema-migration)
+  before upgrading if you may need to roll back the package.
+
 ## [0.4.6] - 2026-10-17
 
 ### Fixed
@@ -450,7 +482,10 @@ All notable changes to Ash are documented here. The format follows
 - Fixed duplicate `project.urls` tables so the distribution builds with modern
   `setuptools`; expanded CI across Python 3.11 and 3.12.
 
-[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.3...HEAD
+[Unreleased]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.6...HEAD
+[0.4.6]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.5...ash-v0.4.6
+[0.4.5]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.4...ash-v0.4.5
+[0.4.4]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.3...ash-v0.4.4
 [0.4.3]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.2...ash-v0.4.3
 [0.4.2]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.1...ash-v0.4.2
 [0.4.1]: https://github.com/Suraj-H675/Ash-Harness/compare/ash-v0.4.0...ash-v0.4.1

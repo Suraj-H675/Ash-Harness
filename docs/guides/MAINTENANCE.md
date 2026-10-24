@@ -168,6 +168,29 @@ separately, restore this v19 backup while still running 0.4.3, then install
 the immutable 0.4.2 package. Do not start 0.4.3 against that database again
 before reinstalling 0.4.2, or it will migrate the schema forward.
 
+For **0.4.6 → 0.5.0**, the session schema advances
+from v20 to v21. Before migration, Ash creates a
+`sessions.db.before-v21-migration.<timestamp>.backup`. Migration adds the
+nullable `after_mode` column to `file_checkpoints`. It preserves the saved
+content and `before_mode` for existing checkpoints. Their `after_mode` value is
+null, so recovery keeps the previous hash-based check.
+
+To return to 0.4.6 after the migration:
+
+1. Stop all Ash processes that use the profile or database.
+2. Preserve work created after the migration separately. The v20 backup does
+   not include it.
+3. Restore the `before-v21-migration` backup with
+   `ash storage restore /path/to/backup --yes` while the newer release is
+   installed.
+4. Immediately install the immutable 0.4.6 package. Do not start the newer
+   release again before installing 0.4.6, or it will migrate the database to
+   v21 again.
+
+If no compatible v20 backup exists, keep the newer release installed or
+restore another known-good v20 backup. Do not start 0.4.6 against a v21
+database.
+
 ## Reset selected default-profile state
 
 Ash reset is deliberately selective:
