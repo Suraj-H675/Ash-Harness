@@ -12,8 +12,8 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 _SECRET_VALUE_ASSIGNMENT = re.compile(
     r"""(?ix)
     (?P<field_quote>(?:\\?["'])?)
-    (?P<field>(?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token))\b
-    (?P=field_quote)
+    (?P<field>(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token))\b
+    (?P<closing_field_quote>(?:\\?["'])?)
     (?P<separator>\s*[=:]\s*)
     (?:
         (?P<escaped_double>\\"(?:\\.|[^"\\])*?(?<!\\)\\")
@@ -29,8 +29,8 @@ _SECRET_VALUE_ASSIGNMENT = re.compile(
 _UNTERMINATED_SECRET_VALUE_ASSIGNMENT = re.compile(
     r"""(?ix)
     (?P<field_quote>(?:\\?["'])?)
-    (?P<field>(?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token))\b
-    (?P=field_quote)
+    (?P<field>(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token))\b
+    (?P<closing_field_quote>(?:\\?["'])?)
     (?P<separator>\s*[=:]\s*)
     (?:
         (?P<escaped_double>\\"(?:\\.|[^"\\])*)
@@ -100,7 +100,7 @@ _SECRET_CANDIDATE_PATTERNS = (
 )
 _SECRET_ASSIGNMENT = re.compile(
     r"""(?ix)
-    \b(?:[a-z0-9]+[_-])*
+    (?<![a-z0-9])
     (api[_-]?key|access[_-]?token|auth[_-]?token|secret|password)\b
     \s*[=:]\s*
     (?:
@@ -420,23 +420,24 @@ def _redact_secret_assignment(match: re.Match[str]) -> str:
         or ""
     )
     field_quote = match.group("field_quote")
-    if field_quote.startswith("\\"):
+    closing_field_quote = match.group("closing_field_quote") or ""
+    if field_quote.startswith("\\") or closing_field_quote.startswith("\\"):
         return (
-            f"{field_quote}{match.group('field')}{field_quote}"
+            f"{field_quote}{match.group('field')}{closing_field_quote}"
             f"{match.group('separator')}"
             r'\"[REDACTED]\"'
         )
     if value.startswith('\\"') and value.endswith('\\"'):
         return (
             f"{match.group('field_quote')}{match.group('field')}"
-            f"{match.group('field_quote')}{match.group('separator')}"
+            f"{closing_field_quote}{match.group('separator')}"
             r'\"[REDACTED]\"'
         )
     quote = value[0] if value[:1] in {'"', "'"} else ""
     closing_quote = quote if quote else ""
     return (
-        f"{match.group('field_quote')}{match.group('field')}"
-        f"{match.group('field_quote')}{match.group('separator')}"
+        f"{field_quote}{match.group('field')}"
+        f"{closing_field_quote}{match.group('separator')}"
         f"{quote}[REDACTED]{closing_quote}"
     )
 
@@ -450,15 +451,16 @@ def _redact_unterminated_secret_assignment(match: re.Match[str]) -> str:
     )
     quote = value[:1]
     field_quote = match.group("field_quote")
+    closing_field_quote = match.group("closing_field_quote") or ""
     if value.startswith("\\"):
         return (
-            f"{field_quote}{match.group('field')}{field_quote}"
+            f"{field_quote}{match.group('field')}{closing_field_quote}"
             f"{match.group('separator')}"
             r'\"[REDACTED]'
         )
     return (
         f"{field_quote}{match.group('field')}"
-        f"{field_quote}{match.group('separator')}"
+        f"{closing_field_quote}{match.group('separator')}"
         f"{quote}[REDACTED]"
     )
 
@@ -615,8 +617,8 @@ def _last_whitespace_boundary(value: str) -> int | None:
 _SECRET_ASSIGNMENT_START = re.compile(
     r"""(?ix)
     (?P<field_quote>(?:\\?["'])?)
-    (?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token)\b
-    (?P=field_quote)
+    (?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token)\b
+    (?P<closing_field_quote>(?:\\?["'])?)
     \s*[=:]\s*
     (?P<value_escape>\\?)(?P<value_quote>["'])
     """
@@ -624,9 +626,9 @@ _SECRET_ASSIGNMENT_START = re.compile(
 _SECRET_ASSIGNMENT_PREFIX = re.compile(
     r"""(?ix)
     (?P<field_quote>(?:\\?["'])?)
-    (?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token)\b
-    (?P=field_quote)
-    (?:\s*[=:]\s*\\?)?
+    (?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|token)\b
+    (?P<closing_field_quote>(?:\\?["'])?)
+    [ \t]*(?:[=:][ \t]*\\?)?
     $
     """
 )
@@ -659,6 +661,9 @@ def _incomplete_secret_assignment_start(value: str) -> int | None:
     starts: list[int] = []
     for match in _SECRET_ASSIGNMENT_START.finditer(value):
         if _quoted_secret_end(value, match) is None:
+            starts.append(match.start())
+    for match in _SECRET_VALUE_ASSIGNMENT.finditer(value):
+        if match.group("unquoted") is not None and match.end() == len(value):
             starts.append(match.start())
     prefix = _SECRET_ASSIGNMENT_PREFIX.search(value)
     if prefix is not None:

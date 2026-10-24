@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 import ash.core.redaction as redaction_module
@@ -18,6 +20,61 @@ def test_redaction_handles_common_secret_shapes() -> None:
     assert redact_value({"api_key": "sk-example-secret-12345"}) == {
         "api_key": "[REDACTED]"
     }
+
+
+def test_redaction_handles_long_unbroken_text_without_quadratic_delay() -> None:
+    value = "x" * 16_384
+    started = time.perf_counter()
+
+    rendered = redact_text(value)
+
+    elapsed = time.perf_counter() - started
+    assert rendered == value
+    assert elapsed < 1.0
+
+
+@pytest.mark.parametrize(
+    ("value", "marker"),
+    [
+        ("OPENAI_API_KEY=compound-assignment-secret", "compound-assignment-secret"),
+        (
+            'payload={"service_password": "compound-quoted-secret"}',
+            "compound-quoted-secret",
+        ),
+        (
+            r'payload={\"service_auth_token\": \"compound-escaped-secret\"}',
+            "compound-escaped-secret",
+        ),
+    ],
+)
+def test_redaction_catches_compound_assignment_field_names(
+    value: str,
+    marker: str,
+) -> None:
+    assert marker not in redact_text(value)
+
+
+def test_secret_candidate_scan_handles_long_delimited_nonsecret_text_quickly() -> None:
+    value = "x-" * 8_192
+    started = time.perf_counter()
+
+    findings = find_secret_candidates(value)
+
+    elapsed = time.perf_counter() - started
+    assert findings == ()
+    assert elapsed < 1.0
+
+
+def test_streaming_redactor_handles_long_delimited_text_quickly() -> None:
+    value = "x-" * 4_096
+    redactor = StreamingRedactor(max_token_characters=8_193)
+    started = time.perf_counter()
+
+    emitted = redactor.feed(value)
+
+    elapsed = time.perf_counter() - started
+    assert emitted == ""
+    assert elapsed < 1.0
 
 
 @pytest.mark.parametrize(
@@ -186,6 +243,28 @@ def test_streaming_redactor_retains_chunk_split_secrets() -> None:
     assert "supersecretvalue" not in emitted
     assert "[REDACTED]" in emitted
     assert tail == "next"
+
+
+@pytest.mark.parametrize(
+    ("value", "secret"),
+    [
+        ("foobar-secret: synthetic-marker-unquoted\n", "synthetic-marker-unquoted"),
+        ("password: synthetic-marker-plain\n", "synthetic-marker-plain"),
+        ("OPENAI_API_KEY = synthetic-marker-assignment\n", "synthetic-marker-assignment"),
+    ],
+)
+def test_streaming_redactor_withholds_unquoted_assignment_values_across_chunks(
+    value: str, secret: str
+) -> None:
+    for split in range(len(value) + 1):
+        redactor = StreamingRedactor()
+        emitted = (
+            redactor.feed(value[:split])
+            + redactor.feed(value[split:])
+            + redactor.finish()
+        )
+        assert secret not in emitted
+        assert "[REDACTED]" in emitted
 
 
 def test_redaction_removes_private_key_blocks() -> None:
