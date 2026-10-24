@@ -61,7 +61,7 @@ jobs:
           uv build --wheel "$sdist" --out-dir dist
           cp src/ash/installer.py dist/install-ash.py
           cp install.sh dist/install.sh
-          sha256sum dist/* > dist/SHA256SUMS
+          (cd dist && sha256sum *.whl *.tar.gz install-ash.py install.sh > SHA256SUMS)
 
       - name: Verify release artifacts
         shell: bash
@@ -77,7 +77,7 @@ jobs:
           .release-smoke/bin/python tests/packaging/smoke_minimal_install.py
           uv run --python 3.10 --no-project python -I tests/packaging/smoke_standalone_installer_py310.py
           sh -n dist/install.sh
-          sha256sum --check dist/SHA256SUMS
+          (cd dist && sha256sum --check SHA256SUMS)
 
       - name: Attest release artifacts
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1

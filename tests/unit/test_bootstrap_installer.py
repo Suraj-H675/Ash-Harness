@@ -86,7 +86,42 @@ def test_release_workflow_publishes_bootstrap_as_attested_asset() -> None:
 
     assert "cp install.sh dist/install.sh" in source
     assert source.count("dist/install.sh") >= 3
-    assert "sha256sum dist/* > dist/SHA256SUMS" in source
+
+
+def test_release_checksums_verify_after_flat_asset_download(tmp_path: Path) -> None:
+    source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    generation = next(
+        line.strip()
+        for line in source.splitlines()
+        if "sha256sum" in line and "> " in line and "SHA256SUMS" in line
+    )
+    assert "(cd dist && " in generation
+    assert "(cd dist && sha256sum --check SHA256SUMS)" in source
+
+    dist = tmp_path / "dist"
+    download = tmp_path / "download"
+    dist.mkdir()
+    download.mkdir()
+    for name in ("ash_ai-test.whl", "ash_ai-test.tar.gz", "install-ash.py", "install.sh"):
+        (dist / name).write_bytes(name.encode())
+
+    generated = subprocess.run(
+        ["bash", "-eu", "-c", generation],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert generated.returncode == 0, generated.stderr
+    for asset in dist.iterdir():
+        shutil.copy2(asset, download / asset.name)
+
+    verified = subprocess.run(
+        ["sha256sum", "--check", "SHA256SUMS"],
+        cwd=download,
+        capture_output=True,
+        text=True,
+    )
+    assert verified.returncode == 0, verified.stderr
 
 
 def test_bootstrap_file_is_executable() -> None:
