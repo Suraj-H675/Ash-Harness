@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -634,6 +635,312 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
         server.server_close()
         thread.join(timeout=2)
 
+
+@pytest.mark.parametrize(
+    ("provider", "base_env", "native_tools"),
+    [("lmstudio", "LMSTUDIO_API_BASE", True), ("vllm", "VLLM_API_BASE", False)],
+)
+def test_local_runtime_failure_feedback_survives_interrupted_process_restart(
+    tmp_path: Path,
+    provider: str,
+    base_env: str,
+    native_tools: bool,
+) -> None:
+    requests: list[dict[str, object]] = []
+    third_request_started = threading.Event()
+    release_third_request = threading.Event()
+
+    def write_action(content: str, overwrite: bool) -> tuple[str, dict[str, object]]:
+        return "write_file", {
+            "file_path": "local_agent.txt",
+            "content": content,
+            "overwrite": overwrite,
+        }
+
+    verify_action = (
+        "run_command",
+        {
+            "command_line": "python3 -B test_local_agent.py",
+            "cwd": ".",
+            "timeout_seconds": 10,
+        },
+    )
+    actions = [
+        write_action("BROKEN\n", False),
+        verify_action,
+        write_action("LOCAL_AGENT_OK\n", True),
+        verify_action,
+    ]
+    expected_tools = [name for name, _ in actions]
+    action_index = 0
+
+    def chunk(delta: dict[str, object], finish: str | None) -> dict[str, object]:
+        return {
+            "id": "local-tool",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "local-model",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+
+    def reply(
+        action: tuple[str, dict[str, object]] | None, call_number: int
+    ) -> list[dict[str, object]]:
+        if action is None:
+            return [chunk({"content": "LOCAL-CODING-OK"}, "stop")]
+        name, arguments = action
+        native_call = {
+            "index": 0,
+            "id": f"call-local-{call_number}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)},
+        }
+        content = (
+            f'<call_tool name="{name}">'
+            + "".join(
+                f'<arg name="{key}">{str(value).lower() if isinstance(value, bool) else value}</arg>'
+                for key, value in arguments.items()
+            )
+            + "</call_tool>"
+        )
+        delta = {"tool_calls": [native_call]} if native_tools else {"content": content}
+        return (
+            [chunk(delta, None), chunk({}, "tool_calls")]
+            if native_tools
+            else [chunk(delta, "stop")]
+        )
+
+    catalogs = {
+        "/api/v1/models": {
+            "models": [
+                {
+                    "key": "local-model",
+                    "type": "llm",
+                    "loaded_instances": [{"config": {"context_length": 32768}}],
+                    "capabilities": {"trained_for_tool_use": True, "vision": False},
+                }
+            ]
+        },
+        "/v1/models": {
+            "object": "list",
+            "data": [{"id": "local-model", "max_model_len": 32768}],
+        },
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+        def send_payload(self, payload: object, *, stream: bool = False) -> None:
+            body = (
+                "".join(
+                    "data: " + json.dumps(item, separators=(",", ":")) + "\n\n"
+                    for item in payload
+                )
+                + "data: [DONE]\n\n"
+                if stream
+                else json.dumps(payload)
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "text/event-stream" if stream else "application/json"
+            )
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            expected = "/api/v1/models" if native_tools else "/v1/models"
+            if self.path != expected:
+                self.send_error(404)
+                return
+            self.send_payload(catalogs[self.path])
+
+        def do_POST(self) -> None:
+            nonlocal action_index
+            if self.path != "/v1/chat/completions":
+                self.send_error(404)
+                return
+            size = int(self.headers.get("Content-Length", "0") or 0)
+            payload = json.loads(self.rfile.read(size) if size else b"{}")
+            requests.append(payload)
+            request_number = len(requests)
+            if request_number == 3:
+                third_request_started.set()
+                if not release_third_request.wait(timeout=25):
+                    self.send_error(504)
+                return
+            if action_index < len(actions):
+                action = actions[action_index]
+                action_index += 1
+                assert bool(payload.get("tools")) is native_tools
+                self.send_payload(reply(action, action_index), stream=True)
+                return
+            assert request_number == 6
+            self.send_payload(reply(None, action_index), stream=True)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    process: subprocess.Popen[str] | None = None
+    try:
+        workspace, home, db_directory = (
+            tmp_path / name for name in ("workspace", "home", "db")
+        )
+        for path in (workspace, home, db_directory):
+            path.mkdir()
+        (workspace / "test_local_agent.py").write_text(
+            "from pathlib import Path\n"
+            "content = Path('local_agent.txt').read_text(encoding='utf-8')\n"
+            "with Path('check_history.txt').open('a', encoding='utf-8') as history:\n"
+            "    history.write(content)\n"
+            "assert content == 'LOCAL_AGENT_OK\\n'\n"
+        )
+        (workspace / "README.md").write_text("# local coding fixture\n")
+        environment = {
+            "PATH": os.pathsep.join((str(Path(sys.executable).parent), os.defpath)),
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "TMPDIR": str(tmp_path),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "NO_COLOR": "1",
+            "ASH_MODEL": f"{provider}/local-model",
+            base_env: f"http://127.0.0.1:{server.server_port}/v1",
+        }
+        _route_loopback_directly(environment)
+        for git_args in (
+            ("init", "-q"),
+            ("config", "user.name", "Ash Test"),
+            ("config", "user.email", "ash@test"),
+            ("add", "README.md", "test_local_agent.py"),
+            ("commit", "-qm", "seed"),
+        ):
+            subprocess.run(
+                ["git", *git_args],
+                cwd=workspace,
+                env=environment,
+                timeout=10,
+                check=True,
+            )
+        ash = [sys.executable, "-m", "ash", "--db-directory", str(db_directory)]
+
+        def cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [*ash, *arguments],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+
+        trust = cli("trust", "add", str(workspace))
+        assert trust.returncode == 0, trust.stderr
+        permission = cli("permissions", "allow", "run_command", "--json")
+        assert permission.returncode == 0, permission.stderr
+        process = subprocess.Popen(
+            [
+                *ash,
+                "--mode",
+                "auto_edit",
+                "-p",
+                "Create local_agent.txt, run its test, repair the failure, and verify.",
+                "--output-format",
+                "json",
+            ],
+            cwd=workspace,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert third_request_started.wait(timeout=15), (
+            f"CLI never reached the held provider request; exit={process.poll()}"
+        )
+        assert (workspace / "local_agent.txt").read_bytes() == b"BROKEN\n"
+        assert (workspace / "check_history.txt").read_bytes() == b"BROKEN\n"
+        try:
+            process.kill()
+            process.communicate(timeout=5)
+        finally:
+            release_third_request.set()
+        assert process.returncode is not None and process.returncode != 0
+
+        store = SessionStore(db_directory / "sessions.db")
+        sessions = store.list_sessions(project_path=str(workspace), limit=5)
+        assert len(sessions) == 1
+        session_id = sessions[0].session_id
+        interrupted = store.load_session(session_id)
+        assert len(store.started_turns(session_id)) == 1
+        before_calls = interrupted.tool_calls
+        assert [call.tool_name for call in before_calls] == expected_tools[:2]
+        assert all(call.approved and call.executed for call in before_calls)
+        assert before_calls[1].error and "AssertionError" in before_calls[1].error
+
+        resumed = cli(
+            "--session",
+            session_id,
+            "--mode",
+            "auto_edit",
+            "-p",
+            "Continue from the saved test failure, repair the file, and verify it.",
+            "--output-format",
+            "json",
+        )
+        assert resumed.returncode == 0, resumed.stderr
+        result = json.loads(resumed.stdout)
+        assert result["session_id"] == session_id
+        assert result["response"] == "LOCAL-CODING-OK"
+        assert len(requests) == 6
+        assert "AssertionError" in json.dumps(requests[3]["messages"])
+        assert (workspace / "local_agent.txt").read_bytes() == b"LOCAL_AGENT_OK\n"
+        assert (
+            workspace / "check_history.txt"
+        ).read_bytes() == b"BROKEN\nLOCAL_AGENT_OK\n"
+
+        recovery = cli("sessions", "recovery", "--session", session_id, "--json")
+        assert recovery.returncode == 0, recovery.stderr
+        reports = json.loads(recovery.stdout)["reports"]
+        assert len(reports) == 1
+        assert reports[0]["status"] == "interrupted"
+        assert reports[0]["unknown_calls"] == []
+        assert reports[0]["unresolved_files"] == []
+        audit = cli("audit", "verify", "--session", session_id, "--json")
+        assert audit.returncode == 0, audit.stderr
+        assert json.loads(audit.stdout)["ok"] is True
+
+        final_store = SessionStore(db_directory / "sessions.db")
+        final_sessions = final_store.list_sessions(project_path=str(workspace), limit=5)
+        assert [session.session_id for session in final_sessions] == [session_id]
+        calls = final_store.load_session(session_id).tool_calls
+        assert [call.tool_name for call in calls] == expected_tools
+        assert all(call.approved and call.executed for call in calls)
+        assert calls[1].error and "AssertionError" in calls[1].error
+        assert calls[3].error is None
+        latest = final_store.latest_file_checkpoints(session_id)
+        assert len(latest) == 1
+        turn_ids = [reports[0]["turn_id"], latest[0]["turn_id"]]
+        rows = final_store.file_checkpoints_for_turns(session_id, turn_ids)
+        hashes = {str(row["call_id"]): row["after_sha256"] for row in rows}
+        assert hashes == {
+            calls[0].call_id: hashlib.sha256(b"BROKEN\n").hexdigest(),
+            calls[2].call_id: hashlib.sha256(b"LOCAL_AGENT_OK\n").hexdigest(),
+        }
+    finally:
+        release_third_request.set()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 _BUILTIN_OPENAI_COMPATIBLE_ROUTES = [
     ("deepseek", "DEEPSEEK_API_BASE", "DEEPSEEK_API_KEY"),
