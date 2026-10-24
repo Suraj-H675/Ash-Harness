@@ -6,6 +6,21 @@ All notable changes to Ash are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-24
+
+### Fixed
+- Verified downloaded release checksums against the downloaded bytes before installation.
+- Made `ash repair` reinstall the exact verified release instead of treating a matching version as already installed.
+- Reported provider connectivity and completion verification separately, avoiding false success or failure for routes without a supported model catalog.
+
+### Changed
+- Moved CLI argument declarations into a dedicated parser module without changing command behavior.
+
+### Upgrade notes
+- This is a package-only upgrade from 0.5.0. The session database remains at schema v21; no additional data migration is required.
+
+## [0.5.0] - 2026-10-24
+
 ### Added
 - Added Agent Skills discovery from shared user and trusted-workspace skill
   directories.
@@ -33,7 +48,7 @@ All notable changes to Ash are documented here. The format follows
 - Updated dependencies to patched security releases.
 
 ### Upgrade notes
-- A 0.4.6 session database uses schema v20. The planned 0.5.0 release advances it to
+- A 0.4.6 session database uses schema v20. Release 0.5.0 advances it to
   v21 and creates a `before-v21-migration` backup before adding the nullable
   `file_checkpoints.after_mode` column. See [Maintenance and recovery](docs/guides/MAINTENANCE.md#roll-back-across-a-session-schema-migration)
   before upgrading if you may need to roll back the package.

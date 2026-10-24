@@ -67,8 +67,10 @@ perform a second client-side build from the Git tag. The temporary wheel is
 removed after the manager finishes, and the installed `ash --version` must also
 match the requested `ash-v<version>` release tag.
 
-Re-running the same verified immutable ref repairs the managed environment.
-Installing a newer immutable ref upgrades it. Installing an older verified
+Re-running the normal installer for the same verified immutable ref is a no-op
+when the installed version and capability packs already match. Use `ash repair`
+to force reinstallation of that exact verified release. Installing a newer
+immutable ref upgrades it. Installing an older verified
 immutable ref rolls back the managed **package**. Supported capability extras
 already present in the managed installation are preserved across upgrade,
 repair, and package rollback.
