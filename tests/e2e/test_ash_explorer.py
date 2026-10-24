@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import threading
+import tomllib
 from argparse import Namespace
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
@@ -1191,7 +1192,8 @@ def test_agent_directed_run_adapts_after_real_write_observation(
     manifest = json.loads((evidence / "manifest.json").read_text())
     revision = manifest["baseline_revision"]
     assert revision is None or len(revision) in {40, 64}
-    assert manifest["ash_version"] == "0.4.6"
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert manifest["ash_version"] == project["project"]["version"]
     assert len(manifest["runner_sha256"]) == 64
     assert manifest["seed"] == 23
     assert manifest["pending_cleanup"] is False
