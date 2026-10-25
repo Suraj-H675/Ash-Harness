@@ -96,6 +96,22 @@ async def test_git_inspection_and_patch(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_apply_patch_explains_unsupported_codex_format(tmp_path: Path) -> None:
+    target = tmp_path / "hello.txt"
+    target.write_text("old\n")
+    tool = ApplyPatchTool(SafetyGuard(tmp_path))
+    assert "unified diff" in tool.json_schema()["properties"]["patch"]["description"]
+
+    result = await tool.run(
+        patch="*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch\n"
+    )
+
+    assert result.success is False
+    assert "git-style unified diff" in (result.error or "")
+    assert target.read_text() == "old\n"
+
+
+@pytest.mark.asyncio
 async def test_direct_apply_patch_refuses_competing_ash_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

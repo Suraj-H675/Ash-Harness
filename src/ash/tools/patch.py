@@ -27,7 +27,15 @@ from ash.tools.base import BaseTool, ToolExecutionOutcome, ToolResult
 
 
 class ApplyPatchArgs(BaseModel):
-    patch: str = Field(..., min_length=1, description="Unified diff to apply.")
+    patch: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Git-style unified diff, with --- a/path, +++ b/path, and "
+            "@@ -1 +1 @@ hunk headers. Do not use the Codex "
+            "*** Begin Patch / *** Update File format."
+        ),
+    )
     dry_run: bool = False
 
 
@@ -38,7 +46,11 @@ PATCH_OUTPUT_LIMIT_EXIT = -2
 
 class ApplyPatchTool(BaseTool):
     name = "apply_patch"
-    description = "Validate and atomically apply a unified multi-file patch."
+    description = (
+        "Validate and atomically apply a git-style unified diff. Include "
+        "--- a/path, +++ b/path, and @@ hunk headers; Codex-style "
+        "*** Begin Patch blocks are not supported."
+    )
     args_schema = ApplyPatchArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
@@ -167,6 +179,11 @@ def _patch_timeout_result(
 
 
 def extract_patch_paths(patch: str, guard: SafetyGuard) -> set[str]:
+    if patch.lstrip().startswith("*** Begin Patch"):
+        raise ValueError(
+            "Codex-style *** Begin Patch blocks are not supported; provide "
+            "a git-style unified diff with --- a/path, +++ b/path, and @@ hunks"
+        )
     paths: set[str] = set()
     for line in patch.splitlines():
         candidate = ""
