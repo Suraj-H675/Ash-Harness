@@ -611,4 +611,5 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
     assert "search_tools" in provider.initial_system_prompt
     assert "next provider iteration" in provider.initial_system_prompt.casefold()
     assert "concrete tool actions" in provider.initial_system_prompt.casefold()
+    assert "Check requested behavior and edge cases" in provider.initial_system_prompt
     await loop.aclose()

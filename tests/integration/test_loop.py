@@ -179,9 +179,9 @@ def test_default_prompt_distinguishes_test_passes_from_task_verification(
     assert asyncio.run(loop.run_turn("Fix an existing function")) == "Acknowledged."
 
     system = provider.received_messages[0][0]["content"]
-    assert "Passing available tests does not prove untested requirements" in system
-    assert "Run focused checks when permitted" in system
-    assert "Never claim a check was run when it was not" in system
+    assert "Check requested behavior and edge cases, not only passing tests" in system
+    assert "Run checks when permitted" in system
+    assert "never claim unrun tests" in system
 
 
 def test_continuous_turns_finalize_each_step_usage_before_follow_up(
