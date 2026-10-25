@@ -1630,7 +1630,9 @@ def test_coding_trial_grades_hidden_oracle_instead_of_final_claim() -> None:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory(prefix="work-", dir="/tmp") as directory:
+            with tempfile.TemporaryDirectory(
+                prefix="work-", dir=Path(tempfile.gettempdir()).resolve()
+            ) as directory:
                 scratch = Path(directory)
                 project = scratch / "project"
                 home = scratch / "home"
