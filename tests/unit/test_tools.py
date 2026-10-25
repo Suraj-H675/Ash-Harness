@@ -1033,6 +1033,125 @@ async def test_replace_file_content_accepts_matching_expected_sha256(
 
 
 @pytest.mark.asyncio
+async def test_replace_file_content_finds_unique_full_line_without_bounds(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "doc.txt"
+    original = "before\n    old text\nafter\n"
+    target.write_text(original, encoding="utf-8")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        target_content="    old text",
+        replacement_content="    new text",
+        expected_sha256=hashlib.sha256(original.encode()).hexdigest(),
+    )
+
+    assert result.success is True
+    assert "lines 2-2" in result.output
+    assert target.read_text(encoding="utf-8") == "before\n    new text\nafter\n"
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_unique_multiline_preserves_mixed_endings(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_bytes(codecs.BOM_UTF8 + b"first\r\nsecond\r\nthird\nfourth\r")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        target_content="second\nthird",
+        replacement_content="SECOND\nTHIRD",
+    )
+
+    assert result.success is True
+    assert "lines 2-3" in result.output
+    assert (
+        target.read_bytes() == codecs.BOM_UTF8 + b"first\r\nSECOND\r\nTHIRD\nfourth\r"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "needle", "message"),
+    [
+        ("same\nother\nsame\n", "same", "multiple full-line blocks"),
+        ("before suffix\nafter\n", "before", "complete block of lines"),
+        ("before\nafter\n", "not present", "complete block of lines"),
+        ("before\nafter\n", "", "nonempty full-line"),
+        ("before\nafter\n", "\n", "nonempty full-line"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_replace_file_content_unique_mode_fails_closed(
+    project_root: Path,
+    guard: SafetyGuard,
+    source: str,
+    needle: str,
+    message: str,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_text(source, encoding="utf-8")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        target_content=needle,
+        replacement_content="changed",
+    )
+
+    assert result.success is False
+    assert message in (result.error or "")
+    assert target.read_text(encoding="utf-8") == source
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_unique_mode_checks_hash_and_bounds(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_text("one\ntwo\n", encoding="utf-8")
+    tool = ReplaceFileContentTool(guard)
+
+    stale = await tool.run(
+        file_path="doc.txt",
+        target_content="two",
+        replacement_content="new",
+        expected_sha256="0" * 64,
+    )
+    missing_end = await tool.run(
+        file_path="doc.txt",
+        start_line=2,
+        target_content="two",
+        replacement_content="new",
+    )
+
+    assert stale.success is False
+    assert "File changed since it was read" in (stale.error or "")
+    assert missing_end.success is False
+    assert "Supply both" in (missing_end.error or "")
+    assert target.read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_unique_mode_refuses_unicode_line_mismatch(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "doc.txt"
+    original = "one\u2028two\nthree\n"
+    target.write_text(original, encoding="utf-8")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        target_content="one\u2028two",
+        replacement_content="new",
+    )
+
+    assert result.success is False
+    assert "does not match complete file lines" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
 async def test_replace_file_content_rejects_stale_expected_sha256(
     project_root: Path,
     guard: SafetyGuard,

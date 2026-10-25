@@ -92,20 +92,29 @@ class WriteFileArgs(BaseModel):
 
 class ReplaceFileContentArgs(BaseModel):
     file_path: str = Field(..., description="Path of target file to edit.")
-    start_line: int = Field(
-        ...,
+    start_line: int | None = Field(
+        None,
         ge=1,
-        description="Start of block range containing target content (1-indexed, inclusive).",
+        description=(
+            "Optional 1-indexed inclusive start line. Supply both line bounds "
+            "for an exact range edit, or neither to match a unique block of full lines."
+        ),
     )
-    end_line: int = Field(
-        ...,
+    end_line: int | None = Field(
+        None,
         ge=1,
-        description="End of block range containing target content (1-indexed, inclusive).",
+        description=(
+            "Optional 1-indexed inclusive end line. Must be supplied with start_line."
+        ),
     )
     target_content: str = Field(
         ...,
         max_length=MAX_TEXT_ARGUMENT_CHARS,
-        description="Exact string of characters to search for within the specified line range.",
+        description=(
+            "Exact text of every complete line being replaced, including indentation. "
+            "With line bounds, it must equal the entire selected range; without "
+            "bounds, it must match exactly one full-line block in the file."
+        ),
     )
     replacement_content: str = Field(
         ...,
@@ -314,13 +323,25 @@ class WriteFileTool(BaseTool):
 class ReplaceFileContentTool(BaseTool):
     name = "replace_file_content"
     description = (
-        "Replace exact content within a bounded line range of a workspace file."
+        "Replace exact complete lines in a workspace file. Give both line bounds "
+        "for a strict range edit, or omit both to replace a unique full-line block. "
+        "Ambiguous matches and stale file hashes are rejected."
     )
     args_schema = ReplaceFileContentArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ReplaceFileContentArgs(**kwargs)
-        if args.end_line < args.start_line:
+        if (args.start_line is None) != (args.end_line is None):
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: Supply both start_line and end_line, or omit both.",
+            )
+        if (
+            args.start_line is not None
+            and args.end_line is not None
+            and args.end_line < args.start_line
+        ):
             return ToolResult(
                 success=False, output="", error="Error: end_line must be >= start_line."
             )
@@ -360,27 +381,46 @@ class ReplaceFileContentTool(BaseTool):
             return ToolResult(success=False, output="", error=stale_error)
         lines = original_text.splitlines(keepends=True)
 
-        start_index = args.start_line - 1
-        end_index = args.end_line
-        if start_index >= len(lines) or end_index > len(lines):
-            return ToolResult(
-                success=False,
-                output="",
-                error="Error: Line range is outside file bounds.",
-            )
-
-        segment = "".join(lines[start_index:end_index])
-        normalized_segment = _strip_trailing_newlines(_normalize_line_endings(segment))
         normalized_target = _strip_trailing_newlines(
             _normalize_line_endings(args.target_content)
         )
+        if args.start_line is None:
+            span, match_error = _find_unique_line_span(original_text, normalized_target)
+            if match_error is not None:
+                return ToolResult(success=False, output="", error=match_error)
+            assert span is not None
+            start_index, end_index = span
+            segment = "".join(lines[start_index:end_index])
+            if (
+                _strip_trailing_newlines(_normalize_line_endings(segment))
+                != normalized_target
+            ):
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error="Error: target_content does not match complete file lines.",
+                )
+        else:
+            assert args.end_line is not None
+            start_index = args.start_line - 1
+            end_index = args.end_line
+            if start_index >= len(lines) or end_index > len(lines):
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error="Error: Line range is outside file bounds.",
+                )
 
-        if normalized_segment != normalized_target:
-            return ToolResult(
-                success=False,
-                output="",
-                error=_build_mismatch_error(normalized_target, normalized_segment),
+            segment = "".join(lines[start_index:end_index])
+            normalized_segment = _strip_trailing_newlines(
+                _normalize_line_endings(segment)
             )
+            if normalized_segment != normalized_target:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=_build_mismatch_error(normalized_target, normalized_segment),
+                )
 
         replacement_lines = _replacement_lines_for_span(
             lines, start_index, end_index, args.replacement_content
@@ -406,7 +446,7 @@ class ReplaceFileContentTool(BaseTool):
         return ToolResult(
             success=True,
             output=(
-                f"Replaced lines {args.start_line}-{args.end_line} in {resolved_path}."
+                f"Replaced lines {start_index + 1}-{end_index} in {resolved_path}."
             ),
         )
 
@@ -680,6 +720,46 @@ def _replacement_lines_for_span(
 
 def _strip_trailing_newlines(content: str) -> str:
     return content.rstrip("\n")
+
+
+def _find_unique_line_span(
+    original_text: str, normalized_target: str
+) -> tuple[tuple[int, int] | None, str | None]:
+    if not normalized_target:
+        return None, "Error: A nonempty full-line target_content is required."
+
+    content = _normalize_line_endings(original_text)
+    matches: list[int] = []
+    if content.startswith(normalized_target) and (
+        len(content) == len(normalized_target)
+        or content[len(normalized_target)] == "\n"
+    ):
+        matches.append(0)
+
+    cursor = 0
+    needle = "\n" + normalized_target
+    while (index := content.find(needle, cursor)) != -1:
+        start = index + 1
+        end = start + len(normalized_target)
+        if end == len(content) or content[end] == "\n":
+            matches.append(start)
+            if len(matches) > 1:
+                return (
+                    None,
+                    "Error: target_content matches multiple full-line blocks. "
+                    "Specify both start_line and end_line to choose one.",
+                )
+        cursor = index + 1
+
+    if not matches:
+        return (
+            None,
+            "Error: target_content does not match a complete block of lines. "
+            "Read the file again and copy the exact lines, including indentation.",
+        )
+
+    start_index = content.count("\n", 0, matches[0])
+    return (start_index, start_index + normalized_target.count("\n") + 1), None
 
 
 def _format_read_truncation_metadata(

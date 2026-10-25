@@ -121,9 +121,9 @@ Performs structured Search and Replace operations on a contiguous block of text.
     ```python
     class ReplaceFileContentArgs(BaseModel):
         file_path: str = Field(..., description="Path of target file to edit.")
-        start_line: int = Field(..., description="Start of block range containing target content (1-indexed, inclusive).")
-        end_line: int = Field(..., description="End of block range containing target content (1-indexed, inclusive).")
-        target_content: str = Field(..., description="Exact string of characters to search for. Must match target range exactly, including leading spaces and tabs.")
+        start_line: int | None = Field(None, description="Optional 1-indexed inclusive start line.")
+        end_line: int | None = Field(None, description="Optional 1-indexed inclusive end line.")
+        target_content: str = Field(..., description="Exact complete lines to replace, including indentation.")
         replacement_content: str = Field(
             ...,
             description=(
@@ -134,11 +134,12 @@ Performs structured Search and Replace operations on a contiguous block of text.
     ```
 *   **Implementation Match & Write Algorithm**:
     1.  **Resolve & Read**: Resolve path using path-scoping rules. Read the entire target file as lines.
-    2.  **Scope Verification**: Extract lines from index `start_line - 1` to `end_line` (inclusive), retaining each source line's terminator.
+    2.  **Scope Verification**: With both line bounds, extract lines from index `start_line - 1` to `end_line` (inclusive), retaining each source line's terminator. Without either bound, find exactly one nonempty block of complete lines matching `target_content` in the file. Reject missing, partial-line, and ambiguous matches without changing the file. Providing only one bound is invalid.
     3.  **Normalize for Matching Only**: Normalize CRLF and lone CR inside the extracted file segment and `target_content` to `\n`. Strip trailing newline characters strictly for comparison. Do not normalize the source file before reassembly.
     4.  **Exact Matching**: Compare normalized strings.
         -   If they do NOT match exactly, raise an error immediately. Return a line-by-line diff comparison showing exactly where spacing or content mismatches occur.
-        -   The match must be constrained *strictly* within the specified line range bounds. Do not search outside the specified range.
+        -   For explicitly bounded edits, the match must be constrained *strictly* within the specified line range bounds. Do not search outside the specified range.
+        -   Unbounded unique-block matching still requires exact full-line content. If repeated content appears more than once, provide both line bounds to disambiguate. Optional `expected_sha256` protects either mode against stale reads.
     5.  **Choose Replacement Terminators**:
         -   Treat LF-only replacement separators as newline-neutral and map them to the most common terminator in the replaced range. Break ties by first occurrence. If the range has none, use the nearest surrounding CRLF, CR, or LF terminator, preferring the preceding line on a tie, or LF when none exists.
         -   If the replacement contains CR, preserve its supplied CRLF, CR, and LF separators as explicit. Unchanged source lines keep their original terminators.
