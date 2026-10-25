@@ -246,6 +246,63 @@ async def test_search_text_returns_file_and_line(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_text_accepts_a_single_file_path(tmp_path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("first\nneedle here\n")
+    (tmp_path / "src" / "other.py").write_text("needle elsewhere\n")
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+
+    result = await tool.run(
+        pattern="needle", directory_path="src/app.py", fixed_strings=True
+    )
+
+    assert result.success is True
+    assert result.output == "src/app.py:2:needle here"
+    assert result.truncated is False
+
+    matching = await tool.run(
+        pattern="needle", directory_path="src/app.py", glob="**/*.py"
+    )
+    excluded = await tool.run(
+        pattern="needle", directory_path="src/app.py", glob="**/*.md"
+    )
+    assert matching.output == result.output
+    assert excluded.success is True
+    assert excluded.output == ""
+
+
+@pytest.mark.asyncio
+async def test_search_text_single_file_preserves_scoped_read_protection(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "app.py"
+    target.write_text("harmless\n")
+    outside = tmp_path / "outside.py"
+    outside.write_text("PRIVATE_NEEDLE\n")
+    original = search_module.read_scoped_bytes
+
+    def replace_with_symlink(path, guard, **kwargs):
+        if Path(path) == target:
+            target.unlink()
+            try:
+                target.symlink_to(outside)
+            except OSError as exc:
+                pytest.skip(f"symlink creation is unavailable: {exc}")
+        return original(path, guard, **kwargs)
+
+    monkeypatch.setattr(search_module, "read_scoped_bytes", replace_with_symlink)
+    result = await SearchTextTool(SafetyGuard(workspace)).run(
+        pattern="PRIVATE_NEEDLE", directory_path="app.py", fixed_strings=True
+    )
+
+    assert result.success is True
+    assert "PRIVATE_NEEDLE" not in result.output
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
 async def test_search_text_supports_regex_and_case_insensitive_matching(
     tmp_path,
 ) -> None:
@@ -379,6 +436,19 @@ async def test_search_text_reports_invalid_regex(tmp_path) -> None:
     assert result.success is False
     assert result.error is not None
     assert result.error.startswith("Invalid regex:")
+    assert "fixed_strings=true" in result.error
+
+
+@pytest.mark.asyncio
+async def test_search_text_single_file_still_rejects_outside_workspace(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (tmp_path / "outside.py").write_text("secret\n")
+
+    with pytest.raises(Exception, match="outside project scope"):
+        await SearchTextTool(SafetyGuard(workspace)).run(
+            pattern="secret", directory_path="../outside.py"
+        )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")

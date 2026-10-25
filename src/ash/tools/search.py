@@ -231,7 +231,9 @@ class GlobFilesTool(BaseTool):
 
 class SearchTextArgs(BaseModel):
     pattern: str = Field(..., min_length=1, max_length=4_096)
-    directory_path: str = "."
+    directory_path: str = Field(
+        ".", description="Workspace directory or single regular file to search."
+    )
     glob: str | None = None
     fixed_strings: bool = False
     case_sensitive: bool = True
@@ -241,22 +243,34 @@ class SearchTextArgs(BaseModel):
 class SearchTextTool(BaseTool):
     name = "search_text"
     execution_contract = ToolExecutionContract(parallel_safe=True)
-    description = "Search bounded workspace text with file and line locations."
+    description = (
+        "Search bounded workspace text in a directory or file with line locations."
+    )
     args_schema = SearchTextArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SearchTextArgs(**kwargs)
         root = self.safety_guard.validate_path(args.directory_path)
-        if not _is_scoped_directory(root, self.safety_guard):
+        try:
+            _, metadata = stat_scoped_path(root, self.safety_guard)
+        except (OSError, SafetyViolation):
             return ToolResult(
-                success=False, output="", error=f"Not a directory: {root}"
+                success=False, output="", error=f"Not a directory or file: {root}"
             )
-        return await self._python_fallback(root, args)
+        if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+            return ToolResult(
+                success=False, output="", error=f"Not a directory or file: {root}"
+            )
+        return await self._python_fallback(
+            root, args, single_file=stat.S_ISREG(metadata.st_mode)
+        )
 
     async def _python_fallback(
         self,
         root: Path,
         args: SearchTextArgs,
+        *,
+        single_file: bool,
     ) -> ToolResult:
         flags = regex_engine.VERSION0
         if not args.case_sensitive:
@@ -267,7 +281,14 @@ class SearchTextTool(BaseTool):
         try:
             regex = regex_engine.compile(expression, flags)
         except regex_engine.error as exc:
-            return ToolResult(success=False, output="", error=f"Invalid regex: {exc}")
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Invalid regex: {exc}. Escape regex special characters or "
+                    "use fixed_strings=true for a literal search."
+                ),
+            )
 
         regex_time_remaining = MAX_SEARCH_REGEX_TOTAL_SECONDS
         regex_incomplete = False
@@ -344,13 +365,18 @@ class SearchTextTool(BaseTool):
             scan_incomplete = True
 
         scanned = 0
-        for path, is_directory in _iter_workspace_paths(
-            root,
-            self.safety_guard,
-            recursive=True,
-            max_depth=MAX_SEARCH_DEPTH,
-            on_incomplete=mark_scan_incomplete,
-        ):
+        candidates: Iterator[tuple[Path, bool]] = (
+            iter(((root, False),))
+            if single_file
+            else _iter_workspace_paths(
+                root,
+                self.safety_guard,
+                recursive=True,
+                max_depth=MAX_SEARCH_DEPTH,
+                on_incomplete=mark_scan_incomplete,
+            )
+        )
+        for path, is_directory in candidates:
             scanned += 1
             if scanned > MAX_SEARCH_SCAN_ENTRIES:
                 scan_truncated = True
@@ -359,7 +385,9 @@ class SearchTextTool(BaseTool):
                 await asyncio.sleep(0)
             if is_directory:
                 continue
-            relative = path.relative_to(root).as_posix()
+            relative = path.relative_to(
+                self.safety_guard.project_root if single_file else root
+            ).as_posix()
             if args.glob and not _matches_workspace_glob(relative, args.glob):
                 continue
             try:
