@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -9,8 +10,8 @@ from pydantic import BaseModel, Field
 
 from ash.cli import _render_context_provenance
 from ash.config import AshConfig
-from ash.context.history import ContextFragmentKind
-from ash.core.loop import AshLoop
+from ash.context.history import ContextBudgetAllocator, ContextFragmentKind
+from ash.core.loop import AshLoop, _default_system_prompt
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
@@ -23,6 +24,23 @@ from ash.ui.headless import HeadlessUI
 
 class TextArgs(BaseModel):
     text: str = Field(..., description="Database query text.")
+
+
+def test_small_context_keeps_discovery_and_verification() -> None:
+    # Reproduce the CI macOS provider's 501-token core-system allocation.
+    workspace = Path(
+        "/private/var/folders/ab/abcdefghijklmnopqrstuvwx/T/pytest-of-runner/"
+        "pytest-0/test_default_runtime_discovers2"
+    )
+    prompt = _default_system_prompt(workspace, native_tools=True, search_tools=True)
+    fitted = ContextBudgetAllocator(
+        max_context_tokens=4_096, completion_reserve=1_024
+    ).fit_text(prompt, limit=501, count_tokens=lambda text: max(1, len(text) // 4))
+
+    assert "next provider iteration" in fitted.text
+    assert "Check requested behavior and edge cases" in fitted.text
+    assert "never claim unrun tests" in fitted.text
+    assert fitted.truncated is False
 
 
 class DummyTool(BaseTool):
