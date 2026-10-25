@@ -187,3 +187,45 @@ The project, home, trust state, and database live in one owned temporary tree.
 Catchable exits clean that tree. If the controller is killed before cleanup,
 the manifest retains its path and pending-cleanup state; abandoned paths are
 never scanned or deleted automatically.
+
+## Coding task outcomes
+
+Run the bounded CLI and grader check with:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m pytest -vv \
+  tests/e2e/test_local_openai_compatible_process.py \
+  -k test_coding_trial_grades_hidden_oracle_instead_of_final_claim
+```
+
+The provider returns fixed decisions for two disposable Git projects. One turn
+claims completion without changing the incorrect file. The other writes the
+requested result. A separate Python process checks the file and an unrelated
+tracked file after each turn. Ash's exit code and final response are recorded,
+but neither affects the grade. This checks outcome plumbing, not model ability.
+The test needs permission to bind a loopback socket.
+
+When a free local model endpoint is available, use a fresh disposable Git
+project, a temporary home and database, and the same independent-check pattern.
+Set `ASH_MODEL` and `LMSTUDIO_API_BASE` or `VLLM_API_BASE` to that loopback
+server. Set `HOME` and the XDG directories to the temporary home. Trust the
+project, then run Ash with a clean environment containing only `PATH`, the
+temporary home and XDG paths, `PYTHONPATH`, `ASH_MODEL`, and the local base URL.
+Leave proxy and credential variables unset.
+
+```sh
+PYTHONPATH=src .venv/bin/python -m ash trust add "$project"
+PYTHONPATH=src .venv/bin/python -m ash --db-directory "$database" \
+  --mode auto_edit -p "$prompt" --output-format json
+```
+
+Run the hidden checker in a separate process after Ash exits. Keep its source
+and path outside the project during the Ash turn. Record the model ID, prompt,
+CLI exit code, final response, verifier output, and Git diff separately. Grade
+only the verifier and unrelated-state checks. Report live-model results
+separately from the scripted provider cases, and do not generalize model ability
+from one task. A separate verifier process is not an OS sandbox: execute
+untrusted model-generated code only inside an appropriately restricted sandbox
+or disposable container, with filesystem, process, and network access limited.
+The scripted test above uses fixed, trusted fixture code and does not establish
+safe execution of arbitrary candidate code.

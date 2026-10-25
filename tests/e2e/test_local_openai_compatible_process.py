@@ -5,6 +5,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import textwrap
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1446,3 +1448,389 @@ def test_ollama_fresh_process_completes_native_file_edit_tool_turn(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_coding_trial_grades_hidden_oracle_instead_of_final_claim() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    oracle_code = textwrap.dedent(
+        """\
+        import hashlib
+        import importlib.util
+        import json
+        import sys
+        from pathlib import Path
+
+        project = Path(sys.argv[1])
+        spec = importlib.util.spec_from_file_location("status", project / "status.py")
+        if spec is None or spec.loader is None:
+            raise RuntimeError("could not load status.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        status_hash = hashlib.sha256((project / "status.py").read_bytes()).hexdigest()
+        notes_hash = hashlib.sha256((project / "notes.txt").read_bytes()).hexdigest()
+        checks = {
+            "returns_ready": module.state() == "ready",
+            "artifact_changed": status_hash != sys.argv[2],
+            "unrelated_file_preserved": notes_hash == sys.argv[3],
+        }
+        print(json.dumps(checks, sort_keys=True))
+        raise SystemExit(0 if all(checks.values()) else 1)
+        """
+    )
+
+    def git(project: Path, home: Path, *arguments: str) -> str:
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(home),
+            "GIT_CONFIG_GLOBAL": str(home / ".gitconfig"),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+        completed = subprocess.run(
+            ["git", "-C", str(project), *arguments],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return completed.stdout.strip()
+
+    def run_trial(label: str, scripted_write: bool) -> dict[str, object]:
+        requests: list[dict[str, object]] = []
+        seen: list[tuple[str, str, str | None]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+            def _json(self, payload: object) -> None:
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _stream(self, chunks: list[dict[str, object]]) -> None:
+                body = (
+                    "".join(
+                        "data: " + json.dumps(chunk, separators=(",", ":")) + "\n\n"
+                        for chunk in chunks
+                    )
+                    + "data: [DONE]\n\n"
+                )
+                encoded = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_GET(self) -> None:
+                seen.append(("GET", self.path, self.headers.get("Authorization")))
+                if self.path != "/api/v1/models":
+                    self.send_error(404)
+                    return
+                self._json(
+                    {
+                        "models": [
+                            {
+                                "key": "local-model",
+                                "type": "llm",
+                                "max_output_tokens": 64,
+                                "loaded_instances": [
+                                    {"config": {"context_length": 32768}}
+                                ],
+                                "capabilities": {"trained_for_tool_use": True},
+                            }
+                        ]
+                    }
+                )
+
+            def do_POST(self) -> None:
+                seen.append(("POST", self.path, self.headers.get("Authorization")))
+                if self.path != "/v1/chat/completions":
+                    self.send_error(404)
+                    return
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                request = json.loads(self.rfile.read(length) if length else b"{}")
+                requests.append(request)
+                call_number = len(requests)
+                if scripted_write and call_number == 1:
+                    tool_delta = {
+                        "index": 0,
+                        "id": "call-local-1",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": json.dumps(
+                                {
+                                    "file_path": "status.py",
+                                    "content": 'def state():\n    return "ready"\n',
+                                    "overwrite": True,
+                                }
+                            ),
+                        },
+                    }
+                    self._stream(
+                        [
+                            {
+                                "id": "coding-turn",
+                                "object": "chat.completion.chunk",
+                                "created": 1,
+                                "model": "local-model",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"tool_calls": [tool_delta]},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "coding-turn",
+                                "object": "chat.completion.chunk",
+                                "created": 1,
+                                "model": "local-model",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "tool_calls",
+                                    }
+                                ],
+                            },
+                        ]
+                    )
+                    return
+                if call_number != (2 if scripted_write else 1):
+                    self.send_error(500)
+                    return
+                self._stream(
+                    [
+                        {
+                            "id": "coding-turn",
+                            "object": "chat.completion.chunk",
+                            "created": 1,
+                            "model": "local-model",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": "success"},
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                        }
+                    ]
+                )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory(prefix="work-", dir="/tmp") as directory:
+                scratch = Path(directory)
+                project = scratch / "project"
+                home = scratch / "home"
+                template = scratch / "template"
+                project.mkdir()
+                template.mkdir()
+                for name in ("config", "data", "cache", "tmp"):
+                    (home / name).mkdir(parents=True)
+                (home / ".gitconfig").touch()
+                (project / "status.py").write_text(
+                    'def state():\n    return "todo"\n', encoding="utf-8"
+                )
+                (project / "notes.txt").write_text(
+                    "Keep this file unchanged.\n", encoding="utf-8"
+                )
+                git(
+                    project,
+                    home,
+                    "init",
+                    "--quiet",
+                    "--initial-branch=main",
+                    "--template",
+                    str(template),
+                )
+                git(project, home, "add", "status.py", "notes.txt")
+                git(
+                    project,
+                    home,
+                    "-c",
+                    "user.name=Coding Trial",
+                    "-c",
+                    "user.email=trial@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "baseline",
+                )
+                initial_head = git(project, home, "rev-parse", "HEAD")
+                initial_status_hash = hashlib.sha256(
+                    (project / "status.py").read_bytes()
+                ).hexdigest()
+                initial_notes_hash = hashlib.sha256(
+                    (project / "notes.txt").read_bytes()
+                ).hexdigest()
+                environment = {
+                    "PATH": os.environ.get("PATH", ""),
+                    "HOME": str(home),
+                    "USERPROFILE": str(home),
+                    "XDG_CONFIG_HOME": str(home / "config"),
+                    "XDG_DATA_HOME": str(home / "data"),
+                    "XDG_CACHE_HOME": str(home / "cache"),
+                    "TMPDIR": str(home / "tmp"),
+                    "TMP": str(home / "tmp"),
+                    "TEMP": str(home / "tmp"),
+                    "PYTHONPATH": str(repository / "src"),
+                    "ASH_MODEL": "lmstudio/local-model",
+                    "LMSTUDIO_API_BASE": (f"http://127.0.0.1:{server.server_port}/v1"),
+                    "NO_COLOR": "1",
+                }
+                trust = subprocess.run(
+                    [sys.executable, "-m", "ash", "trust", "add", str(project)],
+                    cwd=project,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=15,
+                )
+                assert trust.returncode == 0, trust.stderr
+                assert git(project, home, "status", "--porcelain") == ""
+
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "ash",
+                        "--db-directory",
+                        str(scratch / "database"),
+                        "--mode",
+                        "auto_edit",
+                        "-p",
+                        'Update status.py so state() returns "ready". Keep notes.txt unchanged.',
+                        "--output-format",
+                        "json",
+                    ],
+                    cwd=project,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=45,
+                )
+                try:
+                    final = json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    final = {}
+                final_response = (
+                    final.get("response") if isinstance(final, dict) else None
+                )
+
+                verifier = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-B",
+                        "-c",
+                        oracle_code,
+                        str(project),
+                        initial_status_hash,
+                        initial_notes_hash,
+                    ],
+                    cwd=scratch,
+                    env={
+                        "PATH": os.environ.get("PATH", ""),
+                        "HOME": str(home),
+                        "TMPDIR": str(home / "tmp"),
+                    },
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+                try:
+                    oracle_report = json.loads(verifier.stdout)
+                except json.JSONDecodeError:
+                    oracle_report = {}
+                changed_paths = git(
+                    project, home, "diff", "--name-only", "HEAD"
+                ).splitlines()
+                untracked_paths = git(
+                    project, home, "ls-files", "--others", "--exclude-standard"
+                ).splitlines()
+                state_preserved = (
+                    git(project, home, "rev-parse", "HEAD") == initial_head
+                    and hashlib.sha256((project / "notes.txt").read_bytes()).hexdigest()
+                    == initial_notes_hash
+                    and changed_paths == (["status.py"] if scripted_write else [])
+                    and untracked_paths == []
+                )
+                oracle_passed = (
+                    verifier.returncode == 0
+                    and oracle_report.get("returns_ready") is True
+                    and oracle_report.get("artifact_changed") is True
+                    and oracle_report.get("unrelated_file_preserved") is True
+                )
+                grade = "pass" if oracle_passed and state_preserved else "fail"
+                evidence = {
+                    "label": label,
+                    "cli_exit_code": result.returncode,
+                    "final_response": final_response,
+                    "cli_stderr": result.stderr,
+                    "oracle_exit_code": verifier.returncode,
+                    "oracle_report": oracle_report,
+                    "changed_paths": changed_paths,
+                    "untracked_paths": untracked_paths,
+                    "state_preserved": state_preserved,
+                    "grade": grade,
+                    "provider_requests": len(requests),
+                    "provider_auth_headers": [
+                        auth for _, _, auth in seen if auth is not None
+                    ],
+                }
+                assert grade == ("pass" if scripted_write else "fail"), evidence
+                assert state_preserved, evidence
+                assert result.returncode == 0, evidence
+                assert final_response == "success", evidence
+                assert len(requests) == (2 if scripted_write else 1), evidence
+                assert all(
+                    (method, path)
+                    in {
+                        ("GET", "/api/v1/models"),
+                        ("POST", "/v1/chat/completions"),
+                    }
+                    for method, path, _ in seen
+                ), evidence
+                assert all(auth is None for _, _, auth in seen), evidence
+                assert all(
+                    "unrelated_file_preserved" not in json.dumps(request)
+                    for request in requests
+                ), evidence
+                if scripted_write:
+                    assert any(
+                        message.get("role") == "tool"
+                        and message.get("tool_call_id") == "call-local-1"
+                        for message in requests[-1].get("messages", [])
+                    ), evidence
+                return evidence
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    unchanged = run_trial("unchanged", scripted_write=False)
+    correct = run_trial("correct", scripted_write=True)
+
+    assert unchanged["cli_exit_code"] == 0
+    assert unchanged["final_response"] == "success"
+    assert unchanged["oracle_exit_code"] != 0
+    assert unchanged["grade"] == "fail"
+    assert correct["cli_exit_code"] == 0
+    assert correct["oracle_exit_code"] == 0
+    assert correct["grade"] == "pass"
