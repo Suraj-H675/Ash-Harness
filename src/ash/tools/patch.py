@@ -32,7 +32,8 @@ class ApplyPatchArgs(BaseModel):
         min_length=1,
         description=(
             "Git-style unified diff, with --- a/path, +++ b/path, and "
-            "@@ -1 +1 @@ hunk headers. Do not use the Codex "
+            "@@ -1 +1 @@ hunk headers; hunk line counts must match the "
+            "context, added, and removed lines. Do not use the Codex "
             "*** Begin Patch / *** Update File format."
         ),
     )
@@ -79,7 +80,7 @@ class ApplyPatchTool(BaseTool):
                 return ToolResult(
                     success=False,
                     output=check[1],
-                    error=f"Patch check failed: {check[2].strip()}",
+                    error=_patch_check_error(check[2]),
                 )
             return ToolResult(
                 success=True,
@@ -97,7 +98,7 @@ class ApplyPatchTool(BaseTool):
                     return ToolResult(
                         success=False,
                         output=check[1],
-                        error=f"Patch check failed: {check[2].strip()}",
+                        error=_patch_check_error(check[2]),
                     )
                 for path in paths:
                     self.safety_guard.validate_mutation_path(path)
@@ -176,6 +177,18 @@ def _patch_timeout_result(
             else ToolExecutionOutcome.COMPLETED
         ),
     )
+
+
+def _patch_check_error(stderr: str) -> str:
+    detail = stderr.strip()
+    if "corrupt patch at" in detail:
+        detail += (
+            " Check each @@ -start,count +start,count @@ hunk header: context "
+            "lines count on both sides, removed lines on the old side, and "
+            "added lines on the new side. If necessary, use replace_file_edits "
+            "instead of repeatedly submitting malformed diffs."
+        )
+    return f"Patch check failed: {detail}"
 
 
 def extract_patch_paths(patch: str, guard: SafetyGuard) -> set[str]:

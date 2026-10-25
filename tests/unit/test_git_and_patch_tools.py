@@ -111,6 +111,29 @@ async def test_apply_patch_explains_unsupported_codex_format(tmp_path: Path) -> 
     assert target.read_text() == "old\n"
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.asyncio
+async def test_apply_patch_explains_corrupt_hunk_counts(
+    tmp_path: Path, dry_run: bool
+) -> None:
+    await _init_repo(tmp_path)
+    target = tmp_path / "hello.txt"
+    target.write_text("old\n")
+    await _git(tmp_path, "add", "hello.txt")
+    await _git(tmp_path, "commit", "-qm", "initial")
+
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
+        patch="--- a/hello.txt\n+++ b/hello.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n",
+        dry_run=dry_run,
+    )
+
+    assert result.success is False
+    assert "corrupt patch at" in (result.error or "")
+    assert "context lines count on both sides" in (result.error or "")
+    assert "replace_file_edits" in (result.error or "")
+    assert target.read_text() == "old\n"
+
+
 @pytest.mark.asyncio
 async def test_direct_apply_patch_refuses_competing_ash_mutation(
     tmp_path: Path,
