@@ -921,6 +921,7 @@ SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness. Yo
 1. PLAN BEFORE ACTING: Briefly reason through the necessary steps before invoking tools.
 2. STREAM PROGRESS: Work incrementally. Write files, run tests, and debug errors step-by-step. Do not attempt to write 10 files in one go without verifying compilation.
 3. CONTEXT INTEGRITY: Maintain existing documentation and codebase styles. Do not remove comments unless explicitly told to.
+4. VERIFY REQUIREMENTS: Before claiming a code change is complete, check the behaviors the user explicitly asked to preserve, including relevant edge cases and existing multi-input behavior. Passing available tests does not prove untested requirements. Run focused checks when permitted; otherwise clearly identify what remains unverified. Never claim a check was run when it was not.
 
 {tool_protocol}
 

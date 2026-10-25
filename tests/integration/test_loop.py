@@ -162,6 +162,28 @@ def test_text_only_turn_persists_user_and_assistant_messages(
     assert session.messages[1].content == "Hello, world!"
 
 
+def test_default_prompt_distinguishes_test_passes_from_task_verification(
+    tmp_workspace: Path,
+    safety_guard: SafetyGuard,
+    session_store: SessionStore,
+) -> None:
+    provider = FakeProvider(scripts=[["Acknowledged."]])
+    loop = AshLoop(
+        session_store=session_store,
+        provider=provider,
+        safety_guard=safety_guard,
+        ui=_make_ui(),
+        project_root=tmp_workspace,
+    )
+
+    assert asyncio.run(loop.run_turn("Fix an existing function")) == "Acknowledged."
+
+    system = provider.received_messages[0][0]["content"]
+    assert "Passing available tests does not prove untested requirements" in system
+    assert "Run focused checks when permitted" in system
+    assert "Never claim a check was run when it was not" in system
+
+
 def test_continuous_turns_finalize_each_step_usage_before_follow_up(
     tmp_workspace: Path,
     safety_guard: SafetyGuard,
