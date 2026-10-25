@@ -19,11 +19,11 @@ from ash.tools.base import BaseTool, ToolResult, count_output_tokens
 ESSENTIAL_TOOL_NAMES = frozenset(
     {
         "activate_skill",
-        "apply_patch",
         "ask_user",
         "git_status",
         "list_dir",
         "read_file",
+        "replace_file_content",
         "run_command",
         "search_text",
         "write_file",

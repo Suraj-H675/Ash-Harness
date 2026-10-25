@@ -75,6 +75,29 @@ def test_large_catalog_keeps_compact_core_and_searchable_remainder(tmp_path) -> 
     assert len(visible) < len(catalog)
 
 
+@pytest.mark.asyncio
+async def test_default_edit_tool_is_exact_replacement_and_patch_is_discoverable(
+    tmp_path,
+) -> None:
+    assert "replace_file_content" in ESSENTIAL_TOOL_NAMES
+    assert "apply_patch" not in ESSENTIAL_TOOL_NAMES
+
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=8)
+    catalog[search.name] = search
+    for name in ESSENTIAL_TOOL_NAMES:
+        catalog[name] = DummyTool(guard, name, f"Essential {name} tool.")
+    catalog["apply_patch"] = DummyTool(
+        guard, "apply_patch", "Apply a git-style unified diff to code."
+    )
+
+    assert "apply_patch" not in search.visible_tools(catalog)
+    result = await search.run(query="apply_patch")
+    assert result.success is True
+    assert "apply_patch" in search.visible_tools(catalog)
+
+
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
