@@ -2900,8 +2900,17 @@ class AshLoop:
             stored_output = str(call["result"] or "")
             stored_error = str(call["error"]) if call["error"] is not None else None
             if bool(call["executed"]) or stored_error is not None:
+                stored_success = call["success"]
+                # A terminal failure can have stdout but no error text. The
+                # nullable outcome is absent on pre-v22 records.
+                successful = (
+                    bool(stored_success)
+                    if stored_success is not None
+                    else stored_error is None
+                )
+                ambiguous = stored_success is None and stored_error is not None
                 result_payload = {
-                    "success": stored_error is None,
+                    "success": successful,
                     "output": stored_output,
                     "error": stored_error,
                     "truncated": False,
@@ -2924,8 +2933,8 @@ class AshLoop:
                     turn_id=turn_id,
                     call_id=call_id,
                     tool_name=tool_name,
-                    success=stored_error is None,
-                    ambiguous=stored_error is not None,
+                    success=successful,
+                    ambiguous=ambiguous,
                     result=stored_output,
                     error=stored_error,
                     message=message,

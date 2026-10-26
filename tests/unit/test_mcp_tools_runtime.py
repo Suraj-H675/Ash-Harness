@@ -3154,8 +3154,14 @@ async def test_loop_preserves_task_handle_when_call_record_is_missing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_success", "stored_error"),
+    [(True, None), (False, None), (False, "remote failure"), (None, None)],
+)
 async def test_loop_recovers_locally_finalized_mcp_call_without_server_or_duplicates(
     tmp_path: Path,
+    stored_success: bool | None,
+    stored_error: str | None,
 ) -> None:
     store = SessionStore(tmp_path / "sessions.db")
     session = store.create_session(str(tmp_path))
@@ -3173,6 +3179,8 @@ async def test_loop_recovers_locally_finalized_mcp_call_without_server_or_duplic
             executed=True,
             dispatched=True,
             result="already persisted result",
+            error=stored_error,
+            success=stored_success,
             timestamp=datetime.now(timezone.utc),
         ),
         turn_id=turn_id,
@@ -3222,7 +3230,12 @@ async def test_loop_recovers_locally_finalized_mcp_call_without_server_or_duplic
         ]
         assert len(messages) == 1
         assert "already persisted result" in messages[0].content
+        expected_success = True if stored_success is None else stored_success
+        assert f'"success": {str(expected_success).lower()}' in messages[0].content
+        saved_call = store.load_session(session.session_id).tool_calls[0]
+        assert saved_call.success is stored_success
         assert store.list_mcp_tasks(session.session_id) == []
+        assert store.list_ambiguous_mcp_task_handles(tmp_path) == []
 
         persist_stale_task()
         recovered_again = await loop.start_session(session.session_id)
@@ -3232,6 +3245,7 @@ async def test_loop_recovers_locally_finalized_mcp_call_without_server_or_duplic
             if message.role == "tool" and message.metadata.get("call_id") == call_id
         ]
         assert len(messages_again) == 1
+        assert f'"success": {str(expected_success).lower()}' in messages_again[0].content
         assert store.list_mcp_tasks(session.session_id) == []
     finally:
         await loop.aclose()
