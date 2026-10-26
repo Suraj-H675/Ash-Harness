@@ -23,6 +23,27 @@ async def test_list_directory_is_bounded(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_directory_caps_after_deterministic_path_order(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("a_first.py", "b_second.py", "c_middle.py", "z_last.py"):
+        (tmp_path / name).write_text("", encoding="utf-8")
+    original = search_module.list_scoped_directory
+
+    def reverse_entries(directory, guard):
+        metadata, children = original(directory, guard)
+        return metadata, list(reversed(children))
+
+    monkeypatch.setattr(search_module, "list_scoped_directory", reverse_entries)
+
+    result = await ListDirectoryTool(SafetyGuard(tmp_path)).run(max_results=2)
+
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output == "a_first.py\nb_second.py\n[truncated after 2 entries]"
+
+
+@pytest.mark.asyncio
 async def test_list_directory_caps_recursive_depth(tmp_path) -> None:
     deep_file = tmp_path / "one" / "two" / "three" / "four" / "five.txt"
     deep_file.parent.mkdir(parents=True)

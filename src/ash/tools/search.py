@@ -58,7 +58,7 @@ def _iter_workspace_paths(
             return
         try:
             _, children = list_scoped_directory(directory, guard)
-            for name, is_directory in children:
+            for name, is_directory in sorted(children):
                 path = directory / name
                 yield path, is_directory
                 if not recursive or (max_depth is not None and depth + 1 >= max_depth):
