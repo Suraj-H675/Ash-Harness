@@ -1,9 +1,11 @@
-"""SIGTERM of the real CLI must settle a running command before exiting."""
+"""Signals to the real CLI must settle running commands before exiting."""
 
 from __future__ import annotations
 
 import json
 import os
+import select
+import signal
 import subprocess
 import sys
 import threading
@@ -201,3 +203,181 @@ def test_cli_sigterm_cleans_running_command_and_records_unknown_outcome(
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX terminal signal contract")
+@pytest.mark.parametrize(
+    ("interrupt_signal", "expected_exit_code"),
+    [(signal.SIGINT, 130), (signal.SIGTERM, 143)],
+)
+def test_interactive_cli_signal_cleans_command_and_records_unknown_outcome(
+    tmp_path: Path,
+    interrupt_signal: signal.Signals,
+    expected_exit_code: int,
+) -> None:
+    import fcntl
+    import pty
+    import struct
+    import termios
+
+    workspace = tmp_path / "project"
+    home = tmp_path / "home"
+    db_directory = tmp_path / "db"
+    for directory in (workspace, home, db_directory):
+        directory.mkdir()
+
+    command = (
+        "trap '' TERM; printf running > started.marker; "
+        "sleep 3; printf survived > survived.marker"
+    )
+    environment = {
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "TMPDIR": str(tmp_path),
+        "PATH": os.defpath,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "NO_COLOR": "1",
+        "TERM": "dumb",
+        "ASH_SCREEN_READER_MODE": "true",
+        "ASH_WORKSPACE_ROOT": str(workspace),
+        "ASH_MODEL": "openai/gpt-4o",
+        "OPENAI_API_KEY": "ash-test-placeholder",
+        "ASH_ALLOW_UNSAFE_AUTO_APPROVE": "true",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    trust = subprocess.run(
+        [sys.executable, "-m", "ash", "trust", "add", str(workspace)],
+        cwd=workspace,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert trust.returncode == 0, trust.stderr
+
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "ash",
+            "--db-directory",
+            str(db_directory),
+            "--mode",
+            "auto_approve",
+        ],
+        cwd=workspace,
+        env=environment,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+    )
+    os.close(slave)
+    captured = bytearray()
+    try:
+        deadline = time.monotonic() + 15
+        while b"> " not in captured and process.poll() is None:
+            if time.monotonic() >= deadline:
+                pytest.fail(f"interactive CLI did not show a prompt: {bytes(captured[-1000:])!r}")
+            if select.select([master], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master, 65_536))
+                except OSError:
+                    break
+        assert b"> " in captured, (process.poll(), bytes(captured[-1000:]))
+        os.write(master, f"! {command}\r".encode())
+
+        started = workspace / "started.marker"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not started.exists() and process.poll() is None:
+            if select.select([master], [], [], 0.05)[0]:
+                try:
+                    captured.extend(os.read(master, 65_536))
+                except OSError:
+                    break
+        assert started.exists(), (process.poll(), bytes(captured[-1000:]))
+
+        process.send_signal(interrupt_signal)
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            while select.select([master], [], [], 0)[0]:
+                try:
+                    captured.extend(os.read(master, 65_536))
+                except OSError:
+                    break
+            pytest.fail(
+                "interactive CLI did not finish cancellation: "
+                f"signal={interrupt_signal.name}, output={bytes(captured[-10000:])!r}"
+            )
+        time.sleep(3.3)
+        store = SessionStore(db_directory / "sessions.db")
+        sessions = store.list_sessions(project_path=str(workspace), limit=5)
+        assert len(sessions) == 1
+        session_id = sessions[0].session_id
+        calls = [
+            call for call in store.load_session(session_id).tool_calls
+            if call.tool_name == "run_command"
+        ]
+        reports = store.interrupted_recovery_reports(session_id)
+        survived = (workspace / "survived.marker").exists()
+        assert (
+            process.returncode == expected_exit_code
+            and not survived
+            and len(calls) == 1
+            and calls[0].dispatched
+            and len(reports) == 1
+            and len(reports[0]["unknown_calls"]) == 1
+        ), (
+            f"returncode={process.returncode}, survived={survived}, "
+            f"calls={[(call.dispatched, call.executed, call.error) for call in calls]}, "
+            f"reports={reports}, output={bytes(captured[-1000:])!r}"
+        )
+        assert len(calls) == 1
+        assert calls[0].dispatched is True
+        assert len(reports) == 1
+        assert len(reports[0]["unknown_calls"]) == 1
+        assert store.verify_audit_log(session_id) == []
+
+        recovery = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ash",
+                "--db-directory",
+                str(db_directory),
+                "sessions",
+                "recovery",
+                "--session",
+                session_id,
+                "--json",
+            ],
+            cwd=workspace,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        assert recovery.returncode == 0, recovery.stderr
+        reports_from_cli = json.loads(recovery.stdout)["reports"]
+        assert len(reports_from_cli) == 1
+        assert len(reports_from_cli[0]["unknown_calls"]) == 1
+        calls_after_restart = [
+            call
+            for call in store.load_session(session_id).tool_calls
+            if call.tool_name == "run_command"
+        ]
+        assert len(calls_after_restart) == 1
+        assert store.verify_audit_log(session_id) == []
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master)

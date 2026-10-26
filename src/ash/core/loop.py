@@ -3675,24 +3675,7 @@ class AshLoop:
         except asyncio.CancelledError:
             self._pause_goal_nonfatal()
             current_turn_id = self.turn_context.turn_id if self.turn_context else None
-            if current_turn_id is not None and current_turn_id != previous_turn_id:
-                try:
-                    from ash.core.checkpoints import recover_interrupted_turns
-
-                    if self.current_session is None:
-                        raise RuntimeError("cancelled turn has no active session")
-                    self.recovery_summary = recover_interrupted_turns(
-                        self.session_store,
-                        self.safety_guard,
-                        self.current_session.session_id,
-                    )
-                    self.recovered_turns = self.recovery_summary.interrupted_turns
-                    self._emit_recovered_tool_events(self.recovery_summary)
-                except Exception as exc:  # noqa: BLE001 - preserve cancellation semantics
-                    _log.warning(
-                        "cancel recovery failed for {}: {}", current_turn_id, exc
-                    )
-                    self.session_store.interrupt_turn(current_turn_id)
+            self._recover_cancelled_turn(current_turn_id, previous_turn_id)
             discarded = len(self._steering_messages)
             self._steering_messages.clear()
             self._emit_event(
@@ -5729,6 +5712,119 @@ class AshLoop:
             persisted.append(redacted_call)
         return persisted
 
+    def _recover_cancelled_turn(
+        self,
+        current_turn_id: str | None,
+        previous_turn_id: str | None,
+    ) -> None:
+        if current_turn_id is None or current_turn_id == previous_turn_id:
+            return
+        try:
+            from ash.core.checkpoints import recover_interrupted_turns
+
+            if self.current_session is None:
+                raise RuntimeError("cancelled turn has no active session")
+            self.recovery_summary = recover_interrupted_turns(
+                self.session_store,
+                self.safety_guard,
+                self.current_session.session_id,
+            )
+            self.recovered_turns = self.recovery_summary.interrupted_turns
+            self._emit_recovered_tool_events(self.recovery_summary)
+        except Exception as exc:  # noqa: BLE001 - preserve cancellation semantics
+            _log.warning("cancel recovery failed for {}: {}", current_turn_id, exc)
+            self.session_store.interrupt_turn(current_turn_id)
+
+    async def _execute_tool_in_standalone_turn(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self._closing or self._closed:
+            raise RuntimeError("Ash runtime is closed")
+        if self.current_session is None:
+            raise RuntimeError("cannot execute a tool without an active session")
+        self._verify_project_root_identity()
+        if self._turn_running:
+            raise RuntimeError("a turn is already running")
+        if self._session_lifecycle_lock.locked():
+            raise RuntimeError("session mutation is already in progress")
+
+        session_lease = self.session_store.acquire_session_runtime_lease(
+            self.current_session.session_id
+        )
+        previous_turn_context = self.turn_context
+        previous_turn_id = (
+            previous_turn_context.turn_id if previous_turn_context is not None else None
+        )
+        previous_log_context = current_log_context()
+        self._turn_running = True
+        turn_id: str | None = None
+        journal_started = False
+        try:
+            await self._finish_pending_session_tool_start()
+            if self.current_session is not None:
+                await self._recover_current_session_before_turn()
+            if self.current_session is None:
+                raise RuntimeError("session disappeared before direct tool execution")
+
+            from ash.context.turn import TurnContext
+
+            session = self.current_session
+            turn_id = str(uuid4())
+            self.turn_context = TurnContext(
+                session_id=session.session_id,
+                turn_id=turn_id,
+            )
+            set_log_context(
+                session_id=session.session_id,
+                turn_id=turn_id,
+                operation_id=None,
+            )
+            self.session_store.start_turn(
+                session.session_id,
+                turn_id,
+                "direct tool invocation",
+            )
+            journal_started = True
+
+            results = await self._execute_tool_calls(
+                [
+                    {
+                        "call_id": str(uuid4()),
+                        "name": tool_name,
+                        "arguments": deepcopy(arguments),
+                    }
+                ],
+                session,
+            )
+            if len(results) != 1:
+                raise RuntimeError(
+                    "single mediated tool call returned an invalid result count"
+                )
+            self.session_store.complete_turn(turn_id)
+            journal_started = False
+            return results[0]
+        except asyncio.CancelledError:
+            self._recover_cancelled_turn(turn_id, previous_turn_id)
+            raise
+        except Exception:
+            if turn_id is not None and journal_started:
+                self.session_store.interrupt_turn(turn_id)
+            raise
+        finally:
+            self._active_turn_user_message = None
+            self._turn_running = False
+            try:
+                self._flush_runtime_events_nonfatal()
+                await self._close_retired_mcp_runtimes(raise_on_failure=False)
+            finally:
+                try:
+                    replace_log_context(previous_log_context)
+                    self.turn_context = previous_turn_context
+                finally:
+                    session_lease.close()
+
     async def execute_tool(
         self,
         tool_name: str,
@@ -5745,6 +5841,8 @@ class AshLoop:
         session = self.current_session
         if session is None:
             raise RuntimeError("cannot execute a tool without an active session")
+        if self.turn_context is None:
+            return await self._execute_tool_in_standalone_turn(tool_name, arguments)
         results = await self._execute_tool_calls(
             [
                 {

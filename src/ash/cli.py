@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import json
 import math
@@ -1217,17 +1218,9 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 await loop.start_session()
                 _sync_repl_model_config(config, loop)
             assert loop.current_session is not None
-            from uuid import uuid4
-
-            await loop._execute_tool_calls(
-                [
-                    {
-                        "call_id": str(uuid4()),
-                        "name": "run_command",
-                        "arguments": {"command_line": command_line},
-                    }
-                ],
-                loop.current_session,
+            await loop.execute_tool(
+                "run_command",
+                {"command_line": command_line},
             )
             continue
 
@@ -5232,11 +5225,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
             return 130
     try:
         return asyncio.run(
-            _bootstrap_and_repl(
-                loop,
-                config,
-                sandbox_manager,
-                session_id=startup_session_id,
+            _with_sigterm_cleanup(
+                lambda: _bootstrap_and_repl(
+                    loop,
+                    config,
+                    sandbox_manager,
+                    session_id=startup_session_id,
+                )
             )
         )
     except KeyboardInterrupt:
@@ -5252,6 +5247,21 @@ async def _headless_with_sigterm_cleanup(
     session_id: str | None,
     ui: Any,
     json_schema_path: Path | None = None,
+) -> int:
+    return await _with_sigterm_cleanup(
+        lambda: _bootstrap_and_headless(
+            loop,
+            config,
+            prompt=prompt,
+            session_id=session_id,
+            ui=ui,
+            json_schema_path=json_schema_path,
+        )
+    )
+
+
+async def _with_sigterm_cleanup(
+    operation: Callable[[], Awaitable[int]],
 ) -> int:
     import signal
 
@@ -5272,15 +5282,11 @@ async def _headless_with_sigterm_cleanup(
     except (NotImplementedError, RuntimeError):
         pass
     try:
-        return await _bootstrap_and_headless(
-            loop,
-            config,
-            prompt=prompt,
-            session_id=session_id,
-            ui=ui,
-            json_schema_path=json_schema_path,
-        )
+        return await operation()
     except asyncio.CancelledError:
+        # Settle worker cleanup while the event loop can still process its
+        # callbacks, before asyncio.run() performs its final shutdown.
+        await event_loop.shutdown_default_executor()
         if terminated:
             return 143
         raise
