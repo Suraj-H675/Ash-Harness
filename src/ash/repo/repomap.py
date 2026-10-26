@@ -568,6 +568,7 @@ class RepoMap:
         self._adjacency: _SparseAdjacency | None = None
         self._priority_paths: tuple[Path, ...] = ()
         self._file_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
+        self._index_incomplete = False
         self._initial_refresh_ready = threading.Event()
         self._initial_refresh_error: BaseException | None = None
         self._initial_refresh_cancel = threading.Event()
@@ -595,6 +596,13 @@ class RepoMap:
         """Whether the initial repository snapshot is available without waiting."""
 
         return self._initial_refresh_ready.is_set()
+
+    @property
+    def index_incomplete(self) -> bool:
+        """Whether eligible source files were omitted from the current index."""
+
+        self._wait_for_initial_refresh()
+        return self._index_incomplete
 
     def refresh(self) -> None:
         """Re-walk the workspace and rebuild the graph."""
@@ -933,6 +941,7 @@ class RepoMap:
             if module_name is not None:
                 module_index[module_name] = resolved
 
+        self._index_incomplete = len(files) < len(eligible)
         if next_cache == self._file_cache:
             return
 
@@ -1033,6 +1042,9 @@ class RepoMap:
         ):
             return
 
+        selected_paths = {node.path for node in files}
+        if any(node.path not in selected_paths for node in self._files):
+            self._index_incomplete = True
         self._files = files
         self._file_cache = {
             node.path: (
