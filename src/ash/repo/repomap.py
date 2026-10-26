@@ -807,7 +807,10 @@ class RepoMap:
         except ValueError:
             return False
         normalized = pattern.replace("\\", "/")
-        return fnmatch.fnmatchcase(relative, normalized)
+        return fnmatch.fnmatchcase(relative, normalized) or (
+            normalized.startswith("**/")
+            and fnmatch.fnmatchcase(relative, normalized[3:])
+        )
 
     def _explicit_unindexed_path(self, pattern: str | None) -> Path | None:
         """Resolve one literal source path without changing the bounded map."""

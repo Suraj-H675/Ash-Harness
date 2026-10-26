@@ -72,6 +72,35 @@ async def test_symbol_tools_support_globs_case_folding_and_limits(
 
 
 @pytest.mark.asyncio
+async def test_double_star_symbol_glob_matches_root_and_nested_sources(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "root.py").write_text("def Wanted(): pass\ndef use():\n    Wanted()\n")
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "nested.py").write_text("def Wanted(): pass\ndef use():\n    Wanted()\n")
+    guard = SafetyGuard(tmp_path)
+    repo_map = RepoMap(tmp_path)
+
+    definition = await FindSymbolTool(guard, repo_map).run(
+        query="Wanted", path_glob="**/*.py"
+    )
+    reference = await FindReferencesTool(guard, repo_map).run(
+        query="Wanted", path_glob="**/*.py"
+    )
+
+    assert set(definition.output.splitlines()) == {
+        "root.py:1: function Wanted [python]",
+        "pkg/nested.py:1: function Wanted [python]",
+    }
+    assert set(reference.output.splitlines()) == {
+        "root.py:3:5: Wanted [python]",
+        "pkg/nested.py:3:5: Wanted [python]",
+    }
+    assert not definition.truncated and not reference.truncated
+
+
+@pytest.mark.asyncio
 async def test_symbol_tools_report_empty_results_as_success(workspace: Path) -> None:
     guard = SafetyGuard(workspace)
     repo_map = RepoMap(workspace)
