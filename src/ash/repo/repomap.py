@@ -659,7 +659,13 @@ class RepoMap:
             self._refresh()
         expected = name if case_sensitive else name.casefold()
         matches: list[Symbol] = []
-        for file_node in self._files:
+        files = list(self._files)
+        explicit = self._explicit_unindexed_path(path_glob)
+        if explicit is not None:
+            loaded = self._load_file(explicit)
+            if loaded is not None:
+                files.append(loaded[2])
+        for file_node in files:
             if not self._matches_path_glob(file_node.path, path_glob):
                 continue
             for symbol in file_node.symbols:
@@ -690,12 +696,16 @@ class RepoMap:
             self._refresh()
         matches: list[SourceLocation] = []
         ascii_name = name.encode("ascii") if case_sensitive and name.isascii() else None
-        for file_node in self._files:
-            if not self._matches_path_glob(file_node.path, path_glob):
+        paths = [node.path for node in self._files]
+        explicit = self._explicit_unindexed_path(path_glob)
+        if explicit is not None:
+            paths.append(explicit)
+        for path in paths:
+            if not self._matches_path_glob(path, path_glob):
                 continue
             try:
                 _, source = read_scoped_bytes(
-                    file_node.path,
+                    path,
                     self._guard,
                     max_bytes=MAX_SOURCE_FILE_BYTES,
                 )
@@ -704,7 +714,7 @@ class RepoMap:
             if ascii_name is not None and ascii_name not in source:
                 continue
             for location in self._extractor.find_references(
-                file_node.path,
+                path,
                 name,
                 case_sensitive=case_sensitive,
                 source=source,
@@ -785,6 +795,48 @@ class RepoMap:
             return False
         normalized = pattern.replace("\\", "/")
         return fnmatch.fnmatchcase(relative, normalized)
+
+    def _explicit_unindexed_path(self, pattern: str | None) -> Path | None:
+        """Resolve one literal source path without changing the bounded map."""
+
+        if not pattern or any(char in pattern for char in "*?["):
+            return None
+        relative = Path(pattern.replace("\\", "/"))
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.suffix.casefold() not in SOURCE_SUFFIXES
+            or len(relative.parts) - 1 > MAX_REPO_DISCOVERY_DEPTH
+            or any(
+                part in DEFAULT_IGNORED_DIRS or part.startswith(".")
+                for part in relative.parts[:-1]
+            )
+            or _matches_exclude_pattern(relative, self._exclude_patterns, is_dir=False)
+            or any(
+                _matches_exclude_pattern(
+                    Path(*relative.parts[:depth]), self._exclude_patterns, is_dir=True
+                )
+                for depth in range(1, len(relative.parts))
+            )
+        ):
+            return None
+        try:
+            path, metadata = stat_scoped_path(self.project_root / relative, self._guard)
+        except (OSError, SafetyViolation):
+            return None
+        if (
+            path in self._index
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > MAX_SOURCE_FILE_BYTES
+        ):
+            return None
+        ignored = _git_ignored_files(
+            self.project_root,
+            [path],
+            guard=self._guard,
+            expected_root_identity=self._project_root_identity,
+        )
+        return None if path in ignored else path
 
     def render(
         self,

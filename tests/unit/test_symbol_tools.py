@@ -1,4 +1,6 @@
 from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
@@ -120,6 +122,86 @@ async def test_symbol_navigation_reports_incomplete_repository_index(
     refreshed = await FindSymbolTool(guard, repo_map).run(query="missing")
     assert refreshed.success and not refreshed.truncated
     assert "index incomplete" not in refreshed.output
+
+
+@pytest.mark.asyncio
+async def test_explicit_symbol_path_finds_file_outside_repo_map_limit(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a.py").write_text("def early(): pass\n")
+    (tmp_path / "b.py").write_text("def other(): pass\n")
+    target = tmp_path / "target.py"
+    target.write_text("def Wanted(): pass\ndef use():\n    Wanted()\n")
+    repo_map = RepoMap(tmp_path, max_files=2)
+    indexed = [node.path for node in repo_map.files]
+    assert target not in indexed
+    guard = SafetyGuard(tmp_path)
+
+    definition = await FindSymbolTool(guard, repo_map).run(
+        query="Wanted", path_glob="target.py"
+    )
+    reference = await FindReferencesTool(guard, repo_map).run(
+        query="Wanted", path_glob="target.py"
+    )
+    assert "target.py:1: function Wanted" in definition.output
+    assert "target.py:3:5: Wanted" in reference.output
+    assert [node.path for node in repo_map.files] == indexed
+
+    target.write_text("def Renamed(): pass\ndef use():\n    Renamed()\n")
+    updated = await FindSymbolTool(guard, repo_map).run(
+        query="Renamed", path_glob="target.py"
+    )
+    assert "target.py:1: function Renamed" in updated.output
+
+
+@pytest.mark.asyncio
+async def test_explicit_symbol_path_respects_excluded_directories(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a.py").write_text("def early(): pass\n")
+    hidden = tmp_path / "generated"
+    hidden.mkdir()
+    (hidden / "secret.py").write_text("def Secret(): pass\n")
+    repo_map = RepoMap(tmp_path, max_files=1, exclude_patterns=["generated/"])
+    result = await FindSymbolTool(SafetyGuard(tmp_path), repo_map).run(
+        query="Secret", path_glob="generated/secret.py"
+    )
+    assert "function Secret" not in result.output
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+async def test_explicit_symbol_path_respects_gitignore(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".gitignore").write_text("ignored.py\n")
+    (tmp_path / "a.py").write_text("def indexed(): pass\n")
+    (tmp_path / "ignored.py").write_text("def Hidden(): pass\n")
+    repo_map = RepoMap(tmp_path, max_files=1)
+
+    result = await FindSymbolTool(SafetyGuard(tmp_path), repo_map).run(
+        query="Hidden", path_glob="ignored.py"
+    )
+    assert "function Hidden" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_explicit_symbol_path_rejects_external_symlink(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "a.py").write_text("def early(): pass\n")
+    outside = tmp_path / "outside.py"
+    outside.write_text(
+        "def OutsideSecret(): pass\ndef caller():\n    OutsideSecret()\n"
+    )
+    (workspace / "target.py").symlink_to(outside)
+    repo_map = RepoMap(workspace, max_files=1)
+    guard = SafetyGuard(workspace)
+
+    for tool in (FindSymbolTool(guard, repo_map), FindReferencesTool(guard, repo_map)):
+        result = await tool.run(query="OutsideSecret", path_glob="target.py")
+        assert "outside.py" not in result.output
+        assert "function OutsideSecret" not in result.output
+        assert "target.py:" not in result.output
 
 
 def test_ranked_new_active_file_marks_index_incomplete(tmp_path: Path) -> None:
