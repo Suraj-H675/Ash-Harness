@@ -681,6 +681,7 @@ class RepoMap:
         if refresh:
             self._refresh()
         matches: list[SourceLocation] = []
+        ascii_name = name.encode("ascii") if case_sensitive and name.isascii() else None
         for file_node in self._files:
             if not self._matches_path_glob(file_node.path, path_glob):
                 continue
@@ -691,6 +692,8 @@ class RepoMap:
                     max_bytes=MAX_SOURCE_FILE_BYTES,
                 )
             except (OSError, SafetyViolation):
+                continue
+            if ascii_name is not None and ascii_name not in source:
                 continue
             for location in self._extractor.find_references(
                 file_node.path,

@@ -379,7 +379,9 @@ def test_repomap_find_references_does_not_read_swapped_external_file(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "safe.py"
-    target.write_text("def harmless():\n    return 1\n", encoding="utf-8")
+    target.write_text(
+        "def harmless():\n    return 'outside_name'\n", encoding="utf-8"
+    )
     saved = workspace / "safe-saved.py"
     outside = tmp_path / "outside.py"
     outside.write_text(
@@ -871,6 +873,39 @@ def test_repomap_finds_definitions_and_references_across_languages(
         ("client.ts", 2),
         ("service.py", 5),
     }
+
+
+def test_reference_lookup_avoids_parsing_files_without_case_sensitive_ascii_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matching = tmp_path / "matching.py"
+    different_case = tmp_path / "different_case.py"
+    matching.write_text("def call():\n    Needle()\n", encoding="utf-8")
+    different_case.write_text("def call():\n    needle()\n", encoding="utf-8")
+    repo_map = RepoMap(tmp_path)
+    original = repo_map._extractor.find_references
+    parsed_files: list[Path] = []
+
+    def record_lookup(path: Path, *args: object, **kwargs: object):
+        parsed_files.append(path)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(repo_map._extractor, "find_references", record_lookup)
+
+    sensitive = repo_map.find_references("Needle")
+    assert [Path(item.file_path) for item in sensitive] == [matching]
+    assert parsed_files == [matching]
+
+    parsed_files.clear()
+    insensitive = repo_map.find_references("Needle", case_sensitive=False)
+    assert {Path(item.file_path) for item in insensitive} == {matching, different_case}
+    assert set(parsed_files) == {matching, different_case}
+
+    different_case.write_text("def call():\n    Needle()\n", encoding="utf-8")
+    parsed_files.clear()
+    updated = repo_map.find_references("Needle")
+    assert {Path(item.file_path) for item in updated} == {matching, different_case}
+    assert set(parsed_files) == {matching, different_case}
 
 
 def test_repomap_symbol_queries_support_path_globs_and_case_folding(
