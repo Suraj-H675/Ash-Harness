@@ -45,6 +45,8 @@ def test_terminal_tool_persistence_retry_is_idempotent_and_conflicts_are_rejecte
         dispatched=True,
         result="hello",
         error=None,
+        success=True,
+        exit_code=0,
         timestamp=timestamp,
     )
     message = Message(
@@ -61,6 +63,8 @@ def test_terminal_tool_persistence_retry_is_idempotent_and_conflicts_are_rejecte
     )
     loaded = store.load_session(session.session_id)
     assert len(loaded.tool_calls) == 1
+    assert loaded.tool_calls[0].success is True
+    assert loaded.tool_calls[0].exit_code == 0
     assert [m.metadata.get("call_id") for m in loaded.messages if m.role == "tool"] == [
         record.call_id
     ]
@@ -72,6 +76,13 @@ def test_terminal_tool_persistence_retry_is_idempotent_and_conflicts_are_rejecte
             session.session_id,
             record.model_copy(update={"result": "different"}),
             message.model_copy(update={"content": "different"}),
+            turn_id=turn_id,
+        )
+    with pytest.raises(SessionStorageError, match="conflicting terminal tool"):
+        store.finalize_tool_call_with_message(
+            session.session_id,
+            record.model_copy(update={"success": False, "exit_code": 1}),
+            message,
             turn_id=turn_id,
         )
     preserved = store.load_session(session.session_id)
@@ -888,6 +899,9 @@ def test_recovered_mcp_failure_archives_only_unknown_outcomes(
     assert store.list_mcp_tasks(session.session_id) == []
     handles = store.list_ambiguous_mcp_task_handles(tmp_path)
     assert [handle.task_id for handle in handles] == ([task_id] if ambiguous else [])
+    recovered_call = store.load_session(session.session_id).tool_calls[0]
+    assert recovered_call.success is (None if ambiguous else False)
+    assert recovered_call.exit_code is None
     assert (
         len(
             [
@@ -1026,7 +1040,7 @@ def test_v20_migration_adds_checkpoint_after_mode_without_losing_rows(
     )
     with closing(get_db_connection(db_path)) as conn, conn:
         conn.execute("ALTER TABLE file_checkpoints DROP COLUMN after_mode")
-        conn.execute("DELETE FROM schema_migrations WHERE version = 21")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 21")
 
     migrated = SessionStore(db_path)
 
@@ -1049,6 +1063,43 @@ def test_v20_migration_adds_checkpoint_after_mode_without_losing_rows(
     assert row["after_mode"] is None
     assert version == CURRENT_SCHEMA_VERSION
     assert migrated.load_session(session.session_id).session_id == session.session_id
+
+
+def test_v21_migration_preserves_tool_calls_without_inventing_outcomes(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "v21-tool-calls.db"
+    store = SessionStore(db_path)
+    session = store.create_session(str(tmp_path))
+    store.save_tool_call(
+        session.session_id,
+        ToolCallRecord(
+            call_id="old-command",
+            tool_name="run_command",
+            arguments={"command_line": "false"},
+            approved=True,
+            executed=True,
+            result="checks failed on stdout",
+            error=None,
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    with closing(get_db_connection(db_path)) as conn, conn:
+        conn.execute("ALTER TABLE tool_calls DROP COLUMN success")
+        conn.execute("ALTER TABLE tool_calls DROP COLUMN exit_code")
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 22")
+
+    migrated = SessionStore(db_path)
+    recovered = migrated.load_session(session.session_id).tool_calls[0]
+    assert recovered.result == "checks failed on stdout"
+    assert recovered.error is None
+    assert recovered.success is None
+    assert recovered.exit_code is None
+    with closing(get_db_connection(db_path)) as conn:
+        row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+    assert row is not None and row[0] == CURRENT_SCHEMA_VERSION
+    backups = list(tmp_path.glob("v21-tool-calls.db.before-v22-migration.*.backup"))
+    assert len(backups) == 1
 
 
 def test_mcp_task_durable_state_has_count_and_payload_limits(

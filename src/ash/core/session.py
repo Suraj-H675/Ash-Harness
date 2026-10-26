@@ -57,7 +57,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 21
+CURRENT_SCHEMA_VERSION = 22
 TURN_JOURNAL_INPUT_OMITTED: Final[str] = "<prompt omitted>"
 SQLITE_INTEGER_MAX = 2**63 - 1
 SQLITE_REAL_MAX = sys.float_info.max
@@ -378,6 +378,13 @@ class ToolCallRecord(BaseModel):
     dispatched: bool = False
     result: str | None = None
     error: str | None = None
+    success: bool | None = Field(
+        None,
+        description="Observed success, or unknown for pending and historical calls.",
+    )
+    exit_code: int | None = Field(
+        None, description="Process exit code when reported by the tool."
+    )
     timestamp: datetime
 
 
@@ -1312,6 +1319,8 @@ class SessionStore:
                 self._migrate_v20(conn)
             if from_version < 21:
                 self._migrate_v21(conn)
+            if from_version < 22:
+                self._migrate_v22(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -1901,6 +1910,22 @@ class SessionStore:
             (21, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v22(self, conn: sqlite3.Connection) -> None:
+        """Retain explicit outcomes for new tool calls; older outcomes remain unknown."""
+
+        if not _column_exists(conn, "tool_calls", "success"):
+            conn.execute(
+                "ALTER TABLE tool_calls ADD COLUMN success INTEGER "
+                "CHECK(success IN (0, 1))"
+            )
+        if not _column_exists(conn, "tool_calls", "exit_code"):
+            conn.execute("ALTER TABLE tool_calls ADD COLUMN exit_code INTEGER")
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (22, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -2406,7 +2431,7 @@ class SessionStore:
                 tool_call_rows = conn.execute(
                     """
                     SELECT call_id, tool_name, arguments_json, approved, executed,
-                           dispatched, result, error, timestamp
+                           dispatched, result, error, success, exit_code, timestamp
                     FROM tool_calls
                     WHERE session_id = ?
                     ORDER BY timestamp DESC, call_id DESC
@@ -2419,7 +2444,7 @@ class SessionStore:
                 tool_call_rows = conn.execute(
                     """
                     SELECT call_id, tool_name, arguments_json, approved, executed,
-                           dispatched, result, error, timestamp
+                           dispatched, result, error, success, exit_code, timestamp
                     FROM tool_calls
                     WHERE session_id = ?
                     ORDER BY timestamp ASC, call_id ASC
@@ -2468,6 +2493,10 @@ class SessionStore:
                         dispatched=bool(row["dispatched"]),
                         result=row["result"],
                         error=row["error"],
+                        success=(
+                            None if row["success"] is None else bool(row["success"])
+                        ),
+                        exit_code=row["exit_code"],
                         timestamp=_deserialize_datetime(row["timestamp"]),
                     )
                     for row in tool_call_rows
@@ -4696,10 +4725,12 @@ class SessionStore:
                     dispatched,
                     result,
                     error,
+                    success,
+                    exit_code,
                     timestamp,
                     turn_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, call_id) DO UPDATE SET
                     tool_name = excluded.tool_name,
                     arguments_json = excluded.arguments_json,
@@ -4708,6 +4739,8 @@ class SessionStore:
                     dispatched = excluded.dispatched,
                     result = excluded.result,
                     error = excluded.error,
+                    success = excluded.success,
+                    exit_code = excluded.exit_code,
                     timestamp = excluded.timestamp,
                     turn_id = COALESCE(excluded.turn_id, tool_calls.turn_id)
                 """,
@@ -4721,6 +4754,8 @@ class SessionStore:
                     int(record.dispatched),
                     record.result,
                     record.error,
+                    record.success,
+                    record.exit_code,
                     _serialize_datetime(record.timestamp),
                     turn_id,
                 ),
@@ -4750,7 +4785,7 @@ class SessionStore:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT tool_name, arguments_json, approved, executed, dispatched, "
-                "result, error, turn_id FROM tool_calls "
+                "result, error, success, exit_code, turn_id FROM tool_calls "
                 "WHERE session_id = ? AND call_id = ?",
                 (session_id, record.call_id),
             ).fetchone()
@@ -4775,6 +4810,8 @@ class SessionStore:
                     or bool(existing["dispatched"]) != record.dispatched
                     or existing["result"] != record.result
                     or existing["error"] != record.error
+                    or existing["success"] != record.success
+                    or existing["exit_code"] != record.exit_code
                 ):
                     raise SessionStorageError("conflicting terminal tool call retry")
             if terminal_messages:
@@ -4800,10 +4837,12 @@ class SessionStore:
                     dispatched,
                     result,
                     error,
+                    success,
+                    exit_code,
                     timestamp,
                     turn_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, call_id) DO UPDATE SET
                     tool_name = excluded.tool_name,
                     arguments_json = excluded.arguments_json,
@@ -4812,6 +4851,8 @@ class SessionStore:
                     dispatched = excluded.dispatched,
                     result = excluded.result,
                     error = excluded.error,
+                    success = excluded.success,
+                    exit_code = excluded.exit_code,
                     timestamp = excluded.timestamp,
                     turn_id = COALESCE(excluded.turn_id, tool_calls.turn_id)
                 """,
@@ -4825,6 +4866,8 @@ class SessionStore:
                     int(record.dispatched),
                     record.result,
                     record.error,
+                    record.success,
+                    record.exit_code,
                     _serialize_datetime(record.timestamp),
                     turn_id,
                 ),
@@ -5212,9 +5255,17 @@ class SessionStore:
             already_terminal = bool(call["executed"]) or call["error"] is not None
             if not already_terminal:
                 conn.execute(
-                    "UPDATE tool_calls SET executed = 1, result = ?, error = ? "
+                    "UPDATE tool_calls SET executed = 1, result = ?, error = ?, "
+                    "success = ? "
                     "WHERE session_id = ? AND turn_id = ? AND call_id = ?",
-                    (result, error, session_id, turn_id, call_id),
+                    (
+                        result,
+                        error,
+                        None if ambiguous else int(success),
+                        session_id,
+                        turn_id,
+                        call_id,
+                    ),
                 )
                 self._append_audit_log_in_connection(
                     conn,

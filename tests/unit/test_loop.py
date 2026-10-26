@@ -109,6 +109,51 @@ class MyTestTool(BaseTool):
         return ToolResult(success=True, output="my_tool ran")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [0, 1])
+async def test_stdout_only_tool_call_persists_explicit_outcome(
+    tmp_path, exit_code: int
+) -> None:
+    class StdoutResultTool(MyTestTool):
+        async def run(self, **kwargs):
+            return ToolResult(
+                success=exit_code == 0,
+                output="test result on stdout",
+                error=None,
+                exit_code=exit_code,
+            )
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "tool-result.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(),
+        tmp_path,
+        tools={"my_tool": StdoutResultTool(guard)},
+        safety_tier="auto_approve",
+    )
+    try:
+        session = await loop.start_session()
+        results = await loop._execute_tool_calls(
+            [{"call_id": "failed-check", "name": "my_tool", "arguments": {}}],
+            session,
+            persist_tool_messages=True,
+        )
+        assert results[0]["success"] is (exit_code == 0)
+        assert results[0]["exit_code"] == exit_code
+        saved = store.load_session(session.session_id).tool_calls[0]
+        assert saved.executed is True
+        assert saved.result == "test result on stdout"
+        assert saved.error is None
+        assert saved.success is (exit_code == 0)
+        assert saved.exit_code == exit_code
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
 class EventTool(BaseTool):
     name = "event_tool"
     args_schema = None

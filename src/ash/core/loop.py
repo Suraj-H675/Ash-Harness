@@ -6344,6 +6344,8 @@ class AshLoop:
             record.result = tool_result.output
             record.error = tool_result.error
             ambiguous = tool_result.outcome is ToolExecutionOutcome.UNKNOWN
+            record.success = None if ambiguous or not tool_started else tool_result.success
+            record.exit_code = tool_result.exit_code
             if not defer_terminal_persistence:
                 self.session_store.save_tool_call(
                     session.session_id,
