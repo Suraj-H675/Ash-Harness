@@ -145,7 +145,34 @@ async def test_explicit_symbol_path_finds_file_outside_repo_map_limit(
     )
     assert "target.py:1: function Wanted" in definition.output
     assert "target.py:3:5: Wanted" in reference.output
+    assert not definition.truncated and not reference.truncated
+    assert "index incomplete" not in definition.output
+    assert "index incomplete" not in reference.output
     assert [node.path for node in repo_map.files] == indexed
+
+    absent = await FindSymbolTool(guard, repo_map).run(
+        query="Absent", path_glob="target.py"
+    )
+    assert absent.output == "No definitions found for 'Absent'."
+    assert not absent.truncated
+
+    indexed_file = await FindSymbolTool(guard, repo_map).run(
+        query="early", path_glob="a.py"
+    )
+    assert "a.py:1: function early" in indexed_file.output
+    assert not indexed_file.truncated
+
+    wildcard = await FindSymbolTool(guard, repo_map).run(
+        query="Wanted", path_glob="*.py"
+    )
+    assert wildcard.truncated
+    assert "index incomplete" in wildcard.output
+
+    unmatched_spelling = await FindSymbolTool(guard, repo_map).run(
+        query="Wanted", path_glob="./target.py"
+    )
+    assert unmatched_spelling.truncated
+    assert "in indexed files" in unmatched_spelling.output
 
     target.write_text("def Renamed(): pass\ndef use():\n    Renamed()\n")
     updated = await FindSymbolTool(guard, repo_map).run(

@@ -55,8 +55,9 @@ class FindSymbolTool(BaseTool):
         )
         truncated = len(matches) > args.max_results
         matches = matches[: args.max_results]
+        incomplete = self.repo_map.query_incomplete(args.path_glob)
         if not matches:
-            scope = " in indexed files" if self.repo_map.index_incomplete else ""
+            scope = " in indexed files" if incomplete else ""
             output = f"No definitions found{scope} for {args.query!r}."
         else:
             lines: list[str] = []
@@ -68,7 +69,6 @@ class FindSymbolTool(BaseTool):
                     f"[{item.language}]"
                 )
             output = "\n".join(lines)
-        incomplete = self.repo_map.index_incomplete
         output += _incomplete_index_note(incomplete)
         return ToolResult(
             success=True,
@@ -109,8 +109,9 @@ class FindReferencesTool(BaseTool):
         )
         truncated = len(matches) > args.max_results
         matches = matches[: args.max_results]
+        incomplete = self.repo_map.query_incomplete(args.path_glob)
         if not matches:
-            scope = " in indexed files" if self.repo_map.index_incomplete else ""
+            scope = " in indexed files" if incomplete else ""
             output = f"No references found{scope} for {args.query!r}."
         else:
             lines = [
@@ -122,7 +123,6 @@ class FindReferencesTool(BaseTool):
                 for item in matches
             ]
             output = "\n".join(lines)
-        incomplete = self.repo_map.index_incomplete
         output += _incomplete_index_note(incomplete)
         return ToolResult(
             success=True,

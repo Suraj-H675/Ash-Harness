@@ -604,6 +604,19 @@ class RepoMap:
         self._wait_for_initial_refresh()
         return self._index_incomplete
 
+    def query_incomplete(self, path_glob: str | None = None) -> bool:
+        """Report missing coverage for a query's file scope, not the entire map."""
+
+        self._wait_for_initial_refresh()
+        if not self._index_incomplete:
+            return False
+        if not path_glob or any(char in path_glob for char in "*?["):
+            return True
+        if any(self._matches_path_glob(path, path_glob) for path in self._index):
+            return False
+        explicit = self._explicit_unindexed_path(path_glob)
+        return explicit is None or not self._matches_path_glob(explicit, path_glob)
+
     def refresh(self) -> None:
         """Re-walk the workspace and rebuild the graph."""
 
