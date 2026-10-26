@@ -419,7 +419,11 @@ class ReplaceFileContentTool(BaseTool):
                 return ToolResult(
                     success=False,
                     output="",
-                    error=_build_mismatch_error(normalized_target, normalized_segment),
+                    error=(
+                        _build_mismatch_error(normalized_target, normalized_segment)
+                        + " If target_content uniquely matches a full-line block, "
+                        "omit both start_line and end_line instead."
+                    ),
                 )
 
         replacement_lines = _replacement_lines_for_span(
@@ -833,4 +837,8 @@ def _build_mismatch_error(expected: str, actual: str) -> str:
             lineterm="",
         )
     )
-    return f"Error: target_content does not match the specified line range.\n{diff}"
+    return (
+        "Error: target_content does not match the specified line range. "
+        "Read the file again and copy the exact complete lines, including indentation."
+        f"\n{diff}"
+    )

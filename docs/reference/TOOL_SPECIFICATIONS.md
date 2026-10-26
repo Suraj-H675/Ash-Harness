@@ -137,7 +137,7 @@ Performs structured Search and Replace operations on a contiguous block of text.
     2.  **Scope Verification**: With both line bounds, extract lines from index `start_line - 1` to `end_line` (inclusive), retaining each source line's terminator. Without either bound, find exactly one nonempty block of complete lines matching `target_content` in the file. Reject missing, partial-line, and ambiguous matches without changing the file. Providing only one bound is invalid.
     3.  **Normalize for Matching Only**: Normalize CRLF and lone CR inside the extracted file segment and `target_content` to `\n`. Strip trailing newline characters strictly for comparison. Do not normalize the source file before reassembly.
     4.  **Exact Matching**: Compare normalized strings.
-        -   If they do NOT match exactly, raise an error immediately. Return a line-by-line diff comparison showing exactly where spacing or content mismatches occur.
+        -   If they do NOT match exactly, raise an error immediately. Return a line-by-line diff comparison showing exactly where spacing or content mismatches occur, with guidance to reread and copy exact lines. A single-range edit also explains that both line bounds can be omitted when the full-line target is unique.
         -   For explicitly bounded edits, the match must be constrained *strictly* within the specified line range bounds. Do not search outside the specified range.
         -   Unbounded unique-block matching still requires exact full-line content. If repeated content appears more than once, provide both line bounds to disambiguate. Optional `expected_sha256` protects either mode against stale reads.
     5.  **Choose Replacement Terminators**:

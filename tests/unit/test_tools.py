@@ -1233,6 +1233,7 @@ async def test_replace_file_edits_rejects_mismatch_without_partial_write(
 
     assert result.success is False
     assert "edit 2 target_content does not match" in (result.error or "")
+    assert "Read the file again" in (result.error or "")
     assert target.read_text(encoding="utf-8") == original
 
 
@@ -1285,7 +1286,40 @@ async def test_replace_file_content_does_not_search_outside_requested_bounds(
 
     assert result.success is False
     assert "target_content does not match" in (result.error or "")
+    assert "omit both start_line and end_line" in (result.error or "")
     assert target.read_text(encoding="utf-8") == "target\nmiddle\ntarget\n"
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_mismatch_explains_safe_unique_block_recovery(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    original = "header\n    unique line\nfooter\n"
+    target.write_text(original, encoding="utf-8")
+    tool = ReplaceFileContentTool(guard)
+
+    mismatch = await tool.run(
+        file_path="doc.txt",
+        start_line=1,
+        end_line=1,
+        target_content="    unique line",
+        replacement_content="    replaced",
+    )
+    assert mismatch.success is False
+    assert "Read the file again" in (mismatch.error or "")
+    assert "omit both start_line and end_line" in (mismatch.error or "")
+    assert "--- target_content" in (mismatch.error or "")
+    assert target.read_text(encoding="utf-8") == original
+
+    recovered = await tool.run(
+        file_path="doc.txt",
+        target_content="    unique line",
+        replacement_content="    replaced",
+    )
+    assert recovered.success is True
+    assert target.read_text(encoding="utf-8") == "header\n    replaced\nfooter\n"
 
 
 @pytest.mark.asyncio
