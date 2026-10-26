@@ -295,10 +295,12 @@ async def test_session_picker_redacts_and_bounds_preview_load_errors() -> None:
 async def test_session_picker_enter_does_not_wait_for_search_when_metadata_match_is_visible() -> None:
     search_started = threading.Event()
     release_search = threading.Event()
+    search_finished = threading.Event()
 
     def search_sessions(_query: str) -> tuple[SessionSummary, ...]:
         search_started.set()
-        release_search.wait(timeout=2)
+        release_search.wait(timeout=15)
+        search_finished.set()
         return ()
 
     with create_pipe_input() as pipe:
@@ -317,7 +319,8 @@ async def test_session_picker_enter_does_not_wait_for_search_when_metadata_match
             )
             picker.search_buffer.text = "frontend"
             pipe.send_text("\r")
-            assert await asyncio.wait_for(pending, 0.2) == "frontend-id"
+            assert await asyncio.wait_for(pending, 3) == "frontend-id"
+            assert not search_finished.is_set()
         finally:
             release_search.set()
 
@@ -326,10 +329,12 @@ async def test_session_picker_enter_does_not_wait_for_search_when_metadata_match
 async def test_session_picker_enter_does_not_wait_for_search_after_clearing_query() -> None:
     search_started = threading.Event()
     release_search = threading.Event()
+    search_finished = threading.Event()
 
     def search_sessions(_query: str) -> tuple[SessionSummary, ...]:
         search_started.set()
-        release_search.wait(timeout=2)
+        release_search.wait(timeout=15)
+        search_finished.set()
         return ()
 
     with create_pipe_input() as pipe:
@@ -348,7 +353,8 @@ async def test_session_picker_enter_does_not_wait_for_search_after_clearing_quer
             )
             picker.search_buffer.text = ""
             pipe.send_text("\r")
-            assert await asyncio.wait_for(pending, 0.2) == "recent-id"
+            assert await asyncio.wait_for(pending, 3) == "recent-id"
+            assert not search_finished.is_set()
         finally:
             release_search.set()
 
@@ -357,10 +363,12 @@ async def test_session_picker_enter_does_not_wait_for_search_after_clearing_quer
 async def test_session_picker_enter_rechecks_metadata_after_query_changes() -> None:
     search_started = threading.Event()
     release_search = threading.Event()
+    search_finished = threading.Event()
 
     def search_sessions(_query: str) -> tuple[SessionSummary, ...]:
         search_started.set()
-        release_search.wait(timeout=2)
+        release_search.wait(timeout=15)
+        search_finished.set()
         return ()
 
     with create_pipe_input() as pipe:
@@ -378,7 +386,8 @@ async def test_session_picker_enter_rechecks_metadata_after_query_changes() -> N
                 asyncio.to_thread(search_started.wait, 1), 1
             )
             picker.search_buffer.text = "frontend"
-            assert await asyncio.wait_for(pending, 0.2) == "frontend-id"
+            assert await asyncio.wait_for(pending, 3) == "frontend-id"
+            assert not search_finished.is_set()
         finally:
             release_search.set()
 
