@@ -378,13 +378,8 @@ class ToolCallRecord(BaseModel):
     dispatched: bool = False
     result: str | None = None
     error: str | None = None
-    success: bool | None = Field(
-        None,
-        description="Observed success, or unknown for pending and historical calls.",
-    )
-    exit_code: int | None = Field(
-        None, description="Process exit code when reported by the tool."
-    )
+    success: bool | None = None
+    exit_code: int | None = None
     timestamp: datetime
 
 
