@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import select
 import struct
@@ -126,6 +127,41 @@ def _stop_pty_cli(master: int, process: subprocess.Popen[bytes]) -> None:
             process.kill()
             process.wait(timeout=5)
     os.close(master)
+
+
+@pytest.mark.parametrize("output_format", ("json", "stream-json"))
+def test_headless_bare_resume_keeps_structured_error_output_clean(
+    tmp_path: Path, output_format: str
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    environment = _terminal_environment(home, workspace, model="lmstudio/local-model")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ash",
+            "--resume",
+            "-p",
+            "hello",
+            "--output-format",
+            output_format,
+        ],
+        cwd=workspace,
+        env=environment,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 1, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert len(events) == 1
+    assert events[0]["type"] == "error"
+    assert "--resume" in events[0]["error"]["message"]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")

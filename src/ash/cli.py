@@ -5135,7 +5135,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
             and not cursor_ui_available
         )
 
-        if args.resume == "" and (config.screen_reader_mode or limited_terminal_mode):
+        if (
+            args.resume == ""
+            and args.prompt is None
+            and (config.screen_reader_mode or limited_terminal_mode)
+        ):
             sessions = session_store.list_sessions(
                 project_path=str(config.workspace_root),
                 limit=20,
