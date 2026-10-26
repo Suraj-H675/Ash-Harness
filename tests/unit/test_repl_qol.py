@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from ash.cli import _repl, _session_usage_lines
+from ash.core.checkpoints import RecoverySummary
 from ash.core.session import (
     Message,
     SessionStore,
@@ -157,6 +158,7 @@ async def _run_repl(
     turn_metadata: list[dict | None] | None = None,
     session_loads: list | None = None,
     session_starts: list[str | None] | None = None,
+    recovery_on_resume: RecoverySummary | None = None,
 ) -> int:
     ui_type = _install_frontend(
         monkeypatch,
@@ -216,6 +218,9 @@ async def _run_repl(
             else store.load_session(session_id)
         )
         loop.current_session = session
+        if session_id is not None and recovery_on_resume is not None:
+            loop.recovery_summary = recovery_on_resume
+            loop.recovered_turns = recovery_on_resume.interrupted_turns
         return session
 
     loop.start_session = start_session
@@ -484,6 +489,36 @@ async def test_resume_accepts_multiword_session_title_without_quoting(
     output = capsys.readouterr()
     assert "Usage: /resume" not in output.err
     assert output.out.count("Resumed chat.") == 2
+
+
+@pytest.mark.asyncio
+async def test_resume_shows_recovery_attention_after_loading_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    current = store.create_session(str(tmp_path), model="ollama/test-model")
+    interrupted = store.create_session(str(tmp_path), model="ollama/test-model")
+    summary = RecoverySummary(
+        interrupted_turns=1,
+        unknown_calls=("run_command",),
+    )
+
+    assert await _run_repl(
+        tmp_path,
+        monkeypatch,
+        iter((f"/resume {interrupted.session_id}", "/exit")),
+        session_store=store,
+        current_session=current,
+        recovery_on_resume=summary,
+    ) == 0
+
+    output = capsys.readouterr()
+    assert "Resumed chat." in output.out
+    assert "1 unknown tool outcome(s)" in output.err
+    assert "Run /recovery" in output.err
+    assert "before retrying side effects" in output.err
 
 
 @pytest.mark.asyncio

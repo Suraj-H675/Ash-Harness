@@ -920,6 +920,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
     has_live_surface = bool(getattr(prompt_input, "supports_live_surface", False))
     if not isinstance(loop.ui, TerminalUI):
         raise TypeError("interactive REPL requires TerminalUI")
+    terminal_ui = loop.ui
     bind_prompt_surface = getattr(loop.ui, "bind_prompt_surface", None)
     if callable(bind_prompt_surface) and has_live_surface:
         bind_prompt_surface(
@@ -948,10 +949,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
         else:
             print(text, flush=True)
 
-    recovery_summary = getattr(loop, "recovery_summary", None)
-    if recovery_summary is not None and getattr(loop, "recovered_turns", False):
-        summary = recovery_summary
-        loop.ui.write_status(
+    def show_recovery_status() -> None:
+        summary = getattr(loop, "recovery_summary", None)
+        if summary is None or not getattr(loop, "recovered_turns", False):
+            return
+        terminal_ui.write_status(
             "Recovered "
             f"{summary.interrupted_turns} interrupted turn(s): "
             f"{summary.compensated_calls} tool call(s) compensated; "
@@ -960,11 +962,13 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
             error=summary.needs_attention,
         )
         if summary.needs_attention:
-            loop.ui.write_status(
+            terminal_ui.write_status(
                 "Run /recovery to inspect unresolved files and ambiguous external "
                 "outcomes before retrying side effects.",
                 error=True,
             )
+
+    show_recovery_status()
 
     def _print_classified_error(exc: BaseException) -> None:
         """Route interactive classified failures through the active UI surface."""
@@ -1742,6 +1746,7 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     continue
                 loop.ui.load_session_transcript(session)
                 transition_feedback("Resumed chat.")
+                show_recovery_status()
                 continue
             if command.name == "rename":
                 if not arguments or loop.current_session is None:
