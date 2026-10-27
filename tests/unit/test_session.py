@@ -1098,7 +1098,11 @@ def test_v21_migration_preserves_tool_calls_without_inventing_outcomes(
     with closing(get_db_connection(db_path)) as conn:
         row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
     assert row is not None and row[0] == CURRENT_SCHEMA_VERSION
-    backups = list(tmp_path.glob("v21-tool-calls.db.before-v22-migration.*.backup"))
+    backups = list(
+        tmp_path.glob(
+            f"v21-tool-calls.db.before-v{CURRENT_SCHEMA_VERSION}-migration.*.backup"
+        )
+    )
     assert len(backups) == 1
 
 

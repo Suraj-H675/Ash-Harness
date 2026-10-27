@@ -25,7 +25,13 @@ from pydantic_settings import (
 )
 
 from ash.provider_catalog import BUILTIN_PROVIDER_IDS
-from ash.profiles import active_profile_name, profile_directory, profile_exists
+from ash.profiles import (
+    DEFAULT_PROFILE,
+    active_profile_name,
+    profile_directory,
+    profile_exists,
+    validate_profile_name,
+)
 from ash.safe_io import read_bounded_bytes
 
 
@@ -292,6 +298,57 @@ def _known_settings_values(
     }
 
 
+def _reject_unsafe_coworker_environment(expected_db_directory: Path) -> None:
+    """Inspect ambient safety/path overrides without inheriting other settings."""
+
+    def ambient_value(name: str) -> str | None:
+        matches = [
+            os.environ[key]
+            for key in os.environ
+            if key.casefold() == name.casefold()
+        ]
+        if len(set(matches)) > 1:
+            raise ValueError(f"coworker environment has conflicting {name} values")
+        return matches[0] if matches else None
+
+    safety_tier = ambient_value("ASH_SAFETY_TIER") or ""
+    if safety_tier.strip().casefold() == "auto_approve":
+        raise ValueError("coworker profiles cannot inherit auto_approve")
+
+    unsafe_override = ambient_value("ASH_ALLOW_UNSAFE_AUTO_APPROVE")
+    if unsafe_override is not None:
+        normalized_override = unsafe_override.strip().casefold()
+        if normalized_override in {"1", "true", "t", "yes", "y", "on"}:
+            raise ValueError(
+                "coworker profiles cannot inherit the unsafe auto_approve override"
+            )
+        if normalized_override not in {
+            "0",
+            "false",
+            "f",
+            "no",
+            "n",
+            "off",
+        }:
+            raise ValueError(
+                "coworker unsafe auto_approve environment value is invalid"
+            )
+
+    database_override = ambient_value("ASH_DB_DIRECTORY")
+    if database_override is not None:
+        try:
+            configured_db_directory = Path(
+                os.path.abspath(Path(database_override).expanduser())
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("coworker environment db_directory is invalid") from exc
+        if configured_db_directory != expected_db_directory:
+            raise ValueError(
+                "coworker environment db_directory must match its isolated "
+                "profile database directory"
+            )
+
+
 def _case_insensitive_value(values: Any, key: str) -> Any:
     wanted = key.casefold()
     for candidate, value in values.items():
@@ -437,6 +494,7 @@ class AshConfig(BaseSettings):
 
     _config_sources: dict[str, tuple[str, str]] = PrivateAttr(default_factory=dict)
     _config_diagnostics: list[str] = PrivateAttr(default_factory=list)
+    _coworker_runtime_blocked: bool = PrivateAttr(default=False)
 
     model: str = Field(
         "anthropic/claude-sonnet-5-5",
@@ -1880,12 +1938,44 @@ class AshConfig(BaseSettings):
         cls.model_validate(dict(values), context=_VALIDATION_ONLY_CONTEXT)
 
     @classmethod
+    def _load_for_profile(
+        cls,
+        profile_name: str,
+        *,
+        ash_dir: Path | None = None,
+        workspace_root: Path | None = None,
+    ) -> "AshConfig":
+        """Load one explicit profile after its owner binding is verified.
+
+        This internal loader is for identity-bound local state. It does not
+        consult the active profile marker or ``ASH_PROFILE``, and it does not
+        publish dotenv values into ``os.environ``. Its effective database
+        directory must remain the selected profile's own ``db`` directory.
+        """
+
+        normalized_profile = validate_profile_name(profile_name)
+        if normalized_profile == DEFAULT_PROFILE:
+            raise ValueError("coworkers must use an explicit named Ash profile")
+        state_root = ash_dir or (Path.home() / ".ash")
+        if not profile_exists(normalized_profile, ash_dir=state_root):
+            raise ValueError(f"Ash profile does not exist: {normalized_profile!r}")
+        return cls.load(
+            _profile_name=normalized_profile,
+            _ash_dir=state_root,
+            _validation_only=True,
+            workspace_root=workspace_root or discover_workspace_root(),
+        )
+
+    @classmethod
     def load(
         cls,
         *,
         _override_source: str = "override",
         _override_detail: str = "AshConfig.load()",
         _workspace_trust_override: bool | None = None,
+        _profile_name: str | None = None,
+        _ash_dir: Path | None = None,
+        _validation_only: bool = False,
         **overrides: Any,
     ) -> "AshConfig":
         """Resolve all supported layers and retain exact field provenance.
@@ -1894,8 +1984,12 @@ class AshConfig(BaseSettings):
         trusted project config, user TOML, user dotenv, then built-in defaults.
         """
 
-        base_config_directory = Path.home() / ".ash"
-        active_profile = active_profile_name(ash_dir=base_config_directory)
+        base_config_directory = _ash_dir or (Path.home() / ".ash")
+        active_profile = (
+            validate_profile_name(_profile_name)
+            if _profile_name is not None
+            else active_profile_name(ash_dir=base_config_directory)
+        )
         profile_state_directory = profile_directory(
             active_profile,
             ash_dir=base_config_directory,
@@ -1908,16 +2002,27 @@ class AshConfig(BaseSettings):
                 f"Ash profile does not exist: {active_profile!r}; "
                 f"run `ash profile add {active_profile}` first"
             )
-        user_config_path = _configured_settings_path(
-            "toml_file",
-            _INITIAL_USER_CONFIG_PATH,
-            profile_state_directory / "ash.toml",
-        )
-        dotenv_path = _configured_settings_path(
-            "env_file",
-            _INITIAL_DOTENV_PATH,
-            profile_state_directory / ".env",
-        )
+        if _validation_only:
+            expected_db_directory = Path(
+                os.path.abspath(profile_state_directory / "db")
+            )
+            _reject_unsafe_coworker_environment(expected_db_directory)
+        if _validation_only:
+            # Identity-bound reads must not inherit the legacy process-global
+            # config-file overrides used by ordinary Ash loading.
+            user_config_path = profile_state_directory / "ash.toml"
+            dotenv_path = profile_state_directory / ".env"
+        else:
+            user_config_path = _configured_settings_path(
+                "toml_file",
+                _INITIAL_USER_CONFIG_PATH,
+                profile_state_directory / "ash.toml",
+            )
+            dotenv_path = _configured_settings_path(
+                "env_file",
+                _INITIAL_DOTENV_PATH,
+                profile_state_directory / ".env",
+            )
 
         raw_dotenv_values = _BoundedDotEnvSettingsSource(cls, env_file=dotenv_path)()
         dotenv_values = _known_settings_values(cls, raw_dotenv_values)
@@ -1925,10 +2030,18 @@ class AshConfig(BaseSettings):
             cls,
             _BoundedTomlConfigSettingsSource(cls, toml_file=user_config_path)(),
         )
-        env_values = _known_settings_values(cls, EnvSettingsSource(cls)())
+        env_values = (
+            {}
+            if _validation_only
+            else _known_settings_values(cls, EnvSettingsSource(cls)())
+        )
 
         dotenv_details = _apply_legacy_model_values(dotenv_values, raw_dotenv_values)
-        env_details = _apply_legacy_model_values(env_values, os.environ)
+        env_details = (
+            {}
+            if _validation_only
+            else _apply_legacy_model_values(env_values, os.environ)
+        )
         base_values: dict[str, Any] = {}
         for values in (dotenv_values, user_values, env_values, overrides):
             base_values.update(values)
@@ -2015,6 +2128,18 @@ class AshConfig(BaseSettings):
             detail=_override_detail,
         )
 
+        if _validation_only:
+            selected_model = merged.get("model")
+            if isinstance(selected_model, str) and "/" not in selected_model:
+                profile_provider = _case_insensitive_value(
+                    raw_dotenv_values,
+                    "ASH_PROVIDER",
+                ) or "anthropic"
+                merged["model"] = (
+                    f"{str(profile_provider).strip() or 'anthropic'}/"
+                    f"{selected_model}"
+                )
+
         raw_schema_version = merged.get("config_schema_version")
         schema_v1 = (
             raw_schema_version is None
@@ -2062,14 +2187,35 @@ class AshConfig(BaseSettings):
                 "schema v1 compatibility migration",
             )
 
-        config = cls(**merged)
-        if env_details.get("model") == "ASH_MODEL_NAME" and not os.environ.get(
+        config = (
+            cls.model_validate(merged, context=_VALIDATION_ONLY_CONTEXT)
+            if _validation_only
+            else cls(**merged)
+        )
+        if _validation_only:
+            expected_db_directory = Path(
+                os.path.abspath(profile_state_directory / "db")
+            )
+            if config.db_directory != expected_db_directory:
+                raise ValueError(
+                    "coworker profile db_directory must resolve to its isolated "
+                    "profile database directory"
+                )
+            if (
+                config.safety_tier.strip().casefold() == "auto_approve"
+                or config.allow_unsafe_auto_approve
+            ):
+                raise ValueError(
+                    "coworker profiles cannot enable auto_approve or its unsafe override"
+                )
+        if not _validation_only and env_details.get("model") == "ASH_MODEL_NAME" and not os.environ.get(
             "ASH_MODEL"
         ):
             os.environ["ASH_MODEL"] = str(env_values["model"])
         config._config_sources = sources
         config._config_diagnostics = diagnostics
         config._record_derived_sources()
+        config._coworker_runtime_blocked = _validation_only
         return config
 
     def config_source(self, field: str) -> tuple[str, str] | None:
@@ -2094,7 +2240,13 @@ class AshConfig(BaseSettings):
 
         payload = self.model_dump(mode="python")
         payload.update(values)
-        updated = type(self).model_validate(payload)
+        validation_context = (
+            _VALIDATION_ONLY_CONTEXT
+            if self._coworker_runtime_blocked
+            else None
+        )
+        updated = type(self).model_validate(payload, context=validation_context)
+        updated._coworker_runtime_blocked = self._coworker_runtime_blocked
         updated._config_sources = dict(self._config_sources)
         updated._config_sources.update(
             {

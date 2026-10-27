@@ -246,6 +246,11 @@ class AshClient:
         """Create a client, honoring persisted workspace trust unless overridden."""
 
         runtime_config = config or AshConfig.load()
+        if runtime_config._coworker_runtime_blocked:
+            raise RuntimeError(
+                "coworker-bound configuration cannot start a model runtime until "
+                "provider credentials and extension state are isolated"
+            )
         if workspace is not None:
             runtime_config = runtime_config.model_copy(
                 update={"workspace_root": workspace.resolve()}
