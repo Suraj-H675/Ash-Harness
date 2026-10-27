@@ -235,3 +235,149 @@ while True:
         "utf-8", errors="replace"
     )
     assert container_name not in containers.stdout.decode("utf-8", errors="replace")
+
+
+@pytest.mark.skipif(
+    shutil.which("docker") is None or os.environ.get("ASH_RUN_DOCKER_TESTS") != "1",
+    reason="set ASH_RUN_DOCKER_TESTS=1 on a host with Docker",
+)
+def test_supervised_coworker_syntax_checks_isolate_concurrent_sessions_and_restart(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = tmp_path / "ash"
+    profiles = ash_dir / "profiles"
+    profiles.mkdir(parents=True)
+    workspaces = []
+    for profile_name, source in (
+        ("alpha", "raise RuntimeError('syntax check must not execute source')\n"),
+        ("beta", "def broken(:\n"),
+    ):
+        (profiles / profile_name).mkdir()
+        workspace = tmp_path / f"{profile_name}-workspace"
+        workspace.mkdir()
+        (workspace / "selected.py").write_text(source, encoding="utf-8")
+        (workspace / "not-selected.py").write_text(
+            "def must_not_be_staged(:\n",
+            encoding="utf-8",
+        )
+        workspaces.append(workspace)
+
+    directory = CoworkerDirectory.open(ash_dir)
+    identities = [
+        directory.create(
+            owner_id="local-owner-label",
+            display_name=profile_name,
+            profile_name=profile_name,
+            workspace=workspace,
+        )
+        for profile_name, workspace in zip(("alpha", "beta"), workspaces, strict=True)
+    ]
+    handles = [
+        directory.open_coworker(
+            owner_id="local-owner-label",
+            coworker_id=identity.coworker_id,
+        )
+        for identity in identities
+    ]
+
+    async def run_concurrently() -> list[object]:
+        return list(
+            await asyncio.gather(
+                handles[0].check_python_syntax(
+                    run_id="alpha-syntax",
+                    permitted_files=("selected.py",),
+                ),
+                handles[1].check_python_syntax(
+                    run_id="beta-syntax",
+                    permitted_files=("selected.py",),
+                ),
+            )
+        )
+
+    reports = asyncio.run(run_concurrently())
+    alpha_report, beta_report = reports
+    assert alpha_report.valid is True
+    assert beta_report.valid is False
+    assert alpha_report.session_ref.coworker_id != beta_report.session_ref.coworker_id
+    assert alpha_report.session_ref.session_id != beta_report.session_ref.session_id
+    assert (
+        alpha_report.session_ref.session_id
+        != alpha_report.session_ref.canonical_session_id
+    )
+    assert (
+        beta_report.session_ref.session_id != beta_report.session_ref.canonical_session_id
+    )
+    assert (
+        alpha_report.session_ref.canonical_session_id
+        != beta_report.session_ref.canonical_session_id
+    )
+    assert alpha_report.files[0].name == "selected.py"
+    assert beta_report.files[0].name == "selected.py"
+    assert beta_report.files[0].line == 1
+
+    restart_code = """
+import json, sys
+from pathlib import Path
+from ash.coworkers import CoworkerDirectory
+directory = CoworkerDirectory.open(Path(sys.argv[1]))
+results = []
+for offset in (2, 5):
+    handle = directory.open_coworker(
+        owner_id=sys.argv[offset], coworker_id=sys.argv[offset + 1]
+    )
+    owner = directory._require_local_coworker_owner(handle)
+    canonical = handle.ensure_canonical_conversation()
+    run = handle.begin_background_run(sys.argv[offset + 2])
+    results.append({
+        'coworker_id': handle.identity.coworker_id,
+        'owner_uid': owner.owner_uid,
+        'canonical': canonical.session_id,
+        'session': run.session_id,
+        'run_id': run.run_id,
+    })
+print(json.dumps(results, separators=(',', ':')))
+"""
+    restarted = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-I",
+            "-c",
+            restart_code,
+            str(ash_dir),
+            "local-owner-label",
+            identities[0].coworker_id,
+            "alpha-syntax",
+            "local-owner-label",
+            identities[1].coworker_id,
+            "beta-syntax",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env={
+            "HOME": str(tmp_path / "restart-home"),
+            "XDG_CONFIG_HOME": str(tmp_path / "restart-config"),
+            "XDG_DATA_HOME": str(tmp_path / "restart-data"),
+            "XDG_CACHE_HOME": str(tmp_path / "restart-cache"),
+            "TMPDIR": str(tmp_path / "restart-tmp"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=30,
+    )
+    persistent = json.loads(restarted.stdout)
+    assert persistent == [
+        {
+            "coworker_id": report.session_ref.coworker_id,
+            "owner_uid": identity.owner_uid,
+            "canonical": report.session_ref.canonical_session_id,
+            "session": report.session_ref.session_id,
+            "run_id": report.session_ref.run_id,
+        }
+        for identity, report in zip(identities, (alpha_report, beta_report), strict=True)
+    ]

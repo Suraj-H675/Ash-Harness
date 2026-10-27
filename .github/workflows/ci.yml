@@ -158,11 +158,11 @@ jobs:
           python-version: "3.12"
       - run: uv sync --locked --group dev
       - name: Build hardened sandbox image
-        run: uv run --locked ash sandbox build --image ash-sandbox:ci
+        run: uv run --locked ash sandbox build --image ash-sandbox:latest
       - name: Real Docker cgroup enforcement
         env:
           ASH_RUN_DOCKER_TESTS: "1"
-          ASH_DOCKER_TEST_IMAGE: "ash-sandbox:ci"
+          ASH_DOCKER_TEST_IMAGE: "ash-sandbox:latest"
         run: uv run --locked pytest -q tests/e2e/test_sandbox_docker.py --timeout=120 --timeout-method=thread
 
   native-sandbox-e2e:

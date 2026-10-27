@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import sys
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -589,3 +590,292 @@ def test_coworker_process_environment_refuses_workspace_storage(
     with pytest.raises(CoworkerDirectoryError, match="outside the workspace"):
         with handle.worker_process_environment():
             pytest.fail("workspace storage must not back a worker process")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="staging is Linux-only")
+def test_coworker_python_syntax_check_stages_only_permitted_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from ash.coworkers import CoworkerDirectory
+    from ash.sandbox.manager import SandboxResult
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    _profile(ash_dir, "alpha")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "selected.py").write_text("answer = 42\n", encoding="utf-8")
+    (workspace / "not-selected.py").write_text("def broken(:\n", encoding="utf-8")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="owner-label",
+        display_name="Python checker",
+        profile_name="alpha",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="owner-label",
+        coworker_id=identity.coworker_id,
+    )
+    observed: dict[str, object] = {}
+
+    class FakeSandboxManager:
+        def __init__(self, **settings: object) -> None:
+            observed["settings"] = settings
+            self.backend_name = "docker"
+
+        def has_aggregate_resource_limits(self) -> bool:
+            return True
+
+        async def run_supervised_process(
+            self,
+            command: Sequence[str],
+            *,
+            cwd: Path,
+            timeout: int,
+        ) -> SandboxResult:
+            observed["command"] = command
+            observed["timeout"] = timeout
+            observed["staged_names"] = sorted(path.name for path in cwd.iterdir())
+            assert (cwd / "selected.py").read_text(encoding="utf-8") == "answer = 42\n"
+            return SandboxResult(
+                exit_code=0,
+                stdout='{"files":[{"name":"selected.py","ok":true,"line":null,"column":null}]}',
+                stderr="",
+                tier=3,
+                backend_name="docker",
+            )
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", FakeSandboxManager)
+
+    report = asyncio.run(
+        handle.check_python_syntax(
+            run_id="syntax-run",
+            permitted_files=("selected.py",),
+        )
+    )
+
+    assert identity.owner_uid == os.geteuid()
+    assert report.session_ref.run_id == "syntax-run"
+    assert report.session_ref.session_id != report.session_ref.canonical_session_id
+    assert report.files[0].name == "selected.py"
+    assert report.files[0].valid is True
+    assert observed["staged_names"] == ["selected.py"]
+    assert observed["command"][0] == "/usr/local/bin/python"
+    assert "not-selected.py" not in observed["command"]
+    assert observed["settings"]["network"] is False
+    assert observed["settings"]["workspace_read_only"] is True
+    assert observed["settings"]["allow_scoped_fallback"] is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="staging requires Linux mountinfo")
+@pytest.mark.parametrize(
+    "adversary",
+    [
+        "owner",
+        "symlink",
+        "hardlink",
+        "fifo",
+        "socket",
+        "mountpoint",
+        "secret",
+        "credential",
+        "traversal",
+        "unknown",
+    ],
+)
+def test_coworker_python_syntax_check_rejects_unverified_or_unsafe_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    adversary: str,
+) -> None:
+    import asyncio
+
+    from ash.coworkers import (
+        CoworkerDirectory,
+        CoworkerDirectoryError,
+        CoworkerRuntimeUnavailable,
+    )
+    from ash.sandbox.manager import SandboxResult
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    _profile(ash_dir, "alpha")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    selected = workspace / "selected.py"
+    selected.write_text("value = 1\n", encoding="utf-8")
+    if adversary == "symlink":
+        selected.unlink()
+        selected.symlink_to(workspace / "other.py")
+        (workspace / "other.py").write_text("value = 1\n", encoding="utf-8")
+    elif adversary == "hardlink":
+        selected.unlink()
+        (workspace / "other.py").write_text("value = 1\n", encoding="utf-8")
+        os.link(workspace / "other.py", selected)
+    elif adversary == "fifo":
+        selected.unlink()
+        os.mkfifo(selected)
+    elif adversary == "socket":
+        import errno
+        import socket
+
+        selected.unlink()
+        with socket.socket(socket.AF_UNIX) as listener:
+            prior_directory = Path.cwd()
+            try:
+                os.chdir(workspace)
+                try:
+                    listener.bind(selected.name)
+                except PermissionError as exc:
+                    if exc.errno != errno.EPERM:
+                        raise
+                    pytest.skip("host sandbox forbids Unix-domain socket creation")
+            finally:
+                os.chdir(prior_directory)
+    elif adversary == "secret":
+        selected.write_text(
+            'aws_secret_access_key = "' + "x" * 32 + '"\n',
+            encoding="utf-8",
+        )
+    elif adversary == "credential":
+        selected.write_text(
+            'credential = "' + "x" * 32 + '"\n',
+            encoding="utf-8",
+        )
+
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="owner-label",
+        display_name="Python checker",
+        profile_name="alpha",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="owner-label",
+        coworker_id=identity.coworker_id,
+    )
+    dispatched = False
+
+    class FakeSandboxManager:
+        def __init__(self, **_settings: object) -> None:
+            self.backend_name = "docker"
+
+        def has_aggregate_resource_limits(self) -> bool:
+            return True
+
+        async def run_supervised_process(
+            self,
+            _command: Sequence[str],
+            *,
+            cwd: Path,
+            timeout: int,
+        ) -> SandboxResult:
+            nonlocal dispatched
+            del cwd, timeout
+            dispatched = True
+            return SandboxResult(
+                0,
+                "{}",
+                "",
+                3,
+                "docker",
+                outcome_unknown=adversary == "unknown",
+            )
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", FakeSandboxManager)
+    if adversary == "owner":
+        monkeypatch.setattr("ash.coworkers._current_owner_uid", lambda: os.geteuid() + 1)
+        expected_error = CoworkerRuntimeUnavailable
+    elif adversary == "mountpoint":
+        monkeypatch.setattr(
+            "ash.coworkers._linux_mountpoints",
+            lambda: frozenset({selected}),
+        )
+        expected_error = CoworkerDirectoryError
+    elif adversary == "traversal":
+        expected_error = ValueError
+    elif adversary == "unknown":
+        expected_error = CoworkerRuntimeUnavailable
+    else:
+        expected_error = CoworkerDirectoryError
+
+    with pytest.raises(expected_error):
+        asyncio.run(
+            handle.check_python_syntax(
+                run_id=f"syntax-{adversary}",
+                permitted_files=("../selected.py",)
+                if adversary == "traversal"
+                else ("selected.py",),
+            )
+        )
+    assert dispatched is (adversary == "unknown")
+
+
+def test_coworker_directory_migration_does_not_infer_owner_authority(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+    from uuid import uuid4
+
+    from ash.coworkers import (
+        CoworkerDirectory,
+        CoworkerHandle,
+        CoworkerRuntimeUnavailable,
+    )
+
+    ash_dir = tmp_path / "ash"
+    ash_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = ash_dir / "coworkers.sqlite3"
+    coworker_id = str(uuid4())
+    canonical_session_id = str(uuid4())
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE coworker_directory_meta (schema_version INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO coworker_directory_meta(schema_version) VALUES (1)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE coworkers (
+                coworker_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                profile_name TEXT NOT NULL UNIQUE,
+                workspace_path TEXT NOT NULL,
+                canonical_session_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK(state IN ('provisioning', 'ready')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO coworkers (
+                coworker_id, owner_id, display_name, profile_name, workspace_path,
+                canonical_session_id, state, created_at, updated_at
+            ) VALUES (?, 'owner-label', 'Old coworker', 'alpha', ?, ?, 'ready', 'now', 'now')
+            """,
+            (coworker_id, str(workspace), canonical_session_id),
+        )
+
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory._get_by_profile("alpha")
+    assert identity is not None
+    assert identity.owner_uid is None
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        directory._require_local_coworker_owner(CoworkerHandle(directory, identity))
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (2,)
+        assert connection.execute(
+            "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
+            (coworker_id,),
+        ).fetchone() == (None,)
