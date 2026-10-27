@@ -52,3 +52,11 @@ Finish and independently review Phase A evidence on immutable IDs, explicit owne
 ### Next engineering obligation
 
 Prove the remaining identity authority propagation through every runtime credential, tool and extension initialization path before lifting the explicit runtime block. Then progress to responsibility and authenticated-event admission, conservative recovery and durable approvals in the accepted gate order. Never bypass existing tool permission checks or treat a stored owner ID as independently authenticated user authority.
+
+## CI recovery checkpoint (2026-10-27)
+
+- GitHub Actions run 40449972114 on Crew commit `95b5840202314e12e66de3e45a385ce8a1905da8` completed with **failure**: 10 successful jobs and six failed Python matrix jobs (Linux/macOS × Python 3.12/3.13/3.14).
+- All six test jobs failed on one new coworker unit test, `test_explicit_profile_load_is_concurrent_and_does_not_publish_dotenv`: it incorrectly assumed ambient `ANTHROPIC_API_KEY` was absent, despite another legacy test leaving a synthetic environment key present. This is a test-isolation problem, not evidence the coworker loader published secrets.
+- Corrected the test to explicitly cover both absent and pre-existing ambient Anthropic credentials. In both cases, asserted the whole process environment is unchanged and profile-specific dotenv credential values do not replace the ambient key.
+- Independent focused regression under isolated HOME/XDG/TMPDIR: **435 passed in 37.20 s** covering coworker, session, config, SDK, profiles, automation, automation SDK and policy unit tests; `ruff check` passed and `git diff --check` passed. No model/provider network calls.
+- Re-review complete against actual CI logs; this checkpoint concerns CI test isolation only, not approval to lift the coworker runtime block.

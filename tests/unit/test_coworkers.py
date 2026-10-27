@@ -30,9 +30,11 @@ def _profile(ash_dir: Path, name: str, *, settings: str = "") -> Path:
     return profile
 
 
+@pytest.mark.parametrize("existing_api_key", [None, "preexisting-process-key"])
 def test_explicit_profile_load_is_concurrent_and_does_not_publish_dotenv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    existing_api_key: str | None,
 ) -> None:
     from ash.config import AshConfig
 
@@ -47,6 +49,10 @@ def test_explicit_profile_load_is_concurrent_and_does_not_publish_dotenv(
     monkeypatch.setenv("ASH_OPENAI_API_KEY", "ambient-api-sentinel")
     monkeypatch.setenv("ASH_MODEL", "openai/ambient-model")
     monkeypatch.setenv("ASH_PROVIDER", "openai")
+    if existing_api_key is None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", existing_api_key)
     (alpha / ".env").write_text(
         "ASH_OPENAI_API_KEY=alpha-sentinel\nANTHROPIC_API_KEY=alpha-runtime-only\n",
         encoding="utf-8",
@@ -85,7 +91,7 @@ def test_explicit_profile_load_is_concurrent_and_does_not_publish_dotenv(
     assert beta_config._coworker_runtime_blocked is True
     assert dict(os.environ) == before
     assert marker.read_text(encoding="utf-8") == "marker-only\n"
-    assert "ANTHROPIC_API_KEY" not in os.environ
+    assert os.environ.get("ANTHROPIC_API_KEY") == existing_api_key
 
 
 @pytest.mark.parametrize(
