@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import stat
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -442,3 +446,143 @@ def test_coworker_config_cannot_start_runtime_and_headless_ask_denies(
 
         asyncio.run(AshClient.create(config=handle.effective_config()))
     assert HeadlessUI().request_tool_approval("write_file", {}) is False
+
+
+def test_coworker_process_environments_do_not_inherit_host_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.coworkers import CoworkerDirectory, CoworkerProcessEnvironment
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    _profile(ash_dir, "alpha")
+    _profile(ash_dir, "beta")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = CoworkerDirectory.open(ash_dir)
+    identities = [
+        directory.create(
+            owner_id="owner",
+            display_name=name,
+            profile_name=name,
+            workspace=workspace,
+        )
+        for name in ("alpha", "beta")
+    ]
+    handles = [
+        directory.open_coworker(owner_id="owner", coworker_id=item.coworker_id)
+        for item in identities
+    ]
+
+    ambient = {
+        "ASH_PROFILE": "ambient-profile",
+        "ASH_OPENAI_API_KEY": "ambient-provider-sentinel",
+        "ASH_MODEL": "ambient-provider-model",
+        "ANTHROPIC_API_KEY": "ambient-provider-sentinel",
+        "OPENAI_API_KEY": "ambient-provider-sentinel",
+        "AWS_SECRET_ACCESS_KEY": "ambient-cloud-sentinel",
+        "AWS_SHARED_CREDENTIALS_FILE": "/ambient/aws/credentials",
+        "CLOUDSDK_CONFIG": "/ambient/gcloud",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/ambient/cloud/credentials.json",
+        "AZURE_CLIENT_SECRET": "ambient-cloud-sentinel",
+        "AZURE_CONFIG_DIR": "/ambient/azure",
+        "HTTP_PROXY": "http://ambient-proxy.invalid",
+        "PYTHONPATH": "/ambient/python/path",
+        "PATH": "/ambient/executable/path",
+        "XDG_CONFIG_HOME": "/ambient/config",
+        "XDG_DATA_HOME": "/ambient/data",
+        "XDG_CACHE_HOME": "/ambient/cache",
+        "TMPDIR": "/ambient/tmp",
+    }
+    for name, value in ambient.items():
+        monkeypatch.setenv(name, value)
+    before = dict(os.environ)
+    probe = (
+        "import json, os, tempfile; from pathlib import Path; "
+        "print(json.dumps({'env': dict(os.environ), 'home': str(Path.home()), "
+        "'cwd': os.getcwd(), 'tmp': tempfile.gettempdir(), "
+        "'ash_exists': (Path.home() / '.ash').exists()}))"
+    )
+
+    with (
+        handles[0].worker_process_environment() as alpha_environment,
+        handles[1].worker_process_environment() as beta_environment,
+    ):
+        assert alpha_environment.root != beta_environment.root
+        if os.name != "nt":
+            assert stat.S_IMODE(alpha_environment.root.stat().st_mode) == 0o700
+            assert stat.S_IMODE(beta_environment.root.stat().st_mode) == 0o700
+
+        def run_probe(
+            environment: CoworkerProcessEnvironment,
+        ) -> dict[str, object]:
+            process_environment = environment.as_environ()
+            completed = subprocess.run(
+                [sys.executable, "-I", "-c", probe],
+                cwd=environment.working_directory,
+                env=process_environment,
+                capture_output=True,
+                check=True,
+                text=True,
+                timeout=10,
+            )
+            return json.loads(completed.stdout)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            alpha_future = executor.submit(run_probe, alpha_environment)
+            beta_future = executor.submit(run_probe, beta_environment)
+            alpha_result = alpha_future.result()
+            beta_result = beta_future.result()
+
+        for environment, result in (
+            (alpha_environment, alpha_result),
+            (beta_environment, beta_result),
+        ):
+            child_environment = result["env"]
+            assert isinstance(child_environment, dict)
+            expected_environment = environment.as_environ()
+            assert child_environment.keys() >= expected_environment.keys()
+            assert child_environment.keys() - expected_environment.keys() <= {
+                "LC_CTYPE"
+            }
+            assert all(
+                child_environment[name] == value
+                for name, value in expected_environment.items()
+            )
+            assert result["home"] == str(environment.home)
+            assert result["cwd"] == str(environment.working_directory)
+            assert result["tmp"] == str(environment.temporary_directory)
+            assert result["ash_exists"] is False
+            assert all(
+                child_environment.get(name) != value for name, value in ambient.items()
+            )
+
+    assert not alpha_environment.root.exists()
+    assert not beta_environment.root.exists()
+    assert dict(os.environ) == before
+
+
+def test_coworker_process_environment_refuses_workspace_storage(
+    tmp_path: Path,
+) -> None:
+    from ash.coworkers import CoworkerDirectory, CoworkerDirectoryError
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ash_dir = workspace / ".ash"
+    ash_dir.mkdir()
+    _profile(ash_dir, "alpha")
+    handle = CoworkerDirectory.open(ash_dir).create(
+        owner_id="owner",
+        display_name="Workspace state",
+        profile_name="alpha",
+        workspace=workspace,
+    )
+    handle = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="owner",
+        coworker_id=handle.coworker_id,
+    )
+
+    with pytest.raises(CoworkerDirectoryError, match="outside the workspace"):
+        with handle.worker_process_environment():
+            pytest.fail("workspace storage must not back a worker process")

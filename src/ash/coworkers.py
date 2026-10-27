@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from contextlib import closing
+import tempfile
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +73,52 @@ class CoworkerSessionRef:
     session_id: str
     canonical_session_id: str
     run_id: str | None
+
+
+@dataclass(frozen=True)
+class CoworkerProcessEnvironment:
+    """Per-run default paths and an allowlisted environment for one child."""
+
+    root: Path
+    home: Path
+    working_directory: Path
+    temporary_directory: Path
+    config_directory: Path
+    data_directory: Path
+    cache_directory: Path
+    state_directory: Path
+    runtime_directory: Path
+
+    def as_environ(self) -> dict[str, str]:
+        """Build a fresh allowlist environment for a child process."""
+
+        home = str(self.home)
+        environment = {
+            "HOME": home,
+            "XDG_CONFIG_HOME": str(self.config_directory),
+            "XDG_DATA_HOME": str(self.data_directory),
+            "XDG_CACHE_HOME": str(self.cache_directory),
+            "XDG_STATE_HOME": str(self.state_directory),
+            "XDG_RUNTIME_DIR": str(self.runtime_directory),
+            "TMPDIR": str(self.temporary_directory),
+            "TMP": str(self.temporary_directory),
+            "TEMP": str(self.temporary_directory),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        if os.name == "nt":
+            environment.update(
+                {
+                    "USERPROFILE": home,
+                    "APPDATA": str(self.home / "AppData" / "Roaming"),
+                    "LOCALAPPDATA": str(self.home / "AppData" / "Local"),
+                }
+            )
+            for name in ("SYSTEMROOT", "WINDIR"):
+                value = os.environ.get(name)
+                if value:
+                    environment[name] = value
+        return environment
 
 
 def _normalize_owner_id(owner_id: str) -> str:
@@ -510,6 +558,71 @@ class CoworkerHandle:
             project_path=self.identity.workspace,
         )
         return session, _session_ref(binding)
+
+    @contextmanager
+    def worker_process_environment(self) -> Iterator[CoworkerProcessEnvironment]:
+        """Yield scrubbed default paths for one child; runtime remains unavailable.
+
+        The context passes no workspace, database, provider, extension, or
+        callback objects. It does not restrict the child's OS permissions.
+        Keep the context open until the child exits.
+        """
+
+        current = self._directory._get_owned(
+            owner_id=self.identity.owner_id,
+            coworker_id=self.identity.coworker_id,
+        )
+        if (
+            current.profile_name != self.identity.profile_name
+            or current.workspace != self.identity.workspace
+            or current.canonical_session_id != self.identity.canonical_session_id
+            or current.state != "ready"
+        ):
+            raise CoworkerDirectoryError("coworker process binding changed")
+
+        state_root = self._directory.ash_dir.resolve(strict=True)
+        workspace = current.workspace.resolve(strict=True)
+        if state_root == workspace or state_root.is_relative_to(workspace):
+            raise CoworkerDirectoryError(
+                "coworker process storage must be outside the workspace"
+            )
+
+        prefix = f".ash-coworker-{current.coworker_id[:8]}-"
+        with tempfile.TemporaryDirectory(
+            prefix=prefix,
+            dir=state_root,
+        ) as temporary_root:
+            root = Path(temporary_root)
+            paths = {
+                name: root / name
+                for name in (
+                    "home",
+                    "config",
+                    "data",
+                    "cache",
+                    "state",
+                    "run",
+                    "tmp",
+                    "work",
+                )
+            }
+            for path in paths.values():
+                path.mkdir(mode=0o700)
+            if os.name == "nt":
+                (paths["home"] / "AppData").mkdir(mode=0o700)
+                (paths["home"] / "AppData" / "Roaming").mkdir(mode=0o700)
+                (paths["home"] / "AppData" / "Local").mkdir(mode=0o700)
+            yield CoworkerProcessEnvironment(
+                root=root,
+                home=paths["home"],
+                working_directory=paths["work"],
+                temporary_directory=paths["tmp"],
+                config_directory=paths["config"],
+                data_directory=paths["data"],
+                cache_directory=paths["cache"],
+                state_directory=paths["state"],
+                runtime_directory=paths["run"],
+            )
 
     def start_runtime(self) -> None:
         """Fail closed until all provider/auth and extension roots are scoped."""
