@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -57,6 +58,13 @@ from ash.sandbox import (
 ApprovalCallback = Callable[[str, dict[str, Any]], Awaitable[bool]]
 
 
+class RuntimeCapabilityProfile(StrEnum):
+    """Capability sets supported by Ash runtime assembly."""
+
+    GENERAL = "general"
+    TURN_ONLY = "turn_only"
+
+
 def _rollback_startup_owners(
     closers: Sequence[Callable[[], None]],
     primary_error: BaseException,
@@ -79,7 +87,7 @@ class RuntimeComponents:
     provider: ProviderABC
     session_store: SessionStore
     safety_guard: SafetyGuard
-    sandbox_manager: SandboxManager
+    sandbox_manager: SandboxManager | None
     workspace_trusted: bool
     plugins: tuple[DiscoveredPlugin, ...]
 
@@ -464,6 +472,73 @@ def _require_permission_mode_safety(
         raise SandboxBackendUnavailable(safety_error)
 
 
+def _build_turn_only_runtime(
+    config: AshConfig,
+    ui: LoopUI,
+    *,
+    provider: ProviderABC | None,
+    session_store: SessionStore | None,
+    run_maintenance: bool,
+) -> RuntimeComponents:
+    """Build a persistent AshLoop with no Ash tools or extension capabilities."""
+
+    if provider is None:
+        raise ValueError("turn-only runtime requires an explicit provider")
+    if config.fallback_models:
+        raise ValueError("turn-only runtime does not support fallback providers")
+
+    store = session_store or SessionStore(config.db_directory / "sessions.db")
+    if run_maintenance and config.session_retention_days > 0:
+        store.cleanup_sessions(
+            config.session_retention_days,
+            project_path=str(config.workspace_root.resolve()),
+        )
+    blocklist = list(
+        dict.fromkeys((*SafetyGuard.default_blocklist(), *config.command_blocklist))
+    )
+    guard = SafetyGuard(config.workspace_root, blocklist_commands=blocklist)
+    loop = AshLoop(
+        session_store=store,
+        provider=provider,
+        provider_factory=None,
+        safety_guard=guard,
+        ui=ui,
+        project_root=config.workspace_root,
+        tools={},
+        max_turn_iterations=1,
+        repo_map=None,
+        planner=None,
+        enable_sprint_planning=False,
+        hooks=None,
+        on_tool_approval=None,
+        enable_memory_recall=False,
+        skill_nudge_interval=0,
+        continuous_mode=False,
+        max_continuous_turns=1,
+        safety_tier=config.safety_tier,
+        enable_project_memory=False,
+        embedding_provider="none",
+        openai_api_key="",
+        onnx_model_path=None,
+        memory_db_path=None,
+        auto_index_memory=False,
+        mcp_configs={},
+        mcp_interactions=None,
+        config=config,
+        max_steering_messages=config.steering_queue_limit,
+        event_observer=None,
+    )
+    return RuntimeComponents(
+        loop=loop,
+        provider=provider,
+        session_store=store,
+        safety_guard=guard,
+        sandbox_manager=None,
+        workspace_trusted=False,
+        plugins=(),
+    )
+
+
 def build_runtime(
     config: AshConfig,
     ui: LoopUI,
@@ -480,11 +555,38 @@ def build_runtime(
     mcp_sampling_review: SamplingReview | None = None,
     mcp_elicitation_callback: ElicitationCallback | None = None,
     run_maintenance: bool = True,
+    runtime_capability_profile: RuntimeCapabilityProfile = (
+        RuntimeCapabilityProfile.GENERAL
+    ),
 ) -> RuntimeComponents:
-    """Assemble one runtime with identical extension and safety semantics."""
+    """Assemble the standard or explicit turn-only Ash runtime."""
 
     config._require_runtime_available()
     require_supported_native_platform()
+    if not isinstance(runtime_capability_profile, RuntimeCapabilityProfile):
+        raise TypeError("runtime_capability_profile must be a RuntimeCapabilityProfile")
+    if runtime_capability_profile is RuntimeCapabilityProfile.TURN_ONLY:
+        if (
+            provider_factory is not None
+            or agent_provider_factory is not None
+            or permission_rules is not None
+            or managed_rules is not None
+            or workspace_trusted is True
+            or approval_callback is not None
+            or bool(additional_mcp_configs)
+            or mcp_sampling_review is not None
+            or mcp_elicitation_callback is not None
+        ):
+            raise ValueError(
+                "turn-only runtime does not accept tools, extensions, or callbacks"
+            )
+        return _build_turn_only_runtime(
+            config,
+            ui,
+            provider=provider,
+            session_store=session_store,
+            run_maintenance=run_maintenance,
+        )
 
     trusted = (
         is_workspace_trusted(config.workspace_root)

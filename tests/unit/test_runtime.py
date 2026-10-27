@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 
 from ash.context.instructions import MAX_INSTRUCTION_FILE_BYTES
-from ash.runtime import _memory_database_path, build_repo_map, build_runtime, build_tools
+from ash.runtime import (
+    RuntimeCapabilityProfile,
+    _memory_database_path,
+    build_repo_map,
+    build_runtime,
+    build_tools,
+)
 from ash.context.turn import TurnContext
 from ash.core.session import SessionStore
 from ash.config import AshConfig
@@ -98,9 +104,82 @@ def test_build_runtime_rejects_coworker_bound_config(
             workspace_trusted=False,
             run_maintenance=False,
         )
+    with pytest.raises(RuntimeError, match="cannot start a model runtime"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            workspace_trusted=False,
+            run_maintenance=False,
+            runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+        )
 
     assert not config.db_directory.exists()
     assert not (ash_dir / "plugins").exists()
+
+
+@pytest.mark.asyncio
+async def test_turn_only_runtime_runs_real_loop_without_tools(tmp_path: Path) -> None:
+    from ash.sdk import AshClient
+
+    class DeterministicProvider(RuntimeProvider):
+        def __init__(self) -> None:
+            self.tool_schema = None
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature
+            self.tool_schema = tools
+            yield StreamChunk(content="<response>turn completed</response>", is_done=True)
+
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    provider = DeterministicProvider()
+    client = await AshClient.create(
+        config=config,
+        provider=provider,
+        run_maintenance=False,
+        runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+    )
+    try:
+        assert client.loop.tools == {}
+        result = await client.prompt("Say hello")
+        assert result.response == "turn completed"
+        assert provider.tool_schema in (None, [])
+    finally:
+        await client.close()
+
+    reopened_store = SessionStore(config.db_directory / "sessions.db")
+    stored = reopened_store.load_session(result.session_id)
+    assert [message.role for message in stored.messages][-2:] == [
+        "user",
+        "assistant",
+    ]
+
+
+def test_turn_only_runtime_rejects_secondary_provider_factories(
+    tmp_path: Path,
+) -> None:
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    with pytest.raises(ValueError, match="does not accept tools, extensions, or callbacks"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            provider_factory=lambda _config: pytest.fail(
+                "turn-only runtime must not create a secondary provider"
+            ),
+            runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+            run_maintenance=False,
+        )
 
 
 @pytest.mark.asyncio

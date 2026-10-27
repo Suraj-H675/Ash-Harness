@@ -29,7 +29,7 @@ from ash.core.session import SessionLineage, SessionSummary
 from ash.mcp.interactions import ElicitationCallback, SamplingReview
 from ash.mcp.server import MCPServerConfig
 from ash.providers.base import ProviderABC
-from ash.runtime import build_runtime
+from ash.runtime import RuntimeCapabilityProfile, build_runtime
 from ash.safety.trust import is_workspace_trusted
 from ash.ui.headless import HeadlessUI
 
@@ -242,6 +242,9 @@ class AshClient:
         mcp_sampling_review: SamplingReview | None = None,
         mcp_elicitation_callback: ElicitationCallback | None = None,
         run_maintenance: bool = True,
+        runtime_capability_profile: RuntimeCapabilityProfile = (
+            RuntimeCapabilityProfile.GENERAL
+        ),
     ) -> "AshClient":
         """Create a client, honoring persisted workspace trust unless overridden."""
 
@@ -263,6 +266,7 @@ class AshClient:
             mcp_sampling_review=mcp_sampling_review,
             mcp_elicitation_callback=mcp_elicitation_callback,
             run_maintenance=run_maintenance,
+            runtime_capability_profile=runtime_capability_profile,
         )
         client = cls(runtime.loop, runtime_config)
         try:

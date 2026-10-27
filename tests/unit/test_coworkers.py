@@ -417,6 +417,7 @@ def test_coworker_config_cannot_start_runtime_and_headless_ask_denies(
 ) -> None:
     from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
     from ash.providers.registry import ProviderRegistry
+    from ash.runtime import RuntimeCapabilityProfile
     from ash.sdk import AshClient
     from ash.ui.headless import HeadlessUI
 
@@ -445,7 +446,13 @@ def test_coworker_config_cannot_start_runtime_and_headless_ask_denies(
     with pytest.raises(RuntimeError, match="cannot start a model runtime"):
         import asyncio
 
-        asyncio.run(AshClient.create(config=handle.effective_config()))
+        asyncio.run(
+            AshClient.create(
+                config=handle.effective_config(),
+                provider=object(),
+                runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+            )
+        )
     assert HeadlessUI().request_tool_approval("write_file", {}) is False
 
 
