@@ -483,6 +483,7 @@ def build_runtime(
 ) -> RuntimeComponents:
     """Assemble one runtime with identical extension and safety semantics."""
 
+    config._require_runtime_available()
     require_supported_native_platform()
 
     trusted = (

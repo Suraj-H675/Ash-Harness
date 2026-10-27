@@ -54,6 +54,55 @@ def test_build_repo_map_defers_expensive_initial_index(
     assert captured["defer_initial_refresh"] is True
 
 
+def test_build_runtime_rejects_coworker_bound_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.registry import ProviderRegistry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
+    for name in (
+        "ASH_PROFILE",
+        "ASH_DB_DIRECTORY",
+        "ASH_SAFETY_TIER",
+        "ASH_ALLOW_UNSAFE_AUTO_APPROVE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    ash_dir = home / ".ash"
+    profile = ash_dir / "profiles" / "atlas"
+    profile.mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig._load_for_profile(
+        "atlas",
+        ash_dir=ash_dir,
+        workspace_root=workspace,
+    )
+    assert config._coworker_runtime_blocked is True
+
+    def reject_provider_build(self: ProviderRegistry, config: AshConfig) -> None:
+        del self, config
+        pytest.fail("coworker-bound runtime must not build a provider")
+
+    monkeypatch.setattr(ProviderRegistry, "build", reject_provider_build)
+    with pytest.raises(RuntimeError, match="cannot start a model runtime"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            workspace_trusted=False,
+            run_maintenance=False,
+        )
+
+    assert not config.db_directory.exists()
+    assert not (ash_dir / "plugins").exists()
+
+
 @pytest.mark.asyncio
 async def test_runtime_owns_observability_observer_until_loop_close(
     tmp_path: Path,

@@ -411,6 +411,7 @@ def test_coworker_config_cannot_start_runtime_and_headless_ask_denies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
+    from ash.providers.registry import ProviderRegistry
     from ash.sdk import AshClient
     from ash.ui.headless import HeadlessUI
 
@@ -418,6 +419,12 @@ def test_coworker_config_cannot_start_runtime_and_headless_ask_denies(
     _profile(ash_dir, "alpha")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+
+    def reject_provider_build(self: ProviderRegistry, config: object) -> None:
+        del self, config
+        pytest.fail("coworker registration must not build a model provider")
+
+    monkeypatch.setattr(ProviderRegistry, "build", reject_provider_build)
     coworker = CoworkerDirectory.open(ash_dir).create(
         owner_id="owner",
         display_name="No runtime yet",

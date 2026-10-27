@@ -2218,6 +2218,13 @@ class AshConfig(BaseSettings):
         config._coworker_runtime_blocked = _validation_only
         return config
 
+    def _require_runtime_available(self) -> None:
+        if self._coworker_runtime_blocked:
+            raise RuntimeError(
+                "coworker-bound configuration cannot start a model runtime until "
+                "provider credentials and extension state are isolated"
+            )
+
     def config_source(self, field: str) -> tuple[str, str] | None:
         """Return the selected source and detail for one field."""
 
