@@ -542,9 +542,12 @@ def test_coworker_process_environments_do_not_inherit_host_state(
             assert isinstance(child_environment, dict)
             expected_environment = environment.as_environ()
             assert child_environment.keys() >= expected_environment.keys()
-            assert child_environment.keys() - expected_environment.keys() <= {
-                "LC_CTYPE"
-            }
+            os_injected_names = {"LC_CTYPE"}
+            if sys.platform == "darwin":
+                os_injected_names.add("__CF_USER_TEXT_ENCODING")
+            assert child_environment.keys() - expected_environment.keys() <= (
+                os_injected_names
+            )
             assert all(
                 child_environment[name] == value
                 for name, value in expected_environment.items()

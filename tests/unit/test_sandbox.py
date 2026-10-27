@@ -42,6 +42,25 @@ from ash.tools.base import ToolExecutionOutcome
 from ash.tools.command import RunCommandTool
 
 
+_SUPERVISED_DOCKER_ENVIRONMENT = {
+    "HOME": "/tmp",
+    "PATH": os.defpath,
+    "DOCKER_HOST": "unix:///var/run/docker.sock",
+}
+
+
+def _stub_supervised_docker_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    manager: SandboxManager,
+    environment: dict[str, str] | None = None,
+) -> None:
+    monkeypatch.setattr(
+        manager,
+        "_capture_supervised_docker_environment",
+        AsyncMock(return_value=dict(environment or _SUPERVISED_DOCKER_ENVIRONMENT)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # probes
 # ---------------------------------------------------------------------------
@@ -612,6 +631,842 @@ def test_manager_falls_back_to_scoped_when_nothing_available(tmp_path: Path) -> 
         assert mgr.backend_name == "scoped"
 
 
+def test_supervised_process_refuses_scoped_auto_selection_before_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_sandbox_exec", return_value=False),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="auto",
+            workspace_read_only=True,
+        )
+
+    assert manager.backend_name == "scoped"
+
+    async def reject_spawn(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        pytest.fail("unisolated process must not start")
+
+    monkeypatch.setattr(
+        "ash.sandbox.manager.asyncio.create_subprocess_exec", reject_spawn
+    )
+    with pytest.raises(SandboxBackendUnavailable):
+        asyncio.run(
+            manager.run_supervised_process(
+                [sys.executable, "-c", "print('must-not-run')"],
+                cwd=tmp_path,
+                timeout=5,
+            )
+        )
+
+
+def test_public_run_does_not_accept_supervisor_container_controls(
+    tmp_path: Path,
+) -> None:
+    manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
+
+    with pytest.raises(TypeError, match="_docker_container_name"):
+        manager.run(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            _docker_container_name="ash-supervised-abc123",
+            _docker_supervised_token="a" * 32,
+        )
+    with pytest.raises(TypeError, match="_docker_container_name"):
+        manager.prepare(
+            ["echo", "must-not-be-supervised"],
+            cwd=tmp_path,
+            _docker_container_name="ash-supervised-abc123",
+            _docker_supervised_token="a" * 32,
+        )
+
+
+@pytest.mark.parametrize("proxy_source", ["docker_config", "client_environment"])
+def test_supervised_process_refuses_docker_proxy_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    proxy_source: str,
+) -> None:
+    docker_config = tmp_path / "docker-config"
+    docker_config.mkdir()
+    (docker_config / "config.json").write_text(
+        '{"proxies":{"default":{"httpProxy":"http://proxy.invalid:3128"}}}'
+        if proxy_source == "docker_config"
+        else '{"proxies":{}}',
+        encoding="utf-8",
+    )
+    for name in (
+        "ALL_PROXY",
+        "FTP_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "all_proxy",
+        "ftp_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DOCKER_CONFIG", str(docker_config))
+    if proxy_source == "client_environment":
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            network=False,
+            workspace_read_only=True,
+            docker_memory_mb=128,
+            docker_cpus=0.5,
+        )
+    _stub_supervised_docker_environment(
+        monkeypatch, manager, docker_cli_environment()
+    )
+    run = AsyncMock()
+    monkeypatch.setattr(manager, "_run", run)
+
+    with pytest.raises(SandboxBackendUnavailable, match="proxy injection"):
+        asyncio.run(
+            manager.run_supervised_process(
+                [sys.executable, "-c", "raise SystemExit(70)"],
+                cwd=tmp_path,
+                timeout=5,
+            )
+        )
+
+    run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_supervised_docker_environment_pins_local_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
+    for name in (
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_CONFIG",
+        "ALL_PROXY",
+        "FTP_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "all_proxy",
+        "ftp_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "SSH_AUTH_SOCK",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    docker_control = AsyncMock(
+        side_effect=[b"default\n", b"unix:///var/run/docker.sock\n"]
+    )
+
+    with (
+        patch(
+            "ash.sandbox.manager.resolve_host_executable", return_value="/usr/bin/docker"
+        ),
+        patch("ash.sandbox.manager._run_docker_control", docker_control),
+    ):
+        environment = await manager._capture_supervised_docker_environment()
+
+    assert environment["DOCKER_HOST"] == "unix:///var/run/docker.sock"
+    assert "DOCKER_CONTEXT" not in environment
+    assert "SSH_AUTH_SOCK" not in environment
+    assert docker_control.await_args_list[1].args[0] == [
+        "/usr/bin/docker",
+        "context",
+        "inspect",
+        "--format",
+        "{{.Endpoints.docker.Host}}",
+        "default",
+    ]
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["ssh://docker@example.invalid", "unix://relative/docker.sock"],
+)
+@pytest.mark.asyncio
+async def test_supervised_docker_environment_refuses_remote_or_overridden_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+) -> None:
+    manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
+    for name in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    docker_control = AsyncMock(side_effect=[b"work-remote\n", f"{endpoint}\n".encode()])
+
+    with (
+        patch(
+            "ash.sandbox.manager.resolve_host_executable", return_value="/usr/bin/docker"
+        ),
+        patch("ash.sandbox.manager._run_docker_control", docker_control),
+        pytest.raises(SandboxBackendUnavailable, match="local Docker socket"),
+    ):
+        await manager._capture_supervised_docker_environment()
+
+    docker_control.assert_awaited()
+
+    monkeypatch.setenv("DOCKER_HOST", "tcp://docker.example.invalid:2376")
+    docker_control.reset_mock()
+    with pytest.raises(SandboxBackendUnavailable, match="DOCKER_HOST"):
+        await manager._capture_supervised_docker_environment()
+    docker_control.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "is_local"),
+    [
+        ("npipe:////./pipe/docker_engine", True),
+        ("npipe:////remote/pipe/docker_engine", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_supervised_docker_environment_checks_windows_named_pipe_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+    is_local: bool,
+) -> None:
+    manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
+    for name in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    docker_control = AsyncMock(
+        side_effect=[b"desktop-windows\n", f"{endpoint}\n".encode()]
+    )
+
+    with (
+        patch("ash.sandbox.manager.os.name", "nt"),
+        patch(
+            "ash.sandbox.manager.resolve_host_executable", return_value="docker.exe"
+        ),
+        patch("ash.sandbox.manager._run_docker_control", docker_control),
+    ):
+        if is_local:
+            environment = await manager._capture_supervised_docker_environment()
+            assert environment["DOCKER_HOST"] == endpoint
+        else:
+            with pytest.raises(SandboxBackendUnavailable, match="local Docker socket"):
+                await manager._capture_supervised_docker_environment()
+
+
+def test_supervised_process_returns_the_managed_child_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            network=False,
+            workspace_read_only=True,
+            docker_memory_mb=128,
+            docker_cpus=0.5,
+        )
+    _stub_supervised_docker_environment(monkeypatch, manager)
+    monkeypatch.setattr(
+        "ash.sandbox.manager.secrets.token_hex", lambda _length: "a" * 32
+    )
+    expected = SandboxResult(
+        exit_code=0,
+        stdout="ok",
+        stderr="",
+        tier=SANDBOX_TIER_DOCKER,
+        backend_name="docker",
+    )
+    run = AsyncMock(return_value=expected)
+    monkeypatch.setattr(manager, "_run", run)
+
+    result = asyncio.run(
+        manager.run_supervised_process(
+            [sys.executable, "-c", "print('ok')"],
+            cwd=tmp_path,
+            timeout=5,
+        )
+    )
+
+    assert result == expected
+    run.assert_awaited_once_with(
+        [sys.executable, "-c", "print('ok')"],
+        cwd=tmp_path,
+        timeout=5,
+        stdin=asyncio.subprocess.DEVNULL,
+        env=_SUPERVISED_DOCKER_ENVIRONMENT,
+        _docker_container_name="ash-supervised-" + "a" * 32,
+        _docker_supervised_token="a" * 32,
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        SandboxResult(
+            exit_code=125,
+            stdout="",
+            stderr="Docker attach failed",
+            tier=SANDBOX_TIER_DOCKER,
+            backend_name="docker",
+        ),
+        SandboxResult(
+            exit_code=-1,
+            stdout="",
+            stderr="timed out",
+            tier=SANDBOX_TIER_DOCKER,
+            backend_name="docker",
+            timed_out=True,
+        ),
+        SandboxResult(
+            exit_code=-1,
+            stdout="",
+            stderr="output limit",
+            tier=SANDBOX_TIER_DOCKER,
+            backend_name="docker",
+            output_truncated=True,
+        ),
+        SandboxResult(
+            exit_code=-1,
+            stdout="",
+            stderr="outcome unknown",
+            tier=SANDBOX_TIER_DOCKER,
+            backend_name="docker",
+            outcome_unknown=True,
+        ),
+    ],
+)
+def test_supervised_process_removes_container_after_ambiguous_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    result: SandboxResult,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            network=False,
+            workspace_read_only=True,
+            docker_memory_mb=128,
+            docker_cpus=0.5,
+        )
+    _stub_supervised_docker_environment(monkeypatch, manager)
+    monkeypatch.setattr(
+        "ash.sandbox.manager.secrets.token_hex", lambda _length: "b" * 32
+    )
+    run = AsyncMock(return_value=result)
+    remove = AsyncMock()
+    monkeypatch.setattr(manager, "_run", run)
+    monkeypatch.setattr(manager, "_remove_supervised_container", remove)
+
+    observed = asyncio.run(
+        manager.run_supervised_process(
+            [sys.executable, "-c", "pass"], cwd=tmp_path, timeout=5
+        )
+    )
+
+    assert observed == result
+    remove.assert_awaited_once_with(
+        "ash-supervised-" + "b" * 32, "b" * 32, _SUPERVISED_DOCKER_ENVIRONMENT
+    )
+
+
+def test_supervised_process_removes_container_after_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            network=False,
+            workspace_read_only=True,
+            docker_memory_mb=128,
+            docker_cpus=0.5,
+        )
+    _stub_supervised_docker_environment(monkeypatch, manager)
+    monkeypatch.setattr(
+        "ash.sandbox.manager.secrets.token_hex", lambda _length: "c" * 32
+    )
+    run = AsyncMock(side_effect=asyncio.CancelledError)
+    remove = AsyncMock()
+    monkeypatch.setattr(manager, "_run", run)
+    monkeypatch.setattr(manager, "_remove_supervised_container", remove)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            manager.run_supervised_process(
+                [sys.executable, "-c", "pass"], cwd=tmp_path, timeout=5
+            )
+        )
+
+    remove.assert_awaited_once_with(
+        "ash-supervised-" + "c" * 32, "c" * 32, _SUPERVISED_DOCKER_ENVIRONMENT
+    )
+
+
+def test_supervised_process_requires_confirmed_container_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            network=False,
+            workspace_read_only=True,
+            docker_memory_mb=128,
+            docker_cpus=0.5,
+        )
+    _stub_supervised_docker_environment(monkeypatch, manager)
+    result = SandboxResult(
+        exit_code=-1,
+        stdout="",
+        stderr="timed out",
+        tier=SANDBOX_TIER_DOCKER,
+        backend_name="docker",
+        timed_out=True,
+    )
+    monkeypatch.setattr("ash.sandbox.manager.secrets.token_hex", lambda _size: "e" * 32)
+    monkeypatch.setattr(manager, "_run", AsyncMock(return_value=result))
+    monkeypatch.setattr(
+        manager,
+        "_remove_supervised_container",
+        AsyncMock(side_effect=SandboxBackendUnavailable("Docker daemon unavailable")),
+    )
+
+    with pytest.raises(
+        SandboxBackendUnavailable, match="could not be confirmed stopped"
+    ):
+        asyncio.run(
+            manager.run_supervised_process(
+                [sys.executable, "-c", "pass"], cwd=tmp_path, timeout=5
+            )
+        )
+
+
+def test_supervised_process_waits_for_cleanup_before_propagating_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            network=False,
+            workspace_read_only=True,
+            docker_memory_mb=128,
+            docker_cpus=0.5,
+        )
+    _stub_supervised_docker_environment(monkeypatch, manager)
+    monkeypatch.setattr("ash.sandbox.manager.secrets.token_hex", lambda _size: "f" * 32)
+    result = SandboxResult(
+        exit_code=0,
+        stdout="",
+        stderr="",
+        tier=SANDBOX_TIER_DOCKER,
+        backend_name="docker",
+        timed_out=True,
+    )
+    cleanup_started = asyncio.Event()
+    allow_cleanup_to_finish = asyncio.Event()
+
+    async def delayed_cleanup(
+        _name: str, _token: str, _environment: dict[str, str]
+    ) -> None:
+        cleanup_started.set()
+        await allow_cleanup_to_finish.wait()
+
+    monkeypatch.setattr(manager, "_run", AsyncMock(return_value=result))
+    remove = AsyncMock(side_effect=delayed_cleanup)
+    monkeypatch.setattr(manager, "_remove_supervised_container", remove)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            manager.run_supervised_process(
+                [sys.executable, "-c", "pass"], cwd=tmp_path, timeout=5
+            )
+        )
+        await cleanup_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        allow_cleanup_to_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    remove.assert_awaited_once_with(
+        "ash-supervised-" + "f" * 32, "f" * 32, _SUPERVISED_DOCKER_ENVIRONMENT
+    )
+
+
+def test_supervised_process_propagates_cancellation_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            network=False,
+            workspace_read_only=True,
+            docker_memory_mb=128,
+            docker_cpus=0.5,
+        )
+    _stub_supervised_docker_environment(monkeypatch, manager)
+    monkeypatch.setattr("ash.sandbox.manager.secrets.token_hex", lambda _size: "g" * 32)
+    result = SandboxResult(
+        exit_code=0,
+        stdout="",
+        stderr="",
+        tier=SANDBOX_TIER_DOCKER,
+        backend_name="docker",
+        timed_out=True,
+    )
+    cleanup_started = asyncio.Event()
+    allow_cleanup_to_fail = asyncio.Event()
+    cleanup_error = SandboxBackendUnavailable("Docker daemon unavailable")
+
+    async def failing_cleanup(
+        _name: str, _token: str, _environment: dict[str, str]
+    ) -> None:
+        cleanup_started.set()
+        await allow_cleanup_to_fail.wait()
+        raise cleanup_error
+
+    monkeypatch.setattr(manager, "_run", AsyncMock(return_value=result))
+    remove = AsyncMock(side_effect=failing_cleanup)
+    monkeypatch.setattr(manager, "_remove_supervised_container", remove)
+
+    async def exercise() -> asyncio.CancelledError:
+        task = asyncio.create_task(
+            manager.run_supervised_process(
+                [sys.executable, "-c", "pass"], cwd=tmp_path, timeout=5
+            )
+        )
+        await cleanup_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        allow_cleanup_to_fail.set()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        return raised.value
+
+    cancellation = asyncio.run(exercise())
+    assert cancellation.__cause__ is cleanup_error
+    assert any("cleanup failed" in note for note in cancellation.__notes__)
+    remove.assert_awaited_once_with(
+        "ash-supervised-" + "g" * 32, "g" * 32, _SUPERVISED_DOCKER_ENVIRONMENT
+    )
+
+
+def test_supervised_process_reports_cleanup_task_cancellation_as_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            network=False,
+            workspace_read_only=True,
+            docker_memory_mb=128,
+            docker_cpus=0.5,
+        )
+    _stub_supervised_docker_environment(monkeypatch, manager)
+    monkeypatch.setattr("ash.sandbox.manager.secrets.token_hex", lambda _size: "h" * 32)
+    result = SandboxResult(
+        exit_code=0,
+        stdout="",
+        stderr="",
+        tier=SANDBOX_TIER_DOCKER,
+        backend_name="docker",
+        timed_out=True,
+    )
+    monkeypatch.setattr(manager, "_run", AsyncMock(return_value=result))
+    remove = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr(manager, "_remove_supervised_container", remove)
+
+    with pytest.raises(
+        SandboxBackendUnavailable, match="could not be confirmed stopped"
+    ) as raised:
+        asyncio.run(
+            manager.run_supervised_process(
+                [sys.executable, "-c", "pass"], cwd=tmp_path, timeout=5
+            )
+        )
+
+    assert isinstance(raised.value.__cause__, asyncio.CancelledError)
+    remove.assert_awaited_once_with(
+        "ash-supervised-" + "h" * 32, "h" * 32, _SUPERVISED_DOCKER_ENVIRONMENT
+    )
+
+
+@pytest.mark.asyncio
+async def test_supervised_cleanup_refuses_unowned_container_name(
+    tmp_path: Path,
+) -> None:
+    manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
+    container_id = "a" * 64
+    inspect = AsyncMock(return_value=f"{container_id} another-run-token\n".encode())
+
+    with (
+        patch(
+            "ash.sandbox.manager.resolve_host_executable", return_value="/usr/bin/docker"
+        ),
+        patch("ash.sandbox.manager._run_docker_control", inspect),
+        pytest.raises(SandboxBackendUnavailable, match="matching supervisor token"),
+    ):
+        await manager._remove_supervised_container(
+            "ash-supervised-collision", "b" * 32, _SUPERVISED_DOCKER_ENVIRONMENT
+        )
+
+    inspect.assert_awaited_once_with(
+        [
+            "/usr/bin/docker",
+            "inspect",
+            "--format",
+            '{{.Id}} {{index .Config.Labels "ash.supervised.token"}}',
+            "ash-supervised-collision",
+        ],
+        timeout_seconds=15,
+        env=_SUPERVISED_DOCKER_ENVIRONMENT,
+    )
+
+
+@pytest.mark.asyncio
+async def test_supervised_cleanup_removes_only_verified_container_id(
+    tmp_path: Path,
+) -> None:
+    manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
+    container_id = "c" * 64
+    token = "d" * 32
+    control = AsyncMock(side_effect=[f"{container_id} {token}\n".encode(), b""])
+
+    with (
+        patch(
+            "ash.sandbox.manager.resolve_host_executable", return_value="/usr/bin/docker"
+        ),
+        patch("ash.sandbox.manager._run_docker_control", control),
+    ):
+        await manager._remove_supervised_container(
+            "ash-supervised-run", token, _SUPERVISED_DOCKER_ENVIRONMENT
+        )
+
+    assert control.await_args_list[1].args[0] == [
+        "/usr/bin/docker",
+        "rm",
+        "--force",
+        container_id,
+    ]
+    assert control.await_args_list[1].kwargs["env"] == _SUPERVISED_DOCKER_ENVIRONMENT
+
+
+def test_supervised_process_container_name_reaches_docker_invocation(
+    tmp_path: Path,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            network=False,
+            workspace_read_only=True,
+            docker_memory_mb=128,
+            docker_cpus=0.5,
+        )
+
+    with patch("ash.sandbox.manager.has_docker", return_value=True):
+        with manager._prepare_launch(
+            ["echo", "bounded"],
+            cwd=tmp_path,
+            passthrough_env_names=(),
+            pty=False,
+            docker_container_name="ash-supervised-abc123",
+            docker_supervised_token="a" * 32,
+        ) as invocation_context:
+            invocation = invocation_context
+            assert invocation.backend_name == "docker"
+
+    assert "--name" in invocation.argv
+    assert invocation.argv[invocation.argv.index("--name") + 1] == (
+        "ash-supervised-abc123"
+    )
+    assert "--label" in invocation.argv
+    assert invocation.argv[invocation.argv.index("--label") + 1] == (
+        "ash.supervised.token=" + "a" * 32
+    )
+
+
+@pytest.mark.asyncio
+async def test_sandbox_manager_can_close_child_stdin(tmp_path: Path) -> None:
+    manager = SandboxManager(workspace_root=tmp_path, backend_preference="direct")
+
+    result = await manager.run(
+        [sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"],
+        cwd=tmp_path,
+        timeout=5,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "''\n"
+
+
+def test_supervised_process_requires_docker_and_all_boundary_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=True),
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+    ):
+        bubblewrap = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="native",
+            network=False,
+            workspace_read_only=True,
+        )
+    assert bubblewrap.backend_name == "bubblewrap"
+
+    async def reject_spawn(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        pytest.fail("Bubblewrap must not start a supervised process")
+
+    monkeypatch.setattr(
+        "ash.sandbox.manager.asyncio.create_subprocess_exec", reject_spawn
+    )
+    with pytest.raises(SandboxBackendUnavailable):
+        asyncio.run(
+            bubblewrap.run_supervised_process(
+                [sys.executable, "-c", "print('must-not-run')"],
+                cwd=tmp_path,
+                timeout=5,
+            )
+        )
+
+    with (
+        patch("ash.sandbox.manager.sys.platform", "darwin"),
+        patch("ash.sandbox.manager.has_sandbox_exec", return_value=True),
+        patch("ash.sandbox.manager.has_docker", return_value=False),
+    ):
+        sandbox_exec = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="native",
+            network=False,
+            workspace_read_only=True,
+        )
+    assert sandbox_exec.backend_name == "sandbox-exec"
+    with pytest.raises(SandboxBackendUnavailable):
+        asyncio.run(
+            sandbox_exec.run_supervised_process(
+                [sys.executable, "-c", "print('must-not-run')"],
+                cwd=tmp_path,
+                timeout=5,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"network": True},
+        {"workspace_read_only": False},
+        {"docker_memory_mb": 0},
+        {"docker_cpus": 0},
+        {"allow_scoped_fallback": True},
+    ],
+)
+def test_supervised_process_rejects_unsafe_docker_configuration(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options: dict[str, object] = {
+        "network": False,
+        "workspace_read_only": True,
+        "docker_memory_mb": 128,
+        "docker_cpus": 0.5,
+        "allow_scoped_fallback": False,
+    }
+    options.update(overrides)
+    with (
+        patch("ash.sandbox.manager.sys.platform", "linux"),
+        patch("ash.sandbox.manager.has_bwrap", return_value=False),
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+    ):
+        manager = SandboxManager(
+            workspace_root=tmp_path,
+            backend_preference="docker",
+            **options,
+        )
+    assert manager.backend_name == "docker"
+
+    async def reject_spawn(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        pytest.fail("unsafe Docker configuration must not start a process")
+
+    monkeypatch.setattr(
+        "ash.sandbox.manager.asyncio.create_subprocess_exec", reject_spawn
+    )
+    with pytest.raises(SandboxBackendUnavailable):
+        asyncio.run(
+            manager.run_supervised_process(
+                [sys.executable, "-c", "print('must-not-run')"],
+                cwd=tmp_path,
+                timeout=5,
+            )
+        )
+
+
 def test_manager_respects_preferred_tier(tmp_path: Path) -> None:
     with (
         patch("ash.sandbox.manager.sys.platform", "linux"),
@@ -1106,6 +1961,64 @@ def test_docker_wrap_emits_cpu_and_memory_limits(tmp_path: Path) -> None:
     assert argv[argv.index("--memory") + 1] == "2048m"
     assert argv[argv.index("--cpus") + 1] == "1.5"
     assert "--pids-limit=256" in argv
+
+
+def test_docker_wrap_can_name_supervised_container_for_cleanup(
+    tmp_path: Path,
+) -> None:
+    fake = tmp_path / "docker"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    backend = DockerSandbox(workspace_root=tmp_path, docker_path=str(fake))
+
+    argv = backend.wrap(["echo", "bounded"], container_name="ash-supervised-abc123")
+
+    assert argv[argv.index("--name") + 1] == "ash-supervised-abc123"
+    with pytest.raises(SandboxBackendUnavailable, match="container name"):
+        backend.wrap(["true"], container_name="../escape")
+
+
+def test_docker_wrap_clears_proxy_environment_for_supervised_container(
+    tmp_path: Path,
+) -> None:
+    fake = tmp_path / "docker"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    backend = DockerSandbox(
+        workspace_root=tmp_path,
+        docker_path=str(fake),
+        network=False,
+        workspace_read_only=True,
+        memory_limit="128m",
+        cpus=0.5,
+    )
+
+    argv = backend.wrap(
+        ["echo", "bounded"],
+        container_name="ash-supervised-abc123",
+        supervised_token="a" * 32,
+        clear_proxy_environment=True,
+    )
+
+    env_values = {
+        argv[index + 1]
+        for index, value in enumerate(argv[:-1])
+        if value == "--env"
+    }
+    assert {
+        "ALL_PROXY=",
+        "FTP_PROXY=",
+        "HTTP_PROXY=",
+        "HTTPS_PROXY=",
+        "NO_PROXY=",
+        "all_proxy=",
+        "ftp_proxy=",
+        "http_proxy=",
+        "https_proxy=",
+        "no_proxy=",
+    } <= env_values
+    mount = argv[argv.index("--mount") + 1]
+    assert mount.endswith(",readonly,bind-recursive=disabled")
 
 
 def test_docker_can_mount_workspace_read_only(tmp_path: Path) -> None:

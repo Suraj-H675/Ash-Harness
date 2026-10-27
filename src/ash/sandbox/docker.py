@@ -11,9 +11,11 @@ raises :class:`SandboxBackendUnavailable`.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -33,6 +35,28 @@ from ash.safety.environment import build_scrubbed_environment, resolve_host_exec
 
 DEFAULT_IMAGE = "ash-sandbox:latest"
 _DOCKER_VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_DOCKER_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_DOCKER_SUPERVISED_TOKEN = re.compile(r"^[0-9a-f]{32}$")
+_DOCKER_CONTAINER_ID = re.compile(r"^[0-9a-f]{12,64}$")
+_DOCKER_PROXY_ENV_NAMES = (
+    "ALL_PROXY",
+    "FTP_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "all_proxy",
+    "ftp_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
+_DOCKER_PROXY_CONFIG_FIELDS = (
+    "allProxy",
+    "ftpProxy",
+    "httpProxy",
+    "httpsProxy",
+    "noProxy",
+)
 _DOCKER_ENV_ALLOWLIST = (
     "ALL_PROXY",
     "DOCKER_API_VERSION",
@@ -54,6 +78,43 @@ _DOCKER_ENV_ALLOWLIST = (
 )
 
 
+def docker_proxy_configuration_present(
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    source = os.environ if environment is None else environment
+    if any(source.get(name) for name in _DOCKER_PROXY_ENV_NAMES):
+        return True
+
+    configured_root = source.get("DOCKER_CONFIG")
+    home = source.get("HOME")
+    config_root = (
+        Path(configured_root).expanduser()
+        if configured_root
+        else (Path(home).expanduser() if home else Path.home()) / ".docker"
+    )
+    try:
+        config = json.loads((config_root / "config.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SandboxBackendUnavailable(
+            "Docker client configuration cannot be checked for proxy settings"
+        ) from exc
+    if not isinstance(config, dict):
+        raise SandboxBackendUnavailable("Docker client configuration is invalid")
+    proxies = config.get("proxies")
+    if proxies is None:
+        return False
+    if not isinstance(proxies, dict):
+        raise SandboxBackendUnavailable("Docker proxy configuration is invalid")
+    for proxy_config in proxies.values():
+        if not isinstance(proxy_config, dict):
+            raise SandboxBackendUnavailable("Docker proxy configuration is invalid")
+        if any(proxy_config.get(name) for name in _DOCKER_PROXY_CONFIG_FIELDS):
+            return True
+    return False
+
+
 def docker_cli_environment() -> dict[str, str]:
     """Return only operational state required by the trusted Docker CLI."""
 
@@ -66,12 +127,13 @@ def run_docker_cli_sync(
     workspace_root: str | Path | None = None,
     timeout: float | None = None,
     capture_output: bool = False,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run a trusted Docker CLI command with descendant-tree ownership."""
 
     plan = prepare_process_tree(workspace_root=workspace_root)
     popen_kwargs: dict[str, Any] = {
-        "env": docker_cli_environment(),
+        "env": env if env is not None else docker_cli_environment(),
         **plan.spawn_options,
     }
     if capture_output:
@@ -141,6 +203,9 @@ class DockerSandbox(SandboxBackend):
         cwd: Path | None = None,
         passthrough_env_names: Sequence[str] = (),
         workspace_volume: str | None = None,
+        container_name: str | None = None,
+        supervised_token: str | None = None,
+        clear_proxy_environment: bool = False,
     ) -> list[str]:
         """Build a full ``docker run --rm … image command`` argv list."""
 
@@ -150,6 +215,21 @@ class DockerSandbox(SandboxBackend):
             )
         if not command:
             raise ValueError("command must be a non-empty sequence")
+        if container_name is not None and not _DOCKER_CONTAINER_NAME.fullmatch(
+            container_name
+        ):
+            raise SandboxBackendUnavailable("invalid Docker container name")
+        if supervised_token is not None and (
+            container_name is None
+            or not _DOCKER_SUPERVISED_TOKEN.fullmatch(supervised_token)
+            or self.network
+            or not self.workspace_read_only
+            or self.workspace_root is None
+            or workspace_volume is not None
+            or self.memory_limit is None
+            or self.cpus is None
+        ):
+            raise SandboxBackendUnavailable("invalid supervised Docker configuration")
 
         args: list[str] = [
             self.docker_path or "docker",
@@ -163,6 +243,13 @@ class DockerSandbox(SandboxBackend):
             "--env",
             "HOME=/tmp",
         ]
+        if container_name is not None:
+            args.extend(["--name", container_name])
+        if supervised_token is not None:
+            args.extend(["--label", f"ash.supervised.token={supervised_token}"])
+        if clear_proxy_environment or supervised_token is not None:
+            for name in _DOCKER_PROXY_ENV_NAMES:
+                args.extend(["--env", f"{name}="])
         if self.run_as_host_user and hasattr(os, "getuid"):
             args.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
         if not self.network:
@@ -196,6 +283,8 @@ class DockerSandbox(SandboxBackend):
             mount = f"type=bind,source={root},target=/workspace"
             if self.workspace_read_only:
                 mount += ",readonly"
+                if supervised_token is not None:
+                    mount += ",bind-recursive=disabled"
             args.extend(["--mount", mount])
             container_cwd = "/workspace"
         if self.output_dir is not None:
