@@ -482,6 +482,25 @@ class CoworkerSessionBinding:
     run_id: str | None
 
 
+@dataclass(frozen=True)
+class CoworkerWorkerSessionBinding:
+    """Bind one persisted coworker run to its fixed physical worker root.
+
+    The owner and coworker IDs snapshot the database relationship. They are not
+    authentication; the parent must validate the owner UID before dispatch.
+    """
+
+    session_id: str
+    canonical_session_id: str
+    owner_id: str
+    coworker_id: str
+    project_key: str
+    runtime_project_root: Path
+    runtime_directory_identity: tuple[int, int]
+    database_path: str
+    database_identity: tuple[int, int, int, int]
+
+
 MAX_SESSION_TITLE_CHARS = 256
 _SESSION_PERMISSION_MODES = frozenset(
     {"", "interactive", "auto_edit", "plan", "auto_approve", "dry_run"}
@@ -2841,6 +2860,82 @@ class SessionStore:
             raise KeyError(f"Session not found: {session_id}")
         if str(row["project_key"]) != project_key:
             raise ValueError("session belongs to a different workspace")
+
+    def _bind_coworker_worker_session(
+        self,
+        session_id: str,
+        runtime_project_root: str | Path,
+    ) -> CoworkerWorkerSessionBinding:
+        """Map one persisted coworker background run to its physical worker root.
+
+        The persisted owner and coworker labels establish the session relationship,
+        but they do not authenticate a caller. The parent validates local ownership
+        before dispatch. This private receipt only permits a worker runtime to reopen
+        that exact background session under its staged container workspace.
+        """
+
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("coworker worker session ID is invalid")
+        project_root = Path(runtime_project_root).expanduser().resolve(strict=True)
+        metadata = project_root.stat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("coworker worker workspace is not a directory")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT b.owner_id, b.coworker_id, b.session_id,
+                       b.canonical_session_id, s.project_key
+                FROM coworker_session_bindings AS b
+                JOIN sessions AS s ON s.session_id = b.session_id
+                JOIN coworker_session_bindings AS c
+                  ON c.owner_id = b.owner_id
+                 AND c.coworker_id = b.coworker_id
+                 AND c.kind = 'conversation'
+                 AND c.session_id = b.canonical_session_id
+                 AND c.canonical_session_id = b.canonical_session_id
+                JOIN sessions AS canonical
+                  ON canonical.session_id = c.session_id
+                 AND canonical.project_key = s.project_key
+                WHERE b.session_id = ?
+                  AND b.kind = 'background'
+                  AND b.run_id IS NOT NULL
+                  AND b.session_id <> b.canonical_session_id
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("session is not a bound coworker background run")
+        database = self._database
+        return CoworkerWorkerSessionBinding(
+            session_id=str(row["session_id"]),
+            canonical_session_id=str(row["canonical_session_id"]),
+            owner_id=str(row["owner_id"]),
+            coworker_id=str(row["coworker_id"]),
+            project_key=str(row["project_key"]),
+            runtime_project_root=project_root,
+            runtime_directory_identity=(int(metadata.st_dev), int(metadata.st_ino)),
+            database_path=self.db_path,
+            database_identity=(
+                database.parent_device,
+                database.parent_inode,
+                database.file_device,
+                database.file_inode,
+            ),
+        )
+
+    def _require_coworker_worker_session(
+        self,
+        session_id: str,
+        project_root: str | Path,
+        binding: CoworkerWorkerSessionBinding,
+    ) -> None:
+        """Recheck the worker mapping against this store and physical root."""
+
+        if not isinstance(binding, CoworkerWorkerSessionBinding):
+            raise ValueError("coworker worker session binding is invalid")
+        current = self._bind_coworker_worker_session(session_id, project_root)
+        if current != binding:
+            raise ValueError("coworker worker session binding changed")
 
     def session_model(self, session_id: str) -> str:
         """Return the durable requested model route for one session."""

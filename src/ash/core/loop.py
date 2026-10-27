@@ -56,6 +56,7 @@ from ash.core.events import EventContext, envelope_event
 from ash.core.session import (
     AuditAction,
     AuditResult,
+    CoworkerWorkerSessionBinding,
     Message,
     Session,
     SessionStore,
@@ -1397,6 +1398,7 @@ class AshLoop:
         config: "AshConfig | None" = None,
         max_steering_messages: int = 20,
         event_observer: "RuntimeEventObserver | None" = None,
+        _coworker_worker_binding: CoworkerWorkerSessionBinding | None = None,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -1407,6 +1409,12 @@ class AshLoop:
         if self.safety_guard.project_root != self.project_root:
             raise ValueError("runtime workspace does not match SafetyGuard workspace")
         self._project_root_identity = _directory_identity(self.project_root)
+        self._coworker_worker_binding = _coworker_worker_binding
+        if (
+            _coworker_worker_binding is not None
+            and _coworker_worker_binding.runtime_project_root != self.project_root
+        ):
+            raise ValueError("runtime workspace does not match coworker worker binding")
         self.tools: dict[str, BaseTool] = dict(tools or {})
         self._started_tool_ids: set[int] = set()
         self._closed_tool_ids: set[int] = set()
@@ -2116,6 +2124,9 @@ class AshLoop:
         if self._closing or self._closed:
             raise RuntimeError("Ash runtime is closed")
         self._verify_project_root_identity()
+        worker_binding = self._coworker_worker_binding
+        if worker_binding is not None and session_id != worker_binding.session_id:
+            raise ValueError("coworker worker runtime is bound to one session")
         pending_session_id = self._pending_session_tool_start_id
         pending_tool_start = (
             self.current_session is not None
@@ -2129,7 +2140,14 @@ class AshLoop:
             )
             target_permission_mode = self.permission_policy.mode
         elif session_id is not None:
-            self.session_store.require_session_project(session_id, self.project_root)
+            if worker_binding is None:
+                self.session_store.require_session_project(session_id, self.project_root)
+            else:
+                self.session_store._require_coworker_worker_session(
+                    session_id,
+                    self.project_root,
+                    worker_binding,
+                )
             target_model = (
                 self.session_store.session_model(session_id)
                 or self._default_session_model

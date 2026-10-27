@@ -32,6 +32,8 @@ from ash.sandbox import (
 )
 from ash.sandbox.bwrap import probe_bwrap
 from ash.sandbox.docker import (
+    COWORKER_IMAGE,
+    COWORKER_WORKER_COMMAND,
     DEFAULT_IMAGE,
     docker_cli_environment,
     probe_docker,
@@ -59,6 +61,77 @@ def _stub_supervised_docker_environment(
         "_capture_supervised_docker_environment",
         AsyncMock(return_value=dict(environment or _SUPERVISED_DOCKER_ENVIRONMENT)),
     )
+
+
+def test_coworker_worker_writable_mount_is_fixed_and_sessions_only(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "staged-request"
+    workspace.mkdir()
+    state = tmp_path / "profile-db"
+    state.mkdir(mode=0o700)
+    (state / "sessions.db").write_bytes(b"synthetic database")
+    sandbox = DockerSandbox(
+        image=COWORKER_IMAGE,
+        workspace_root=workspace,
+        network=False,
+        workspace_read_only=True,
+        memory_limit="1024m",
+        cpus=0.5,
+        docker_path=sys.executable,
+    )
+
+    argv = sandbox.wrap(
+        COWORKER_WORKER_COMMAND,
+        cwd=workspace,
+        container_name="ash-supervised-" + "a" * 32,
+        supervised_token="a" * 32,
+        supervised_state_directory=state,
+    )
+
+    mounts = [argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "--mount"]
+    assert any("target=/workspace,readonly" in mount for mount in mounts)
+    assert any(
+        f"source={state},target=/worker-state,bind-recursive=disabled" in mount
+        and "readonly" not in mount
+        for mount in mounts
+    )
+    assert not any("OPENAI_API_KEY" in item for item in argv)
+    assert not any("ANTHROPIC_API_KEY" in item for item in argv)
+
+
+@pytest.mark.parametrize("unsafe_state", ["unexpected-file", "symlink"])
+def test_coworker_worker_mount_rejects_unexpected_state(
+    tmp_path: Path,
+    unsafe_state: str,
+) -> None:
+    workspace = tmp_path / "staged-request"
+    workspace.mkdir()
+    state = tmp_path / "profile-db"
+    state.mkdir(mode=0o700)
+    (state / "sessions.db").write_bytes(b"synthetic database")
+    if unsafe_state == "unexpected-file":
+        (state / "memory.db").write_bytes(b"must not be mounted")
+    else:
+        (state / "unexpected").symlink_to(state / "sessions.db")
+    sandbox = DockerSandbox(
+        image=COWORKER_IMAGE,
+        workspace_root=workspace,
+        network=False,
+        workspace_read_only=True,
+        memory_limit="1024m",
+        cpus=0.5,
+        docker_path=sys.executable,
+    )
+
+    with pytest.raises(SandboxBackendUnavailable, match="unexpected or unsafe"):
+        sandbox.wrap(
+            COWORKER_WORKER_COMMAND,
+            cwd=workspace,
+            container_name="ash-supervised-" + "b" * 32,
+            supervised_token="b" * 32,
+            supervised_state_directory=state,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -916,6 +989,8 @@ def test_supervised_process_returns_the_managed_child_result(
         env=_SUPERVISED_DOCKER_ENVIRONMENT,
         _docker_container_name="ash-supervised-" + "a" * 32,
         _docker_supervised_token="a" * 32,
+        _docker_supervised_state_directory=None,
+        _max_output_bytes=100_000,
     )
 
 

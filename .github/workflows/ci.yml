@@ -159,6 +159,21 @@ jobs:
       - run: uv sync --locked --group dev
       - name: Build hardened sandbox image
         run: uv run --locked ash sandbox build --image ash-sandbox:latest
+      - name: Build locked offline Ash coworker image
+        run: |
+          set -euo pipefail
+          uv build --wheel --out-dir dist
+          worker_context="$(mktemp -d)"
+          uv export --locked --no-dev --no-emit-project --format requirements.txt \
+            --output-file "$worker_context/requirements.txt"
+          cp src/ash/sandbox/Dockerfile.coworker "$worker_context/Dockerfile"
+          cp dist/ash_ai-*.whl "$worker_context/ash.whl"
+          docker build --pull --tag ash-coworker-worker:latest "$worker_context"
+          docker run --rm --network none --entrypoint python \
+            ash-coworker-worker:latest -I -c \
+            "from pathlib import Path; import ash.coworker_worker; from ash.sdk import AshClient; from ash.runtime import RuntimeCapabilityProfile; assert AshClient and RuntimeCapabilityProfile.TURN_ONLY; assert Path('/workspace').is_dir(); assert Path('/worker-state').is_dir()"
+          docker run --rm --network none --entrypoint python \
+            ash-coworker-worker:latest -I -m pip check
       - name: Real Docker cgroup enforcement
         env:
           ASH_RUN_DOCKER_TESTS: "1"

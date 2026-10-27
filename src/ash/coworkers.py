@@ -1,9 +1,9 @@
-"""Owner-bound coworker identities over Ash profiles and session storage.
+"""Owner-bound coworker identities, sessions, and one fixed offline worker seam.
 
-This module establishes durable local identity and session associations only.
-It deliberately does not start provider runtimes: current provider credentials,
-ChatGPT authentication, and extension discovery still have process/global-home
-readers that are not safe for concurrent coworker execution.
+General provider runtimes remain unavailable: provider credentials, ChatGPT
+authentication, and extension discovery still have process/global-home readers
+that are not safe for concurrent coworker execution. The only turn admitted here
+uses a fixed offline provider inside the supervised Docker worker.
 """
 
 from __future__ import annotations
@@ -37,17 +37,25 @@ from ash.profiles import (
     profile_exists,
     validate_profile_name,
 )
-from ash.sandbox.docker import DEFAULT_IMAGE
+from ash.coworker_worker import (
+    WORKER_MAX_REQUEST_BYTES,
+    WORKER_MAX_PROMPT_BYTES,
+    WORKER_MODEL,
+    WORKER_RESPONSE,
+)
+from ash.sandbox.docker import COWORKER_IMAGE, DEFAULT_IMAGE
 from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 2
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 3
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
 _MAX_SYNTAX_FILES = 32
 _MAX_SYNTAX_FILE_BYTES = 1_048_576
 _MAX_SYNTAX_TOTAL_BYTES = 5_242_880
 _SYNTAX_WORKER_TIMEOUT_SECONDS = 30
+_OFFLINE_TURN_TIMEOUT_SECONDS = 45
+_OFFLINE_TURN_MAX_RESPONSE_BYTES = 8_192
 _SECRET_NAME_PARTS = (
     "credential",
     "secret",
@@ -162,6 +170,15 @@ class CoworkerPythonSyntaxReport:
     @property
     def valid(self) -> bool:
         return all(file.valid for file in self.files)
+
+
+@dataclass(frozen=True)
+class CoworkerTurnResult:
+    """One fixed offline AshLoop turn and its owner-bound background session."""
+
+    session_ref: CoworkerSessionRef
+    request_id: str
+    response: str
 
 
 @dataclass(frozen=True)
@@ -475,6 +492,102 @@ def _stage_python_files(
             os.close(root_descriptor)
 
 
+def _stage_offline_worker_request(
+    destination: Path,
+    *,
+    request_id: str,
+    session_id: str,
+    prompt: str,
+) -> None:
+    if not sys.platform.startswith("linux"):
+        raise CoworkerRuntimeUnavailable(
+            "supervised coworker turns require Linux Docker staging"
+        )
+    payload = json.dumps(
+        {
+            "version": 1,
+            "request_id": request_id,
+            "session_id": session_id,
+            "prompt": prompt,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(payload) > WORKER_MAX_REQUEST_BYTES:
+        raise CoworkerDirectoryError("offline coworker request exceeds its limit")
+    directory_descriptor = -1
+    file_descriptor = -1
+    try:
+        directory_descriptor = os.open(
+            destination,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        if os.listdir(directory_descriptor):
+            raise CoworkerDirectoryError(
+                "offline coworker request staging directory is not empty"
+            )
+        file_descriptor = os.open(
+            "request.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o400,
+            dir_fd=directory_descriptor,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(file_descriptor, view)
+            if written <= 0:
+                raise OSError("short write while staging offline coworker request")
+            view = view[written:]
+    except OSError as exc:
+        raise CoworkerDirectoryError(
+            "offline coworker request staging failed"
+        ) from exc
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+
+
+def _unique_protocol_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate worker response field")
+        result[key] = value
+    return result
+
+
+def _parse_offline_worker_response(
+    stdout: str,
+    *,
+    request_id: str,
+    session_id: str,
+) -> str:
+    try:
+        encoded = stdout.encode("utf-8", errors="strict")
+        if len(encoded) > _OFFLINE_TURN_MAX_RESPONSE_BYTES:
+            raise ValueError("worker response exceeds its limit")
+        payload = json.loads(stdout, object_pairs_hook=_unique_protocol_object)
+    except (UnicodeEncodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise CoworkerRuntimeUnavailable(
+            "supervised coworker worker returned an invalid result"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"version", "request_id", "session_id", "response"}
+        or type(payload["version"]) is not int
+        or payload["version"] != 1
+        or payload["request_id"] != request_id
+        or payload["session_id"] != session_id
+        or payload["response"] != WORKER_RESPONSE
+    ):
+        raise CoworkerRuntimeUnavailable(
+            "supervised coworker worker returned an invalid result"
+        )
+    return WORKER_RESPONSE
+
+
 def _parse_python_syntax_report(
     stdout: str,
     expected_names: tuple[str, ...],
@@ -631,6 +744,12 @@ class CoworkerDirectory:
                         (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
                     )
                     version = _COWORKER_DIRECTORY_SCHEMA_VERSION
+                if version == 2:
+                    conn.execute(
+                        "UPDATE coworker_directory_meta SET schema_version = ?",
+                        (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
+                    )
+                    version = _COWORKER_DIRECTORY_SCHEMA_VERSION
                 if version != _COWORKER_DIRECTORY_SCHEMA_VERSION:
                     raise CoworkerDirectoryError(
                         "coworker directory schema version is unsupported: "
@@ -643,6 +762,40 @@ class CoworkerDirectory:
                 if "owner_uid" not in columns:
                     raise CoworkerDirectoryError(
                         "coworker directory owner binding schema is incomplete"
+                    )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coworker_turn_dispatches (
+                        owner_id TEXT NOT NULL,
+                        coworker_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        request_id TEXT NOT NULL UNIQUE,
+                        status TEXT NOT NULL CHECK(status IN ('claimed', 'completed')),
+                        created_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        PRIMARY KEY(owner_id, coworker_id, run_id)
+                    )
+                    """
+                )
+                dispatch_columns = {
+                    str(column["name"])
+                    for column in conn.execute(
+                        "PRAGMA table_info(coworker_turn_dispatches)"
+                    )
+                }
+                if dispatch_columns != {
+                    "owner_id",
+                    "coworker_id",
+                    "run_id",
+                    "session_id",
+                    "request_id",
+                    "status",
+                    "created_at",
+                    "completed_at",
+                }:
+                    raise CoworkerDirectoryError(
+                        "coworker dispatch journal schema is incomplete"
                     )
         except (sqlite3.DatabaseError, OSError, SessionStorageError) as exc:
             raise CoworkerDirectoryError(
@@ -660,6 +813,118 @@ class CoworkerDirectory:
         if row is None:
             raise CoworkerNotFound("coworker not found")
         return _record_from_row(row)
+
+    def _claim_offline_turn(
+        self,
+        *,
+        handle: "CoworkerHandle",
+        run_id: str,
+        session_id: str,
+        request_id: str,
+    ) -> None:
+        """Durably consume one run key before any worker process is dispatched."""
+
+        identity = handle.identity
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM coworkers WHERE owner_id = ? AND coworker_id = ?",
+                    (identity.owner_id, identity.coworker_id),
+                ).fetchone()
+                current = _record_from_row(row) if row is not None else None
+                owner_uid = _current_owner_uid()
+                if (
+                    current is None
+                    or current.owner_id != identity.owner_id
+                    or current.coworker_id != identity.coworker_id
+                    or current.owner_uid != identity.owner_uid
+                    or current.profile_name != identity.profile_name
+                    or current.workspace != identity.workspace
+                    or current.canonical_session_id != identity.canonical_session_id
+                    or current.owner_uid is None
+                    or current.owner_uid != owner_uid
+                    or current.state != "ready"
+                ):
+                    raise CoworkerRuntimeUnavailable(
+                        "local coworker owner identity could not be verified"
+                    )
+                prior = conn.execute(
+                    "SELECT status FROM coworker_turn_dispatches "
+                    "WHERE owner_id = ? AND coworker_id = ? AND run_id = ?",
+                    (identity.owner_id, identity.coworker_id, run_id),
+                ).fetchone()
+                if prior is not None:
+                    raise CoworkerRuntimeUnavailable(
+                        "coworker run was already claimed; refusing replay"
+                    )
+                conn.execute(
+                    "INSERT INTO coworker_turn_dispatches "
+                    "(owner_id, coworker_id, run_id, session_id, request_id, "
+                    "status, created_at, completed_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'claimed', ?, NULL)",
+                    (
+                        identity.owner_id,
+                        identity.coworker_id,
+                        run_id,
+                        session_id,
+                        request_id,
+                        _now(),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise CoworkerRuntimeUnavailable(
+                "coworker run was already claimed; refusing replay"
+            ) from exc
+
+    def _complete_offline_turn(
+        self,
+        *,
+        handle: "CoworkerHandle",
+        run_id: str,
+        session_id: str,
+        request_id: str,
+    ) -> None:
+        """Mark a claimed dispatch complete only after validating its transcript."""
+
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            identity = handle.identity
+            row = conn.execute(
+                "SELECT * FROM coworkers WHERE owner_id = ? AND coworker_id = ?",
+                (identity.owner_id, identity.coworker_id),
+            ).fetchone()
+            current = _record_from_row(row) if row is not None else None
+            if (
+                current is None
+                or current.owner_uid != identity.owner_uid
+                or current.profile_name != identity.profile_name
+                or current.workspace != identity.workspace
+                or current.canonical_session_id != identity.canonical_session_id
+                or current.state != "ready"
+                or current.owner_uid != _current_owner_uid()
+            ):
+                raise CoworkerDirectoryError(
+                    "coworker owner binding changed before dispatch completion"
+                )
+            cursor = conn.execute(
+                "UPDATE coworker_turn_dispatches SET status = 'completed', "
+                "completed_at = ? WHERE owner_id = ? AND coworker_id = ? "
+                "AND run_id = ? AND session_id = ? AND request_id = ? "
+                "AND status = 'claimed'",
+                (
+                    _now(),
+                    handle.identity.owner_id,
+                    handle.identity.coworker_id,
+                    run_id,
+                    session_id,
+                    request_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CoworkerDirectoryError(
+                    "offline coworker dispatch journal changed"
+                )
 
     def _require_local_coworker_owner(self, handle: "CoworkerHandle") -> Coworker:
         current = self._get_owned(
@@ -700,14 +965,29 @@ class CoworkerDirectory:
         )
 
     def _session_store(self, record: Coworker, config: AshConfig) -> SessionStore:
-        expected_db = Path(
+        expected_db = self._profile_database_directory(record)
+        if config.db_directory != expected_db:
+            raise CoworkerDirectoryError("bound coworker database path changed")
+        return SessionStore(config.db_directory / "sessions.db")
+
+    def _profile_database_directory(self, record: Coworker) -> Path:
+        if record.profile_name == DEFAULT_PROFILE or not profile_exists(
+            record.profile_name,
+            ash_dir=self.ash_dir,
+        ):
+            raise CoworkerDirectoryError("bound coworker profile is missing or unsafe")
+        return Path(
             os.path.abspath(
                 profile_directory(record.profile_name, ash_dir=self.ash_dir) / "db"
             )
         )
-        if config.db_directory != expected_db:
-            raise CoworkerDirectoryError("bound coworker database path changed")
-        return SessionStore(config.db_directory / "sessions.db")
+
+    def _session_store_for_record(self, record: Coworker) -> SessionStore:
+        """Open only the owner-bound profile DB without reading provider config."""
+
+        return SessionStore(
+            self._profile_database_directory(record) / "sessions.db"
+        )
 
     def create(
         self,
@@ -862,13 +1142,20 @@ class CoworkerHandle:
         return self._directory._effective_config(self.identity)
 
     def _store(self) -> SessionStore:
-        config = self.effective_config()
-        return self._directory._session_store(self.identity, config)
+        record = self._directory._get_owned(
+            self.identity.owner_id, self.identity.coworker_id
+        )
+        if (
+            record.profile_name != self.identity.profile_name
+            or record.workspace != self.identity.workspace
+            or record.canonical_session_id != self.identity.canonical_session_id
+        ):
+            raise CoworkerDirectoryError("coworker session binding changed")
+        return self._directory._session_store_for_record(record)
 
     def _finish_provisioning(self) -> CoworkerSessionRef:
         record = self.identity
-        config = self.effective_config()
-        store = self._directory._session_store(record, config)
+        store = self._directory._session_store_for_record(record)
         lease = store.acquire_session_runtime_lease(record.canonical_session_id)
         try:
             store.ensure_coworker_conversation(
@@ -913,6 +1200,23 @@ class CoworkerHandle:
             return self._finish_provisioning()
         return self._require_canonical()
 
+    def _ensure_background_run_under_lease(
+        self,
+        store: SessionStore,
+        *,
+        run_id: str,
+        canonical_session_id: str,
+    ) -> CoworkerSessionRef:
+        self._require_canonical()
+        binding = store.ensure_coworker_run(
+            owner_id=self.identity.owner_id,
+            coworker_id=self.identity.coworker_id,
+            run_id=run_id,
+            canonical_session_id=canonical_session_id,
+            project_path=self.identity.workspace,
+        )
+        return _session_ref(binding)
+
     def begin_background_run(self, run_id: str) -> CoworkerSessionRef:
         """Create one fresh session per run key under the canonical session lease."""
 
@@ -930,18 +1234,13 @@ class CoworkerHandle:
 
         lease = store.acquire_session_runtime_lease(canonical.session_id)
         try:
-            # Revalidate the canonical session while holding Ash's normal lease.
-            self._require_canonical()
-            binding = store.ensure_coworker_run(
-                owner_id=self.identity.owner_id,
-                coworker_id=self.identity.coworker_id,
+            return self._ensure_background_run_under_lease(
+                store,
                 run_id=run_id,
                 canonical_session_id=canonical.session_id,
-                project_path=self.identity.workspace,
             )
         finally:
             lease.close()
-        return _session_ref(binding)
 
     def load_session(self, session_id: str) -> tuple[Session, CoworkerSessionRef]:
         """Load only session IDs in this owner/coworker association set."""
@@ -1034,12 +1333,170 @@ class CoworkerHandle:
         finally:
             lease.close()
 
+    async def run_offline_turn(
+        self,
+        *,
+        run_id: str,
+        prompt: str,
+    ) -> CoworkerTurnResult:
+        """Run one deterministic AshLoop turn inside the fixed Docker worker.
+
+        This path admits no caller-selected provider, command, image, tool, or
+        extension. The parent validates and leases the owner-bound canonical
+        session; AshLoop acquires the separate background-session lease inside
+        the worker container. A run with any existing transcript is refused so
+        an ambiguous dispatch cannot be replayed.
+        """
+
+        current = self._directory._require_local_coworker_owner(self)
+        if not isinstance(run_id, str):
+            raise ValueError("run_id must be a string")
+        if not isinstance(prompt, str) or not prompt.strip() or "\0" in prompt:
+            raise ValueError("prompt must be non-empty text without NUL bytes")
+        try:
+            prompt_size = len(prompt.encode("utf-8", errors="strict"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("prompt must be valid UTF-8 text") from exc
+        if prompt_size > WORKER_MAX_PROMPT_BYTES:
+            raise ValueError(
+                f"prompt exceeds the {WORKER_MAX_PROMPT_BYTES}-byte worker limit"
+            )
+
+        canonical = self.ensure_canonical_conversation()
+        store = self._directory._session_store_for_record(current)
+        canonical_lease = store.acquire_session_runtime_lease(canonical.session_id)
+        try:
+            current = self._directory._require_local_coworker_owner(self)
+            if current.canonical_session_id != canonical.session_id:
+                raise CoworkerDirectoryError("canonical coworker binding changed")
+            session_ref = self._ensure_background_run_under_lease(
+                store,
+                run_id=run_id,
+                canonical_session_id=canonical.session_id,
+            )
+            background, binding = self.load_session(session_ref.session_id)
+            if (
+                binding != session_ref
+                or binding.canonical_session_id != current.canonical_session_id
+                or background.session_id != session_ref.session_id
+            ):
+                raise CoworkerDirectoryError(
+                    "background worker session binding changed"
+                )
+            if background.messages or background.tool_calls:
+                raise CoworkerRuntimeUnavailable(
+                    "coworker run already contains turn data; refusing replay"
+                )
+
+            request_id = str(uuid4())
+            state_directory = self._directory._profile_database_directory(current)
+            with self.worker_process_environment() as environment:
+                _stage_offline_worker_request(
+                    environment.working_directory,
+                    request_id=request_id,
+                    session_id=session_ref.session_id,
+                    prompt=prompt,
+                )
+                manager = SandboxManager(
+                    workspace_root=environment.working_directory,
+                    network=False,
+                    workspace_read_only=True,
+                    allow_scoped_fallback=False,
+                    backend_preference="docker",
+                    docker_image=COWORKER_IMAGE,
+                    docker_memory_mb=1_024,
+                    docker_cpus=0.5,
+                    require_resource_containment=True,
+                )
+                if (
+                    manager.backend_name != "docker"
+                    or not manager.has_aggregate_resource_limits()
+                ):
+                    raise SandboxBackendUnavailable(
+                        "offline coworker turns require bounded Docker execution"
+                    )
+                current = self._directory._require_local_coworker_owner(self)
+                if current.canonical_session_id != canonical.session_id:
+                    raise CoworkerDirectoryError("canonical coworker binding changed")
+                latest_session, latest_binding = self.load_session(
+                    session_ref.session_id
+                )
+                if (
+                    latest_binding != session_ref
+                    or latest_session.messages
+                    or latest_session.tool_calls
+                ):
+                    raise CoworkerRuntimeUnavailable(
+                        "coworker run changed before dispatch; refusing replay"
+                    )
+                store.update_session_model(session_ref.session_id, WORKER_MODEL)
+                self._directory._claim_offline_turn(
+                    handle=self,
+                    run_id=run_id,
+                    session_id=session_ref.session_id,
+                    request_id=request_id,
+                )
+                result = await manager._run_supervised_coworker_worker(
+                    cwd=environment.working_directory,
+                    timeout=_OFFLINE_TURN_TIMEOUT_SECONDS,
+                    state_directory=state_directory,
+                )
+                if (
+                    result.backend_name != "docker"
+                    or result.fallback_used
+                    or result.exit_code != 0
+                    or result.timed_out
+                    or result.outcome_unknown
+                    or result.output_truncated
+                ):
+                    raise CoworkerRuntimeUnavailable(
+                        "offline coworker worker ended without a known result"
+                    )
+                response = _parse_offline_worker_response(
+                    result.stdout,
+                    request_id=request_id,
+                    session_id=session_ref.session_id,
+                )
+
+            persisted, persisted_binding = self.load_session(session_ref.session_id)
+            if (
+                persisted_binding != session_ref
+                or persisted.session_id != session_ref.session_id
+                or persisted.model != WORKER_MODEL
+                or len(persisted.messages) != 2
+                or tuple(message.role for message in persisted.messages)
+                != ("user", "assistant")
+                or persisted.messages[0].content != prompt
+                or persisted.messages[0].metadata.get("coworker_request_id")
+                != request_id
+                or persisted.messages[1].content != response
+                or persisted.tool_calls
+            ):
+                raise CoworkerRuntimeUnavailable(
+                    "offline coworker transcript did not match its request"
+                )
+            self._directory._require_local_coworker_owner(self)
+            self._directory._complete_offline_turn(
+                handle=self,
+                run_id=run_id,
+                session_id=session_ref.session_id,
+                request_id=request_id,
+            )
+            return CoworkerTurnResult(
+                session_ref=session_ref,
+                request_id=request_id,
+                response=response,
+            )
+        finally:
+            canonical_lease.close()
+
     @contextmanager
     def worker_process_environment(self) -> Iterator[CoworkerProcessEnvironment]:
-        """Yield scrubbed default paths for one child; runtime remains unavailable.
+        """Yield scrubbed private paths for one fixed worker process.
 
         The context passes no workspace, database, provider, extension, or
-        callback objects. It does not restrict the child's OS permissions.
+        callback objects through process environment variables. A dedicated
+        supervised Docker call may bind the checked session DB separately.
         Keep the context open until the child exits.
         """
 

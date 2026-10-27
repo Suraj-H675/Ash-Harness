@@ -20,7 +20,7 @@ from ash.core.loop import AshLoop, LoopUI
 from ash.core.planner import Planner
 from ash.core.redaction import redact_text
 from ash.core.secret_middleware import SecretRedactionMiddleware
-from ash.core.session import SessionStore
+from ash.core.session import CoworkerWorkerSessionBinding, SessionStore
 from ash.hooks.config import HookConfigSource, load_command_hooks
 from ash.logging import current_log_context
 from ash.mcp.interactions import (
@@ -479,6 +479,7 @@ def _build_turn_only_runtime(
     provider: ProviderABC | None,
     session_store: SessionStore | None,
     run_maintenance: bool,
+    coworker_worker_binding: CoworkerWorkerSessionBinding | None,
 ) -> RuntimeComponents:
     """Build a persistent AshLoop with no Ash tools or extension capabilities."""
 
@@ -488,6 +489,14 @@ def _build_turn_only_runtime(
         raise ValueError("turn-only runtime does not support fallback providers")
 
     store = session_store or SessionStore(config.db_directory / "sessions.db")
+    if coworker_worker_binding is not None:
+        if session_store is None:
+            raise ValueError("coworker worker runtime requires its bound session store")
+        if (
+            config.workspace_root.expanduser().resolve(strict=True)
+            != coworker_worker_binding.runtime_project_root
+        ):
+            raise ValueError("runtime workspace does not match coworker worker binding")
     if run_maintenance and config.session_retention_days > 0:
         store.cleanup_sessions(
             config.session_retention_days,
@@ -527,6 +536,7 @@ def _build_turn_only_runtime(
         config=config,
         max_steering_messages=config.steering_queue_limit,
         event_observer=None,
+        _coworker_worker_binding=coworker_worker_binding,
     )
     return RuntimeComponents(
         loop=loop,
@@ -558,6 +568,7 @@ def build_runtime(
     runtime_capability_profile: RuntimeCapabilityProfile = (
         RuntimeCapabilityProfile.GENERAL
     ),
+    _coworker_worker_binding: CoworkerWorkerSessionBinding | None = None,
 ) -> RuntimeComponents:
     """Assemble the standard or explicit turn-only Ash runtime."""
 
@@ -565,6 +576,11 @@ def build_runtime(
     require_supported_native_platform()
     if not isinstance(runtime_capability_profile, RuntimeCapabilityProfile):
         raise TypeError("runtime_capability_profile must be a RuntimeCapabilityProfile")
+    if (
+        _coworker_worker_binding is not None
+        and runtime_capability_profile is not RuntimeCapabilityProfile.TURN_ONLY
+    ):
+        raise ValueError("coworker worker binding requires a turn-only runtime")
     if runtime_capability_profile is RuntimeCapabilityProfile.TURN_ONLY:
         if (
             provider_factory is not None
@@ -586,6 +602,7 @@ def build_runtime(
             provider=provider,
             session_store=session_store,
             run_maintenance=run_maintenance,
+            coworker_worker_binding=_coworker_worker_binding,
         )
 
     trusted = (

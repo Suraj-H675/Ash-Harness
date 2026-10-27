@@ -15,6 +15,7 @@ import json
 import subprocess
 import os
 import re
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,9 +35,18 @@ from ash.safety.environment import build_scrubbed_environment, resolve_host_exec
 
 
 DEFAULT_IMAGE = "ash-sandbox:latest"
+COWORKER_IMAGE = "ash-coworker-worker:latest"
+COWORKER_WORKER_COMMAND = (
+    "/usr/local/bin/python",
+    "-B",
+    "-I",
+    "-m",
+    "ash.coworker_worker",
+)
 _DOCKER_VOLUME_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _DOCKER_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _DOCKER_SUPERVISED_TOKEN = re.compile(r"^[0-9a-f]{32}$")
+_COWORKER_LOCK_FILE = re.compile(r"^\.sessions\.db\.session-[0-9a-f]{32}\.lock$")
 _DOCKER_CONTAINER_ID = re.compile(r"^[0-9a-f]{12,64}$")
 _DOCKER_PROXY_ENV_NAMES = (
     "ALL_PROXY",
@@ -206,6 +216,7 @@ class DockerSandbox(SandboxBackend):
         container_name: str | None = None,
         supervised_token: str | None = None,
         clear_proxy_environment: bool = False,
+        supervised_state_directory: Path | None = None,
     ) -> list[str]:
         """Build a full ``docker run --rm … image command`` argv list."""
 
@@ -230,6 +241,27 @@ class DockerSandbox(SandboxBackend):
             or self.cpus is None
         ):
             raise SandboxBackendUnavailable("invalid supervised Docker configuration")
+        state_directory: Path | None = None
+        if supervised_state_directory is not None:
+            if (
+                self.image != COWORKER_IMAGE
+                or tuple(command) != COWORKER_WORKER_COMMAND
+                or supervised_token is None
+                or self.network
+                or not self.workspace_read_only
+                or self.workspace_root is None
+                or workspace_volume is not None
+                or self.memory_limit is None
+                or self.cpus is None
+            ):
+                raise SandboxBackendUnavailable(
+                    "writable session state is reserved for the fixed supervised "
+                    "coworker worker"
+                )
+            state_directory = _validate_coworker_state_directory(
+                supervised_state_directory,
+                workspace_root=self.workspace_root,
+            )
 
         args: list[str] = [
             self.docker_path or "docker",
@@ -287,6 +319,14 @@ class DockerSandbox(SandboxBackend):
                     mount += ",bind-recursive=disabled"
             args.extend(["--mount", mount])
             container_cwd = "/workspace"
+        if state_directory is not None:
+            args.extend(
+                [
+                    "--mount",
+                    "type=bind,source="
+                    f"{state_directory},target=/worker-state,bind-recursive=disabled",
+                ]
+            )
         if self.output_dir is not None:
             out = Path(self.output_dir).resolve()
             out.mkdir(parents=True, exist_ok=True)
@@ -330,6 +370,71 @@ class DockerSandbox(SandboxBackend):
         args.append(self.image)
         args.extend(command)
         return args
+
+
+def _validate_coworker_state_directory(
+    path: Path,
+    *,
+    workspace_root: Path,
+) -> Path:
+    """Allow one sessions-only profile directory as the worker's write mount."""
+
+    candidate = Path(os.path.abspath(Path(path).expanduser()))
+    try:
+        resolved = candidate.resolve(strict=True)
+        workspace = Path(workspace_root).resolve(strict=True)
+        metadata = candidate.stat(follow_symlinks=False)
+        entries = tuple(candidate.iterdir())
+    except OSError as exc:
+        raise SandboxBackendUnavailable(
+            "coworker session state directory is unavailable"
+        ) from exc
+    if (
+        candidate != resolved
+        or not stat.S_ISDIR(metadata.st_mode)
+        or candidate == workspace
+        or candidate.is_relative_to(workspace)
+        or workspace.is_relative_to(candidate)
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or (
+            hasattr(os, "getuid")
+            and metadata.st_uid != os.getuid()
+        )
+    ):
+        raise SandboxBackendUnavailable("coworker session state path is unsafe")
+
+    allowed_names = {
+        "sessions.db",
+        "sessions.db-shm",
+        "sessions.db-wal",
+        "sessions.db-journal",
+    }
+    names: set[str] = set()
+    for entry in entries:
+        try:
+            entry_metadata = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise SandboxBackendUnavailable(
+                "coworker session state changed during inspection"
+            ) from exc
+        if (
+            not stat.S_ISREG(entry_metadata.st_mode)
+            or entry_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or (hasattr(os, "getuid") and entry_metadata.st_uid != os.getuid())
+            or not (
+                entry.name in allowed_names
+                or _COWORKER_LOCK_FILE.fullmatch(entry.name)
+            )
+        ):
+            raise SandboxBackendUnavailable(
+                "coworker state mount contains an unexpected or unsafe file"
+            )
+        names.add(entry.name)
+    if "sessions.db" not in names:
+        raise SandboxBackendUnavailable(
+            "coworker state mount does not contain its session database"
+        )
+    return resolved
 
 
 def probe_docker(
