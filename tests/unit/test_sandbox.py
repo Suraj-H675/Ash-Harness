@@ -1323,7 +1323,10 @@ def test_supervised_process_container_name_reaches_docker_invocation(
             docker_cpus=0.5,
         )
 
-    with patch("ash.sandbox.manager.has_docker", return_value=True):
+    with (
+        patch("ash.sandbox.manager.has_docker", return_value=True),
+        patch("ash.sandbox.manager.DockerSandbox.is_available", return_value=True),
+    ):
         with manager._prepare_launch(
             ["echo", "bounded"],
             cwd=tmp_path,
