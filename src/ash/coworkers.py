@@ -9,6 +9,7 @@ uses a fixed offline provider inside the supervised Docker worker.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4, uuid5
 
+from ash.automation.models import ScheduleSpec
+from ash.automation.schedules import build_schedule, first_fire_time
 from ash.config import AshConfig
 from ash.core.session import (
     CoworkerSessionBinding,
@@ -47,7 +50,7 @@ from ash.sandbox.docker import COWORKER_IMAGE, DEFAULT_IMAGE
 from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 4
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 5
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
 _MAX_RESPONSIBILITY_SCOPE_BYTES = 2048
@@ -196,7 +199,7 @@ class CoworkerTurnResult:
 
 @dataclass(frozen=True)
 class CoworkerResponsibility:
-    """One durable, manually admitted objective bound to one coworker."""
+    """One durable objective and optional schedule bound to one coworker."""
 
     responsibility_id: str
     owner_id: str
@@ -211,6 +214,9 @@ class CoworkerResponsibility:
     updated_at: datetime
     paused_at: datetime | None = None
     completed_at: datetime | None = None
+    schedule: ScheduleSpec | None = None
+    first_fire_at: datetime | None = None
+    misfire_grace_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -392,6 +398,80 @@ def _responsibility_prompt(responsibility: CoworkerResponsibility) -> str:
     return prompt
 
 
+_RESPONSIBILITY_SELECT = """
+    SELECT responsibility.*,
+        schedule.owner_uid AS schedule_owner_uid,
+        schedule.schedule_kind,
+        schedule.schedule_value,
+        schedule.schedule_timezone,
+        schedule.schedule_anchor_at,
+        schedule.first_fire_at,
+        schedule.misfire_grace_seconds
+    FROM coworker_responsibilities AS responsibility
+    LEFT JOIN coworker_responsibility_schedules AS schedule
+      ON schedule.owner_id = responsibility.owner_id
+     AND schedule.coworker_id = responsibility.coworker_id
+     AND schedule.responsibility_id = responsibility.responsibility_id
+"""
+
+
+def _validated_responsibility_schedule(
+    schedule: ScheduleSpec,
+    *,
+    now: datetime,
+) -> tuple[ScheduleSpec, datetime]:
+    """Revalidate a public ScheduleSpec and calculate its first occurrence."""
+
+    if not isinstance(schedule, ScheduleSpec):
+        raise ValueError("schedule must be an Ash ScheduleSpec")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("schedule validation time must include a UTC offset")
+    current = now.astimezone(timezone.utc)
+    if schedule.kind == "at":
+        if schedule.anchor_at is not None:
+            raise ValueError("at schedules cannot include an interval anchor")
+        normalized = build_schedule(
+            at=schedule.value,
+            timezone_name=schedule.timezone,
+            now=current,
+        )
+    elif schedule.kind == "every":
+        if not isinstance(schedule.value, str):
+            raise ValueError("interval schedule value must be text")
+        try:
+            seconds = float(schedule.value)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("interval schedule value must be normalized seconds") from exc
+        if not math.isfinite(seconds):
+            raise ValueError("interval schedule value must be finite")
+        anchor = (
+            current if schedule.anchor_at is None else schedule.anchor_at
+        )
+        if (
+            not isinstance(anchor, datetime)
+            or anchor.tzinfo is None
+            or anchor.utcoffset() is None
+        ):
+            raise ValueError("interval schedule anchor must include a UTC offset")
+        duration = f"{seconds:.6f}".rstrip("0").rstrip(".") + "s"
+        normalized = build_schedule(
+            every=duration,
+            timezone_name=schedule.timezone,
+            now=anchor.astimezone(timezone.utc),
+        )
+    elif schedule.kind == "cron":
+        if schedule.anchor_at is not None:
+            raise ValueError("cron schedules cannot include an interval anchor")
+        normalized = build_schedule(
+            cron=schedule.value,
+            timezone_name=schedule.timezone,
+            now=current,
+        )
+    else:
+        raise ValueError("schedule kind must be 'at', 'every', or 'cron'")
+    return normalized, first_fire_time(normalized, now=current)
+
+
 def _responsibility_from_row(row: sqlite3.Row) -> CoworkerResponsibility:
     try:
         raw_criteria = json.loads(str(row["success_criteria_json"]))
@@ -407,6 +487,63 @@ def _responsibility_from_row(row: sqlite3.Row) -> CoworkerResponsibility:
             "completed",
         }:
             raise ValueError("unsupported responsibility state")
+        schedule_kind = row["schedule_kind"]
+        if schedule_kind is None:
+            if any(
+                row[name] is not None
+                for name in (
+                    "schedule_owner_uid",
+                    "schedule_value",
+                    "schedule_timezone",
+                    "schedule_anchor_at",
+                    "first_fire_at",
+                    "misfire_grace_seconds",
+                )
+            ):
+                raise ValueError("incomplete schedule binding")
+            schedule = None
+            first_at = None
+            grace = None
+        else:
+            owner_uid = int(row["owner_uid"]) if row["owner_uid"] is not None else None
+            if (
+                schedule_kind not in {"at", "every", "cron"}
+                or owner_uid is None
+                or row["schedule_owner_uid"] != owner_uid
+                or row["schedule_value"] is None
+                or row["schedule_timezone"] is None
+                or row["first_fire_at"] is None
+                or type(row["misfire_grace_seconds"]) is not int
+                or not 0 <= row["misfire_grace_seconds"] <= 2_592_000
+            ):
+                raise ValueError("invalid schedule binding")
+            anchor_text = row["schedule_anchor_at"]
+            anchor = (
+                datetime.fromisoformat(str(anchor_text))
+                if anchor_text is not None
+                else None
+            )
+            first_at = datetime.fromisoformat(str(row["first_fire_at"]))
+            if (
+                (anchor is not None and (anchor.tzinfo is None or anchor.utcoffset() is None))
+                or first_at.tzinfo is None
+                or first_at.utcoffset() is None
+            ):
+                raise ValueError("schedule timestamps must include a UTC offset")
+            schedule = ScheduleSpec(
+                kind=schedule_kind,
+                value=str(row["schedule_value"]),
+                timezone=str(row["schedule_timezone"]),
+                anchor_at=anchor,
+            )
+            first_at = first_at.astimezone(timezone.utc)
+            created_at = datetime.fromisoformat(str(row["created_at"]))
+            normalized_schedule, validated_first_at = (
+                _validated_responsibility_schedule(schedule, now=created_at)
+            )
+            if normalized_schedule != schedule or validated_first_at != first_at:
+                raise ValueError("stored schedule does not match its validated binding")
+            grace = int(row["misfire_grace_seconds"])
         return CoworkerResponsibility(
             responsibility_id=str(row["responsibility_id"]),
             owner_id=str(row["owner_id"]),
@@ -429,6 +566,9 @@ def _responsibility_from_row(row: sqlite3.Row) -> CoworkerResponsibility:
                 if row["completed_at"] is not None
                 else None
             ),
+            schedule=schedule,
+            first_fire_at=first_at,
+            misfire_grace_seconds=grace,
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise CoworkerDirectoryError("stored coworker responsibility is invalid") from exc
@@ -957,7 +1097,7 @@ class CoworkerDirectory:
                         (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
                     )
                     version = _COWORKER_DIRECTORY_SCHEMA_VERSION
-                if version != _COWORKER_DIRECTORY_SCHEMA_VERSION:
+                if version not in {4, _COWORKER_DIRECTORY_SCHEMA_VERSION}:
                     raise CoworkerDirectoryError(
                         "coworker directory schema version is unsupported: "
                         f"{version}"
@@ -1101,6 +1241,55 @@ class CoworkerDirectory:
                     "ON coworker_turn_dispatches(owner_id, coworker_id, "
                     "responsibility_id, event_key) WHERE responsibility_id IS NOT NULL"
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coworker_responsibility_schedules (
+                        owner_id TEXT NOT NULL,
+                        owner_uid INTEGER NOT NULL,
+                        coworker_id TEXT NOT NULL,
+                        responsibility_id TEXT NOT NULL,
+                        schedule_kind TEXT NOT NULL
+                            CHECK(schedule_kind IN ('at','every','cron')),
+                        schedule_value TEXT NOT NULL,
+                        schedule_timezone TEXT NOT NULL,
+                        schedule_anchor_at TEXT,
+                        first_fire_at TEXT NOT NULL,
+                        misfire_grace_seconds INTEGER NOT NULL
+                            CHECK(misfire_grace_seconds BETWEEN 0 AND 2592000),
+                        PRIMARY KEY(owner_id, coworker_id, responsibility_id),
+                        FOREIGN KEY(owner_id, coworker_id, responsibility_id)
+                            REFERENCES coworker_responsibilities(
+                                owner_id, coworker_id, responsibility_id
+                            )
+                    )
+                    """
+                )
+                schedule_columns = {
+                    str(column["name"])
+                    for column in conn.execute(
+                        "PRAGMA table_info(coworker_responsibility_schedules)"
+                    )
+                }
+                if schedule_columns != {
+                    "owner_id",
+                    "owner_uid",
+                    "coworker_id",
+                    "responsibility_id",
+                    "schedule_kind",
+                    "schedule_value",
+                    "schedule_timezone",
+                    "schedule_anchor_at",
+                    "first_fire_at",
+                    "misfire_grace_seconds",
+                }:
+                    raise CoworkerDirectoryError(
+                        "coworker responsibility schedule schema is incomplete"
+                    )
+                if version == 4:
+                    conn.execute(
+                        "UPDATE coworker_directory_meta SET schema_version = ?",
+                        (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
+                    )
         except (sqlite3.DatabaseError, OSError, SessionStorageError) as exc:
             raise CoworkerDirectoryError(
                 f"could not open coworker directory {self.db_path}: {exc}"
@@ -1157,6 +1346,8 @@ class CoworkerDirectory:
         objective: str,
         success_criteria: Sequence[str],
         trigger_type: CoworkerResponsibilityTrigger,
+        schedule: ScheduleSpec | None,
+        misfire_grace_seconds: int,
     ) -> CoworkerResponsibility:
         current = self._validate_handle_binding(handle)
         normalized_scope = _normalize_responsibility_text(
@@ -1174,6 +1365,23 @@ class CoworkerDirectory:
             raise ValueError("trigger_type must be 'manual'")
         identifier = str(uuid4())
         now = _now()
+        now_datetime = datetime.fromisoformat(now)
+        normalized_schedule: ScheduleSpec | None = None
+        first_fire_at: datetime | None = None
+        if schedule is not None:
+            if (
+                type(misfire_grace_seconds) is not int
+                or not 0 <= misfire_grace_seconds <= 2_592_000
+            ):
+                raise ValueError(
+                    "misfire_grace_seconds must be between 0 and 2592000"
+                )
+            normalized_schedule, first_fire_at = _validated_responsibility_schedule(
+                schedule,
+                now=now_datetime,
+            )
+        elif misfire_grace_seconds != 86_400:
+            raise ValueError("misfire_grace_seconds requires a schedule")
         record = CoworkerResponsibility(
             responsibility_id=identifier,
             owner_id=current.owner_id,
@@ -1184,8 +1392,13 @@ class CoworkerDirectory:
             success_criteria=criteria,
             trigger_type=trigger_type,
             status="active",
-            created_at=datetime.fromisoformat(now),
-            updated_at=datetime.fromisoformat(now),
+            created_at=now_datetime,
+            updated_at=now_datetime,
+            schedule=normalized_schedule,
+            first_fire_at=first_fire_at,
+            misfire_grace_seconds=(
+                misfire_grace_seconds if normalized_schedule is not None else None
+            ),
         )
         _responsibility_prompt(record)
         try:
@@ -1214,6 +1427,30 @@ class CoworkerDirectory:
                         now,
                     ),
                 )
+                if normalized_schedule is not None and first_fire_at is not None:
+                    conn.execute(
+                        "INSERT INTO coworker_responsibility_schedules ("
+                        "owner_id, owner_uid, coworker_id, responsibility_id, "
+                        "schedule_kind, schedule_value, schedule_timezone, "
+                        "schedule_anchor_at, first_fire_at, misfire_grace_seconds) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            current.owner_id,
+                            current.owner_uid,
+                            current.coworker_id,
+                            identifier,
+                            normalized_schedule.kind,
+                            normalized_schedule.value,
+                            normalized_schedule.timezone,
+                            (
+                                normalized_schedule.anchor_at.isoformat()
+                                if normalized_schedule.anchor_at is not None
+                                else None
+                            ),
+                            first_fire_at.isoformat(),
+                            misfire_grace_seconds,
+                        ),
+                    )
         except sqlite3.IntegrityError as exc:
             raise CoworkerDirectoryError(
                 "could not create coworker responsibility"
@@ -1231,9 +1468,10 @@ class CoworkerDirectory:
         current = self._validate_handle_binding(handle)
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT * FROM coworker_responsibilities "
-                "WHERE owner_id = ? AND coworker_id = ? "
-                "ORDER BY created_at DESC, responsibility_id LIMIT ?",
+                _RESPONSIBILITY_SELECT
+                + " WHERE responsibility.owner_id = ? AND responsibility.coworker_id = ? "
+                "ORDER BY responsibility.created_at DESC, "
+                "responsibility.responsibility_id LIMIT ?",
                 (current.owner_id, current.coworker_id, limit),
             ).fetchall()
         return [_responsibility_from_row(row) for row in rows]
@@ -1247,8 +1485,9 @@ class CoworkerDirectory:
         current = self._validate_handle_binding(handle)
         with closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT * FROM coworker_responsibilities WHERE owner_id = ? "
-                "AND coworker_id = ? AND responsibility_id = ?",
+                _RESPONSIBILITY_SELECT
+                + " WHERE responsibility.owner_id = ? AND responsibility.coworker_id = ? "
+                "AND responsibility.responsibility_id = ?",
                 (current.owner_id, current.coworker_id, identifier),
             ).fetchone()
         if row is None:
@@ -1274,8 +1513,9 @@ class CoworkerDirectory:
             conn.execute("BEGIN IMMEDIATE")
             current = self._validate_handle_binding(handle, conn)
             row = conn.execute(
-                "SELECT * FROM coworker_responsibilities WHERE owner_id = ? "
-                "AND coworker_id = ? AND responsibility_id = ?",
+                _RESPONSIBILITY_SELECT
+                + " WHERE responsibility.owner_id = ? AND responsibility.coworker_id = ? "
+                "AND responsibility.responsibility_id = ?",
                 (current.owner_id, current.coworker_id, identifier),
             ).fetchone()
             if row is None:
@@ -1308,8 +1548,9 @@ class CoworkerDirectory:
                 ),
             )
             updated = conn.execute(
-                "SELECT * FROM coworker_responsibilities WHERE owner_id = ? "
-                "AND coworker_id = ? AND responsibility_id = ?",
+                _RESPONSIBILITY_SELECT
+                + " WHERE responsibility.owner_id = ? AND responsibility.coworker_id = ? "
+                "AND responsibility.responsibility_id = ?",
                 (current.owner_id, current.coworker_id, identifier),
             ).fetchone()
             if updated is None:
@@ -1712,8 +1953,14 @@ class CoworkerHandle:
         objective: str,
         success_criteria: Sequence[str] = (),
         trigger_type: CoworkerResponsibilityTrigger = "manual",
+        schedule: ScheduleSpec | None = None,
+        misfire_grace_seconds: int = 86_400,
     ) -> CoworkerResponsibility:
-        """Create an active responsibility owned by this coworker binding."""
+        """Create an active responsibility and optional stored schedule binding.
+
+        A stored schedule is currently configuration for inspection only; this
+        method does not admit or dispatch due scheduled occurrences.
+        """
 
         return self._directory._create_responsibility(
             handle=self,
@@ -1721,6 +1968,8 @@ class CoworkerHandle:
             objective=objective,
             success_criteria=success_criteria,
             trigger_type=trigger_type,
+            schedule=schedule,
+            misfire_grace_seconds=misfire_grace_seconds,
         )
 
     def list_responsibilities(

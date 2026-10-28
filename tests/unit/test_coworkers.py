@@ -341,12 +341,207 @@ def test_coworker_responsibilities_are_scoped_durable_and_owner_checked(
         handle.get_responsibility(responsibility.responsibility_id)
 
 
+@pytest.mark.parametrize("schedule_kind", ["at", "every", "cron"])
+def test_responsibility_schedule_binding_is_persisted_and_owner_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schedule_kind: str,
+) -> None:
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import CoworkerDirectory, CoworkerNotFound
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    _, _, other_handle = _ready_coworker(ash_dir, workspace, profile_name="other")
+    fixed_now = datetime(2026, 3, 28, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: fixed_now.isoformat())
+    if schedule_kind == "at":
+        schedule = build_schedule(
+            at=(fixed_now + timedelta(hours=2)).isoformat(),
+            now=fixed_now,
+        )
+        expected_first_fire = fixed_now + timedelta(hours=2)
+    elif schedule_kind == "every":
+        schedule = build_schedule(every="30m", now=fixed_now)
+        expected_first_fire = fixed_now + timedelta(minutes=30)
+    else:
+        schedule = build_schedule(
+            cron="30 2 * * sun",
+            timezone_name="Europe/Berlin",
+            now=fixed_now,
+        )
+        # Berlin's spring-forward 02:30 is normalized by Ash's shared helper.
+        expected_first_fire = datetime(2026, 3, 29, 1, tzinfo=timezone.utc)
+
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=schedule,
+        misfire_grace_seconds=900,
+    )
+
+    assert responsibility.owner_id == identity.owner_id
+    assert responsibility.owner_uid == identity.owner_uid
+    assert responsibility.coworker_id == identity.coworker_id
+    assert responsibility.schedule is not None
+    assert responsibility.schedule.kind == schedule_kind
+    assert responsibility.first_fire_at == expected_first_fire
+    assert responsibility.misfire_grace_seconds == 900
+    assert handle.list_responsibilities() == [responsibility]
+    paused = handle.set_responsibility_status(
+        responsibility.responsibility_id,
+        "paused",
+    )
+    assert paused.schedule == schedule
+    assert paused.first_fire_at == expected_first_fire
+    completed = handle.set_responsibility_status(
+        responsibility.responsibility_id,
+        "completed",
+    )
+    assert completed.schedule == schedule
+    with pytest.raises(CoworkerNotFound):
+        other_handle.get_responsibility(responsibility.responsibility_id)
+
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert reopened.get_responsibility(responsibility.responsibility_id) == completed
+    with sqlite3.connect(directory.db_path) as connection:
+        row = connection.execute(
+            "SELECT owner_id, owner_uid, coworker_id, responsibility_id, "
+            "schedule_kind, first_fire_at, misfire_grace_seconds "
+            "FROM coworker_responsibility_schedules"
+        ).fetchone()
+    assert row == (
+        identity.owner_id,
+        identity.owner_uid,
+        identity.coworker_id,
+        responsibility.responsibility_id,
+        schedule_kind,
+        expected_first_fire.isoformat(),
+        900,
+    )
+
+
+def test_responsibility_schedule_revalidation_and_grace_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from ash.automation.models import ScheduleSpec
+    from ash.automation.schedules import build_schedule
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, _, handle = _ready_coworker(ash_dir, workspace)
+    fixed_now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: fixed_now.isoformat())
+    future_at = build_schedule(
+        at=(fixed_now + timedelta(hours=1)).isoformat(),
+        now=fixed_now,
+    )
+
+    for grace in (True, -1, 2_592_001):
+        with pytest.raises(ValueError, match="misfire_grace_seconds"):
+            handle.create_responsibility(
+                scope="Release review",
+                objective="Review the checklist.",
+                schedule=future_at,
+                misfire_grace_seconds=grace,
+            )
+    with pytest.raises(ValueError, match="cron expression"):
+        handle.create_responsibility(
+            scope="Release review",
+            objective="Review the checklist.",
+            schedule=ScheduleSpec("cron", "not cron", "UTC"),
+        )
+    with pytest.raises(ValueError, match="future"):
+        handle.create_responsibility(
+            scope="Release review",
+            objective="Review the checklist.",
+            schedule=ScheduleSpec("at", fixed_now.isoformat()),
+        )
+    with pytest.raises(ValueError, match="interval schedule anchor"):
+        handle.create_responsibility(
+            scope="Release review",
+            objective="Review the checklist.",
+            schedule=ScheduleSpec("every", "60", anchor_at=""),  # type: ignore[arg-type]
+        )
+
+
+def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from uuid import uuid4
+
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the checklist.",
+    )
+    run_id = str(uuid4())
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "INSERT INTO coworker_turn_dispatches ("
+            "owner_id, coworker_id, run_id, session_id, request_id, status, "
+            "responsibility_id, trigger_type, event_key, created_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, 'completed', ?, 'manual', 'legacy-event', ?, ?)",
+            (
+                identity.owner_id,
+                identity.coworker_id,
+                run_id,
+                str(uuid4()),
+                str(uuid4()),
+                responsibility.responsibility_id,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:01:00+00:00",
+            ),
+        )
+        connection.execute("DROP TABLE coworker_responsibility_schedules")
+        connection.execute(
+            "UPDATE coworker_directory_meta SET schema_version = 4"
+        )
+
+    migrated = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert migrated.get_responsibility(responsibility.responsibility_id) == responsibility
+    assert migrated.list_responsibility_runs(responsibility.responsibility_id)[0].run_id == run_id
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (5,)
+        assert connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall() == []
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coworker_responsibility_schedules"
+        ).fetchone() == (0,)
+
+
 
 
 def test_responsibility_management_requires_current_local_owner_uid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from ash.automation.models import ScheduleSpec
     from ash.coworkers import CoworkerRuntimeUnavailable
 
     ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
@@ -367,6 +562,11 @@ def test_responsibility_management_requires_current_local_owner_uid(
     for operation in (
         lambda: handle.create_responsibility(
             scope="Forbidden responsibility", objective="Must be denied"
+        ),
+        lambda: handle.create_responsibility(
+            scope="Forbidden schedule",
+            objective="Must be denied",
+            schedule=ScheduleSpec("at", "2099-01-01T00:00:00+00:00"),
         ),
         handle.list_responsibilities,
         lambda: handle.get_responsibility(responsibility.responsibility_id),
@@ -1114,7 +1314,7 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (4,)
+        ).fetchone() == (5,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
@@ -1197,7 +1397,7 @@ def test_coworker_directory_v3_migration_preserves_dispatch_history(
     with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (4,)
+        ).fetchone() == (5,)
         columns = {
             str(row[1])
             for row in connection.execute(
