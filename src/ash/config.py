@@ -1142,7 +1142,9 @@ class AshConfig(BaseSettings):
             "Optional semantic embedding provider: none, onnx (local), or openai (remote)."
         ),
     )
-    openai_api_key: str = Field("", description="API key for OpenAI embeddings")
+    openai_api_key: str = Field(
+        "", repr=False, exclude=True, description="API key for OpenAI embeddings"
+    )
     onnx_model_path: Path = Field(
         Path(".ash/model.onnx"),
         description="Path to ONNX MiniLM model for local embeddings",
@@ -2289,6 +2291,9 @@ class AshConfig(BaseSettings):
         """Copy settings while retaining provenance for explicit overrides."""
 
         payload = self.model_dump(mode="python")
+        # Secrets are intentionally excluded from serialized config, but an
+        # in-process settings copy must preserve the selected embedding key.
+        payload["openai_api_key"] = self.openai_api_key
         payload.update(values)
         validation_context = (
             _VALIDATION_ONLY_CONTEXT

@@ -162,6 +162,17 @@ def test_default_registry_exposes_builtins_without_constructing_them() -> None:
     )
 
 
+def test_config_api_key_field_is_not_exposed_in_repr_or_dump() -> None:
+    config = AshConfig(model="openai/gpt-test", openai_api_key="synthetic-private-key")
+    assert config.openai_api_key == "synthetic-private-key"
+    assert "synthetic-private-key" not in repr(config)
+    assert "synthetic-private-key" not in str(config.model_dump())
+    adjusted = config.with_overrides({"temperature": 0.4})
+    assert adjusted.openai_api_key == "synthetic-private-key"
+    assert "synthetic-private-key" not in repr(adjusted)
+    assert "synthetic-private-key" not in str(adjusted.model_dump())
+
+
 def test_coworker_provider_uses_only_explicit_profile_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -337,7 +348,11 @@ async def test_coworker_anthropic_adapter_ignores_ambient_sdk_route_and_headers(
     request = sdk_client._build_request(
         FinalRequestOptions(method="POST", url="/v1/messages", json_data={})
     )
-    assert request.headers["Authorization"] == "Bearer ambient-header-secret"
+    # Older Anthropic SDKs do not add ambient custom headers during _build_request.
+    # Simulate those headers explicitly to exercise the outgoing stripping hook
+    # under both minimum and current supported dependencies.
+    request.headers["Authorization"] = "Bearer ambient-header-secret"
+    request.headers["X-Ambient-Secret"] = "ambient-header-secret"
     for hook in http_client._event_hooks["request"]:
         await hook(request)
 
