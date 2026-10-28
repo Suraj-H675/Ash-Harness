@@ -70,7 +70,12 @@ def test_coworker_worker_writable_mount_is_fixed_and_sessions_only(
     workspace.mkdir()
     state = tmp_path / "profile-db"
     state.mkdir(mode=0o700)
-    (state / "sessions.db").write_bytes(b"synthetic database")
+    from ash.core.session import SessionStore
+
+    store = SessionStore(state / "sessions.db")
+    lease = store.acquire_session_runtime_lease("coworker-test-session")
+    lease.close()
+    assert (state / ".sessions.db.ash-lock").is_file()
     sandbox = DockerSandbox(
         image=COWORKER_IMAGE,
         workspace_root=workspace,
@@ -100,7 +105,10 @@ def test_coworker_worker_writable_mount_is_fixed_and_sessions_only(
     assert not any("ANTHROPIC_API_KEY" in item for item in argv)
 
 
-@pytest.mark.parametrize("unsafe_state", ["unexpected-file", "symlink"])
+@pytest.mark.parametrize(
+    "unsafe_state",
+    ["unexpected-file", "symlink", "coordination-symlink", "malformed-coordination"],
+)
 def test_coworker_worker_mount_rejects_unexpected_state(
     tmp_path: Path,
     unsafe_state: str,
@@ -112,8 +120,12 @@ def test_coworker_worker_mount_rejects_unexpected_state(
     (state / "sessions.db").write_bytes(b"synthetic database")
     if unsafe_state == "unexpected-file":
         (state / "memory.db").write_bytes(b"must not be mounted")
-    else:
+    elif unsafe_state == "symlink":
         (state / "unexpected").symlink_to(state / "sessions.db")
+    elif unsafe_state == "coordination-symlink":
+        (state / ".sessions.db.ash-lock").symlink_to(state / "sessions.db")
+    else:
+        (state / ".sessions.db.ash-lock-extra").write_bytes(b"not an Ash lock")
     sandbox = DockerSandbox(
         image=COWORKER_IMAGE,
         workspace_root=workspace,

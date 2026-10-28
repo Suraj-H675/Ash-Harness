@@ -408,6 +408,7 @@ def _validate_coworker_state_directory(
         "sessions.db-shm",
         "sessions.db-wal",
         "sessions.db-journal",
+        ".sessions.db.ash-lock",
     }
     names: set[str] = set()
     for entry in entries:
