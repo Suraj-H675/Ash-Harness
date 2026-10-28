@@ -19,13 +19,13 @@ import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4, uuid5
 
 from ash.automation.models import ScheduleSpec
-from ash.automation.schedules import build_schedule, first_fire_time
+from ash.automation.schedules import build_schedule, first_fire_time, next_fire_time
 from ash.config import AshConfig
 from ash.core.session import (
     CoworkerSessionBinding,
@@ -50,7 +50,7 @@ from ash.sandbox.docker import COWORKER_IMAGE, DEFAULT_IMAGE
 from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 5
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 6
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
 _MAX_RESPONSIBILITY_SCOPE_BYTES = 2048
@@ -137,6 +137,8 @@ class CoworkerRuntimeUnavailable(RuntimeError):
 
 CoworkerResponsibilityStatus = Literal["active", "paused", "completed"]
 CoworkerResponsibilityTrigger = Literal["manual"]
+CoworkerResponsibilityRunTrigger = Literal["manual", "scheduled"]
+CoworkerScheduleTickStatus = Literal["idle", "skipped", "completed"]
 
 
 @dataclass(frozen=True)
@@ -193,7 +195,7 @@ class CoworkerTurnResult:
     request_id: str
     response: str
     responsibility_id: str | None = None
-    trigger_type: CoworkerResponsibilityTrigger | None = None
+    trigger_type: CoworkerResponsibilityRunTrigger | None = None
     event_key: str | None = None
 
 
@@ -216,6 +218,7 @@ class CoworkerResponsibility:
     completed_at: datetime | None = None
     schedule: ScheduleSpec | None = None
     first_fire_at: datetime | None = None
+    next_fire_at: datetime | None = None
     misfire_grace_seconds: int | None = None
 
 
@@ -225,13 +228,60 @@ class CoworkerResponsibilityRun:
 
     responsibility_id: str
     event_key: str
-    trigger_type: CoworkerResponsibilityTrigger
+    trigger_type: CoworkerResponsibilityRunTrigger
     run_id: str
-    session_id: str
-    request_id: str
-    status: Literal["claimed", "completed"]
+    session_id: str | None
+    request_id: str | None
+    status: Literal["claimed", "completed", "skipped"]
     created_at: datetime
     completed_at: datetime | None = None
+    scheduled_for: datetime | None = None
+    skip_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CoworkerScheduleTickResult:
+    """One explicit due check over at most one scheduled occurrence."""
+
+    status: CoworkerScheduleTickStatus
+    responsibility_id: str | None = None
+    event_key: str | None = None
+    turn: CoworkerTurnResult | None = None
+    skip_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status == "idle":
+            if any(
+                value is not None
+                for value in (
+                    self.responsibility_id,
+                    self.event_key,
+                    self.turn,
+                    self.skip_reason,
+                )
+            ):
+                raise ValueError("idle schedule result cannot carry an occurrence")
+            return
+        if self.status == "skipped":
+            if (
+                self.responsibility_id is None
+                or self.event_key is None
+                or self.turn is not None
+                or self.skip_reason != "misfire_grace_expired"
+            ):
+                raise ValueError("skipped schedule result is incomplete")
+            return
+        if (
+            self.status != "completed"
+            or self.responsibility_id is None
+            or self.event_key is None
+            or self.turn is None
+            or self.skip_reason is not None
+            or self.turn.responsibility_id != self.responsibility_id
+            or self.turn.trigger_type != "scheduled"
+            or self.turn.event_key != self.event_key
+        ):
+            raise ValueError("completed schedule result is incomplete")
 
 
 @dataclass(frozen=True)
@@ -406,6 +456,7 @@ _RESPONSIBILITY_SELECT = """
         schedule.schedule_timezone,
         schedule.schedule_anchor_at,
         schedule.first_fire_at,
+        schedule.next_fire_at,
         schedule.misfire_grace_seconds
     FROM coworker_responsibilities AS responsibility
     LEFT JOIN coworker_responsibility_schedules AS schedule
@@ -497,6 +548,7 @@ def _responsibility_from_row(row: sqlite3.Row) -> CoworkerResponsibility:
                     "schedule_timezone",
                     "schedule_anchor_at",
                     "first_fire_at",
+                    "next_fire_at",
                     "misfire_grace_seconds",
                 )
             ):
@@ -524,10 +576,20 @@ def _responsibility_from_row(row: sqlite3.Row) -> CoworkerResponsibility:
                 else None
             )
             first_at = datetime.fromisoformat(str(row["first_fire_at"]))
+            next_text = row["next_fire_at"]
+            next_at = (
+                datetime.fromisoformat(str(next_text))
+                if next_text is not None
+                else None
+            )
             if (
                 (anchor is not None and (anchor.tzinfo is None or anchor.utcoffset() is None))
                 or first_at.tzinfo is None
                 or first_at.utcoffset() is None
+                or (
+                    next_at is not None
+                    and (next_at.tzinfo is None or next_at.utcoffset() is None)
+                )
             ):
                 raise ValueError("schedule timestamps must include a UTC offset")
             schedule = ScheduleSpec(
@@ -537,13 +599,20 @@ def _responsibility_from_row(row: sqlite3.Row) -> CoworkerResponsibility:
                 anchor_at=anchor,
             )
             first_at = first_at.astimezone(timezone.utc)
+            next_at = next_at.astimezone(timezone.utc) if next_at is not None else None
             created_at = datetime.fromisoformat(str(row["created_at"]))
             normalized_schedule, validated_first_at = (
                 _validated_responsibility_schedule(schedule, now=created_at)
             )
             if normalized_schedule != schedule or validated_first_at != first_at:
                 raise ValueError("stored schedule does not match its validated binding")
+            if next_at is not None and next_at < first_at:
+                raise ValueError("schedule cursor precedes its first occurrence")
+            if schedule.kind in {"every", "cron"} and next_at is None:
+                raise ValueError("recurring schedule has no next occurrence")
             grace = int(row["misfire_grace_seconds"])
+        if schedule_kind is None:
+            next_at = None
         return CoworkerResponsibility(
             responsibility_id=str(row["responsibility_id"]),
             owner_id=str(row["owner_id"]),
@@ -568,6 +637,7 @@ def _responsibility_from_row(row: sqlite3.Row) -> CoworkerResponsibility:
             ),
             schedule=schedule,
             first_fire_at=first_at,
+            next_fire_at=next_at,
             misfire_grace_seconds=grace,
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -577,18 +647,54 @@ def _responsibility_from_row(row: sqlite3.Row) -> CoworkerResponsibility:
 def _responsibility_run_from_row(row: sqlite3.Row) -> CoworkerResponsibilityRun:
     try:
         status = str(row["status"])
-        if row["trigger_type"] != "manual" or status not in {
+        trigger_type = str(row["trigger_type"])
+        if trigger_type not in {"manual", "scheduled"} or status not in {
             "claimed",
             "completed",
+            "skipped",
         }:
             raise ValueError("unsupported responsibility run state")
+        session_id = row["session_id"]
+        request_id = row["request_id"]
+        scheduled_for_text = row["scheduled_for"]
+        skip_reason = row["skip_reason"]
+        scheduled_for = (
+            datetime.fromisoformat(str(scheduled_for_text))
+            if scheduled_for_text is not None
+            else None
+        )
+        if status == "skipped":
+            if (
+                trigger_type != "scheduled"
+                or session_id is not None
+                or request_id is not None
+                or skip_reason != "misfire_grace_expired"
+                or scheduled_for_text is None
+            ):
+                raise ValueError("invalid skipped occurrence")
+        elif session_id is None or request_id is None or skip_reason is not None:
+            raise ValueError("invalid claimed turn")
+        if (trigger_type == "scheduled") != (scheduled_for is not None):
+            raise ValueError("run schedule attribution is incomplete")
+        if scheduled_for is not None:
+            if scheduled_for.tzinfo is None or scheduled_for.utcoffset() is None:
+                raise ValueError("scheduled occurrence timestamp has no UTC offset")
+            if (
+                str(row["event_key"]) != _scheduled_event_key(scheduled_for)
+                or str(row["run_id"])
+                != _scheduled_run_id(
+                    str(row["responsibility_id"]),
+                    scheduled_for,
+                )
+            ):
+                raise ValueError("scheduled occurrence attribution does not match")
         return CoworkerResponsibilityRun(
             responsibility_id=str(row["responsibility_id"]),
             event_key=str(row["event_key"]),
-            trigger_type="manual",
+            trigger_type=trigger_type,  # type: ignore[arg-type]
             run_id=str(row["run_id"]),
-            session_id=str(row["session_id"]),
-            request_id=str(row["request_id"]),
+            session_id=str(session_id) if session_id is not None else None,
+            request_id=str(request_id) if request_id is not None else None,
             status=status,  # type: ignore[arg-type]
             created_at=datetime.fromisoformat(str(row["created_at"])),
             completed_at=(
@@ -596,6 +702,12 @@ def _responsibility_run_from_row(row: sqlite3.Row) -> CoworkerResponsibilityRun:
                 if row["completed_at"] is not None
                 else None
             ),
+            scheduled_for=(
+                scheduled_for.astimezone(timezone.utc)
+                if scheduled_for is not None
+                else None
+            ),
+            skip_reason=(str(skip_reason) if skip_reason is not None else None),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise CoworkerDirectoryError(
@@ -614,6 +726,29 @@ def _normalize_workspace(workspace: str | Path) -> Path:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _scheduled_event_key(scheduled_for: datetime) -> str:
+    if scheduled_for.tzinfo is None or scheduled_for.utcoffset() is None:
+        raise ValueError("scheduled occurrence must include a UTC offset")
+    instant = scheduled_for.astimezone(timezone.utc)
+    return f"scheduled:{instant.isoformat()}"
+
+
+def _scheduled_run_id(responsibility_id: str, scheduled_for: datetime) -> str:
+    return str(
+        uuid5(
+            UUID(responsibility_id),
+            f"ash-crew-scheduled-trigger:{_scheduled_event_key(scheduled_for)}",
+        )
+    )
+
+
+def _current_time() -> datetime:
+    current = datetime.fromisoformat(_now())
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise CoworkerDirectoryError("current time must include a UTC offset")
+    return current.astimezone(timezone.utc)
 
 
 def _record_from_row(row: sqlite3.Row) -> Coworker:
@@ -994,6 +1129,58 @@ def _session_ref(
     )
 
 
+def _create_coworker_turn_dispatches(
+    conn: sqlite3.Connection,
+    *,
+    table_name: str,
+) -> None:
+    if table_name not in {
+        "coworker_turn_dispatches",
+        "coworker_turn_dispatches_v6",
+    }:
+        raise ValueError("invalid coworker dispatch table name")
+    conn.execute(
+        f"""
+        CREATE TABLE {table_name} (
+            owner_id TEXT NOT NULL,
+            coworker_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            session_id TEXT,
+            request_id TEXT UNIQUE,
+            status TEXT NOT NULL CHECK(status IN ('claimed', 'completed', 'skipped')),
+            responsibility_id TEXT REFERENCES
+                coworker_responsibilities(responsibility_id),
+            trigger_type TEXT CHECK(trigger_type IS NULL OR
+                trigger_type IN ('manual', 'scheduled')),
+            event_key TEXT CHECK(event_key IS NULL OR
+                length(event_key) BETWEEN 1 AND 128),
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            scheduled_for TEXT,
+            skip_reason TEXT,
+            PRIMARY KEY(owner_id, coworker_id, run_id),
+            CHECK (
+                (responsibility_id IS NULL AND trigger_type IS NULL
+                    AND event_key IS NULL AND scheduled_for IS NULL
+                    AND skip_reason IS NULL)
+                OR (responsibility_id IS NOT NULL AND trigger_type = 'manual'
+                    AND event_key IS NOT NULL AND scheduled_for IS NULL
+                    AND skip_reason IS NULL)
+                OR (responsibility_id IS NOT NULL AND trigger_type = 'scheduled'
+                    AND event_key IS NOT NULL AND scheduled_for IS NOT NULL)
+            ),
+            CHECK (
+                (status IN ('claimed', 'completed') AND session_id IS NOT NULL
+                    AND request_id IS NOT NULL AND skip_reason IS NULL)
+                OR (status = 'skipped' AND trigger_type = 'scheduled'
+                    AND session_id IS NULL AND request_id IS NULL
+                    AND skip_reason = 'misfire_grace_expired')
+            )
+        )
+        """
+    )
+
+
 class CoworkerDirectory:
     """Versioned local index of owner/profile-bound coworker identities."""
 
@@ -1029,6 +1216,7 @@ class CoworkerDirectory:
                         "AND name NOT LIKE 'sqlite_%'"
                     )
                 }
+                dispatch_was_present = "coworker_turn_dispatches" in tables
                 if not tables:
                     conn.execute(
                         "CREATE TABLE coworker_directory_meta "
@@ -1070,6 +1258,7 @@ class CoworkerDirectory:
                         "coworker directory schema version is missing"
                     )
                 version = int(row["schema_version"])
+                original_version = version
                 if version == 1:
                     columns = {
                         str(column["name"])
@@ -1097,7 +1286,7 @@ class CoworkerDirectory:
                         (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
                     )
                     version = _COWORKER_DIRECTORY_SCHEMA_VERSION
-                if version not in {4, _COWORKER_DIRECTORY_SCHEMA_VERSION}:
+                if version not in {4, 5, _COWORKER_DIRECTORY_SCHEMA_VERSION}:
                     raise CoworkerDirectoryError(
                         "coworker directory schema version is unsupported: "
                         f"{version}"
@@ -1166,27 +1355,11 @@ class CoworkerDirectory:
                     "ON coworker_responsibilities(owner_id, coworker_id, created_at, "
                     "responsibility_id)"
                 )
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS coworker_turn_dispatches (
-                        owner_id TEXT NOT NULL,
-                        coworker_id TEXT NOT NULL,
-                        run_id TEXT NOT NULL,
-                        session_id TEXT NOT NULL,
-                        request_id TEXT NOT NULL UNIQUE,
-                        status TEXT NOT NULL CHECK(status IN ('claimed', 'completed')),
-                        responsibility_id TEXT REFERENCES
-                            coworker_responsibilities(responsibility_id),
-                        trigger_type TEXT CHECK(trigger_type IS NULL OR
-                            trigger_type IN ('manual')),
-                        event_key TEXT CHECK(event_key IS NULL OR
-                            length(event_key) BETWEEN 1 AND 128),
-                        created_at TEXT NOT NULL,
-                        completed_at TEXT,
-                        PRIMARY KEY(owner_id, coworker_id, run_id)
+                if not dispatch_was_present:
+                    _create_coworker_turn_dispatches(
+                        conn,
+                        table_name="coworker_turn_dispatches",
                     )
-                    """
-                )
                 dispatch_columns = {
                     str(column["name"])
                     for column in conn.execute(
@@ -1205,6 +1378,8 @@ class CoworkerDirectory:
                     "event_key",
                     "created_at",
                     "completed_at",
+                    "scheduled_for",
+                    "skip_reason",
                 }
                 for name, declaration in (
                     (
@@ -1219,6 +1394,8 @@ class CoworkerDirectory:
                         "event_key",
                         "TEXT CHECK(event_key IS NULL OR length(event_key) BETWEEN 1 AND 128)",
                     ),
+                    ("scheduled_for", "TEXT"),
+                    ("skip_reason", "TEXT"),
                 ):
                     if name not in dispatch_columns:
                         conn.execute(
@@ -1235,11 +1412,60 @@ class CoworkerDirectory:
                     raise CoworkerDirectoryError(
                         "coworker dispatch journal schema is incomplete"
                     )
+                dispatch_schema_row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'coworker_turn_dispatches'"
+                ).fetchone()
+                dispatch_schema = (
+                    str(dispatch_schema_row["sql"]).casefold()
+                    if dispatch_schema_row is not None
+                    else ""
+                )
+                if dispatch_was_present and (
+                    original_version < _COWORKER_DIRECTORY_SCHEMA_VERSION
+                    or "scheduled" not in dispatch_schema
+                    or "skipped" not in dispatch_schema
+                ):
+                    old_columns = dispatch_columns
+                    scheduled_for_select = (
+                        "scheduled_for" if "scheduled_for" in old_columns else "NULL"
+                    )
+                    skip_reason_select = (
+                        "skip_reason" if "skip_reason" in old_columns else "NULL"
+                    )
+                    conn.execute(
+                        "DROP INDEX IF EXISTS "
+                        "idx_coworker_turn_dispatches_responsibility_event"
+                    )
+                    conn.execute(
+                        "ALTER TABLE coworker_turn_dispatches "
+                        "RENAME TO coworker_turn_dispatches_legacy"
+                    )
+                    _create_coworker_turn_dispatches(
+                        conn,
+                        table_name="coworker_turn_dispatches_v6",
+                    )
+                    conn.execute(
+                        "INSERT INTO coworker_turn_dispatches_v6 ("
+                        "owner_id, coworker_id, run_id, session_id, request_id, "
+                        "status, responsibility_id, trigger_type, event_key, "
+                        "created_at, completed_at, scheduled_for, skip_reason) "
+                        "SELECT owner_id, coworker_id, run_id, session_id, "
+                        "request_id, status, responsibility_id, trigger_type, "
+                        f"event_key, created_at, completed_at, {scheduled_for_select}, "
+                        f"{skip_reason_select} FROM coworker_turn_dispatches_legacy"
+                    )
+                    conn.execute("DROP TABLE coworker_turn_dispatches_legacy")
+                    conn.execute(
+                        "ALTER TABLE coworker_turn_dispatches_v6 "
+                        "RENAME TO coworker_turn_dispatches"
+                    )
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS "
                     "idx_coworker_turn_dispatches_responsibility_event "
                     "ON coworker_turn_dispatches(owner_id, coworker_id, "
-                    "responsibility_id, event_key) WHERE responsibility_id IS NOT NULL"
+                    "responsibility_id, trigger_type, event_key) "
+                    "WHERE responsibility_id IS NOT NULL"
                 )
                 conn.execute(
                     """
@@ -1254,6 +1480,7 @@ class CoworkerDirectory:
                         schedule_timezone TEXT NOT NULL,
                         schedule_anchor_at TEXT,
                         first_fire_at TEXT NOT NULL,
+                        next_fire_at TEXT,
                         misfire_grace_seconds INTEGER NOT NULL
                             CHECK(misfire_grace_seconds BETWEEN 0 AND 2592000),
                         PRIMARY KEY(owner_id, coworker_id, responsibility_id),
@@ -1270,6 +1497,16 @@ class CoworkerDirectory:
                         "PRAGMA table_info(coworker_responsibility_schedules)"
                     )
                 }
+                if "next_fire_at" not in schedule_columns:
+                    conn.execute(
+                        "ALTER TABLE coworker_responsibility_schedules "
+                        "ADD COLUMN next_fire_at TEXT"
+                    )
+                    conn.execute(
+                        "UPDATE coworker_responsibility_schedules "
+                        "SET next_fire_at = first_fire_at"
+                    )
+                    schedule_columns.add("next_fire_at")
                 if schedule_columns != {
                     "owner_id",
                     "owner_uid",
@@ -1280,16 +1517,16 @@ class CoworkerDirectory:
                     "schedule_timezone",
                     "schedule_anchor_at",
                     "first_fire_at",
+                    "next_fire_at",
                     "misfire_grace_seconds",
                 }:
                     raise CoworkerDirectoryError(
                         "coworker responsibility schedule schema is incomplete"
                     )
-                if version == 4:
-                    conn.execute(
-                        "UPDATE coworker_directory_meta SET schema_version = ?",
-                        (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
-                    )
+                conn.execute(
+                    "UPDATE coworker_directory_meta SET schema_version = ?",
+                    (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
+                )
         except (sqlite3.DatabaseError, OSError, SessionStorageError) as exc:
             raise CoworkerDirectoryError(
                 f"could not open coworker directory {self.db_path}: {exc}"
@@ -1396,6 +1633,7 @@ class CoworkerDirectory:
             updated_at=now_datetime,
             schedule=normalized_schedule,
             first_fire_at=first_fire_at,
+            next_fire_at=first_fire_at,
             misfire_grace_seconds=(
                 misfire_grace_seconds if normalized_schedule is not None else None
             ),
@@ -1432,8 +1670,9 @@ class CoworkerDirectory:
                         "INSERT INTO coworker_responsibility_schedules ("
                         "owner_id, owner_uid, coworker_id, responsibility_id, "
                         "schedule_kind, schedule_value, schedule_timezone, "
-                        "schedule_anchor_at, first_fire_at, misfire_grace_seconds) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "schedule_anchor_at, first_fire_at, next_fire_at, "
+                        "misfire_grace_seconds) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             current.owner_id,
                             current.owner_uid,
@@ -1447,6 +1686,7 @@ class CoworkerDirectory:
                                 if normalized_schedule.anchor_at is not None
                                 else None
                             ),
+                            first_fire_at.isoformat(),
                             first_fire_at.isoformat(),
                             misfire_grace_seconds,
                         ),
@@ -1493,6 +1733,28 @@ class CoworkerDirectory:
         if row is None:
             raise CoworkerNotFound("coworker responsibility not found")
         return _responsibility_from_row(row)
+
+    def _next_due_responsibility(
+        self,
+        handle: "CoworkerHandle",
+    ) -> CoworkerResponsibility | None:
+        """Read the earliest due schedule scoped to this verified handle."""
+
+        current = self._require_local_coworker_owner(handle)
+        now_text = _current_time().isoformat()
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                _RESPONSIBILITY_SELECT
+                + " WHERE responsibility.owner_id = ? "
+                "AND responsibility.coworker_id = ? "
+                "AND responsibility.status = 'active' "
+                "AND schedule.next_fire_at IS NOT NULL "
+                "AND schedule.next_fire_at <= ? "
+                "ORDER BY schedule.next_fire_at, responsibility.responsibility_id "
+                "LIMIT 1",
+                (current.owner_id, current.coworker_id, now_text),
+            ).fetchone()
+        return _responsibility_from_row(row) if row is not None else None
 
     def _set_responsibility_status(
         self,
@@ -1595,12 +1857,16 @@ class CoworkerDirectory:
         request_id: str,
         responsibility_id: str | None = None,
         event_key: str | None = None,
-    ) -> None:
+        scheduled_for: datetime | None = None,
+        prompt: str | None = None,
+    ) -> CoworkerScheduleTickResult | None:
         """Durably consume one run key before any worker process is dispatched."""
 
         identity = handle.identity
         if (responsibility_id is None) != (event_key is None):
             raise ValueError("responsibility_id and event_key must be supplied together")
+        if scheduled_for is not None and responsibility_id is None:
+            raise ValueError("scheduled occurrence requires a responsibility")
         normalized_responsibility_id = (
             _normalize_responsibility_id(responsibility_id)
             if responsibility_id is not None
@@ -1611,6 +1877,15 @@ class CoworkerDirectory:
             if event_key is not None
             else None
         )
+        normalized_scheduled_for = (
+            scheduled_for.astimezone(timezone.utc)
+            if scheduled_for is not None
+            and scheduled_for.tzinfo is not None
+            and scheduled_for.utcoffset() is not None
+            else None
+        )
+        if scheduled_for is not None and normalized_scheduled_for is None:
+            raise ValueError("scheduled occurrence must include a UTC offset")
         try:
             with closing(self._connect()) as conn, conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -1635,26 +1910,157 @@ class CoworkerDirectory:
                     raise CoworkerRuntimeUnavailable(
                         "local coworker owner identity could not be verified"
                     )
+                responsibility_record: CoworkerResponsibility | None = None
                 if normalized_responsibility_id is not None:
-                    responsibility = conn.execute(
-                        "SELECT owner_uid, trigger_type, status "
-                        "FROM coworker_responsibilities WHERE owner_id = ? "
-                        "AND coworker_id = ? AND responsibility_id = ?",
+                    responsibility_row = conn.execute(
+                        _RESPONSIBILITY_SELECT
+                        + " WHERE responsibility.owner_id = ? "
+                        "AND responsibility.coworker_id = ? "
+                        "AND responsibility.responsibility_id = ?",
                         (
                             identity.owner_id,
                             identity.coworker_id,
                             normalized_responsibility_id,
                         ),
                     ).fetchone()
+                    responsibility_record = (
+                        _responsibility_from_row(responsibility_row)
+                        if responsibility_row is not None
+                        else None
+                    )
                     if (
-                        responsibility is None
-                        or responsibility["owner_uid"] != current.owner_uid
-                        or responsibility["trigger_type"] != "manual"
-                        or responsibility["status"] != "active"
+                        responsibility_record is None
+                        or responsibility_record.owner_uid != current.owner_uid
+                        or responsibility_record.trigger_type != "manual"
+                        or responsibility_record.status != "active"
                     ):
                         raise CoworkerRuntimeUnavailable(
-                            "coworker responsibility is not active for manual dispatch"
+                            "coworker responsibility is not active for dispatch"
                         )
+                trigger_type: CoworkerResponsibilityRunTrigger | None = (
+                    "scheduled"
+                    if normalized_scheduled_for is not None
+                    else "manual"
+                    if normalized_responsibility_id is not None
+                    else None
+                )
+                if normalized_scheduled_for is not None:
+                    assert normalized_responsibility_id is not None
+                    assert responsibility_record is not None
+                    schedule_at = normalized_scheduled_for
+                    schedule = responsibility_record.schedule
+                    if (
+                        schedule is None
+                        or responsibility_record.next_fire_at is None
+                        or responsibility_record.misfire_grace_seconds is None
+                        or responsibility_record.owner_uid != current.owner_uid
+                        or responsibility_record.next_fire_at != schedule_at
+                        or normalized_event_key != _scheduled_event_key(schedule_at)
+                        or run_id
+                        != _scheduled_run_id(
+                            normalized_responsibility_id,
+                            schedule_at,
+                        )
+                    ):
+                        raise CoworkerRuntimeUnavailable(
+                            "scheduled occurrence binding changed before claim"
+                        )
+                    if prompt != _responsibility_prompt(responsibility_record):
+                        raise CoworkerRuntimeUnavailable(
+                            "scheduled occurrence prompt does not match its responsibility"
+                        )
+                    claim_time = _current_time()
+                    if schedule_at > claim_time:
+                        return CoworkerScheduleTickResult(status="idle")
+                    next_fire = (
+                        None
+                        if schedule.kind == "at"
+                        else next_fire_time(
+                            schedule,
+                            previous=schedule_at,
+                            now=claim_time,
+                        )
+                    )
+                    next_fire_text = next_fire.isoformat() if next_fire else None
+                    if claim_time - schedule_at > timedelta(
+                        seconds=responsibility_record.misfire_grace_seconds
+                    ):
+                        conn.execute(
+                            "INSERT INTO coworker_turn_dispatches ("
+                            "owner_id, coworker_id, run_id, session_id, request_id, "
+                            "status, responsibility_id, trigger_type, event_key, "
+                            "created_at, completed_at, scheduled_for, skip_reason) "
+                            "VALUES (?, ?, ?, NULL, NULL, 'skipped', ?, 'scheduled', "
+                            "?, ?, NULL, ?, 'misfire_grace_expired')",
+                            (
+                                identity.owner_id,
+                                identity.coworker_id,
+                                run_id,
+                                normalized_responsibility_id,
+                                normalized_event_key,
+                                claim_time.isoformat(),
+                                schedule_at.isoformat(),
+                            ),
+                        )
+                        cursor = conn.execute(
+                            "UPDATE coworker_responsibility_schedules "
+                            "SET next_fire_at = ? WHERE owner_id = ? "
+                            "AND coworker_id = ? AND responsibility_id = ? "
+                            "AND next_fire_at = ?",
+                            (
+                                next_fire_text,
+                                identity.owner_id,
+                                identity.coworker_id,
+                                normalized_responsibility_id,
+                                schedule_at.isoformat(),
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise CoworkerDirectoryError(
+                                "scheduled occurrence cursor changed during skip"
+                            )
+                        return CoworkerScheduleTickResult(
+                            status="skipped",
+                            responsibility_id=normalized_responsibility_id,
+                            event_key=normalized_event_key,
+                            skip_reason="misfire_grace_expired",
+                        )
+                    prior = conn.execute(
+                        "SELECT 1 FROM coworker_turn_dispatches "
+                        "WHERE owner_id = ? AND coworker_id = ? "
+                        "AND responsibility_id = ? AND trigger_type = 'scheduled' "
+                        "AND event_key = ?",
+                        (
+                            identity.owner_id,
+                            identity.coworker_id,
+                            normalized_responsibility_id,
+                            normalized_event_key,
+                        ),
+                    ).fetchone()
+                    if prior is not None:
+                        raise CoworkerRuntimeUnavailable(
+                            "scheduled occurrence was already claimed; refusing replay"
+                        )
+                    cursor = conn.execute(
+                        "UPDATE coworker_responsibility_schedules "
+                        "SET next_fire_at = ? WHERE owner_id = ? "
+                        "AND coworker_id = ? AND responsibility_id = ? "
+                        "AND next_fire_at = ?",
+                        (
+                            next_fire_text,
+                            identity.owner_id,
+                            identity.coworker_id,
+                            normalized_responsibility_id,
+                            schedule_at.isoformat(),
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise CoworkerDirectoryError(
+                            "scheduled occurrence cursor changed during claim"
+                        )
+                    created_at = claim_time.isoformat()
+                else:
+                    created_at = _now()
                 prior = conn.execute(
                     "SELECT status FROM coworker_turn_dispatches "
                     "WHERE owner_id = ? AND coworker_id = ? AND run_id = ?",
@@ -1668,8 +2074,8 @@ class CoworkerDirectory:
                     "INSERT INTO coworker_turn_dispatches "
                     "(owner_id, coworker_id, run_id, session_id, request_id, "
                     "status, responsibility_id, trigger_type, event_key, "
-                    "created_at, completed_at) "
-                    "VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, NULL)",
+                    "created_at, completed_at, scheduled_for, skip_reason) "
+                    "VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, NULL, ?, NULL)",
                     (
                         identity.owner_id,
                         identity.coworker_id,
@@ -1677,15 +2083,21 @@ class CoworkerDirectory:
                         session_id,
                         request_id,
                         normalized_responsibility_id,
-                        "manual" if normalized_responsibility_id is not None else None,
+                        trigger_type,
                         normalized_event_key,
-                        _now(),
+                        created_at,
+                        (
+                            normalized_scheduled_for.isoformat()
+                            if normalized_scheduled_for is not None
+                            else None
+                        ),
                     ),
                 )
         except sqlite3.IntegrityError as exc:
             raise CoworkerRuntimeUnavailable(
                 "coworker run was already claimed; refusing replay"
             ) from exc
+        return None
 
     def _complete_offline_turn(
         self,
@@ -2228,7 +2640,10 @@ class CoworkerHandle:
         an ambiguous dispatch cannot be replayed.
         """
 
-        return await self._run_offline_turn(run_id=run_id, prompt=prompt)
+        result = await self._run_offline_turn(run_id=run_id, prompt=prompt)
+        if not isinstance(result, CoworkerTurnResult):
+            raise CoworkerDirectoryError("offline turn did not produce a worker result")
+        return result
 
     async def run_responsibility(
         self,
@@ -2255,11 +2670,40 @@ class CoworkerHandle:
                 f"ash-crew-manual-trigger:{normalized_event_key}",
             )
         )
-        return await self._run_offline_turn(
+        result = await self._run_offline_turn(
             run_id=run_id,
             prompt=_responsibility_prompt(responsibility),
             responsibility_id=identifier,
             event_key=normalized_event_key,
+        )
+        if not isinstance(result, CoworkerTurnResult):
+            raise CoworkerDirectoryError("manual responsibility did not produce a worker result")
+        return result
+
+    async def run_due_responsibilities_once(self) -> CoworkerScheduleTickResult:
+        """Check and process at most one due scheduled occurrence for this coworker."""
+
+        responsibility = self._directory._next_due_responsibility(self)
+        if responsibility is None:
+            return CoworkerScheduleTickResult(status="idle")
+        scheduled_for = responsibility.next_fire_at
+        if responsibility.schedule is None or scheduled_for is None:
+            raise CoworkerDirectoryError("due responsibility has no schedule cursor")
+        event_key = _scheduled_event_key(scheduled_for)
+        result = await self._run_offline_turn(
+            run_id=_scheduled_run_id(responsibility.responsibility_id, scheduled_for),
+            prompt=_responsibility_prompt(responsibility),
+            responsibility_id=responsibility.responsibility_id,
+            event_key=event_key,
+            scheduled_for=scheduled_for,
+        )
+        if isinstance(result, CoworkerScheduleTickResult):
+            return result
+        return CoworkerScheduleTickResult(
+            status="completed",
+            responsibility_id=responsibility.responsibility_id,
+            event_key=event_key,
+            turn=result,
         )
 
     async def _run_offline_turn(
@@ -2269,7 +2713,8 @@ class CoworkerHandle:
         prompt: str,
         responsibility_id: str | None = None,
         event_key: str | None = None,
-    ) -> CoworkerTurnResult:
+        scheduled_for: datetime | None = None,
+    ) -> CoworkerTurnResult | CoworkerScheduleTickResult:
         """Run one fixed turn after any responsibility claim has been checked."""
 
         current = self._directory._require_local_coworker_owner(self)
@@ -2354,14 +2799,18 @@ class CoworkerHandle:
                         "coworker run changed before dispatch; refusing replay"
                     )
                 store.update_session_model(session_ref.session_id, WORKER_MODEL)
-                self._directory._claim_offline_turn(
+                claim_result = self._directory._claim_offline_turn(
                     handle=self,
                     run_id=run_id,
                     session_id=session_ref.session_id,
                     request_id=request_id,
                     responsibility_id=responsibility_id,
                     event_key=event_key,
+                    scheduled_for=scheduled_for,
+                    prompt=prompt if scheduled_for is not None else None,
                 )
+                if claim_result is not None:
+                    return claim_result
                 result = await manager._run_supervised_coworker_worker(
                     cwd=environment.working_directory,
                     timeout=_OFFLINE_TURN_TIMEOUT_SECONDS,
@@ -2413,7 +2862,13 @@ class CoworkerHandle:
                 request_id=request_id,
                 response=response,
                 responsibility_id=responsibility_id,
-                trigger_type=("manual" if responsibility_id is not None else None),
+                trigger_type=(
+                    "scheduled"
+                    if scheduled_for is not None
+                    else "manual"
+                    if responsibility_id is not None
+                    else None
+                ),
                 event_key=event_key,
             )
         finally:

@@ -758,3 +758,63 @@ def test_supervised_manual_responsibility_reuses_owner_bound_worker(
             )
         )
     assert len(reopened.list_responsibility_runs(responsibility.responsibility_id)) == 1
+
+
+@pytest.mark.skipif(
+    shutil.which("docker") is None or os.environ.get("ASH_RUN_DOCKER_TESTS") != "1",
+    reason="set ASH_RUN_DOCKER_TESTS=1 on a host with Docker",
+)
+def test_supervised_scheduled_responsibility_dispatches_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from ash.automation.schedules import build_schedule
+    from ash.coworker_worker import WORKER_RESPONSE
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = tmp_path / "ash"
+    (ash_dir / "profiles" / "scheduled").mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="owner-scheduled",
+        display_name="Scheduled",
+        profile_name="scheduled",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    created_at = datetime(2026, 10, 28, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: created_at.isoformat())
+    responsibility = handle.create_responsibility(
+        scope="Synthetic scheduled release health check",
+        objective="Report the synthetic blocking condition.",
+        success_criteria=("Report the blocker",),
+        schedule=build_schedule(
+            at=(created_at + timedelta(minutes=1)).isoformat(),
+            now=created_at,
+        ),
+    )
+    due_at = responsibility.first_fire_at
+    assert due_at == created_at + timedelta(minutes=1)
+    monkeypatch.setattr("ash.coworkers._now", lambda: due_at.isoformat())
+
+    result = asyncio.run(handle.run_due_responsibilities_once())
+
+    assert result.status == "completed"
+    assert result.turn is not None
+    assert result.turn.response == WORKER_RESPONSE
+    assert result.turn.trigger_type == "scheduled"
+    assert result.turn.event_key == f"scheduled:{due_at.isoformat()}"
+    run, = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert run.status == "completed"
+    assert run.trigger_type == "scheduled"
+    assert run.scheduled_for == due_at
+    assert run.session_id == result.turn.session_ref.session_id
+    assert handle.get_responsibility(responsibility.responsibility_id).next_fire_at is None
+    assert asyncio.run(handle.run_due_responsibilities_once()).status == "idle"

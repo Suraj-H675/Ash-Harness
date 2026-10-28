@@ -59,6 +59,71 @@ def _ready_coworker(
     return directory, identity, handle
 
 
+def _install_fake_offline_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    identity: object,
+    *,
+    started: object | None = None,
+    release: object | None = None,
+    result: object | None = None,
+) -> dict[str, int]:
+    from ash.coworker_worker import _run_turn
+    from ash.core.session import SessionStore
+    from ash.sandbox.manager import SandboxResult
+
+    calls = {"dispatches": 0}
+
+    class InProcessOfflineWorker:
+        def __init__(self, **settings: object) -> None:
+            assert settings["network"] is False
+            assert settings["workspace_read_only"] is True
+            assert settings["allow_scoped_fallback"] is False
+            assert settings["docker_image"] == "ash-coworker-worker:latest"
+            self.backend_name = "docker"
+
+        def has_aggregate_resource_limits(self) -> bool:
+            return True
+
+        async def _run_supervised_coworker_worker(
+            self,
+            *,
+            cwd: Path,
+            timeout: int,
+            state_directory: Path,
+        ) -> SandboxResult:
+            calls["dispatches"] += 1
+            assert timeout == 45
+            if started is not None:
+                started.set()  # type: ignore[attr-defined]
+            if release is not None:
+                await release.wait()  # type: ignore[attr-defined]
+            if result is not None:
+                return result  # type: ignore[return-value]
+            request = json.loads((cwd / "request.json").read_text(encoding="utf-8"))
+            worker_store = SessionStore(state_directory / "sessions.db")
+            binding = worker_store._bind_coworker_worker_session(
+                request["session_id"],
+                identity.workspace,  # type: ignore[attr-defined]
+            )
+            response = await _run_turn(
+                request["request_id"],
+                request["session_id"],
+                request["prompt"],
+                session_store=worker_store,
+                binding=binding,
+            )
+            return SandboxResult(
+                exit_code=0,
+                stdout=json.dumps(response),
+                stderr="",
+                tier=3,
+                backend_name="docker",
+            )
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", InProcessOfflineWorker)
+    return calls
+
+
 @pytest.mark.parametrize("existing_api_key", [None, "preexisting-process-key"])
 def test_explicit_profile_load_is_concurrent_and_does_not_publish_dotenv(
     tmp_path: Path,
@@ -391,6 +456,7 @@ def test_responsibility_schedule_binding_is_persisted_and_owner_scoped(
     assert responsibility.schedule is not None
     assert responsibility.schedule.kind == schedule_kind
     assert responsibility.first_fire_at == expected_first_fire
+    assert responsibility.next_fire_at == expected_first_fire
     assert responsibility.misfire_grace_seconds == 900
     assert handle.list_responsibilities() == [responsibility]
     paused = handle.set_responsibility_status(
@@ -477,6 +543,648 @@ def test_responsibility_schedule_revalidation_and_grace_bounds(
         )
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+@pytest.mark.parametrize("schedule_kind", ["at", "every", "cron"])
+def test_due_responsibility_runs_one_persisted_occurrence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schedule_kind: str,
+) -> None:
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    from ash.automation.schedules import build_schedule, next_fire_time
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, identity, handle = _ready_coworker(ash_dir, workspace)
+    created_at = datetime(2026, 3, 28, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: created_at.isoformat())
+    if schedule_kind == "at":
+        schedule = build_schedule(
+            at=(created_at + timedelta(minutes=2)).isoformat(),
+            now=created_at,
+        )
+    elif schedule_kind == "every":
+        schedule = build_schedule(every="10m", now=created_at)
+    else:
+        schedule = build_schedule(
+            cron="30 2 * * sun",
+            timezone_name="Europe/Berlin",
+            now=created_at,
+        )
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=schedule,
+        misfire_grace_seconds=3_600,
+    )
+    first_fire = responsibility.first_fire_at
+    assert first_fire is not None
+    assert responsibility.next_fire_at == first_fire
+    calls = _install_fake_offline_worker(monkeypatch, identity)
+
+    def reject_generic_automation_worker(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError(
+            "scheduled responsibility reached the generic automation worker"
+        )
+
+    monkeypatch.setattr(
+        "ash.automation.worker.AutomationWorkerService",
+        reject_generic_automation_worker,
+    )
+    monkeypatch.setattr("ash.coworkers._now", lambda: first_fire.isoformat())
+
+    result = asyncio.run(handle.run_due_responsibilities_once())
+
+    assert result.status == "completed"
+    assert result.responsibility_id == responsibility.responsibility_id
+    assert result.turn is not None
+    assert result.turn.trigger_type == "scheduled"
+    assert result.turn.event_key == f"scheduled:{first_fire.isoformat()}"
+    assert calls["dispatches"] == 1
+    run, = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert run.trigger_type == "scheduled"
+    assert run.status == "completed"
+    assert run.scheduled_for == first_fire
+    assert run.event_key == result.turn.event_key
+    assert run.session_id == result.turn.session_ref.session_id
+    expected_next = (
+        None
+        if schedule_kind == "at"
+        else next_fire_time(schedule, previous=first_fire, now=first_fire)
+    )
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert reopened.get_responsibility(
+        responsibility.responsibility_id
+    ).next_fire_at == expected_next
+    assert asyncio.run(reopened.run_due_responsibilities_once()).status == "idle"
+    assert calls["dispatches"] == 1
+
+
+def test_schedule_tick_result_rejects_inconsistent_status_fields() -> None:
+    from ash.coworkers import CoworkerScheduleTickResult
+
+    with pytest.raises(ValueError, match="idle schedule result"):
+        CoworkerScheduleTickResult(status="idle", event_key="scheduled:bad")
+    with pytest.raises(ValueError, match="skipped schedule result"):
+        CoworkerScheduleTickResult(
+            status="skipped",
+            responsibility_id="responsibility",
+            event_key="scheduled:bad",
+        )
+    with pytest.raises(ValueError, match="completed schedule result"):
+        CoworkerScheduleTickResult(status="completed")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+def test_due_responsibility_keeps_both_fall_back_instants_distinct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from datetime import datetime, timezone
+
+    from ash.automation.schedules import build_schedule
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, identity, handle = _ready_coworker(ash_dir, workspace)
+    clock = [datetime(2026, 10, 24, 12, tzinfo=timezone.utc)]
+    monkeypatch.setattr("ash.coworkers._now", lambda: clock[0].isoformat())
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=build_schedule(
+            cron="30 2 * * sun",
+            timezone_name="Europe/Berlin",
+            now=clock[0],
+        ),
+    )
+    first_fold = datetime(2026, 10, 25, 0, 30, tzinfo=timezone.utc)
+    second_fold = datetime(2026, 10, 25, 1, 30, tzinfo=timezone.utc)
+    assert responsibility.first_fire_at == first_fold
+    calls = _install_fake_offline_worker(monkeypatch, identity)
+
+    clock[0] = first_fold
+    first = asyncio.run(handle.run_due_responsibilities_once())
+    assert first.status == "completed"
+    assert first.event_key == f"scheduled:{first_fold.isoformat()}"
+    assert handle.get_responsibility(responsibility.responsibility_id).next_fire_at == second_fold
+
+    clock[0] = second_fold
+    second = asyncio.run(handle.run_due_responsibilities_once())
+    assert second.status == "completed"
+    assert second.event_key == f"scheduled:{second_fold.isoformat()}"
+    runs = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert {run.scheduled_for for run in runs} == {first_fold, second_fold}
+    assert {run.event_key for run in runs} == {first.event_key, second.event_key}
+    assert calls["dispatches"] == 2
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+@pytest.mark.parametrize(
+    ("delay_seconds", "expected_status"),
+    [(20, "completed"), (21, "skipped")],
+)
+def test_due_responsibility_applies_inclusive_grace_and_coalesces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delay_seconds: int,
+    expected_status: str,
+) -> None:
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    from ash.automation.schedules import build_schedule, next_fire_time
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, identity, handle = _ready_coworker(ash_dir, workspace)
+    created_at = datetime(2026, 6, 1, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: created_at.isoformat())
+    schedule = build_schedule(every="10s", now=created_at)
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=schedule,
+        misfire_grace_seconds=20,
+    )
+    first_fire = responsibility.first_fire_at
+    assert first_fire is not None
+    now = first_fire + timedelta(seconds=delay_seconds)
+    monkeypatch.setattr("ash.coworkers._now", lambda: now.isoformat())
+    calls = _install_fake_offline_worker(monkeypatch, identity)
+
+    result = asyncio.run(handle.run_due_responsibilities_once())
+
+    assert result.status == expected_status
+    assert calls["dispatches"] == (1 if expected_status == "completed" else 0)
+    run, = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert run.status == expected_status
+    assert run.scheduled_for == first_fire
+    assert run.event_key == f"scheduled:{first_fire.isoformat()}"
+    assert run.skip_reason == (
+        None if expected_status == "completed" else "misfire_grace_expired"
+    )
+    assert run.session_id is not None if expected_status == "completed" else run.session_id is None
+    expected_next = next_fire_time(schedule, previous=first_fire, now=now)
+    assert handle.get_responsibility(
+        responsibility.responsibility_id
+    ).next_fire_at == expected_next
+    assert asyncio.run(handle.run_due_responsibilities_once()).status == "idle"
+    assert calls["dispatches"] == (1 if expected_status == "completed" else 0)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+@pytest.mark.parametrize("uid_state", ["missing", "foreign"])
+def test_due_responsibility_requires_current_owner_uid_and_coworker_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    uid_state: str,
+) -> None:
+    import asyncio
+    from datetime import datetime, timezone
+
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import CoworkerRuntimeUnavailable
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, identity, handle = _ready_coworker(ash_dir, workspace)
+    _, _, foreign_handle = _ready_coworker(
+        ash_dir,
+        workspace,
+        profile_name="foreign-worker",
+    )
+    created_at = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: created_at.isoformat())
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=build_schedule(every="10m", now=created_at),
+    )
+    due_at = responsibility.first_fire_at
+    assert due_at is not None
+    monkeypatch.setattr("ash.coworkers._now", lambda: due_at.isoformat())
+    calls = _install_fake_offline_worker(monkeypatch, identity)
+
+    assert asyncio.run(foreign_handle.run_due_responsibilities_once()).status == "idle"
+    monkeypatch.setattr(
+        "ash.coworkers._current_owner_uid",
+        lambda: None if uid_state == "missing" else identity.owner_uid + 1,
+    )
+    with pytest.raises(CoworkerRuntimeUnavailable, match="owner identity"):
+        asyncio.run(handle.run_due_responsibilities_once())
+
+    monkeypatch.setattr("ash.coworkers._current_owner_uid", lambda: identity.owner_uid)
+    assert calls["dispatches"] == 0
+    assert handle.list_responsibility_runs(responsibility.responsibility_id) == []
+    assert handle.get_responsibility(responsibility.responsibility_id).next_fire_at == due_at
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+def test_due_responsibility_two_processes_admit_one_occurrence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from ash.automation.schedules import build_schedule
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    created_at = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: created_at.isoformat())
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=build_schedule(every="10m", now=created_at),
+    )
+    due_at = responsibility.first_fire_at
+    assert due_at is not None
+    marker = tmp_path / "worker-dispatches.txt"
+    barrier_dir = tmp_path / "selected-occurrences"
+    barrier_dir.mkdir()
+    isolated_home = ash_dir.parent
+    child_environment = {
+        "PATH": os.defpath,
+        "HOME": str(isolated_home),
+        "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+        "XDG_DATA_HOME": str(isolated_home / ".local" / "share"),
+        "XDG_CACHE_HOME": str(isolated_home / ".cache"),
+        "XDG_STATE_HOME": str(isolated_home / ".local" / "state"),
+        "TMPDIR": str(tmp_path),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+    }
+    child_source = r"""
+import asyncio
+import os
+import sys
+import time
+from pathlib import Path
+import ash.coworkers as coworkers
+from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
+from ash.sandbox.manager import SandboxResult
+from ash.core.session import SessionStorageError
+
+due_at, marker_path, owner_id, coworker_id, barrier_path = sys.argv[1:6]
+responsibility_id = sys.argv[6]
+original_now = coworkers._now
+def frozen_now():
+    return due_at
+coworkers._now = frozen_now
+real_next_due = CoworkerDirectory._next_due_responsibility
+def synchronized_next_due(directory, handle):
+    item = real_next_due(directory, handle)
+    if item is not None:
+        Path(barrier_path, str(os.getpid())).touch()
+        deadline = time.monotonic() + 5
+        while len(list(Path(barrier_path).iterdir())) < 2:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("the competing occurrence selectors did not rendezvous")
+            time.sleep(0.01)
+    return item
+CoworkerDirectory._next_due_responsibility = synchronized_next_due
+
+class CompetingWorker:
+    def __init__(self, **_settings):
+        self.backend_name = "docker"
+    def has_aggregate_resource_limits(self):
+        return True
+    async def _run_supervised_coworker_worker(self, **_settings):
+        with open(marker_path, "a", encoding="utf-8") as stream:
+            stream.write("dispatch\n")
+        await asyncio.sleep(0.15)
+        return SandboxResult(
+            exit_code=-1, stdout="", stderr="", tier=3,
+            backend_name="docker", outcome_unknown=True,
+        )
+
+async def main():
+    coworkers.SandboxManager = CompetingWorker
+    handle = CoworkerDirectory.open().open_coworker(
+        owner_id=owner_id, coworker_id=coworker_id,
+    )
+    try:
+        result = await handle.run_due_responsibilities_once()
+        print(result.status)
+    except CoworkerRuntimeUnavailable as error:
+        if "known result" in str(error).casefold():
+            print("unknown")
+        elif not any(
+            text in str(error).casefold()
+            for text in ("lease", "claimed", "binding changed")
+        ):
+            raise
+        else:
+            print("contended")
+    except SessionStorageError:
+        print("contended")
+
+asyncio.run(main())
+"""
+    command = [
+        sys.executable,
+        "-c",
+        child_source,
+        due_at.isoformat(),
+        str(marker),
+        identity.owner_id,
+        identity.coworker_id,
+        str(barrier_dir),
+        responsibility.responsibility_id,
+    ]
+    processes = [
+        subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=child_environment,
+        )
+        for _ in range(2)
+    ]
+    try:
+        outputs = [process.communicate(timeout=15) for process in processes]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+        for process in processes:
+            process.communicate(timeout=5)
+
+    assert all(process.returncode == 0 for process in processes), outputs
+    assert sorted(stdout.strip() for stdout, _stderr in outputs) == [
+        "contended",
+        "unknown",
+    ]
+    assert len(list(barrier_dir.iterdir())) == 2
+    assert marker.read_text(encoding="utf-8").splitlines() == ["dispatch"]
+    runs = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert len(runs) == 1
+    assert runs[0].status == "claimed"
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall() == []
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+def test_pause_before_scheduled_claim_leaves_occurrence_due(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from datetime import datetime, timezone
+
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import CoworkerRuntimeUnavailable
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, _, handle = _ready_coworker(ash_dir, workspace)
+    now = datetime(2026, 7, 1, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: now.isoformat())
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=build_schedule(every="10m", now=now),
+    )
+    due_at = responsibility.first_fire_at
+    assert due_at is not None
+    monkeypatch.setattr("ash.coworkers._now", lambda: due_at.isoformat())
+    dispatches = 0
+
+    class PauseBeforeClaim:
+        def __init__(self, **_settings: object) -> None:
+            handle.set_responsibility_status(
+                responsibility.responsibility_id,
+                "paused",
+            )
+            self.backend_name = "docker"
+
+        def has_aggregate_resource_limits(self) -> bool:
+            return True
+
+        async def _run_supervised_coworker_worker(self, **_settings: object) -> object:
+            nonlocal dispatches
+            dispatches += 1
+            raise AssertionError("paused occurrence reached worker dispatch")
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", PauseBeforeClaim)
+    with pytest.raises(CoworkerRuntimeUnavailable, match="not active"):
+        asyncio.run(handle.run_due_responsibilities_once())
+
+    assert dispatches == 0
+    assert handle.list_responsibility_runs(responsibility.responsibility_id) == []
+    paused = handle.get_responsibility(responsibility.responsibility_id)
+    assert paused.status == "paused"
+    assert paused.next_fire_at == due_at
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+def test_scheduled_claim_rejects_a_caller_selected_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from datetime import datetime, timezone
+
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import (
+        CoworkerRuntimeUnavailable,
+        _scheduled_event_key,
+        _scheduled_run_id,
+    )
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, _, handle = _ready_coworker(ash_dir, workspace)
+    created_at = datetime(2026, 7, 2, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: created_at.isoformat())
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=build_schedule(every="10m", now=created_at),
+    )
+    due_at = responsibility.first_fire_at
+    assert due_at is not None
+    monkeypatch.setattr("ash.coworkers._now", lambda: due_at.isoformat())
+    calls = _install_fake_offline_worker(monkeypatch, handle.identity)
+
+    with pytest.raises(CoworkerRuntimeUnavailable, match="prompt does not match"):
+        asyncio.run(
+            handle._run_offline_turn(
+                run_id=_scheduled_run_id(responsibility.responsibility_id, due_at),
+                prompt="Run arbitrary caller supplied instructions.",
+                responsibility_id=responsibility.responsibility_id,
+                event_key=_scheduled_event_key(due_at),
+                scheduled_for=due_at,
+            )
+        )
+
+    assert calls["dispatches"] == 0
+    assert handle.list_responsibility_runs(responsibility.responsibility_id) == []
+    assert handle.get_responsibility(responsibility.responsibility_id).next_fire_at == due_at
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+def test_pause_and_second_same_loop_tick_are_responsive_after_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import time
+    from datetime import datetime, timezone
+
+    from ash.automation.schedules import build_schedule
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, _, handle = _ready_coworker(ash_dir, workspace)
+    created_at = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: created_at.isoformat())
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=build_schedule(every="10m", now=created_at),
+    )
+    due_at = responsibility.first_fire_at
+    assert due_at is not None
+    monkeypatch.setattr("ash.coworkers._now", lambda: due_at.isoformat())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = _install_fake_offline_worker(
+        monkeypatch,
+        handle.identity,
+        started=started,
+        release=release,
+    )
+
+    async def run_ticks() -> None:
+        first = asyncio.create_task(handle.run_due_responsibilities_once())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        run, = handle.list_responsibility_runs(responsibility.responsibility_id)
+        assert run.status == "claimed"
+        assert run.session_id is not None
+        second = await asyncio.wait_for(handle.run_due_responsibilities_once(), timeout=0.5)
+        assert second.status == "idle"
+        started_at = time.monotonic()
+        handle.set_responsibility_status(responsibility.responsibility_id, "paused")
+        assert time.monotonic() - started_at < 0.5
+        assert handle.list_responsibility_runs(responsibility.responsibility_id)[0].status == "claimed"
+        release.set()
+        completed = await first
+        assert completed.status == "completed"
+
+    asyncio.run(run_ticks())
+    assert calls["dispatches"] == 1
+    assert handle.list_responsibility_runs(responsibility.responsibility_id)[0].status == "completed"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+@pytest.mark.parametrize("outcome", ["cancelled", "timeout", "unknown"])
+def test_scheduled_ambiguous_outcome_stays_claimed_and_is_not_replayed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    import asyncio
+    from datetime import datetime, timezone
+
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
+    from ash.sandbox.manager import SandboxResult
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, identity, handle = _ready_coworker(ash_dir, workspace)
+    created_at = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: created_at.isoformat())
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=build_schedule(every="10m", now=created_at),
+    )
+    due_at = responsibility.first_fire_at
+    assert due_at is not None
+    monkeypatch.setattr("ash.coworkers._now", lambda: due_at.isoformat())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    if outcome == "timeout":
+        forced_result = SandboxResult(
+            exit_code=-1,
+            stdout="",
+            stderr="",
+            tier=3,
+            backend_name="docker",
+            timed_out=True,
+        )
+    elif outcome == "unknown":
+        forced_result = SandboxResult(
+            exit_code=-1,
+            stdout="",
+            stderr="",
+            tier=3,
+            backend_name="docker",
+            outcome_unknown=True,
+        )
+    else:
+        forced_result = None
+    calls = _install_fake_offline_worker(
+        monkeypatch,
+        identity,
+        started=started,
+        release=release,
+        result=forced_result,
+    )
+
+    async def run_ambiguous_turn() -> None:
+        task = asyncio.create_task(handle.run_due_responsibilities_once())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        if outcome == "cancelled":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            release.set()
+            with pytest.raises(CoworkerRuntimeUnavailable, match="known result"):
+                await task
+
+    asyncio.run(run_ambiguous_turn())
+
+    run, = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert run.status == "claimed"
+    assert run.completed_at is None
+    assert handle.get_responsibility(responsibility.responsibility_id).next_fire_at is not None
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    persisted_run, = reopened.list_responsibility_runs(responsibility.responsibility_id)
+    assert persisted_run.status == "claimed"
+    assert asyncio.run(reopened.run_due_responsibilities_once()).status == "idle"
+    assert calls["dispatches"] == 1
+
+
 def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -526,13 +1234,154 @@ def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (5,)
+        ).fetchone() == (6,)
         assert connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall() == []
         assert connection.execute(
             "SELECT COUNT(*) FROM coworker_responsibility_schedules"
         ).fetchone() == (0,)
+
+
+def test_v5_coworker_directory_migration_adds_cursor_and_preserves_dispatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    now = datetime(2026, 10, 3, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: now.isoformat())
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the release checklist.",
+        schedule=build_schedule(every="30m", now=now),
+    )
+    assert responsibility.first_fire_at is not None
+    run_id = str(uuid4())
+    session_id = str(uuid4())
+    request_id = str(uuid4())
+
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "INSERT INTO coworker_turn_dispatches ("
+            "owner_id, coworker_id, run_id, session_id, request_id, status, "
+            "responsibility_id, trigger_type, event_key, created_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, 'completed', ?, 'manual', 'legacy-event', ?, ?)",
+            (
+                identity.owner_id,
+                identity.coworker_id,
+                run_id,
+                session_id,
+                request_id,
+                responsibility.responsibility_id,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        connection.execute(
+            "DROP INDEX idx_coworker_turn_dispatches_responsibility_event"
+        )
+        connection.execute(
+            "ALTER TABLE coworker_turn_dispatches "
+            "RENAME TO coworker_turn_dispatches_v6"
+        )
+        connection.execute(
+            """
+            CREATE TABLE coworker_turn_dispatches (
+                owner_id TEXT NOT NULL,
+                coworker_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                request_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('claimed', 'completed')),
+                responsibility_id TEXT REFERENCES
+                    coworker_responsibilities(responsibility_id),
+                trigger_type TEXT CHECK(trigger_type IS NULL OR
+                    trigger_type IN ('manual')),
+                event_key TEXT CHECK(event_key IS NULL OR
+                    length(event_key) BETWEEN 1 AND 128),
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY(owner_id, coworker_id, run_id)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO coworker_turn_dispatches ("
+            "owner_id, coworker_id, run_id, session_id, request_id, status, "
+            "responsibility_id, trigger_type, event_key, created_at, completed_at) "
+            "SELECT owner_id, coworker_id, run_id, session_id, request_id, status, "
+            "responsibility_id, trigger_type, event_key, created_at, completed_at "
+            "FROM coworker_turn_dispatches_v6"
+        )
+        connection.execute("DROP TABLE coworker_turn_dispatches_v6")
+        connection.execute(
+            "ALTER TABLE coworker_responsibility_schedules "
+            "RENAME TO coworker_responsibility_schedules_v6"
+        )
+        connection.execute(
+            """
+            CREATE TABLE coworker_responsibility_schedules (
+                owner_id TEXT NOT NULL,
+                owner_uid INTEGER NOT NULL,
+                coworker_id TEXT NOT NULL,
+                responsibility_id TEXT NOT NULL,
+                schedule_kind TEXT NOT NULL CHECK(schedule_kind IN ('at','every','cron')),
+                schedule_value TEXT NOT NULL,
+                schedule_timezone TEXT NOT NULL,
+                schedule_anchor_at TEXT,
+                first_fire_at TEXT NOT NULL,
+                misfire_grace_seconds INTEGER NOT NULL
+                    CHECK(misfire_grace_seconds BETWEEN 0 AND 2592000),
+                PRIMARY KEY(owner_id, coworker_id, responsibility_id),
+                FOREIGN KEY(owner_id, coworker_id, responsibility_id)
+                    REFERENCES coworker_responsibilities(
+                        owner_id, coworker_id, responsibility_id
+                    )
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO coworker_responsibility_schedules ("
+            "owner_id, owner_uid, coworker_id, responsibility_id, schedule_kind, "
+            "schedule_value, schedule_timezone, schedule_anchor_at, first_fire_at, "
+            "misfire_grace_seconds) SELECT owner_id, owner_uid, coworker_id, "
+            "responsibility_id, schedule_kind, schedule_value, schedule_timezone, "
+            "schedule_anchor_at, first_fire_at, misfire_grace_seconds "
+            "FROM coworker_responsibility_schedules_v6"
+        )
+        connection.execute("DROP TABLE coworker_responsibility_schedules_v6")
+        connection.execute(
+            "UPDATE coworker_directory_meta SET schema_version = 5"
+        )
+
+    migrated = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    persisted = migrated.get_responsibility(responsibility.responsibility_id)
+    assert persisted.first_fire_at == responsibility.first_fire_at
+    assert persisted.next_fire_at == responsibility.first_fire_at
+    run, = migrated.list_responsibility_runs(responsibility.responsibility_id)
+    assert run.run_id == run_id
+    assert run.session_id == session_id
+    assert run.request_id == request_id
+    assert run.status == "completed"
+    assert run.trigger_type == "manual"
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (6,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 
@@ -1314,7 +2163,7 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (5,)
+        ).fetchone() == (6,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
@@ -1397,7 +2246,7 @@ def test_coworker_directory_v3_migration_preserves_dispatch_history(
     with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (5,)
+        ).fetchone() == (6,)
         columns = {
             str(row[1])
             for row in connection.execute(
