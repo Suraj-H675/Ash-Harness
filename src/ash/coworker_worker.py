@@ -119,7 +119,7 @@ async def _run_turn(
             "session_retention_days": 0,
         }
     )
-    client = await AshClient._create_coworker_worker(
+    client = await AshClient._create_coworker_turn(
         config=config,
         provider=_OfflineCoworkerProvider(),
         session_id=session_id,

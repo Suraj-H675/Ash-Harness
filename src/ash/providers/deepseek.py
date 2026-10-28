@@ -97,7 +97,11 @@ class DeepSeekProvider(ProviderABC):
                 api_key=self._api_key,
                 base_url=self._base_url,
                 max_retries=0,
-                http_client=_owned_openai_http_client(),
+                http_client=_owned_openai_http_client(
+                    trust_env=not getattr(
+                        self, "_ash_disable_ambient_transport", False
+                    )
+                ),
             )
         return self._client
 

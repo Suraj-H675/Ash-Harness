@@ -617,8 +617,12 @@ def test_ash_owned_sdk_clients_disable_nested_retries(monkeypatch) -> None:
     assert len(openai_calls) == 3
     assert all(call["max_retries"] == 0 for call in openai_calls)
     assert all("http_client" in call for call in openai_calls)
-    assert openai_http_calls == [{"follow_redirects": False}] * 3
-    assert anthropic_http_calls == [{"follow_redirects": False}]
+    assert openai_http_calls == [
+        {"follow_redirects": False, "trust_env": True}
+    ] * 3
+    assert anthropic_http_calls == [
+        {"follow_redirects": False, "trust_env": True}
+    ]
     assert len(anthropic_calls) == 1
     assert anthropic_calls[0]["max_retries"] == 0
     assert anthropic_calls[0]["api_key"] == "key"
@@ -642,9 +646,13 @@ def test_ollama_owned_http_client_is_lazy(monkeypatch: pytest.MonkeyPatch) -> No
     assert calls == []
     assert provider._client is None
     assert provider._resolve_client() is client
-    assert calls == [{"timeout": 60.0}]
+    assert calls == [
+        {"timeout": 60.0, "trust_env": True, "follow_redirects": False}
+    ]
     assert provider._resolve_client() is client
-    assert calls == [{"timeout": 60.0}]
+    assert calls == [
+        {"timeout": 60.0, "trust_env": True, "follow_redirects": False}
+    ]
 
 
 def test_openai_message_translation_preserves_tool_call_ids():
@@ -2401,7 +2409,7 @@ async def test_anthropic_default_endpoint_preserves_sdk_api_key_fallback(
     ]
 
     assert "".join(chunk.content for chunk in chunks) == "hello"
-    assert http_calls == [{"follow_redirects": False}]
+    assert http_calls == [{"follow_redirects": False, "trust_env": True}]
     assert len(sdk_calls) == 1
     assert sdk_calls[0]["max_retries"] == 0
     assert sdk_calls[0]["http_client"].kind == "anthropic-http"

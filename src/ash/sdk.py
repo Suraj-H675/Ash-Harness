@@ -276,7 +276,7 @@ class AshClient:
         return await cls._client_from_runtime(runtime, runtime_config, session_id)
 
     @classmethod
-    async def _create_coworker_worker(
+    async def _create_coworker_turn(
         cls,
         *,
         config: AshConfig,
@@ -285,7 +285,7 @@ class AshClient:
         session_store: SessionStore,
         binding: CoworkerWorkerSessionBinding,
     ) -> "AshClient":
-        """Create the fixed turn-only runtime for one persisted worker session."""
+        """Create a no-tools TURN_ONLY runtime for one bound coworker session."""
 
         if session_id != binding.session_id:
             raise ValueError("coworker worker session ID does not match its binding")
@@ -293,15 +293,25 @@ class AshClient:
             binding.runtime_project_root
         ):
             raise ValueError("runtime workspace does not match coworker worker binding")
-        runtime = build_runtime(
-            config,
-            ui=HeadlessUI(output_format="text", stream=io.StringIO()),
-            provider=provider,
-            session_store=session_store,
-            run_maintenance=False,
-            runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
-            _coworker_worker_binding=binding,
-        )
+        try:
+            runtime = build_runtime(
+                config,
+                ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+                provider=provider,
+                session_store=session_store,
+                run_maintenance=False,
+                runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+                _coworker_worker_binding=binding,
+            )
+        except BaseException as primary_error:
+            try:
+                await provider.aclose()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    "coworker provider cleanup failed "
+                    f"({type(cleanup_error).__name__})"
+                )
+            raise
         return await cls._client_from_runtime(runtime, config, session_id)
 
     @classmethod

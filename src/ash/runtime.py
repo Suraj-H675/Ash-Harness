@@ -572,10 +572,15 @@ def build_runtime(
 ) -> RuntimeComponents:
     """Assemble the standard or explicit turn-only Ash runtime."""
 
-    config._require_runtime_available()
-    require_supported_native_platform()
     if not isinstance(runtime_capability_profile, RuntimeCapabilityProfile):
         raise TypeError("runtime_capability_profile must be a RuntimeCapabilityProfile")
+    if not (
+        config._coworker_runtime_blocked
+        and runtime_capability_profile is RuntimeCapabilityProfile.TURN_ONLY
+        and isinstance(_coworker_worker_binding, CoworkerWorkerSessionBinding)
+    ):
+        config._require_runtime_available()
+    require_supported_native_platform()
     if (
         _coworker_worker_binding is not None
         and runtime_capability_profile is not RuntimeCapabilityProfile.TURN_ONLY

@@ -19,7 +19,11 @@ from ash.providers.base import (
 )
 from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
 from ash.providers.openai import _owned_openai_http_client
-from ash.providers.readiness import redact_provider_error
+from ash.providers.readiness import (
+    normalize_provider_base_url,
+    redact_provider_error,
+    require_secure_provider_transport,
+)
 from ash.safe_io import strict_json_loads
 
 
@@ -299,13 +303,18 @@ class OpenAIResponsesProvider(ProviderABC):
         model_name: str,
         api_key: str,
         *,
+        base_url: str | None = None,
         token_counter: TokenCounterLike | None = None,
         client: Any | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("OpenAI API key is required")
+        if base_url:
+            base_url = normalize_provider_base_url(base_url, provider="openai")
+            require_secure_provider_transport(base_url, provider="openai")
         self._model_name = model_name
         self._api_key = api_key
+        self._base_url = base_url
         self._token_counter = token_counter or OpenAITokenCounter(model_name)
         self._client = client
         self._owns_client = client is None
@@ -325,8 +334,13 @@ class OpenAIResponsesProvider(ProviderABC):
         if self._client is None:
             self._client = openai.AsyncOpenAI(
                 api_key=self._api_key,
+                base_url=self._base_url,
                 max_retries=0,
-                http_client=_owned_openai_http_client(),
+                http_client=_owned_openai_http_client(
+                    trust_env=not getattr(
+                        self, "_ash_disable_ambient_transport", False
+                    )
+                ),
             )
         return self._client
 

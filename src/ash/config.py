@@ -415,6 +415,8 @@ class _BoundedTomlConfigSettingsSource(TomlConfigSettingsSource):
 class _BoundedDotEnvSettingsSource(DotEnvSettingsSource):
     """Pydantic dotenv source that parses a bounded in-memory snapshot."""
 
+    _raw_file_values: Mapping[str, str | None] = {}
+
     def _read_env_file(
         self,
         file_path: Path,
@@ -426,11 +428,21 @@ class _BoundedDotEnvSettingsSource(DotEnvSettingsSource):
         )
         encoding = self.env_file_encoding or "utf-8"
         file_vars = dotenv_values(stream=io.StringIO(raw.decode(encoding)))
-        return {
+        raw_file_vars = dotenv_values(
+            stream=io.StringIO(raw.decode(encoding)),
+            interpolate=False,
+        )
+        values = {
             key if self.case_sensitive else key.lower(): value
             for key, value in file_vars.items()
             if not (self.env_ignore_empty and value == "")
         }
+        self._raw_file_values = {
+            key if self.case_sensitive else key.lower(): value
+            for key, value in raw_file_vars.items()
+            if not (self.env_ignore_empty and value == "")
+        }
+        return values
 
 
 def _filter_project_config(
@@ -495,6 +507,9 @@ class AshConfig(BaseSettings):
     _config_sources: dict[str, tuple[str, str]] = PrivateAttr(default_factory=dict)
     _config_diagnostics: list[str] = PrivateAttr(default_factory=list)
     _coworker_runtime_blocked: bool = PrivateAttr(default=False)
+    _coworker_provider_environment: dict[str, str] = PrivateAttr(
+        default_factory=dict
+    )
 
     model: str = Field(
         "anthropic/claude-sonnet-5-5",
@@ -2024,7 +2039,22 @@ class AshConfig(BaseSettings):
                 profile_state_directory / ".env",
             )
 
-        raw_dotenv_values = _BoundedDotEnvSettingsSource(cls, env_file=dotenv_path)()
+        dotenv_source = _BoundedDotEnvSettingsSource(cls, env_file=dotenv_path)
+        raw_dotenv_values = dotenv_source()
+        raw_profile_dotenv_values = dotenv_source._raw_file_values
+        if _validation_only:
+            # A profile's effective Ash settings must not import values from
+            # parent-process dotenv interpolation. Provider-specific raw
+            # credential variables are checked separately at provider admission.
+            if any(
+                isinstance(value, str) and "${" in value
+                for key, value in raw_profile_dotenv_values.items()
+                if key.casefold().startswith("ash_")
+                or key.casefold() in cls.model_fields
+            ):
+                raise ValueError(
+                    "coworker profile Ash settings cannot use dotenv interpolation"
+                )
         dotenv_values = _known_settings_values(cls, raw_dotenv_values)
         user_values = _known_settings_values(
             cls,
@@ -2216,6 +2246,19 @@ class AshConfig(BaseSettings):
         config._config_diagnostics = diagnostics
         config._record_derived_sources()
         config._coworker_runtime_blocked = _validation_only
+        if _validation_only:
+            from ash.providers.readiness import provider_runtime_environment
+
+            profile_dotenv_values = {
+                key.upper(): value
+                for key, value in raw_profile_dotenv_values.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+            config._coworker_provider_environment = provider_runtime_environment(
+                config,
+                profile_dotenv_values,
+                include_fallbacks=False,
+            )
         return config
 
     def _require_runtime_available(self) -> None:

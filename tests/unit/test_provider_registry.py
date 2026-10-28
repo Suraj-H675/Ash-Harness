@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import httpx
@@ -158,6 +160,365 @@ def test_default_registry_exposes_builtins_without_constructing_them() -> None:
         "vllm",
         "xai",
     )
+
+
+def test_coworker_provider_uses_only_explicit_profile_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.openai import OpenAIProvider
+
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-key-must-not-be-used")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://ambient.example/v1")
+    ash_dir = tmp_path / ".ash"
+    profile_dir = ash_dir / "profiles" / "crew"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "ash.toml").write_text(
+        "model = 'openai/gpt-test'\nopenai_auth_mode = 'api_key'\n",
+        encoding="utf-8",
+    )
+    (profile_dir / ".env").write_text(
+        "OPENAI_API_KEY=selected-profile-key\n"
+        "OPENAI_API_BASE=https://profile.example/v1\n",
+        encoding="utf-8",
+    )
+    config = AshConfig._load_for_profile(
+        "crew",
+        ash_dir=ash_dir,
+        workspace_root=tmp_path,
+    )
+
+    provider = create_default_provider_registry().build_for_coworker(
+        config,
+    )
+
+    assert isinstance(provider, OpenAIProvider)
+    assert provider._api_key == "selected-profile-key"
+    assert provider._base_url == "https://profile.example/v1"
+    assert provider._client_options["api_key"] == "selected-profile-key"
+    assert os.environ["OPENAI_API_KEY"] == "ambient-key-must-not-be-used"
+    assert "selected-profile-key" not in repr(config)
+    assert "selected-profile-key" not in str(config.model_dump())
+
+
+def test_coworker_provider_profiles_do_not_cross_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.openai import OpenAIProvider
+
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-key")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://ambient.example/v1")
+    ash_dir = tmp_path / ".ash"
+    configs: list[AshConfig] = []
+    for profile_name, key, base_url in (
+        ("atlas", "atlas-profile-key", "https://atlas.example/v1"),
+        ("scout", "scout-profile-key", "https://scout.example/v1"),
+    ):
+        profile_dir = ash_dir / "profiles" / profile_name
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "ash.toml").write_text(
+            "model = 'openai/gpt-test'\nopenai_auth_mode = 'api_key'\n",
+            encoding="utf-8",
+        )
+        (profile_dir / ".env").write_text(
+            f"OPENAI_API_KEY={key}\nOPENAI_API_BASE={base_url}\n",
+            encoding="utf-8",
+        )
+        configs.append(
+            AshConfig._load_for_profile(
+                profile_name,
+                ash_dir=ash_dir,
+                workspace_root=tmp_path,
+            )
+        )
+
+    registry = create_default_provider_registry()
+    providers = [registry.build_for_coworker(config) for config in configs]
+
+    assert all(isinstance(provider, OpenAIProvider) for provider in providers)
+    assert [provider._api_key for provider in providers] == [
+        "atlas-profile-key",
+        "scout-profile-key",
+    ]
+    assert [provider._base_url for provider in providers] == [
+        "https://atlas.example/v1",
+        "https://scout.example/v1",
+    ]
+    assert all(provider._api_key != "ambient-key" for provider in providers)
+
+
+def test_coworker_provider_rejects_ambient_key_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.readiness import ProviderConfigurationError
+
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-key-must-not-be-used")
+    ash_dir = tmp_path / ".ash"
+    profile_dir = ash_dir / "profiles" / "crew"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "ash.toml").write_text(
+        "model = 'openai/gpt-test'\nopenai_auth_mode = 'api_key'\n",
+        encoding="utf-8",
+    )
+    config = AshConfig._load_for_profile(
+        "crew",
+        ash_dir=ash_dir,
+        workspace_root=tmp_path,
+    )
+
+    with pytest.raises(ProviderConfigurationError, match="OPENAI_API_KEY"):
+        create_default_provider_registry().build_for_coworker(config)
+
+
+def test_coworker_provider_does_not_expand_profile_key_from_process_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AMBIENT_TEST_KEY", "ambient-synthetic-key")
+    ash_dir = tmp_path / ".ash"
+    profile_dir = ash_dir / "profiles" / "crew"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "ash.toml").write_text(
+        "model = 'openai/gpt-test'\nopenai_auth_mode = 'api_key'\n",
+        encoding="utf-8",
+    )
+    (profile_dir / ".env").write_text(
+        "OPENAI_API_KEY=${AMBIENT_TEST_KEY}\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="coworker profile Ash settings"):
+        AshConfig._load_for_profile(
+            "crew",
+            ash_dir=ash_dir,
+            workspace_root=tmp_path,
+        )
+    assert os.environ["AMBIENT_TEST_KEY"] == "ambient-synthetic-key"
+
+
+@pytest.mark.asyncio
+async def test_coworker_anthropic_adapter_ignores_ambient_sdk_route_and_headers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-api-key")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ambient.example/v1")
+    monkeypatch.setenv(
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "Authorization: Bearer ambient-header-secret\n"
+        "X-Ambient-Secret: ambient-header-secret",
+    )
+    ash_dir = tmp_path / ".ash"
+    profile_dir = ash_dir / "profiles" / "crew"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "ash.toml").write_text(
+        "model = 'anthropic/claude-sonnet-5-5'\n",
+        encoding="utf-8",
+    )
+    (profile_dir / ".env").write_text(
+        "ANTHROPIC_API_KEY=selected-profile-key\n", encoding="utf-8"
+    )
+    config = AshConfig._load_for_profile(
+        "crew",
+        ash_dir=ash_dir,
+        workspace_root=tmp_path,
+    )
+
+    from ash.providers.anthropic import AnthropicProvider
+
+    provider = create_default_provider_registry().build_for_coworker(config)
+    assert isinstance(provider, AnthropicProvider)
+    sdk_client = provider._resolve_client()
+    http_client = sdk_client._client
+    assert str(sdk_client.base_url).rstrip("/") == "https://api.anthropic.com"
+
+    from anthropic._models import FinalRequestOptions
+
+    request = sdk_client._build_request(
+        FinalRequestOptions(method="POST", url="/v1/messages", json_data={})
+    )
+    assert request.headers["Authorization"] == "Bearer ambient-header-secret"
+    for hook in http_client._event_hooks["request"]:
+        await hook(request)
+
+    assert "Authorization" not in request.headers
+    assert "X-Ambient-Secret" not in request.headers
+    assert request.headers["x-api-key"] == "selected-profile-key"
+    assert os.environ["ANTHROPIC_API_KEY"] == "ambient-api-key"
+    await provider.aclose()
+
+
+@pytest.mark.parametrize(
+    ("update", "error"),
+    [
+        ({"fallback_models": ["openai/backup"]}, "fallback providers"),
+        (
+            {"provider_api_key_envs": {"openai": ["OPENAI_SECONDARY"]}},
+            "credential pools or helpers",
+        ),
+        (
+            {"provider_api_key_helpers": {"openai": {"command": ["ignored"]}}},
+            "credential pools or helpers",
+        ),
+    ],
+)
+def test_coworker_provider_refuses_fallbacks_and_credential_subsystems(
+    tmp_path: Path,
+    update: dict[str, object],
+    error: str,
+) -> None:
+    ash_dir = tmp_path / ".ash"
+    profile_dir = ash_dir / "profiles" / "crew"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "ash.toml").write_text(
+        "model = 'openai/gpt-test'\nopenai_auth_mode = 'api_key'\n",
+        encoding="utf-8",
+    )
+    (profile_dir / ".env").write_text(
+        "OPENAI_API_KEY=selected-profile-key\n", encoding="utf-8"
+    )
+    config = AshConfig._load_for_profile(
+        "crew",
+        ash_dir=ash_dir,
+        workspace_root=tmp_path,
+    ).model_copy(update=update)
+
+    with pytest.raises(ValueError, match=error):
+        create_default_provider_registry().build_for_coworker(config)
+
+
+@pytest.mark.asyncio
+async def test_coworker_openai_adapter_uses_profile_credentials_and_isolated_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.providers.openai as openai_module
+    from ash.providers.openai import OpenAIProvider
+
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-key-must-not-be-used")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9999")
+    ash_dir = tmp_path / ".ash"
+    profile_dir = ash_dir / "profiles" / "crew"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "ash.toml").write_text(
+        "model = 'openai/gpt-test'\nopenai_auth_mode = 'api_key'\n",
+        encoding="utf-8",
+    )
+    (profile_dir / ".env").write_text(
+        "OPENAI_API_KEY=selected-profile-key\n"
+        "OPENAI_API_BASE=https://profile.example/v1\n",
+        encoding="utf-8",
+    )
+    config = AshConfig._load_for_profile(
+        "crew",
+        ash_dir=ash_dir,
+        workspace_root=tmp_path,
+    )
+    provider = create_default_provider_registry().build_for_coworker(config)
+    assert isinstance(provider, OpenAIProvider)
+    captured: dict[str, object] = {}
+
+    def mock_transport(
+        *, anonymous: bool = False, trust_env: bool = True
+    ) -> httpx.AsyncClient:
+        del anonymous
+        captured["trust_env"] = trust_env
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _request: (_ for _ in ()).throw(
+                    AssertionError("provider attempted live transport")
+                )
+            ),
+            follow_redirects=False,
+            trust_env=trust_env,
+        )
+
+    monkeypatch.setattr(openai_module, "_owned_openai_http_client", mock_transport)
+
+    sdk_client = provider._resolve_client()
+    http_client = sdk_client._client
+    assert http_client._trust_env is False
+    assert isinstance(http_client._transport, httpx.MockTransport)
+    from openai._base_client import FinalRequestOptions
+
+    wire_request = sdk_client._build_request(
+        FinalRequestOptions(
+            method="POST",
+            url="/chat/completions",
+            json_data={"model": "gpt-test", "messages": []},
+        )
+    )
+    assert wire_request.headers["Authorization"] == "Bearer selected-profile-key"
+    assert str(wire_request.url) == "https://profile.example/v1/chat/completions"
+    await sdk_client.close()
+
+    from types import SimpleNamespace
+
+    class FixtureStream:
+        def __init__(self) -> None:
+            self.chunks = iter(
+                (
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    content="fixture answer", tool_calls=None
+                                ),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                    ),
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content=None, tool_calls=None),
+                                finish_reason="stop",
+                            )
+                        ],
+                        usage=None,
+                    ),
+                )
+            )
+
+        def __aiter__(self) -> "FixtureStream":
+            return self
+
+        async def __anext__(self) -> object:
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+        async def aclose(self) -> None:
+            return None
+
+    class FixtureCompletions:
+        async def create(self, **kwargs: object) -> FixtureStream:
+            captured["request"] = kwargs
+            return FixtureStream()
+
+    class FixtureClient:
+        def __init__(self) -> None:
+            self.chat = SimpleNamespace(completions=FixtureCompletions())
+
+        async def close(self) -> None:
+            return None
+
+    provider._client = FixtureClient()
+    chunks = [
+        chunk
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "Explain this fixture."}]
+        )
+    ]
+    await provider.aclose()
+
+    assert "fixture answer" in "".join(chunk.content for chunk in chunks)
+    assert captured["trust_env"] is False
+    assert captured["request"]["model"] == "gpt-test"  # type: ignore[index]
+    assert captured["request"]["messages"][0]["content"] == "Explain this fixture."  # type: ignore[index]
+    assert "ambient-key-must-not-be-used" not in str(captured)
 
 
 @pytest.mark.parametrize(

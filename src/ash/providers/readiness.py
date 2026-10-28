@@ -439,15 +439,23 @@ _BUILTIN_KEY_ENVS = {
 _BUILTIN_KEY_ENVS["openai-compatible"] = ("OPENAI_API_KEY",)
 
 
-def _first_environment_value(names: tuple[str, ...]) -> str:
+def _first_environment_value(
+    names: tuple[str, ...], environ: Mapping[str, str] | None = None
+) -> str:
+    environment_values = os.environ if environ is None else environ
     for name in names:
-        value = os.environ.get(name, "")
+        value = environment_values.get(name, "")
         if value:
             return value
     return ""
 
 
-def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
+def provider_runtime_environment(
+    config: "AshConfig",
+    environ: Mapping[str, str] | None = None,
+    *,
+    include_fallbacks: bool = True,
+) -> dict[str, str]:
     """Return only provider-specific environment needed to rebuild a route.
 
     Subprocess workers must not inherit the parent's general environment. This
@@ -456,10 +464,10 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
     their base URL in config and may opt into one explicit ``key_env``.
     """
 
-    models = [
-        str(config.model),
-        *[str(item) for item in getattr(config, "fallback_models", ())],
-    ]
+    source = os.environ if environ is None else environ
+    models = [str(config.model)]
+    if include_fallbacks:
+        models.extend(str(item) for item in getattr(config, "fallback_models", ()))
     keys: set[str] = set()
     custom_providers = getattr(config, "custom_providers", {})
     provider_api_key_envs = getattr(config, "provider_api_key_envs", {})
@@ -559,6 +567,8 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
         key_envs = _BUILTIN_KEY_ENVS.get(provider, ())
         if provider != "azure" and not explicit_api_key_sources:
             keys.update(key_envs)
+        if provider == "anthropic":
+            keys.add("ASH_API_KEY")
         custom = (
             custom_providers.get(provider)
             if isinstance(custom_providers, dict)
@@ -568,7 +578,15 @@ def provider_runtime_environment(config: "AshConfig") -> dict[str, str]:
             declared_key_env = str(custom.get("key_env") or "").strip()
             if declared_key_env and not explicit_api_key_sources:
                 keys.add(declared_key_env)
-    return {key: os.environ[key] for key in sorted(keys) if key in os.environ}
+    values = {key: source[key] for key in sorted(keys) if key in source}
+    provider, _ = parse_model_string(config.model)
+    if (
+        provider == "anthropic"
+        and not values.get("ANTHROPIC_API_KEY")
+        and values.get("ASH_API_KEY")
+    ):
+        values["ANTHROPIC_API_KEY"] = values.pop("ASH_API_KEY")
+    return values
 
 
 def normalize_provider_base_url(value: object, *, provider: str) -> str:
@@ -648,6 +666,7 @@ def resolve_provider_connection(
     config: "AshConfig",
     *,
     api_key_override: str | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> ProviderConnection:
     """Resolve the provider route used for construction and connectivity checks.
 
@@ -656,17 +675,18 @@ def resolve_provider_connection(
     without one are treated as intentionally anonymous.
     """
 
+    environment_values = os.environ if environ is None else environ
     provider, model_name = parse_model_string(config.model)
     if provider == "vertex":
         from ash.providers.vertex import vertex_openai_base_url
 
         project = (
             str(getattr(config, "vertex_project", "") or "").strip()
-            or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
+            or environment_values.get("GOOGLE_CLOUD_PROJECT", "").strip()
         )
         location = (
             str(getattr(config, "vertex_location", "") or "").strip()
-            or os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
+            or environment_values.get("GOOGLE_CLOUD_LOCATION", "").strip()
         )
         try:
             base_url = vertex_openai_base_url(project, location)
@@ -689,12 +709,12 @@ def resolve_provider_connection(
 
         region = (
             str(getattr(config, "bedrock_region", "") or "").strip()
-            or os.environ.get("AWS_REGION", "").strip()
-            or os.environ.get("AWS_DEFAULT_REGION", "").strip()
+            or environment_values.get("AWS_REGION", "").strip()
+            or environment_values.get("AWS_DEFAULT_REGION", "").strip()
         )
         profile = (
             str(getattr(config, "bedrock_profile", "") or "").strip()
-            or os.environ.get("AWS_PROFILE", "").strip()
+            or environment_values.get("AWS_PROFILE", "").strip()
         )
         try:
             base_url = bedrock_runtime_base_url(
@@ -717,8 +737,8 @@ def resolve_provider_connection(
 
         azure_url = (
             str(getattr(config, "azure_base_url", "") or "").strip()
-            or os.environ.get("AZURE_OPENAI_BASE_URL", "").strip()
-            or os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
+            or environment_values.get("AZURE_OPENAI_BASE_URL", "").strip()
+            or environment_values.get("AZURE_OPENAI_ENDPOINT", "").strip()
         )
         try:
             base_url = normalize_azure_openai_base_url(azure_url)
@@ -733,7 +753,7 @@ def resolve_provider_connection(
                 "AZURE_OPENAI_API_KEY",
                 api_key_override
                 if api_key_override is not None
-                else os.environ.get("AZURE_OPENAI_API_KEY", ""),
+                else environment_values.get("AZURE_OPENAI_API_KEY", ""),
             )
             resolved_auth_mode: AuthMode = "bearer"
         elif auth_mode == "entra":
@@ -755,7 +775,7 @@ def resolve_provider_connection(
         )
     if provider == "ollama":
         default = "http://localhost:11434"
-        supplied = os.environ.get("OLLAMA_API_BASE")
+        supplied = environment_values.get("OLLAMA_API_BASE")
         base_url = normalize_provider_base_url(supplied or default, provider=provider)
         return ProviderConnection(
             provider=provider,
@@ -770,7 +790,7 @@ def resolve_provider_connection(
     builtin = _BUILTIN_CONNECTIONS.get(provider)
     if builtin is not None:
         default, base_env, catalog_format, auth_mode = builtin
-        supplied = os.environ.get(base_env)
+        supplied = environment_values.get(base_env)
         base_url = normalize_provider_base_url(supplied or default, provider=provider)
         key_envs = _BUILTIN_KEY_ENVS.get(provider, ())
         if auth_mode == "none":
@@ -782,7 +802,7 @@ def resolve_provider_connection(
                 " or ".join(key_envs),
                 api_key_override
                 if api_key_override is not None
-                else _first_environment_value(key_envs),
+                else _first_environment_value(key_envs, environment_values),
             )
             require_secure_provider_transport(base_url, provider=provider)
         return ProviderConnection(
@@ -820,7 +840,7 @@ def resolve_provider_connection(
             source,
             api_key_override
             if api_key_override is not None
-            else os.environ.get(key_env, "") or inline_key,
+            else environment_values.get(key_env, "") or inline_key,
         )
         require_secure_provider_transport(base_url, provider=provider)
     else:

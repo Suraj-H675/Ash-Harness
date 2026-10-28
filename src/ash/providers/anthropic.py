@@ -114,6 +114,15 @@ def _prepare_anthropic_content(content: Any) -> Any:
     return prepared
 
 
+def _anthropic_custom_header_names(value: str) -> tuple[str, ...]:
+    names = {
+        line[:separator].strip()
+        for line in value.splitlines()
+        if (separator := line.find(":")) > 0 and line[:separator].strip()
+    }
+    return tuple(sorted(names, key=str.casefold))
+
+
 def prepare_anthropic_tools(
     tools: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]] | None:
@@ -257,9 +266,29 @@ class AnthropicProvider(ProviderABC):
                 "Install it with `pip install anthropic` or inject a client."
             ) from exc
 
+        coworker_bound = getattr(self, "_ash_disable_ambient_transport", False)
+        http_client_options: dict[str, Any] = {
+            "follow_redirects": False,
+            "trust_env": not coworker_bound,
+        }
+        if coworker_bound:
+            ambient_header_names = _anthropic_custom_header_names(
+                os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
+            )
+
+            async def strip_ambient_headers(request: Any) -> None:
+                for name in ambient_header_names:
+                    request.headers.pop(name, None)
+                request.headers["x-api-key"] = self._api_key
+                request.headers["anthropic-version"] = "2023-06-01"
+                request.headers["content-type"] = "application/json"
+
+            http_client_options["event_hooks"] = {
+                "request": [strip_ambient_headers]
+            }
         kwargs: dict[str, Any] = {
             "max_retries": 0,
-            "http_client": DefaultAsyncHttpxClient(follow_redirects=False),
+            "http_client": DefaultAsyncHttpxClient(**http_client_options),
         }
         if self._api_key:
             kwargs["api_key"] = self._api_key
