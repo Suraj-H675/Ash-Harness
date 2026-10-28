@@ -7,6 +7,6 @@ WORKDIR /opt/ash
 RUN install -d -m 0755 /workspace /worker-state
 COPY requirements.txt /tmp/requirements.txt
 RUN python -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt
-COPY ash.whl /tmp/ash.whl
-RUN python -m pip install --no-cache-dir --no-deps /tmp/ash.whl \
-    && rm -f /tmp/ash.whl /tmp/requirements.txt
+COPY ash_ai-*.whl /tmp/
+RUN python -m pip install --no-cache-dir --no-deps /tmp/ash_ai-*.whl \
+    && rm -f /tmp/ash_ai-*.whl /tmp/requirements.txt

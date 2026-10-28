@@ -167,7 +167,7 @@ jobs:
           uv export --locked --no-dev --no-emit-project --format requirements.txt \
             --output-file "$worker_context/requirements.txt"
           cp src/ash/sandbox/Dockerfile.coworker "$worker_context/Dockerfile"
-          cp dist/ash_ai-*.whl "$worker_context/ash.whl"
+          cp dist/ash_ai-*.whl "$worker_context/"
           docker build --pull --tag ash-coworker-worker:latest "$worker_context"
           docker run --rm --network none --entrypoint python \
             ash-coworker-worker:latest -I -c \

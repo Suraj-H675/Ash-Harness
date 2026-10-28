@@ -928,6 +928,7 @@ def test_migrated_coworker_can_read_sessions_but_cannot_execute_without_uid(
         )
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
 def test_offline_coworker_turn_does_not_replay_unknown_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1018,6 +1019,39 @@ def test_offline_coworker_turn_does_not_replay_unknown_dispatch(
     canonical_lease.close()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS fail-closed staging")
+def test_offline_coworker_turn_refuses_non_linux_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    _profile(ash_dir, "offline")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="owner-label",
+        display_name="Offline worker",
+        profile_name="offline",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="owner-label",
+        coworker_id=identity.coworker_id,
+    )
+
+    def reject_docker_dispatch(**_settings: object) -> None:
+        pytest.fail("Linux-only worker must be refused before Docker dispatch")
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", reject_docker_dispatch)
+    with pytest.raises(CoworkerRuntimeUnavailable, match="require Linux Docker staging"):
+        asyncio.run(handle.run_offline_turn(run_id="denied", prompt="no execution"))
+
+
 def test_offline_worker_runs_real_ashloop_without_tools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1106,6 +1140,7 @@ def test_offline_worker_runs_real_ashloop_without_tools(
     assert session.tool_calls == []
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
 def test_offline_worker_cancellation_releases_lease_and_keeps_dispatch_claimed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
