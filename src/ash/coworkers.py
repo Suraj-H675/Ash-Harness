@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from ash.config import AshConfig
 from ash.core.session import (
@@ -47,9 +47,15 @@ from ash.sandbox.docker import COWORKER_IMAGE, DEFAULT_IMAGE
 from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 3
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 4
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
+_MAX_RESPONSIBILITY_SCOPE_BYTES = 2048
+_MAX_RESPONSIBILITY_OBJECTIVE_BYTES = 6144
+_MAX_RESPONSIBILITY_CRITERIA = 8
+_MAX_RESPONSIBILITY_CRITERION_BYTES = 512
+_MAX_RESPONSIBILITY_EVENT_KEY_CHARS = 128
+_MAX_RESPONSIBILITY_RUNS = 100
 _MAX_SYNTAX_FILES = 32
 _MAX_SYNTAX_FILE_BYTES = 1_048_576
 _MAX_SYNTAX_TOTAL_BYTES = 5_242_880
@@ -126,6 +132,10 @@ class CoworkerRuntimeUnavailable(RuntimeError):
     """Provider execution is not admitted by this identity/session proof."""
 
 
+CoworkerResponsibilityStatus = Literal["active", "paused", "completed"]
+CoworkerResponsibilityTrigger = Literal["manual"]
+
+
 @dataclass(frozen=True)
 class Coworker:
     """Persisted identity; only ``display_name`` may change after creation."""
@@ -179,6 +189,43 @@ class CoworkerTurnResult:
     session_ref: CoworkerSessionRef
     request_id: str
     response: str
+    responsibility_id: str | None = None
+    trigger_type: CoworkerResponsibilityTrigger | None = None
+    event_key: str | None = None
+
+
+@dataclass(frozen=True)
+class CoworkerResponsibility:
+    """One durable, manually admitted objective bound to one coworker."""
+
+    responsibility_id: str
+    owner_id: str
+    owner_uid: int | None
+    coworker_id: str
+    scope: str
+    objective: str
+    success_criteria: tuple[str, ...]
+    trigger_type: CoworkerResponsibilityTrigger
+    status: CoworkerResponsibilityStatus
+    created_at: datetime
+    updated_at: datetime
+    paused_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class CoworkerResponsibilityRun:
+    """Attribution for one admitted responsibility trigger and session run."""
+
+    responsibility_id: str
+    event_key: str
+    trigger_type: CoworkerResponsibilityTrigger
+    run_id: str
+    session_id: str
+    request_id: str
+    status: Literal["claimed", "completed"]
+    created_at: datetime
+    completed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -260,6 +307,160 @@ def _normalize_coworker_id(coworker_id: str) -> str:
         return str(UUID(coworker_id))
     except (ValueError, AttributeError) as exc:
         raise ValueError("coworker_id must be a UUID string") from exc
+
+
+def _normalize_responsibility_id(responsibility_id: str) -> str:
+    if not isinstance(responsibility_id, str):
+        raise ValueError("responsibility_id must be a UUID string")
+    try:
+        return str(UUID(responsibility_id))
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("responsibility_id must be a UUID string") from exc
+
+
+def _normalize_responsibility_text(
+    value: str,
+    field_name: str,
+    maximum_bytes: int,
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be text")
+    normalized = value.strip()
+    try:
+        encoded = normalized.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field_name} must be valid UTF-8 text") from exc
+    if (
+        not normalized
+        or len(encoded) > maximum_bytes
+        or any(
+            (ord(character) < 32 and character not in "\n\t")
+            or ord(character) == 127
+            for character in normalized
+        )
+    ):
+        raise ValueError(
+            f"{field_name} must be non-empty, printable, and at most "
+            f"{maximum_bytes} UTF-8 bytes"
+        )
+    return normalized
+
+
+def _normalize_success_criteria(criteria: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(criteria, (str, bytes)) or not isinstance(criteria, Sequence):
+        raise ValueError("success_criteria must be a sequence of text items")
+    if len(criteria) > _MAX_RESPONSIBILITY_CRITERIA:
+        raise ValueError(
+            "success_criteria must contain at most "
+            f"{_MAX_RESPONSIBILITY_CRITERIA} items"
+        )
+    return tuple(
+        _normalize_responsibility_text(
+            item,
+            "success criterion",
+            _MAX_RESPONSIBILITY_CRITERION_BYTES,
+        )
+        for item in criteria
+    )
+
+
+def _normalize_responsibility_event_key(event_key: str) -> str:
+    if not isinstance(event_key, str):
+        raise ValueError("event_key must be text")
+    normalized = event_key.strip()
+    if (
+        not normalized
+        or len(normalized) > _MAX_RESPONSIBILITY_EVENT_KEY_CHARS
+        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+    ):
+        raise ValueError(
+            "event_key must be non-empty, bounded, and printable"
+        )
+    return normalized
+
+
+def _responsibility_prompt(responsibility: CoworkerResponsibility) -> str:
+    prompt = f"Scope: {responsibility.scope}\nObjective: {responsibility.objective}"
+    if responsibility.success_criteria:
+        prompt += "\nSuccess criteria:\n" + "\n".join(
+            f"- {criterion}" for criterion in responsibility.success_criteria
+        )
+    if len(prompt.encode("utf-8")) > WORKER_MAX_PROMPT_BYTES:
+        raise CoworkerDirectoryError(
+            "responsibility contract exceeds the offline worker prompt limit"
+        )
+    return prompt
+
+
+def _responsibility_from_row(row: sqlite3.Row) -> CoworkerResponsibility:
+    try:
+        raw_criteria = json.loads(str(row["success_criteria_json"]))
+        if (
+            not isinstance(raw_criteria, list)
+            or any(not isinstance(item, str) for item in raw_criteria)
+        ):
+            raise ValueError("criteria must be a list of strings")
+        status = str(row["status"])
+        if row["trigger_type"] != "manual" or status not in {
+            "active",
+            "paused",
+            "completed",
+        }:
+            raise ValueError("unsupported responsibility state")
+        return CoworkerResponsibility(
+            responsibility_id=str(row["responsibility_id"]),
+            owner_id=str(row["owner_id"]),
+            owner_uid=(int(row["owner_uid"]) if row["owner_uid"] is not None else None),
+            coworker_id=str(row["coworker_id"]),
+            scope=str(row["scope"]),
+            objective=str(row["objective"]),
+            success_criteria=tuple(raw_criteria),
+            trigger_type="manual",
+            status=status,  # type: ignore[arg-type]
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            paused_at=(
+                datetime.fromisoformat(str(row["paused_at"]))
+                if row["paused_at"] is not None
+                else None
+            ),
+            completed_at=(
+                datetime.fromisoformat(str(row["completed_at"]))
+                if row["completed_at"] is not None
+                else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise CoworkerDirectoryError("stored coworker responsibility is invalid") from exc
+
+
+def _responsibility_run_from_row(row: sqlite3.Row) -> CoworkerResponsibilityRun:
+    try:
+        status = str(row["status"])
+        if row["trigger_type"] != "manual" or status not in {
+            "claimed",
+            "completed",
+        }:
+            raise ValueError("unsupported responsibility run state")
+        return CoworkerResponsibilityRun(
+            responsibility_id=str(row["responsibility_id"]),
+            event_key=str(row["event_key"]),
+            trigger_type="manual",
+            run_id=str(row["run_id"]),
+            session_id=str(row["session_id"]),
+            request_id=str(row["request_id"]),
+            status=status,  # type: ignore[arg-type]
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            completed_at=(
+                datetime.fromisoformat(str(row["completed_at"]))
+                if row["completed_at"] is not None
+                else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CoworkerDirectoryError(
+            "stored coworker responsibility run is invalid"
+        ) from exc
 
 
 def _normalize_workspace(workspace: str | Path) -> Path:
@@ -750,6 +951,12 @@ class CoworkerDirectory:
                         (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
                     )
                     version = _COWORKER_DIRECTORY_SCHEMA_VERSION
+                if version == 3:
+                    conn.execute(
+                        "UPDATE coworker_directory_meta SET schema_version = ?",
+                        (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
+                    )
+                    version = _COWORKER_DIRECTORY_SCHEMA_VERSION
                 if version != _COWORKER_DIRECTORY_SCHEMA_VERSION:
                     raise CoworkerDirectoryError(
                         "coworker directory schema version is unsupported: "
@@ -764,6 +971,62 @@ class CoworkerDirectory:
                         "coworker directory owner binding schema is incomplete"
                     )
                 conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_coworkers_owner_identity "
+                    "ON coworkers(owner_id, coworker_id)"
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coworker_responsibilities (
+                        responsibility_id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
+                        owner_uid INTEGER,
+                        coworker_id TEXT NOT NULL,
+                        scope TEXT NOT NULL,
+                        objective TEXT NOT NULL,
+                        success_criteria_json TEXT NOT NULL,
+                        trigger_type TEXT NOT NULL CHECK(trigger_type IN ('manual')),
+                        status TEXT NOT NULL CHECK(status IN
+                            ('active','paused','completed')),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        paused_at TEXT,
+                        completed_at TEXT,
+                        UNIQUE(owner_id, coworker_id, responsibility_id),
+                        FOREIGN KEY(owner_id, coworker_id)
+                            REFERENCES coworkers(owner_id, coworker_id)
+                    )
+                    """
+                )
+                responsibility_columns = {
+                    str(column["name"])
+                    for column in conn.execute(
+                        "PRAGMA table_info(coworker_responsibilities)"
+                    )
+                }
+                if responsibility_columns != {
+                    "responsibility_id",
+                    "owner_id",
+                    "owner_uid",
+                    "coworker_id",
+                    "scope",
+                    "objective",
+                    "success_criteria_json",
+                    "trigger_type",
+                    "status",
+                    "created_at",
+                    "updated_at",
+                    "paused_at",
+                    "completed_at",
+                }:
+                    raise CoworkerDirectoryError(
+                        "coworker responsibility schema is incomplete"
+                    )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coworker_responsibilities_owner "
+                    "ON coworker_responsibilities(owner_id, coworker_id, created_at, "
+                    "responsibility_id)"
+                )
+                conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS coworker_turn_dispatches (
                         owner_id TEXT NOT NULL,
@@ -772,6 +1035,12 @@ class CoworkerDirectory:
                         session_id TEXT NOT NULL,
                         request_id TEXT NOT NULL UNIQUE,
                         status TEXT NOT NULL CHECK(status IN ('claimed', 'completed')),
+                        responsibility_id TEXT REFERENCES
+                            coworker_responsibilities(responsibility_id),
+                        trigger_type TEXT CHECK(trigger_type IS NULL OR
+                            trigger_type IN ('manual')),
+                        event_key TEXT CHECK(event_key IS NULL OR
+                            length(event_key) BETWEEN 1 AND 128),
                         created_at TEXT NOT NULL,
                         completed_at TEXT,
                         PRIMARY KEY(owner_id, coworker_id, run_id)
@@ -784,19 +1053,54 @@ class CoworkerDirectory:
                         "PRAGMA table_info(coworker_turn_dispatches)"
                     )
                 }
-                if dispatch_columns != {
+                required_dispatch_columns = {
                     "owner_id",
                     "coworker_id",
                     "run_id",
                     "session_id",
                     "request_id",
                     "status",
+                    "responsibility_id",
+                    "trigger_type",
+                    "event_key",
                     "created_at",
                     "completed_at",
-                }:
+                }
+                for name, declaration in (
+                    (
+                        "responsibility_id",
+                        "TEXT REFERENCES coworker_responsibilities(responsibility_id)",
+                    ),
+                    (
+                        "trigger_type",
+                        "TEXT CHECK(trigger_type IS NULL OR trigger_type IN ('manual'))",
+                    ),
+                    (
+                        "event_key",
+                        "TEXT CHECK(event_key IS NULL OR length(event_key) BETWEEN 1 AND 128)",
+                    ),
+                ):
+                    if name not in dispatch_columns:
+                        conn.execute(
+                            "ALTER TABLE coworker_turn_dispatches "
+                            f"ADD COLUMN {name} {declaration}"
+                        )
+                dispatch_columns = {
+                    str(column["name"])
+                    for column in conn.execute(
+                        "PRAGMA table_info(coworker_turn_dispatches)"
+                    )
+                }
+                if dispatch_columns != required_dispatch_columns:
                     raise CoworkerDirectoryError(
                         "coworker dispatch journal schema is incomplete"
                     )
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "idx_coworker_turn_dispatches_responsibility_event "
+                    "ON coworker_turn_dispatches(owner_id, coworker_id, "
+                    "responsibility_id, event_key) WHERE responsibility_id IS NOT NULL"
+                )
         except (sqlite3.DatabaseError, OSError, SessionStorageError) as exc:
             raise CoworkerDirectoryError(
                 f"could not open coworker directory {self.db_path}: {exc}"
@@ -814,6 +1118,233 @@ class CoworkerDirectory:
             raise CoworkerNotFound("coworker not found")
         return _record_from_row(row)
 
+    def _validate_handle_binding(
+        self,
+        handle: "CoworkerHandle",
+        conn: sqlite3.Connection | None = None,
+    ) -> Coworker:
+        identity = handle.identity
+        if conn is None:
+            with closing(self._connect()) as connection:
+                return self._validate_handle_binding(handle, connection)
+        row = conn.execute(
+            "SELECT * FROM coworkers WHERE owner_id = ? AND coworker_id = ?",
+            (identity.owner_id, identity.coworker_id),
+        ).fetchone()
+        current = _record_from_row(row) if row is not None else None
+        if current is None:
+            raise CoworkerNotFound("coworker not found")
+        if (
+            current.owner_uid != identity.owner_uid
+            or current.profile_name != identity.profile_name
+            or current.workspace != identity.workspace
+            or current.canonical_session_id != identity.canonical_session_id
+            or current.state != "ready"
+        ):
+            raise CoworkerDirectoryError("coworker process binding changed")
+        local_uid = _current_owner_uid()
+        if local_uid is None or current.owner_uid is None or current.owner_uid != local_uid:
+            raise CoworkerRuntimeUnavailable(
+                "local coworker owner identity could not be verified"
+            )
+        return current
+
+    def _create_responsibility(
+        self,
+        *,
+        handle: "CoworkerHandle",
+        scope: str,
+        objective: str,
+        success_criteria: Sequence[str],
+        trigger_type: CoworkerResponsibilityTrigger,
+    ) -> CoworkerResponsibility:
+        current = self._validate_handle_binding(handle)
+        normalized_scope = _normalize_responsibility_text(
+            scope,
+            "scope",
+            _MAX_RESPONSIBILITY_SCOPE_BYTES,
+        )
+        normalized_objective = _normalize_responsibility_text(
+            objective,
+            "objective",
+            _MAX_RESPONSIBILITY_OBJECTIVE_BYTES,
+        )
+        criteria = _normalize_success_criteria(success_criteria)
+        if trigger_type != "manual":
+            raise ValueError("trigger_type must be 'manual'")
+        identifier = str(uuid4())
+        now = _now()
+        record = CoworkerResponsibility(
+            responsibility_id=identifier,
+            owner_id=current.owner_id,
+            owner_uid=current.owner_uid,
+            coworker_id=current.coworker_id,
+            scope=normalized_scope,
+            objective=normalized_objective,
+            success_criteria=criteria,
+            trigger_type=trigger_type,
+            status="active",
+            created_at=datetime.fromisoformat(now),
+            updated_at=datetime.fromisoformat(now),
+        )
+        _responsibility_prompt(record)
+        try:
+            with closing(self._connect()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                latest = self._validate_handle_binding(handle, conn)
+                if latest != current:
+                    raise CoworkerDirectoryError(
+                        "coworker binding changed before responsibility creation"
+                    )
+                conn.execute(
+                    "INSERT INTO coworker_responsibilities ("
+                    "responsibility_id, owner_id, owner_uid, coworker_id, scope, "
+                    "objective, success_criteria_json, trigger_type, status, "
+                    "created_at, updated_at, paused_at, completed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', 'active', ?, ?, NULL, NULL)",
+                    (
+                        identifier,
+                        current.owner_id,
+                        current.owner_uid,
+                        current.coworker_id,
+                        normalized_scope,
+                        normalized_objective,
+                        json.dumps(criteria, ensure_ascii=False, separators=(",", ":")),
+                        now,
+                        now,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise CoworkerDirectoryError(
+                "could not create coworker responsibility"
+            ) from exc
+        return self._get_responsibility(handle, identifier)
+
+    def _list_responsibilities(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        limit: int,
+    ) -> list[CoworkerResponsibility]:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        current = self._validate_handle_binding(handle)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM coworker_responsibilities "
+                "WHERE owner_id = ? AND coworker_id = ? "
+                "ORDER BY created_at DESC, responsibility_id LIMIT ?",
+                (current.owner_id, current.coworker_id, limit),
+            ).fetchall()
+        return [_responsibility_from_row(row) for row in rows]
+
+    def _get_responsibility(
+        self,
+        handle: "CoworkerHandle",
+        responsibility_id: str,
+    ) -> CoworkerResponsibility:
+        identifier = _normalize_responsibility_id(responsibility_id)
+        current = self._validate_handle_binding(handle)
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM coworker_responsibilities WHERE owner_id = ? "
+                "AND coworker_id = ? AND responsibility_id = ?",
+                (current.owner_id, current.coworker_id, identifier),
+            ).fetchone()
+        if row is None:
+            raise CoworkerNotFound("coworker responsibility not found")
+        return _responsibility_from_row(row)
+
+    def _set_responsibility_status(
+        self,
+        handle: "CoworkerHandle",
+        responsibility_id: str,
+        status: CoworkerResponsibilityStatus,
+    ) -> CoworkerResponsibility:
+        identifier = _normalize_responsibility_id(responsibility_id)
+        if status not in {"active", "paused", "completed"}:
+            raise ValueError("status must be active, paused, or completed")
+        allowed = {
+            ("active", "paused"),
+            ("active", "completed"),
+            ("paused", "active"),
+            ("paused", "completed"),
+        }
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._validate_handle_binding(handle, conn)
+            row = conn.execute(
+                "SELECT * FROM coworker_responsibilities WHERE owner_id = ? "
+                "AND coworker_id = ? AND responsibility_id = ?",
+                (current.owner_id, current.coworker_id, identifier),
+            ).fetchone()
+            if row is None:
+                raise CoworkerNotFound("coworker responsibility not found")
+            record = _responsibility_from_row(row)
+            if record.status == status:
+                return record
+            if (record.status, status) not in allowed:
+                raise CoworkerDirectoryError(
+                    f"cannot change responsibility from {record.status} to {status}"
+                )
+            now = _now()
+            conn.execute(
+                "UPDATE coworker_responsibilities SET status = ?, updated_at = ?, "
+                "paused_at = CASE WHEN ? = 'paused' THEN ? ELSE paused_at END, "
+                "completed_at = CASE WHEN ? = 'completed' THEN ? ELSE completed_at END "
+                "WHERE owner_id = ? AND coworker_id = ? AND responsibility_id = ? "
+                "AND status = ?",
+                (
+                    status,
+                    now,
+                    status,
+                    now,
+                    status,
+                    now,
+                    current.owner_id,
+                    current.coworker_id,
+                    identifier,
+                    record.status,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM coworker_responsibilities WHERE owner_id = ? "
+                "AND coworker_id = ? AND responsibility_id = ?",
+                (current.owner_id, current.coworker_id, identifier),
+            ).fetchone()
+            if updated is None:
+                raise CoworkerDirectoryError("responsibility changed during transition")
+            return _responsibility_from_row(updated)
+
+    def _list_responsibility_runs(
+        self,
+        handle: "CoworkerHandle",
+        responsibility_id: str,
+        *,
+        limit: int,
+    ) -> list[CoworkerResponsibilityRun]:
+        if type(limit) is not int or not 1 <= limit <= _MAX_RESPONSIBILITY_RUNS:
+            raise ValueError(
+                f"limit must be between 1 and {_MAX_RESPONSIBILITY_RUNS}"
+            )
+        identifier = _normalize_responsibility_id(responsibility_id)
+        current = self._validate_handle_binding(handle)
+        with closing(self._connect()) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM coworker_responsibilities WHERE owner_id = ? "
+                "AND coworker_id = ? AND responsibility_id = ?",
+                (current.owner_id, current.coworker_id, identifier),
+            ).fetchone()
+            if exists is None:
+                raise CoworkerNotFound("coworker responsibility not found")
+            rows = conn.execute(
+                "SELECT * FROM coworker_turn_dispatches WHERE owner_id = ? "
+                "AND coworker_id = ? AND responsibility_id = ? "
+                "ORDER BY created_at DESC, run_id LIMIT ?",
+                (current.owner_id, current.coworker_id, identifier, limit),
+            ).fetchall()
+        return [_responsibility_run_from_row(row) for row in rows]
+
     def _claim_offline_turn(
         self,
         *,
@@ -821,10 +1352,24 @@ class CoworkerDirectory:
         run_id: str,
         session_id: str,
         request_id: str,
+        responsibility_id: str | None = None,
+        event_key: str | None = None,
     ) -> None:
         """Durably consume one run key before any worker process is dispatched."""
 
         identity = handle.identity
+        if (responsibility_id is None) != (event_key is None):
+            raise ValueError("responsibility_id and event_key must be supplied together")
+        normalized_responsibility_id = (
+            _normalize_responsibility_id(responsibility_id)
+            if responsibility_id is not None
+            else None
+        )
+        normalized_event_key = (
+            _normalize_responsibility_event_key(event_key)
+            if event_key is not None
+            else None
+        )
         try:
             with closing(self._connect()) as conn, conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -849,6 +1394,26 @@ class CoworkerDirectory:
                     raise CoworkerRuntimeUnavailable(
                         "local coworker owner identity could not be verified"
                     )
+                if normalized_responsibility_id is not None:
+                    responsibility = conn.execute(
+                        "SELECT owner_uid, trigger_type, status "
+                        "FROM coworker_responsibilities WHERE owner_id = ? "
+                        "AND coworker_id = ? AND responsibility_id = ?",
+                        (
+                            identity.owner_id,
+                            identity.coworker_id,
+                            normalized_responsibility_id,
+                        ),
+                    ).fetchone()
+                    if (
+                        responsibility is None
+                        or responsibility["owner_uid"] != current.owner_uid
+                        or responsibility["trigger_type"] != "manual"
+                        or responsibility["status"] != "active"
+                    ):
+                        raise CoworkerRuntimeUnavailable(
+                            "coworker responsibility is not active for manual dispatch"
+                        )
                 prior = conn.execute(
                     "SELECT status FROM coworker_turn_dispatches "
                     "WHERE owner_id = ? AND coworker_id = ? AND run_id = ?",
@@ -861,14 +1426,18 @@ class CoworkerDirectory:
                 conn.execute(
                     "INSERT INTO coworker_turn_dispatches "
                     "(owner_id, coworker_id, run_id, session_id, request_id, "
-                    "status, created_at, completed_at) "
-                    "VALUES (?, ?, ?, ?, ?, 'claimed', ?, NULL)",
+                    "status, responsibility_id, trigger_type, event_key, "
+                    "created_at, completed_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, NULL)",
                     (
                         identity.owner_id,
                         identity.coworker_id,
                         run_id,
                         session_id,
                         request_id,
+                        normalized_responsibility_id,
+                        "manual" if normalized_responsibility_id is not None else None,
+                        normalized_event_key,
                         _now(),
                     ),
                 )
@@ -1136,6 +1705,68 @@ class CoworkerHandle:
     def identity(self) -> Coworker:
         return self._identity
 
+    def create_responsibility(
+        self,
+        *,
+        scope: str,
+        objective: str,
+        success_criteria: Sequence[str] = (),
+        trigger_type: CoworkerResponsibilityTrigger = "manual",
+    ) -> CoworkerResponsibility:
+        """Create an active responsibility owned by this coworker binding."""
+
+        return self._directory._create_responsibility(
+            handle=self,
+            scope=scope,
+            objective=objective,
+            success_criteria=success_criteria,
+            trigger_type=trigger_type,
+        )
+
+    def list_responsibilities(
+        self,
+        *,
+        limit: int = 200,
+    ) -> list[CoworkerResponsibility]:
+        """List responsibilities visible through this owner-bound handle."""
+
+        return self._directory._list_responsibilities(self, limit=limit)
+
+    def get_responsibility(
+        self,
+        responsibility_id: str,
+    ) -> CoworkerResponsibility:
+        """Read one responsibility visible through this owner-bound handle."""
+
+        return self._directory._get_responsibility(self, responsibility_id)
+
+    def set_responsibility_status(
+        self,
+        responsibility_id: str,
+        status: CoworkerResponsibilityStatus,
+    ) -> CoworkerResponsibility:
+        """Pause, resume, or complete a responsibility with a checked transition."""
+
+        return self._directory._set_responsibility_status(
+            self,
+            responsibility_id,
+            status,
+        )
+
+    def list_responsibility_runs(
+        self,
+        responsibility_id: str,
+        *,
+        limit: int = _MAX_RESPONSIBILITY_RUNS,
+    ) -> list[CoworkerResponsibilityRun]:
+        """List durable manual trigger claims and their session associations."""
+
+        return self._directory._list_responsibility_runs(
+            self,
+            responsibility_id,
+            limit=limit,
+        )
+
     def effective_config(self) -> AshConfig:
         """Return the explicit profile snapshot; SDK runtime creation is denied."""
 
@@ -1348,6 +1979,50 @@ class CoworkerHandle:
         an ambiguous dispatch cannot be replayed.
         """
 
+        return await self._run_offline_turn(run_id=run_id, prompt=prompt)
+
+    async def run_responsibility(
+        self,
+        responsibility_id: str,
+        *,
+        event_key: str,
+    ) -> CoworkerTurnResult:
+        """Manually admit one active responsibility into the fixed offline run."""
+
+        self._directory._require_local_coworker_owner(self)
+        identifier = _normalize_responsibility_id(responsibility_id)
+        normalized_event_key = _normalize_responsibility_event_key(event_key)
+        responsibility = self.get_responsibility(identifier)
+        if (
+            responsibility.status != "active"
+            or responsibility.trigger_type != "manual"
+        ):
+            raise CoworkerRuntimeUnavailable(
+                "coworker responsibility is not active for manual dispatch"
+            )
+        run_id = str(
+            uuid5(
+                UUID(identifier),
+                f"ash-crew-manual-trigger:{normalized_event_key}",
+            )
+        )
+        return await self._run_offline_turn(
+            run_id=run_id,
+            prompt=_responsibility_prompt(responsibility),
+            responsibility_id=identifier,
+            event_key=normalized_event_key,
+        )
+
+    async def _run_offline_turn(
+        self,
+        *,
+        run_id: str,
+        prompt: str,
+        responsibility_id: str | None = None,
+        event_key: str | None = None,
+    ) -> CoworkerTurnResult:
+        """Run one fixed turn after any responsibility claim has been checked."""
+
         current = self._directory._require_local_coworker_owner(self)
         if not isinstance(run_id, str):
             raise ValueError("run_id must be a string")
@@ -1435,6 +2110,8 @@ class CoworkerHandle:
                     run_id=run_id,
                     session_id=session_ref.session_id,
                     request_id=request_id,
+                    responsibility_id=responsibility_id,
+                    event_key=event_key,
                 )
                 result = await manager._run_supervised_coworker_worker(
                     cwd=environment.working_directory,
@@ -1486,6 +2163,9 @@ class CoworkerHandle:
                 session_ref=session_ref,
                 request_id=request_id,
                 response=response,
+                responsibility_id=responsibility_id,
+                trigger_type=("manual" if responsibility_id is not None else None),
+                event_key=event_key,
             )
         finally:
             canonical_lease.close()

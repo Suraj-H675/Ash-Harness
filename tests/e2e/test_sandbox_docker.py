@@ -670,3 +670,91 @@ print(json.dumps(results, separators=(',', ':')))
                 prompt=prompts[0],
             )
         )
+
+
+
+@pytest.mark.skipif(
+    shutil.which("docker") is None or os.environ.get("ASH_RUN_DOCKER_TESTS") != "1",
+    reason="set ASH_RUN_DOCKER_TESTS=1 on a host with Docker",
+)
+def test_supervised_manual_responsibility_reuses_owner_bound_worker(
+    tmp_path: Path,
+) -> None:
+    from ash.coworker_worker import WORKER_RESPONSE
+    from ash.coworkers import (
+        CoworkerDirectory,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+    )
+
+    ash_dir = tmp_path / "ash"
+    (ash_dir / "profiles" / "alpha").mkdir(parents=True)
+    (ash_dir / "profiles" / "beta").mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = CoworkerDirectory.open(ash_dir)
+    alpha = directory.create(
+        owner_id="owner-alpha",
+        display_name="Alpha",
+        profile_name="alpha",
+        workspace=workspace,
+    )
+    beta = directory.create(
+        owner_id="owner-beta",
+        display_name="Beta",
+        profile_name="beta",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id=alpha.owner_id, coworker_id=alpha.coworker_id
+    )
+    other = directory.open_coworker(
+        owner_id=beta.owner_id, coworker_id=beta.coworker_id
+    )
+    responsibility = handle.create_responsibility(
+        scope="Synthetic release health check",
+        objective="Report the synthetic blocking condition.",
+        success_criteria=("Report the blocker",),
+    )
+    with pytest.raises(CoworkerNotFound):
+        other.get_responsibility(responsibility.responsibility_id)
+
+    report = asyncio.run(
+        handle.run_responsibility(
+            responsibility.responsibility_id, event_key="synthetic-release-1"
+        )
+    )
+    assert report.response == WORKER_RESPONSE
+    assert report.responsibility_id == responsibility.responsibility_id
+    assert report.event_key == "synthetic-release-1"
+    assert report.session_ref.coworker_id == alpha.coworker_id
+
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=alpha.owner_id, coworker_id=alpha.coworker_id
+    )
+    run, = reopened.list_responsibility_runs(responsibility.responsibility_id)
+    assert run.status == "completed"
+    assert run.session_id == report.session_ref.session_id
+    transcript, binding = reopened.load_session(run.session_id)
+    assert binding == report.session_ref
+    assert [message.role for message in transcript.messages] == ["user", "assistant"]
+    assert transcript.messages[0].content.startswith("Scope: Synthetic release health")
+    assert transcript.messages[1].content == WORKER_RESPONSE
+    assert transcript.tool_calls == []
+
+    with pytest.raises(CoworkerRuntimeUnavailable, match="(turn data|already claimed)"):
+        asyncio.run(
+            reopened.run_responsibility(
+                responsibility.responsibility_id,
+                event_key="synthetic-release-1",
+            )
+        )
+    reopened.set_responsibility_status(responsibility.responsibility_id, "paused")
+    with pytest.raises(CoworkerRuntimeUnavailable, match="not active"):
+        asyncio.run(
+            reopened.run_responsibility(
+                responsibility.responsibility_id,
+                event_key="synthetic-release-2",
+            )
+        )
+    assert len(reopened.list_responsibility_runs(responsibility.responsibility_id)) == 1

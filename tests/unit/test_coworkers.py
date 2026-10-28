@@ -35,6 +35,30 @@ def _profile(ash_dir: Path, name: str, *, settings: str = "") -> Path:
     return profile
 
 
+def _ready_coworker(
+    ash_dir: Path,
+    workspace: Path,
+    *,
+    owner_id: str = "owner-label",
+    profile_name: str = "worker",
+) -> tuple[object, object, object]:
+    from ash.coworkers import CoworkerDirectory
+
+    _profile(ash_dir, profile_name)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id=owner_id,
+        display_name=profile_name,
+        profile_name=profile_name,
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id=owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    return directory, identity, handle
+
+
 @pytest.mark.parametrize("existing_api_key", [None, "preexisting-process-key"])
 def test_explicit_profile_load_is_concurrent_and_does_not_publish_dotenv(
     tmp_path: Path,
@@ -227,6 +251,215 @@ def test_coworker_identity_restart_rename_and_session_leases(
         directory.open_coworker(
             owner_id="another-owner",
             coworker_id=created.coworker_id,
+        )
+
+
+def test_coworker_responsibilities_are_scoped_durable_and_owner_checked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from ash.coworkers import CoworkerDirectory, CoworkerDirectoryError, CoworkerNotFound
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    _, other_identity, other_handle = _ready_coworker(
+        ash_dir,
+        workspace,
+        profile_name="other",
+    )
+    responsibility = handle.create_responsibility(
+        scope="Weekly release health for service alpha",
+        objective="Review the latest release report and record the remaining blockers.",
+        success_criteria=("Name each open blocker", "Include the report date"),
+    )
+
+    assert responsibility.owner_id == identity.owner_id
+    assert responsibility.owner_uid == identity.owner_uid
+    assert responsibility.coworker_id == identity.coworker_id
+    assert responsibility.trigger_type == "manual"
+    assert responsibility.status == "active"
+    assert responsibility.created_at.tzinfo is not None
+    assert responsibility.success_criteria == (
+        "Name each open blocker",
+        "Include the report date",
+    )
+    assert handle.list_responsibilities() == [responsibility]
+    assert handle.get_responsibility(responsibility.responsibility_id) == responsibility
+    assert other_handle.list_responsibilities() == []
+    with pytest.raises(CoworkerNotFound):
+        other_handle.get_responsibility(responsibility.responsibility_id)
+    with pytest.raises(CoworkerNotFound):
+        directory.open_coworker(
+            owner_id="another-owner",
+            coworker_id=identity.coworker_id,
+        )
+
+    paused = handle.set_responsibility_status(
+        responsibility.responsibility_id,
+        "paused",
+    )
+    assert paused.status == "paused"
+    assert paused.paused_at is not None
+    assert paused.updated_at >= responsibility.updated_at
+    resumed = handle.set_responsibility_status(
+        responsibility.responsibility_id,
+        "active",
+    )
+    assert resumed.status == "active"
+    assert resumed.paused_at == paused.paused_at
+    completed = handle.set_responsibility_status(
+        responsibility.responsibility_id,
+        "completed",
+    )
+    assert completed.status == "completed"
+    assert completed.completed_at is not None
+    assert handle.set_responsibility_status(
+        responsibility.responsibility_id,
+        "completed",
+    ) == completed
+    with pytest.raises(CoworkerDirectoryError, match="cannot change"):
+        handle.set_responsibility_status(responsibility.responsibility_id, "active")
+
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert reopened.get_responsibility(responsibility.responsibility_id) == completed
+    assert other_identity.coworker_id != identity.coworker_id
+
+    replacement_uid = (identity.owner_uid or 0) + 1
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "UPDATE coworkers SET owner_uid = ? WHERE coworker_id = ?",
+            (replacement_uid, identity.coworker_id),
+        )
+    with pytest.raises(CoworkerDirectoryError, match="binding changed"):
+        handle.get_responsibility(responsibility.responsibility_id)
+
+
+
+
+def test_responsibility_management_requires_current_local_owner_uid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.coworkers import CoworkerRuntimeUnavailable
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    responsibility = handle.create_responsibility(
+        scope="Synthetic release",
+        objective="Report a synthetic release blocker.",
+    )
+
+    owner_uid = identity.owner_uid
+    assert owner_uid is not None
+    monkeypatch.setattr(
+        "ash.coworkers._current_owner_uid",
+        lambda: owner_uid + 1,
+    )
+    for operation in (
+        lambda: handle.create_responsibility(
+            scope="Forbidden responsibility", objective="Must be denied"
+        ),
+        handle.list_responsibilities,
+        lambda: handle.get_responsibility(responsibility.responsibility_id),
+        lambda: handle.set_responsibility_status(
+            responsibility.responsibility_id, "paused"
+        ),
+        lambda: handle.list_responsibility_runs(responsibility.responsibility_id),
+    ):
+        with pytest.raises(CoworkerRuntimeUnavailable, match="owner identity"):
+            operation()
+
+    monkeypatch.setattr("ash.coworkers._current_owner_uid", lambda: None)
+    with pytest.raises(CoworkerRuntimeUnavailable, match="owner identity"):
+        handle.get_responsibility(responsibility.responsibility_id)
+
+    # A legacy row with no claimed owner UID may still reopen sessions, but
+    # cannot claim authority over newly introduced responsibility management.
+    monkeypatch.setattr("ash.coworkers._current_owner_uid", lambda: owner_uid)
+    import sqlite3
+
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "UPDATE coworkers SET owner_uid = NULL WHERE coworker_id = ?",
+            (identity.coworker_id,),
+        )
+    legacy_handle = directory.open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    legacy_handle.ensure_canonical_conversation()
+    with pytest.raises(CoworkerRuntimeUnavailable, match="owner identity"):
+        legacy_handle.get_responsibility(responsibility.responsibility_id)
+
+def test_coworker_responsibility_validation_rejects_bad_contracts_and_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from ash.coworkers import CoworkerNotFound, CoworkerRuntimeUnavailable
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, _, handle = _ready_coworker(ash_dir, workspace)
+
+    with pytest.raises(ValueError, match="scope"):
+        handle.create_responsibility(scope=" ", objective="Review the report")
+    with pytest.raises(ValueError, match="objective"):
+        handle.create_responsibility(scope="Release review", objective="\0")
+    with pytest.raises(ValueError, match="success_criteria"):
+        handle.create_responsibility(
+            scope="Release review",
+            objective="Review the report",
+            success_criteria=tuple(f"criterion {index}" for index in range(9)),
+        )
+    with pytest.raises(ValueError, match="trigger_type"):
+        handle.create_responsibility(
+            scope="Release review",
+            objective="Review the report",
+            trigger_type="scheduled",
+        )
+    with pytest.raises(ValueError, match="responsibility_id"):
+        handle.get_responsibility("../responsibility")
+    with pytest.raises(ValueError, match="status"):
+        handle.set_responsibility_status(
+            "00000000-0000-4000-8000-000000000001",
+            "invalid",
+        )
+    with pytest.raises(CoworkerNotFound):
+        handle.get_responsibility("00000000-0000-4000-8000-000000000001")
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the report.",
+    )
+    with pytest.raises(ValueError, match="event_key"):
+        asyncio.run(
+            handle.run_responsibility(
+                responsibility.responsibility_id,
+                event_key="bad\nkey",
+            )
+        )
+    owner_uid = handle.identity.owner_uid
+    monkeypatch.setattr(
+        "ash.coworkers._current_owner_uid",
+        lambda: None if owner_uid is None else owner_uid + 1,
+    )
+    with pytest.raises(CoworkerRuntimeUnavailable, match="owner identity"):
+        asyncio.run(
+            handle.run_responsibility(
+                responsibility.responsibility_id,
+                event_key="valid-key",
+            )
         )
 
 
@@ -881,11 +1114,106 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (3,)
+        ).fetchone() == (4,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
         ).fetchone() == (None,)
+
+
+def test_coworker_directory_v3_migration_preserves_dispatch_history(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+    from uuid import uuid4
+
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = tmp_path / "ash"
+    ash_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    coworker_id = str(uuid4())
+    run_id = "prior-claimed-run"
+    with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
+        connection.execute(
+            "CREATE TABLE coworker_directory_meta (schema_version INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO coworker_directory_meta(schema_version) VALUES (3)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE coworkers (
+                coworker_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                owner_uid INTEGER,
+                display_name TEXT NOT NULL,
+                profile_name TEXT NOT NULL UNIQUE,
+                workspace_path TEXT NOT NULL,
+                canonical_session_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK(state IN ('provisioning', 'ready')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO coworkers (
+                coworker_id, owner_id, owner_uid, display_name, profile_name,
+                workspace_path, canonical_session_id, state, created_at, updated_at
+            ) VALUES (?, 'owner', NULL, 'Legacy', 'legacy', ?, ?, 'ready', 'now', 'now')
+            """,
+            (coworker_id, str(workspace), str(uuid4())),
+        )
+        connection.execute(
+            """
+            CREATE TABLE coworker_turn_dispatches (
+                owner_id TEXT NOT NULL,
+                coworker_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                request_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('claimed', 'completed')),
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY(owner_id, coworker_id, run_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO coworker_turn_dispatches (
+                owner_id, coworker_id, run_id, session_id, request_id,
+                status, created_at, completed_at
+            ) VALUES ('owner', ?, ?, ?, ?, 'claimed', 'now', NULL)
+            """,
+            (coworker_id, run_id, str(uuid4()), str(uuid4())),
+        )
+
+    CoworkerDirectory.open(ash_dir)
+
+    with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (4,)
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(coworker_turn_dispatches)"
+            )
+        }
+        assert {"responsibility_id", "trigger_type", "event_key"} <= columns
+        row = connection.execute(
+            "SELECT status, responsibility_id, trigger_type, event_key "
+            "FROM coworker_turn_dispatches WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        assert row == ("claimed", None, None, None)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coworker_responsibilities"
+        ).fetchone() == (0,)
 
 
 
@@ -1249,3 +1577,344 @@ def test_offline_coworker_response_rejects_unknown_or_malformed_protocol(
             request_id="00000000-0000-4000-8000-000000000001",
             session_id="00000000-0000-4000-8000-000000000002",
         )
+
+
+def test_paused_or_completed_responsibility_cannot_be_dispatched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from ash.coworkers import CoworkerRuntimeUnavailable
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, _, handle = _ready_coworker(ash_dir, workspace)
+    responsibility = handle.create_responsibility(
+        scope="Release readiness",
+        objective="Review the current release report.",
+    )
+
+    def reject_dispatch(**_settings: object) -> None:
+        pytest.fail("inactive responsibility reached worker setup")
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", reject_dispatch)
+    handle.set_responsibility_status(responsibility.responsibility_id, "paused")
+    with pytest.raises(CoworkerRuntimeUnavailable, match="not active"):
+        asyncio.run(
+            handle.run_responsibility(
+                responsibility.responsibility_id,
+                event_key="release-check-1",
+            )
+        )
+    handle.set_responsibility_status(responsibility.responsibility_id, "active")
+    handle.set_responsibility_status(responsibility.responsibility_id, "completed")
+    with pytest.raises(CoworkerRuntimeUnavailable, match="not active"):
+        asyncio.run(
+            handle.run_responsibility(
+                responsibility.responsibility_id,
+                event_key="release-check-2",
+            )
+        )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+def test_responsibility_pause_before_claim_prevents_worker_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from ash.coworkers import CoworkerRuntimeUnavailable
+    from ash.sandbox.manager import SandboxResult
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, _, handle = _ready_coworker(ash_dir, workspace)
+    responsibility = handle.create_responsibility(
+        scope="Release readiness",
+        objective="Review the current release report.",
+    )
+    dispatches = 0
+
+    class PauseBeforeClaim:
+        def __init__(self, **_settings: object) -> None:
+            handle.set_responsibility_status(
+                responsibility.responsibility_id,
+                "paused",
+            )
+            self.backend_name = "docker"
+
+        def has_aggregate_resource_limits(self) -> bool:
+            return True
+
+        async def _run_supervised_coworker_worker(
+            self,
+            **_settings: object,
+        ) -> SandboxResult:
+            nonlocal dispatches
+            dispatches += 1
+            return SandboxResult(
+                exit_code=70,
+                stdout="",
+                stderr="",
+                tier=3,
+                backend_name="docker",
+            )
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", PauseBeforeClaim)
+    with pytest.raises(CoworkerRuntimeUnavailable, match="not active"):
+        asyncio.run(
+            handle.run_responsibility(
+                responsibility.responsibility_id,
+                event_key="pause-race",
+            )
+        )
+
+    assert dispatches == 0
+    assert handle.list_responsibility_runs(responsibility.responsibility_id) == []
+    assert handle.get_responsibility(responsibility.responsibility_id).status == "paused"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+def test_manual_responsibility_run_records_cause_and_survives_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from ash.core.session import SessionStore
+    from ash.coworker_worker import _run_turn
+    from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
+    from ash.sandbox.manager import SandboxResult
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    responsibility = handle.create_responsibility(
+        scope="Release readiness for service alpha",
+        objective="Review the release report and identify outstanding blockers.",
+        success_criteria=("Name each blocker",),
+    )
+    dispatches = 0
+
+    class InProcessOfflineWorker:
+        def __init__(self, **settings: object) -> None:
+            assert settings["network"] is False
+            assert settings["workspace_read_only"] is True
+            assert settings["allow_scoped_fallback"] is False
+            assert settings["docker_image"] == "ash-coworker-worker:latest"
+            self.backend_name = "docker"
+
+        def has_aggregate_resource_limits(self) -> bool:
+            return True
+
+        async def _run_supervised_coworker_worker(
+            self,
+            *,
+            cwd: Path,
+            timeout: int,
+            state_directory: Path,
+        ) -> SandboxResult:
+            nonlocal dispatches
+            dispatches += 1
+            assert timeout == 45
+            request = json.loads((cwd / "request.json").read_text(encoding="utf-8"))
+            assert set(request) == {"version", "request_id", "session_id", "prompt"}
+            assert "Scope: Release readiness for service alpha" in request["prompt"]
+            assert "Name each blocker" in request["prompt"]
+            worker_store = SessionStore(state_directory / "sessions.db")
+            binding = worker_store._bind_coworker_worker_session(
+                request["session_id"],
+                identity.workspace,
+            )
+            result = await _run_turn(
+                request["request_id"],
+                request["session_id"],
+                request["prompt"],
+                session_store=worker_store,
+                binding=binding,
+            )
+            return SandboxResult(
+                exit_code=0,
+                stdout=json.dumps(result),
+                stderr="",
+                tier=3,
+                backend_name="docker",
+            )
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", InProcessOfflineWorker)
+    result = asyncio.run(
+        handle.run_responsibility(
+            responsibility.responsibility_id,
+            event_key="release-report-2026-10-28",
+        )
+    )
+
+    assert result.session_ref.run_id is not None
+    assert result.responsibility_id == responsibility.responsibility_id
+    assert result.trigger_type == "manual"
+    assert result.event_key == "release-report-2026-10-28"
+    assert result.response == "Ash offline coworker completed one supervised turn."
+    assert handle.get_responsibility(responsibility.responsibility_id).status == "active"
+    runs = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert len(runs) == 1
+    assert runs[0].event_key == "release-report-2026-10-28"
+    assert runs[0].trigger_type == "manual"
+    assert runs[0].run_id == result.session_ref.run_id
+    assert runs[0].session_id == result.session_ref.session_id
+    assert runs[0].status == "completed"
+    assert runs[0].completed_at is not None
+    assert dispatches == 1
+
+    isolated_home = ash_dir.parent
+    child_environment = {
+        "PATH": os.defpath,
+        "HOME": str(isolated_home),
+        "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+        "XDG_DATA_HOME": str(isolated_home / ".local" / "share"),
+        "XDG_CACHE_HOME": str(isolated_home / ".cache"),
+        "XDG_STATE_HOME": str(isolated_home / ".local" / "state"),
+        "TMPDIR": str(tmp_path),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+    }
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, sys; "
+            "from ash.coworkers import CoworkerDirectory; "
+            "handle = CoworkerDirectory.open().open_coworker("
+            "owner_id=sys.argv[1], coworker_id=sys.argv[2]); "
+            "item = handle.get_responsibility(sys.argv[3]); "
+            "runs = handle.list_responsibility_runs(item.responsibility_id); "
+            "print(json.dumps({'status': item.status, 'runs': len(runs), "
+            "'run_status': runs[0].status, 'session_id': runs[0].session_id}))",
+            identity.owner_id,
+            identity.coworker_id,
+            responsibility.responsibility_id,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=child_environment,
+    )
+    assert json.loads(child.stdout) == {
+        "status": "active",
+        "runs": 1,
+        "run_status": "completed",
+        "session_id": result.session_ref.session_id,
+    }
+
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert reopened.get_responsibility(responsibility.responsibility_id) == (
+        handle.get_responsibility(responsibility.responsibility_id)
+    )
+    transcript, binding = reopened.load_session(result.session_ref.session_id)
+    assert binding == result.session_ref
+    assert [message.role for message in transcript.messages] == ["user", "assistant"]
+    assert transcript.messages[1].content == result.response
+    with pytest.raises(CoworkerRuntimeUnavailable, match="turn data"):
+        asyncio.run(
+            reopened.run_responsibility(
+                responsibility.responsibility_id,
+                event_key="release-report-2026-10-28",
+            )
+        )
+    assert dispatches == 1
+    assert directory._get_owned(identity.owner_id, identity.coworker_id) == identity
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="offline worker staging requires Linux")
+@pytest.mark.parametrize("failure_kind", ["timeout", "unknown"])
+def test_concurrent_responsibility_event_is_claimed_once_after_ambiguous_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    import asyncio
+    from threading import Event, Lock
+
+    from ash.coworkers import CoworkerRuntimeUnavailable
+    from ash.sandbox.manager import SandboxResult
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, _, handle = _ready_coworker(ash_dir, workspace)
+    responsibility = handle.create_responsibility(
+        scope="Release readiness",
+        objective="Review the current release report.",
+    )
+    dispatch_started = Event()
+    release_dispatch = Event()
+    second_contender_started = Event()
+    calls = 0
+    calls_lock = Lock()
+
+    class AmbiguousOfflineWorker:
+        def __init__(self, **_settings: object) -> None:
+            self.backend_name = "docker"
+
+        def has_aggregate_resource_limits(self) -> bool:
+            return True
+
+        async def _run_supervised_coworker_worker(
+            self,
+            *,
+            cwd: Path,
+            timeout: int,
+            state_directory: Path,
+        ) -> SandboxResult:
+            nonlocal calls
+            del cwd, timeout, state_directory
+            with calls_lock:
+                calls += 1
+            dispatch_started.set()
+            if not release_dispatch.wait(timeout=5):
+                raise AssertionError("test did not release the dispatched worker")
+            return SandboxResult(
+                exit_code=-1,
+                stdout="",
+                stderr="",
+                tier=3,
+                backend_name="docker",
+                timed_out=failure_kind == "timeout",
+                outcome_unknown=failure_kind == "unknown",
+            )
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", AmbiguousOfflineWorker)
+
+    def contend(started: Event | None = None) -> object:
+        if started is not None:
+            started.set()
+        return asyncio.run(
+            handle.run_responsibility(
+                responsibility.responsibility_id,
+                event_key="same-manual-event",
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(contend)
+        assert dispatch_started.wait(timeout=5)
+        second = executor.submit(contend, second_contender_started)
+        assert second_contender_started.wait(timeout=5)
+        release_dispatch.set()
+        with pytest.raises(CoworkerRuntimeUnavailable, match="known result"):
+            first.result(timeout=10)
+        with pytest.raises(CoworkerRuntimeUnavailable, match="already claimed"):
+            second.result(timeout=10)
+
+    assert calls == 1
+    runs = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert len(runs) == 1
+    assert runs[0].event_key == "same-manual-event"
+    assert runs[0].status == "claimed"
