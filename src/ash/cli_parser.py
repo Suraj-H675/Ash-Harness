@@ -67,6 +67,64 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     )
     profile_remove.add_argument("name")
     profile_remove.add_argument("--yes", action="store_true")
+    crew_parser = subparsers.add_parser(
+        "crew",
+        help="Manage read-only, profile-scoped Ash coworkers",
+        description=(
+            "Create and ask profile-scoped coworkers. Model answers are proposals only; "
+            "Crew does not modify files."
+        ),
+    )
+    crew_subparsers = crew_parser.add_subparsers(
+        dest="crew_action", required=True
+    )
+    crew_create = crew_subparsers.add_parser(
+        "create", help="Bind a coworker to an existing named profile and workspace"
+    )
+    crew_create.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_create.add_argument("--name", required=True, help="Coworker display name")
+    crew_create.add_argument(
+        "--profile",
+        dest="crew_profile",
+        required=True,
+        help="Existing named Ash profile for this coworker",
+    )
+    crew_create.add_argument(
+        "--workspace",
+        required=True,
+        type=Path,
+        help="Existing workspace directory bound to this coworker",
+    )
+    crew_list = crew_subparsers.add_parser(
+        "list", help="List coworkers owned by the current local UID"
+    )
+    crew_list.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_ask = crew_subparsers.add_parser(
+        "ask",
+        help="Ask one read-only question with explicitly listed workspace files",
+    )
+    crew_ask.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_ask.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_ask.add_argument("--question", required=True, help="Question for this one-shot turn")
+    crew_ask.add_argument(
+        "--turn-id",
+        help="Stable printable one-shot ID; generated when omitted",
+    )
+    crew_ask.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        metavar="WORKSPACE_RELATIVE_PATH",
+        help="Explicit read-only evidence file; repeat for each file",
+    )
+    crew_history = crew_subparsers.add_parser(
+        "history", help="Show recent one-shot turn outcomes after reopening"
+    )
+    crew_history.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_history.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_history.add_argument(
+        "--limit", type=int, default=10, help="Number of recent outcomes to show (1-100)"
+    )
     providers_parser = subparsers.add_parser(
         "providers",
         help="List provider routes or test the active/provider model route",

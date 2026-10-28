@@ -74,8 +74,13 @@ def snapshot_scoped_file(
     guard: SafetyGuard,
     *,
     max_bytes: int | None = None,
+    require_single_link: bool = False,
 ) -> tuple[Path, ScopedFileSnapshot]:
-    """Capture one regular file without following a changed path component."""
+    """Capture one regular file without following a changed path component.
+
+    When ``require_single_link`` is true, reject files that have more than one
+    hard link. The link count is checked on the anchored entry and opened file.
+    """
 
     if max_bytes is not None and max_bytes < 0:
         raise ValueError("max_bytes cannot be negative")
@@ -88,6 +93,8 @@ def snapshot_scoped_file(
                     return target, _missing_snapshot()
                 if not stat.S_ISREG(existing.st_mode):
                     raise ScopedIOError(f"not a regular file: {target}")
+                if require_single_link:
+                    _require_single_link(existing, target)
                 flags = os.O_RDONLY | _flag("O_CLOEXEC") | _flag("O_NOFOLLOW")
                 try:
                     fd = os.open(name, flags, dir_fd=parent_fd)
@@ -97,10 +104,14 @@ def snapshot_scoped_file(
                     raise _scoped_open_error(target, exc) from exc
                 try:
                     opened = os.fstat(fd)
+                    if require_single_link:
+                        _require_single_link(opened, target)
                     if not _same_file(existing, opened):
                         raise ScopedFileChanged(f"file changed while opening: {target}")
                     content = _read_all(fd, max_bytes=max_bytes)
                     finished = os.fstat(fd)
+                    if require_single_link:
+                        _require_single_link(finished, target)
                     if not _same_snapshot(opened, finished):
                         raise ScopedFileChanged(f"file changed while reading: {target}")
                     return target, ScopedFileSnapshot(
@@ -113,7 +124,12 @@ def snapshot_scoped_file(
                     os.close(fd)
         except FileNotFoundError:
             return target, _missing_snapshot()
-    return target, _fallback_snapshot(target, guard, max_bytes=max_bytes)
+    return target, _fallback_snapshot(
+        target,
+        guard,
+        max_bytes=max_bytes,
+        require_single_link=require_single_link,
+    )
 
 
 def stat_scoped_path(
@@ -776,12 +792,20 @@ def _require_expected(actual: str, expected: str, target: Path) -> None:
 
 
 def _fallback_read(
-    target: Path, guard: SafetyGuard, *, max_bytes: int | None = None
+    target: Path,
+    guard: SafetyGuard,
+    *,
+    max_bytes: int | None = None,
+    require_single_link: bool = False,
 ) -> bytes:
     before = _fallback_identity(target)
     assert before is not None
+    if require_single_link:
+        _require_single_link(before, target)
     with target.open("rb") as handle:
         opened = os.fstat(handle.fileno())
+        if require_single_link:
+            _require_single_link(opened, target)
         if not stat.S_ISREG(opened.st_mode) or not _same_file(before, opened):
             raise ScopedFileChanged(f"file changed while opening: {target}")
         data = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
@@ -790,6 +814,8 @@ def _fallback_read(
     guard.validate_mutation_path(target)
     after = _fallback_identity(target)
     assert after is not None
+    if require_single_link:
+        _require_single_link(after, target)
     if not _same_snapshot(opened, after):
         raise ScopedFileChanged(f"file changed while reading: {target}")
     return data
@@ -804,17 +830,31 @@ def _fallback_snapshot(
     guard: SafetyGuard,
     *,
     max_bytes: int | None,
+    require_single_link: bool = False,
 ) -> ScopedFileSnapshot:
     existing = _fallback_identity(target, missing_ok=True)
     if existing is None:
         return _missing_snapshot()
     if not stat.S_ISREG(existing.st_mode):
         raise ScopedIOError(f"not a regular file: {target}")
-    content = _fallback_read(target, guard, max_bytes=max_bytes)
+    if require_single_link:
+        _require_single_link(existing, target)
+    content = _fallback_read(
+        target,
+        guard,
+        max_bytes=max_bytes,
+        require_single_link=require_single_link,
+    )
+    finished = _fallback_identity(target)
+    assert finished is not None
+    if require_single_link:
+        _require_single_link(finished, target)
+    if not _same_snapshot(existing, finished):
+        raise ScopedFileChanged(f"file changed while reading: {target}")
     return ScopedFileSnapshot(
         exists=True,
         content=content,
-        mode=existing.st_mode,
+        mode=finished.st_mode,
         sha256=hashlib.sha256(content).hexdigest(),
     )
 
@@ -1091,6 +1131,12 @@ def _same_optional_snapshot(
     if left is None or right is None:
         return left is right
     return _same_snapshot(left, right)
+
+
+def _require_single_link(metadata: os.stat_result, target: Path) -> None:
+    links = getattr(metadata, "st_nlink", None)
+    if type(links) is not int or links != 1:
+        raise ScopedIOError(f"file must have exactly one hard link: {target}")
 
 
 def _flag(name: str) -> int:

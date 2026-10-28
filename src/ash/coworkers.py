@@ -208,6 +208,18 @@ class CoworkerModelTurnResult:
     model: str
 
 
+@dataclass(frozen=True)
+class CoworkerReadOnlyTurnHistory:
+    """Bounded readback of one persisted profile-scoped model turn."""
+
+    session_ref: CoworkerSessionRef
+    status: Literal["claimed", "completed"]
+    created_at: str
+    completed_at: str | None
+    response: str | None
+    model: str | None
+
+
 def _validate_model_turn_text(value: str, field_name: str, *, required: bool) -> None:
     if not isinstance(value, str) or (required and not value.strip()) or "\0" in value:
         raise ValueError(f"{field_name} must be valid bounded text")
@@ -1738,6 +1750,24 @@ class CoworkerDirectory:
             raise CoworkerNotFound("coworker not found")
         return _record_from_row(row)
 
+    def list_for_local_owner(self, *, owner_id: str) -> tuple[Coworker, ...]:
+        """List only ready coworkers bound to the current effective UID."""
+
+        owner = _normalize_owner_id(owner_id)
+        owner_uid = _current_owner_uid()
+        if owner_uid is None:
+            raise CoworkerRuntimeUnavailable(
+                "local coworker owner identity could not be verified"
+            )
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM coworkers WHERE owner_id = ? AND owner_uid = ? "
+                "AND state = 'ready' "
+                "ORDER BY display_name COLLATE NOCASE, coworker_id",
+                (owner, owner_uid),
+            ).fetchall()
+        return tuple(_record_from_row(row) for row in rows)
+
     def _validate_handle_binding(
         self,
         handle: "CoworkerHandle",
@@ -2041,6 +2071,85 @@ class CoworkerDirectory:
                 (current.owner_id, current.coworker_id, identifier, limit),
             ).fetchall()
         return [_responsibility_run_from_row(row) for row in rows]
+
+    def _list_readonly_turn_history(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        limit: int,
+    ) -> tuple[CoworkerReadOnlyTurnHistory, ...]:
+        if type(limit) is not int or not 1 <= limit <= _MAX_RESPONSIBILITY_RUNS:
+            raise ValueError(f"limit must be between 1 and {_MAX_RESPONSIBILITY_RUNS}")
+        current = self._require_local_coworker_owner(handle)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT run_id, request_id, session_id, status, created_at, completed_at "
+                "FROM coworker_turn_dispatches WHERE owner_id = ? AND coworker_id = ? "
+                "AND responsibility_id IS NULL AND trigger_type IS NULL "
+                "AND substr(request_id, 15, 1) = '5' "
+                "ORDER BY created_at DESC, run_id LIMIT ?",
+                (current.owner_id, current.coworker_id, limit),
+            ).fetchall()
+
+        history: list[CoworkerReadOnlyTurnHistory] = []
+        for row in rows:
+            current = self._require_local_coworker_owner(handle)
+            run_id = str(row["run_id"])
+            try:
+                expected_request_id = str(uuid5(UUID(run_id), "request"))
+            except ValueError as exc:
+                raise CoworkerDirectoryError(
+                    "model turn history has invalid run identity"
+                ) from exc
+            if row["request_id"] != expected_request_id:
+                raise CoworkerDirectoryError(
+                    "model turn history request identity changed"
+                )
+            session_id = str(row["session_id"])
+            session, session_ref = handle.load_session(session_id)
+            if (
+                session_ref.coworker_id != current.coworker_id
+                or session_ref.run_id != run_id
+                or session_ref.session_id != session_id
+            ):
+                raise CoworkerDirectoryError(
+                    "model turn history session binding changed"
+                )
+
+            raw_status = str(row["status"])
+            if raw_status == "claimed":
+                status: Literal["claimed", "completed"] = "claimed"
+            elif raw_status == "completed":
+                status = "completed"
+            else:
+                raise CoworkerDirectoryError("model turn history has an invalid status")
+            response: str | None = None
+            model: str | None = None
+            if status == "completed":
+                assistant_messages = [
+                    message for message in session.messages if message.role == "assistant"
+                ]
+                if not assistant_messages:
+                    raise CoworkerDirectoryError(
+                        "completed model turn has no persisted response"
+                    )
+                response = assistant_messages[-1].content
+                model = session.model
+            history.append(
+                CoworkerReadOnlyTurnHistory(
+                    session_ref=session_ref,
+                    status=status,
+                    created_at=str(row["created_at"]),
+                    completed_at=(
+                        str(row["completed_at"])
+                        if row["completed_at"] is not None
+                        else None
+                    ),
+                    response=response,
+                    model=model,
+                )
+            )
+        return tuple(history)
 
     def _claim_offline_turn(
         self,
@@ -2551,6 +2660,20 @@ class CoworkerHandle:
     @property
     def identity(self) -> Coworker:
         return self._identity
+
+    def require_local_owner(self) -> Coworker:
+        """Recheck the persisted identity and current UID before local access."""
+
+        return self._directory._require_local_coworker_owner(self)
+
+    def list_readonly_turn_history(
+        self,
+        *,
+        limit: int = 20,
+    ) -> tuple[CoworkerReadOnlyTurnHistory, ...]:
+        """Return recent owner-checked one-shot model turns without profile data."""
+
+        return self._directory._list_readonly_turn_history(self, limit=limit)
 
     def create_responsibility(
         self,

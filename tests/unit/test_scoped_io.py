@@ -20,6 +20,7 @@ from ash.safety.scoped_io import (
     remove_scoped_file,
     read_scoped_bytes,
     restore_scoped_file,
+    snapshot_scoped_file,
     stat_scoped_path,
     workspace_mutation_lock,
 )
@@ -110,6 +111,35 @@ def test_scoped_read_rejects_in_scope_symlink(tmp_path) -> None:
 
     with pytest.raises(SafetyViolation, match="symlink or junction"):
         read_scoped_bytes(link, SafetyGuard(tmp_path))
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_scoped_snapshot_can_reject_hardlinks_without_changing_default(
+    tmp_path,
+    fallback: bool,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("evidence", encoding="utf-8")
+    alias = tmp_path / "alias.txt"
+    try:
+        os.link(target, alias)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Hard-link creation is unavailable: {exc}")
+
+    mode = (
+        patch("ash.safety.scoped_io._supports_anchored_io", return_value=False)
+        if fallback
+        else nullcontext()
+    )
+    with mode:
+        _, ordinary_snapshot = snapshot_scoped_file(target, SafetyGuard(tmp_path))
+        assert ordinary_snapshot.content == b"evidence"
+        with pytest.raises(ScopedIOError, match="exactly one hard link"):
+            snapshot_scoped_file(
+                target,
+                SafetyGuard(tmp_path),
+                require_single_link=True,
+            )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptor")
