@@ -1254,7 +1254,7 @@ def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (6,)
+        ).fetchone() == (7,)
         assert connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall() == []
@@ -1400,7 +1400,7 @@ def test_v5_coworker_directory_migration_adds_cursor_and_preserves_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (6,)
+        ).fetchone() == (7,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -2183,7 +2183,7 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (6,)
+        ).fetchone() == (7,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
@@ -2266,7 +2266,7 @@ def test_coworker_directory_v3_migration_preserves_dispatch_history(
     with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (6,)
+        ).fetchone() == (7,)
         columns = {
             str(row[1])
             for row in connection.execute(
@@ -3266,3 +3266,105 @@ def test_coworker_turn_request_rejects_malformed_and_oversized_fields() -> None:
             turn_id="secret",
             question="-----BEGIN OPENSSH PRIVATE KEY-----",
         )
+
+
+def test_v2_coworker_directory_migration_adds_file_approval_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from uuid import uuid4
+
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    coworker_id = str(uuid4())
+    canonical_session_id = str(uuid4())
+    with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
+        connection.execute(
+            "CREATE TABLE coworker_directory_meta (schema_version INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO coworker_directory_meta(schema_version) VALUES (2)"
+        )
+        connection.execute(
+            "CREATE TABLE coworkers ("
+            "coworker_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, owner_uid INTEGER, "
+            "display_name TEXT NOT NULL, profile_name TEXT NOT NULL UNIQUE, "
+            "workspace_path TEXT NOT NULL, canonical_session_id TEXT NOT NULL UNIQUE, "
+            "state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO coworkers VALUES (?, 'legacy-owner', ?, 'Legacy', "
+            "'legacy-v2', ?, ?, 'ready', '2026-01-01T00:00:00+00:00', "
+            "'2026-01-01T00:00:00+00:00')",
+            (
+                coworker_id,
+                os.geteuid(),
+                str(workspace),
+                canonical_session_id,
+            ),
+        )
+
+    directory = CoworkerDirectory.open(ash_dir)
+    assert directory._get_owned("legacy-owner", coworker_id).owner_uid == os.geteuid()
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (7,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coworker_file_approvals"
+        ).fetchone() == (0,)
+        assert {row[1] for row in connection.execute(
+            "PRAGMA table_info(coworker_turn_dispatches)"
+        )} >= {"workspace_device", "workspace_inode"}
+
+
+def test_v6_coworker_directory_migration_keeps_legacy_dispatch_unbound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from uuid import uuid4
+
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    run_id = str(uuid4())
+    ref = handle.begin_background_run(run_id)
+    request_id = str(uuid4())
+    directory._claim_offline_turn(
+        handle=handle,
+        run_id=run_id,
+        session_id=ref.session_id,
+        request_id=request_id,
+    )
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute("DROP TABLE coworker_file_approval_events")
+        connection.execute("DROP TABLE coworker_file_approvals")
+        connection.execute(
+            "ALTER TABLE coworker_turn_dispatches DROP COLUMN workspace_inode"
+        )
+        connection.execute(
+            "ALTER TABLE coworker_turn_dispatches DROP COLUMN workspace_device"
+        )
+        connection.execute(
+            "UPDATE coworker_directory_meta SET schema_version = 6"
+        )
+
+    CoworkerDirectory.open(ash_dir)
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (7,)
+        assert connection.execute(
+            "SELECT status, workspace_device, workspace_inode "
+            "FROM coworker_turn_dispatches WHERE run_id = ?",
+            (run_id,),
+        ).fetchone() == ("claimed", None, None)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

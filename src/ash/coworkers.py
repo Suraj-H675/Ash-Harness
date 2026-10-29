@@ -9,6 +9,7 @@ separate fixed offline worker remains networkless and unchanged.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -17,11 +18,13 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import unicodedata
 from collections.abc import AsyncGenerator, Iterator, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 from uuid import UUID, uuid4, uuid5
 
@@ -49,6 +52,17 @@ from ash.profiles import (
     profile_exists,
     validate_profile_name,
 )
+from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.grants import load_managed_permission_rules, load_permission_rules
+from ash.safety.policy import PermissionPolicy, PolicyAction
+from ash.safety.scoped_io import (
+    ScopedFileChanged,
+    ScopedIOError,
+    atomic_write_scoped_bytes,
+    snapshot_scoped_file,
+    stat_scoped_path,
+    workspace_mutation_lock,
+)
 from ash.coworker_worker import (
     WORKER_MAX_REQUEST_BYTES,
     WORKER_MAX_PROMPT_BYTES,
@@ -59,7 +73,7 @@ from ash.sandbox.docker import COWORKER_IMAGE, DEFAULT_IMAGE
 from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 6
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 7
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
 _MAX_RESPONSIBILITY_SCOPE_BYTES = 2048
@@ -78,6 +92,50 @@ _MODEL_TURN_TIMEOUT_SECONDS = 30
 _MODEL_TURN_MAX_PROMPT_BYTES = 16_384
 _MODEL_TURN_MAX_RESPONSE_BYTES = 8_192
 _MODEL_TURN_MAX_COMPLETION_TOKENS = 512
+_FILE_APPROVAL_TTL = timedelta(minutes=15)
+_FILE_APPROVAL_MAX_BYTES = 16_384
+_FILE_APPROVAL_POLICY_REVISION = 1
+_FILE_APPROVAL_STATUSES = frozenset(
+    {
+        "pending",
+        "approved",
+        "denied",
+        "expired",
+        "revoked",
+        "dispatching",
+        "succeeded",
+        "failed",
+        "blocked",
+        "ambiguous",
+    }
+)
+_FILE_APPROVAL_PROTECTED_COMPONENTS = frozenset(
+    {
+        ".agents",
+        ".ash",
+        ".aws",
+        ".azure",
+        ".claude",
+        ".codex",
+        ".config",
+        ".docker",
+        ".gcloud",
+        ".git",
+        ".gnupg",
+        ".kube",
+        ".ssh",
+        "ref",
+    }
+)
+_FILE_APPROVAL_PROTECTED_FILES = frozenset(
+    {"agents.md", "claude.md", "codex.md", "gemini.md"}
+)
+_FILE_APPROVAL_SENSITIVE_COMPONENT = re.compile(
+    r"(?:^|[._-])(?:credential|credentials|secret|secrets|password|passwords|"
+    r"token|private[_-]?key|id_rsa|id_ed25519|id_ecdsa|id_dsa|"
+    r"access[_-]?token|auth[_-]?token|api[_-]?key)(?:$|[._-])",
+    re.IGNORECASE,
+)
 _SECRET_NAME_PARTS = (
     "credential",
     "secret",
@@ -185,6 +243,7 @@ class CoworkerTurnRequest:
     turn_id: str
     question: str
     evidence: str = ""
+    workspace_identity: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -196,6 +255,14 @@ class CoworkerTurnRequest:
             raise ValueError("turn_id must be bounded printable ASCII text")
         _validate_model_turn_text(self.question, "question", required=True)
         _validate_model_turn_text(self.evidence, "evidence", required=False)
+        if self.workspace_identity is not None and (
+            len(self.workspace_identity) != 2
+            or type(self.workspace_identity[0]) is not int
+            or type(self.workspace_identity[1]) is not int
+            or self.workspace_identity[0] < 0
+            or self.workspace_identity[1] <= 0
+        ):
+            raise ValueError("workspace_identity must be a device and inode pair")
 
 
 @dataclass(frozen=True)
@@ -218,6 +285,75 @@ class CoworkerReadOnlyTurnHistory:
     completed_at: str | None
     response: str | None
     model: str | None
+
+
+CoworkerFileApprovalStatus = Literal[
+    "pending",
+    "approved",
+    "denied",
+    "expired",
+    "revoked",
+    "dispatching",
+    "succeeded",
+    "failed",
+    "blocked",
+    "ambiguous",
+]
+CoworkerFileApprovalAction = Literal["create", "replace"]
+
+
+@dataclass(frozen=True)
+class CoworkerFileApproval:
+    """One exact, one-shot Atlas-bound workspace file correction."""
+
+    approval_id: str
+    owner_id: str
+    owner_uid: int
+    coworker_id: str
+    profile_name: str
+    workspace: Path
+    workspace_device: int
+    workspace_inode: int
+    canonical_session_id: str
+    source_run_id: str
+    source_session_id: str
+    source_request_id: str
+    source_model: str
+    source_prompt_sha256: str
+    source_response_sha256: str
+    target_path: str
+    replacement_source_path: str
+    replacement_source_sha256: str
+    action: CoworkerFileApprovalAction
+    expected_sha256: str
+    expected_mode: int | None
+    expected_content: bytes
+    replacement_content: bytes
+    replacement_sha256: str
+    policy_revision: int
+    policy_sha256: str
+    approval_digest: str
+    status: CoworkerFileApprovalStatus
+    created_at: str
+    expires_at: str
+    decision: Literal["approve", "deny"] | None
+    decision_uid: int | None
+    decided_at: str | None
+    dispatch_started_at: str | None
+    finished_at: str | None
+    failure_code: str | None
+    observed_sha256: str | None
+    observed_at: str | None
+
+
+@dataclass(frozen=True)
+class CoworkerFileApprovalEvent:
+    """Append-only lifecycle record for one file approval."""
+
+    status: CoworkerFileApprovalStatus
+    occurred_at: str
+    actor_uid: int | None
+    detail: str
 
 
 def _validate_model_turn_text(value: str, field_name: str, *, required: bool) -> None:
@@ -1364,6 +1500,8 @@ def _create_coworker_turn_dispatches(
             completed_at TEXT,
             scheduled_for TEXT,
             skip_reason TEXT,
+            workspace_device INTEGER,
+            workspace_inode INTEGER,
             PRIMARY KEY(owner_id, coworker_id, run_id),
             CHECK (
                 (responsibility_id IS NULL AND trigger_type IS NULL
@@ -1385,6 +1523,376 @@ def _create_coworker_turn_dispatches(
         )
         """
     )
+
+
+def _create_coworker_file_approval_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS coworker_file_approvals (
+            approval_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            owner_uid INTEGER NOT NULL CHECK(owner_uid >= 0),
+            coworker_id TEXT NOT NULL,
+            profile_name TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            workspace_device INTEGER NOT NULL,
+            workspace_inode INTEGER NOT NULL,
+            canonical_session_id TEXT NOT NULL,
+            source_run_id TEXT NOT NULL,
+            source_session_id TEXT NOT NULL,
+            source_request_id TEXT NOT NULL,
+            source_model TEXT NOT NULL,
+            source_prompt_sha256 TEXT NOT NULL,
+            source_response_sha256 TEXT NOT NULL,
+            target_path TEXT NOT NULL,
+            replacement_source_path TEXT NOT NULL,
+            replacement_source_sha256 TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN ('create', 'replace')),
+            expected_sha256 TEXT NOT NULL,
+            expected_mode INTEGER,
+            expected_content BLOB NOT NULL,
+            replacement_content BLOB NOT NULL,
+            replacement_sha256 TEXT NOT NULL,
+            policy_revision INTEGER NOT NULL,
+            policy_sha256 TEXT NOT NULL,
+            approval_digest TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'pending', 'approved', 'denied', 'expired', 'revoked',
+                'dispatching', 'succeeded', 'failed', 'blocked', 'ambiguous'
+            )),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            decision TEXT CHECK(decision IS NULL OR decision IN ('approve', 'deny')),
+            decision_uid INTEGER,
+            decided_at TEXT,
+            dispatch_started_at TEXT,
+            finished_at TEXT,
+            failure_code TEXT,
+            observed_sha256 TEXT,
+            observed_at TEXT,
+            UNIQUE(owner_id, coworker_id, source_run_id),
+            FOREIGN KEY(owner_id, coworker_id)
+                REFERENCES coworkers(owner_id, coworker_id),
+            FOREIGN KEY(owner_id, coworker_id, source_run_id)
+                REFERENCES coworker_turn_dispatches(owner_id, coworker_id, run_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_coworker_file_approvals_owner_status "
+        "ON coworker_file_approvals(owner_id, coworker_id, status, created_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS coworker_file_approval_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            approval_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'pending', 'approved', 'denied', 'expired', 'revoked',
+                'dispatching', 'succeeded', 'failed', 'blocked', 'ambiguous'
+            )),
+            occurred_at TEXT NOT NULL,
+            actor_uid INTEGER,
+            detail TEXT NOT NULL,
+            FOREIGN KEY(approval_id)
+                REFERENCES coworker_file_approvals(approval_id)
+        )
+        """
+    )
+    approval_columns = {
+        str(column["name"])
+        for column in conn.execute("PRAGMA table_info(coworker_file_approvals)")
+    }
+    expected_approval_columns = {
+        "approval_id",
+        "owner_id",
+        "owner_uid",
+        "coworker_id",
+        "profile_name",
+        "workspace_path",
+        "workspace_device",
+        "workspace_inode",
+        "canonical_session_id",
+        "source_run_id",
+        "source_session_id",
+        "source_request_id",
+        "source_model",
+        "source_prompt_sha256",
+        "source_response_sha256",
+        "target_path",
+        "replacement_source_path",
+        "replacement_source_sha256",
+        "action",
+        "expected_sha256",
+        "expected_mode",
+        "expected_content",
+        "replacement_content",
+        "replacement_sha256",
+        "policy_revision",
+        "policy_sha256",
+        "approval_digest",
+        "status",
+        "created_at",
+        "expires_at",
+        "decision",
+        "decision_uid",
+        "decided_at",
+        "dispatch_started_at",
+        "finished_at",
+        "failure_code",
+        "observed_sha256",
+        "observed_at",
+    }
+    if approval_columns != expected_approval_columns:
+        raise CoworkerDirectoryError("coworker file approval schema is incomplete")
+
+
+_FILE_APPROVAL_IMMUTABLE_FIELDS = (
+    "approval_id",
+    "owner_id",
+    "owner_uid",
+    "coworker_id",
+    "profile_name",
+    "workspace_path",
+    "workspace_device",
+    "workspace_inode",
+    "canonical_session_id",
+    "source_run_id",
+    "source_session_id",
+    "source_request_id",
+    "source_model",
+    "source_prompt_sha256",
+    "source_response_sha256",
+    "target_path",
+    "replacement_source_path",
+    "replacement_source_sha256",
+    "action",
+    "expected_sha256",
+    "expected_mode",
+    "replacement_sha256",
+    "policy_revision",
+    "policy_sha256",
+    "created_at",
+    "expires_at",
+)
+_FILE_APPROVAL_TRANSITIONS: dict[str, frozenset[str]] = {
+    "pending": frozenset({"approved", "denied", "expired", "revoked"}),
+    "approved": frozenset({"dispatching", "expired", "revoked", "failed"}),
+    "dispatching": frozenset(
+        {"succeeded", "failed", "blocked", "ambiguous"}
+    ),
+    "denied": frozenset(),
+    "expired": frozenset(),
+    "revoked": frozenset(),
+    "succeeded": frozenset(),
+    "failed": frozenset(),
+    "blocked": frozenset(),
+    "ambiguous": frozenset(),
+}
+
+
+def _parse_file_approval_status(value: Any) -> CoworkerFileApprovalStatus:
+    match value:
+        case "pending":
+            return "pending"
+        case "approved":
+            return "approved"
+        case "denied":
+            return "denied"
+        case "expired":
+            return "expired"
+        case "revoked":
+            return "revoked"
+        case "dispatching":
+            return "dispatching"
+        case "succeeded":
+            return "succeeded"
+        case "failed":
+            return "failed"
+        case "blocked":
+            return "blocked"
+        case "ambiguous":
+            return "ambiguous"
+        case _:
+            raise CoworkerDirectoryError("file approval has an invalid status")
+
+
+def _parse_file_approval_action(value: Any) -> CoworkerFileApprovalAction:
+    match value:
+        case "create":
+            return "create"
+        case "replace":
+            return "replace"
+        case _:
+            raise CoworkerDirectoryError("file approval has an invalid action")
+
+
+def _parse_file_approval_decision(value: Any) -> Literal["approve", "deny"] | None:
+    match value:
+        case None:
+            return None
+        case "approve":
+            return "approve"
+        case "deny":
+            return "deny"
+        case _:
+            raise CoworkerDirectoryError("file approval has an invalid decision")
+
+
+def _file_approval_digest(values: Any) -> str:
+    payload: dict[str, Any] = {}
+    for field in _FILE_APPROVAL_IMMUTABLE_FIELDS:
+        value = values[field]
+        if isinstance(value, bytes):
+            value = hashlib.sha256(value).hexdigest()
+        payload[field] = value
+    payload["expected_content_sha256"] = hashlib.sha256(
+        values["expected_content"]
+    ).hexdigest()
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _approval_from_row(row: sqlite3.Row) -> CoworkerFileApproval:
+    expected_content = row["expected_content"]
+    replacement_content = row["replacement_content"]
+    if not isinstance(expected_content, bytes) or not isinstance(
+        replacement_content, bytes
+    ):
+        raise CoworkerDirectoryError("file approval content is invalid")
+    if (
+        hashlib.sha256(replacement_content).hexdigest() != row["replacement_sha256"]
+        or _file_approval_digest(row) != row["approval_digest"]
+    ):
+        raise CoworkerDirectoryError("file approval content or digest changed")
+    status = _parse_file_approval_status(row["status"])
+    action = _parse_file_approval_action(row["action"])
+    decision = _parse_file_approval_decision(row["decision"])
+    try:
+        UUID(str(row["approval_id"]))
+        UUID(str(row["source_run_id"]))
+        UUID(str(row["source_session_id"]))
+        UUID(str(row["source_request_id"]))
+        UUID(str(row["canonical_session_id"]))
+        datetime.fromisoformat(str(row["created_at"]))
+        datetime.fromisoformat(str(row["expires_at"]))
+    except (ValueError, TypeError) as exc:
+        raise CoworkerDirectoryError("file approval has invalid identity or time") from exc
+    return CoworkerFileApproval(
+        approval_id=str(row["approval_id"]),
+        owner_id=str(row["owner_id"]),
+        owner_uid=int(row["owner_uid"]),
+        coworker_id=str(row["coworker_id"]),
+        profile_name=str(row["profile_name"]),
+        workspace=Path(str(row["workspace_path"])),
+        workspace_device=int(row["workspace_device"]),
+        workspace_inode=int(row["workspace_inode"]),
+        canonical_session_id=str(row["canonical_session_id"]),
+        source_run_id=str(row["source_run_id"]),
+        source_session_id=str(row["source_session_id"]),
+        source_request_id=str(row["source_request_id"]),
+        source_model=str(row["source_model"]),
+        source_prompt_sha256=str(row["source_prompt_sha256"]),
+        source_response_sha256=str(row["source_response_sha256"]),
+        target_path=str(row["target_path"]),
+        replacement_source_path=str(row["replacement_source_path"]),
+        replacement_source_sha256=str(row["replacement_source_sha256"]),
+        action=action,
+        expected_sha256=str(row["expected_sha256"]),
+        expected_mode=(
+            int(row["expected_mode"]) if row["expected_mode"] is not None else None
+        ),
+        expected_content=expected_content,
+        replacement_content=replacement_content,
+        replacement_sha256=str(row["replacement_sha256"]),
+        policy_revision=int(row["policy_revision"]),
+        policy_sha256=str(row["policy_sha256"]),
+        approval_digest=str(row["approval_digest"]),
+        status=status,
+        created_at=str(row["created_at"]),
+        expires_at=str(row["expires_at"]),
+        decision=decision,
+        decision_uid=(int(row["decision_uid"]) if row["decision_uid"] is not None else None),
+        decided_at=(str(row["decided_at"]) if row["decided_at"] is not None else None),
+        dispatch_started_at=(
+            str(row["dispatch_started_at"])
+            if row["dispatch_started_at"] is not None
+            else None
+        ),
+        finished_at=(str(row["finished_at"]) if row["finished_at"] is not None else None),
+        failure_code=(str(row["failure_code"]) if row["failure_code"] is not None else None),
+        observed_sha256=(
+            str(row["observed_sha256"])
+            if row["observed_sha256"] is not None
+            else None
+        ),
+        observed_at=(str(row["observed_at"]) if row["observed_at"] is not None else None),
+    )
+
+
+def _validate_file_approval_path(raw_path: str, *, label: str) -> str:
+    if not isinstance(raw_path, str) or not raw_path or "\\" in raw_path:
+        raise ValueError(f"{label} must be a workspace-relative path")
+    if any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+        for character in raw_path
+    ):
+        raise ValueError(f"{label} cannot contain control or format characters")
+    windows_path = PureWindowsPath(raw_path)
+    if Path(raw_path).is_absolute() or windows_path.is_absolute() or windows_path.drive:
+        raise ValueError(f"{label} must be workspace-relative")
+    components = raw_path.split("/")
+    if any(component in {"", ".", ".."} for component in components):
+        raise ValueError(f"{label} cannot contain traversal components")
+    for component in components:
+        folded = component.casefold()
+        if (
+            folded in _FILE_APPROVAL_PROTECTED_COMPONENTS
+            or folded.startswith(".env")
+            or folded in {".netrc", ".npmrc", ".pypirc", ".dockerconfigjson"}
+            or PurePosixPath(folded).suffix
+            in {".pem", ".key", ".p12", ".pfx", ".ppk", ".keystore", ".jks"}
+            or _FILE_APPROVAL_SENSITIVE_COMPONENT.search(component) is not None
+        ):
+            raise ValueError(f"{label} is in a protected or sensitive path")
+    if components[-1].casefold() in _FILE_APPROVAL_PROTECTED_FILES:
+        raise ValueError(f"{label} is a protected instruction file")
+    return PurePosixPath(*components).as_posix()
+
+
+def _validated_file_approval_text(
+    content: bytes,
+    *,
+    label: str,
+    profile_secrets: Sequence[str] = (),
+) -> str:
+    if not isinstance(content, bytes) or len(content) > _FILE_APPROVAL_MAX_BYTES:
+        raise ValueError(f"{label} exceeds the bounded text size")
+    if b"\0" in content:
+        raise ValueError(f"{label} must be UTF-8 text")
+    try:
+        text = content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label} must be UTF-8 text") from exc
+    if any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+        and character not in {"\n", "\r", "\t"}
+        for character in text
+    ):
+        raise ValueError(f"{label} contains control or format characters")
+    if redact_known_secrets(text) != text or any(
+        pattern.search(text) for pattern in _SECRET_CONTENT_PATTERNS
+    ):
+        raise ValueError(f"{label} contains a recognized secret")
+    if any(secret and secret in text for secret in profile_secrets):
+        raise ValueError(f"{label} contains a bound profile secret")
+    return text
 
 
 class CoworkerDirectory:
@@ -1410,6 +1918,11 @@ class CoworkerDirectory:
 
     def _connect(self) -> sqlite3.Connection:
         return get_db_connection(self.db_path)
+
+    def _connect_durable(self) -> sqlite3.Connection:
+        connection = self._connect()
+        connection.execute("PRAGMA synchronous=FULL;")
+        return connection
 
     def _initialize(self) -> None:
         try:
@@ -1492,7 +2005,7 @@ class CoworkerDirectory:
                         (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
                     )
                     version = _COWORKER_DIRECTORY_SCHEMA_VERSION
-                if version not in {4, 5, _COWORKER_DIRECTORY_SCHEMA_VERSION}:
+                if version not in {4, 5, 6, _COWORKER_DIRECTORY_SCHEMA_VERSION}:
                     raise CoworkerDirectoryError(
                         "coworker directory schema version is unsupported: "
                         f"{version}"
@@ -1586,6 +2099,8 @@ class CoworkerDirectory:
                     "completed_at",
                     "scheduled_for",
                     "skip_reason",
+                    "workspace_device",
+                    "workspace_inode",
                 }
                 for name, declaration in (
                     (
@@ -1602,6 +2117,8 @@ class CoworkerDirectory:
                     ),
                     ("scheduled_for", "TEXT"),
                     ("skip_reason", "TEXT"),
+                    ("workspace_device", "INTEGER"),
+                    ("workspace_inode", "INTEGER"),
                 ):
                     if name not in dispatch_columns:
                         conn.execute(
@@ -1628,7 +2145,7 @@ class CoworkerDirectory:
                     else ""
                 )
                 if dispatch_was_present and (
-                    original_version < _COWORKER_DIRECTORY_SCHEMA_VERSION
+                    original_version < 6
                     or "scheduled" not in dispatch_schema
                     or "skipped" not in dispatch_schema
                 ):
@@ -1729,6 +2246,7 @@ class CoworkerDirectory:
                     raise CoworkerDirectoryError(
                         "coworker responsibility schedule schema is incomplete"
                     )
+                _create_coworker_file_approval_tables(conn)
                 conn.execute(
                     "UPDATE coworker_directory_meta SET schema_version = ?",
                     (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
@@ -2162,6 +2680,7 @@ class CoworkerDirectory:
         event_key: str | None = None,
         scheduled_for: datetime | None = None,
         prompt: str | None = None,
+        workspace_identity: tuple[int, int] | None = None,
     ) -> CoworkerScheduleTickResult | None:
         """Durably consume one run key before model or worker dispatch."""
 
@@ -2170,6 +2689,15 @@ class CoworkerDirectory:
             raise ValueError("responsibility_id and event_key must be supplied together")
         if scheduled_for is not None and responsibility_id is None:
             raise ValueError("scheduled occurrence requires a responsibility")
+        if workspace_identity is not None and (
+            responsibility_id is not None
+            or len(workspace_identity) != 2
+            or type(workspace_identity[0]) is not int
+            or type(workspace_identity[1]) is not int
+            or workspace_identity[0] < 0
+            or workspace_identity[1] <= 0
+        ):
+            raise ValueError("workspace identity is invalid for this dispatch")
         normalized_responsibility_id = (
             _normalize_responsibility_id(responsibility_id)
             if responsibility_id is not None
@@ -2213,6 +2741,11 @@ class CoworkerDirectory:
                     raise CoworkerRuntimeUnavailable(
                         "local coworker owner identity could not be verified"
                     )
+                if workspace_identity is not None:
+                    SafetyGuard(
+                        current.workspace,
+                        expected_project_root_identity=workspace_identity,
+                    ).ensure_project_root_current()
                 responsibility_record: CoworkerResponsibility | None = None
                 if normalized_responsibility_id is not None:
                     responsibility_row = conn.execute(
@@ -2377,8 +2910,9 @@ class CoworkerDirectory:
                     "INSERT INTO coworker_turn_dispatches "
                     "(owner_id, coworker_id, run_id, session_id, request_id, "
                     "status, responsibility_id, trigger_type, event_key, "
-                    "created_at, completed_at, scheduled_for, skip_reason) "
-                    "VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, NULL, ?, NULL)",
+                    "created_at, completed_at, scheduled_for, skip_reason, "
+                    "workspace_device, workspace_inode) "
+                    "VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, NULL, ?, NULL, ?, ?)",
                     (
                         identity.owner_id,
                         identity.coworker_id,
@@ -2394,6 +2928,8 @@ class CoworkerDirectory:
                             if normalized_scheduled_for is not None
                             else None
                         ),
+                        workspace_identity[0] if workspace_identity else None,
+                        workspace_identity[1] if workspace_identity else None,
                     ),
                 )
         except sqlite3.IntegrityError as exc:
@@ -2471,6 +3007,998 @@ class CoworkerDirectory:
                 "local coworker owner identity could not be verified"
             )
         return current
+
+    def _require_completed_atlas_turn(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        run_id: str,
+        session_id: str,
+        request_id: str,
+    ) -> tuple[Coworker, Session, tuple[int, int], str, str]:
+        current = self._require_local_coworker_owner(handle)
+        if current.profile_name != "atlas":
+            raise CoworkerRuntimeUnavailable(
+                "file corrections require the Atlas profile-bound coworker"
+            )
+        try:
+            normalized_run_id = str(UUID(run_id))
+            normalized_session_id = str(UUID(session_id))
+            normalized_request_id = str(UUID(request_id))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("source run, session, and request IDs must be UUIDs") from exc
+        if normalized_request_id != str(uuid5(UUID(normalized_run_id), "request")):
+            raise CoworkerRuntimeUnavailable("source request identity does not match its run")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM coworker_turn_dispatches WHERE owner_id = ? "
+                "AND coworker_id = ? AND run_id = ? AND session_id = ? "
+                "AND request_id = ?",
+                (
+                    current.owner_id,
+                    current.coworker_id,
+                    normalized_run_id,
+                    normalized_session_id,
+                    normalized_request_id,
+                ),
+            ).fetchone()
+        if (
+            row is None
+            or row["status"] != "completed"
+            or row["responsibility_id"] is not None
+            or row["trigger_type"] is not None
+            or row["workspace_device"] is None
+            or row["workspace_inode"] is None
+        ):
+            raise CoworkerRuntimeUnavailable(
+                "source must be a completed owner-bound Atlas read-only turn"
+            )
+        workspace_identity = (int(row["workspace_device"]), int(row["workspace_inode"]))
+        guard = SafetyGuard(
+            current.workspace,
+            expected_project_root_identity=workspace_identity,
+        )
+        guard.ensure_project_root_current()
+        session, binding = handle.load_session(normalized_session_id)
+        if (
+            binding.coworker_id != current.coworker_id
+            or binding.run_id != normalized_run_id
+            or binding.session_id != normalized_session_id
+            or binding.canonical_session_id != current.canonical_session_id
+            or session.session_id != normalized_session_id
+            or len(session.messages) != 2
+            or tuple(message.role for message in session.messages)
+            != ("user", "assistant")
+            or session.messages[0].metadata.get("coworker_request_id")
+            != normalized_request_id
+            or session.tool_calls
+            or not session.messages[0].content.strip()
+            or not session.messages[1].content.strip()
+            or len(session.messages[0].content.encode("utf-8", errors="strict"))
+            > _MODEL_TURN_MAX_PROMPT_BYTES
+            or len(session.messages[1].content.encode("utf-8", errors="strict"))
+            > _MODEL_TURN_MAX_RESPONSE_BYTES
+        ):
+            raise CoworkerRuntimeUnavailable(
+                "source transcript is not the exact completed read-only turn"
+            )
+        self._require_local_coworker_owner(handle)
+        return (
+            current,
+            session,
+            workspace_identity,
+            hashlib.sha256(session.messages[0].content.encode("utf-8")).hexdigest(),
+            hashlib.sha256(session.messages[1].content.encode("utf-8")).hexdigest(),
+        )
+
+    def _file_effect_policy(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        target_path: str,
+        replacement: bytes,
+        action: Literal["create", "replace"],
+    ) -> tuple[str, PolicyAction]:
+        current = self._require_local_coworker_owner(handle)
+        config = self._effective_config(current)
+        managed_rules = load_managed_permission_rules(current.workspace)
+        persistent_rules = load_permission_rules(current.workspace)
+        mode = config.safety_tier
+        policy = PermissionPolicy(
+            mode,
+            managed_rules=managed_rules,
+            persistent_rules=persistent_rules,
+        )
+        decision = policy.evaluate(
+            "write_file",
+            {
+                "file_path": target_path,
+                "content": replacement.decode("utf-8"),
+                "overwrite": action == "replace",
+            },
+        )
+        snapshot = {
+            "revision": _FILE_APPROVAL_POLICY_REVISION,
+            "mode": mode,
+            "managed_rules": sorted(
+                (rule.as_payload() for rule in managed_rules),
+                key=lambda value: str(value["id"]),
+            ),
+            "persistent_rules": sorted(
+                (rule.as_payload() for rule in persistent_rules),
+                key=lambda value: str(value["id"]),
+            ),
+        }
+        encoded = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest(), decision.action
+
+    def _file_effect_target_snapshot(
+        self,
+        *,
+        current: Coworker,
+        workspace_identity: tuple[int, int],
+        relative_path: str,
+        owner_uid: int,
+    ) -> tuple[SafetyGuard, Path, Any, int | None]:
+        normalized = _validate_file_approval_path(relative_path, label="target path")
+        guard = SafetyGuard(
+            current.workspace,
+            expected_project_root_identity=workspace_identity,
+        )
+        guard.ensure_project_root_current()
+        _, root_metadata = stat_scoped_path(guard.project_root, guard)
+        if (
+            root_metadata.st_uid != owner_uid
+            or root_metadata.st_dev != workspace_identity[0]
+            or root_metadata.st_ino != workspace_identity[1]
+        ):
+            raise CoworkerRuntimeUnavailable(
+                "workspace root is not owned by the authorized local owner"
+            )
+        target = guard.validate_mutation_path(normalized)
+        _, parent_metadata = stat_scoped_path(target.parent, guard)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != owner_uid
+            or parent_metadata.st_dev != workspace_identity[0]
+        ):
+            raise CoworkerRuntimeUnavailable(
+                "target parent is not an owner-controlled workspace directory"
+            )
+        _, snapshot = snapshot_scoped_file(
+            target,
+            guard,
+            max_bytes=_FILE_APPROVAL_MAX_BYTES,
+            require_single_link=True,
+        )
+        mode: int | None = None
+        if snapshot.exists:
+            _, metadata = stat_scoped_path(target, guard)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != owner_uid
+                or metadata.st_dev != workspace_identity[0]
+                or getattr(metadata, "st_nlink", None) != 1
+            ):
+                raise CoworkerRuntimeUnavailable(
+                    "target is not an owner-owned single-link workspace file"
+                )
+            mode = stat.S_IMODE(metadata.st_mode)
+        return guard, target, snapshot, mode
+
+    def _prepare_file_approval(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        run_id: str,
+        session_id: str,
+        request_id: str,
+        target_path: str,
+        replacement_file_path: str,
+    ) -> CoworkerFileApproval:
+        (
+            current,
+            session,
+            workspace_identity,
+            prompt_sha256,
+            response_sha256,
+        ) = self._require_completed_atlas_turn(
+            handle,
+            run_id=run_id,
+            session_id=session_id,
+            request_id=request_id,
+        )
+        target_path = _validate_file_approval_path(target_path, label="target path")
+        replacement_file_path = _validate_file_approval_path(
+            replacement_file_path,
+            label="replacement file path",
+        )
+        if replacement_file_path == target_path:
+            raise ValueError("replacement source and target must be different files")
+        profile_secrets = _profile_provider_secrets(self._effective_config(current))
+        guard, target, target_snapshot, expected_mode = self._file_effect_target_snapshot(
+            current=current,
+            workspace_identity=workspace_identity,
+            relative_path=target_path,
+            owner_uid=current.owner_uid if current.owner_uid is not None else -1,
+        )
+        try:
+            source, source_snapshot = snapshot_scoped_file(
+                replacement_file_path,
+                guard,
+                max_bytes=_FILE_APPROVAL_MAX_BYTES,
+                require_single_link=True,
+            )
+        except ScopedIOError as exc:
+            if str(exc).startswith("file exceeds "):
+                raise ValueError(
+                    "replacement source exceeds the 16 KiB file approval limit"
+                ) from exc
+            raise
+        if not source_snapshot.exists:
+            raise ValueError("replacement source file does not exist")
+        _, source_metadata = stat_scoped_path(source, guard)
+        if (
+            not stat.S_ISREG(source_metadata.st_mode)
+            or source_metadata.st_uid != current.owner_uid
+            or source_metadata.st_dev != workspace_identity[0]
+            or getattr(source_metadata, "st_nlink", None) != 1
+        ):
+            raise CoworkerRuntimeUnavailable(
+                "replacement source is not an owner-owned single-link text file"
+            )
+        _validated_file_approval_text(
+            source_snapshot.content,
+            label="replacement source",
+            profile_secrets=profile_secrets,
+        )
+        if target_snapshot.exists:
+            _validated_file_approval_text(
+                target_snapshot.content,
+                label="target file",
+                profile_secrets=profile_secrets,
+            )
+            if target_snapshot.sha256 == source_snapshot.sha256:
+                raise ValueError("replacement has no file-content change")
+        action: Literal["create", "replace"] = (
+            "replace" if target_snapshot.exists else "create"
+        )
+        policy_sha256, policy_action = self._file_effect_policy(
+            handle,
+            target_path=target_path,
+            replacement=source_snapshot.content,
+            action=action,
+        )
+        if policy_action == PolicyAction.DENY:
+            raise CoworkerRuntimeUnavailable(
+                "current Ash policy denies this exact workspace file effect"
+            )
+        now = _current_time()
+        created_at = now.isoformat()
+        expires_at = (now + _FILE_APPROVAL_TTL).isoformat()
+        approval_id = str(uuid4())
+        values: dict[str, Any] = {
+            "approval_id": approval_id,
+            "owner_id": current.owner_id,
+            "owner_uid": current.owner_uid,
+            "coworker_id": current.coworker_id,
+            "profile_name": current.profile_name,
+            "workspace_path": str(current.workspace),
+            "workspace_device": workspace_identity[0],
+            "workspace_inode": workspace_identity[1],
+            "canonical_session_id": current.canonical_session_id,
+            "source_run_id": str(UUID(run_id)),
+            "source_session_id": str(UUID(session_id)),
+            "source_request_id": str(UUID(request_id)),
+            "source_model": session.model,
+            "source_prompt_sha256": prompt_sha256,
+            "source_response_sha256": response_sha256,
+            "target_path": target_path,
+            "replacement_source_path": replacement_file_path,
+            "replacement_source_sha256": source_snapshot.sha256,
+            "action": action,
+            "expected_sha256": target_snapshot.sha256,
+            "expected_mode": expected_mode,
+            "expected_content": target_snapshot.content,
+            "replacement_content": source_snapshot.content,
+            "replacement_sha256": source_snapshot.sha256,
+            "policy_revision": _FILE_APPROVAL_POLICY_REVISION,
+            "policy_sha256": policy_sha256,
+            "created_at": created_at,
+            "expires_at": expires_at,
+        }
+        approval_digest = _file_approval_digest(values)
+        columns = (*_FILE_APPROVAL_IMMUTABLE_FIELDS[:-2], "expected_content", "replacement_content", "approval_digest", "status", "created_at", "expires_at")
+        insert_values = {
+            **values,
+            "approval_digest": approval_digest,
+            "status": "pending",
+        }
+        column_sql = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
+        try:
+            with closing(self._connect_durable()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                latest = self._require_local_coworker_owner(handle)
+                if latest != current:
+                    raise CoworkerRuntimeUnavailable(
+                        "coworker binding changed before approval was recorded"
+                    )
+                conn.execute(
+                    f"INSERT INTO coworker_file_approvals ({column_sql}) "
+                    f"VALUES ({placeholders})",
+                    tuple(insert_values[column] for column in columns),
+                )
+                self._append_file_approval_event(
+                    conn,
+                    approval_id=approval_id,
+                    status="pending",
+                    actor_uid=current.owner_uid,
+                    detail="proposed",
+                    occurred_at=created_at,
+                )
+        except sqlite3.IntegrityError as exc:
+            raise CoworkerRuntimeUnavailable(
+                "this source run already has a file approval; inspect its existing approval"
+            ) from exc
+        return self._get_file_approval(handle, approval_id)
+
+    def _append_file_approval_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        approval_id: str,
+        status: CoworkerFileApprovalStatus,
+        actor_uid: int | None,
+        detail: str,
+        occurred_at: str | None = None,
+    ) -> None:
+        if status not in _FILE_APPROVAL_STATUSES or not detail.isascii():
+            raise CoworkerDirectoryError("file approval event is invalid")
+        conn.execute(
+            "INSERT INTO coworker_file_approval_events "
+            "(approval_id, status, occurred_at, actor_uid, detail) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (approval_id, status, occurred_at or _now(), actor_uid, detail),
+        )
+
+    def _file_approval_events(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        approval_id: str,
+        status: str,
+    ) -> tuple[CoworkerFileApprovalEvent, ...]:
+        rows = conn.execute(
+            "SELECT status, occurred_at, actor_uid, detail "
+            "FROM coworker_file_approval_events WHERE approval_id = ? "
+            "ORDER BY event_id",
+            (approval_id,),
+        ).fetchall()
+        events: list[CoworkerFileApprovalEvent] = []
+        previous: str | None = None
+        for row in rows:
+            event_status = _parse_file_approval_status(row["status"])
+            if previous is None:
+                if event_status != "pending":
+                    raise CoworkerDirectoryError("file approval history has no proposal event")
+            elif event_status not in _FILE_APPROVAL_TRANSITIONS[previous]:
+                raise CoworkerDirectoryError("file approval history has an invalid transition")
+            previous = event_status
+            events.append(
+                CoworkerFileApprovalEvent(
+                    status=event_status,
+                    occurred_at=str(row["occurred_at"]),
+                    actor_uid=(
+                        int(row["actor_uid"]) if row["actor_uid"] is not None else None
+                    ),
+                    detail=str(row["detail"]),
+                )
+            )
+        if not events or previous != status:
+            raise CoworkerDirectoryError("file approval status and history disagree")
+        return tuple(events)
+
+    def _get_file_approval(
+        self,
+        handle: "CoworkerHandle",
+        approval_id: str,
+    ) -> CoworkerFileApproval:
+        try:
+            normalized_id = str(UUID(approval_id))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("approval ID must be a UUID") from exc
+        current = self._require_local_coworker_owner(handle)
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM coworker_file_approvals WHERE approval_id = ? "
+                "AND owner_id = ? AND coworker_id = ?",
+                (normalized_id, current.owner_id, current.coworker_id),
+            ).fetchone()
+            if row is None:
+                raise CoworkerNotFound("file approval not found")
+            approval = _approval_from_row(row)
+            self._file_approval_events(
+                conn,
+                approval_id=approval.approval_id,
+                status=approval.status,
+            )
+        if (
+            approval.owner_id != current.owner_id
+            or approval.owner_uid != current.owner_uid
+            or approval.coworker_id != current.coworker_id
+            or approval.profile_name != current.profile_name
+            or approval.workspace != current.workspace
+            or approval.canonical_session_id != current.canonical_session_id
+        ):
+            raise CoworkerDirectoryError("file approval owner binding changed")
+        return approval
+
+    def _list_file_approvals(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        limit: int,
+    ) -> tuple[CoworkerFileApproval, ...]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("approval limit must be between 1 and 100")
+        current = self._require_local_coworker_owner(handle)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM coworker_file_approvals WHERE owner_id = ? "
+                "AND coworker_id = ? ORDER BY created_at DESC, approval_id LIMIT ?",
+                (current.owner_id, current.coworker_id, limit),
+            ).fetchall()
+            approvals: list[CoworkerFileApproval] = []
+            for row in rows:
+                approval = _approval_from_row(row)
+                self._file_approval_events(
+                    conn,
+                    approval_id=approval.approval_id,
+                    status=approval.status,
+                )
+                approvals.append(approval)
+        for approval in approvals:
+            if (
+                approval.owner_uid != current.owner_uid
+                or approval.profile_name != current.profile_name
+                or approval.workspace != current.workspace
+                or approval.canonical_session_id != current.canonical_session_id
+            ):
+                raise CoworkerDirectoryError("file approval owner binding changed")
+        return tuple(approvals)
+
+    def _transition_file_approval(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        approval_id: str,
+        expected_status: CoworkerFileApprovalStatus,
+        status: CoworkerFileApprovalStatus,
+        detail: str,
+        decision: Literal["approve", "deny"] | None = None,
+        dispatch_started: bool = False,
+        finished: bool = False,
+        failure_code: str | None = None,
+        observed_sha256: str | None = None,
+        observation_recorded: bool = False,
+    ) -> CoworkerFileApproval:
+        if status not in _FILE_APPROVAL_TRANSITIONS[expected_status]:
+            raise CoworkerDirectoryError("file approval transition is not permitted")
+        current_uid = _current_owner_uid()
+        if current_uid is None or current_uid != handle.identity.owner_uid:
+            raise CoworkerRuntimeUnavailable(
+                "local coworker owner identity could not be verified"
+            )
+        now = _now()
+        updates: dict[str, Any] = {"status": status}
+        if decision is not None:
+            updates.update(
+                decision=decision,
+                decision_uid=current_uid,
+                decided_at=now,
+            )
+        if dispatch_started:
+            updates["dispatch_started_at"] = now
+        if finished:
+            updates["finished_at"] = now
+        if failure_code is not None:
+            updates["failure_code"] = failure_code
+        if observation_recorded:
+            updates["observed_sha256"] = observed_sha256
+            updates["observed_at"] = now
+        assignments = ", ".join(f"{column} = ?" for column in updates)
+        try:
+            with closing(self._connect_durable()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                owner_row = conn.execute(
+                    "SELECT * FROM coworkers WHERE owner_id = ? AND coworker_id = ?",
+                    (handle.identity.owner_id, handle.identity.coworker_id),
+                ).fetchone()
+                current = _record_from_row(owner_row) if owner_row is not None else None
+                if (
+                    current is None
+                    or current.owner_uid != current_uid
+                    or current.profile_name != handle.identity.profile_name
+                    or current.workspace != handle.identity.workspace
+                    or current.canonical_session_id
+                    != handle.identity.canonical_session_id
+                    or current.state != "ready"
+                ):
+                    raise CoworkerRuntimeUnavailable(
+                        "coworker is no longer active for this file approval"
+                    )
+                row = conn.execute(
+                    "SELECT * FROM coworker_file_approvals WHERE approval_id = ? "
+                    "AND owner_id = ? AND coworker_id = ?",
+                    (
+                        approval_id,
+                        handle.identity.owner_id,
+                        handle.identity.coworker_id,
+                    ),
+                ).fetchone()
+                if row is None:
+                    raise CoworkerNotFound("file approval not found")
+                approval = _approval_from_row(row)
+                self._file_approval_events(
+                    conn,
+                    approval_id=approval_id,
+                    status=approval.status,
+                )
+                if approval.status != expected_status:
+                    raise CoworkerRuntimeUnavailable(
+                        "file approval was already consumed or changed"
+                    )
+                cursor = conn.execute(
+                    f"UPDATE coworker_file_approvals SET {assignments} "
+                    "WHERE approval_id = ? AND owner_id = ? AND coworker_id = ? "
+                    "AND approval_digest = ? AND status = ?",
+                    (
+                        *updates.values(),
+                        approval_id,
+                        current.owner_id,
+                        current.coworker_id,
+                        approval.approval_digest,
+                        expected_status,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise CoworkerRuntimeUnavailable(
+                        "file approval was already consumed or changed"
+                    )
+                self._append_file_approval_event(
+                    conn,
+                    approval_id=approval_id,
+                    status=status,
+                    actor_uid=current_uid,
+                    detail=detail,
+                    occurred_at=now,
+                )
+        except sqlite3.DatabaseError as exc:
+            raise CoworkerDirectoryError(
+                "file approval state could not be durably updated"
+            ) from exc
+        return self._get_file_approval(handle, approval_id)
+
+    def _expire_file_approval_if_due(
+        self,
+        handle: "CoworkerHandle",
+        approval: CoworkerFileApproval,
+    ) -> CoworkerFileApproval:
+        if approval.status not in {"pending", "approved"}:
+            return approval
+        expires_at = datetime.fromisoformat(approval.expires_at).astimezone(timezone.utc)
+        if expires_at > _current_time():
+            return approval
+        return self._transition_file_approval(
+            handle,
+            approval_id=approval.approval_id,
+            expected_status=approval.status,
+            status="expired",
+            detail="expired",
+            finished=True,
+            failure_code="expired",
+        )
+
+    def _verify_file_approval_context(
+        self,
+        handle: "CoworkerHandle",
+        approval: CoworkerFileApproval,
+        *,
+        check_target: bool,
+        check_policy: bool,
+    ) -> tuple[Coworker, SafetyGuard, Path]:
+        current, session, workspace_identity, prompt_hash, response_hash = (
+            self._require_completed_atlas_turn(
+                handle,
+                run_id=approval.source_run_id,
+                session_id=approval.source_session_id,
+                request_id=approval.source_request_id,
+            )
+        )
+        if (
+            current.owner_id != approval.owner_id
+            or current.owner_uid != approval.owner_uid
+            or current.coworker_id != approval.coworker_id
+            or current.profile_name != approval.profile_name
+            or current.workspace != approval.workspace
+            or current.canonical_session_id != approval.canonical_session_id
+            or workspace_identity
+            != (approval.workspace_device, approval.workspace_inode)
+            or session.model != approval.source_model
+            or prompt_hash != approval.source_prompt_sha256
+            or response_hash != approval.source_response_sha256
+        ):
+            raise CoworkerRuntimeUnavailable("file approval source binding changed")
+        guard, target, snapshot, mode = self._file_effect_target_snapshot(
+            current=current,
+            workspace_identity=workspace_identity,
+            relative_path=approval.target_path,
+            owner_uid=approval.owner_uid,
+        )
+        if check_target and (
+            snapshot.sha256 != approval.expected_sha256
+            or snapshot.content != approval.expected_content
+            or mode != approval.expected_mode
+        ):
+            raise CoworkerRuntimeUnavailable("approved target changed after proposal")
+        if check_policy:
+            policy_sha256, action = self._file_effect_policy(
+                handle,
+                target_path=approval.target_path,
+                replacement=approval.replacement_content,
+                action=approval.action,
+            )
+            if action == PolicyAction.DENY or (
+                policy_sha256 != approval.policy_sha256
+                or approval.policy_revision != _FILE_APPROVAL_POLICY_REVISION
+            ):
+                raise CoworkerRuntimeUnavailable(
+                    "current Ash policy no longer matches the approved snapshot"
+                )
+        return current, guard, target
+
+    def _decide_file_approval(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        approval_id: str,
+        decision: Literal["approve", "deny"],
+    ) -> CoworkerFileApproval:
+        approval = self._expire_file_approval_if_due(
+            handle,
+            self._get_file_approval(handle, approval_id),
+        )
+        if approval.status != "pending":
+            raise CoworkerRuntimeUnavailable(
+                "file approval is no longer pending and cannot be decided again"
+            )
+        if decision == "deny":
+            return self._transition_file_approval(
+                handle,
+                approval_id=approval.approval_id,
+                expected_status="pending",
+                status="denied",
+                detail="denied_by_local_owner",
+                decision="deny",
+                finished=True,
+            )
+        if decision != "approve":
+            raise ValueError("decision must be approve or deny")
+        try:
+            self._verify_file_approval_context(
+                handle,
+                approval,
+                check_target=True,
+                check_policy=True,
+            )
+        except Exception as exc:
+            self._transition_file_approval(
+                handle,
+                approval_id=approval.approval_id,
+                expected_status="pending",
+                status="revoked",
+                detail="proposal_precondition_changed",
+                finished=True,
+                failure_code="precondition_changed",
+            )
+            raise CoworkerRuntimeUnavailable(
+                "file approval was revoked because its source, target, or policy changed"
+            ) from exc
+        return self._transition_file_approval(
+            handle,
+            approval_id=approval.approval_id,
+            expected_status="pending",
+            status="approved",
+            detail="approved_by_local_owner",
+            decision="approve",
+        )
+
+    def _revoke_file_approval(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        approval_id: str,
+    ) -> CoworkerFileApproval:
+        approval = self._expire_file_approval_if_due(
+            handle,
+            self._get_file_approval(handle, approval_id),
+        )
+        if approval.status != "approved":
+            raise CoworkerRuntimeUnavailable(
+                "only an approved, unapplied file correction can be revoked"
+            )
+        return self._transition_file_approval(
+            handle,
+            approval_id=approval.approval_id,
+            expected_status="approved",
+            status="revoked",
+            detail="revoked_by_local_owner",
+            finished=True,
+        )
+
+    def _apply_file_approval(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        approval_id: str,
+    ) -> CoworkerFileApproval:
+        approval = self._expire_file_approval_if_due(
+            handle,
+            self._get_file_approval(handle, approval_id),
+        )
+        if approval.status != "approved":
+            raise CoworkerRuntimeUnavailable(
+                "file correction is not approved or its one-shot apply was consumed"
+            )
+        try:
+            current, _, target = self._verify_file_approval_context(
+                handle,
+                approval,
+                check_target=True,
+                check_policy=True,
+            )
+        except Exception as exc:
+            self._transition_file_approval(
+                handle,
+                approval_id=approval.approval_id,
+                expected_status="approved",
+                status="revoked",
+                detail="precondition_changed_before_dispatch",
+                finished=True,
+                failure_code="precondition_changed",
+            )
+            raise CoworkerRuntimeUnavailable(
+                "file approval was revoked before dispatch because a binding changed"
+            ) from exc
+
+        try:
+            with workspace_mutation_lock():
+                latest = self._get_file_approval(handle, approval.approval_id)
+                latest = self._expire_file_approval_if_due(handle, latest)
+                if latest.status != "approved":
+                    raise CoworkerRuntimeUnavailable(
+                        "file approval was consumed before apply could claim it"
+                    )
+                self._transition_file_approval(
+                    handle,
+                    approval_id=approval.approval_id,
+                    expected_status="approved",
+                    status="dispatching",
+                    detail="dispatch_intent_committed",
+                    dispatch_started=True,
+                )
+                try:
+                    current, guard, target = self._verify_file_approval_context(
+                        handle,
+                        approval,
+                        check_target=True,
+                        check_policy=True,
+                    )
+                except Exception as exc:
+                    self._transition_file_approval(
+                        handle,
+                        approval_id=approval.approval_id,
+                        expected_status="dispatching",
+                        status="blocked",
+                        detail="effect_boundary_revalidation_failed",
+                        finished=True,
+                        failure_code="effect_revalidation_failed",
+                    )
+                    raise CoworkerRuntimeUnavailable(
+                        "file effect was blocked by current source, target, or policy"
+                    ) from exc
+                try:
+                    atomic_write_scoped_bytes(
+                        target,
+                        approval.replacement_content,
+                        guard,
+                        overwrite=approval.action == "replace",
+                        expected_sha256=approval.expected_sha256,
+                        create_parents=False,
+                        require_single_link=True,
+                        expected_mode=approval.expected_mode,
+                        expected_uid=approval.owner_uid,
+                        expected_device=approval.workspace_device,
+                    )
+                    _, observed = snapshot_scoped_file(
+                        target,
+                        guard,
+                        max_bytes=_FILE_APPROVAL_MAX_BYTES,
+                        require_single_link=True,
+                    )
+                    if (
+                        not observed.exists
+                        or observed.sha256 != approval.replacement_sha256
+                        or observed.content != approval.replacement_content
+                    ):
+                        raise CoworkerDirectoryError(
+                            "file effect output did not match the approved payload"
+                        )
+                    return self._transition_file_approval(
+                        handle,
+                        approval_id=approval.approval_id,
+                        expected_status="dispatching",
+                        status="succeeded",
+                        detail="effect_verified",
+                        finished=True,
+                        observed_sha256=observed.sha256,
+                        observation_recorded=True,
+                    )
+                except (ScopedFileChanged, FileExistsError) as exc:
+                    observed_sha256 = self._observe_approval_target(approval, guard)
+                    matched = observed_sha256 == approval.replacement_sha256
+                    self._transition_file_approval(
+                        handle,
+                        approval_id=approval.approval_id,
+                        expected_status="dispatching",
+                        status="succeeded" if matched else "failed",
+                        detail=(
+                            "target_matches_approved_payload"
+                            if matched
+                            else "compare_and_swap_rejected"
+                        ),
+                        finished=True,
+                        failure_code=None if matched else "target_changed",
+                        observed_sha256=observed_sha256,
+                        observation_recorded=True,
+                    )
+                    raise CoworkerRuntimeUnavailable(
+                        "file effect did not dispatch because the target changed"
+                    ) from exc
+                except Exception as exc:
+                    observed_sha256 = self._observe_approval_target(approval, guard)
+                    matched = observed_sha256 == approval.replacement_sha256
+                    self._transition_file_approval(
+                        handle,
+                        approval_id=approval.approval_id,
+                        expected_status="dispatching",
+                        status="succeeded" if matched else "ambiguous",
+                        detail=(
+                            "target_matches_approved_payload"
+                            if matched
+                            else "effect_outcome_uncertain"
+                        ),
+                        finished=True,
+                        failure_code=None if matched else "unknown_dispatch_outcome",
+                        observed_sha256=observed_sha256,
+                        observation_recorded=True,
+                    )
+                    raise CoworkerRuntimeUnavailable(
+                        "file effect outcome was inspected; inspect this approval"
+                    ) from exc
+        except ScopedIOError as exc:
+            if "approval was consumed" in str(exc):
+                raise
+            raise CoworkerRuntimeUnavailable(
+                "file effect could not acquire the workspace mutation boundary"
+            ) from exc
+
+    def _observe_approval_target(
+        self,
+        approval: CoworkerFileApproval,
+        guard: SafetyGuard,
+    ) -> str | None:
+        try:
+            current = self._get_owned(approval.owner_id, approval.coworker_id)
+            _, _, observed, _ = self._file_effect_target_snapshot(
+                current=current,
+                workspace_identity=(approval.workspace_device, approval.workspace_inode),
+                relative_path=approval.target_path,
+                owner_uid=approval.owner_uid,
+            )
+        except (OSError, SafetyViolation):
+            return None
+        return observed.sha256
+
+    def _inspect_file_approval(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        approval_id: str,
+    ) -> tuple[CoworkerFileApproval, tuple[CoworkerFileApprovalEvent, ...]]:
+        approval = self._expire_file_approval_if_due(
+            handle,
+            self._get_file_approval(handle, approval_id),
+        )
+        if approval.status == "dispatching":
+            try:
+                with workspace_mutation_lock():
+                    approval = self._get_file_approval(handle, approval.approval_id)
+                    if approval.status == "dispatching":
+                        approval = self._reconcile_file_approval(handle, approval)
+            except ScopedIOError:
+                pass
+        with closing(self._connect()) as conn:
+            events = self._file_approval_events(
+                conn,
+                approval_id=approval.approval_id,
+                status=approval.status,
+            )
+        return approval, events
+
+    def _reconcile_file_approval(
+        self,
+        handle: "CoworkerHandle",
+        approval: CoworkerFileApproval,
+    ) -> CoworkerFileApproval:
+        observed_sha256: str | None = None
+        try:
+            current, session, workspace_identity, prompt_hash, response_hash = (
+                self._require_completed_atlas_turn(
+                    handle,
+                    run_id=approval.source_run_id,
+                    session_id=approval.source_session_id,
+                    request_id=approval.source_request_id,
+                )
+            )
+            if (
+                current.owner_uid != approval.owner_uid
+                or current.profile_name != approval.profile_name
+                or current.workspace != approval.workspace
+                or current.canonical_session_id != approval.canonical_session_id
+                or workspace_identity
+                != (approval.workspace_device, approval.workspace_inode)
+                or session.model != approval.source_model
+                or prompt_hash != approval.source_prompt_sha256
+                or response_hash != approval.source_response_sha256
+            ):
+                raise CoworkerRuntimeUnavailable("source binding changed")
+            _, _, observed, _ = self._file_effect_target_snapshot(
+                current=current,
+                workspace_identity=workspace_identity,
+                relative_path=approval.target_path,
+                owner_uid=approval.owner_uid,
+            )
+            observed_sha256 = observed.sha256
+            succeeded = (
+                observed.exists
+                and observed.sha256 == approval.replacement_sha256
+                and observed.content == approval.replacement_content
+            )
+        except Exception:
+            succeeded = False
+        return self._transition_file_approval(
+            handle,
+            approval_id=approval.approval_id,
+            expected_status="dispatching",
+            status="succeeded" if succeeded else "ambiguous",
+            detail=(
+                "exact_target_reconciled_after_restart"
+                if succeeded
+                else "dispatch_outcome_remains_ambiguous"
+            ),
+            finished=True,
+            failure_code=None if succeeded else "unknown_dispatch_outcome",
+            observed_sha256=observed_sha256,
+            observation_recorded=True,
+        )
 
     def _get_by_profile(self, profile_name: str) -> Coworker | None:
         with closing(self._connect()) as conn:
@@ -2675,6 +4203,72 @@ class CoworkerHandle:
 
         return self._directory._list_readonly_turn_history(self, limit=limit)
 
+    def prepare_file_approval(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        request_id: str,
+        target_path: str,
+        replacement_file_path: str,
+    ) -> CoworkerFileApproval:
+        """Persist one user-supplied correction bound to a completed Atlas turn."""
+
+        return self._directory._prepare_file_approval(
+            self,
+            run_id=run_id,
+            session_id=session_id,
+            request_id=request_id,
+            target_path=target_path,
+            replacement_file_path=replacement_file_path,
+        )
+
+    def list_file_approvals(
+        self,
+        *,
+        limit: int = 50,
+    ) -> tuple[CoworkerFileApproval, ...]:
+        """List durable one-shot file approval states for this coworker."""
+
+        return self._directory._list_file_approvals(self, limit=limit)
+
+    def inspect_file_approval(
+        self,
+        approval_id: str,
+    ) -> tuple[CoworkerFileApproval, tuple[CoworkerFileApprovalEvent, ...]]:
+        """Inspect one durable decision and reconcile a journaled effect once."""
+
+        return self._directory._inspect_file_approval(
+            self,
+            approval_id=approval_id,
+        )
+
+    def _approve_file_approval(self, approval_id: str) -> CoworkerFileApproval:
+        return self._directory._decide_file_approval(
+            self,
+            approval_id=approval_id,
+            decision="approve",
+        )
+
+    def _deny_file_approval(self, approval_id: str) -> CoworkerFileApproval:
+        return self._directory._decide_file_approval(
+            self,
+            approval_id=approval_id,
+            decision="deny",
+        )
+
+    def _revoke_file_approval(self, approval_id: str) -> CoworkerFileApproval:
+        return self._directory._revoke_file_approval(
+            self,
+            approval_id=approval_id,
+        )
+
+    def _apply_file_approval(self, approval_id: str) -> CoworkerFileApproval:
+        return self._directory._apply_file_approval(
+            self,
+            approval_id=approval_id,
+        )
+
     def create_responsibility(
         self,
         *,
@@ -2794,6 +4388,16 @@ class CoworkerHandle:
             )
         )
         request_id = str(uuid5(UUID(run_id), "request"))
+        workspace_guard = SafetyGuard(
+            current.workspace,
+            expected_project_root_identity=request.workspace_identity,
+        )
+        workspace_identity = workspace_guard.project_root_identity
+        if workspace_identity is None:
+            raise CoworkerRuntimeUnavailable(
+                "workspace identity cannot be bound for this read-only turn"
+            )
+        workspace_guard.ensure_project_root_current()
         canonical = self.ensure_canonical_conversation()
         store = self._directory._session_store_for_record(current)
         canonical_lease = store.acquire_session_runtime_lease(canonical.session_id)
@@ -2865,6 +4469,7 @@ class CoworkerHandle:
                     run_id=run_id,
                     session_id=session_ref.session_id,
                     request_id=request_id,
+                    workspace_identity=workspace_identity,
                 )
             except BaseException as exc:
                 try:

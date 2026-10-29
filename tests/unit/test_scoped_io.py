@@ -13,6 +13,7 @@ from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import (
     ScopedFileChanged,
     ScopedIOError,
+    atomic_write_scoped_bytes,
     atomic_write_scoped_text,
     atomic_write_scoped_text_chunks,
     list_scoped_directory,
@@ -481,3 +482,39 @@ def test_scoped_stat_reports_regular_files_and_directories(
 
     assert stat.S_ISDIR(directory_metadata.st_mode)
     assert stat.S_ISREG(file_metadata.st_mode)
+
+
+def test_atomic_write_can_refuse_parent_creation_and_hardlink_replacement(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    guard = SafetyGuard(workspace)
+    missing_parent = workspace / "not-created" / "target.txt"
+    with pytest.raises((FileNotFoundError, ScopedIOError)):
+        atomic_write_scoped_bytes(
+            missing_parent,
+            b"content",
+            guard,
+            overwrite=False,
+            create_parents=False,
+        )
+    assert not missing_parent.parent.exists()
+
+    target = workspace / "target.txt"
+    alias = workspace / "alias.txt"
+    target.write_bytes(b"old")
+    try:
+        os.link(target, alias)
+    except (NotImplementedError, OSError):
+        pytest.skip("hard links are unavailable")
+    with pytest.raises(ScopedIOError, match="hard link"):
+        atomic_write_scoped_bytes(
+            target,
+            b"new",
+            guard,
+            overwrite=True,
+            expected_sha256=hashlib.sha256(b"old").hexdigest(),
+            require_single_link=True,
+        )
+    assert target.read_bytes() == b"old"

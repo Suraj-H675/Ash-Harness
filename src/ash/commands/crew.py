@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -12,7 +13,7 @@ import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 from ash.core.redaction import redact_known_secrets
 from ash.core.session import SessionStorageError
@@ -20,6 +21,8 @@ from ash.coworkers import (
     Coworker,
     CoworkerDirectory,
     CoworkerDirectoryError,
+    CoworkerFileApproval,
+    CoworkerHandle,
     CoworkerNotFound,
     CoworkerRuntimeUnavailable,
     CoworkerTurnRequest,
@@ -85,6 +88,14 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _ask(args)
     if action == "history":
         return _history(args)
+    if action == "propose":
+        return _propose(args)
+    if action == "approvals":
+        return _approvals(args)
+    if action == "approval" and args.crew_approval_action == "show":
+        return _approval_show(args)
+    if action in {"approve", "deny", "revoke", "apply"}:
+        return _approval_decision(args, action)
     _write_error("Unsupported Crew command.")
     return 2
 
@@ -157,15 +168,21 @@ def _ask(args: argparse.Namespace) -> int:
             coworker_id=args.coworker_id,
         )
         identity = handle.require_local_owner()
+        workspace_guard = SafetyGuard(identity.workspace)
+        workspace_identity = workspace_guard.project_root_identity
+        if workspace_identity is None:
+            raise ValueError("workspace identity cannot be bound for this turn")
         evidence_files = _read_explicit_evidence(
             identity.workspace,
             tuple(args.evidence),
+            guard=workspace_guard,
         )
         evidence = _serialize_evidence(evidence_files)
         request = CoworkerTurnRequest(
             turn_id=turn_id,
             question=args.question,
             evidence=evidence,
+            workspace_identity=workspace_identity,
         )
     except (
         CoworkerDirectoryError,
@@ -236,6 +253,7 @@ def _ask(args: argparse.Namespace) -> int:
     _write_line(f"Turn ID: {_safe_text(result.turn_id, single_line=True)}")
     _write_line(f"Run ID: {result.session_ref.run_id}")
     _write_line(f"Session ID: {result.session_ref.session_id}")
+    _write_line(f"Request ID: {uuid5(UUID(result.session_ref.run_id), 'request')}")
     _write_line(f"Model: {_safe_text(result.model, single_line=True)}")
     _write_line("Response:")
     _write_line(_safe_text(result.response))
@@ -292,13 +310,228 @@ def _history(args: argparse.Namespace) -> int:
     return 0
 
 
+def _open_approval_handle(args: argparse.Namespace) -> CoworkerHandle:
+    handle = CoworkerDirectory.open().open_coworker(
+        owner_id=args.owner,
+        coworker_id=args.coworker_id,
+    )
+    handle.require_local_owner()
+    return handle
+
+
+def _propose(args: argparse.Namespace) -> int:
+    try:
+        handle = _open_approval_handle(args)
+        approval = handle.prepare_file_approval(
+            run_id=args.run_id,
+            session_id=args.session_id,
+            request_id=args.request_id,
+            target_path=args.target,
+            replacement_file_path=args.replacement_file,
+        )
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        OSError,
+        SafetyViolation,
+        SessionStorageError,
+        ScopedIOError,
+        ValueError,
+    ) as exc:
+        _write_error(f"File correction could not be staged: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"File correction could not be staged ({type(exc).__name__}).")
+        return 2
+    _render_file_approval(approval)
+    _write_line("Status: pending explicit local owner approval; no file was changed.")
+    return 0
+
+
+def _approvals(args: argparse.Namespace) -> int:
+    try:
+        handle = _open_approval_handle(args)
+        entries = handle.list_file_approvals(limit=args.limit)
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        OSError,
+        ValueError,
+    ) as exc:
+        _write_error(f"File approval list is unavailable: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"File approval list is unavailable ({type(exc).__name__}).")
+        return 2
+    if not entries:
+        _write_line("No file approvals found for this coworker.")
+        return 0
+    for approval in entries:
+        _write_line(
+            f"{approval.status}: {approval.approval_id} "
+            f"{_safe_text(approval.action, single_line=True)} "
+            f"{_safe_text(approval.target_path, single_line=True)}"
+        )
+        _write_line(f"  Approval digest: {approval.approval_digest}")
+        _write_line(f"  Expected prior SHA-256: {approval.expected_sha256}")
+        _write_line(f"  Replacement SHA-256: {approval.replacement_sha256}")
+    return 0
+
+
+def _approval_show(args: argparse.Namespace) -> int:
+    try:
+        handle = _open_approval_handle(args)
+        approval, events = handle.inspect_file_approval(args.approval_id)
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        OSError,
+        SafetyViolation,
+        SessionStorageError,
+        ScopedIOError,
+        ValueError,
+    ) as exc:
+        _write_error(f"File approval could not be inspected: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"File approval could not be inspected ({type(exc).__name__}).")
+        return 2
+    _render_file_approval(approval)
+    _write_line("History:")
+    for event in events:
+        actor = (
+            f" UID {event.actor_uid}"
+            if event.actor_uid is not None
+            else ""
+        )
+        _write_line(
+            f"  {event.occurred_at} {event.status}{actor} "
+            f"({_safe_text(event.detail, single_line=True)})"
+        )
+    return 0
+
+
+def _approval_decision(args: argparse.Namespace, action: str) -> int:
+    try:
+        handle = _open_approval_handle(args)
+        approval, _ = handle.inspect_file_approval(args.approval_id)
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        OSError,
+        SafetyViolation,
+        SessionStorageError,
+        ScopedIOError,
+        ValueError,
+    ) as exc:
+        _write_error(f"File approval is unavailable: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"File approval is unavailable ({type(exc).__name__}).")
+        return 2
+    _render_file_approval(approval)
+    expected = f"{action.upper()} {approval.approval_id} {approval.approval_digest}"
+    if not _require_tty_confirmation(expected):
+        _write_error(
+            "Blocked. This decision requires an interactive local TTY and the exact challenge."
+        )
+        return 2
+    try:
+        if action == "approve":
+            result = handle._approve_file_approval(approval.approval_id)
+        elif action == "deny":
+            result = handle._deny_file_approval(approval.approval_id)
+        elif action == "revoke":
+            result = handle._revoke_file_approval(approval.approval_id)
+        elif action == "apply":
+            result = handle._apply_file_approval(approval.approval_id)
+        else:
+            raise ValueError("unsupported file approval action")
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        OSError,
+        SafetyViolation,
+        SessionStorageError,
+        ScopedIOError,
+        ValueError,
+    ) as exc:
+        _write_error(f"File approval action was refused: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"File approval action could not complete ({type(exc).__name__}).")
+        return 2
+    _write_line(f"Status: {result.status}.")
+    _write_line(f"Approval ID: {result.approval_id}")
+    if action == "approve":
+        _write_line(
+            "Decision recorded durably. Run `ash crew apply` with this exact ID "
+            "to make the one file effect."
+        )
+    elif action == "apply":
+        _write_line(
+            "The one-shot file action is recorded. Inspect it with `ash crew approval show`."
+        )
+    return 0
+
+
+def _require_tty_confirmation(challenge: str) -> bool:
+    try:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            return False
+        _write_line(f"Type exactly: {challenge}")
+        sys.stdout.flush()
+        answer = sys.stdin.readline()
+    except (AttributeError, OSError, ValueError):
+        return False
+    return answer.rstrip("\r\n") == challenge
+
+
+def _render_file_approval(approval: CoworkerFileApproval) -> None:
+    _write_line(f"Approval ID: {approval.approval_id}")
+    _write_line(f"Status: {approval.status}")
+    _write_line(f"Target: {_safe_text(approval.target_path, single_line=True)}")
+    _write_line(f"Action: {approval.action}")
+    _write_line(f"Source run: {approval.source_run_id}")
+    _write_line(f"Source session: {approval.source_session_id}")
+    _write_line(f"Source request: {approval.source_request_id}")
+    _write_line(f"Expected prior SHA-256: {approval.expected_sha256}")
+    _write_line(f"Replacement SHA-256: {approval.replacement_sha256}")
+    _write_line(f"Approval digest: {approval.approval_digest}")
+    _write_line(f"Expires: {_safe_text(approval.expires_at, single_line=True)}")
+    if approval.observed_sha256 is not None:
+        _write_line(f"Last observed target SHA-256: {approval.observed_sha256}")
+    if approval.failure_code is not None:
+        _write_line(f"Outcome code: {approval.failure_code}")
+    before = approval.expected_content.decode("utf-8")
+    after = approval.replacement_content.decode("utf-8")
+    diff = "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{approval.target_path}",
+            tofile=f"b/{approval.target_path}",
+        )
+    )
+    if diff:
+        _write_line("Proposed diff:")
+        _write_line(_safe_text(diff))
+
+
 def _read_explicit_evidence(
     workspace: Path,
     paths: Sequence[str],
+    *,
+    guard: SafetyGuard | None = None,
 ) -> tuple[_RepositoryEvidence, ...]:
     if len(paths) > _MAX_EVIDENCE_FILES:
         raise ValueError(f"at most {_MAX_EVIDENCE_FILES} evidence files may be listed")
-    guard = SafetyGuard(workspace)
+    guard = guard or SafetyGuard(workspace)
     evidence: list[_RepositoryEvidence] = []
     total_bytes = 0
     for raw_path in paths:

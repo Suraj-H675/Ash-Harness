@@ -69,10 +69,10 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     profile_remove.add_argument("--yes", action="store_true")
     crew_parser = subparsers.add_parser(
         "crew",
-        help="Manage read-only, profile-scoped Ash coworkers",
+        help="Manage profile-scoped coworkers and exact local file approvals",
         description=(
-            "Create and ask profile-scoped coworkers. Model answers are proposals only; "
-            "Crew does not modify files."
+            "Create and ask profile-scoped coworkers. Atlas answers remain read-only; "
+            "a separate owner decision can authorize one bounded workspace file effect."
         ),
     )
     crew_subparsers = crew_parser.add_subparsers(
@@ -125,6 +125,50 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     crew_history.add_argument(
         "--limit", type=int, default=10, help="Number of recent outcomes to show (1-100)"
     )
+    crew_propose = crew_subparsers.add_parser(
+        "propose",
+        help="Stage one exact user-supplied file correction from a completed Atlas turn",
+    )
+    crew_propose.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_propose.add_argument("--coworker-id", required=True, help="Immutable Atlas coworker ID")
+    crew_propose.add_argument("--run-id", required=True, help="Completed Atlas run ID")
+    crew_propose.add_argument("--session-id", required=True, help="Completed Atlas session ID")
+    crew_propose.add_argument("--request-id", required=True, help="Completed Atlas request ID")
+    crew_propose.add_argument("--target", required=True, metavar="WORKSPACE_RELATIVE_PATH")
+    crew_propose.add_argument(
+        "--replacement-file",
+        required=True,
+        metavar="WORKSPACE_RELATIVE_PATH",
+        help="Owner-supplied UTF-8 text file under the coworker's workspace",
+    )
+    crew_approvals = crew_subparsers.add_parser(
+        "approvals", help="List durable file approval states"
+    )
+    crew_approvals.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_approvals.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_approvals.add_argument("--limit", type=int, default=20)
+    crew_approval = crew_subparsers.add_parser(
+        "approval", help="Inspect one durable file approval after restart"
+    )
+    crew_approval_subparsers = crew_approval.add_subparsers(
+        dest="crew_approval_action", required=True
+    )
+    crew_approval_show = crew_approval_subparsers.add_parser(
+        "show", help="Show the exact file diff, decision history, and observed outcome"
+    )
+    crew_approval_show.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_approval_show.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_approval_show.add_argument("--approval-id", required=True, help="Immutable approval ID")
+    for action, help_text in (
+        ("approve", "Approve one exact pending file correction at a local TTY"),
+        ("deny", "Deny one exact pending file correction at a local TTY"),
+        ("revoke", "Revoke an approved correction before apply"),
+        ("apply", "Apply one approved correction exactly once at a local TTY"),
+    ):
+        command = crew_subparsers.add_parser(action, help=help_text)
+        command.add_argument("--owner", required=True, help="Explicit local owner label")
+        command.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+        command.add_argument("--approval-id", required=True, help="Immutable approval ID")
     providers_parser = subparsers.add_parser(
         "providers",
         help="List provider routes or test the active/provider model route",
