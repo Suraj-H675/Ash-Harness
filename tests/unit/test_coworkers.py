@@ -1241,6 +1241,7 @@ def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
             ),
         )
         connection.execute("DROP TABLE coworker_responsibility_schedules")
+        connection.execute("ALTER TABLE coworkers DROP COLUMN lifecycle_status")
         connection.execute(
             "UPDATE coworker_directory_meta SET schema_version = 4"
         )
@@ -1254,7 +1255,7 @@ def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (9,)
+        ).fetchone() == (10,)
         assert connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall() == []
@@ -1380,6 +1381,7 @@ def test_v5_coworker_directory_migration_adds_cursor_and_preserves_dispatches(
             "FROM coworker_responsibility_schedules_v6"
         )
         connection.execute("DROP TABLE coworker_responsibility_schedules_v6")
+        connection.execute("ALTER TABLE coworkers DROP COLUMN lifecycle_status")
         connection.execute(
             "UPDATE coworker_directory_meta SET schema_version = 5"
         )
@@ -1400,7 +1402,7 @@ def test_v5_coworker_directory_migration_adds_cursor_and_preserves_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (9,)
+        ).fetchone() == (10,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -2348,7 +2350,7 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (9,)
+        ).fetchone() == (10,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
@@ -2431,7 +2433,7 @@ def test_coworker_directory_v3_migration_preserves_dispatch_history(
     with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (9,)
+        ).fetchone() == (10,)
         columns = {
             str(row[1])
             for row in connection.execute(
@@ -3478,7 +3480,7 @@ def test_v2_coworker_directory_migration_adds_file_approval_boundary(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (9,)
+        ).fetchone() == (10,)
         assert connection.execute(
             "SELECT COUNT(*) FROM coworker_file_approvals"
         ).fetchone() == (0,)
@@ -3518,6 +3520,7 @@ def test_v6_coworker_directory_migration_keeps_legacy_dispatch_unbound(
         connection.execute(
             "ALTER TABLE coworker_turn_dispatches DROP COLUMN workspace_device"
         )
+        connection.execute("ALTER TABLE coworkers DROP COLUMN lifecycle_status")
         connection.execute(
             "UPDATE coworker_directory_meta SET schema_version = 6"
         )
@@ -3526,7 +3529,7 @@ def test_v6_coworker_directory_migration_keeps_legacy_dispatch_unbound(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (9,)
+        ).fetchone() == (10,)
 
 
 def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
@@ -3628,6 +3631,7 @@ def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
             "ON coworker_turn_dispatches(owner_id, coworker_id, responsibility_id, "
             "trigger_type, event_key) WHERE responsibility_id IS NOT NULL"
         )
+        connection.execute("ALTER TABLE coworkers DROP COLUMN lifecycle_status")
         connection.execute("UPDATE coworker_directory_meta SET schema_version = 7")
 
     reopened = CoworkerDirectory.open(ash_dir).open_coworker(
@@ -3642,7 +3646,7 @@ def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (9,)
+        ).fetchone() == (10,)
         columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(coworker_turn_dispatches)")
@@ -3687,6 +3691,7 @@ def test_v8_coworker_directory_migration_grants_no_ambient_evidence(
         connection.execute(
             "ALTER TABLE coworker_responsibilities DROP COLUMN revision"
         )
+        connection.execute("ALTER TABLE coworkers DROP COLUMN lifecycle_status")
         connection.execute("UPDATE coworker_directory_meta SET schema_version = 8")
 
     migrated = CoworkerDirectory.open(ash_dir).open_coworker(
@@ -3697,7 +3702,7 @@ def test_v8_coworker_directory_migration_grants_no_ambient_evidence(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (9,)
+        ).fetchone() == (10,)
         assert connection.execute(
             "SELECT evidence_paths_json FROM coworker_responsibilities "
             "WHERE responsibility_id = ?",
@@ -3708,3 +3713,174 @@ def test_v8_coworker_directory_migration_grants_no_ambient_evidence(
             "WHERE responsibility_id = ?",
             (responsibility.responsibility_id,),
         ).fetchone() == (1,)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_v9_lifecycle_migration_preserves_responsibility_schedule_and_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from uuid import uuid4
+
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import CoworkerDirectory, _manual_responsibility_run_id
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "evidence.txt").write_text("owner-granted evidence\n", encoding="utf-8")
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    schedule = build_schedule(every="10m")
+    responsibility = handle.create_responsibility(
+        scope="Persisted migration evidence",
+        objective="Keep this grant and schedule through migration.",
+        evidence_paths=("evidence.txt",),
+        schedule=schedule,
+    )
+    event_key = "v9-preserved-claim"
+    run_id = _manual_responsibility_run_id(
+        responsibility.responsibility_id,
+        event_key,
+    )
+    session_ref = handle.begin_background_run(run_id)
+    request_id = str(uuid4())
+    directory._claim_responsibility_turn(
+        handle=handle,
+        run_id=run_id,
+        session_id=session_ref.session_id,
+        request_id=request_id,
+        responsibility_id=responsibility.responsibility_id,
+        event_key=event_key,
+        trigger_type="manual",
+    )
+
+    with sqlite3.connect(directory.db_path) as connection:
+        before_responsibility = connection.execute(
+            "SELECT evidence_paths_json, revision, status FROM coworker_responsibilities "
+            "WHERE responsibility_id = ?",
+            (responsibility.responsibility_id,),
+        ).fetchone()
+        before_schedule = connection.execute(
+            "SELECT first_fire_at, next_fire_at, misfire_grace_seconds "
+            "FROM coworker_responsibility_schedules WHERE responsibility_id = ?",
+            (responsibility.responsibility_id,),
+        ).fetchone()
+        before_claim = connection.execute(
+            "SELECT run_id, status, responsibility_id, trigger_type, event_key "
+            "FROM coworker_turn_dispatches WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        connection.execute("ALTER TABLE coworkers DROP COLUMN lifecycle_status")
+        connection.execute("UPDATE coworker_directory_meta SET schema_version = 9")
+
+    reopened_directory = CoworkerDirectory.open(ash_dir)
+    reopened_handle = reopened_directory.open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert reopened_handle.identity.lifecycle_status == "active"
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT evidence_paths_json, revision, status FROM coworker_responsibilities "
+            "WHERE responsibility_id = ?",
+            (responsibility.responsibility_id,),
+        ).fetchone() == before_responsibility
+        assert connection.execute(
+            "SELECT first_fire_at, next_fire_at, misfire_grace_seconds "
+            "FROM coworker_responsibility_schedules WHERE responsibility_id = ?",
+            (responsibility.responsibility_id,),
+        ).fetchone() == before_schedule
+        assert connection.execute(
+            "SELECT run_id, status, responsibility_id, trigger_type, event_key "
+            "FROM coworker_turn_dispatches WHERE run_id = ?",
+            (run_id,),
+        ).fetchone() == before_claim
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (10,)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "coworker lifecycle schema is incomplete"),
+        ("downgraded", "coworker lifecycle schema version was downgraded"),
+        ("invalid", "coworker lifecycle status is invalid"),
+    ],
+)
+def test_coworker_lifecycle_schema_refuses_incomplete_or_downgraded_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    import sqlite3
+
+    from ash.coworkers import CoworkerDirectory, CoworkerDirectoryError
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, _ = _ready_coworker(ash_dir, workspace)
+    with sqlite3.connect(directory.db_path) as connection:
+        if mutation == "missing":
+            connection.execute("ALTER TABLE coworkers DROP COLUMN lifecycle_status")
+        elif mutation == "downgraded":
+            connection.execute("UPDATE coworker_directory_meta SET schema_version = 9")
+        else:
+            connection.execute("PRAGMA ignore_check_constraints = ON")
+            connection.execute(
+                "UPDATE coworkers SET lifecycle_status = 'corrupt' WHERE coworker_id = ?",
+                (identity.coworker_id,),
+            )
+
+    with pytest.raises(CoworkerDirectoryError, match=message):
+        CoworkerDirectory.open(ash_dir)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_competing_resume_and_archive_leave_archive_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    assert handle.pause().lifecycle_status == "paused"
+    barrier = threading.Barrier(2)
+
+    def resume() -> str:
+        barrier.wait()
+        try:
+            return handle.resume().lifecycle_status
+        except CoworkerRuntimeUnavailable:
+            return "refused"
+
+    def archive() -> str:
+        barrier.wait()
+        return handle.archive().lifecycle_status
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        resume_future = executor.submit(resume)
+        archive_future = executor.submit(archive)
+        resume_result = resume_future.result()
+        archive_result = archive_future.result()
+
+    assert resume_result in {"active", "refused"}
+    assert archive_result == "archived"
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert reopened.require_owner_binding().lifecycle_status == "archived"
+    assert reopened.archive().lifecycle_status == "archived"
+    with pytest.raises(CoworkerRuntimeUnavailable, match="from archived to active"):
+        reopened.resume()

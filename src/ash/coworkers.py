@@ -82,7 +82,8 @@ from ash.sandbox.docker import COWORKER_IMAGE, DEFAULT_IMAGE
 from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 9
+_COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION = 9
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 10
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
 _MAX_RESPONSIBILITY_SCOPE_BYTES = 2048
@@ -220,6 +221,7 @@ CoworkerResponsibilityTrigger = Literal["manual"]
 CoworkerResponsibilityRunTrigger = Literal["manual", "event", "scheduled"]
 CoworkerResponsibilityExecutionKind = Literal["legacy", "offline", "model"]
 CoworkerScheduleTickStatus = Literal["idle", "skipped", "completed"]
+CoworkerLifecycleStatus = Literal["active", "paused", "archived"]
 
 
 @dataclass(frozen=True)
@@ -234,6 +236,7 @@ class Coworker:
     workspace: Path
     canonical_session_id: str
     state: Literal["provisioning", "ready"]
+    lifecycle_status: CoworkerLifecycleStatus
 
 
 @dataclass(frozen=True)
@@ -1345,6 +1348,9 @@ def _current_time() -> datetime:
 
 
 def _record_from_row(row: sqlite3.Row) -> Coworker:
+    lifecycle_status = row["lifecycle_status"]
+    if lifecycle_status not in {"active", "paused", "archived"}:
+        raise CoworkerDirectoryError("coworker lifecycle status is invalid")
     return Coworker(
         coworker_id=str(row["coworker_id"]),
         owner_id=str(row["owner_id"]),
@@ -1354,6 +1360,7 @@ def _record_from_row(row: sqlite3.Row) -> Coworker:
         workspace=Path(str(row["workspace_path"])),
         canonical_session_id=str(row["canonical_session_id"]),
         state=str(row["state"]),  # type: ignore[arg-type]
+        lifecycle_status=lifecycle_status,  # type: ignore[arg-type]
     )
 
 
@@ -2214,6 +2221,9 @@ class CoworkerDirectory:
                             canonical_session_id TEXT NOT NULL UNIQUE,
                             state TEXT NOT NULL
                                 CHECK(state IN ('provisioning', 'ready')),
+                            lifecycle_status TEXT NOT NULL DEFAULT 'active'
+                                CHECK(lifecycle_status IN
+                                    ('active', 'paused', 'archived')),
                             created_at TEXT NOT NULL,
                             updated_at TEXT NOT NULL
                         )
@@ -2262,7 +2272,15 @@ class CoworkerDirectory:
                         (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
                     )
                     version = _COWORKER_DIRECTORY_SCHEMA_VERSION
-                if version not in {4, 5, 6, 7, 8, _COWORKER_DIRECTORY_SCHEMA_VERSION}:
+                if version not in {
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION,
+                    _COWORKER_DIRECTORY_SCHEMA_VERSION,
+                }:
                     raise CoworkerDirectoryError(
                         "coworker directory schema version is unsupported: "
                         f"{version}"
@@ -2274,6 +2292,58 @@ class CoworkerDirectory:
                 if "owner_uid" not in columns:
                     raise CoworkerDirectoryError(
                         "coworker directory owner binding schema is incomplete"
+                    )
+                if (
+                    original_version < _COWORKER_DIRECTORY_SCHEMA_VERSION
+                    and "lifecycle_status" in columns
+                ):
+                    raise CoworkerDirectoryError(
+                        "coworker lifecycle schema version was downgraded"
+                    )
+                if "lifecycle_status" not in columns:
+                    if original_version >= _COWORKER_DIRECTORY_SCHEMA_VERSION:
+                        raise CoworkerDirectoryError(
+                            "coworker lifecycle schema is incomplete"
+                        )
+                    conn.execute(
+                        "ALTER TABLE coworkers ADD COLUMN lifecycle_status TEXT "
+                        "NOT NULL DEFAULT 'active' CHECK(lifecycle_status IN "
+                        "('active', 'paused', 'archived'))"
+                    )
+                    columns.add("lifecycle_status")
+                lifecycle_column = next(
+                    column
+                    for column in conn.execute("PRAGMA table_info(coworkers)")
+                    if str(column["name"]) == "lifecycle_status"
+                )
+                if (
+                    not bool(lifecycle_column["notnull"])
+                    or lifecycle_column["dflt_value"] != "'active'"
+                ):
+                    raise CoworkerDirectoryError(
+                        "coworker lifecycle schema is incomplete"
+                    )
+                coworker_schema_row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'coworkers'"
+                ).fetchone()
+                coworker_schema = re.sub(
+                    r"\s+",
+                    "",
+                    str(coworker_schema_row["sql"]).casefold()
+                    if coworker_schema_row is not None
+                    else "",
+                )
+                if "check(lifecycle_statusin('active','paused','archived'))" not in coworker_schema:
+                    raise CoworkerDirectoryError(
+                        "coworker lifecycle schema validation is incomplete"
+                    )
+                if conn.execute(
+                    "SELECT 1 FROM coworkers WHERE lifecycle_status NOT IN "
+                    "('active', 'paused', 'archived') LIMIT 1"
+                ).fetchone() is not None:
+                    raise CoworkerDirectoryError(
+                        "coworker lifecycle status is invalid"
                     )
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_coworkers_owner_identity "
@@ -2311,7 +2381,7 @@ class CoworkerDirectory:
                     )
                 }
                 if "evidence_paths_json" not in responsibility_columns:
-                    if original_version >= _COWORKER_DIRECTORY_SCHEMA_VERSION:
+                    if original_version >= _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION:
                         raise CoworkerDirectoryError(
                             "coworker responsibility evidence schema is incomplete"
                         )
@@ -2321,7 +2391,7 @@ class CoworkerDirectory:
                     )
                     responsibility_columns.add("evidence_paths_json")
                 if "revision" not in responsibility_columns:
-                    if original_version >= _COWORKER_DIRECTORY_SCHEMA_VERSION:
+                    if original_version >= _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION:
                         raise CoworkerDirectoryError(
                             "coworker responsibility revision schema is incomplete"
                         )
@@ -2329,7 +2399,7 @@ class CoworkerDirectory:
                         "ALTER TABLE coworker_responsibilities ADD COLUMN revision INTEGER"
                     )
                     responsibility_columns.add("revision")
-                if original_version < _COWORKER_DIRECTORY_SCHEMA_VERSION:
+                if original_version < _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION:
                     conn.execute(
                         "UPDATE coworker_responsibilities "
                         "SET evidence_paths_json = '[]', revision = 1"
@@ -2676,10 +2746,22 @@ class CoworkerDirectory:
         handle: "CoworkerHandle",
         conn: sqlite3.Connection | None = None,
     ) -> Coworker:
-        identity = handle.identity
+        current = self._require_coworker_owner_binding(handle, conn)
+        if current.lifecycle_status != "active":
+            raise CoworkerRuntimeUnavailable(
+                self._lifecycle_admission_message(current.lifecycle_status)
+            )
+        return current
+
+    def _require_coworker_owner_binding(
+        self,
+        handle: "CoworkerHandle",
+        conn: sqlite3.Connection | None = None,
+    ) -> Coworker:
         if conn is None:
             with closing(self._connect()) as connection:
-                return self._validate_handle_binding(handle, connection)
+                return self._require_coworker_owner_binding(handle, connection)
+        identity = handle.identity
         row = conn.execute(
             "SELECT * FROM coworkers WHERE owner_id = ? AND coworker_id = ?",
             (identity.owner_id, identity.coworker_id),
@@ -2701,6 +2783,85 @@ class CoworkerDirectory:
                 "local coworker owner identity could not be verified"
             )
         return current
+
+    @staticmethod
+    def _lifecycle_admission_message(
+        status: CoworkerLifecycleStatus,
+    ) -> str:
+        if status == "paused":
+            return "coworker is paused; scheduled entries remain stored but disabled"
+        return "coworker is archived and cannot start new work"
+
+    def _transition_coworker_lifecycle(
+        self,
+        handle: "CoworkerHandle",
+        target: CoworkerLifecycleStatus,
+    ) -> Coworker:
+        if target not in {"active", "paused", "archived"}:
+            raise ValueError("coworker lifecycle status is invalid")
+        if target in {"paused", "archived"}:
+            try:
+                with workspace_mutation_lock():
+                    return self._write_coworker_lifecycle(handle, target)
+            except ScopedIOError as exc:
+                raise CoworkerRuntimeUnavailable(
+                    "coworker lifecycle could not change while an Ash file effect "
+                    "holds the workspace mutation boundary; retry after it finishes"
+                ) from exc
+        return self._write_coworker_lifecycle(handle, target)
+
+    def _write_coworker_lifecycle(
+        self,
+        handle: "CoworkerHandle",
+        target: CoworkerLifecycleStatus,
+    ) -> Coworker:
+        try:
+            with closing(self._connect_durable()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = self._require_coworker_owner_binding(handle, conn)
+                if current.lifecycle_status == target:
+                    return current
+                allowed = {
+                    ("active", "paused"),
+                    ("paused", "active"),
+                    ("active", "archived"),
+                    ("paused", "archived"),
+                }
+                if (current.lifecycle_status, target) not in allowed:
+                    raise CoworkerRuntimeUnavailable(
+                        f"cannot change coworker lifecycle from "
+                        f"{current.lifecycle_status} to {target}"
+                    )
+                now = _now()
+                cursor = conn.execute(
+                    "UPDATE coworkers SET lifecycle_status = ?, updated_at = ? "
+                    "WHERE owner_id = ? AND coworker_id = ? "
+                    "AND lifecycle_status = ?",
+                    (
+                        target,
+                        now,
+                        current.owner_id,
+                        current.coworker_id,
+                        current.lifecycle_status,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise CoworkerRuntimeUnavailable(
+                        "coworker lifecycle changed during transition"
+                    )
+                row = conn.execute(
+                    "SELECT * FROM coworkers WHERE owner_id = ? AND coworker_id = ?",
+                    (current.owner_id, current.coworker_id),
+                ).fetchone()
+                if row is None:
+                    raise CoworkerDirectoryError(
+                        "coworker disappeared during lifecycle transition"
+                    )
+                return _record_from_row(row)
+        except sqlite3.DatabaseError as exc:
+            raise CoworkerDirectoryError(
+                "coworker lifecycle could not be durably updated"
+            ) from exc
 
     def _create_responsibility(
         self,
@@ -2859,7 +3020,7 @@ class CoworkerDirectory:
     ) -> list[CoworkerResponsibility]:
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
-        current = self._validate_handle_binding(handle)
+        current = self._require_coworker_owner_binding(handle)
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 _RESPONSIBILITY_SELECT
@@ -2876,7 +3037,7 @@ class CoworkerDirectory:
         responsibility_id: str,
     ) -> CoworkerResponsibility:
         identifier = _normalize_responsibility_id(responsibility_id)
-        current = self._validate_handle_binding(handle)
+        current = self._require_coworker_owner_binding(handle)
         with closing(self._connect()) as conn:
             row = conn.execute(
                 _RESPONSIBILITY_SELECT
@@ -2986,7 +3147,7 @@ class CoworkerDirectory:
                 f"limit must be between 1 and {_MAX_RESPONSIBILITY_RUNS}"
             )
         identifier = _normalize_responsibility_id(responsibility_id)
-        current = self._validate_handle_binding(handle)
+        current = self._require_coworker_owner_binding(handle)
         with closing(self._connect()) as conn:
             exists = conn.execute(
                 "SELECT 1 FROM coworker_responsibilities WHERE owner_id = ? "
@@ -3011,7 +3172,7 @@ class CoworkerDirectory:
     ) -> tuple[CoworkerReadOnlyTurnHistory, ...]:
         if type(limit) is not int or not 1 <= limit <= _MAX_RESPONSIBILITY_RUNS:
             raise ValueError(f"limit must be between 1 and {_MAX_RESPONSIBILITY_RUNS}")
-        current = self._require_local_coworker_owner(handle)
+        current = self._require_coworker_owner_binding(handle)
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT run_id, request_id, session_id, status, created_at, completed_at "
@@ -3024,7 +3185,7 @@ class CoworkerDirectory:
 
         history: list[CoworkerReadOnlyTurnHistory] = []
         for row in rows:
-            current = self._require_local_coworker_owner(handle)
+            current = self._require_coworker_owner_binding(handle)
             run_id = str(row["run_id"])
             try:
                 expected_request_id = str(uuid5(UUID(run_id), "request"))
@@ -3193,6 +3354,10 @@ class CoworkerDirectory:
                 ):
                     raise CoworkerRuntimeUnavailable(
                         "local coworker owner identity could not be verified"
+                    )
+                if current.lifecycle_status != "active":
+                    raise CoworkerRuntimeUnavailable(
+                        self._lifecycle_admission_message(current.lifecycle_status)
                     )
                 if workspace_identity is not None:
                     SafetyGuard(
@@ -3507,26 +3672,12 @@ class CoworkerDirectory:
                     "offline coworker dispatch journal changed"
                 )
 
-    def _require_local_coworker_owner(self, handle: "CoworkerHandle") -> Coworker:
-        current = self._get_owned(
-            owner_id=handle.identity.owner_id,
-            coworker_id=handle.identity.coworker_id,
-        )
-        if (
-            current.owner_id != handle.identity.owner_id
-            or current.owner_uid != handle.identity.owner_uid
-            or current.profile_name != handle.identity.profile_name
-            or current.workspace != handle.identity.workspace
-            or current.canonical_session_id != handle.identity.canonical_session_id
-            or current.state != "ready"
-        ):
-            raise CoworkerDirectoryError("coworker process binding changed")
-        owner_uid = _current_owner_uid()
-        if owner_uid is None or current.owner_uid is None or current.owner_uid != owner_uid:
-            raise CoworkerRuntimeUnavailable(
-                "local coworker owner identity could not be verified"
-            )
-        return current
+    def _require_local_coworker_owner(
+        self,
+        handle: "CoworkerHandle",
+        conn: sqlite3.Connection | None = None,
+    ) -> Coworker:
+        return self._validate_handle_binding(handle, conn)
 
     def _require_completed_atlas_turn(
         self,
@@ -3535,8 +3686,13 @@ class CoworkerDirectory:
         run_id: str,
         session_id: str,
         request_id: str,
+        require_active: bool = True,
     ) -> tuple[Coworker, Session, tuple[int, int], str, str]:
-        current = self._require_local_coworker_owner(handle)
+        current = (
+            self._require_local_coworker_owner(handle)
+            if require_active
+            else self._require_coworker_owner_binding(handle)
+        )
         if current.profile_name != "atlas":
             raise CoworkerRuntimeUnavailable(
                 "file corrections require the Atlas profile-bound coworker"
@@ -3638,7 +3794,10 @@ class CoworkerDirectory:
             raise CoworkerRuntimeUnavailable(
                 "source transcript is not the exact completed read-only turn"
             )
-        self._require_local_coworker_owner(handle)
+        if require_active:
+            self._require_local_coworker_owner(handle)
+        else:
+            self._require_coworker_owner_binding(handle)
         return (
             current,
             session,
@@ -3881,7 +4040,7 @@ class CoworkerDirectory:
         try:
             with closing(self._connect_durable()) as conn, conn:
                 conn.execute("BEGIN IMMEDIATE")
-                latest = self._require_local_coworker_owner(handle)
+                latest = self._require_local_coworker_owner(handle, conn)
                 if latest != current:
                     raise CoworkerRuntimeUnavailable(
                         "coworker binding changed before approval was recorded"
@@ -3970,7 +4129,7 @@ class CoworkerDirectory:
             normalized_id = str(UUID(approval_id))
         except (ValueError, AttributeError) as exc:
             raise ValueError("approval ID must be a UUID") from exc
-        current = self._require_local_coworker_owner(handle)
+        current = self._require_coworker_owner_binding(handle)
         with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT * FROM coworker_file_approvals WHERE approval_id = ? "
@@ -4004,7 +4163,7 @@ class CoworkerDirectory:
     ) -> tuple[CoworkerFileApproval, ...]:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("approval limit must be between 1 and 100")
-        current = self._require_local_coworker_owner(handle)
+        current = self._require_coworker_owner_binding(handle)
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT * FROM coworker_file_approvals WHERE owner_id = ? "
@@ -4073,22 +4232,12 @@ class CoworkerDirectory:
         try:
             with closing(self._connect_durable()) as conn, conn:
                 conn.execute("BEGIN IMMEDIATE")
-                owner_row = conn.execute(
-                    "SELECT * FROM coworkers WHERE owner_id = ? AND coworker_id = ?",
-                    (handle.identity.owner_id, handle.identity.coworker_id),
-                ).fetchone()
-                current = _record_from_row(owner_row) if owner_row is not None else None
-                if (
-                    current is None
-                    or current.owner_uid != current_uid
-                    or current.profile_name != handle.identity.profile_name
-                    or current.workspace != handle.identity.workspace
-                    or current.canonical_session_id
-                    != handle.identity.canonical_session_id
-                    or current.state != "ready"
+                current = self._require_coworker_owner_binding(handle, conn)
+                if status in {"approved", "dispatching"} and (
+                    current.lifecycle_status != "active"
                 ):
                     raise CoworkerRuntimeUnavailable(
-                        "coworker is no longer active for this file approval"
+                        self._lifecycle_admission_message(current.lifecycle_status)
                     )
                 row = conn.execute(
                     "SELECT * FROM coworker_file_approvals WHERE approval_id = ? "
@@ -4247,6 +4396,7 @@ class CoworkerDirectory:
             )
         if decision != "approve":
             raise ValueError("decision must be approve or deny")
+        self._require_local_coworker_owner(handle)
         try:
             self._verify_file_approval_context(
                 handle,
@@ -4255,6 +4405,11 @@ class CoworkerDirectory:
                 check_policy=True,
             )
         except Exception as exc:
+            latest = self._require_coworker_owner_binding(handle)
+            if latest.lifecycle_status != "active":
+                raise CoworkerRuntimeUnavailable(
+                    self._lifecycle_admission_message(latest.lifecycle_status)
+                ) from exc
             self._transition_file_approval(
                 handle,
                 approval_id=approval.approval_id,
@@ -4313,6 +4468,7 @@ class CoworkerDirectory:
             raise CoworkerRuntimeUnavailable(
                 "file correction is not approved or its one-shot apply was consumed"
             )
+        self._require_local_coworker_owner(handle)
         try:
             current, _, target = self._verify_file_approval_context(
                 handle,
@@ -4321,6 +4477,11 @@ class CoworkerDirectory:
                 check_policy=True,
             )
         except Exception as exc:
+            latest = self._require_coworker_owner_binding(handle)
+            if latest.lifecycle_status != "active":
+                raise CoworkerRuntimeUnavailable(
+                    self._lifecycle_admission_message(latest.lifecycle_status)
+                ) from exc
             self._transition_file_approval(
                 handle,
                 approval_id=approval.approval_id,
@@ -4336,9 +4497,15 @@ class CoworkerDirectory:
 
         try:
             with workspace_mutation_lock():
-                latest = self._get_file_approval(handle, approval.approval_id)
-                latest = self._expire_file_approval_if_due(handle, latest)
-                if latest.status != "approved":
+                latest_approval = self._get_file_approval(
+                    handle,
+                    approval.approval_id,
+                )
+                latest_approval = self._expire_file_approval_if_due(
+                    handle,
+                    latest_approval,
+                )
+                if latest_approval.status != "approved":
                     raise CoworkerRuntimeUnavailable(
                         "file approval was consumed before apply could claim it"
                     )
@@ -4512,6 +4679,7 @@ class CoworkerDirectory:
                     run_id=approval.source_run_id,
                     session_id=approval.source_session_id,
                     request_id=approval.source_request_id,
+                    require_active=False,
                 )
             )
             if (
@@ -4749,6 +4917,26 @@ class CoworkerHandle:
         """Recheck the persisted identity and current UID before local access."""
 
         return self._directory._require_local_coworker_owner(self)
+
+    def require_owner_binding(self) -> Coworker:
+        """Recheck the same-UID binding for read-only owner inspection."""
+
+        return self._directory._require_coworker_owner_binding(self)
+
+    def pause(self) -> Coworker:
+        """Stop new work while retaining this coworker's history and decisions."""
+
+        return self._directory._transition_coworker_lifecycle(self, "paused")
+
+    def resume(self) -> Coworker:
+        """Allow new work for a paused coworker."""
+
+        return self._directory._transition_coworker_lifecycle(self, "active")
+
+    def archive(self) -> Coworker:
+        """Permanently stop new work without deleting coworker data."""
+
+        return self._directory._transition_coworker_lifecycle(self, "archived")
 
     def list_readonly_turn_history(
         self,
@@ -5080,7 +5268,8 @@ class CoworkerHandle:
     def effective_config(self) -> AshConfig:
         """Return the explicit profile snapshot; general SDK runtime stays denied."""
 
-        return self._directory._effective_config(self.identity)
+        current = self._directory._require_local_coworker_owner(self)
+        return self._directory._effective_config(current)
 
     async def run_readonly_turn(
         self,
@@ -5353,7 +5542,7 @@ class CoworkerHandle:
                     raise CoworkerRuntimeUnavailable(
                         "provider turn transcript did not match its request"
                     )
-                self._directory._require_local_coworker_owner(self)
+                self._directory._require_coworker_owner_binding(self)
                 self._directory._complete_responsibility_turn(
                     handle=self,
                     run_id=admission.run_id,
@@ -5457,6 +5646,7 @@ class CoworkerHandle:
     def begin_background_run(self, run_id: str) -> CoworkerSessionRef:
         """Create one fresh session per run key under the canonical session lease."""
 
+        self._directory._require_local_coworker_owner(self)
         canonical = self.ensure_canonical_conversation()
         store = self._store()
         existing = store.get_coworker_run(
@@ -5482,6 +5672,7 @@ class CoworkerHandle:
     def load_session(self, session_id: str) -> tuple[Session, CoworkerSessionRef]:
         """Load only session IDs in this owner/coworker association set."""
 
+        self._directory._require_coworker_owner_binding(self)
         session, binding = self._store().load_coworker_session(
             owner_id=self.identity.owner_id,
             coworker_id=self.identity.coworker_id,
@@ -5539,6 +5730,18 @@ class CoworkerHandle:
                     raise SandboxBackendUnavailable(
                         "coworker syntax checks require bounded Docker execution"
                     )
+                request_id = str(uuid4())
+                claim = self._directory._claim_responsibility_turn(
+                    handle=self,
+                    run_id=run_id,
+                    session_id=session_ref.session_id,
+                    request_id=request_id,
+                    execution_kind="offline",
+                )
+                if claim is not None:
+                    raise CoworkerDirectoryError(
+                        "syntax check unexpectedly received a schedule result"
+                    )
                 result = await manager.run_supervised_process(
                     (
                         "/usr/local/bin/python",
@@ -5562,11 +5765,18 @@ class CoworkerHandle:
                     raise CoworkerRuntimeUnavailable(
                         "supervised syntax worker did not finish with a known result"
                     )
-                return _parse_python_syntax_report(
+                report = _parse_python_syntax_report(
                     result.stdout,
                     names,
                     session_ref,
                 )
+                self._directory._complete_responsibility_turn(
+                    handle=self,
+                    run_id=run_id,
+                    session_id=session_ref.session_id,
+                    request_id=request_id,
+                )
+                return report
         finally:
             lease.close()
 

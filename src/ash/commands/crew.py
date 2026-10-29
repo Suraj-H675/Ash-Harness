@@ -48,6 +48,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _create(args)
     if action == "list":
         return _list(args)
+    if action in {"pause", "resume", "archive"}:
+        return _lifecycle(args, action)
     if action == "ask":
         return _ask(args)
     if action == "history":
@@ -94,7 +96,13 @@ def _create(args: argparse.Namespace) -> int:
         _write_error(f"Coworker could not be created ({type(exc).__name__}).")
         return 2
 
-    _write_line("Coworker ready.")
+    if identity.lifecycle_status == "active":
+        _write_line("Coworker ready.")
+    else:
+        _write_line(
+            "Existing coworker found. Lifecycle was not changed from "
+            f"{identity.lifecycle_status}."
+        )
     _write_identity(identity)
     return 0
 
@@ -126,6 +134,61 @@ def _list(args: argparse.Namespace) -> int:
         return 0
     for identity in coworkers:
         _write_identity(identity)
+    return 0
+
+
+def _lifecycle(args: argparse.Namespace, action: str) -> int:
+    try:
+        handle = CoworkerDirectory.open().open_coworker(
+            owner_id=args.owner,
+            coworker_id=args.coworker_id,
+        )
+        if action == "pause":
+            identity = handle.pause()
+        elif action == "resume":
+            identity = handle.resume()
+        elif action == "archive":
+            identity = handle.archive()
+        else:
+            raise ValueError("unsupported coworker lifecycle action")
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        OSError,
+        ValueError,
+    ) as exc:
+        _write_error(f"Coworker lifecycle could not change: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:  # noqa: BLE001 - keep CLI failures secret-free
+        _write_error(
+            "Coworker lifecycle could not change "
+            f"({type(exc).__name__})."
+        )
+        return 2
+
+    _write_identity(identity)
+    if identity.lifecycle_status == "paused":
+        _write_line(
+            "New work is paused. Scheduled entries remain stored but disabled."
+        )
+        _write_line(
+            "Turns claimed before this lifecycle change may still dispatch or finish. "
+            "Dispatched provider requests cannot be canceled. Inspect history or "
+            "responsibility runs for their outcome."
+        )
+    elif identity.lifecycle_status == "archived":
+        _write_line(
+            "Coworker archived. New work is permanently disabled; history and "
+            "decisions remain available for inspection."
+        )
+        _write_line(
+            "Turns claimed before this lifecycle change may still dispatch or finish. "
+            "Dispatched provider requests cannot be canceled. Inspect history or "
+            "responsibility runs for their outcome."
+        )
+    else:
+        _write_line("Coworker active. New work is enabled.")
     return 0
 
 
@@ -237,7 +300,7 @@ def _history(args: argparse.Namespace) -> int:
             owner_id=args.owner,
             coworker_id=args.coworker_id,
         )
-        handle.require_local_owner()
+        handle.require_owner_binding()
         entries = handle.list_readonly_turn_history(limit=args.limit)
     except (
         CoworkerDirectoryError,
@@ -539,6 +602,8 @@ def _write_model_admission_error(
         marker in str(exc)
         for marker in (
             "not active",
+            "coworker is paused",
+            "coworker is archived",
             "target does not match",
             "owner identity could not be verified",
             "workspace identity cannot be bound",
@@ -561,7 +626,7 @@ def _open_coworker_handle(args: argparse.Namespace) -> CoworkerHandle:
         owner_id=args.owner,
         coworker_id=args.coworker_id,
     )
-    handle.require_local_owner()
+    handle.require_owner_binding()
     return handle
 
 
@@ -646,7 +711,7 @@ def _open_approval_handle(args: argparse.Namespace) -> CoworkerHandle:
         owner_id=args.owner,
         coworker_id=args.coworker_id,
     )
-    handle.require_local_owner()
+    handle.require_owner_binding()
     return handle
 
 
@@ -871,6 +936,9 @@ def _write_identity(identity: Coworker) -> None:
     _write_line(f"Profile: {_safe_text(identity.profile_name, single_line=True)}")
     _write_line(f"Workspace: {_safe_text(str(identity.workspace), single_line=True)}")
     _write_line(f"State: {_safe_text(identity.state, single_line=True)}")
+    _write_line(
+        f"Lifecycle: {_safe_text(identity.lifecycle_status, single_line=True)}"
+    )
 
 
 def _safe_error(exc: Exception) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -13,7 +14,7 @@ from typing import Any
 import pytest
 
 from ash.cli import main
-from ash.coworkers import CoworkerDirectory
+from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.messages import MessageInput
 from ash.providers.registry import ProviderRegistry
@@ -61,6 +62,8 @@ def _install_fake_registry(
     monkeypatch: pytest.MonkeyPatch,
     *,
     atlas_answer: str = "Atlas found the failed assertion and proposes a fix. ",
+    started: asyncio.Event | None = None,
+    release: asyncio.Event | None = None,
 ) -> tuple[ProviderRegistry, list[dict[str, Any]]]:
     observed: list[dict[str, Any]] = []
 
@@ -99,6 +102,10 @@ def _install_fake_registry(
                     "turn_id_reported_before_dispatch": "Turn ID:" in captured_output,
                 }
             )
+            if started is not None:
+                started.set()
+            if release is not None:
+                await release.wait()
             if self.model_name.endswith("atlas"):
                 answer = atlas_answer
                 answer += "atlas-profile-secret \u001b[31mred\u001b[0m\u202e"
@@ -936,6 +943,116 @@ def _new_pending_file_approval(
     return directory, handle, identity, workspace, target, replacement, approval, source_ids
 
 
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_archive_fences_late_approval_and_preserves_unapplied_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.coworkers import CoworkerRuntimeUnavailable
+
+    directory, handle, _, _, target, _, pending, _ = _new_pending_file_approval(
+        tmp_path / "late-approval", monkeypatch, capsys
+    )
+    verify = directory._verify_file_approval_context
+
+    def verify_then_archive(*args: Any, **kwargs: Any) -> Any:
+        result = verify(*args, **kwargs)
+        handle.archive()
+        return result
+
+    monkeypatch.setattr(directory, "_verify_file_approval_context", verify_then_archive)
+    with pytest.raises(CoworkerRuntimeUnavailable, match="coworker is archived"):
+        handle._approve_file_approval(pending.approval_id)
+    assert target.read_bytes() == b"VALUE = 1\n"
+    pending_after_archive, pending_events = handle.inspect_file_approval(
+        pending.approval_id
+    )
+    assert pending_after_archive.status == "pending"
+    assert [event.status for event in pending_events] == ["pending"]
+
+    (
+        approved_directory,
+        approved_handle,
+        _,
+        _,
+        approved_target,
+        _,
+        approved,
+        source_ids,
+    ) = _new_pending_file_approval(
+        tmp_path / "approved-unapplied", monkeypatch, capsys
+    )
+    assert approved_handle._approve_file_approval(approved.approval_id).status == "approved"
+    approved_handle.archive()
+    with pytest.raises(CoworkerRuntimeUnavailable, match="coworker is archived"):
+        approved_handle._apply_file_approval(approved.approval_id)
+    retained, events = approved_handle.inspect_file_approval(approved.approval_id)
+    assert retained.status == "approved"
+    assert [event.status for event in events] == ["pending", "approved"]
+    assert approved_target.read_bytes() == b"VALUE = 1\n"
+    with pytest.raises(CoworkerRuntimeUnavailable, match="coworker is archived"):
+        approved_handle.prepare_file_approval(
+            run_id=source_ids["Run ID"],
+            session_id=source_ids["Session ID"],
+            request_id=source_ids["Request ID"],
+            target_path="src/example.py",
+            replacement_file_path="src/example.fixed.py",
+        )
+    assert len(approved_handle.list_file_approvals()) == 1
+    assert CoworkerDirectory.open(approved_directory.ash_dir).open_coworker(
+        owner_id="local",
+        coworker_id=approved_handle.identity.coworker_id,
+    ).inspect_file_approval(approved.approval_id)[0].status == "approved"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_v9_lifecycle_migration_preserves_file_approval_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    directory, handle, identity, _, target, _, approval, _ = _new_pending_file_approval(
+        tmp_path, monkeypatch, capsys
+    )
+    with sqlite3.connect(directory.db_path) as connection:
+        prior_row = connection.execute(
+            "SELECT approval_id, status, approval_digest, replacement_sha256 "
+            "FROM coworker_file_approvals WHERE approval_id = ?",
+            (approval.approval_id,),
+        ).fetchone()
+        prior_events = connection.execute(
+            "SELECT status, actor_uid, detail FROM coworker_file_approval_events "
+            "WHERE approval_id = ? ORDER BY event_id",
+            (approval.approval_id,),
+        ).fetchall()
+        connection.execute("ALTER TABLE coworkers DROP COLUMN lifecycle_status")
+        connection.execute("UPDATE coworker_directory_meta SET schema_version = 9")
+
+    reopened_directory = CoworkerDirectory.open(directory.ash_dir)
+    reopened = reopened_directory.open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert reopened.identity.lifecycle_status == "active"
+    persisted, events = reopened.inspect_file_approval(approval.approval_id)
+    assert persisted.status == "pending"
+    assert [event.status for event in events] == ["pending"]
+    assert target.read_bytes() == b"VALUE = 1\n"
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT approval_id, status, approval_digest, replacement_sha256 "
+            "FROM coworker_file_approvals WHERE approval_id = ?",
+            (approval.approval_id,),
+        ).fetchone() == prior_row
+        assert connection.execute(
+            "SELECT status, actor_uid, detail FROM coworker_file_approval_events "
+            "WHERE approval_id = ? ORDER BY event_id",
+            (approval.approval_id,),
+        ).fetchall() == prior_events
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_file_approval_rejects_foreign_run_and_linked_or_traversal_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1563,6 +1680,36 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
         "--input",
         str(event_file),
     ]
+    with monkeypatch.context() as wrong_uid:
+        wrong_uid.setattr(coworkers, "_current_owner_uid", lambda: os.geteuid() + 1)
+        assert main(
+            ["crew", "pause", "--owner", "local", "--coworker-id", atlas.coworker_id]
+        ) == 2
+        assert "owner identity" in capsys.readouterr().err
+    assert directory.open_coworker(
+        owner_id="local",
+        coworker_id=atlas.coworker_id,
+    ).require_owner_binding().lifecycle_status == "active"
+
+    assert main(
+        ["crew", "pause", "--owner", "local", "--coworker-id", atlas.coworker_id]
+    ) == 0
+    paused_output = capsys.readouterr().out
+    assert "Lifecycle: paused" in paused_output
+    assert "Scheduled entries remain stored but disabled." in paused_output
+    assert "Turns claimed before this lifecycle change may still dispatch or finish." in paused_output
+    assert main(event_args) == 2
+    assert "coworker is paused" in capsys.readouterr().err
+    assert not observed
+    assert directory.open_coworker(
+        owner_id="local",
+        coworker_id=atlas.coworker_id,
+    ).list_responsibility_runs(atlas_responsibility_id) == []
+    assert main(
+        ["crew", "resume", "--owner", "local", "--coworker-id", atlas.coworker_id]
+    ) == 0
+    assert "Lifecycle: active" in capsys.readouterr().out
+
     wrong_owner_args = event_args.copy()
     wrong_owner_args[wrong_owner_args.index("--owner") + 1] = "foreign"
     assert main(wrong_owner_args) == 2
@@ -1679,6 +1826,29 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert "Scout-only research note." not in atlas_message
 
     assert main(
+        ["crew", "pause", "--owner", "local", "--coworker-id", scout.coworker_id]
+    ) == 0
+    assert "Lifecycle: paused" in capsys.readouterr().out
+    assert main(
+        [
+            "crew",
+            "tick",
+            "--owner",
+            "local",
+            "--coworker-id",
+            scout.coworker_id,
+        ]
+    ) == 2
+    assert "coworker is paused" in capsys.readouterr().err
+    assert len(observed) == 1
+    assert scout_handle.get_responsibility(
+        scout_responsibility_id
+    ).next_fire_at == scheduled.next_fire_at
+    assert main(
+        ["crew", "resume", "--owner", "local", "--coworker-id", scout.coworker_id]
+    ) == 0
+    assert "Lifecycle: active" in capsys.readouterr().out
+    assert main(
         [
             "crew",
             "tick",
@@ -1760,6 +1930,121 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert manual_contract["evidence"][0]["sha256"] == hashlib.sha256(
         protected.read_bytes()
     ).hexdigest()
+    assert main(event_args) == 2
+    duplicate = capsys.readouterr()
+    assert "already used" in duplicate.err or "already claimed" in duplicate.err
+    assert len(observed) == 3
+
+    assert main(
+        ["crew", "archive", "--owner", "local", "--coworker-id", atlas.coworker_id]
+    ) == 0
+    archived_output = capsys.readouterr().out
+    assert "Lifecycle: archived" in archived_output
+    assert "history and decisions remain available for inspection" in archived_output
+    assert "Turns claimed before this lifecycle change may still dispatch or finish." in archived_output
+    assert main(
+        ["crew", "list", "--owner", "local"]
+    ) == 0
+    listed = capsys.readouterr().out
+    assert f"ID: {atlas.coworker_id}" in listed
+    assert "Lifecycle: archived" in listed
+    assert f"ID: {scout.coworker_id}" in listed
+    assert "Lifecycle: active" in listed
+    assert main(
+        [
+            "crew",
+            "create",
+            "--owner",
+            "local",
+            "--name",
+            "Atlas",
+            "--profile",
+            "atlas",
+            "--workspace",
+            str(atlas_workspace),
+        ]
+    ) == 0
+    assert "Lifecycle was not changed from archived" in capsys.readouterr().out
+    assert main(
+        ["crew", "resume", "--owner", "local", "--coworker-id", atlas.coworker_id]
+    ) == 2
+    assert "cannot change coworker lifecycle from archived to active" in capsys.readouterr().err
+    assert main(
+        _ask_args(atlas.coworker_id, "Try starting another turn.", turn_id="after-archive")
+    ) == 2
+    assert "coworker is archived" in capsys.readouterr().err
+    assert len(observed) == 3
+    with pytest.raises(CoworkerRuntimeUnavailable, match="coworker is archived"):
+        atlas_handle.create_responsibility(
+            scope="Must remain disabled",
+            objective="This responsibility must not be persisted.",
+        )
+
+    event_fields["id"] = "atlas-ci-after-archive"
+    event_fields.pop("signature")
+    canonical = json.dumps(
+        event_fields,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    event_fields["signature"] = hmac.new(
+        signing_key, canonical, hashlib.sha256
+    ).hexdigest()
+    event_file.write_text(
+        json.dumps(event_fields, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    assert main(event_args) == 2
+    assert "coworker is archived" in capsys.readouterr().err
+    assert len(observed) == 3
+
+    assert main(
+        [
+            "crew",
+            "responsibility",
+            "run",
+            "--owner",
+            "local",
+            "--coworker-id",
+            scout.coworker_id,
+            "--responsibility-id",
+            scout_responsibility_id,
+            "--event-id",
+            "scout-after-atlas-archive",
+        ]
+    ) == 0
+    assert "Trigger: manual" in capsys.readouterr().out
+    assert len(observed) == 4
+
+    assert main(
+        [
+            "crew",
+            "responsibility",
+            "runs",
+            "--owner",
+            "local",
+            "--coworker-id",
+            atlas.coworker_id,
+            "--responsibility-id",
+            atlas_responsibility_id,
+        ]
+    ) == 0
+    archived_runs = capsys.readouterr().out
+    assert "Status: completed" in archived_runs
+    assert "Atlas recommends inspecting this failure" in archived_runs
+    assert main(
+        [
+            "crew",
+            "responsibility",
+            "list",
+            "--owner",
+            "local",
+            "--coworker-id",
+            atlas.coworker_id,
+        ]
+    ) == 0
+    assert atlas_responsibility_id in capsys.readouterr().out
 
     reopened = CoworkerDirectory.open(ash_dir)
     atlas_handle = reopened.open_coworker(
@@ -1771,7 +2056,12 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
         coworker_id=scout.coworker_id,
     )
     atlas_run, = atlas_handle.list_responsibility_runs(atlas_responsibility_id)
-    scout_run, = scout_handle.list_responsibility_runs(scout_responsibility_id)
+    scout_runs = scout_handle.list_responsibility_runs(scout_responsibility_id)
+    assert len(scout_runs) == 2
+    scout_run = next(run for run in scout_runs if run.trigger_type == "scheduled")
+    scout_after_archive = next(
+        run for run in scout_runs if run.event_key == "scout-after-atlas-archive"
+    )
     manual_run, = atlas_handle.list_responsibility_runs(atlas_manual_responsibility_id)
     assert atlas_run.execution_kind == scout_run.execution_kind == "model"
     assert atlas_run.trigger_type == "event"
@@ -1779,6 +2069,8 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert manual_run.trigger_type == "manual"
     assert manual_run.execution_kind == "model"
     assert manual_run.event_key == "owner-follow-up-1"
+    assert scout_after_archive.execution_kind == "model"
+    assert scout_after_archive.trigger_type == "manual"
     assert manual_run.run_id != atlas_run.run_id
     assert scout_run.trigger_type == "scheduled"
     assert scout_run.event_key == f"scheduled:{scheduled.next_fire_at.isoformat()}"
@@ -1789,6 +2081,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     atlas_session, _ = atlas_handle.load_session(atlas_run.session_id)
     scout_session, _ = scout_handle.load_session(scout_run.session_id)
     assert atlas_session.model == "openai/gpt-atlas"
+    assert atlas_handle.require_owner_binding().lifecycle_status == "archived"
     assert scout_session.model == "openai/gpt-scout"
     assert [message.role for message in atlas_session.messages] == ["user", "assistant"]
     assert [message.role for message in scout_session.messages] == ["user", "assistant"]
@@ -1797,10 +2090,114 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
         scheduled.next_fire_at + timedelta(minutes=10)
     )
 
-    assert main(event_args) == 2
-    duplicate = capsys.readouterr()
-    assert "already used" in duplicate.err or "already claimed" in duplicate.err
-    assert len(observed) == 3
+    assert len(observed) == 4
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_dispatched_provider_turn_finishes_once_after_pause_and_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.coworkers import CoworkerTurnRequest
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        started=started,
+        release=release,
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+    workspace_identity = SafetyGuard(workspace).project_root_identity
+    assert workspace_identity is not None
+    request = CoworkerTurnRequest(
+        turn_id="claimed-before-pause",
+        question="Finish this already dispatched read-only request.",
+        workspace_identity=workspace_identity,
+    )
+
+    async def pause_after_dispatch() -> Any:
+        task = asyncio.create_task(handle.run_readonly_turn(request))
+        await asyncio.wait_for(started.wait(), timeout=10)
+        handle.pause()
+        handle.archive()
+        release.set()
+        return await task
+
+    result = asyncio.run(pause_after_dispatch())
+    assert result.response.startswith("Atlas found the failed assertion")
+    assert len(observed) == 1
+    history = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    ).list_readonly_turn_history()
+    assert len(history) == 1
+    assert history[0].status == "completed"
+    assert history[0].session_ref.run_id == result.session_ref.run_id
+    assert history[0].response == result.response
+    with pytest.raises(CoworkerRuntimeUnavailable, match="coworker is archived"):
+        asyncio.run(
+            handle.run_readonly_turn(
+                CoworkerTurnRequest(
+                    turn_id="must-not-dispatch-after-archive",
+                    question="This new request must be rejected.",
+                    workspace_identity=workspace_identity,
+                )
+            )
+        )
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_pause_before_durable_claim_blocks_provider_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.coworkers import CoworkerTurnRequest
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+    workspace_identity = SafetyGuard(workspace).project_root_identity
+    assert workspace_identity is not None
+    request = CoworkerTurnRequest(
+        turn_id="pause-at-claim",
+        question="The final claim must recheck coworker lifecycle state.",
+        workspace_identity=workspace_identity,
+    )
+    claim = directory._claim_responsibility_turn
+
+    def pause_then_claim(**kwargs: Any) -> Any:
+        handle.pause()
+        return claim(**kwargs)
+
+    monkeypatch.setattr(directory, "_claim_responsibility_turn", pause_then_claim)
+    with pytest.raises(CoworkerRuntimeUnavailable, match="coworker is paused"):
+        asyncio.run(handle.run_readonly_turn(request))
+    assert not observed
+    assert handle.list_readonly_turn_history() == ()
+    assert handle.require_owner_binding().lifecycle_status == "paused"
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
