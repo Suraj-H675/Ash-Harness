@@ -1254,7 +1254,7 @@ def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (8,)
+        ).fetchone() == (9,)
         assert connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall() == []
@@ -1400,7 +1400,7 @@ def test_v5_coworker_directory_migration_adds_cursor_and_preserves_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (8,)
+        ).fetchone() == (9,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -1510,6 +1510,8 @@ try:
         scheduled_for=scheduled_for,
         prompt=prompt,
         workspace_identity=workspace_identity,
+        responsibility_updated_at=responsibility.updated_at,
+        responsibility_revision=responsibility.revision,
     )
 except CoworkerRuntimeUnavailable:
     print("rejected")
@@ -2346,7 +2348,7 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (8,)
+        ).fetchone() == (9,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
@@ -2429,7 +2431,7 @@ def test_coworker_directory_v3_migration_preserves_dispatch_history(
     with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (8,)
+        ).fetchone() == (9,)
         columns = {
             str(row[1])
             for row in connection.execute(
@@ -3476,7 +3478,7 @@ def test_v2_coworker_directory_migration_adds_file_approval_boundary(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (8,)
+        ).fetchone() == (9,)
         assert connection.execute(
             "SELECT COUNT(*) FROM coworker_file_approvals"
         ).fetchone() == (0,)
@@ -3524,7 +3526,7 @@ def test_v6_coworker_directory_migration_keeps_legacy_dispatch_unbound(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (8,)
+        ).fetchone() == (9,)
 
 
 def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
@@ -3640,7 +3642,7 @@ def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (8,)
+        ).fetchone() == (9,)
         columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(coworker_turn_dispatches)")
@@ -3658,3 +3660,51 @@ def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
             (run_id,),
         ).fetchone() == ("completed", 3, 9)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_v8_coworker_directory_migration_grants_no_ambient_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    responsibility = handle.create_responsibility(
+        scope="Legacy responsibility",
+        objective="Keep its existing read-only behavior.",
+    )
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "ALTER TABLE coworker_responsibilities "
+            "DROP COLUMN evidence_paths_json"
+        )
+        connection.execute(
+            "ALTER TABLE coworker_responsibilities DROP COLUMN revision"
+        )
+        connection.execute("UPDATE coworker_directory_meta SET schema_version = 8")
+
+    migrated = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert migrated.get_responsibility(responsibility.responsibility_id).evidence_paths == ()
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (9,)
+        assert connection.execute(
+            "SELECT evidence_paths_json FROM coworker_responsibilities "
+            "WHERE responsibility_id = ?",
+            (responsibility.responsibility_id,),
+        ).fetchone() == ("[]",)
+        assert connection.execute(
+            "SELECT revision FROM coworker_responsibilities "
+            "WHERE responsibility_id = ?",
+            (responsibility.responsibility_id,),
+        ).fetchone() == (1,)

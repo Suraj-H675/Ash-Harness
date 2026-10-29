@@ -145,6 +145,13 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     responsibility_create.add_argument(
         "--success-criterion", action="append", required=True
     )
+    responsibility_create.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        metavar="WORKSPACE_RELATIVE_PATH",
+        help="Explicit read-only evidence file; repeat for each file",
+    )
     responsibility_create.add_argument("--at")
     responsibility_create.add_argument("--every")
     responsibility_create.add_argument("--cron")

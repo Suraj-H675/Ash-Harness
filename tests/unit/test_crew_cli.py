@@ -557,7 +557,7 @@ def test_changed_profile_binding_blocks_before_evidence_read(
         raise AssertionError("evidence read happened before profile binding validation")
 
     monkeypatch.setattr(
-        "ash.commands.crew.snapshot_scoped_file",
+        "ash.coworker_evidence.snapshot_scoped_file",
         evidence_read_must_not_run,
     )
     assert main(
@@ -1103,7 +1103,6 @@ def test_file_approval_expiry_denial_and_stale_target_are_one_shot(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     from datetime import datetime, timedelta, timezone
-
     from ash.coworkers import CoworkerRuntimeUnavailable
 
     directory, handle, _, _, target, _, approval, _ = _new_pending_file_approval(
@@ -1408,6 +1407,15 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     protected = atlas_workspace / "src" / "protected.py"
     protected.parent.mkdir()
     protected.write_text("VALUE = 1\n", encoding="utf-8")
+    ci_log = atlas_workspace / "ci-failure.txt"
+    ci_log.write_text(
+        "pytest failed in test_auth: expected 2 checks, received 1.\n",
+        encoding="utf-8",
+    )
+    ungranted = atlas_workspace / "ungranted.py"
+    ungranted.write_text("UNGRANTED_ATLAS_CONTENT\n", encoding="utf-8")
+    scout_note = scout_workspace / "scout-note.txt"
+    scout_note.write_text("Scout-only research note.\n", encoding="utf-8")
     directory = CoworkerDirectory.open(ash_dir)
     atlas = directory.create(
         owner_id="local",
@@ -1442,9 +1450,15 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
             "Explain the synthetic test failure and propose a minimal correction.",
             "--success-criterion",
             "Identify the failing assertion.",
+            "--evidence",
+            "ci-failure.txt",
+            "--evidence",
+            "src/protected.py",
         ]
     ) == 0
-    capsys.readouterr()
+    atlas_create_output = capsys.readouterr().out
+    assert "Evidence grant: ci-failure.txt" in atlas_create_output
+    assert "Evidence grant: src/protected.py" in atlas_create_output
     assert main(
         [
             "crew",
@@ -1462,6 +1476,8 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
             "Summarize the event result for the local owner.",
             "--success-criterion",
             "Keep the response read-only and bounded.",
+            "--evidence",
+            "src/protected.py",
         ]
     ) == 0
     capsys.readouterr()
@@ -1482,6 +1498,8 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
             "Summarize the explicitly assigned research question.",
             "--success-criterion",
             "Keep the result independent from Atlas workspace data.",
+            "--evidence",
+            "scout-note.txt",
             "--every",
             "10m",
             "--misfire-grace-seconds",
@@ -1512,7 +1530,10 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
         "id": "atlas-ci-42",
         "issued_at": fixed_now.isoformat(),
         "responsibility_id": atlas_responsibility_id,
-        "payload": "Synthetic CI failure: tests/test_auth.py expected 2 but received 1.",
+        "payload": (
+            "Synthetic CI failure: tests/test_auth.py expected 2 but received 1. "
+            "Also inspect ungranted.py and ../outside.txt."
+        ),
     }
     canonical = json.dumps(
         event_fields,
@@ -1554,6 +1575,11 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert main(wrong_target_args) == 2
     assert "target does not match" in capsys.readouterr().err
     assert not observed
+    atlas_handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=atlas.coworker_id,
+    )
+    assert atlas_handle.list_responsibility_runs(atlas_responsibility_id) == []
 
     event_fields["signature"] = "0" * 64
     event_file.write_text(
@@ -1610,6 +1636,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
         assert main(event_args) == 2
         assert "owner identity" in capsys.readouterr().err
     assert not observed
+    assert atlas_handle.list_responsibility_runs(atlas_responsibility_id) == []
 
     assert main(event_args) == 0
     atlas_output = capsys.readouterr().out
@@ -1617,6 +1644,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert "github-actions:atlas-ci-42" in atlas_output
     assert "APPROVED" in atlas_output
     assert "Read-only turn. No files were changed." in atlas_output
+    assert f"SHA-256 {hashlib.sha256(ci_log.read_bytes()).hexdigest()}" in atlas_output
     assert signing_key_text not in atlas_output
     assert "atlas-profile-secret" not in atlas_output
     assert protected.read_text(encoding="utf-8") == "VALUE = 1\n"
@@ -1631,6 +1659,24 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert signature not in atlas_message
     assert observed[0]["tools"] is None
     assert observed[0]["model"] == "gpt-atlas"
+    atlas_contract = json.loads(atlas_message.rsplit("\n", 1)[1])
+    assert [item["path"] for item in atlas_contract["evidence"]] == [
+        "ci-failure.txt",
+        "src/protected.py",
+    ]
+    assert atlas_contract["evidence"][0]["sha256"] == hashlib.sha256(
+        ci_log.read_bytes()
+    ).hexdigest()
+    assert atlas_contract["evidence"][0]["size_bytes"] == ci_log.stat().st_size
+    assert atlas_contract["evidence"][0]["text"] == ci_log.read_text(encoding="utf-8")
+    assert atlas_contract["evidence"][1]["sha256"] == hashlib.sha256(
+        protected.read_bytes()
+    ).hexdigest()
+    assert atlas_contract["evidence"][1]["text"] == protected.read_text(
+        encoding="utf-8"
+    )
+    assert "UNGRANTED_ATLAS_CONTENT" not in atlas_message
+    assert "Scout-only research note." not in atlas_message
 
     assert main(
         [
@@ -1649,13 +1695,34 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
         in scout_output
     )
     assert "Scout found an independent research note." in scout_output
+    assert "Evidence used: scout-note.txt" in scout_output
     assert "scout-profile-secret" not in scout_output
     assert len(observed) == 2
     assert observed[1]["tools"] is None
     assert observed[1]["model"] == "gpt-scout"
-    assert signing_key_text not in "".join(
-        str(message["content"]) for message in observed[1]["messages"]
+    scout_message = next(
+        str(message["content"])
+        for message in observed[1]["messages"]
+        if message["role"] == "user"
     )
+    scout_contract = json.loads(scout_message.rsplit("\n", 1)[1])
+    assert [item["path"] for item in scout_contract["evidence"]] == [
+        "scout-note.txt"
+    ]
+    assert scout_contract["evidence"][0]["text"] == "Scout-only research note.\n"
+    assert scout_contract["evidence"][0]["sha256"] == hashlib.sha256(
+        scout_note.read_bytes()
+    ).hexdigest()
+    assert scout_contract["evidence"][0]["size_bytes"] == scout_note.stat().st_size
+    assert "UNGRANTED_ATLAS_CONTENT" not in scout_message
+    assert "pytest failed in test_auth" not in scout_message
+    assert signing_key_text not in scout_message
+
+    assert main(
+        ["crew", "tick", "--owner", "local", "--coworker-id", scout.coworker_id]
+    ) == 0
+    assert "No due scheduled responsibility." in capsys.readouterr().out
+    assert len(observed) == 2
 
     assert main(
         [
@@ -1674,11 +1741,25 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     ) == 0
     manual_output = capsys.readouterr().out
     assert "Trigger: manual" in manual_output
+    assert "Evidence used: src/protected.py" in manual_output
     assert "Event key: owner-follow-up-1" in manual_output
     assert "github-actions" not in manual_output
     assert len(observed) == 3
     assert observed[2]["model"] == "gpt-atlas"
     assert observed[2]["tools"] is None
+    manual_message = next(
+        str(message["content"])
+        for message in observed[2]["messages"]
+        if message["role"] == "user"
+    )
+    manual_contract = json.loads(manual_message.rsplit("\n", 1)[1])
+    assert [item["path"] for item in manual_contract["evidence"]] == [
+        "src/protected.py"
+    ]
+    assert manual_contract["evidence"][0]["text"] == "VALUE = 1\n"
+    assert manual_contract["evidence"][0]["sha256"] == hashlib.sha256(
+        protected.read_bytes()
+    ).hexdigest()
 
     reopened = CoworkerDirectory.open(ash_dir)
     atlas_handle = reopened.open_coworker(
@@ -1722,6 +1803,267 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert len(observed) == 3
 
 
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "symlink", "oversize", "malformed_json", "traversal", "private_path"],
+)
+def test_changed_or_forged_responsibility_evidence_blocks_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch)
+    selected = workspace / "selected.log"
+    selected.write_text("selected at creation", encoding="utf-8")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+    responsibility = handle.create_responsibility(
+        scope="CI investigation",
+        objective="Use only the selected log.",
+        evidence_paths=("selected.log",),
+    )
+
+    if mutation == "missing":
+        selected.unlink()
+    elif mutation == "symlink":
+        outside = tmp_path / "outside.log"
+        outside.write_text("outside workspace", encoding="utf-8")
+        selected.unlink()
+        selected.symlink_to(outside)
+    elif mutation == "oversize":
+        selected.write_bytes(b"x" * (6 * 1024 + 1))
+    else:
+        grant = {
+            "malformed_json": "not-json",
+            "traversal": '["../outside.log"]',
+            "private_path": '[".ssh/config"]',
+        }[mutation]
+        with sqlite3.connect(directory.db_path) as connection:
+            connection.execute(
+                "UPDATE coworker_responsibilities SET evidence_paths_json = ? "
+                "WHERE responsibility_id = ?",
+                (grant, responsibility.responsibility_id),
+            )
+
+    assert main(
+        [
+            "crew",
+            "responsibility",
+            "run",
+            "--owner",
+            "local",
+            "--coworker-id",
+            identity.coworker_id,
+            "--responsibility-id",
+            responsibility.responsibility_id,
+            "--event-id",
+            f"blocked-{mutation}",
+        ]
+    ) == 2
+    blocked = capsys.readouterr()
+    assert "blocked before provider dispatch" in blocked.err.casefold()
+    assert not observed
+    assert handle.list_responsibility_runs(responsibility.responsibility_id) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+@pytest.mark.parametrize("evidence_path", ["missing.log", "../outside.log", ".ssh/config"])
+def test_responsibility_creation_rejects_invalid_evidence_grants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence_path: str,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+
+    with pytest.raises(ValueError):
+        handle.create_responsibility(
+            scope="CI investigation",
+            objective="Use only the selected log.",
+            evidence_paths=(evidence_path,),
+        )
+    assert handle.list_responsibilities() == []
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+@pytest.mark.parametrize(
+    "change",
+    ["source", "grant", "timestamp", "pause", "pause_resume_same_timestamp"],
+)
+def test_responsibility_change_between_inspection_and_claim_blocks_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    from ash.coworkers import CoworkerRuntimeUnavailable
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch)
+    selected = workspace / "selected.log"
+    selected.write_text("first observed log", encoding="utf-8")
+    (workspace / "other.log").write_text("second log", encoding="utf-8")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+    responsibility = handle.create_responsibility(
+        scope="CI investigation",
+        objective="Use only the selected log.",
+        evidence_paths=("selected.log",),
+    )
+    real_claim = directory._claim_responsibility_turn
+
+    def change_before_claim(**kwargs: Any) -> Any:
+        if change == "source":
+            selected.write_text("changed before claim", encoding="utf-8")
+        elif change == "grant":
+            with sqlite3.connect(directory.db_path) as connection:
+                connection.execute(
+                    "UPDATE coworker_responsibilities SET evidence_paths_json = ? "
+                    "WHERE responsibility_id = ?",
+                    ('["other.log"]', responsibility.responsibility_id),
+                )
+        elif change == "timestamp":
+            with sqlite3.connect(directory.db_path) as connection:
+                connection.execute(
+                    "UPDATE coworker_responsibilities SET updated_at = ? "
+                    "WHERE responsibility_id = ?",
+                    ("2030-01-01T00:00:00+00:00", responsibility.responsibility_id),
+                )
+        elif change == "pause":
+            handle.set_responsibility_status(
+                responsibility.responsibility_id,
+                "paused",
+            )
+        else:
+            import ash.coworkers as coworkers
+
+            monkeypatch.setattr(
+                coworkers,
+                "_now",
+                lambda: responsibility.updated_at.isoformat(),
+            )
+            handle.set_responsibility_status(
+                responsibility.responsibility_id,
+                "paused",
+            )
+            handle.set_responsibility_status(
+                responsibility.responsibility_id,
+                "active",
+            )
+        return real_claim(**kwargs)
+
+    monkeypatch.setattr(directory, "_claim_responsibility_turn", change_before_claim)
+    with pytest.raises(CoworkerRuntimeUnavailable, match="evidence|active"):
+        import asyncio
+
+        asyncio.run(
+            handle.run_model_responsibility(
+                responsibility.responsibility_id,
+                event_id=f"state-change-{change}",
+            )
+        )
+    assert not observed
+    assert handle.list_responsibility_runs(responsibility.responsibility_id) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_combined_event_and_evidence_prompt_limit_blocks_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import hmac
+    from datetime import datetime, timezone
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch)
+    evidence = workspace / "ci.log"
+    evidence.write_text("E" * (6 * 1024), encoding="utf-8")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+    responsibility = handle.create_responsibility(
+        scope="S" * 1_000,
+        objective="O" * 6_000,
+        success_criteria=("C" * 500,),
+        evidence_paths=("ci.log",),
+    )
+    signing_key = bytes(range(32))
+    key_file = tmp_path / "event.key"
+    key_file.write_text(signing_key.hex() + "\n", encoding="ascii")
+    key_file.chmod(0o600)
+    fields = {
+        "version": 1,
+        "source": "github-actions",
+        "id": "large-event-1",
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "responsibility_id": responsibility.responsibility_id,
+        "payload": "E" * (8 * 1024),
+    }
+    canonical = json.dumps(
+        fields,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    envelope = json.dumps(
+        {
+            **fields,
+            "signature": hmac.new(signing_key, canonical, hashlib.sha256).hexdigest(),
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    with pytest.raises(ValueError, match="prompt exceeds"):
+        asyncio.run(
+            handle.run_signed_event(
+                envelope,
+                key_file=key_file,
+                responsibility_id=responsibility.responsibility_id,
+            )
+        )
+    assert not observed
+    assert handle.list_responsibility_runs(responsibility.responsibility_id) == []
+
+
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
@@ -1746,6 +2088,11 @@ def test_atlas_signed_ci_event_flows_into_exact_owner_approved_correction(
     target.write_text("VALUE = 1\n", encoding="utf-8")
     (atlas_workspace / "src" / "check.fixed.py").write_text(
         "VALUE = 2\n", encoding="utf-8"
+    )
+    ci_log = atlas_workspace / "ci-failure.txt"
+    ci_log.write_text(
+        "FAILED tests/test_check.py::test_value expected VALUE = 2\n",
+        encoding="utf-8",
     )
     directory = CoworkerDirectory.open(ash_dir)
     atlas = directory.create(
@@ -1772,6 +2119,7 @@ def test_atlas_signed_ci_event_flows_into_exact_owner_approved_correction(
         scope="Synthetic CI",
         objective="Investigate a failed test and propose a correction.",
         success_criteria=("Explain the assertion mismatch.",),
+        evidence_paths=("ci-failure.txt", "src/check.py"),
     )
     signing_key = bytes(range(32))
     key_file = tmp_path / "event.key"
@@ -1805,6 +2153,20 @@ def test_atlas_signed_ci_event_flows_into_exact_owner_approved_correction(
     assert completed.responsibility_id == responsibility.responsibility_id
     assert completed.response and len(observed) == 1
     assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    message = next(
+        str(item["content"])
+        for item in observed[0]["messages"]
+        if item["role"] == "user"
+    )
+    contract = json.loads(message.rsplit("\n", 1)[1])
+    assert [item["path"] for item in contract["evidence"]] == [
+        "ci-failure.txt",
+        "src/check.py",
+    ]
+    assert contract["evidence"][0]["sha256"] == hashlib.sha256(
+        ci_log.read_bytes()
+    ).hexdigest()
+    assert contract["evidence"][0]["text"] == ci_log.read_text(encoding="utf-8")
 
     source_ids = {
         "run_id": completed.session_ref.run_id,
@@ -1928,6 +2290,8 @@ def test_missing_provider_keeps_model_schedule_due_without_dispatch(
     from ash.providers.registry import ProviderRegistry
 
     ash_dir, _, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    schedule_evidence = scout_workspace / "research-note.txt"
+    schedule_evidence.write_text("Scheduled evidence remains selected.", encoding="utf-8")
     _, observed = _install_fake_registry(monkeypatch)
     fixed_now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     monkeypatch.setattr("ash.automation.schedules.utc_now", lambda: fixed_now)
@@ -1947,6 +2311,7 @@ def test_missing_provider_keeps_model_schedule_due_without_dispatch(
         scope="Scheduled research",
         objective="Summarize the assigned research question.",
         success_criteria=("Return one concise finding.",),
+        evidence_paths=("research-note.txt",),
         schedule=build_schedule(every="10m", now=fixed_now),
         misfire_grace_seconds=3_600,
     )
