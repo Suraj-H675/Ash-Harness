@@ -644,6 +644,61 @@ class CoworkerResponsibilityRun:
     execution_kind: CoworkerResponsibilityExecutionKind = "legacy"
 
 
+CoworkerActivityCause = Literal["ask", "manual", "event", "scheduled"]
+
+
+@dataclass(frozen=True)
+class CoworkerRunInboxEntry:
+    """Metadata-only view of one durable coworker dispatch."""
+
+    coworker_id: str
+    coworker_name: str
+    lifecycle_status: CoworkerLifecycleStatus
+    occurred_at: datetime
+    cause: CoworkerActivityCause
+    run_id: str
+    session_id: str | None
+    request_id: str | None
+    status: Literal["claimed", "completed", "skipped"]
+    execution_kind: CoworkerResponsibilityExecutionKind
+    responsibility_id: str | None = None
+    event_key: str | None = None
+    scheduled_for: datetime | None = None
+    skip_reason: str | None = None
+
+    @property
+    def entry_id(self) -> str:
+        return f"run:{self.coworker_id}:{self.run_id}"
+
+
+@dataclass(frozen=True)
+class CoworkerApprovalInboxEntry:
+    """Metadata-only view of one approval's latest validated status event."""
+
+    coworker_id: str
+    coworker_name: str
+    lifecycle_status: CoworkerLifecycleStatus
+    occurred_at: datetime
+    cause: CoworkerActivityCause
+    approval_id: str
+    source_run_id: str
+    source_session_id: str
+    source_request_id: str
+    status: CoworkerFileApprovalStatus
+    action: CoworkerFileApprovalAction
+    target_path: str
+    expires_at: datetime
+    responsibility_id: str | None = None
+    event_key: str | None = None
+
+    @property
+    def entry_id(self) -> str:
+        return f"approval:{self.approval_id}"
+
+
+CoworkerInboxEntry = CoworkerRunInboxEntry | CoworkerApprovalInboxEntry
+
+
 @dataclass(frozen=True)
 class CoworkerScheduleTickResult:
     """One explicit due check over at most one scheduled occurrence."""
@@ -1338,6 +1393,16 @@ def _signed_event_run_id(responsibility_id: str, event_key: str) -> str:
             f"ash-crew-signed-event:{event_key}",
         )
     )
+
+
+def _inbox_timestamp(value: datetime | str) -> datetime:
+    try:
+        timestamp = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise CoworkerDirectoryError("stored coworker activity timestamp is invalid") from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
 
 
 def _current_time() -> datetime:
@@ -2740,6 +2805,317 @@ class CoworkerDirectory:
                 (owner, owner_uid),
             ).fetchall()
         return tuple(_record_from_row(row) for row in rows)
+
+    def list_inbox(
+        self,
+        *,
+        owner_id: str,
+        limit: int = 20,
+        include_skipped: bool = False,
+    ) -> tuple[CoworkerInboxEntry, ...]:
+        """Derive a bounded owner inbox from durable run and approval records."""
+
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("inbox limit must be between 1 and 100")
+        if type(include_skipped) is not bool:
+            raise ValueError("include_skipped must be a boolean")
+        owner = _normalize_owner_id(owner_id)
+        owner_uid = _current_owner_uid()
+        if owner_uid is None:
+            raise CoworkerRuntimeUnavailable(
+                "local coworker owner identity could not be verified"
+            )
+
+        entries: list[CoworkerInboxEntry] = []
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            coworker_rows = conn.execute(
+                "SELECT * FROM coworkers WHERE owner_id = ? AND owner_uid = ? "
+                "AND state = 'ready' ORDER BY coworker_id",
+                (owner, owner_uid),
+            ).fetchall()
+            coworkers: dict[str, Coworker] = {}
+            for row in coworker_rows:
+                identity = _record_from_row(row)
+                current = self._require_coworker_owner_binding(
+                    CoworkerHandle(self, identity),
+                    conn,
+                )
+                coworkers[current.coworker_id] = current
+            if not coworkers:
+                conn.commit()
+                return ()
+
+            skipped_clause = "" if include_skipped else "AND dispatch.status != 'skipped'"
+            run_rows = conn.execute(
+                "SELECT dispatch.*, coworker.display_name, "
+                "coworker.lifecycle_status "
+                "FROM coworker_turn_dispatches AS dispatch "
+                "JOIN coworkers AS coworker ON coworker.owner_id = dispatch.owner_id "
+                "AND coworker.coworker_id = dispatch.coworker_id "
+                "WHERE dispatch.owner_id = ? AND coworker.owner_uid = ? "
+                "AND coworker.state = 'ready' "
+                f"{skipped_clause} "
+                "ORDER BY julianday(CASE WHEN dispatch.status = 'completed' "
+                "AND dispatch.completed_at IS NOT NULL THEN dispatch.completed_at "
+                "ELSE dispatch.created_at END) DESC, coworker.coworker_id, "
+                "dispatch.run_id LIMIT ?",
+                (owner, owner_uid, limit),
+            ).fetchall()
+            for row in run_rows:
+                run_identity = coworkers.get(str(row["coworker_id"]))
+                if run_identity is None or row["owner_id"] != owner:
+                    raise CoworkerDirectoryError(
+                        "inbox run is outside the local owner binding"
+                    )
+                if row["responsibility_id"] is not None:
+                    run = _responsibility_run_from_row(row)
+                    cause: CoworkerActivityCause = run.trigger_type
+                    run_id = run.run_id
+                    session_id = run.session_id
+                    request_id = run.request_id
+                    status = run.status
+                    execution_kind = run.execution_kind
+                    responsibility_id = run.responsibility_id
+                    event_key = run.event_key
+                    scheduled_for = run.scheduled_for
+                    skip_reason = run.skip_reason
+                    source_time = (
+                        run.completed_at
+                        if run.status == "completed" and run.completed_at is not None
+                        else run.created_at
+                    )
+                else:
+                    status_value = str(row["status"])
+                    execution_kinds: dict[str, CoworkerResponsibilityExecutionKind] = {
+                        "legacy": "legacy",
+                        "offline": "offline",
+                        "model": "model",
+                    }
+                    execution_kind_value = execution_kinds.get(
+                        str(row["execution_kind"])
+                    )
+                    if (
+                        status_value not in {"claimed", "completed"}
+                        or execution_kind_value is None
+                        or row["trigger_type"] is not None
+                        or row["event_key"] is not None
+                        or row["scheduled_for"] is not None
+                        or row["skip_reason"] is not None
+                        or row["session_id"] is None
+                        or row["request_id"] is None
+                    ):
+                        raise CoworkerDirectoryError(
+                            "stored coworker ask dispatch is invalid"
+                        )
+                    execution_kind = execution_kind_value
+                    cause = "ask"
+                    run_id = str(row["run_id"])
+                    session_id = str(row["session_id"])
+                    request_id = str(row["request_id"])
+                    status = status_value  # type: ignore[assignment]
+                    responsibility_id = None
+                    event_key = None
+                    scheduled_for = None
+                    skip_reason = None
+                    source_time = datetime.fromisoformat(
+                        str(row["completed_at"])
+                        if status_value == "completed" and row["completed_at"] is not None
+                        else str(row["created_at"])
+                    )
+                entries.append(
+                    CoworkerRunInboxEntry(
+                        coworker_id=run_identity.coworker_id,
+                        coworker_name=run_identity.display_name,
+                        lifecycle_status=run_identity.lifecycle_status,
+                        occurred_at=_inbox_timestamp(source_time),
+                        cause=cause,
+                        run_id=run_id,
+                        session_id=session_id,
+                        request_id=request_id,
+                        status=status,  # type: ignore[arg-type]
+                        execution_kind=execution_kind,
+                        responsibility_id=responsibility_id,
+                        event_key=event_key,
+                        scheduled_for=(
+                            _inbox_timestamp(scheduled_for)
+                            if scheduled_for is not None
+                            else None
+                        ),
+                        skip_reason=skip_reason,
+                    )
+                )
+
+            approval_rows = conn.execute(
+                "SELECT approval.approval_id, approval.owner_id, "
+                "approval.owner_uid, approval.coworker_id, approval.profile_name, "
+                "approval.workspace_path, approval.canonical_session_id, "
+                "approval.workspace_device, approval.workspace_inode, "
+                "approval.source_run_id, approval.source_session_id, "
+                "approval.source_request_id, approval.action, approval.target_path, "
+                "approval.status, approval.expires_at, "
+                "dispatch.responsibility_id, dispatch.trigger_type, dispatch.event_key, "
+                "dispatch.status AS source_run_status, "
+                "dispatch.execution_kind AS source_run_execution_kind, "
+                "dispatch.session_id AS source_run_session_id, "
+                "dispatch.request_id AS source_run_request_id, "
+                "coworker.display_name, coworker.lifecycle_status, "
+                "latest_event.event_id AS latest_event_id, "
+                "latest_event.status AS latest_event_status, "
+                "latest_event.occurred_at AS latest_event_occurred_at "
+                "FROM coworker_file_approvals AS approval "
+                "JOIN coworkers AS coworker ON coworker.owner_id = approval.owner_id "
+                "AND coworker.coworker_id = approval.coworker_id "
+                "LEFT JOIN coworker_turn_dispatches AS dispatch "
+                "ON dispatch.owner_id = approval.owner_id "
+                "AND dispatch.coworker_id = approval.coworker_id "
+                "AND dispatch.run_id = approval.source_run_id "
+                "JOIN coworker_file_approval_events AS latest_event "
+                "ON latest_event.approval_id = approval.approval_id "
+                "AND latest_event.event_id = (SELECT MAX(event.event_id) "
+                "FROM coworker_file_approval_events AS event "
+                "WHERE event.approval_id = approval.approval_id) "
+                "WHERE approval.owner_id = ? AND coworker.owner_uid = ? "
+                "AND coworker.state = 'ready' "
+                "ORDER BY julianday(latest_event.occurred_at) DESC, "
+                "latest_event.event_id DESC, approval.approval_id LIMIT ?",
+                (owner, owner_uid, limit),
+            ).fetchall()
+            for row in approval_rows:
+                approval_identity = coworkers.get(str(row["coworker_id"]))
+                if approval_identity is None or row["owner_id"] != owner:
+                    raise CoworkerDirectoryError(
+                        "inbox approval is outside the local owner binding"
+                    )
+                if (
+                    row["owner_uid"] != owner_uid
+                    or row["profile_name"] != approval_identity.profile_name
+                    or Path(str(row["workspace_path"])) != approval_identity.workspace
+                    or row["canonical_session_id"] != approval_identity.canonical_session_id
+                    or type(row["workspace_device"]) is not int
+                    or row["workspace_device"] < 0
+                    or type(row["workspace_inode"]) is not int
+                    or row["workspace_inode"] <= 0
+                    or row["source_run_status"] != "completed"
+                    or row["source_run_execution_kind"] != "model"
+                    or row["source_session_id"] != row["source_run_session_id"]
+                    or row["source_request_id"] != row["source_run_request_id"]
+                ):
+                    raise CoworkerDirectoryError(
+                        "inbox approval binding changed"
+                    )
+                approval_status = _parse_file_approval_status(row["status"])
+                events = self._file_approval_events(
+                    conn,
+                    approval_id=str(row["approval_id"]),
+                    status=approval_status,
+                )
+                latest_event = events[-1]
+                if (
+                    latest_event.status != approval_status
+                    or row["latest_event_status"] != latest_event.status
+                    or row["latest_event_occurred_at"] != latest_event.occurred_at
+                ):
+                    raise CoworkerDirectoryError(
+                        "inbox approval status history changed"
+                    )
+                try:
+                    for field in (
+                        "approval_id",
+                        "source_run_id",
+                        "source_session_id",
+                        "source_request_id",
+                        "canonical_session_id",
+                    ):
+                        UUID(str(row[field]))
+                    expires_at = _inbox_timestamp(
+                        datetime.fromisoformat(str(row["expires_at"]))
+                    )
+                except (ValueError, TypeError) as exc:
+                    raise CoworkerDirectoryError(
+                        "inbox approval identity or expiry is invalid"
+                    ) from exc
+                run_trigger = row["trigger_type"]
+                if run_trigger is None:
+                    if (
+                        row["responsibility_id"] is not None
+                        or row["event_key"] is not None
+                    ):
+                        raise CoworkerDirectoryError(
+                            "inbox approval source attribution is invalid"
+                        )
+                    if (
+                        row["source_run_session_id"] != row["source_session_id"]
+                        or row["source_run_request_id"] != row["source_request_id"]
+                    ):
+                        raise CoworkerDirectoryError(
+                            "inbox approval source turn binding changed"
+                        )
+                    cause = "ask"
+                    responsibility_id = None
+                    event_key = None
+                else:
+                    if run_trigger not in {"manual", "event", "scheduled"}:
+                        raise CoworkerDirectoryError(
+                            "inbox approval source trigger is invalid"
+                        )
+                    source_run_row = conn.execute(
+                        "SELECT * FROM coworker_turn_dispatches WHERE owner_id = ? "
+                        "AND coworker_id = ? AND run_id = ?",
+                        (owner, approval_identity.coworker_id, str(row["source_run_id"])),
+                    ).fetchone()
+                    if source_run_row is None:
+                        raise CoworkerDirectoryError(
+                            "inbox approval source run is missing"
+                        )
+                    try:
+                        source_run = _responsibility_run_from_row(source_run_row)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise CoworkerDirectoryError(
+                            "inbox approval source run is invalid"
+                        ) from exc
+                    if (
+                        source_run.status != "completed"
+                        or source_run.execution_kind != "model"
+                        or source_run.trigger_type != run_trigger
+                        or source_run.responsibility_id != row["responsibility_id"]
+                        or source_run.event_key != row["event_key"]
+                        or source_run.session_id != row["source_session_id"]
+                        or source_run.request_id != row["source_request_id"]
+                    ):
+                        raise CoworkerDirectoryError(
+                            "inbox approval source run binding changed"
+                        )
+                    cause = source_run.trigger_type
+                    responsibility_id = source_run.responsibility_id
+                    event_key = source_run.event_key
+                target_path = _validate_file_approval_path(
+                    str(row["target_path"]),
+                    label="file approval target path",
+                )
+                entries.append(
+                    CoworkerApprovalInboxEntry(
+                        coworker_id=approval_identity.coworker_id,
+                        coworker_name=approval_identity.display_name,
+                        lifecycle_status=approval_identity.lifecycle_status,
+                        occurred_at=_inbox_timestamp(latest_event.occurred_at),
+                        cause=cause,
+                        approval_id=str(row["approval_id"]),
+                        source_run_id=str(row["source_run_id"]),
+                        source_session_id=str(row["source_session_id"]),
+                        source_request_id=str(row["source_request_id"]),
+                        status=approval_status,
+                        action=_parse_file_approval_action(row["action"]),
+                        target_path=target_path,
+                        expires_at=expires_at,
+                        responsibility_id=responsibility_id,
+                        event_key=event_key,
+                    )
+                )
+            conn.commit()
+
+        entries.sort(key=lambda entry: (entry.occurred_at, entry.entry_id), reverse=True)
+        return tuple(entries[:limit])
 
     def _validate_handle_binding(
         self,

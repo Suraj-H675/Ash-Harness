@@ -790,6 +790,10 @@ def test_atlas_file_approval_is_durable_exact_and_single_use(
     assert main(approve_args) == 2
     assert "interactive local TTY" in capsys.readouterr().err
     assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    pending_inbox = capsys.readouterr().out
+    assert f"approval:{approval_id}" in pending_inbox
+    assert "Status: Waiting for explicit owner approval." in pending_inbox
 
     class TtyInput(io.StringIO):
         def isatty(self) -> bool:
@@ -835,10 +839,18 @@ def test_atlas_file_approval_is_durable_exact_and_single_use(
     assert run_tty_action(approve_args, "APPROVE") == 0
     assert "Status: approved." in capsys.readouterr().out
     assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    approved_inbox = capsys.readouterr().out
+    assert approved_inbox.count(f"approval:{approval_id}") == 1
+    assert "Status: Approved; waiting for an explicit local apply." in approved_inbox
 
     assert run_tty_action(apply_args, "APPLY") == 0
     assert "Status: succeeded." in capsys.readouterr().out
     assert target.read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    applied_inbox = capsys.readouterr().out
+    assert applied_inbox.count(f"approval:{approval_id}") == 1
+    assert "Status: Applied." in applied_inbox
     assert scout_target.read_text(encoding="utf-8") == "SCOUT = True\n"
 
     directory = CoworkerDirectory.open()
@@ -1230,6 +1242,10 @@ def test_file_approval_expiry_denial_and_stale_target_are_one_shot(
         handle._apply_file_approval(approval.approval_id)
     denied = handle.inspect_file_approval(approval.approval_id)[0]
     assert denied.status == "denied"
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    denied_inbox = capsys.readouterr().out
+    assert f"approval:{approval.approval_id}" in denied_inbox
+    assert "Status: Denied." in denied_inbox
     assert target.read_bytes() == b"VALUE = 1\n"
 
     _, revoked_handle, _, _, revoked_target, _, revoked, _ = (
@@ -1243,6 +1259,10 @@ def test_file_approval_expiry_denial_and_stale_target_are_one_shot(
         event.status
         for event in revoked_handle.inspect_file_approval(revoked.approval_id)[1]
     ] == ["pending", "approved", "revoked"]
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    revoked_inbox = capsys.readouterr().out
+    assert f"approval:{revoked.approval_id}" in revoked_inbox
+    assert "Status: Revoked." in revoked_inbox
     assert revoked_target.read_bytes() == b"VALUE = 1\n"
 
     _, expired_handle, _, _, expired_target, _, expired, _ = _new_pending_file_approval(
@@ -1254,6 +1274,10 @@ def test_file_approval_expiry_denial_and_stale_target_are_one_shot(
         with pytest.raises(CoworkerRuntimeUnavailable, match="no longer pending"):
             expired_handle._approve_file_approval(expired.approval_id)
     assert expired_handle.inspect_file_approval(expired.approval_id)[0].status == "expired"
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    expired_inbox = capsys.readouterr().out
+    assert f"approval:{expired.approval_id}" in expired_inbox
+    assert "Status: Expired." in expired_inbox
     assert expired_target.read_bytes() == b"VALUE = 1\n"
 
     _, stale_handle, _, _, stale_target, _, stale, _ = _new_pending_file_approval(
@@ -1506,8 +1530,10 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     import hmac
+    import subprocess
+    import sys
     from datetime import datetime, timedelta, timezone
-    from uuid import uuid4
+    from uuid import UUID, uuid4, uuid5
 
     import ash.coworkers as coworkers
 
@@ -1524,6 +1550,9 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     protected = atlas_workspace / "src" / "protected.py"
     protected.parent.mkdir()
     protected.write_text("VALUE = 1\n", encoding="utf-8")
+    (atlas_workspace / "src" / "protected.fixed.py").write_text(
+        "VALUE = 2\n", encoding="utf-8"
+    )
     ci_log = atlas_workspace / "ci-failure.txt"
     ci_log.write_text(
         "pytest failed in test_auth: expected 2 checks, received 1.\n",
@@ -1825,6 +1854,62 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert "UNGRANTED_ATLAS_CONTENT" not in atlas_message
     assert "Scout-only research note." not in atlas_message
 
+    atlas_source_ids = {
+        label.lower().replace(" ", "_"): next(
+            line.split(": ", 1)[1]
+            for line in atlas_output.splitlines()
+            if line.startswith(f"{label}: ")
+        )
+        for label in ("Run ID", "Session ID", "Request ID")
+    }
+    assert main(
+        [
+            "crew",
+            "propose",
+            "--owner",
+            "local",
+            "--coworker-id",
+            atlas.coworker_id,
+            "--run-id",
+            atlas_source_ids["run_id"],
+            "--session-id",
+            atlas_source_ids["session_id"],
+            "--request-id",
+            atlas_source_ids["request_id"],
+            "--target",
+            "src/protected.py",
+            "--replacement-file",
+            "src/protected.fixed.py",
+        ]
+    ) == 0
+    proposal_output = capsys.readouterr().out
+    assert "Status: pending" in proposal_output
+    atlas_approval_id = next(
+        line.removeprefix("Approval ID: ")
+        for line in proposal_output.splitlines()
+        if line.startswith("Approval ID: ")
+    )
+    assert protected.read_text(encoding="utf-8") == "VALUE = 1\n"
+
+    assert main(
+        ["crew", "pause", "--owner", "local", "--coworker-id", atlas.coworker_id]
+    ) == 0
+    capsys.readouterr()
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    paused_inbox = capsys.readouterr().out
+    assert f"Coworker: Atlas ({atlas.coworker_id})" in paused_inbox
+    assert f"approval:{atlas_approval_id}" in paused_inbox
+    assert "waiting for explicit owner approval" in paused_inbox.casefold()
+    assert "Lifecycle: paused" in paused_inbox
+    assert "VALUE = 1" not in paused_inbox
+    assert "VALUE = 2" not in paused_inbox
+    assert "APPROVED: Atlas recommends inspecting this failure." not in paused_inbox
+    assert "atlas-profile-secret" not in paused_inbox
+    assert main(
+        ["crew", "resume", "--owner", "local", "--coworker-id", atlas.coworker_id]
+    ) == 0
+    capsys.readouterr()
+
     assert main(
         ["crew", "pause", "--owner", "local", "--coworker-id", scout.coworker_id]
     ) == 0
@@ -1894,6 +1979,88 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert "No due scheduled responsibility." in capsys.readouterr().out
     assert len(observed) == 2
 
+    atlas_event_run_id = atlas_source_ids["run_id"]
+    scout_scheduled_run_id = next(
+        line.split(": ", 1)[1]
+        for line in scout_output.splitlines()
+        if line.startswith("Run ID: ")
+    )
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    first_inbox = capsys.readouterr().out
+    assert "No remote message was sent or delivered." in first_inbox
+    assert f"run:{atlas.coworker_id}:{atlas_event_run_id}" in first_inbox
+    assert f"approval:{atlas_approval_id}" in first_inbox
+    assert f"run:{scout.coworker_id}:{scout_scheduled_run_id}" in first_inbox
+    assert "Trigger" not in first_inbox
+    assert "github-actions:atlas-ci-42" in first_inbox
+    assert "scout-profile-secret" not in first_inbox
+    assert "atlas-profile-secret" not in first_inbox
+    assert "APPROVED: Atlas recommends inspecting this failure." not in first_inbox
+    assert "VALUE = 1" not in first_inbox
+    assert "VALUE = 2" not in first_inbox
+    assert first_inbox.count(f"approval:{atlas_approval_id}") == 1
+    reopened_entries = CoworkerDirectory.open(ash_dir).list_inbox(owner_id="local")
+    reopened_entry_ids = [entry.entry_id for entry in reopened_entries]
+    assert len(reopened_entry_ids) == len(set(reopened_entry_ids))
+    assert f"run:{atlas.coworker_id}:{atlas_event_run_id}" in reopened_entry_ids
+    assert f"approval:{atlas_approval_id}" in reopened_entry_ids
+    assert f"run:{scout.coworker_id}:{scout_scheduled_run_id}" in reopened_entry_ids
+    approval_entry = next(
+        entry for entry in reopened_entries if entry.entry_id == f"approval:{atlas_approval_id}"
+    )
+    assert approval_entry.status == "pending"
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    assert capsys.readouterr().out == first_inbox
+
+    assert main(["crew", "inbox", "--owner", "foreign"]) == 0
+    foreign_inbox = capsys.readouterr().out
+    assert "No Crew activity found" in foreign_inbox
+    assert atlas.coworker_id not in foreign_inbox
+    assert scout.coworker_id not in foreign_inbox
+    with monkeypatch.context() as wrong_uid:
+        wrong_uid.setattr(coworkers, "_current_owner_uid", lambda: os.geteuid() + 1)
+        assert main(["crew", "inbox", "--owner", "local"]) == 0
+        uid_inbox = capsys.readouterr().out
+    assert "No Crew activity found" in uid_inbox
+    assert atlas.coworker_id not in uid_inbox
+    assert scout.coworker_id not in uid_inbox
+
+    skipped_at = (fixed_now - timedelta(hours=2)).astimezone(timezone.utc)
+    skipped_event_key = f"scheduled:{skipped_at.isoformat()}"
+    skipped_run_id = str(
+        uuid5(
+            UUID(scout_responsibility_id),
+            f"ash-crew-scheduled-trigger:{skipped_event_key}",
+        )
+    )
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "INSERT INTO coworker_turn_dispatches "
+            "(owner_id, coworker_id, run_id, session_id, request_id, status, "
+            "execution_kind, responsibility_id, trigger_type, event_key, created_at, "
+            "completed_at, scheduled_for, skip_reason, workspace_device, workspace_inode) "
+            "VALUES (?, ?, ?, NULL, NULL, 'skipped', 'legacy', ?, 'scheduled', ?, ?, "
+            "NULL, ?, 'misfire_grace_expired', NULL, NULL)",
+            (
+                "local",
+                scout.coworker_id,
+                skipped_run_id,
+                scout_responsibility_id,
+                skipped_event_key,
+                fixed_now.isoformat(),
+                skipped_at.isoformat(),
+            ),
+        )
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    quiet_inbox = capsys.readouterr().out
+    assert skipped_run_id not in quiet_inbox
+    assert main(
+        ["crew", "inbox", "--owner", "local", "--include-skipped"]
+    ) == 0
+    included_skips = capsys.readouterr().out
+    assert f"run:{scout.coworker_id}:{skipped_run_id}" in included_skips
+    assert "Skipped because its scheduled start window expired." in included_skips
+
     assert main(
         [
             "crew",
@@ -1930,10 +2097,28 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert manual_contract["evidence"][0]["sha256"] == hashlib.sha256(
         protected.read_bytes()
     ).hexdigest()
+    monkeypatch.setattr(coworkers, "_current_time", lambda: fixed_now)
+    stale_run_id = str(uuid4())
+    stale_run_ref = atlas_handle.begin_background_run(stale_run_id)
+    directory._claim_responsibility_turn(
+        handle=atlas_handle,
+        run_id=stale_run_id,
+        session_id=stale_run_ref.session_id,
+        request_id=str(uuid4()),
+    )
     assert main(event_args) == 2
     duplicate = capsys.readouterr()
     assert "already used" in duplicate.err or "already claimed" in duplicate.err
     assert len(observed) == 3
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    duplicate_inbox = capsys.readouterr().out
+    assert duplicate_inbox.count(
+        f"run:{atlas.coworker_id}:{atlas_event_run_id}"
+    ) == 1
+    assert f"run:{atlas.coworker_id}:{stale_run_id}" in duplicate_inbox
+    assert "Cause: ask" in duplicate_inbox
+    assert "Outcome unknown; this claim will not be replayed." in duplicate_inbox
+    assert f"approval:{atlas_approval_id}" in duplicate_inbox
 
     assert main(
         ["crew", "archive", "--owner", "local", "--coworker-id", atlas.coworker_id]
@@ -2057,11 +2242,13 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     )
     atlas_run, = atlas_handle.list_responsibility_runs(atlas_responsibility_id)
     scout_runs = scout_handle.list_responsibility_runs(scout_responsibility_id)
-    assert len(scout_runs) == 2
+    assert len(scout_runs) == 3
     scout_run = next(run for run in scout_runs if run.trigger_type == "scheduled")
     scout_after_archive = next(
         run for run in scout_runs if run.event_key == "scout-after-atlas-archive"
     )
+    scout_skipped_run = next(run for run in scout_runs if run.run_id == skipped_run_id)
+    assert scout_skipped_run.status == "skipped"
     manual_run, = atlas_handle.list_responsibility_runs(atlas_manual_responsibility_id)
     assert atlas_run.execution_kind == scout_run.execution_kind == "model"
     assert atlas_run.trigger_type == "event"
@@ -2089,6 +2276,41 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert scout_handle.get_responsibility(scout_responsibility_id).next_fire_at == (
         scheduled.next_fire_at + timedelta(minutes=10)
     )
+
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    archived_inbox = capsys.readouterr().out
+    assert f"Coworker: Atlas ({atlas.coworker_id})" in archived_inbox
+    assert f"approval:{atlas_approval_id}" in archived_inbox
+    assert "Lifecycle: archived" in archived_inbox
+    assert f"run:{atlas.coworker_id}:{stale_run_id}" in archived_inbox
+    assert "Outcome unknown; this claim will not be replayed." in archived_inbox
+
+    child_env = os.environ.copy()
+    source_root = str(Path(__file__).resolve().parents[2] / "src")
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (source_root, child_env.get("PYTHONPATH", "")) if part
+    )
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    child = subprocess.run(
+        [sys.executable, "-m", "ash", "crew", "inbox", "--owner", "local"],
+        cwd=tmp_path,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert child.returncode == 0, child.stderr
+    assert f"run:{atlas.coworker_id}:{atlas_event_run_id}" in child.stdout
+    assert f"approval:{atlas_approval_id}" in child.stdout
+    assert f"run:{scout.coworker_id}:{scout_scheduled_run_id}" in child.stdout
+    assert f"run:{atlas.coworker_id}:{stale_run_id}" in child.stdout
+    assert skipped_run_id not in child.stdout
+    assert "outcome unknown; this claim will not be replayed" in child.stdout.casefold()
+    assert "APPROVED: Atlas recommends inspecting this failure." not in child.stdout
+    assert "atlas-profile-secret" not in child.stdout
+    assert "scout-profile-secret" not in child.stdout
+    assert "VALUE = 1" not in child.stdout
+    assert "VALUE = 2" not in child.stdout
 
     assert len(observed) == 4
 
@@ -2672,6 +2894,10 @@ def test_atlas_signed_ci_event_flows_into_exact_owner_approved_correction(
     ]
     with pytest.raises(CoworkerRuntimeUnavailable, match="consumed"):
         reopened._apply_file_approval(approval_id)
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    applied_inbox = capsys.readouterr().out
+    assert applied_inbox.count(f"approval:{approval_id}") == 1
+    assert "Status: Applied." in applied_inbox
     assert len(observed) == 1
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")

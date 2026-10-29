@@ -100,6 +100,21 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         "list", help="List coworkers owned by the current local UID"
     )
     crew_list.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_inbox = crew_subparsers.add_parser(
+        "inbox", help="Show recent local run and approval activity"
+    )
+    crew_inbox.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_inbox.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of newest activity entries to show (1-100)",
+    )
+    crew_inbox.add_argument(
+        "--include-skipped",
+        action="store_true",
+        help="Include scheduled runs skipped after their misfire grace period",
+    )
     for action, help_text in (
         ("pause", "Stop new coworker work while retaining history and decisions"),
         ("resume", "Resume a paused coworker"),

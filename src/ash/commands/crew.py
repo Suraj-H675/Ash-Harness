@@ -7,6 +7,7 @@ import asyncio
 import difflib
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4, uuid5
 
@@ -20,16 +21,18 @@ from ash.coworker_evidence import (
 from ash.core.session import SessionStorageError
 from ash.coworkers import (
     Coworker,
+    CoworkerApprovalInboxEntry,
     CoworkerDirectory,
     CoworkerDirectoryError,
     CoworkerFileApproval,
     CoworkerHandle,
-    CoworkerNotFound,
-    CoworkerRuntimeUnavailable,
     CoworkerModelTurnResult,
+    CoworkerNotFound,
     CoworkerResponsibility,
     CoworkerResponsibilityRun,
     CoworkerResponsibilityStatus,
+    CoworkerRunInboxEntry,
+    CoworkerRuntimeUnavailable,
     CoworkerTurnRequest,
 )
 from ash.exceptions import AshError
@@ -48,6 +51,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _create(args)
     if action == "list":
         return _list(args)
+    if action == "inbox":
+        return _inbox(args)
     if action in {"pause", "resume", "archive"}:
         return _lifecycle(args, action)
     if action == "ask":
@@ -135,6 +140,133 @@ def _list(args: argparse.Namespace) -> int:
     for identity in coworkers:
         _write_identity(identity)
     return 0
+
+
+def _inbox(args: argparse.Namespace) -> int:
+    try:
+        entries = CoworkerDirectory.open().list_inbox(
+            owner_id=args.owner,
+            limit=args.limit,
+            include_skipped=args.include_skipped,
+        )
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        OSError,
+        ValueError,
+    ) as exc:
+        _write_error(f"Local activity inbox is unavailable: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"Local activity inbox is unavailable ({type(exc).__name__}).")
+        return 2
+
+    _write_line("Local Crew activity only. No remote message was sent or delivered.")
+    if not entries:
+        _write_line("No Crew activity found for this owner label.")
+        return 0
+    for entry in entries:
+        _write_line(f"Entry ID: {_safe_text(entry.entry_id, single_line=True)}")
+        _write_line(
+            "Coworker: "
+            f"{_safe_text(entry.coworker_name, single_line=True)} "
+            f"({_safe_text(entry.coworker_id, single_line=True)})"
+        )
+        _write_line(
+            f"Lifecycle: {_safe_text(entry.lifecycle_status, single_line=True)}"
+        )
+        _write_line(f"Cause: {_safe_text(entry.cause, single_line=True)}")
+        if entry.responsibility_id is not None:
+            _write_line(
+                "Responsibility ID: "
+                f"{_safe_text(entry.responsibility_id, single_line=True)}"
+            )
+        if isinstance(entry, CoworkerRunInboxEntry):
+            _render_inbox_run(entry)
+        elif isinstance(entry, CoworkerApprovalInboxEntry):
+            _render_inbox_approval(entry)
+        _write_line("")
+    return 0
+
+
+def _render_inbox_run(entry: CoworkerRunInboxEntry) -> None:
+    _write_line(f"Run ID: {_safe_text(entry.run_id, single_line=True)}")
+    if entry.session_id is not None:
+        _write_line(f"Session ID: {_safe_text(entry.session_id, single_line=True)}")
+    if entry.request_id is not None:
+        _write_line(f"Request ID: {_safe_text(entry.request_id, single_line=True)}")
+    if entry.event_key is not None:
+        _write_line(f"Event key: {_safe_text(entry.event_key, single_line=True)}")
+    if entry.scheduled_for is not None:
+        _write_line(f"Scheduled for: {entry.scheduled_for.isoformat()}")
+    if entry.skip_reason is not None:
+        _write_line(
+            f"Skip reason: {_safe_text(entry.skip_reason, single_line=True)}"
+        )
+    _write_line(f"Execution: {_safe_text(entry.execution_kind, single_line=True)}")
+    _write_line(f"Occurred: {entry.occurred_at.isoformat()}")
+    if entry.status == "claimed":
+        status = "Outcome unknown; this claim will not be replayed."
+    elif entry.status == "skipped":
+        status = "Skipped because its scheduled start window expired."
+    else:
+        status = "Completed."
+    _write_line(f"Status: {_safe_text(status, single_line=True)}")
+
+
+def _render_inbox_approval(entry: CoworkerApprovalInboxEntry) -> None:
+    _write_line(f"Approval ID: {_safe_text(entry.approval_id, single_line=True)}")
+    _write_line(f"Source run ID: {_safe_text(entry.source_run_id, single_line=True)}")
+    _write_line(
+        f"Source session ID: {_safe_text(entry.source_session_id, single_line=True)}"
+    )
+    _write_line(
+        f"Source request ID: {_safe_text(entry.source_request_id, single_line=True)}"
+    )
+    if entry.event_key is not None:
+        _write_line(f"Event key: {_safe_text(entry.event_key, single_line=True)}")
+    if entry.target_path:
+        _write_line(f"Target: {_safe_text(entry.target_path, single_line=True)}")
+    _write_line(f"Action: {_safe_text(entry.action, single_line=True)}")
+    _write_line(f"Occurred: {entry.occurred_at.isoformat()}")
+    _write_line(f"Expires: {entry.expires_at.isoformat()}")
+
+    now = datetime.now(timezone.utc)
+    if entry.status in {"pending", "approved"} and entry.expires_at <= now:
+        status = (
+            "Deadline passed; the expiration transition is not yet recorded. "
+            "Inspect with `ash crew approval show`."
+        )
+    elif entry.status == "pending":
+        status = "Waiting for explicit owner approval."
+    elif entry.status == "approved":
+        status = "Approved; waiting for an explicit local apply."
+    elif entry.status == "denied":
+        status = "Denied."
+    elif entry.status == "expired":
+        status = "Expired."
+    elif entry.status == "revoked":
+        status = "Revoked."
+    elif entry.status == "dispatching":
+        status = (
+            "File effect outcome unknown; inspect with `ash crew approval show`. "
+            "Do not replay."
+        )
+    elif entry.status == "succeeded":
+        status = "Applied."
+    elif entry.status == "failed":
+        status = "Failed. Inspect with `ash crew approval show`."
+    elif entry.status == "blocked":
+        status = "Blocked. Inspect with `ash crew approval show`."
+    else:
+        status = "Outcome ambiguous; inspect with `ash crew approval show`."
+    if entry.lifecycle_status != "active" and entry.status in {"pending", "approved"}:
+        status += (
+            " New approval grants and file effects are blocked while the coworker is "
+            f"{entry.lifecycle_status}."
+        )
+    _write_line(f"Status: {_safe_text(status, single_line=True)}")
 
 
 def _lifecycle(args: argparse.Namespace, action: str) -> int:
