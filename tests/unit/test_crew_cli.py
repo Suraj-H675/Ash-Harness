@@ -1317,66 +1317,66 @@ def test_file_approval_restart_reconciles_dispatch_crashes_without_replay(
     assert second_target.read_bytes() == b"VALUE = 2\n"
 
 
-def _apply_approval_in_process(
-    ash_dir: str,
-    owner_id: str,
-    coworker_id: str,
-    approval_id: str,
-    result_queue: Any,
-) -> None:
-    from pathlib import Path
-
-    from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
-
-    try:
-        handle = CoworkerDirectory.open(Path(ash_dir)).open_coworker(
-            owner_id=owner_id,
-            coworker_id=coworker_id,
-        )
-        result_queue.put(("ok", handle._apply_file_approval(approval_id).status))
-    except CoworkerRuntimeUnavailable:
-        result_queue.put(("rejected", "CoworkerRuntimeUnavailable"))
-
-
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
 def test_file_approval_apply_has_one_multiprocess_claimant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import multiprocessing
+    import subprocess
 
     directory, handle, identity, _, target, _, approval, _ = _new_pending_file_approval(
         tmp_path, monkeypatch, capsys
     )
     handle._approve_file_approval(approval.approval_id)
-    context = multiprocessing.get_context("spawn")
-    result_queue = context.Queue()
+
+    # Run separate Python interpreters, not multiprocessing.spawn on a test
+    # module: tests/ is not an importable package in installed CI builds.
+    child_script = """
+import sys
+from pathlib import Path
+from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
+
+directory = CoworkerDirectory.open(Path(sys.argv[1]))
+handle = directory.open_coworker(owner_id=sys.argv[2], coworker_id=sys.argv[3])
+try:
+    status = handle._apply_file_approval(sys.argv[4]).status
+except CoworkerRuntimeUnavailable:
+    print("rejected")
+else:
+    print(status)
+"""
+    command = [
+        sys.executable,
+        "-c",
+        child_script,
+        str(directory.ash_dir),
+        identity.owner_id,
+        identity.coworker_id,
+        approval.approval_id,
+    ]
     processes = [
-        context.Process(
-            target=_apply_approval_in_process,
-            args=(
-                str(directory.ash_dir),
-                identity.owner_id,
-                identity.coworker_id,
-                approval.approval_id,
-                result_queue,
-            ),
+        subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         for _ in range(2)
     ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(20)
-        if process.is_alive():
-            process.terminate()
-            process.join()
-            pytest.fail("file approval process did not finish")
-        assert process.exitcode == 0
-    results = [result_queue.get(timeout=2) for _ in processes]
-    assert sum(result == ("ok", "succeeded") for result in results) == 1
-    assert results.count(("rejected", "CoworkerRuntimeUnavailable")) == 1
+    results: list[str] = []
+    try:
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=20)
+            assert process.returncode == 0, stderr
+            results.append(stdout.strip())
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+    assert results.count("succeeded") == 1
+    assert results.count("rejected") == 1
     final, events = handle.inspect_file_approval(approval.approval_id)
     assert final.status == "succeeded"
     assert [event.status for event in events].count("dispatching") == 1
