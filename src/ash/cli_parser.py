@@ -69,10 +69,11 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     profile_remove.add_argument("--yes", action="store_true")
     crew_parser = subparsers.add_parser(
         "crew",
-        help="Manage profile-scoped coworkers and exact local file approvals",
+        help="Manage profile-scoped coworkers, responsibilities, and file approvals",
         description=(
-            "Create and ask profile-scoped coworkers. Atlas answers remain read-only; "
-            "a separate owner decision can authorize one bounded workspace file effect."
+            "Create and ask profile-scoped coworkers. Responsibility turns use one "
+            "no-tool model request. Signed events use a local HMAC key file, and "
+            "scheduled work runs only when you invoke ash crew tick."
         ),
     )
     crew_subparsers = crew_parser.add_subparsers(
@@ -125,6 +126,80 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     crew_history.add_argument(
         "--limit", type=int, default=10, help="Number of recent outcomes to show (1-100)"
     )
+    crew_responsibility = crew_subparsers.add_parser(
+        "responsibility",
+        help="Create, inspect, and control one coworker responsibility",
+    )
+    crew_responsibility_subparsers = crew_responsibility.add_subparsers(
+        dest="crew_responsibility_action",
+        required=True,
+    )
+    responsibility_create = crew_responsibility_subparsers.add_parser(
+        "create", help="Create a bounded owner-controlled responsibility"
+    )
+    responsibility_create.add_argument("--owner", required=True)
+    responsibility_create.add_argument("--coworker-id", required=True)
+    responsibility_create.add_argument("--responsibility-id", required=True)
+    responsibility_create.add_argument("--scope", required=True)
+    responsibility_create.add_argument("--objective", required=True)
+    responsibility_create.add_argument(
+        "--success-criterion", action="append", required=True
+    )
+    responsibility_create.add_argument("--at")
+    responsibility_create.add_argument("--every")
+    responsibility_create.add_argument("--cron")
+    responsibility_create.add_argument("--timezone", default="UTC")
+    responsibility_create.add_argument("--misfire-grace-seconds", type=int, default=86_400)
+    responsibility_list = crew_responsibility_subparsers.add_parser(
+        "list", help="List responsibilities for one coworker"
+    )
+    responsibility_list.add_argument("--owner", required=True)
+    responsibility_list.add_argument("--coworker-id", required=True)
+    for action, help_text in (
+        ("pause", "Pause one responsibility before a later trigger claim"),
+        ("resume", "Resume one paused responsibility"),
+        ("complete", "Complete one responsibility permanently"),
+    ):
+        command = crew_responsibility_subparsers.add_parser(action, help=help_text)
+        command.add_argument("--owner", required=True)
+        command.add_argument("--coworker-id", required=True)
+        command.add_argument("--responsibility-id", required=True)
+    responsibility_run = crew_responsibility_subparsers.add_parser(
+        "run", help="Run one active responsibility from a local owner trigger"
+    )
+    responsibility_run.add_argument("--owner", required=True)
+    responsibility_run.add_argument("--coworker-id", required=True)
+    responsibility_run.add_argument("--responsibility-id", required=True)
+    responsibility_run.add_argument("--event-id", required=True)
+    responsibility_runs = crew_responsibility_subparsers.add_parser(
+        "runs", help="Inspect durable trigger claims and persisted model responses"
+    )
+    responsibility_runs.add_argument("--owner", required=True)
+    responsibility_runs.add_argument("--coworker-id", required=True)
+    responsibility_runs.add_argument("--responsibility-id", required=True)
+    responsibility_runs.add_argument("--limit", type=int, default=10)
+    crew_event = crew_subparsers.add_parser(
+        "event", help="Admit one signed event from stdin or a local file"
+    )
+    crew_event.add_argument("--owner", required=True)
+    crew_event.add_argument("--coworker-id", required=True)
+    crew_event.add_argument("--responsibility-id", required=True)
+    crew_event.add_argument(
+        "--key-file",
+        required=True,
+        type=Path,
+        help="Owner-provisioned 0600 HMAC key file outside the coworker workspace",
+    )
+    crew_event.add_argument(
+        "--input",
+        default="-",
+        help="Signed JSON file path, or - to read stdin",
+    )
+    crew_tick = crew_subparsers.add_parser(
+        "tick", help="Run at most one due scheduled responsibility and exit"
+    )
+    crew_tick.add_argument("--owner", required=True)
+    crew_tick.add_argument("--coworker-id", required=True)
     crew_propose = crew_subparsers.add_parser(
         "propose",
         help="Stage one exact user-supplied file correction from a completed Atlas turn",

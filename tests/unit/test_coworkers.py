@@ -1254,7 +1254,7 @@ def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (7,)
+        ).fetchone() == (8,)
         assert connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall() == []
@@ -1400,8 +1400,171 @@ def test_v5_coworker_directory_migration_adds_cursor_and_preserves_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (7,)
+        ).fetchone() == (8,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the claim race uses isolated processes")
+@pytest.mark.parametrize("trigger", ["event", "scheduled"])
+def test_model_responsibility_claim_is_single_use_across_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trigger: str,
+) -> None:
+    from datetime import datetime, timezone
+    from subprocess import PIPE, Popen
+
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import (
+        CoworkerDirectory,
+        _scheduled_event_key,
+        _scheduled_run_id,
+        _signed_event_run_id,
+    )
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, identity, handle = _ready_coworker(ash_dir, workspace)
+    created_at = datetime(2026, 10, 29, 8, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: created_at.isoformat())
+    schedule = (
+        build_schedule(every="10m", now=created_at)
+        if trigger == "scheduled"
+        else None
+    )
+    responsibility = handle.create_responsibility(
+        scope=f"{trigger} model claim",
+        objective="Record one bounded responsibility admission.",
+        schedule=schedule,
+        misfire_grace_seconds=3_600 if schedule is not None else 86_400,
+    )
+    scheduled_for = responsibility.next_fire_at if schedule is not None else None
+    event_key = (
+        _scheduled_event_key(scheduled_for)
+        if scheduled_for is not None
+        else "trusted-source:race-1"
+    )
+    run_id = (
+        _scheduled_run_id(responsibility.responsibility_id, scheduled_for)
+        if scheduled_for is not None
+        else _signed_event_run_id(responsibility.responsibility_id, event_key)
+    )
+    request_id = str(uuid5(UUID(run_id), "request"))
+    session_ref = handle.begin_background_run(run_id)
+    barrier = tmp_path / "claim-contenders"
+    barrier.mkdir()
+    child_environment = {
+        "PATH": os.defpath,
+        "HOME": str(ash_dir.parent),
+        "XDG_CONFIG_HOME": str(ash_dir.parent / ".config"),
+        "XDG_DATA_HOME": str(ash_dir.parent / ".local" / "share"),
+        "XDG_CACHE_HOME": str(ash_dir.parent / ".cache"),
+        "XDG_STATE_HOME": str(ash_dir.parent / ".local" / "state"),
+        "TMPDIR": str(tmp_path),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+    }
+    child_source = r"""
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+import ash.coworkers as coworkers
+from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
+from ash.safety.guard import SafetyGuard
+
+(ash_dir, owner_id, coworker_id, responsibility_id, run_id, session_id,
+ request_id, event_key, trigger, scheduled_text, barrier_path) = sys.argv[1:12]
+directory = CoworkerDirectory.open(Path(ash_dir))
+handle = directory.open_coworker(owner_id=owner_id, coworker_id=coworker_id)
+responsibility = handle.get_responsibility(responsibility_id)
+scheduled_for = datetime.fromisoformat(scheduled_text) if scheduled_text else None
+if scheduled_for is not None:
+    coworkers._current_time = lambda: scheduled_for
+prompt = coworkers._responsibility_model_prompt(
+    responsibility,
+    trigger_type=trigger,
+    event_key=event_key,
+    scheduled_for=scheduled_for,
+)
+workspace_identity = SafetyGuard(handle.identity.workspace).project_root_identity
+Path(barrier_path, str(os.getpid())).touch()
+deadline = time.monotonic() + 10
+while len(list(Path(barrier_path).iterdir())) < 2:
+    if time.monotonic() >= deadline:
+        raise RuntimeError("claim contenders did not rendezvous")
+    time.sleep(0.01)
+try:
+    directory._claim_responsibility_turn(
+        handle=handle,
+        run_id=run_id,
+        session_id=session_id,
+        request_id=request_id,
+        responsibility_id=responsibility_id,
+        event_key=event_key,
+        trigger_type=trigger,
+        execution_kind="model",
+        scheduled_for=scheduled_for,
+        prompt=prompt,
+        workspace_identity=workspace_identity,
+    )
+except CoworkerRuntimeUnavailable:
+    print("rejected")
+else:
+    print("claimed")
+"""
+    command = [
+        sys.executable,
+        "-c",
+        child_source,
+        str(ash_dir),
+        identity.owner_id,
+        identity.coworker_id,
+        responsibility.responsibility_id,
+        run_id,
+        session_ref.session_id,
+        request_id,
+        event_key,
+        trigger,
+        scheduled_for.isoformat() if scheduled_for is not None else "",
+        str(barrier),
+    ]
+    processes = [
+        Popen(
+            command,
+            stdout=PIPE,
+            stderr=PIPE,
+            text=True,
+            env=child_environment,
+        )
+        for _ in range(2)
+    ]
+    results: list[str] = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 0, stderr
+        results.append(stdout.strip())
+
+    assert results.count("claimed") == 1
+    assert results.count("rejected") == 1
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    runs = reopened.list_responsibility_runs(responsibility.responsibility_id)
+    assert len(runs) == 1
+    assert runs[0].run_id == run_id
+    assert runs[0].request_id == request_id
+    assert runs[0].trigger_type == trigger
+    assert runs[0].execution_kind == "model"
+    assert runs[0].status == "claimed"
+    if scheduled_for is not None:
+        updated = reopened.get_responsibility(responsibility.responsibility_id)
+        assert updated.next_fire_at is not None
+        assert updated.next_fire_at > scheduled_for
 
 
 
@@ -2183,7 +2346,7 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (7,)
+        ).fetchone() == (8,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
@@ -2266,7 +2429,7 @@ def test_coworker_directory_v3_migration_preserves_dispatch_history(
     with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (7,)
+        ).fetchone() == (8,)
         columns = {
             str(row[1])
             for row in connection.execute(
@@ -3313,7 +3476,7 @@ def test_v2_coworker_directory_migration_adds_file_approval_boundary(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (7,)
+        ).fetchone() == (8,)
         assert connection.execute(
             "SELECT COUNT(*) FROM coworker_file_approvals"
         ).fetchone() == (0,)
@@ -3338,7 +3501,7 @@ def test_v6_coworker_directory_migration_keeps_legacy_dispatch_unbound(
     run_id = str(uuid4())
     ref = handle.begin_background_run(run_id)
     request_id = str(uuid4())
-    directory._claim_offline_turn(
+    directory._claim_responsibility_turn(
         handle=handle,
         run_id=run_id,
         session_id=ref.session_id,
@@ -3361,10 +3524,137 @@ def test_v6_coworker_directory_migration_keeps_legacy_dispatch_unbound(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (7,)
+        ).fetchone() == (8,)
+
+
+def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from uuid import uuid4
+
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    responsibility = handle.create_responsibility(
+        scope="Atlas CI recovery",
+        objective="Inspect the prior CI failure.",
+    )
+    run_id = str(uuid4())
+    session_id = str(uuid4())
+    request_id = str(uuid4())
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "INSERT INTO coworker_turn_dispatches ("
+            "owner_id, coworker_id, run_id, session_id, request_id, status, "
+            "responsibility_id, trigger_type, event_key, created_at, completed_at, "
+            "workspace_device, workspace_inode) "
+            "VALUES (?, ?, ?, ?, ?, 'completed', ?, 'manual', 'legacy-event', "
+            "'2026-10-20T12:00:00+00:00', '2026-10-20T12:01:00+00:00', 3, 9)",
+            (
+                identity.owner_id,
+                identity.coworker_id,
+                run_id,
+                session_id,
+                request_id,
+                responsibility.responsibility_id,
+            ),
+        )
+        connection.execute(
+            "DROP INDEX idx_coworker_turn_dispatches_responsibility_event"
+        )
+        connection.execute("DROP INDEX idx_coworker_turn_dispatches_event_replay")
+        connection.execute(
+            "ALTER TABLE coworker_turn_dispatches "
+            "RENAME TO coworker_turn_dispatches_v8"
+        )
+        connection.execute(
+            """
+            CREATE TABLE coworker_turn_dispatches (
+                owner_id TEXT NOT NULL,
+                coworker_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                session_id TEXT,
+                request_id TEXT UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('claimed', 'completed', 'skipped')),
+                responsibility_id TEXT REFERENCES
+                    coworker_responsibilities(responsibility_id),
+                trigger_type TEXT CHECK(trigger_type IS NULL OR
+                    trigger_type IN ('manual', 'scheduled')),
+                event_key TEXT CHECK(event_key IS NULL OR
+                    length(event_key) BETWEEN 1 AND 128),
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                scheduled_for TEXT,
+                skip_reason TEXT,
+                workspace_device INTEGER,
+                workspace_inode INTEGER,
+                PRIMARY KEY(owner_id, coworker_id, run_id),
+                CHECK (
+                    (responsibility_id IS NULL AND trigger_type IS NULL
+                        AND event_key IS NULL AND scheduled_for IS NULL
+                        AND skip_reason IS NULL)
+                    OR (responsibility_id IS NOT NULL AND trigger_type = 'manual'
+                        AND event_key IS NOT NULL AND scheduled_for IS NULL
+                        AND skip_reason IS NULL)
+                    OR (responsibility_id IS NOT NULL AND trigger_type = 'scheduled'
+                        AND event_key IS NOT NULL AND scheduled_for IS NOT NULL)
+                ),
+                CHECK (
+                    (status IN ('claimed', 'completed') AND session_id IS NOT NULL
+                        AND request_id IS NOT NULL AND skip_reason IS NULL)
+                    OR (status = 'skipped' AND trigger_type = 'scheduled'
+                        AND session_id IS NULL AND request_id IS NULL
+                        AND skip_reason = 'misfire_grace_expired')
+                )
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO coworker_turn_dispatches SELECT owner_id, coworker_id, "
+            "run_id, session_id, request_id, status, responsibility_id, trigger_type, "
+            "event_key, created_at, completed_at, scheduled_for, skip_reason, "
+            "workspace_device, workspace_inode FROM coworker_turn_dispatches_v8"
+        )
+        connection.execute("DROP TABLE coworker_turn_dispatches_v8")
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_coworker_turn_dispatches_responsibility_event "
+            "ON coworker_turn_dispatches(owner_id, coworker_id, responsibility_id, "
+            "trigger_type, event_key) WHERE responsibility_id IS NOT NULL"
+        )
+        connection.execute("UPDATE coworker_directory_meta SET schema_version = 7")
+
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    run, = reopened.list_responsibility_runs(responsibility.responsibility_id)
+    assert run.run_id == run_id
+    assert run.session_id == session_id
+    assert run.request_id == request_id
+    assert run.execution_kind == "legacy"
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (8,)
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(coworker_turn_dispatches)")
+        }
+        assert "execution_kind" in columns
+        assert "'event'" in str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'coworker_turn_dispatches'"
+            ).fetchone()[0]
+        )
         assert connection.execute(
             "SELECT status, workspace_device, workspace_inode "
             "FROM coworker_turn_dispatches WHERE run_id = ?",
             (run_id,),
-        ).fetchone() == ("claimed", None, None)
+        ).fetchone() == ("completed", 3, 9)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

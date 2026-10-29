@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from uuid import UUID, uuid4, uuid5
 
+from ash.automation.schedules import build_schedule, render_schedule
+from ash.crew_events import MAX_CREW_EVENT_BYTES
 from ash.core.redaction import redact_known_secrets
 from ash.core.session import SessionStorageError
 from ash.coworkers import (
@@ -25,6 +27,10 @@ from ash.coworkers import (
     CoworkerHandle,
     CoworkerNotFound,
     CoworkerRuntimeUnavailable,
+    CoworkerModelTurnResult,
+    CoworkerResponsibility,
+    CoworkerResponsibilityRun,
+    CoworkerResponsibilityStatus,
     CoworkerTurnRequest,
 )
 from ash.exceptions import AshError
@@ -88,6 +94,12 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _ask(args)
     if action == "history":
         return _history(args)
+    if action == "responsibility":
+        return _responsibility(args)
+    if action == "event":
+        return _event(args)
+    if action == "tick":
+        return _tick(args)
     if action == "propose":
         return _propose(args)
     if action == "approvals":
@@ -308,6 +320,335 @@ def _history(args: argparse.Namespace) -> int:
             _write_line("Proposal only. No files were changed.")
         _write_line("")
     return 0
+
+
+def _responsibility(args: argparse.Namespace) -> int:
+    action = args.crew_responsibility_action
+    try:
+        handle = _open_coworker_handle(args)
+        if action == "create":
+            schedule = None
+            if any(value is not None for value in (args.at, args.every, args.cron)):
+                schedule = build_schedule(
+                    at=args.at,
+                    every=args.every,
+                    cron=args.cron,
+                    timezone_name=args.timezone,
+                )
+            responsibility = handle.create_responsibility(
+                responsibility_id=args.responsibility_id,
+                scope=args.scope,
+                objective=args.objective,
+                success_criteria=args.success_criterion,
+                schedule=schedule,
+                misfire_grace_seconds=args.misfire_grace_seconds,
+            )
+            _write_line("Responsibility created.")
+            _render_responsibility(responsibility)
+            return 0
+        if action == "list":
+            responsibilities = handle.list_responsibilities()
+            if not responsibilities:
+                _write_line("No responsibilities found for this coworker.")
+                return 0
+            for responsibility in responsibilities:
+                _render_responsibility(responsibility)
+            return 0
+        if action in {"pause", "resume", "complete"}:
+            status_by_action: dict[str, CoworkerResponsibilityStatus] = {
+                "pause": "paused",
+                "resume": "active",
+                "complete": "completed",
+            }
+            status = status_by_action[action]
+            responsibility = handle.set_responsibility_status(
+                args.responsibility_id,
+                status,
+            )
+            _write_line(f"Responsibility {status}.")
+            _render_responsibility(responsibility)
+            return 0
+        if action == "run":
+            result = asyncio.run(
+                handle.run_model_responsibility(
+                    args.responsibility_id,
+                    event_id=args.event_id,
+                )
+            )
+            _render_model_turn(result)
+            return 0
+        if action == "runs":
+            runs = handle.list_responsibility_runs(
+                args.responsibility_id,
+                limit=args.limit,
+            )
+            if not runs:
+                _write_line("No runs recorded for this responsibility.")
+                return 0
+            for run in runs:
+                _render_responsibility_run(handle, run)
+            return 0
+        _write_error("Unsupported responsibility command.")
+        return 2
+    except CoworkerRuntimeUnavailable as exc:
+        _write_model_admission_error(exc, scheduled=False)
+        return 2
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        AshError,
+        OSError,
+        SafetyViolation,
+        SessionStorageError,
+        ValueError,
+    ) as exc:
+        if action == "run":
+            _write_error(
+                "Responsibility turn failed or its outcome may be unknown. "
+                "Inspect responsibility runs before retrying: "
+                f"{_safe_error(exc)}"
+            )
+        else:
+            _write_error(f"Responsibility command failed: {_safe_error(exc)}")
+        return 2
+    except KeyboardInterrupt:
+        _write_error(
+            "Responsibility turn interrupted. Its outcome may be unknown. "
+            "Inspect `ash crew responsibility runs` before retrying."
+        )
+        return 130
+    except Exception as exc:
+        if action == "run":
+            _write_error(
+                "Responsibility turn failed or its outcome may be unknown "
+                f"({type(exc).__name__}). Inspect responsibility runs before retrying."
+            )
+        else:
+            _write_error(f"Responsibility command failed ({type(exc).__name__}).")
+        return 2
+
+
+def _event(args: argparse.Namespace) -> int:
+    try:
+        handle = _open_coworker_handle(args)
+        envelope = _read_event_envelope(args.input)
+        result = asyncio.run(
+            handle.run_signed_event(
+                envelope,
+                key_file=args.key_file,
+                responsibility_id=args.responsibility_id,
+            )
+        )
+        _render_model_turn(result)
+        return 0
+    except CoworkerRuntimeUnavailable as exc:
+        _write_model_admission_error(exc, scheduled=False)
+        return 2
+    except (CoworkerNotFound, ValueError) as exc:
+        _write_error(f"Blocked before model dispatch: {_safe_error(exc)}")
+        return 2
+    except (
+        CoworkerDirectoryError,
+        AshError,
+        OSError,
+        SafetyViolation,
+        SessionStorageError,
+    ) as exc:
+        _write_error(
+            "Signed event blocked or failed; its provider outcome may be unknown. "
+            "Inspect responsibility runs before retrying: "
+            f"{_safe_error(exc)}"
+        )
+        return 2
+    except KeyboardInterrupt:
+        _write_error(
+            "Signed event turn interrupted. Its outcome may be unknown. "
+            "Inspect `ash crew responsibility runs` before retrying."
+        )
+        return 130
+    except Exception as exc:
+        _write_error(
+            "Signed event turn failed or its outcome is unknown "
+            f"({type(exc).__name__}). Inspect responsibility runs before retrying."
+        )
+        return 2
+
+
+def _tick(args: argparse.Namespace) -> int:
+    try:
+        handle = _open_coworker_handle(args)
+        result = asyncio.run(handle.run_due_model_responsibilities_once())
+        if result.status == "idle":
+            _write_line("No due scheduled responsibility.")
+            return 0
+        if result.status == "skipped":
+            _write_line("Status: skipped after the configured misfire grace.")
+            _write_line(f"Responsibility ID: {result.responsibility_id}")
+            _write_line(f"Event key: {_safe_text(result.event_key or '', single_line=True)}")
+            return 0
+        if result.turn is None:
+            raise CoworkerDirectoryError("completed model schedule tick has no turn")
+        _render_model_turn(result.turn)
+        return 0
+    except CoworkerRuntimeUnavailable as exc:
+        _write_model_admission_error(exc, scheduled=True)
+        return 2
+    except (CoworkerNotFound, ValueError) as exc:
+        _write_error(f"Scheduled turn blocked before provider dispatch: {_safe_error(exc)}")
+        return 2
+    except (
+        CoworkerDirectoryError,
+        AshError,
+        OSError,
+        SafetyViolation,
+        SessionStorageError,
+    ) as exc:
+        _write_error(
+            "Scheduled turn failed or its outcome may be unknown. "
+            "Inspect responsibility runs before retrying: "
+            f"{_safe_error(exc)}"
+        )
+        return 2
+    except KeyboardInterrupt:
+        _write_error(
+            "Scheduled turn interrupted. Its outcome may be unknown. "
+            "Inspect `ash crew responsibility runs` before retrying."
+        )
+        return 130
+    except Exception as exc:
+        _write_error(
+            "Scheduled turn failed or its outcome is unknown "
+            f"({type(exc).__name__}). Inspect responsibility runs before retrying."
+        )
+        return 2
+
+
+def _read_event_envelope(source: str) -> bytes:
+    if source == "-":
+        content = sys.stdin.buffer.read(MAX_CREW_EVENT_BYTES + 1)
+    else:
+        with Path(source).open("rb") as stream:
+            content = stream.read(MAX_CREW_EVENT_BYTES + 1)
+    if len(content) > MAX_CREW_EVENT_BYTES:
+        raise ValueError("signed event exceeds the 16 KiB input limit")
+    return content
+
+
+def _write_model_admission_error(
+    exc: CoworkerRuntimeUnavailable,
+    *,
+    scheduled: bool,
+) -> None:
+    detail = _safe_error(exc)
+    if "configured profile provider is unavailable" in str(exc):
+        timing = (
+            "The scheduled occurrence remains due. "
+            if scheduled
+            else "No provider request was sent. "
+        )
+        _write_error(
+            "Blocked. The selected profile provider is unavailable. "
+            + timing
+            + detail
+        )
+    elif (
+        "will not be replayed" in str(exc)
+        or "already claimed" in str(exc)
+        or "already used" in str(exc)
+    ):
+        _write_error(
+            "This run is non-replayable. Its provider outcome may be unknown. "
+            "Inspect `ash crew responsibility runs`. "
+            + detail
+        )
+    elif any(
+        marker in str(exc)
+        for marker in (
+            "not active",
+            "target does not match",
+            "owner identity could not be verified",
+            "workspace identity cannot be bound",
+            "binding changed before claim",
+            "prompt changed before claim",
+        )
+    ):
+        _write_error(f"Blocked before provider dispatch: {detail}")
+    else:
+        _write_error(
+            "Responsibility turn failed or its provider outcome may be unknown. "
+            "Inspect responsibility runs before retrying: "
+            f"{detail}"
+        )
+
+
+def _open_coworker_handle(args: argparse.Namespace) -> CoworkerHandle:
+    handle = CoworkerDirectory.open().open_coworker(
+        owner_id=args.owner,
+        coworker_id=args.coworker_id,
+    )
+    handle.require_local_owner()
+    return handle
+
+
+def _render_responsibility(responsibility: CoworkerResponsibility) -> None:
+    _write_line(f"Responsibility ID: {responsibility.responsibility_id}")
+    _write_line(f"Coworker ID: {responsibility.coworker_id}")
+    _write_line(f"Status: {responsibility.status}")
+    _write_line(f"Scope: {_safe_text(responsibility.scope, single_line=True)}")
+    _write_line(f"Objective: {_safe_text(responsibility.objective, single_line=True)}")
+    for criterion in responsibility.success_criteria:
+        _write_line(f"Success criterion: {_safe_text(criterion, single_line=True)}")
+    if responsibility.schedule is not None:
+        _write_line(f"Schedule: {render_schedule(responsibility.schedule)}")
+        if responsibility.next_fire_at is not None:
+            _write_line(f"Next fire: {responsibility.next_fire_at.isoformat()}")
+
+
+def _render_model_turn(result: CoworkerModelTurnResult) -> None:
+    _write_line("Status: completed.")
+    if result.responsibility_id is not None:
+        _write_line(f"Responsibility ID: {result.responsibility_id}")
+    if result.trigger_type is not None:
+        _write_line(f"Trigger: {result.trigger_type}")
+    if result.event_key is not None:
+        _write_line(f"Event key: {_safe_text(result.event_key, single_line=True)}")
+    _write_line(f"Run ID: {result.session_ref.run_id}")
+    _write_line(f"Session ID: {result.session_ref.session_id}")
+    if result.request_id is not None:
+        _write_line(f"Request ID: {result.request_id}")
+    _write_line(f"Model: {_safe_text(result.model, single_line=True)}")
+    _write_line("Response:")
+    _write_line(_safe_text(result.response))
+    _write_line("Read-only turn. No files were changed.")
+
+
+def _render_responsibility_run(
+    handle: CoworkerHandle,
+    run: CoworkerResponsibilityRun,
+) -> None:
+    _write_line(f"Responsibility ID: {run.responsibility_id}")
+    _write_line(f"Status: {run.status}")
+    _write_line(f"Trigger: {run.trigger_type}")
+    _write_line(f"Execution: {run.execution_kind}")
+    _write_line(f"Event key: {_safe_text(run.event_key, single_line=True)}")
+    _write_line(f"Run ID: {run.run_id}")
+    if run.session_id is not None:
+        _write_line(f"Session ID: {run.session_id}")
+    if run.request_id is not None:
+        _write_line(f"Request ID: {run.request_id}")
+    if run.scheduled_for is not None:
+        _write_line(f"Scheduled for: {run.scheduled_for.isoformat()}")
+    if run.skip_reason is not None:
+        _write_line(f"Skip reason: {run.skip_reason}")
+    if run.status == "claimed":
+        _write_line("Outcome may be unknown. This claim cannot be replayed.")
+    if run.execution_kind == "model" and run.status == "completed" and run.session_id:
+        session, _ = handle.load_session(run.session_id)
+        _write_line(f"Model: {_safe_text(session.model, single_line=True)}")
+        if session.messages and session.messages[-1].role == "assistant":
+            _write_line("Response:")
+            _write_line(_safe_text(session.messages[-1].content))
+    _write_line("")
 
 
 def _open_approval_handle(args: argparse.Namespace) -> CoworkerHandle:

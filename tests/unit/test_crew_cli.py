@@ -595,7 +595,7 @@ def test_crew_model_history_excludes_unrelated_offline_claims(
     )
     offline_run_id = "synthetic-offline-worker-claim"
     ref = handle.begin_background_run(offline_run_id)
-    directory._claim_offline_turn(
+    directory._claim_responsibility_turn(
         handle=handle,
         run_id=offline_run_id,
         session_id=ref.session_id,
@@ -1381,3 +1381,408 @@ else:
     assert final.status == "succeeded"
     assert [event.status for event in events].count("dispatching") == 1
     assert target.read_bytes() == b"VALUE = 2\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import hmac
+    from datetime import datetime, timedelta, timezone
+    from uuid import uuid4
+
+    import ash.coworkers as coworkers
+
+    ash_dir, atlas_workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_answer="APPROVED: Atlas recommends inspecting this failure. ",
+    )
+    fixed_now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    monkeypatch.setattr("ash.automation.schedules.utc_now", lambda: fixed_now)
+    monkeypatch.setattr("ash.crew_events.utc_now", lambda: fixed_now)
+    monkeypatch.setattr(coworkers, "_now", lambda: fixed_now.isoformat())
+
+    protected = atlas_workspace / "src" / "protected.py"
+    protected.parent.mkdir()
+    protected.write_text("VALUE = 1\n", encoding="utf-8")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=atlas_workspace,
+    )
+    scout = directory.create(
+        owner_id="local",
+        display_name="Scout",
+        profile_name="scout",
+        workspace=scout_workspace,
+    )
+    atlas_responsibility_id = str(uuid4())
+    atlas_manual_responsibility_id = str(uuid4())
+    scout_responsibility_id = str(uuid4())
+
+    assert main(
+        [
+            "crew",
+            "responsibility",
+            "create",
+            "--owner",
+            "local",
+            "--coworker-id",
+            atlas.coworker_id,
+            "--responsibility-id",
+            atlas_responsibility_id,
+            "--scope",
+            "Atlas CI failure",
+            "--objective",
+            "Explain the synthetic test failure and propose a minimal correction.",
+            "--success-criterion",
+            "Identify the failing assertion.",
+        ]
+    ) == 0
+    capsys.readouterr()
+    assert main(
+        [
+            "crew",
+            "responsibility",
+            "create",
+            "--owner",
+            "local",
+            "--coworker-id",
+            atlas.coworker_id,
+            "--responsibility-id",
+            atlas_manual_responsibility_id,
+            "--scope",
+            "Atlas owner follow-up",
+            "--objective",
+            "Summarize the event result for the local owner.",
+            "--success-criterion",
+            "Keep the response read-only and bounded.",
+        ]
+    ) == 0
+    capsys.readouterr()
+    assert main(
+        [
+            "crew",
+            "responsibility",
+            "create",
+            "--owner",
+            "local",
+            "--coworker-id",
+            scout.coworker_id,
+            "--responsibility-id",
+            scout_responsibility_id,
+            "--scope",
+            "Scout independent research",
+            "--objective",
+            "Summarize the explicitly assigned research question.",
+            "--success-criterion",
+            "Keep the result independent from Atlas workspace data.",
+            "--every",
+            "10m",
+            "--misfire-grace-seconds",
+            "3600",
+        ]
+    ) == 0
+    capsys.readouterr()
+    scout_handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=scout.coworker_id,
+    )
+    scheduled = scout_handle.get_responsibility(scout_responsibility_id)
+    assert scheduled.next_fire_at is not None
+    monkeypatch.setattr(
+        coworkers,
+        "_current_time",
+        lambda: scheduled.next_fire_at,
+    )
+
+    signing_key = bytes(range(32))
+    signing_key_text = signing_key.hex()
+    key_file = tmp_path / "crew-event.key"
+    key_file.write_text(signing_key_text + "\n", encoding="ascii")
+    key_file.chmod(0o600)
+    event_fields: dict[str, object] = {
+        "version": 1,
+        "source": "github-actions",
+        "id": "atlas-ci-42",
+        "issued_at": fixed_now.isoformat(),
+        "responsibility_id": atlas_responsibility_id,
+        "payload": "Synthetic CI failure: tests/test_auth.py expected 2 but received 1.",
+    }
+    canonical = json.dumps(
+        event_fields,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(signing_key, canonical, hashlib.sha256).hexdigest()
+    event_fields["signature"] = signature
+    event_file = tmp_path / "atlas-ci-event.json"
+    event_file.write_text(
+        json.dumps(event_fields, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    event_args = [
+        "crew",
+        "event",
+        "--owner",
+        "local",
+        "--coworker-id",
+        atlas.coworker_id,
+        "--responsibility-id",
+        atlas_responsibility_id,
+        "--key-file",
+        str(key_file),
+        "--input",
+        str(event_file),
+    ]
+    wrong_owner_args = event_args.copy()
+    wrong_owner_args[wrong_owner_args.index("--owner") + 1] = "foreign"
+    assert main(wrong_owner_args) == 2
+    assert "no coworker matches" in capsys.readouterr().err
+    assert not observed
+    wrong_target_args = event_args.copy()
+    wrong_target_args[wrong_target_args.index("--responsibility-id") + 1] = (
+        scout_responsibility_id
+    )
+    assert main(wrong_target_args) == 2
+    assert "target does not match" in capsys.readouterr().err
+    assert not observed
+
+    event_fields["signature"] = "0" * 64
+    event_file.write_text(
+        json.dumps(event_fields, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    assert main(event_args) == 2
+    assert "authentication failed" in capsys.readouterr().err
+    assert not observed
+    event_fields["signature"] = signature
+    event_file.write_text(
+        json.dumps(event_fields, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    assert main(
+        [
+            "crew",
+            "responsibility",
+            "pause",
+            "--owner",
+            "local",
+            "--coworker-id",
+            atlas.coworker_id,
+            "--responsibility-id",
+            atlas_responsibility_id,
+        ]
+    ) == 0
+    capsys.readouterr()
+    assert main(event_args) == 2
+    assert "not active" in capsys.readouterr().err
+    assert not observed
+    assert main(
+        [
+            "crew",
+            "responsibility",
+            "resume",
+            "--owner",
+            "local",
+            "--coworker-id",
+            atlas.coworker_id,
+            "--responsibility-id",
+            atlas_responsibility_id,
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    with monkeypatch.context() as wrong_uid:
+        wrong_uid.setattr(
+            coworkers,
+            "_current_owner_uid",
+            lambda: os.geteuid() + 1,
+        )
+        assert main(event_args) == 2
+        assert "owner identity" in capsys.readouterr().err
+    assert not observed
+
+    assert main(event_args) == 0
+    atlas_output = capsys.readouterr().out
+    assert "Trigger: event" in atlas_output
+    assert "github-actions:atlas-ci-42" in atlas_output
+    assert "APPROVED" in atlas_output
+    assert "Read-only turn. No files were changed." in atlas_output
+    assert signing_key_text not in atlas_output
+    assert "atlas-profile-secret" not in atlas_output
+    assert protected.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert len(observed) == 1
+    atlas_message = next(
+        str(message["content"])
+        for message in observed[0]["messages"]
+        if message["role"] == "user"
+    )
+    assert event_fields["payload"] in atlas_message
+    assert signing_key_text not in atlas_message
+    assert signature not in atlas_message
+    assert observed[0]["tools"] is None
+    assert observed[0]["model"] == "gpt-atlas"
+
+    assert main(
+        [
+            "crew",
+            "tick",
+            "--owner",
+            "local",
+            "--coworker-id",
+            scout.coworker_id,
+        ]
+    ) == 0
+    scout_output = capsys.readouterr().out
+    assert "Trigger: scheduled" in scout_output
+    assert (
+        f"scheduled:{scheduled.next_fire_at.astimezone(timezone.utc).isoformat()}"
+        in scout_output
+    )
+    assert "Scout found an independent research note." in scout_output
+    assert "scout-profile-secret" not in scout_output
+    assert len(observed) == 2
+    assert observed[1]["tools"] is None
+    assert observed[1]["model"] == "gpt-scout"
+    assert signing_key_text not in "".join(
+        str(message["content"]) for message in observed[1]["messages"]
+    )
+
+    assert main(
+        [
+            "crew",
+            "responsibility",
+            "run",
+            "--owner",
+            "local",
+            "--coworker-id",
+            atlas.coworker_id,
+            "--responsibility-id",
+            atlas_manual_responsibility_id,
+            "--event-id",
+            "owner-follow-up-1",
+        ]
+    ) == 0
+    manual_output = capsys.readouterr().out
+    assert "Trigger: manual" in manual_output
+    assert "Event key: owner-follow-up-1" in manual_output
+    assert "github-actions" not in manual_output
+    assert len(observed) == 3
+    assert observed[2]["model"] == "gpt-atlas"
+    assert observed[2]["tools"] is None
+
+    reopened = CoworkerDirectory.open(ash_dir)
+    atlas_handle = reopened.open_coworker(
+        owner_id="local",
+        coworker_id=atlas.coworker_id,
+    )
+    scout_handle = reopened.open_coworker(
+        owner_id="local",
+        coworker_id=scout.coworker_id,
+    )
+    atlas_run, = atlas_handle.list_responsibility_runs(atlas_responsibility_id)
+    scout_run, = scout_handle.list_responsibility_runs(scout_responsibility_id)
+    manual_run, = atlas_handle.list_responsibility_runs(atlas_manual_responsibility_id)
+    assert atlas_run.execution_kind == scout_run.execution_kind == "model"
+    assert atlas_run.trigger_type == "event"
+    assert atlas_run.event_key == "github-actions:atlas-ci-42"
+    assert manual_run.trigger_type == "manual"
+    assert manual_run.execution_kind == "model"
+    assert manual_run.event_key == "owner-follow-up-1"
+    assert manual_run.run_id != atlas_run.run_id
+    assert scout_run.trigger_type == "scheduled"
+    assert scout_run.event_key == f"scheduled:{scheduled.next_fire_at.isoformat()}"
+    assert atlas_run.session_id is not None and scout_run.session_id is not None
+    assert atlas_run.session_id != scout_run.session_id
+    assert manual_run.session_id is not None
+    assert manual_run.session_id != atlas_run.session_id
+    atlas_session, _ = atlas_handle.load_session(atlas_run.session_id)
+    scout_session, _ = scout_handle.load_session(scout_run.session_id)
+    assert atlas_session.model == "openai/gpt-atlas"
+    assert scout_session.model == "openai/gpt-scout"
+    assert [message.role for message in atlas_session.messages] == ["user", "assistant"]
+    assert [message.role for message in scout_session.messages] == ["user", "assistant"]
+    assert not atlas_session.tool_calls and not scout_session.tool_calls
+    assert scout_handle.get_responsibility(scout_responsibility_id).next_fire_at == (
+        scheduled.next_fire_at + timedelta(minutes=10)
+    )
+
+    assert main(event_args) == 2
+    duplicate = capsys.readouterr()
+    assert "already used" in duplicate.err or "already claimed" in duplicate.err
+    assert len(observed) == 3
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_missing_provider_keeps_model_schedule_due_without_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import datetime, timezone
+
+    import ash.coworkers as coworkers
+    from ash.automation.schedules import build_schedule
+    from ash.providers.registry import ProviderRegistry
+
+    ash_dir, _, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch)
+    fixed_now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    monkeypatch.setattr("ash.automation.schedules.utc_now", lambda: fixed_now)
+    monkeypatch.setattr(coworkers, "_now", lambda: fixed_now.isoformat())
+    directory = CoworkerDirectory.open(ash_dir)
+    scout = directory.create(
+        owner_id="local",
+        display_name="Scout",
+        profile_name="scout",
+        workspace=scout_workspace,
+    )
+    responsibility = directory.open_coworker(
+        owner_id="local",
+        coworker_id=scout.coworker_id,
+    ).create_responsibility(
+        responsibility_id="70467850-1d12-45eb-8872-826012b1adac",
+        scope="Scheduled research",
+        objective="Summarize the assigned research question.",
+        success_criteria=("Return one concise finding.",),
+        schedule=build_schedule(every="10m", now=fixed_now),
+        misfire_grace_seconds=3_600,
+    )
+    assert responsibility.next_fire_at is not None
+    monkeypatch.setattr(coworkers, "_current_time", lambda: responsibility.next_fire_at)
+    monkeypatch.setattr(
+        "ash.providers.registry.get_provider_registry",
+        ProviderRegistry,
+    )
+
+    assert main(
+        [
+            "crew",
+            "tick",
+            "--owner",
+            "local",
+            "--coworker-id",
+            scout.coworker_id,
+        ]
+    ) == 2
+    blocked = capsys.readouterr()
+    assert "provider is unavailable" in blocked.err
+    assert "scheduled occurrence remains due" in blocked.err
+    assert not observed
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local",
+        coworker_id=scout.coworker_id,
+    )
+    assert reopened.get_responsibility(responsibility.responsibility_id).next_fire_at == (
+        responsibility.next_fire_at
+    )
+    assert reopened.list_responsibility_runs(responsibility.responsibility_id) == []
