@@ -3386,14 +3386,38 @@ class CoworkerDirectory:
         if (
             row is None
             or row["status"] != "completed"
-            or row["responsibility_id"] is not None
-            or row["trigger_type"] is not None
             or row["workspace_device"] is None
             or row["workspace_inode"] is None
         ):
             raise CoworkerRuntimeUnavailable(
                 "source must be a completed owner-bound Atlas read-only turn"
             )
+        if row["responsibility_id"] is None:
+            # Old standalone model turns predate the execution_kind column.
+            if row["trigger_type"] is not None or row["execution_kind"] not in {
+                "legacy",
+                "model",
+            }:
+                raise CoworkerRuntimeUnavailable(
+                    "source is not a completed Atlas read-only model turn"
+                )
+        else:
+            if row["execution_kind"] != "model":
+                raise CoworkerRuntimeUnavailable(
+                    "source responsibility is not a model-backed read-only turn"
+                )
+            try:
+                source_run = _responsibility_run_from_row(row)
+            except CoworkerDirectoryError as exc:
+                raise CoworkerRuntimeUnavailable(
+                    "source responsibility attribution is invalid"
+                ) from exc
+            if source_run.session_id != normalized_session_id or (
+                source_run.request_id != normalized_request_id
+            ):
+                raise CoworkerRuntimeUnavailable(
+                    "source responsibility session identity changed"
+                )
         workspace_identity = (int(row["workspace_device"]), int(row["workspace_inode"]))
         guard = SafetyGuard(
             current.workspace,
@@ -3412,6 +3436,18 @@ class CoworkerDirectory:
             != ("user", "assistant")
             or session.messages[0].metadata.get("coworker_request_id")
             != normalized_request_id
+            or (
+                row["responsibility_id"] is not None
+                and (
+                    session.messages[0].metadata.get("coworker_execution_kind") != "model"
+                    or session.messages[0].metadata.get("coworker_responsibility_id")
+                    != row["responsibility_id"]
+                    or session.messages[0].metadata.get("coworker_trigger_type")
+                    != row["trigger_type"]
+                    or session.messages[0].metadata.get("coworker_event_id")
+                    != row["event_key"]
+                )
+            )
             or session.tool_calls
             or not session.messages[0].content.strip()
             or not session.messages[1].content.strip()

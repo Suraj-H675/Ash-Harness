@@ -1722,6 +1722,199 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert len(observed) == 3
 
 
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_atlas_signed_ci_event_flows_into_exact_owner_approved_correction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import asyncio
+    import hmac
+    from datetime import datetime, timezone
+
+    from ash.coworkers import CoworkerRuntimeUnavailable
+
+    ash_dir, atlas_workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_answer="A CI assertion failed; recommend VALUE = 2. APPROVED",
+    )
+    target = atlas_workspace / "src" / "check.py"
+    target.parent.mkdir()
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    (atlas_workspace / "src" / "check.fixed.py").write_text(
+        "VALUE = 2\n", encoding="utf-8"
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=atlas_workspace,
+    )
+    scout = directory.create(
+        owner_id="local",
+        display_name="Scout",
+        profile_name="scout",
+        workspace=scout_workspace,
+    )
+    atlas_handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=atlas.coworker_id,
+    )
+    scout_handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=scout.coworker_id,
+    )
+    responsibility = atlas_handle.create_responsibility(
+        scope="Synthetic CI",
+        objective="Investigate a failed test and propose a correction.",
+        success_criteria=("Explain the assertion mismatch.",),
+    )
+    signing_key = bytes(range(32))
+    key_file = tmp_path / "event.key"
+    key_file.write_text(signing_key.hex() + "\n", encoding="ascii")
+    key_file.chmod(0o600)
+    event_fields = {
+        "version": 1,
+        "source": "github-actions",
+        "id": "failing-run-42",
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "responsibility_id": responsibility.responsibility_id,
+        "payload": "Synthetic test failed: expected VALUE=2, observed VALUE=1.",
+    }
+    canonical = json.dumps(
+        event_fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    envelope = json.dumps(
+        {
+            **event_fields,
+            "signature": hmac.new(signing_key, canonical, hashlib.sha256).hexdigest(),
+        }
+    ).encode("utf-8")
+    completed = asyncio.run(
+        atlas_handle.run_signed_event(
+            envelope,
+            key_file=key_file,
+            responsibility_id=responsibility.responsibility_id,
+        )
+    )
+    assert completed.trigger_type == "event"
+    assert completed.responsibility_id == responsibility.responsibility_id
+    assert completed.response and len(observed) == 1
+    assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+
+    source_ids = {
+        "run_id": completed.session_ref.run_id,
+        "session_id": completed.session_ref.session_id,
+        "request_id": completed.request_id,
+    }
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        scout_handle.prepare_file_approval(
+            **source_ids,
+            target_path="src/check.py",
+            replacement_file_path="src/check.fixed.py",
+        )
+    # A dispatch claimed as offline or attached to another event is not an
+    # eligible model-backed source, even when the transcript still exists.
+    for column, changed_value, original in (
+        ("execution_kind", "offline", "model"),
+        ("event_key", "github-actions:forged-run", "github-actions:failing-run-42"),
+    ):
+        with sqlite3.connect(directory.db_path) as connection:
+            connection.execute(
+                f"UPDATE coworker_turn_dispatches SET {column} = ? WHERE run_id = ?",
+                (changed_value, source_ids["run_id"]),
+            )
+        with pytest.raises(CoworkerRuntimeUnavailable):
+            atlas_handle.prepare_file_approval(
+                **source_ids,
+                target_path="src/check.py",
+                replacement_file_path="src/check.fixed.py",
+            )
+        with sqlite3.connect(directory.db_path) as connection:
+            connection.execute(
+                f"UPDATE coworker_turn_dispatches SET {column} = ? WHERE run_id = ?",
+                (original, source_ids["run_id"]),
+            )
+    assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert main(
+        [
+            "crew",
+            "propose",
+            "--owner",
+            "local",
+            "--coworker-id",
+            atlas.coworker_id,
+            "--run-id",
+            source_ids["run_id"],
+            "--session-id",
+            source_ids["session_id"],
+            "--request-id",
+            source_ids["request_id"],
+            "--target",
+            "src/check.py",
+            "--replacement-file",
+            "src/check.fixed.py",
+        ]
+    ) == 0
+    output = capsys.readouterr().out
+    assert "Status: pending" in output
+    assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    approval_id = next(
+        line.removeprefix("Approval ID: ")
+        for line in output.splitlines()
+        if line.startswith("Approval ID: ")
+    )
+    approval_digest = next(
+        line.removeprefix("Approval digest: ")
+        for line in output.splitlines()
+        if line.startswith("Approval digest: ")
+    )
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local",
+        coworker_id=atlas.coworker_id,
+    )
+    pending, _ = reopened.inspect_file_approval(approval_id)
+    assert pending.source_run_id == completed.session_ref.run_id
+    assert pending.source_session_id == completed.session_ref.session_id
+    assert pending.status == "pending"
+    assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+
+    expected_challenges = [
+        f"APPROVE {approval_id} {approval_digest}",
+        f"APPLY {approval_id} {approval_digest}",
+    ]
+
+    def confirm_exact_challenge(challenge: str) -> bool:
+        assert challenge == expected_challenges.pop(0)
+        return True
+
+    monkeypatch.setattr("ash.commands.crew._require_tty_confirmation", confirm_exact_challenge)
+    for action in ("approve", "apply"):
+        assert main(
+            [
+                "crew", action,
+                "--owner", "local",
+                "--coworker-id", atlas.coworker_id,
+                "--approval-id", approval_id,
+            ]
+        ) == 0
+        if action == "approve":
+            assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert not expected_challenges
+    assert target.read_text(encoding="utf-8") == "VALUE = 2\n"
+    final, events = reopened.inspect_file_approval(approval_id)
+    assert final.status == "succeeded"
+    assert [event.status for event in events] == [
+        "pending", "approved", "dispatching", "succeeded"
+    ]
+    with pytest.raises(CoworkerRuntimeUnavailable, match="consumed"):
+        reopened._apply_file_approval(approval_id)
+    assert len(observed) == 1
+
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
 def test_missing_provider_keeps_model_schedule_due_without_dispatch(
     tmp_path: Path,
