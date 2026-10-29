@@ -148,7 +148,7 @@ def _payload_contains_signing_key(payload: str, key: bytes) -> bool:
         decoded_key = key.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
         decoded_key = ""
-    if decoded_key.isprintable():
+    if decoded_key and decoded_key.isprintable():
         encoded_forms.add(decoded_key)
     if any(value in payload for value in encoded_forms):
         return True

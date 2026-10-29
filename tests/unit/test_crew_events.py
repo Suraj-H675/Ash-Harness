@@ -87,6 +87,35 @@ def test_signed_crew_event_verifies_canonical_payload_and_binds_target(
     not hasattr(os, "geteuid") or not hasattr(os, "O_NOFOLLOW"),
     reason="signed Crew events require POSIX owner and no-follow checks",
 )
+def test_signed_event_with_non_utf8_signing_key_does_not_reject_inert_payload(
+    tmp_path: Path,
+) -> None:
+    key = bytes([0xFF]) * 32
+    now = datetime(2026, 10, 29, 8, 0, tzinfo=timezone.utc)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    key_file = _write_key(tmp_path / "crew.key", key)
+    envelope = _signed_event(
+        key,
+        now=now,
+        responsibility_id=str(uuid4()),
+        payload="Synthetic CI failure: expected 2 checks but observed 1.",
+    )
+
+    event = parse_signed_crew_event(
+        envelope,
+        key_file=key_file,
+        workspace=workspace,
+        now=now,
+    )
+
+    assert event.payload == "Synthetic CI failure: expected 2 checks but observed 1."
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or not hasattr(os, "O_NOFOLLOW"),
+    reason="signed Crew events require POSIX owner and no-follow checks",
+)
 def test_signed_crew_event_rejects_payload_that_contains_its_signing_key(
     tmp_path: Path,
 ) -> None:

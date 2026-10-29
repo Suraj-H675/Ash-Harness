@@ -511,6 +511,7 @@ class _BoundedReadOnlyProvider(ProviderABC):
         cache_write_tokens = 0
         usage_source: Literal["provider", "estimated", "unavailable"] = "unavailable"
         terminal: StreamChunk | None = None
+        saw_usage_trailer = False
         async for chunk in self._provider.stream_chat(
             messages,
             temperature=temperature,
@@ -521,9 +522,25 @@ class _BoundedReadOnlyProvider(ProviderABC):
                     "provider attempted a tool call during a read-only coworker turn"
                 )
             if terminal is not None:
-                raise ProviderIncompleteStreamError(
-                    "provider emitted data after its terminal response"
-                )
+                # Some OpenAI-compatible streams repeat the terminal choice solely
+                # to attach final usage. Never admit additional model output.
+                if (
+                    saw_usage_trailer
+                    or not chunk.is_done
+                    or chunk.content
+                    or chunk.reasoning
+                    or chunk.reasoning_blocks
+                    or chunk.provider_state
+                    or chunk.metadata
+                    or chunk.usage_source != "provider"
+                    or terminal.usage_source == "provider"
+                    or chunk.stop_reason != terminal.stop_reason
+                    or chunk.model != terminal.model
+                ):
+                    raise ProviderIncompleteStreamError(
+                        "provider emitted data after its terminal response"
+                    )
+                saw_usage_trailer = True
             if chunk.content:
                 output_bytes += len(chunk.content.encode("utf-8", errors="strict"))
                 if output_bytes > _MODEL_TURN_MAX_RESPONSE_BYTES:

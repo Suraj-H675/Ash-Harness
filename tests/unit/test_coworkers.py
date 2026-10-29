@@ -125,6 +125,73 @@ def _install_fake_offline_worker(
     return calls
 
 
+def test_readonly_provider_accepts_only_one_terminal_usage_trailer() -> None:
+    import asyncio
+    from collections.abc import AsyncGenerator
+
+    from ash.coworkers import _BoundedReadOnlyProvider
+    from ash.providers.base import (
+        ProviderABC,
+        ProviderIncompleteStreamError,
+        StreamChunk,
+    )
+    from ash.providers.messages import MessageInput
+
+    class SyntheticProvider(ProviderABC):
+        provider_family = "openrouter"
+
+        def __init__(self, trailer: StreamChunk) -> None:
+            self.trailer = trailer
+
+        @property
+        def model_name(self) -> str:
+            return "synthetic"
+
+        def count_tokens(self, text: str) -> int:
+            return len(text)
+
+        async def stream_chat(
+            self,
+            messages: Sequence[MessageInput],
+            temperature: float = 0.0,
+            tools: list[dict[str, object]] | None = None,
+        ) -> AsyncGenerator[StreamChunk, None]:
+            del messages, temperature, tools
+            yield StreamChunk(content="correct answer")
+            yield StreamChunk(is_done=True, stop_reason="stop", model="synthetic")
+            yield self.trailer
+
+    async def consume(trailer: StreamChunk) -> StreamChunk:
+        provider = _BoundedReadOnlyProvider(SyntheticProvider(trailer), ())
+        chunks = [chunk async for chunk in provider.stream_chat([])]
+        assert len(chunks) == 1
+        return chunks[0]
+
+    terminal_usage = StreamChunk(
+        is_done=True,
+        stop_reason="stop",
+        model="synthetic",
+        usage_source="provider",
+        prompt_tokens=5,
+        completion_tokens=10,
+    )
+    result = asyncio.run(consume(terminal_usage))
+    assert result.content == "correct answer"
+    assert result.is_done
+    assert result.prompt_tokens == 5
+    assert result.completion_tokens == 10
+
+    invalid_trailers = (
+        terminal_usage.model_copy(update={"content": "late"}),
+        terminal_usage.model_copy(update={"stop_reason": "length"}),
+        terminal_usage.model_copy(update={"reasoning": [{"type": "thinking", "thinking": "late"}]}),
+        terminal_usage.model_copy(update={"is_done": False}),
+    )
+    for invalid_trailer in invalid_trailers:
+        with pytest.raises(ProviderIncompleteStreamError):
+            asyncio.run(consume(invalid_trailer))
+
+
 def test_coworker_profile_model_does_not_interpolate_parent_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
