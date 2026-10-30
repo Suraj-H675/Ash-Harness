@@ -73,7 +73,7 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         description=(
             "Create and ask profile-scoped coworkers. Responsibility turns use one "
             "no-tool model request. Signed events use a local HMAC key file, and "
-            "scheduled work runs only when you invoke ash crew tick."
+            "scheduled work runs through ash crew tick or an explicit crew worker."
         ),
     )
     crew_subparsers = crew_parser.add_subparsers(
@@ -254,6 +254,15 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         "--check-model",
         action="store_true",
         help="Probe the selected profile model before claiming this event",
+    )
+    crew_worker = crew_subparsers.add_parser(
+        "worker", help="Poll one coworker's due schedules until stopped"
+    )
+    crew_worker.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_worker.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_worker.add_argument(
+        "--poll-seconds", type=int, default=60,
+        help="Seconds between due checks (10-3600, default: 60)",
     )
     crew_tick = crew_subparsers.add_parser(
         "tick", help="Run at most one due scheduled responsibility and exit"

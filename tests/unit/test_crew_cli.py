@@ -2213,6 +2213,131 @@ else:
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_crew_worker_wakes_due_work_and_obeys_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import datetime, timezone
+
+    import ash.coworkers as coworkers
+    from ash.automation.schedules import build_schedule
+    from ash.commands.crew import _run_crew_worker
+
+    ash_dir, _, workspace = _prepare_profiles(tmp_path, monkeypatch)
+    started = asyncio.Event()
+    _, observed = _install_fake_registry(monkeypatch, started=started)
+    (workspace / "scout.txt").write_text("Scout-only note.\n", encoding="utf-8")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Scout",
+        profile_name="scout", workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    now = datetime.now(timezone.utc)
+    responsibility = handle.create_responsibility(
+        scope="Monitor a selected note",
+        objective="Summarize its content without changing files.",
+        success_criteria=("Only report the given evidence.",),
+        evidence_paths=("scout.txt",),
+        schedule=build_schedule(every="10m", now=now),
+    )
+    assert responsibility.next_fire_at is not None
+    monkeypatch.setattr(coworkers, "_current_time", lambda: responsibility.next_fire_at)
+
+    async def run_one_tick() -> None:
+        stop = asyncio.Event()
+        task = asyncio.create_task(_run_crew_worker(handle, 10, stop=stop))
+        try:
+            await asyncio.wait_for(started.wait(), 4)
+            stop.set()
+            await asyncio.wait_for(task, 4)
+        finally:
+            stop.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run_one_tick())
+    assert len(observed) == 1
+    assert observed[0]["tools"] is None
+    assert "Scout-only note" in str(observed[0]["messages"])
+    assert "completed" in capsys.readouterr().out.lower()
+    assert len(handle.list_responsibility_runs(responsibility.responsibility_id)) == 1
+    assert len(handle.list_readonly_turn_history()) == 0  # Scheduled, not standalone.
+    assert main(["crew", "inbox", "--owner", "local"]) == 0
+    assert "scheduled" in capsys.readouterr().out.lower()
+
+    # A due occurrence is permanently consumed, including across a reopened handle.
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    assert reopened.get_responsibility(responsibility.responsibility_id).next_fire_at != (
+        responsibility.next_fire_at
+    )
+    reopened.pause()
+
+    async def assert_no_dispatch_while_paused() -> None:
+        stop = asyncio.Event()
+        task = asyncio.create_task(_run_crew_worker(reopened, 10, stop=stop))
+        await asyncio.sleep(0.03)
+        stop.set()
+        await asyncio.wait_for(task, 3)
+
+    asyncio.run(assert_no_dispatch_while_paused())
+    assert len(observed) == 1
+    reopened.archive()
+    asyncio.run(_run_crew_worker(reopened, 10, stop=asyncio.Event()))
+    assert "archived" in capsys.readouterr().out
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_crew_worker_cli_stops_on_sigterm_without_a_provider_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import signal
+    import subprocess
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    args = [
+        "crew", "worker", "--owner", "local",
+        "--coworker-id", identity.coworker_id,
+    ]
+    assert main([*args, "--poll-seconds", "9"]) == 2
+    assert "between 10 and 3600" in capsys.readouterr().err
+    assert main([*args, "--owner", "foreign", "--poll-seconds", "10"]) == 2
+    assert "stopped" in capsys.readouterr().err
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "ash", *args, "--poll-seconds", "10"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert "Crew worker started" in process.stdout.readline()
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+        assert "Crew worker stopped" in stdout
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
 def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2736,7 +2861,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert scout.coworker_id not in atlas_show
     assert "atlas-profile-secret" not in atlas_show
     assert "APPROVED: Atlas recommends inspecting this failure." not in atlas_show
-    assert "Schedules require an explicit" in atlas_show
+    assert "Schedules run through an explicit tick or started Crew worker" in atlas_show
     assert len(observed) == 4  # inspection never calls either profile's provider
     assert main([
         "crew", "show", "--owner", "local", "--coworker-id", scout.coworker_id,

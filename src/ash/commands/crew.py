@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import difflib
 import os
+import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +72,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _event(args)
     if action == "tick":
         return _tick(args)
+    if action == "worker":
+        return _worker(args)
     if action == "propose":
         return _propose(args)
     if action == "approvals":
@@ -204,8 +207,9 @@ def _show(args: argparse.Namespace) -> int:
             _render_inbox_approval(entry)
         _write_line("")
     _write_line(
-        "Schedules require an explicit `ash crew tick` invocation; "
-        "there is no resident Crew scheduler or remote notification service."
+        "Schedules run through an explicit tick or started Crew worker; "
+        "there is no automatically installed background service or "
+        "remote notification channel."
     )
     return 0
 
@@ -864,6 +868,111 @@ def _tick(args: argparse.Namespace) -> int:
             f"({type(exc).__name__}). Inspect responsibility runs before retrying."
         )
         return 2
+
+
+def _worker(args: argparse.Namespace) -> int:
+    """Run one explicitly selected coworker's stored schedules until stopped."""
+    if not 10 <= args.poll_seconds <= 3600:
+        _write_error("Worker polling interval must be between 10 and 3600 seconds.")
+        return 2
+    try:
+        handle = _open_coworker_handle(args)
+        if handle.require_owner_binding().lifecycle_status == "archived":
+            _write_error("Archived coworkers cannot start a scheduled worker.")
+            return 2
+        asyncio.run(_run_crew_worker(handle, args.poll_seconds))
+        _write_line("Crew worker stopped.")
+        return 0
+    except KeyboardInterrupt:
+        _write_error(
+            "Crew worker interrupted. An in-flight provider outcome may be unknown; "
+            "inspect Crew responsibility runs before retrying."
+        )
+        return 130
+    except (CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+            OSError, SafetyViolation, SessionStorageError, ValueError) as exc:
+        _write_error(
+            "Crew worker stopped ("
+            f"{type(exc).__name__}). Inspect Crew show and inbox."
+        )
+        return 2
+    except Exception as exc:
+        _write_error(f"Crew worker stopped ({type(exc).__name__}).")
+        return 2
+
+
+async def _run_crew_worker(
+    handle: CoworkerHandle,
+    poll_seconds: int,
+    *,
+    stop: asyncio.Event | None = None,
+) -> None:
+    """One serial, bounded Crew model tick per poll; no independent dispatch path."""
+    stopping = stop if stop is not None else asyncio.Event()
+    loop = asyncio.get_running_loop()
+    registered_term = False
+    if stop is None:
+        try:
+            loop.add_signal_handler(signal.SIGTERM, stopping.set)
+            registered_term = True
+        except (NotImplementedError, RuntimeError):
+            pass
+    _write_line(
+        "Crew worker started for coworker "
+        f"{_safe_text(handle.identity.coworker_id, single_line=True)}. "
+        "Only stored, due responsibilities will run. "
+        "Stop with Ctrl-C or SIGTERM; inspect the Crew inbox for outcomes."
+    )
+    sys.stdout.flush()
+    try:
+        while not stopping.is_set():
+            identity = handle.require_owner_binding()
+            if identity.lifecycle_status == "archived":
+                _write_line("Coworker archived; worker will not dispatch new work.")
+                return
+            if identity.lifecycle_status == "active":
+                try:
+                    result = await handle.run_due_model_responsibilities_once()
+                    if result.status == "completed":
+                        if result.turn is None:
+                            raise CoworkerDirectoryError(
+                                "completed scheduled turn has no persisted result"
+                            )
+                        _write_line(
+                            "Scheduled Crew turn completed; "
+                            f"responsibility {result.responsibility_id}, "
+                            f"event {_safe_text(result.event_key or '', single_line=True)}. "
+                            "Inspect Crew inbox for details."
+                        )
+                    elif result.status == "skipped":
+                        _write_line(
+                            "Scheduled Crew occurrence skipped after misfire grace; "
+                            f"responsibility {result.responsibility_id}."
+                        )
+                except CoworkerModelReadinessError as exc:
+                    _write_error(
+                        "Scheduled Crew turn blocked by provider readiness "
+                        f"({exc.failure_code}); inspect Crew show."
+                    )
+                except CoworkerRuntimeUnavailable:
+                    _write_error(
+                        "Scheduled Crew turn was blocked or its outcome may be unknown; "
+                        "inspect Crew responsibility runs before retrying."
+                    )
+                except (CoworkerDirectoryError, AshError, OSError, SafetyViolation,
+                        SessionStorageError, ValueError):
+                    _write_error(
+                        "Scheduled Crew turn unavailable; inspect Crew show "
+                        "and the local inbox."
+                    )
+            if not stopping.is_set():
+                try:
+                    await asyncio.wait_for(stopping.wait(), timeout=poll_seconds)
+                except TimeoutError:
+                    pass
+    finally:
+        if registered_term:
+            loop.remove_signal_handler(signal.SIGTERM)
 
 
 def _read_event_envelope(source: str) -> bytes:
