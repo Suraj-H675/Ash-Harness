@@ -582,6 +582,81 @@ def test_changed_profile_binding_blocks_before_evidence_read(
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_model_truncation_exposes_safe_category_and_keeps_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+
+    class TruncatedProvider(ProviderABC):
+        provider_family = "openai"
+
+        @property
+        def model_name(self) -> str:
+            return "synthetic-truncated"
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        def configure_max_tokens(self, max_tokens: int) -> None:
+            assert 0 < max_tokens <= 512
+
+        async def stream_chat(
+            self,
+            messages: Sequence[MessageInput],
+            temperature: float = 0.0,
+            tools: list[dict[str, object]] | None = None,
+        ) -> AsyncGenerator[StreamChunk, None]:
+            del messages, temperature, tools
+            yield StreamChunk(content="private-source-should-not-leak")
+            yield StreamChunk(is_done=True, stop_reason="length")
+
+    registry = ProviderRegistry()
+
+    def build(_config: object, _model: str) -> ProviderABC:
+        return TruncatedProvider()
+
+    def scoped_build(
+        _config: object, _model: str, _environment: object
+    ) -> ProviderABC:
+        return TruncatedProvider()
+
+    registry.register("openai", build)
+    registry._register_profile_factory("openai", build, scoped_build)
+    monkeypatch.setattr(
+        "ash.providers.registry.get_provider_registry", lambda: registry
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+    responsibility = handle.create_responsibility(
+        scope="Synthetic CI failure",
+        objective="Summarize this fixture without making changes.",
+    )
+    with pytest.raises(
+        CoworkerRuntimeUnavailable, match="failure_code=completion_truncated"
+    ) as caught:
+        asyncio.run(
+            handle.run_model_responsibility(
+                responsibility.responsibility_id,
+                event_id="truncated-once",
+            )
+        )
+    assert "private-source-should-not-leak" not in str(caught.value)
+    runs = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert len(runs) == 1 and runs[0].status == "claimed"
+    assert directory.list_inbox(owner_id="local")[0].status == "claimed"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
 def test_crew_model_history_excludes_unrelated_offline_claims(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

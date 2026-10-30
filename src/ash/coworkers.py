@@ -49,9 +49,11 @@ from ash.core.session import (
 from ash.core.redaction import redact_known_secrets
 from ash.providers.base import (
     ProviderABC,
+    ProviderCompletionError,
     ProviderIncompleteStreamError,
     StreamChunk,
 )
+from ash.providers.retry import ProviderFailureCategory, classify_provider_failure
 from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.messages import MessageInput
 from ash.profiles import (
@@ -462,6 +464,23 @@ def _profile_provider_secrets(config: AshConfig) -> tuple[str, ...]:
         if isinstance(inline_key, str) and inline_key:
             values.append(inline_key)
     return tuple(dict.fromkeys(value for value in values if value))
+
+
+def _safe_coworker_provider_failure_code(error: BaseException) -> str:
+    """Extract only structured failure facts, never provider-supplied text."""
+
+    failure = classify_provider_failure(error)
+    if failure.status_code is not None and 400 <= failure.status_code <= 599:
+        return f"http_{failure.status_code}"
+    if isinstance(error, ProviderIncompleteStreamError):
+        return "incomplete_stream"
+    if isinstance(error, ProviderCompletionError):
+        if error.stop_category is not None:
+            return f"completion_{error.stop_category.value}"
+        return "completion_invalid"
+    if failure.category is not ProviderFailureCategory.UNKNOWN:
+        return f"provider_{failure.category.value}"
+    return "unknown"
 
 
 class _BoundedReadOnlyProvider(ProviderABC):
@@ -5888,7 +5907,8 @@ class CoworkerHandle:
             except Exception as exc:  # noqa: BLE001 - adapter errors may be sensitive
                 primary_error = CoworkerRuntimeUnavailable(
                     "provider turn failed; the claimed turn will not be replayed "
-                    f"({type(exc).__name__})"
+                    f"({type(exc).__name__}; "
+                    f"failure_code={_safe_coworker_provider_failure_code(exc)})"
                 )
                 raise primary_error from None
             finally:

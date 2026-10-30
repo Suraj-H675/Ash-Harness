@@ -5374,7 +5374,8 @@ class AshLoop:
                                         detail = terminal_stop_reason or "error"
                                         raise ProviderCompletionError(
                                             "provider completion was not safe to "
-                                            f"finalize: {detail} (error)"
+                                            f"finalize: {detail} (error)",
+                                            stop_category=CompletionStopCategory.ERROR,
                                         )
                                     raise ProviderTerminalError(terminal_stop_reason)
                         stream_to_close = active_provider_stream
@@ -5488,7 +5489,8 @@ class AshLoop:
                     detail = terminal_stop_reason or stop_category.value
                     raise ProviderCompletionError(
                         "provider completion was not safe to finalize: "
-                        f"{detail} ({stop_category.value})"
+                        f"{detail} ({stop_category.value})",
+                        stop_category=stop_category,
                     )
                 if parser is not None:
                     try:

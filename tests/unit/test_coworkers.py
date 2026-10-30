@@ -192,6 +192,50 @@ def test_readonly_provider_accepts_only_one_terminal_usage_trailer() -> None:
             asyncio.run(consume(invalid_trailer))
 
 
+def test_coworker_provider_failure_diagnostics_are_structured_and_secret_free() -> None:
+    from ash.coworkers import _safe_coworker_provider_failure_code
+    from ash.providers.base import (
+        CompletionStopCategory,
+        ProviderCompletionError,
+        ProviderIncompleteStreamError,
+    )
+    from ash.providers.retry import ProviderHTTPError
+
+    def wrapped_http_failure(status: int) -> RuntimeError:
+        try:
+            raise ProviderHTTPError(
+                "provider body contained forbidden-secret-token", status_code=status
+            )
+        except ProviderHTTPError as exc:
+            try:
+                raise RuntimeError("sensitive SDK wrapper") from exc
+            except RuntimeError as wrapper:
+                return wrapper
+
+    assert _safe_coworker_provider_failure_code(wrapped_http_failure(429)) == "http_429"
+    assert _safe_coworker_provider_failure_code(wrapped_http_failure(401)) == "http_401"
+    assert _safe_coworker_provider_failure_code(
+        ProviderIncompleteStreamError("sensitive stream data")
+    ) == "incomplete_stream"
+    assert _safe_coworker_provider_failure_code(
+        ProviderCompletionError(
+            "private completion output",
+            stop_category=CompletionStopCategory.TRUNCATED,
+        )
+    ) == "completion_truncated"
+    assert _safe_coworker_provider_failure_code(
+        RuntimeError("user-visible-secret-do-not-leak")
+    ) == "unknown"
+    for label in (
+        _safe_coworker_provider_failure_code(wrapped_http_failure(429)),
+        _safe_coworker_provider_failure_code(
+            RuntimeError("user-visible-secret-do-not-leak")
+        ),
+    ):
+        assert "secret" not in label
+        assert "token" not in label
+
+
 def test_coworker_profile_model_does_not_interpolate_parent_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
