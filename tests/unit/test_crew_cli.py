@@ -91,6 +91,15 @@ def _install_fake_registry(
             tools: list[dict[str, object]] | None = None,
         ) -> AsyncGenerator[StreamChunk, None]:
             del temperature
+            prompt_text = "\n".join(
+                str(
+                    message.get("content", "")
+                    if isinstance(message, dict)
+                    else getattr(message, "content", "")
+                )
+                for message in messages
+            )
+            is_readiness_probe = "Synthetic readiness check." in prompt_text
             get_stdout = getattr(sys.stdout, "getvalue", None)
             captured_output = get_stdout() if callable(get_stdout) else ""
             observed.append(
@@ -99,6 +108,8 @@ def _install_fake_registry(
                     "key": self._api_key,
                     "messages": list(messages),
                     "tools": tools,
+                    "provider_id": id(self),
+                    "is_readiness_probe": is_readiness_probe,
                     "turn_id_reported_before_dispatch": "Turn ID:" in captured_output,
                 }
             )
@@ -107,10 +118,18 @@ def _install_fake_registry(
             if release is not None:
                 await release.wait()
             if self.model_name.endswith("atlas"):
-                answer = atlas_answer
-                answer += "atlas-profile-secret \u001b[31mred\u001b[0m\u202e"
+                answer = (
+                    "4"
+                    if is_readiness_probe
+                    else atlas_answer
+                    + "atlas-profile-secret \u001b[31mred\u001b[0m\u202e"
+                )
             else:
-                answer = "Scout found an independent research note. scout-profile-secret"
+                answer = (
+                    "4"
+                    if is_readiness_probe
+                    else "Scout found an independent research note. scout-profile-secret"
+                )
             yield StreamChunk(content=answer)
             yield StreamChunk(is_done=True)
 
@@ -142,6 +161,100 @@ def _install_fake_registry(
     return registry, observed
 
 
+def _install_readiness_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    probe_answer: str = "4",
+    probe_stop_reason: str | None = "stop",
+    probe_tool_call: bool = False,
+) -> tuple[list[dict[str, Any]], list[ProviderABC]]:
+    observed: list[dict[str, Any]] = []
+    providers: list[ProviderABC] = []
+
+    class ReadinessProvider(ProviderABC):
+        provider_family = "openai"
+
+        def __init__(self, model: str, key: str) -> None:
+            self._model = model
+            self._api_key = key
+            self.closed = False
+
+        @property
+        def model_name(self) -> str:
+            return self._model
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split())
+
+        def configure_max_tokens(self, max_tokens: int) -> None:
+            assert 0 < max_tokens <= 512
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+        async def stream_chat(
+            self,
+            messages: Sequence[MessageInput],
+            temperature: float = 0.0,
+            tools: list[dict[str, object]] | None = None,
+        ) -> AsyncGenerator[StreamChunk, None]:
+            del temperature
+            prompt_text = "\n".join(
+                str(
+                    message.get("content", "")
+                    if isinstance(message, dict)
+                    else getattr(message, "content", "")
+                )
+                for message in messages
+            )
+            is_probe = "Synthetic readiness check." in prompt_text
+            observed.append(
+                {
+                    "model": self.model_name,
+                    "provider_id": id(self),
+                    "prompt": prompt_text,
+                    "tools": tools,
+                    "is_probe": is_probe,
+                }
+            )
+            if is_probe and probe_tool_call:
+                yield StreamChunk(tool_call_delta="attempt_tool")
+            else:
+                answer = probe_answer if is_probe else "real Crew response"
+                yield StreamChunk(content=answer)
+            yield StreamChunk(
+                is_done=True,
+                stop_reason=probe_stop_reason if is_probe else "stop",
+            )
+
+    registry = ProviderRegistry()
+
+    def build_profile_provider(
+        _config: object,
+        model: str,
+        environment: object,
+    ) -> ProviderABC:
+        assert isinstance(environment, dict)
+        key = next(iter(environment.values()), "")
+        assert isinstance(key, str)
+        provider = ReadinessProvider(model, key)
+        providers.append(provider)
+        return provider
+
+    def build_provider(_config: object, model: str) -> ProviderABC:
+        return ReadinessProvider(model, "")
+
+    registry.register("openai", build_provider)
+    registry._register_profile_factory("openai", build_provider, build_profile_provider)
+    registry.register("openrouter", build_provider)
+    registry._register_profile_factory("openrouter", build_provider, build_profile_provider)
+    monkeypatch.setattr(
+        "ash.providers.registry.get_provider_registry",
+        lambda: registry,
+    )
+    return observed, providers
+
+
 def _ask_args(
     coworker_id: str,
     question: str,
@@ -164,6 +277,367 @@ def _ask_args(
     for path in evidence:
         args.extend(["--evidence", path])
     return args
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_crew_check_model_sends_one_synthetic_completion_without_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    observed, providers = _install_readiness_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+
+    assert main(
+        [
+            "crew",
+            "check-model",
+            "--owner",
+            "local",
+            "--coworker-id",
+            identity.coworker_id,
+        ]
+    ) == 0
+    output = capsys.readouterr().out
+    assert "Synthetic model readiness probe passed for openai/gpt-atlas" in output
+    assert "One provider request was attempted" in output
+    assert "No Crew run claim or history was created" in output
+    assert "does not guarantee the next provider request" in output
+    assert len(observed) == 1
+    assert observed[0]["is_probe"] is True
+    assert observed[0]["tools"] is None
+    assert "2 + 2" in observed[0]["prompt"]
+    assert "workspace" not in observed[0]["prompt"].casefold()
+    assert providers[0].closed is True
+    assert handle.list_readonly_turn_history() == ()
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM coworker_turn_dispatches WHERE coworker_id = ?",
+            (identity.coworker_id,),
+        ).fetchone()[0] == 0
+
+    assert main(
+        [
+            "crew",
+            "check-model",
+            "--owner",
+            "foreign",
+            "--coworker-id",
+            identity.coworker_id,
+        ]
+    ) == 2
+    assert "no coworker matches" in capsys.readouterr().err
+    with monkeypatch.context() as wrong_uid:
+        wrong_uid.setattr("ash.coworkers._current_owner_uid", lambda: os.geteuid() + 1)
+        assert main(
+            [
+                "crew",
+                "check-model",
+                "--owner",
+                "local",
+                "--coworker-id",
+                identity.coworker_id,
+            ]
+        ) == 2
+        assert "owner identity" in capsys.readouterr().err
+    handle.pause()
+    assert main(
+        [
+            "crew",
+            "check-model",
+            "--owner",
+            "local",
+            "--coworker-id",
+            identity.coworker_id,
+        ]
+    ) == 2
+    assert "coworker is paused" in capsys.readouterr().err
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+@pytest.mark.parametrize(
+    ("answer", "stop_reason", "tool_call", "failure_code"),
+    [
+        ("", "stop", False, "empty_answer"),
+        ("4", "length", False, "completion_truncated"),
+        ("4", "content_filter", False, "completion_filtered"),
+        ("4", "error", False, "completion_error"),
+        ("4", "stop", True, "tool_call"),
+        ("atlas-profile-secret", "stop", False, "unexpected_answer"),
+    ],
+)
+def test_crew_check_model_rejects_invalid_outputs_without_leaking_or_claiming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    answer: str,
+    stop_reason: str,
+    tool_call: bool,
+    failure_code: str,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    observed, providers = _install_readiness_registry(
+        monkeypatch,
+        probe_answer=answer,
+        probe_stop_reason=stop_reason,
+        probe_tool_call=tool_call,
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+
+    assert main(
+        [
+            "crew",
+            "check-model",
+            "--owner",
+            "local",
+            "--coworker-id",
+            identity.coworker_id,
+        ]
+    ) == 2
+    result = capsys.readouterr()
+    assert f"failure_code={failure_code}" in result.err
+    assert "A provider request was attempted" in result.err
+    assert "no Crew run claim was made" in result.err
+    assert "atlas-profile-secret" not in result.out + result.err
+    assert len(observed) == 1
+    assert observed[0]["is_probe"] is True
+    assert providers[0].closed is True
+    assert handle.list_readonly_turn_history() == ()
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM coworker_turn_dispatches WHERE coworker_id = ?",
+            (identity.coworker_id,),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+@pytest.mark.parametrize("model", ["openrouter/openrouter/free", "openrouter/openrouter/auto"])
+@pytest.mark.parametrize("check_model", [False, True])
+def test_crew_rejects_known_dynamic_openrouter_models_before_provider_or_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    model: str,
+    check_model: bool,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    profile = ash_dir / "profiles" / "atlas"
+    (profile / "ash.toml").write_text(f"model = '{model}'\n", encoding="utf-8")
+    observed, providers = _install_readiness_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+    args = _ask_args(identity.coworker_id, "Explain the synthetic failure.")
+    if check_model:
+        args.append("--check-model")
+
+    assert main(args) == 2
+    result = capsys.readouterr()
+    assert "failure_code=dynamic_model" in result.err
+    assert "No provider request was sent" in result.err
+    assert "no Crew run claim was made" in result.err
+    assert not observed
+    assert not providers
+    assert handle.list_readonly_turn_history() == ()
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM coworker_turn_dispatches WHERE coworker_id = ?",
+            (identity.coworker_id,),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+@pytest.mark.parametrize(
+    "model",
+    [
+        "openrouter/deepseek/deepseek-r1:free",
+        "openrouter/vendor/model-alias",
+    ],
+)
+def test_crew_accepts_pinned_openrouter_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    model: str,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    profile = ash_dir / "profiles" / "atlas"
+    (profile / "ash.toml").write_text(f"model = '{model}'\n", encoding="utf-8")
+    with (profile / ".env").open("a", encoding="utf-8") as stream:
+        stream.write("OPENROUTER_API_KEY=atlas-profile-secret\n")
+    observed, providers = _install_readiness_registry(monkeypatch)
+    identity = CoworkerDirectory.open(ash_dir).create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+
+    args = _ask_args(identity.coworker_id, "Explain the synthetic failure.")
+    args.append("--check-model")
+    assert main(args) == 0
+    output = capsys.readouterr().out
+    assert "real Crew response" in output
+    assert len(observed) == 2
+    assert [item["is_probe"] for item in observed] == [True, False]
+    assert [item["model"] for item in observed] == [
+        model.split("/", 1)[1],
+        model.split("/", 1)[1],
+    ]
+    assert observed[0]["provider_id"] == observed[1]["provider_id"]
+    assert providers[0].closed is True
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_preflight_failure_blocks_ask_before_run_claim_and_success_uses_same_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    observed, providers = _install_readiness_registry(
+        monkeypatch,
+        probe_answer="not four",
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+
+    args = _ask_args(
+        identity.coworker_id,
+        "Explain the fixture.",
+        turn_id="failed-preflight-does-not-claim",
+    )
+    args.append("--check-model")
+    assert main(args) == 2
+    failure = capsys.readouterr()
+    assert "failure_code=unexpected_answer" in failure.err
+    assert "A provider request was attempted" in failure.err
+    assert "no Crew run claim was made" in failure.err
+    assert len(observed) == 1
+    assert handle.list_readonly_turn_history() == ()
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM coworker_turn_dispatches WHERE coworker_id = ?",
+            (identity.coworker_id,),
+        ).fetchone()[0] == 0
+    assert providers[0].closed is True
+
+    observed, providers = _install_readiness_registry(monkeypatch)
+    success_args = _ask_args(
+        identity.coworker_id,
+        "Explain the fixture.",
+        turn_id="success-after-preflight",
+    )
+    success_args.append("--check-model")
+    assert main(success_args) == 0
+    output = capsys.readouterr().out
+    assert "real Crew response" in output
+    assert len(observed) == 2
+    assert [item["is_probe"] for item in observed] == [True, False]
+    assert observed[0]["provider_id"] == observed[1]["provider_id"]
+    assert providers[0].closed is True
+    assert len(handle.list_readonly_turn_history()) == 1
+
+    observed, providers = _install_readiness_registry(monkeypatch)
+    ordinary_args = _ask_args(
+        identity.coworker_id,
+        "Explain the fixture.",
+        turn_id="ordinary-no-preflight",
+    )
+    assert main(ordinary_args) == 0
+    assert "real Crew response" in capsys.readouterr().out
+    assert len(observed) == 1
+    assert observed[0]["is_probe"] is False
+    assert providers[0].closed is True
+    assert len(handle.list_readonly_turn_history()) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_preflight_admission_failure_reports_attempt_without_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.coworkers import _probe_coworker_model as real_probe
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    observed, providers = _install_readiness_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+
+    async def probe_then_pause(provider: Any) -> None:
+        await real_probe(provider)
+        handle.pause()
+
+    monkeypatch.setattr("ash.coworkers._probe_coworker_model", probe_then_pause)
+    args = _ask_args(
+        identity.coworker_id,
+        "Explain the fixture.",
+        turn_id="paused-after-preflight",
+    )
+    args.append("--check-model")
+    assert main(args) == 2
+    failure = capsys.readouterr().err
+    assert "failure_code=admission_rejected" in failure
+    assert "A provider request was attempted" in failure
+    assert "no Crew run claim was made" in failure
+    assert len(observed) == 1
+    assert observed[0]["is_probe"] is True
+    assert providers[0].closed is True
+    assert handle.list_readonly_turn_history() == ()
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM coworker_turn_dispatches WHERE coworker_id = ?",
+            (identity.coworker_id,),
+        ).fetchone()[0] == 0
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
@@ -1783,6 +2257,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
         str(key_file),
         "--input",
         str(event_file),
+        "--check-model",
     ]
     with monkeypatch.context() as wrong_uid:
         wrong_uid.setattr(coworkers, "_current_owner_uid", lambda: os.geteuid() + 1)
@@ -1899,10 +2374,12 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert signing_key_text not in atlas_output
     assert "atlas-profile-secret" not in atlas_output
     assert protected.read_text(encoding="utf-8") == "VALUE = 1\n"
-    assert len(observed) == 1
+    assert len(observed) == 2
+    assert observed[0]["is_readiness_probe"] is True
+    assert observed[1]["is_readiness_probe"] is False
     atlas_message = next(
         str(message["content"])
-        for message in observed[0]["messages"]
+        for message in observed[1]["messages"]
         if message["role"] == "user"
     )
     assert event_fields["payload"] in atlas_message
@@ -1910,6 +2387,9 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert signature not in atlas_message
     assert observed[0]["tools"] is None
     assert observed[0]["model"] == "gpt-atlas"
+    assert observed[1]["tools"] is None
+    assert observed[1]["model"] == "gpt-atlas"
+    assert observed[0]["provider_id"] == observed[1]["provider_id"]
     atlas_contract = json.loads(atlas_message.rsplit("\n", 1)[1])
     assert [item["path"] for item in atlas_contract["evidence"]] == [
         "ci-failure.txt",
@@ -2000,7 +2480,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
         ]
     ) == 2
     assert "coworker is paused" in capsys.readouterr().err
-    assert len(observed) == 1
+    assert len(observed) == 2
     assert scout_handle.get_responsibility(
         scout_responsibility_id
     ).next_fire_at == scheduled.next_fire_at
@@ -2016,6 +2496,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
             "local",
             "--coworker-id",
             scout.coworker_id,
+            "--check-model",
         ]
     ) == 0
     scout_output = capsys.readouterr().out
@@ -2027,12 +2508,17 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert "Scout found an independent research note." in scout_output
     assert "Evidence used: scout-note.txt" in scout_output
     assert "scout-profile-secret" not in scout_output
-    assert len(observed) == 2
-    assert observed[1]["tools"] is None
-    assert observed[1]["model"] == "gpt-scout"
+    assert len(observed) == 4
+    assert observed[2]["is_readiness_probe"] is True
+    assert observed[3]["is_readiness_probe"] is False
+    assert observed[2]["tools"] is None
+    assert observed[2]["model"] == "gpt-scout"
+    assert observed[3]["tools"] is None
+    assert observed[3]["model"] == "gpt-scout"
+    assert observed[2]["provider_id"] == observed[3]["provider_id"]
     scout_message = next(
         str(message["content"])
-        for message in observed[1]["messages"]
+        for message in observed[3]["messages"]
         if message["role"] == "user"
     )
     scout_contract = json.loads(scout_message.rsplit("\n", 1)[1])
@@ -2049,10 +2535,18 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert signing_key_text not in scout_message
 
     assert main(
-        ["crew", "tick", "--owner", "local", "--coworker-id", scout.coworker_id]
+        [
+            "crew",
+            "tick",
+            "--owner",
+            "local",
+            "--coworker-id",
+            scout.coworker_id,
+            "--check-model",
+        ]
     ) == 0
     assert "No due scheduled responsibility." in capsys.readouterr().out
-    assert len(observed) == 2
+    assert len(observed) == 4
 
     atlas_event_run_id = atlas_source_ids["run_id"]
     scout_scheduled_run_id = next(
@@ -2149,6 +2643,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
             atlas_manual_responsibility_id,
             "--event-id",
             "owner-follow-up-1",
+            "--check-model",
         ]
     ) == 0
     manual_output = capsys.readouterr().out
@@ -2156,12 +2651,17 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert "Evidence used: src/protected.py" in manual_output
     assert "Event key: owner-follow-up-1" in manual_output
     assert "github-actions" not in manual_output
-    assert len(observed) == 3
-    assert observed[2]["model"] == "gpt-atlas"
-    assert observed[2]["tools"] is None
+    assert len(observed) == 6
+    assert observed[4]["is_readiness_probe"] is True
+    assert observed[5]["is_readiness_probe"] is False
+    assert observed[4]["model"] == "gpt-atlas"
+    assert observed[5]["model"] == "gpt-atlas"
+    assert observed[4]["tools"] is None
+    assert observed[5]["tools"] is None
+    assert observed[4]["provider_id"] == observed[5]["provider_id"]
     manual_message = next(
         str(message["content"])
-        for message in observed[2]["messages"]
+        for message in observed[5]["messages"]
         if message["role"] == "user"
     )
     manual_contract = json.loads(manual_message.rsplit("\n", 1)[1])
@@ -2184,7 +2684,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert main(event_args) == 2
     duplicate = capsys.readouterr()
     assert "already used" in duplicate.err or "already claimed" in duplicate.err
-    assert len(observed) == 3
+    assert len(observed) == 6
     assert main(["crew", "inbox", "--owner", "local"]) == 0
     duplicate_inbox = capsys.readouterr().out
     assert duplicate_inbox.count(
@@ -2233,7 +2733,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
         _ask_args(atlas.coworker_id, "Try starting another turn.", turn_id="after-archive")
     ) == 2
     assert "coworker is archived" in capsys.readouterr().err
-    assert len(observed) == 3
+    assert len(observed) == 6
     with pytest.raises(CoworkerRuntimeUnavailable, match="coworker is archived"):
         atlas_handle.create_responsibility(
             scope="Must remain disabled",
@@ -2257,7 +2757,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     )
     assert main(event_args) == 2
     assert "coworker is archived" in capsys.readouterr().err
-    assert len(observed) == 3
+    assert len(observed) == 6
 
     assert main(
         [
@@ -2275,7 +2775,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
         ]
     ) == 0
     assert "Trigger: manual" in capsys.readouterr().out
-    assert len(observed) == 4
+    assert len(observed) == 7
 
     assert main(
         [
@@ -2387,7 +2887,7 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert "VALUE = 1" not in child.stdout
     assert "VALUE = 2" not in child.stdout
 
-    assert len(observed) == 4
+    assert len(observed) == 7
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
@@ -2564,6 +3064,7 @@ def test_changed_or_forged_responsibility_evidence_blocks_before_claim(
             responsibility.responsibility_id,
             "--event-id",
             f"blocked-{mutation}",
+            "--check-model",
         ]
     ) == 2
     blocked = capsys.readouterr()

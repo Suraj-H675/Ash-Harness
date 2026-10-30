@@ -48,10 +48,12 @@ from ash.core.session import (
 )
 from ash.core.redaction import redact_known_secrets
 from ash.providers.base import (
+    CompletionStopCategory,
     ProviderABC,
     ProviderCompletionError,
     ProviderIncompleteStreamError,
     StreamChunk,
+    completion_stop_category,
 )
 from ash.providers.retry import ProviderFailureCategory, classify_provider_failure
 from ash.providers.capabilities import ProviderCapabilities
@@ -104,6 +106,10 @@ _MODEL_TURN_TIMEOUT_SECONDS = 30
 _MODEL_TURN_MAX_PROMPT_BYTES = 16_384
 _MODEL_TURN_MAX_RESPONSE_BYTES = 8_192
 _MODEL_TURN_MAX_COMPLETION_TOKENS = 512
+_MODEL_READINESS_PROMPT = (
+    "Synthetic readiness check. What is 2 + 2? Reply with only the numeral 4."
+)
+_MODEL_READINESS_EXPECTED_ANSWER = "4"
 _FILE_APPROVAL_TTL = timedelta(minutes=15)
 _FILE_APPROVAL_MAX_BYTES = 16_384
 _FILE_APPROVAL_POLICY_REVISION = 1
@@ -218,6 +224,22 @@ class CoworkerRuntimeUnavailable(RuntimeError):
     """Provider execution is not admitted by this identity/session proof."""
 
 
+class CoworkerModelReadinessError(CoworkerRuntimeUnavailable):
+    """A safe, structured model selection or readiness failure."""
+
+    def __init__(self, failure_code: str, *, provider_request_attempted: bool) -> None:
+        self.failure_code = failure_code
+        self.provider_request_attempted = provider_request_attempted
+        if failure_code == "provider_unavailable":
+            message = (
+                "configured profile provider is unavailable "
+                f"(failure_code={failure_code})"
+            )
+        else:
+            message = f"model readiness failed (failure_code={failure_code})"
+        super().__init__(message)
+
+
 CoworkerResponsibilityStatus = Literal["active", "paused", "completed"]
 CoworkerResponsibilityTrigger = Literal["manual"]
 CoworkerResponsibilityRunTrigger = Literal["manual", "event", "scheduled"]
@@ -293,6 +315,19 @@ class CoworkerModelTurnResult:
     trigger_type: CoworkerResponsibilityRunTrigger | None = None
     event_key: str | None = None
     evidence_provenance: tuple[EvidenceProvenance, ...] = ()
+
+
+@dataclass(frozen=True)
+class CoworkerModelReadinessResult:
+    """Safe result from one synthetic, non-durable profile model probe."""
+
+    model: str
+
+
+@dataclass(frozen=True)
+class _PreparedCoworkerModelProvider:
+    config: AshConfig
+    provider: "_BoundedReadOnlyProvider"
 
 
 @dataclass(frozen=True)
@@ -481,6 +516,120 @@ def _safe_coworker_provider_failure_code(error: BaseException) -> str:
     if failure.category is not ProviderFailureCategory.UNKNOWN:
         return f"provider_{failure.category.value}"
     return "unknown"
+
+
+def _coworker_model_config(config: AshConfig) -> AshConfig:
+    if not config._coworker_runtime_blocked:
+        raise CoworkerModelReadinessError(
+            "profile_scope_unavailable",
+            provider_request_attempted=False,
+        )
+    if config.provider.casefold() == "openrouter" and config.model_name.casefold() in {
+        "openrouter/free",
+        "openrouter/auto",
+    }:
+        raise CoworkerModelReadinessError(
+            "dynamic_model",
+            provider_request_attempted=False,
+        )
+    return config.model_copy(
+        update={
+            "provider_max_attempts": 1,
+            "provider_request_timeout_seconds": _MODEL_TURN_TIMEOUT_SECONDS,
+            "max_completion_tokens": min(
+                config.max_completion_tokens,
+                _MODEL_TURN_MAX_COMPLETION_TOKENS,
+            ),
+        }
+    )
+
+
+def _prepare_coworker_model_provider(
+    config: AshConfig,
+    *,
+    prompt: str,
+) -> _PreparedCoworkerModelProvider:
+    bounded_config = _coworker_model_config(config)
+
+    profile_secrets = _profile_provider_secrets(bounded_config)
+    if any(secret in prompt for secret in profile_secrets):
+        raise CoworkerModelReadinessError(
+            "profile_secret_in_prompt",
+            provider_request_attempted=False,
+        )
+    try:
+        from ash.providers.registry import get_provider_registry
+
+        provider = get_provider_registry().build_for_coworker(bounded_config)
+    except Exception:  # noqa: BLE001 - keep profile details secret-free
+        raise CoworkerModelReadinessError(
+            "provider_unavailable",
+            provider_request_attempted=False,
+        ) from None
+
+    secrets = list(profile_secrets)
+    inline_key = getattr(provider, "_api_key", "")
+    if isinstance(inline_key, str) and inline_key:
+        secrets.append(inline_key)
+    return _PreparedCoworkerModelProvider(
+        config=bounded_config,
+        provider=_BoundedReadOnlyProvider(provider, secrets),
+    )
+
+
+async def _probe_coworker_model(provider: "_BoundedReadOnlyProvider") -> None:
+    try:
+        terminal: StreamChunk | None = None
+        response: list[str] = []
+        async with asyncio.timeout(_MODEL_TURN_TIMEOUT_SECONDS):
+            async for chunk in provider.stream_chat(
+                [{"role": "user", "content": _MODEL_READINESS_PROMPT}],
+                temperature=0.0,
+                tools=None,
+            ):
+                if chunk.content:
+                    response.append(chunk.content)
+                if chunk.is_done:
+                    terminal = chunk
+    except TimeoutError:
+        raise CoworkerModelReadinessError(
+            "timeout",
+            provider_request_attempted=True,
+        ) from None
+    except CoworkerRuntimeUnavailable as exc:
+        message = str(exc)
+        failure_code = {
+            "provider attempted a tool call during a read-only coworker turn": "tool_call",
+            "provider response exceeds the coworker turn limit": "response_too_large",
+            "redacted provider response exceeds the coworker turn limit": "response_too_large",
+            "provider returned an empty coworker answer": "empty_answer",
+        }.get(message, "invalid_response")
+        raise CoworkerModelReadinessError(
+            failure_code,
+            provider_request_attempted=True,
+        ) from None
+    except Exception as exc:  # noqa: BLE001 - only expose structured failure facts
+        raise CoworkerModelReadinessError(
+            _safe_coworker_provider_failure_code(exc),
+            provider_request_attempted=True,
+        ) from None
+
+    if terminal is None:
+        raise CoworkerModelReadinessError(
+            "incomplete_stream",
+            provider_request_attempted=True,
+        )
+    stop_category = completion_stop_category(terminal.stop_reason)
+    if stop_category is not CompletionStopCategory.COMPLETE:
+        raise CoworkerModelReadinessError(
+            f"completion_{stop_category.value}",
+            provider_request_attempted=True,
+        )
+    if "".join(response).strip() != _MODEL_READINESS_EXPECTED_ANSWER:
+        raise CoworkerModelReadinessError(
+            "unexpected_answer",
+            provider_request_attempted=True,
+        )
 
 
 class _BoundedReadOnlyProvider(ProviderABC):
@@ -3655,6 +3804,22 @@ class CoworkerDirectory:
             )
         return tuple(history)
 
+    def _model_turn_claim_exists(
+        self,
+        handle: "CoworkerHandle",
+        run_id: str,
+    ) -> bool:
+        """Avoid a readiness request for an already consumed deterministic run ID."""
+
+        current = self._require_local_coworker_owner(handle)
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM coworker_turn_dispatches WHERE owner_id = ? "
+                "AND coworker_id = ? AND run_id = ?",
+                (current.owner_id, current.coworker_id, run_id),
+            ).fetchone()
+        return row is not None
+
     def _claim_responsibility_turn(
         self,
         *,
@@ -5500,6 +5665,7 @@ class CoworkerHandle:
         responsibility_id: str,
         *,
         event_id: str,
+        check_model: bool = False,
     ) -> CoworkerModelTurnResult:
         """Run one active responsibility from an explicit local owner trigger."""
 
@@ -5544,7 +5710,8 @@ class CoworkerHandle:
                 responsibility_updated_at=responsibility.updated_at,
                 responsibility_revision=responsibility.revision,
                 evidence_files=evidence_files,
-            )
+            ),
+            check_model=check_model,
         )
         if not isinstance(result, CoworkerModelTurnResult):
             raise CoworkerDirectoryError(
@@ -5558,6 +5725,7 @@ class CoworkerHandle:
         *,
         key_file: Path,
         responsibility_id: str,
+        check_model: bool = False,
     ) -> CoworkerModelTurnResult:
         """Verify and consume one signed event for its explicit responsibility."""
 
@@ -5611,7 +5779,8 @@ class CoworkerHandle:
                 responsibility_updated_at=responsibility.updated_at,
                 responsibility_revision=responsibility.revision,
                 evidence_files=evidence_files,
-            )
+            ),
+            check_model=check_model,
         )
         if not isinstance(result, CoworkerModelTurnResult):
             raise CoworkerDirectoryError(
@@ -5621,6 +5790,8 @@ class CoworkerHandle:
 
     async def run_due_model_responsibilities_once(
         self,
+        *,
+        check_model: bool = False,
     ) -> CoworkerModelScheduleTickResult:
         """Run at most one due responsibility through the selected profile model."""
 
@@ -5666,7 +5837,8 @@ class CoworkerHandle:
                 responsibility_updated_at=responsibility.updated_at,
                 responsibility_revision=responsibility.revision,
                 evidence_files=evidence_files,
-            )
+            ),
+            check_model=check_model,
         )
         if isinstance(result, CoworkerModelScheduleTickResult):
             return result
@@ -5683,9 +5855,55 @@ class CoworkerHandle:
         current = self._directory._require_local_coworker_owner(self)
         return self._directory._effective_config(current)
 
+    async def check_model_readiness(self) -> CoworkerModelReadinessResult:
+        """Probe the configured profile model without creating Crew run state."""
+
+        current = self._directory._require_local_coworker_owner(self)
+        config = self._directory._effective_config(current)
+        prepared = _prepare_coworker_model_provider(
+            config,
+            prompt=_MODEL_READINESS_PROMPT,
+        )
+        primary_error: BaseException | None = None
+        try:
+            await _probe_coworker_model(prepared.provider)
+            try:
+                self._directory._require_local_coworker_owner(self)
+            except Exception:
+                raise CoworkerModelReadinessError(
+                    "owner_binding_changed",
+                    provider_request_attempted=True,
+                ) from None
+            safe_model = redact_known_secrets(
+                prepared.config.model,
+                *prepared.provider._secrets,
+            )
+            return CoworkerModelReadinessResult(model=safe_model)
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                await prepared.provider.aclose()
+            except BaseException as cleanup_error:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        "coworker provider cleanup failed "
+                        f"({type(cleanup_error).__name__})"
+                    )
+                elif isinstance(cleanup_error, Exception):
+                    raise CoworkerModelReadinessError(
+                        "provider_cleanup_failed",
+                        provider_request_attempted=True,
+                    ) from None
+                else:
+                    raise
+
     async def run_readonly_turn(
         self,
         request: CoworkerTurnRequest,
+        *,
+        check_model: bool = False,
     ) -> CoworkerModelTurnResult:
         """Run one profile-backed, tool-free turn in a fresh persisted session.
 
@@ -5722,7 +5940,8 @@ class CoworkerHandle:
                 request_id=request_id,
                 prompt=_readonly_turn_prompt(request),
                 workspace_identity=workspace_identity,
-            )
+            ),
+            check_model=check_model,
         )
         if not isinstance(result, CoworkerModelTurnResult):
             raise CoworkerDirectoryError(
@@ -5733,27 +5952,30 @@ class CoworkerHandle:
     async def _run_profile_model_turn(
         self,
         admission: _CoworkerModelTurnAdmission,
+        *,
+        check_model: bool = False,
     ) -> CoworkerModelTurnResult | CoworkerModelScheduleTickResult:
         prompt = admission.prompt
         current = self._directory._require_local_coworker_owner(self)
-        config = self.effective_config()
-        if not config._coworker_runtime_blocked:
-            raise CoworkerRuntimeUnavailable(
-                "coworker turns require an explicit owner-bound profile snapshot"
+        if check_model and self._directory._model_turn_claim_exists(
+            self,
+            admission.run_id,
+        ):
+            raise CoworkerModelReadinessError(
+                "already_claimed",
+                provider_request_attempted=False,
             )
+        config = _coworker_model_config(self._directory._effective_config(current))
         profile_secrets = _profile_provider_secrets(config)
         if any(secret in prompt for secret in profile_secrets):
-            raise ValueError("coworker request contains a configured provider secret")
-        config = config.model_copy(
-            update={
-                "provider_max_attempts": 1,
-                "provider_request_timeout_seconds": _MODEL_TURN_TIMEOUT_SECONDS,
-                "max_completion_tokens": min(
-                    config.max_completion_tokens,
-                    _MODEL_TURN_MAX_COMPLETION_TOKENS,
-                ),
-            }
-        )
+            if not check_model:
+                raise ValueError(
+                    "coworker request contains a configured provider secret"
+                )
+            raise CoworkerModelReadinessError(
+                "profile_secret_in_prompt",
+                provider_request_attempted=False,
+            )
         workspace_guard = SafetyGuard(
             current.workspace,
             expected_project_root_identity=admission.workspace_identity,
@@ -5762,10 +5984,24 @@ class CoworkerHandle:
         canonical = self.ensure_canonical_conversation()
         store = self._directory._session_store_for_record(current)
         canonical_lease = store.acquire_session_runtime_lease(canonical.session_id)
+        prepared: _PreparedCoworkerModelProvider | None = None
+        owns_provider = False
+        primary_error: BaseException | None = None
+        preflight_completed = False
+        claim_attempted = False
         try:
             current = self._directory._require_local_coworker_owner(self)
             if current.canonical_session_id != canonical.session_id:
                 raise CoworkerDirectoryError("canonical coworker binding changed")
+            if check_model:
+                prepared = _prepare_coworker_model_provider(
+                    config,
+                    prompt=prompt,
+                )
+                owns_provider = True
+                await _probe_coworker_model(prepared.provider)
+                preflight_completed = True
+                current = self._directory._require_local_coworker_owner(self)
             session_ref = self._ensure_background_run_under_lease(
                 store,
                 run_id=admission.run_id,
@@ -5807,23 +6043,17 @@ class CoworkerHandle:
                 raise CoworkerRuntimeUnavailable(
                     "coworker turn changed before dispatch; refusing replay"
                 )
-            store.update_session_model(session_ref.session_id, config.model)
-
-            from ash.providers.registry import get_provider_registry
             from ash.sdk import AshClient
 
-            try:
-                provider = get_provider_registry().build_for_coworker(config)
-            except Exception as exc:  # noqa: BLE001 - keep secrets out of errors
-                raise CoworkerRuntimeUnavailable(
-                    "configured profile provider is unavailable for coworker turns "
-                    f"({type(exc).__name__})"
-                ) from None
-            secrets = list(profile_secrets)
-            inline_key = getattr(provider, "_api_key", "")
-            if isinstance(inline_key, str) and inline_key:
-                secrets.append(inline_key)
-            bounded_provider = _BoundedReadOnlyProvider(provider, secrets)
+            if prepared is None:
+                prepared = _prepare_coworker_model_provider(
+                    config,
+                    prompt=prompt,
+                )
+                owns_provider = True
+            config = prepared.config
+            bounded_provider = prepared.provider
+            store.update_session_model(session_ref.session_id, config.model)
             user_metadata = {
                 "coworker_request_id": admission.request_id,
                 "coworker_execution_kind": "model",
@@ -5836,6 +6066,7 @@ class CoworkerHandle:
                         "coworker_event_id": admission.event_key or "",
                     }
                 )
+            claim_attempted = True
             try:
                 claim_result = self._directory._claim_responsibility_turn(
                     handle=self,
@@ -5854,42 +6085,39 @@ class CoworkerHandle:
                     responsibility_revision=admission.responsibility_revision,
                     evidence_files=admission.evidence_files,
                 )
-            except BaseException as exc:
-                try:
-                    await bounded_provider.aclose()
-                except BaseException as cleanup_error:
-                    exc.add_note(
-                        "coworker provider cleanup failed "
-                        f"({type(cleanup_error).__name__})"
+            except CoworkerRuntimeUnavailable as exc:
+                if not check_model:
+                    raise
+                failure_code = (
+                    "already_claimed"
+                    if any(
+                        marker in str(exc).casefold()
+                        for marker in ("already claimed", "already used")
                     )
-                raise
+                    else "claim_rejected"
+                )
+                raise CoworkerModelReadinessError(
+                    failure_code,
+                    provider_request_attempted=True,
+                ) from None
             if isinstance(claim_result, CoworkerModelScheduleTickResult):
+                owns_provider = False
                 await bounded_provider.aclose()
                 return claim_result
             if claim_result is not None:
-                await bounded_provider.aclose()
                 raise CoworkerDirectoryError(
                     "model coworker turn unexpectedly returned an offline schedule result"
                 )
-            try:
-                client = await AshClient._create_coworker_turn(
-                    config=config,
-                    provider=bounded_provider,
-                    session_id=session_ref.session_id,
-                    session_store=store,
-                    binding=worker_binding,
-                )
-            except BaseException as exc:
-                try:
-                    await bounded_provider.aclose()
-                except BaseException as cleanup_error:
-                    exc.add_note(
-                        "coworker provider cleanup failed "
-                        f"({type(cleanup_error).__name__})"
-                    )
-                raise
+            client = await AshClient._create_coworker_turn(
+                config=config,
+                provider=bounded_provider,
+                session_id=session_ref.session_id,
+                session_store=store,
+                binding=worker_binding,
+            )
+            owns_provider = False
 
-            primary_error: BaseException | None = None
+            primary_error = None
             try:
                 async with asyncio.timeout(_MODEL_TURN_TIMEOUT_SECONDS):
                     result = await client.prompt(prompt, user_metadata=user_metadata)
@@ -5977,7 +6205,44 @@ class CoworkerHandle:
                     item.provenance for item in admission.evidence_files
                 ),
             )
+        except BaseException as exc:
+            reported_error: BaseException | None = None
+            if (
+                check_model
+                and preflight_completed
+                and not claim_attempted
+                and isinstance(exc, Exception)
+                and not isinstance(exc, CoworkerModelReadinessError)
+            ):
+                reported_error = CoworkerModelReadinessError(
+                    "admission_rejected",
+                    provider_request_attempted=True,
+                )
+            primary_error = reported_error or exc
+            if owns_provider and prepared is not None:
+                owns_provider = False
+                try:
+                    await prepared.provider.aclose()
+                except BaseException as cleanup_error:
+                    primary_error.add_note(
+                        "coworker provider cleanup failed "
+                        f"({type(cleanup_error).__name__})"
+                    )
+            if reported_error is not None:
+                raise reported_error from None
+            raise
         finally:
+            if owns_provider and prepared is not None:
+                try:
+                    await prepared.provider.aclose()
+                except BaseException as cleanup_error:
+                    if primary_error is not None:
+                        primary_error.add_note(
+                            "coworker provider cleanup failed "
+                            f"({type(cleanup_error).__name__})"
+                        )
+                    else:
+                        raise
             canonical_lease.close()
 
     def _store(self) -> SessionStore:

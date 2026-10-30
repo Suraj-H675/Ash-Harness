@@ -141,6 +141,17 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         metavar="WORKSPACE_RELATIVE_PATH",
         help="Explicit read-only evidence file; repeat for each file",
     )
+    crew_ask.add_argument(
+        "--check-model",
+        action="store_true",
+        help="Probe the selected profile model before claiming this turn",
+    )
+    crew_model_check = crew_subparsers.add_parser(
+        "check-model",
+        help="Send one synthetic readiness probe without creating a Crew run",
+    )
+    crew_model_check.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_model_check.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
     crew_history = crew_subparsers.add_parser(
         "history", help="Show recent one-shot turn outcomes after reopening"
     )
@@ -201,6 +212,11 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     responsibility_run.add_argument("--coworker-id", required=True)
     responsibility_run.add_argument("--responsibility-id", required=True)
     responsibility_run.add_argument("--event-id", required=True)
+    responsibility_run.add_argument(
+        "--check-model",
+        action="store_true",
+        help="Probe the selected profile model before claiming this run",
+    )
     responsibility_runs = crew_responsibility_subparsers.add_parser(
         "runs", help="Inspect durable trigger claims and persisted model responses"
     )
@@ -225,11 +241,21 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         default="-",
         help="Signed JSON file path, or - to read stdin",
     )
+    crew_event.add_argument(
+        "--check-model",
+        action="store_true",
+        help="Probe the selected profile model before claiming this event",
+    )
     crew_tick = crew_subparsers.add_parser(
         "tick", help="Run at most one due scheduled responsibility and exit"
     )
     crew_tick.add_argument("--owner", required=True)
     crew_tick.add_argument("--coworker-id", required=True)
+    crew_tick.add_argument(
+        "--check-model",
+        action="store_true",
+        help="Probe the selected profile model before claiming a due run",
+    )
     crew_propose = crew_subparsers.add_parser(
         "propose",
         help="Stage one exact user-supplied file correction from a completed Atlas turn",

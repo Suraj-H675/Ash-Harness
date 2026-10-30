@@ -26,6 +26,8 @@ from ash.coworkers import (
     CoworkerDirectoryError,
     CoworkerFileApproval,
     CoworkerHandle,
+    CoworkerModelReadinessError,
+    CoworkerModelReadinessResult,
     CoworkerModelTurnResult,
     CoworkerNotFound,
     CoworkerResponsibility,
@@ -55,6 +57,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _inbox(args)
     if action in {"pause", "resume", "archive"}:
         return _lifecycle(args, action)
+    if action == "check-model":
+        return _check_model(args)
     if action == "ask":
         return _ask(args)
     if action == "history":
@@ -380,8 +384,16 @@ def _ask(args: argparse.Namespace) -> int:
     )
     _write_line("Status: attempting one read-only model turn.")
     try:
-        result = asyncio.run(handle.run_readonly_turn(request))
+        result = asyncio.run(
+            handle.run_readonly_turn(request, check_model=args.check_model)
+        )
     except CoworkerRuntimeUnavailable as exc:
+        if isinstance(exc, CoworkerModelReadinessError):
+            if not args.check_model and exc.failure_code == "provider_unavailable":
+                _write_error(f"Blocked. {_safe_error(exc)}. No provider request was sent.")
+            else:
+                _write_model_readiness_failure(exc, check_requested=args.check_model)
+            return 2
         message = _safe_error(exc)
         if "configured profile provider is unavailable" in str(exc):
             _write_error(f"Blocked. {message}. No provider request was sent.")
@@ -424,6 +436,80 @@ def _ask(args: argparse.Namespace) -> int:
     _write_line(_safe_text(result.response))
     _write_line("Proposal only. No files were changed.")
     return 0
+
+
+def _check_model(args: argparse.Namespace) -> int:
+    try:
+        handle = _open_coworker_handle(args)
+        result = asyncio.run(handle.check_model_readiness())
+    except CoworkerModelReadinessError as exc:
+        _write_model_readiness_failure(exc, check_requested=True)
+        return 2
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        AshError,
+        OSError,
+        SafetyViolation,
+        SessionStorageError,
+        ValueError,
+    ) as exc:
+        _write_error(f"Model check blocked before provider dispatch: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:  # noqa: BLE001 - never print provider details
+        _write_error(
+            "Model check failed before provider dispatch "
+            f"({type(exc).__name__}); no provider request was sent."
+        )
+        return 2
+
+    _write_model_readiness_success(result)
+    return 0
+
+
+def _write_model_readiness_success(result: CoworkerModelReadinessResult) -> None:
+    _write_line(
+        "Synthetic model readiness probe passed for "
+        f"{_safe_text(result.model, single_line=True)}."
+    )
+    _write_line("One provider request was attempted. No Crew run claim or history was created.")
+    _write_line(
+        "This probe is an advisory signal and does not guarantee the next provider request."
+    )
+
+
+def _write_model_readiness_failure(
+    exc: CoworkerModelReadinessError,
+    *,
+    check_requested: bool,
+) -> None:
+    if exc.failure_code == "already_claimed":
+        request_status = (
+            "A provider request was attempted during preflight"
+            if exc.provider_request_attempted
+            else "No provider request was attempted"
+        )
+        _write_error(
+            "This deterministic Crew run ID was already claimed. "
+            f"{request_status}; the existing claim was left unchanged and no new "
+            "Crew run claim was made."
+        )
+        return
+    label = (
+        "Model readiness check failed"
+        if check_requested
+        else "Crew model selection was blocked"
+    )
+    request_status = (
+        "A provider request was attempted"
+        if exc.provider_request_attempted
+        else "No provider request was sent"
+    )
+    _write_error(
+        f"{label} (failure_code={exc.failure_code}). {request_status}; "
+        "no Crew run claim was made."
+    )
 
 
 def _history(args: argparse.Namespace) -> int:
@@ -527,6 +613,7 @@ def _responsibility(args: argparse.Namespace) -> int:
                 handle.run_model_responsibility(
                     args.responsibility_id,
                     event_id=args.event_id,
+                    check_model=args.check_model,
                 )
             )
             _render_model_turn(result)
@@ -545,6 +632,12 @@ def _responsibility(args: argparse.Namespace) -> int:
         _write_error("Unsupported responsibility command.")
         return 2
     except CoworkerRuntimeUnavailable as exc:
+        if isinstance(exc, CoworkerModelReadinessError):
+            if not args.check_model and exc.failure_code == "provider_unavailable":
+                _write_model_admission_error(exc, scheduled=False)
+            else:
+                _write_model_readiness_failure(exc, check_requested=args.check_model)
+            return 2
         _write_model_admission_error(exc, scheduled=False)
         return 2
     except (
@@ -596,11 +689,18 @@ def _event(args: argparse.Namespace) -> int:
                 envelope,
                 key_file=args.key_file,
                 responsibility_id=args.responsibility_id,
+                check_model=args.check_model,
             )
         )
         _render_model_turn(result)
         return 0
     except CoworkerRuntimeUnavailable as exc:
+        if isinstance(exc, CoworkerModelReadinessError):
+            if not args.check_model and exc.failure_code == "provider_unavailable":
+                _write_model_admission_error(exc, scheduled=False)
+            else:
+                _write_model_readiness_failure(exc, check_requested=args.check_model)
+            return 2
         _write_model_admission_error(exc, scheduled=False)
         return 2
     except (CoworkerNotFound, ValueError) as exc:
@@ -639,7 +739,11 @@ def _event(args: argparse.Namespace) -> int:
 def _tick(args: argparse.Namespace) -> int:
     try:
         handle = _open_coworker_handle(args)
-        result = asyncio.run(handle.run_due_model_responsibilities_once())
+        result = asyncio.run(
+            handle.run_due_model_responsibilities_once(
+                check_model=args.check_model,
+            )
+        )
         if result.status == "idle":
             _write_line("No due scheduled responsibility.")
             return 0
@@ -653,6 +757,12 @@ def _tick(args: argparse.Namespace) -> int:
         _render_model_turn(result.turn)
         return 0
     except CoworkerRuntimeUnavailable as exc:
+        if isinstance(exc, CoworkerModelReadinessError):
+            if not args.check_model and exc.failure_code == "provider_unavailable":
+                _write_model_admission_error(exc, scheduled=True)
+            else:
+                _write_model_readiness_failure(exc, check_requested=args.check_model)
+            return 2
         _write_model_admission_error(exc, scheduled=True)
         return 2
     except (CoworkerNotFound, ValueError) as exc:
