@@ -758,6 +758,7 @@ def _event(args: argparse.Namespace) -> int:
                 key_file=args.key_file,
                 responsibility_id=args.responsibility_id,
                 check_model=args.check_model,
+                draft_correction=args.draft_correction,
             )
         )
         _render_model_turn(result)
@@ -1139,6 +1140,7 @@ def _propose(args: argparse.Namespace) -> int:
             request_id=args.request_id,
             target_path=args.target,
             replacement_file_path=args.replacement_file,
+            from_response=args.from_response,
         )
     except (
         CoworkerDirectoryError,
@@ -1311,6 +1313,8 @@ def _render_file_approval(approval: CoworkerFileApproval) -> None:
     _write_line(f"Source run: {approval.source_run_id}")
     _write_line(f"Source session: {approval.source_session_id}")
     _write_line(f"Source request: {approval.source_request_id}")
+    if approval.replacement_source_path == "<atlas-response>":
+        _write_line("Replacement origin: Atlas draft (untrusted; owner review required)")
     _write_line(f"Expected prior SHA-256: {approval.expected_sha256}")
     _write_line(f"Replacement SHA-256: {approval.replacement_sha256}")
     _write_line(f"Approval digest: {approval.approval_digest}")

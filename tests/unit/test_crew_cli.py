@@ -62,6 +62,7 @@ def _install_fake_registry(
     monkeypatch: pytest.MonkeyPatch,
     *,
     atlas_answer: str = "Atlas found the failed assertion and proposes a fix. ",
+    atlas_draft_answer: str | None = None,
     started: asyncio.Event | None = None,
     release: asyncio.Event | None = None,
 ) -> tuple[ProviderRegistry, list[dict[str, Any]]]:
@@ -121,8 +122,12 @@ def _install_fake_registry(
                 answer = (
                     "4"
                     if is_readiness_probe
-                    else atlas_answer
-                    + "atlas-profile-secret \u001b[31mred\u001b[0m\u202e"
+                    else (
+                        atlas_draft_answer
+                        if atlas_draft_answer is not None
+                        else atlas_answer
+                        + "atlas-profile-secret \u001b[31mred\u001b[0m\u202e"
+                    )
                 )
             else:
                 answer = (
@@ -2335,6 +2340,198 @@ def test_crew_worker_cli_stops_on_sigterm_without_a_provider_request(
         if process.poll() is None:
             process.kill()
             process.communicate()
+
+
+def _model_draft_event_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    model_answer: str,
+    draft: bool = True,
+) -> tuple[Any, Any, Path, dict[str, str]]:
+    from datetime import datetime, timezone
+    from uuid import uuid4
+    import hmac
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, _ = _install_fake_registry(
+        monkeypatch, atlas_draft_answer=model_answer,
+    )
+    (workspace / "src").mkdir()
+    target = workspace / "src" / "check.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    (workspace / "src" / "not-granted.py").write_text("DO_NOT_EDIT = True\n", encoding="utf-8")
+    (workspace / "failure.log").write_text(
+        "FAIL check_value expected VALUE = 2, observed VALUE = 1\n",
+        encoding="utf-8",
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas", workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=identity.coworker_id)
+    responsibility = handle.create_responsibility(
+        scope="CI failure", objective="Find a minimal exact source correction.",
+        success_criteria=("Explain and correct the failing literal.",),
+        evidence_paths=("src/check.py", "failure.log"),
+    )
+    key = bytes(range(32))
+    key_file = tmp_path / "event.key"
+    key_file.write_text(key.hex() + "\n", encoding="ascii")
+    key_file.chmod(0o600)
+    fields = {
+        "version": 1, "source": "github-actions", "id": str(uuid4()),
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "responsibility_id": responsibility.responsibility_id,
+        "payload": "Test expects VALUE=2 but source has VALUE=1",
+    }
+    canonical = json.dumps(
+        fields, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode()
+    envelope = {
+        **fields, "signature": hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    }
+    event_file = tmp_path / "event.json"
+    event_file.write_text(json.dumps(envelope), encoding="utf-8")
+    args = [
+        "crew", "event", "--owner", "local", "--coworker-id", identity.coworker_id,
+        "--responsibility-id", responsibility.responsibility_id,
+        "--key-file", str(key_file), "--input", str(event_file),
+    ]
+    if draft:
+        args.append("--draft-correction")
+    assert main(args) == 0
+    output = capsys.readouterr().out
+    ids = {
+        label: next(line.split(": ", 1)[1] for line in output.splitlines()
+                    if line.startswith(f"{label}: "))
+        for label in ("Run ID", "Session ID", "Request ID")
+    }
+    assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+    return handle, identity, target, ids
+
+
+def _model_draft_stage_args(identity: Any, ids: dict[str, str], target: str = "src/check.py") -> list[str]:
+    return [
+        "crew", "propose", "--owner", "local", "--coworker-id", identity.coworker_id,
+        "--run-id", ids["Run ID"], "--session-id", ids["Session ID"],
+        "--request-id", ids["Request ID"], "--target", target, "--from-response",
+    ]
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_atlas_drafts_exact_correction_with_separate_owner_approval_and_single_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    model_answer = json.dumps({
+        "action": "replace", "target": "src/check.py", "replacement": "VALUE = 2\n"
+    })
+    handle, identity, target, ids = _model_draft_event_fixture(
+        tmp_path, monkeypatch, capsys, model_answer=model_answer,
+    )
+    assert main(_model_draft_stage_args(identity, ids, target="src/not-granted.py")) == 2
+    assert "not unchanged, explicitly granted" in capsys.readouterr().err
+    assert main(_model_draft_stage_args(identity, ids)) == 0
+    output = capsys.readouterr().out
+    assert "Proposed diff:" in output
+    assert "VALUE = 2" in output
+    assert "pending explicit local owner approval" in output
+    assert target.read_bytes() == b"VALUE = 1\n"
+    approval_id = next(
+        line.split(": ", 1)[1] for line in output.splitlines()
+        if line.startswith("Approval ID: ")
+    )
+    digest = next(
+        line.split(": ", 1)[1] for line in output.splitlines()
+        if line.startswith("Approval digest: ")
+    )
+    approval, _ = handle.inspect_file_approval(approval_id)
+    assert approval.status == "pending"
+    assert approval.replacement_source_path == "<atlas-response>"
+    assert approval.replacement_content == b"VALUE = 2\n"
+    assert main([
+        "crew", "apply", "--owner", "local", "--coworker-id", identity.coworker_id,
+        "--approval-id", approval_id,
+    ]) == 2
+    assert target.read_bytes() == b"VALUE = 1\n"
+    capsys.readouterr()
+
+    challenges = [f"APPROVE {approval_id} {digest}", f"APPLY {approval_id} {digest}"]
+    def confirm(challenge: str) -> bool:
+        assert challenge == challenges.pop(0)
+        return True
+    monkeypatch.setattr("ash.commands.crew._require_tty_confirmation", confirm)
+    for action in ("approve", "apply"):
+        assert main([
+            "crew", action, "--owner", "local", "--coworker-id", identity.coworker_id,
+            "--approval-id", approval_id,
+        ]) == 0
+    assert not challenges
+    assert target.read_bytes() == b"VALUE = 2\n"
+    reopened = CoworkerDirectory.open().open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    final, events = reopened.inspect_file_approval(approval_id)
+    assert final.status == "succeeded"
+    assert [item.status for item in events] == [
+        "pending", "approved", "dispatching", "succeeded",
+    ]
+    assert main(_model_draft_stage_args(identity, ids)) == 2
+    assert len(handle.list_file_approvals()) == 1
+    assert target.read_bytes() == b"VALUE = 2\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+@pytest.mark.parametrize(
+    "model_answer",
+    [
+        "A fix is VALUE=2",
+        '{"action":"replace","action":"replace","target":"src/check.py","replacement":"VALUE = 2\\n"}',
+        '{"action":"replace","target":"src/not-granted.py","replacement":"VALUE = 2\\n"}',
+        '{"action":"replace","target":"src/check.py","replacement":"VALUE = 2\\n","ignored":1}',
+        '{"action":"no_change"}',
+        '{"action":"replace","target":"src/check.py","replacement":""}',
+        '{"action":"replace","target":"src/check.py","replacement":"gsk_abcdefghijklmnopqrstuvwxyz012345"}',
+    ],
+)
+def test_atlas_model_draft_rejects_untrusted_or_unsupported_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], model_answer: str,
+) -> None:
+    handle, identity, target, ids = _model_draft_event_fixture(
+        tmp_path, monkeypatch, capsys, model_answer=model_answer,
+    )
+    assert main(_model_draft_stage_args(identity, ids)) == 2
+    assert "could not be staged" in capsys.readouterr().err
+    assert handle.list_file_approvals() == ()
+    assert target.read_bytes() == b"VALUE = 1\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+@pytest.mark.parametrize("change", ["stale", "not_draft"])
+def test_atlas_response_cannot_stage_ungrounded_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], change: str,
+) -> None:
+    model_answer = json.dumps({
+        "action": "replace", "target": "src/check.py", "replacement": "VALUE = 2\n"
+    })
+    handle, identity, target, ids = _model_draft_event_fixture(
+        tmp_path, monkeypatch, capsys,
+        model_answer=model_answer, draft=change != "not_draft",
+    )
+    if change == "stale":
+        target.write_bytes(b"VALUE = 9\n")
+    assert main(_model_draft_stage_args(identity, ids)) == 2
+    error = capsys.readouterr().err
+    assert (
+        "not unchanged, explicitly granted" in error
+        if change == "stale"
+        else "not authorized" in error
+    )
+    assert handle.list_file_approvals() == ()
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")

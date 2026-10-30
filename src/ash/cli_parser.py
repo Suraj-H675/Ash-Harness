@@ -255,6 +255,11 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         action="store_true",
         help="Probe the selected profile model before claiming this event",
     )
+    crew_event.add_argument(
+        "--draft-correction",
+        action="store_true",
+        help="Ask Atlas to return a strict, owner-reviewable file correction JSON",
+    )
     crew_worker = crew_subparsers.add_parser(
         "worker", help="Poll one coworker's due schedules until stopped"
     )
@@ -276,7 +281,7 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     )
     crew_propose = crew_subparsers.add_parser(
         "propose",
-        help="Stage one exact user-supplied file correction from a completed Atlas turn",
+        help="Stage one exact owner-file or Atlas-drafted correction for review",
     )
     crew_propose.add_argument("--owner", required=True, help="Explicit local owner label")
     crew_propose.add_argument("--coworker-id", required=True, help="Immutable Atlas coworker ID")
@@ -284,11 +289,16 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     crew_propose.add_argument("--session-id", required=True, help="Completed Atlas session ID")
     crew_propose.add_argument("--request-id", required=True, help="Completed Atlas request ID")
     crew_propose.add_argument("--target", required=True, metavar="WORKSPACE_RELATIVE_PATH")
-    crew_propose.add_argument(
+    crew_propose_source = crew_propose.add_mutually_exclusive_group(required=True)
+    crew_propose_source.add_argument(
         "--replacement-file",
-        required=True,
         metavar="WORKSPACE_RELATIVE_PATH",
         help="Owner-supplied UTF-8 text file under the coworker's workspace",
+    )
+    crew_propose_source.add_argument(
+        "--from-response",
+        action="store_true",
+        help="Stage a validated exact correction drafted by Atlas from granted evidence",
     )
     crew_approvals = crew_subparsers.add_parser(
         "approvals", help="List durable file approval states"
