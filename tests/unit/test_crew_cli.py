@@ -1561,6 +1561,16 @@ def test_archive_fences_late_approval_and_preserves_unapplied_decision(
             replacement_file_path="src/example.fixed.py",
         )
     assert len(approved_handle.list_file_approvals()) == 1
+    assert main([
+        "crew", "show", "--owner", "local",
+        "--coworker-id", approved_handle.identity.coworker_id,
+    ]) == 0
+    archived_view = capsys.readouterr().out
+    assert "Lifecycle: archived" in archived_view
+    assert "Previously claimed turns may still finish" in archived_view
+    assert f"approval:{approved.approval_id}" in archived_view
+    assert "VALUE = 1" not in archived_view
+    assert "VALUE = 2" not in archived_view
     assert CoworkerDirectory.open(approved_directory.ash_dir).open_coworker(
         owner_id="local",
         coworker_id=approved_handle.identity.coworker_id,
@@ -2574,6 +2584,45 @@ def test_signed_event_and_due_schedule_use_distinct_profile_model_turns(
     assert f"run:{atlas.coworker_id}:{atlas_event_run_id}" in reopened_entry_ids
     assert f"approval:{atlas_approval_id}" in reopened_entry_ids
     assert f"run:{scout.coworker_id}:{scout_scheduled_run_id}" in reopened_entry_ids
+    atlas_entries = CoworkerDirectory.open(ash_dir).list_inbox(
+        owner_id="local", coworker_id=atlas.coworker_id
+    )
+    assert {entry.entry_id for entry in atlas_entries} == {
+        f"run:{atlas.coworker_id}:{atlas_event_run_id}",
+        f"approval:{atlas_approval_id}",
+    }
+    assert CoworkerDirectory.open(ash_dir).list_inbox(
+        owner_id="local", coworker_id=scout.coworker_id
+    )[0].entry_id == f"run:{scout.coworker_id}:{scout_scheduled_run_id}"
+    assert main([
+        "crew", "show", "--owner", "local", "--coworker-id", atlas.coworker_id,
+        "--limit", "10",
+    ]) == 0
+    atlas_show = capsys.readouterr().out
+    assert "Responsibilities:" in atlas_show
+    assert "Recent local activity" in atlas_show
+    assert f"run:{atlas.coworker_id}:{atlas_event_run_id}" in atlas_show
+    assert f"approval:{atlas_approval_id}" in atlas_show
+    assert scout.coworker_id not in atlas_show
+    assert "atlas-profile-secret" not in atlas_show
+    assert "APPROVED: Atlas recommends inspecting this failure." not in atlas_show
+    assert "Schedules require an explicit" in atlas_show
+    assert len(observed) == 4  # inspection never calls either profile's provider
+    assert main([
+        "crew", "show", "--owner", "local", "--coworker-id", scout.coworker_id,
+    ]) == 0
+    scout_show = capsys.readouterr().out
+    assert f"run:{scout.coworker_id}:{scout_scheduled_run_id}" in scout_show
+    assert atlas.coworker_id not in scout_show
+    assert main([
+        "crew", "show", "--owner", "foreign", "--coworker-id", atlas.coworker_id,
+    ]) == 2
+    assert atlas.coworker_id not in capsys.readouterr().err
+    assert main([
+        "crew", "show", "--owner", "local", "--coworker-id", atlas.coworker_id,
+        "--limit", "0",
+    ]) == 2
+    assert "show limit must be between 1 and 20" in capsys.readouterr().err
     approval_entry = next(
         entry for entry in reopened_entries if entry.entry_id == f"approval:{atlas_approval_id}"
     )

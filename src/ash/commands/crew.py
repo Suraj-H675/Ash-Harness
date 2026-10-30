@@ -53,6 +53,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _create(args)
     if action == "list":
         return _list(args)
+    if action == "show":
+        return _show(args)
     if action == "inbox":
         return _inbox(args)
     if action in {"pause", "resume", "archive"}:
@@ -143,6 +145,68 @@ def _list(args: argparse.Namespace) -> int:
         return 0
     for identity in coworkers:
         _write_identity(identity)
+    return 0
+
+
+def _show(args: argparse.Namespace) -> int:
+    try:
+        if not 1 <= args.limit <= 20:
+            raise ValueError("show limit must be between 1 and 20")
+        handle = _open_coworker_handle(args)
+        identity = handle.require_owner_binding()
+        responsibilities = handle.list_responsibilities()
+        activity = CoworkerDirectory.open().list_inbox(
+            owner_id=args.owner,
+            coworker_id=identity.coworker_id,
+            limit=args.limit,
+        )
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        OSError, SafetyViolation, SessionStorageError, ValueError,
+    ) as exc:
+        _write_error(f"Coworker inspection is unavailable: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"Coworker inspection is unavailable ({type(exc).__name__}).")
+        return 2
+
+    _write_identity(identity)
+    if identity.lifecycle_status != "active":
+        _write_line("New work and new approval effects are disabled for this coworker.")
+        _write_line("Previously claimed turns may still finish; inspect their outcome below.")
+    _write_line("Responsibilities:")
+    if not responsibilities:
+        _write_line("  None.")
+    for responsibility in responsibilities[:args.limit]:
+        _write_line(
+            f"  {_safe_text(responsibility.responsibility_id, single_line=True)}: "
+            f"{responsibility.status} "
+            f"({_safe_text(responsibility.scope, single_line=True)})"
+        )
+        if responsibility.schedule is not None:
+            _write_line(f"    Schedule: {render_schedule(responsibility.schedule)}")
+            if responsibility.next_fire_at is not None:
+                _write_line(
+                    f"    Stored next occurrence: {responsibility.next_fire_at.isoformat()}"
+                )
+    if len(responsibilities) > args.limit:
+        _write_line("  More: use `ash crew responsibility list` for the full view.")
+
+    _write_line("Recent local activity (no remote notifications were delivered):")
+    if not activity:
+        _write_line("  None.")
+    for entry in activity:
+        _write_line(f"Entry ID: {_safe_text(entry.entry_id, single_line=True)}")
+        _write_line(f"Cause: {_safe_text(entry.cause, single_line=True)}")
+        if isinstance(entry, CoworkerRunInboxEntry):
+            _render_inbox_run(entry)
+        elif isinstance(entry, CoworkerApprovalInboxEntry):
+            _render_inbox_approval(entry)
+        _write_line("")
+    _write_line(
+        "Schedules require an explicit `ash crew tick` invocation; "
+        "there is no resident Crew scheduler or remote notification service."
+    )
     return 0
 
 

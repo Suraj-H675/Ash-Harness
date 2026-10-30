@@ -100,6 +100,15 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         "list", help="List coworkers owned by the current local UID"
     )
     crew_list.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_show = crew_subparsers.add_parser(
+        "show", help="Inspect one coworker, its responsibilities, and recent activity"
+    )
+    crew_show.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_show.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_show.add_argument(
+        "--limit", type=int, default=5,
+        help="Maximum responsibility summaries and activity entries (1-20)",
+    )
     crew_inbox = crew_subparsers.add_parser(
         "inbox", help="Show recent local run and approval activity"
     )

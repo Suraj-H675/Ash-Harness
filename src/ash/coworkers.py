@@ -2997,6 +2997,7 @@ class CoworkerDirectory:
         owner_id: str,
         limit: int = 20,
         include_skipped: bool = False,
+        coworker_id: str | None = None,
     ) -> tuple[CoworkerInboxEntry, ...]:
         """Derive a bounded owner inbox from durable run and approval records."""
 
@@ -3005,19 +3006,27 @@ class CoworkerDirectory:
         if type(include_skipped) is not bool:
             raise ValueError("include_skipped must be a boolean")
         owner = _normalize_owner_id(owner_id)
+        selected_id = (
+            _normalize_coworker_id(coworker_id) if coworker_id is not None else None
+        )
         owner_uid = _current_owner_uid()
         if owner_uid is None:
             raise CoworkerRuntimeUnavailable(
                 "local coworker owner identity could not be verified"
             )
+        selected_clause = " AND coworker_id = ?" if selected_id is not None else ""
+        joined_clause = (
+            " AND coworker.coworker_id = ?" if selected_id is not None else ""
+        )
+        selected_params = (selected_id,) if selected_id is not None else ()
 
         entries: list[CoworkerInboxEntry] = []
         with closing(self._connect()) as conn:
             conn.execute("BEGIN")
             coworker_rows = conn.execute(
                 "SELECT * FROM coworkers WHERE owner_id = ? AND owner_uid = ? "
-                "AND state = 'ready' ORDER BY coworker_id",
-                (owner, owner_uid),
+                f"AND state = 'ready'{selected_clause} ORDER BY coworker_id",
+                (owner, owner_uid, *selected_params),
             ).fetchall()
             coworkers: dict[str, Coworker] = {}
             for row in coworker_rows:
@@ -3040,12 +3049,12 @@ class CoworkerDirectory:
                 "AND coworker.coworker_id = dispatch.coworker_id "
                 "WHERE dispatch.owner_id = ? AND coworker.owner_uid = ? "
                 "AND coworker.state = 'ready' "
-                f"{skipped_clause} "
+                f"{joined_clause} {skipped_clause} "
                 "ORDER BY julianday(CASE WHEN dispatch.status = 'completed' "
                 "AND dispatch.completed_at IS NOT NULL THEN dispatch.completed_at "
                 "ELSE dispatch.created_at END) DESC, coworker.coworker_id, "
                 "dispatch.run_id LIMIT ?",
-                (owner, owner_uid, limit),
+                (owner, owner_uid, *selected_params, limit),
             ).fetchall()
             for row in run_rows:
                 run_identity = coworkers.get(str(row["coworker_id"]))
@@ -3162,9 +3171,10 @@ class CoworkerDirectory:
                 "WHERE event.approval_id = approval.approval_id) "
                 "WHERE approval.owner_id = ? AND coworker.owner_uid = ? "
                 "AND coworker.state = 'ready' "
+                f"{joined_clause} "
                 "ORDER BY julianday(latest_event.occurred_at) DESC, "
                 "latest_event.event_id DESC, approval.approval_id LIMIT ?",
-                (owner, owner_uid, limit),
+                (owner, owner_uid, *selected_params, limit),
             ).fetchall()
             for row in approval_rows:
                 approval_identity = coworkers.get(str(row["coworker_id"]))
