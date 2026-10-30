@@ -2049,6 +2049,89 @@ async def test_openai_compatible_providers_handle_usage_only_terminal_chunk(
 
 @pytest.mark.parametrize("finish_reason", ["stop", "length"])
 @pytest.mark.asyncio
+async def test_crew_groq_real_sdk_sse_contract_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+    finish_reason: str,
+) -> None:
+    import importlib
+    import json
+
+    import openai
+
+    from ash.coworkers import _BoundedReadOnlyProvider
+    from ash.providers import groq as groq_adapter
+    from ash.providers.groq import GroqProvider
+
+    # The OpenAI SDK uses httpx in older supported versions and httpx2 in
+    # newer ones; the test transport must match the SDK's own response type.
+    sdk_base = importlib.import_module("openai._base_client")
+    sdk_http = getattr(sdk_base, "httpx2", None) or getattr(sdk_base, "httpx")
+    requests: list[dict[str, Any]] = []
+
+    async def respond(request: Any) -> Any:
+        body = json.loads(request.content)
+        assert request.url.path == "/openai/v1/chat/completions"
+        assert request.headers["authorization"] == "Bearer fixture-key"
+        assert body["model"] == "openai/gpt-oss-20b"
+        assert body["stream"] is True
+        assert body["max_completion_tokens"] == 512
+        assert not body.get("tools")
+        requests.append(body)
+
+        def frame(choices: list[dict[str, Any]], usage: Any = None) -> str:
+            return "data: " + json.dumps(
+                {
+                    "id": "chatcmpl-fixture",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "openai/gpt-oss-20b",
+                    "choices": choices,
+                    "usage": usage,
+                }
+            ) + "\n\n"
+
+        stream = frame(
+            [{"index": 0, "delta": {"content": "4"}, "finish_reason": None}]
+        )
+        stream += frame(
+            [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+        )
+        stream += frame([], {"prompt_tokens": 12, "completion_tokens": 5})
+        stream += "data: [DONE]\n\n"
+        return sdk_http.Response(
+            200, headers={"content-type": "text/event-stream"}, content=stream
+        )
+
+    monkeypatch.setattr(
+        groq_adapter,
+        "_owned_openai_http_client",
+        lambda **kwargs: openai.DefaultAsyncHttpxClient(
+            transport=sdk_http.MockTransport(respond), **kwargs
+        ),
+    )
+    inner = GroqProvider("openai/gpt-oss-20b", "fixture-key")
+    inner.configure_max_tokens(512)
+    provider = _BoundedReadOnlyProvider(inner, ())
+    try:
+        chunks = [
+            chunk
+            async for chunk in provider.stream_chat(
+                [{"role": "user", "content": "2 + 2?"}]
+            )
+        ]
+    finally:
+        await provider.aclose()
+    assert len(requests) == 1
+    assert len(chunks) == 1
+    assert chunks[0].content == "4"
+    assert chunks[0].stop_reason == finish_reason
+    assert chunks[0].prompt_tokens == 12
+    assert chunks[0].completion_tokens == 5
+    assert chunks[0].usage_source == "provider"
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.asyncio
 async def test_crew_preserves_groq_terminal_reason_with_usage_only_trailer(
     monkeypatch: pytest.MonkeyPatch,
     finish_reason: str,
