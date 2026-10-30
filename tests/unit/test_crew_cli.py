@@ -280,6 +280,136 @@ def _ask_args(
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_crew_real_groq_adapter_with_offline_stream_keeps_profiles_isolated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Exercise real Crew routing and the Groq adapter without any network I/O."""
+    from types import SimpleNamespace
+
+    from ash.providers.registry import create_default_provider_registry
+
+    ash_dir, atlas_workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    for name in ("atlas", "scout"):
+        profile = ash_dir / "profiles" / name
+        (profile / "ash.toml").write_text(
+            'model = "groq/openai/gpt-oss-20b"\n', encoding="utf-8"
+        )
+        (profile / ".env").write_text(
+            f"GROQ_API_KEY={name}-fixture-key\n", encoding="utf-8"
+        )
+    monkeypatch.setenv("GROQ_API_KEY", "wrong-ambient-fixture-key")
+    registry = create_default_provider_registry()
+    monkeypatch.setattr("ash.providers.registry.get_provider_registry", lambda: registry)
+
+    requests: list[tuple[str, dict[str, Any]]] = []
+    clients: list[Any] = []
+
+    def fake_openai_client(**options: Any) -> Any:
+        key = options["api_key"]
+
+        class CompletionClient:
+            async def create(self, **kwargs: Any) -> AsyncGenerator[Any, None]:
+                requests.append((key, kwargs))
+                prompt = str(kwargs["messages"][-1]["content"])
+                answer = (
+                    "4"
+                    if "Synthetic readiness check." in prompt
+                    else f"{key.split('-')[0]} inspected the assigned evidence."
+                )
+
+                async def stream() -> AsyncGenerator[Any, None]:
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content=answer, tool_calls=None),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                    )
+                    yield SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content="", tool_calls=None),
+                                finish_reason="stop",
+                            )
+                        ],
+                        usage=None,
+                    )
+                    yield SimpleNamespace(
+                        choices=[],
+                        usage=SimpleNamespace(prompt_tokens=18, completion_tokens=8),
+                    )
+
+                return stream()
+
+        class Client:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(completions=CompletionClient())
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        client = Client()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("ash.providers.groq.openai.AsyncOpenAI", fake_openai_client)
+
+    (atlas_workspace / "ci.log").write_text("atlas-only failure\n", encoding="utf-8")
+    (scout_workspace / "scout.txt").write_text("scout-only research\n", encoding="utf-8")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=atlas_workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_workspace,
+    )
+    monkeypatch.setenv("ASH_PROFILE", "scout")
+    for identity, evidence in ((atlas, "ci.log"), (scout, "scout.txt")):
+        args = _ask_args(
+            identity.coworker_id, "Inspect only this assigned fixture.", evidence,
+        )
+        assert main([*args, "--check-model"]) == 0
+        output = capsys.readouterr().out
+        assert "Proposal only. No files were changed." in output
+        assert "fixture-key" not in output
+        assert main([
+            "crew", "history", "--owner", "local",
+            "--coworker-id", identity.coworker_id,
+        ]) == 0
+        history = capsys.readouterr().out
+        assert identity.display_name.lower() in history
+        assert "fixture-key" not in history
+
+    assert len(requests) == 4  # One probe and one Crew turn for each profile.
+    assert [key for key, _ in requests] == [
+        "atlas-fixture-key", "atlas-fixture-key",
+        "scout-fixture-key", "scout-fixture-key",
+    ]
+    assert all(options["model"] == "openai/gpt-oss-20b" for _, options in requests)
+    assert all("tools" not in options for _, options in requests)
+    assert all("fixture-key" not in str(options["messages"]) for _, options in requests)
+    assert all(0 < options["max_completion_tokens"] <= 512 for _, options in requests)
+    assert "atlas-only failure" in str(requests[1][1]["messages"])
+    assert "scout-only research" not in str(requests[1][1]["messages"])
+    assert "scout-only research" in str(requests[3][1]["messages"])
+    assert "atlas-only failure" not in str(requests[3][1]["messages"])
+    assert all(client.closed for client in clients)
+    assert len(directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    ).list_readonly_turn_history()) == 1
+    assert len(directory.open_coworker(
+        owner_id="local", coworker_id=scout.coworker_id,
+    ).list_readonly_turn_history()) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
 def test_crew_check_model_sends_one_synthetic_completion_without_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
