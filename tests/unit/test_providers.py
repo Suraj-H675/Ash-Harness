@@ -2047,6 +2047,47 @@ async def test_openai_compatible_providers_handle_usage_only_terminal_chunk(
     assert client.closed is True
 
 
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.asyncio
+async def test_crew_preserves_groq_terminal_reason_with_usage_only_trailer(
+    monkeypatch: pytest.MonkeyPatch,
+    finish_reason: str,
+) -> None:
+    from ash.coworkers import _BoundedReadOnlyProvider
+    from ash.providers.groq import GroqProvider
+
+    usage = SimpleNamespace(prompt_tokens=24, completion_tokens=12)
+    client = _FakeOpenAIClient(
+        [
+            _openai_chunk(content="bounded answer"),
+            _openai_chunk(finish_reason=finish_reason),
+            _openai_chunk(usage=usage),
+        ]
+    )
+    monkeypatch.setattr("ash.providers.groq.openai.AsyncOpenAI", lambda **_: client)
+    inner = GroqProvider("openai/gpt-oss-20b", "synthetic-key")
+    provider = _BoundedReadOnlyProvider(inner, ())
+    output = [
+        chunk
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "synthetic evidence"}]
+        )
+    ]
+
+    assert len(output) == 1
+    assert output[0].content == "bounded answer"
+    assert output[0].stop_reason == finish_reason
+    assert completion_stop_category(output[0].stop_reason) == (
+        CompletionStopCategory.COMPLETE
+        if finish_reason == "stop"
+        else CompletionStopCategory.TRUNCATED
+    )
+    assert output[0].prompt_tokens == 24
+    assert output[0].completion_tokens == 12
+    assert output[0].usage_source == "provider"
+    await provider.aclose()
+
+
 @pytest.mark.parametrize("provider_name", ["deepseek", "groq"])
 @pytest.mark.asyncio
 async def test_openai_compatible_usage_chunk_before_choice_terminal_is_incomplete(

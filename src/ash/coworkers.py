@@ -690,8 +690,8 @@ class _BoundedReadOnlyProvider(ProviderABC):
                     "provider attempted a tool call during a read-only coworker turn"
                 )
             if terminal is not None:
-                # Some OpenAI-compatible streams repeat the terminal choice solely
-                # to attach final usage. Never admit additional model output.
+                # Some OpenAI-compatible streams append final usage without a
+                # stop reason. Keep the original terminal outcome authoritative.
                 if (
                     saw_usage_trailer
                     or not chunk.is_done
@@ -702,7 +702,7 @@ class _BoundedReadOnlyProvider(ProviderABC):
                     or chunk.metadata
                     or chunk.usage_source != "provider"
                     or terminal.usage_source == "provider"
-                    or chunk.stop_reason != terminal.stop_reason
+                    or chunk.stop_reason not in {None, terminal.stop_reason}
                     or chunk.model != terminal.model
                 ):
                     raise ProviderIncompleteStreamError(
@@ -724,7 +724,7 @@ class _BoundedReadOnlyProvider(ProviderABC):
                 usage_source = "provider"
             elif chunk.usage_source == "estimated" and usage_source == "unavailable":
                 usage_source = "estimated"
-            if chunk.is_done:
+            if chunk.is_done and terminal is None:
                 terminal = chunk
         if terminal is None:
             raise ProviderIncompleteStreamError(
