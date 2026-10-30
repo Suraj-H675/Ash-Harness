@@ -4177,3 +4177,154 @@ def test_coworker_brief_v10_migration_and_invalid_row_refusal(
         )
     with pytest.raises(Exception, match="coworker brief owner binding changed"):
         CoworkerDirectory.open(ash_dir)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+@pytest.mark.parametrize("profile", ["atlas", "scout"])
+def test_reviewed_model_excerpt_adoption_rejects_non_tty_and_stays_coworker_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], profile: str,
+) -> None:
+    ash_dir, atlas_workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    observed, _ = _install_readiness_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identities = {
+        name: directory.create(
+            owner_id="local", display_name=name.title(), profile_name=name,
+            workspace=workspace,
+        )
+        for name, workspace in (
+            ("atlas", atlas_workspace), ("scout", scout_workspace)
+        )
+    }
+    identity = identities[profile]
+    handle = directory.open_coworker(owner_id="local", coworker_id=identity.coworker_id)
+    assert main(_ask_args(identity.coworker_id, "Find a useful observation.",
+                          turn_id=f"brief-adopt-{profile}")) == 0
+    lines = capsys.readouterr().out.splitlines()
+    ids = {
+        label: next(line.split(": ", 1)[1] for line in lines
+                    if line.startswith(f"{label}: "))
+        for label in ("Run ID", "Session ID", "Request ID")
+    }
+    preview = handle.preview_brief_adoption(
+        run_id=ids["Run ID"], session_id=ids["Session ID"],
+        request_id=ids["Request ID"], excerpt="real Crew response",
+    )
+    assert preview.expected_revision == 0
+    assert ids["Run ID"] in preview.text
+    assert handle.read_brief().text == ""
+    args = [
+        "crew", "brief", "adopt", "--owner", "local",
+        "--coworker-id", identity.coworker_id,
+        "--run-id", ids["Run ID"], "--session-id", ids["Session ID"],
+        "--request-id", ids["Request ID"], "--excerpt", "real Crew response",
+    ]
+    assert main(args) == 2
+    assert "interactive local TTY" in capsys.readouterr().err
+    assert handle.read_brief().revision == 0
+    def confirm(challenge: str) -> bool:
+        assert challenge == (
+            f"ADOPT {ids['Run ID']} {preview.expected_revision} "
+            f"{preview.source_response_sha256}"
+        )
+        return True
+    monkeypatch.setattr("ash.commands.crew._require_tty_confirmation", confirm)
+    assert main(args) == 0
+    assert handle.read_brief().text == preview.text
+    assert handle.read_brief().revision == 1
+    assert "Brief updated" in capsys.readouterr().out
+    assert main(args) == 2
+    assert "already in the coworker brief" in capsys.readouterr().err
+    assert main(_ask_args(identity.coworker_id, "Recall context.",
+                          turn_id=f"brief-adopt-followup-{profile}")) == 0
+    assert preview.text in str(observed[-1]["prompt"])
+    other = identities["scout" if profile == "atlas" else "atlas"]
+    other_handle = directory.open_coworker(
+        owner_id="local", coworker_id=other.coworker_id,
+    )
+    assert other_handle.read_brief().text == ""
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        other_handle.preview_brief_adoption(
+            run_id=ids["Run ID"], session_id=ids["Session ID"],
+            request_id=ids["Request ID"], excerpt="real Crew response",
+        )
+    assert main(["crew", "brief", "show", "--owner", "other",
+                 "--coworker-id", identity.coworker_id]) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_brief_adoption_rereads_revision_and_provenance_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _install_readiness_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=identity.coworker_id)
+    assert main(_ask_args(identity.coworker_id, "Report a finding.",
+                          turn_id="adopt-stale")) == 0
+    lines = capsys.readouterr().out.splitlines()
+    ids = {
+        label: next(line.split(": ", 1)[1] for line in lines
+                    if line.startswith(f"{label}: "))
+        for label in ("Run ID", "Session ID", "Request ID")
+    }
+    kwargs = {
+        "run_id": ids["Run ID"], "session_id": ids["Session ID"],
+        "request_id": ids["Request ID"], "excerpt": "real Crew response",
+    }
+    preview = handle.preview_brief_adoption(**kwargs)
+    with pytest.raises(ValueError, match="exactly match"):
+        handle.preview_brief_adoption(**{**kwargs, "excerpt": "invented finding"})
+    with pytest.raises(ValueError, match="exactly match"):
+        handle.preview_brief_adoption(**{**kwargs, "excerpt": "real Crew response."})
+    with pytest.raises(ValueError, match="nonempty exact"):
+        handle.preview_brief_adoption(**{**kwargs, "excerpt": "real Crew "})
+    with pytest.raises(ValueError, match="recognized secret"):
+        handle.preview_brief_adoption(**{
+            **kwargs, "excerpt": "gsk_abcdefghijklmnopqrstuvwxyz012345",
+        })
+    with pytest.raises(CoworkerRuntimeUnavailable, match="source transcript"):
+        handle.adopt_brief_from_run(
+            **kwargs, expected_revision=preview.expected_revision,
+            expected_response_sha256="0" * 64,
+        )
+    assert handle.read_brief().revision == 0
+
+    def change_during_confirmation(challenge: str) -> bool:
+        assert challenge.startswith("ADOPT ")
+        handle.set_brief("Independent owner update.")
+        return True
+    monkeypatch.setattr(
+        "ash.commands.crew._require_tty_confirmation", change_during_confirmation,
+    )
+    assert main([
+        "crew", "brief", "adopt", "--owner", "local",
+        "--coworker-id", identity.coworker_id,
+        "--run-id", ids["Run ID"], "--session-id", ids["Session ID"],
+        "--request-id", ids["Request ID"], "--excerpt", "real Crew response",
+    ]) == 2
+    assert "changed since review" in capsys.readouterr().err
+    assert handle.read_brief().text == "Independent owner update."
+    assert handle.read_brief().revision == 1
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "UPDATE coworker_turn_dispatches SET execution_kind = 'legacy' "
+            "WHERE run_id = ?", (ids["Run ID"],),
+        )
+    with pytest.raises(CoworkerRuntimeUnavailable, match="model-backed"):
+        handle.preview_brief_adoption(**kwargs)
+    assert handle.read_brief().revision == 1
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "UPDATE coworker_turn_dispatches SET execution_kind = 'model' "
+            "WHERE run_id = ?", (ids["Run ID"],),
+        )
+    handle.archive()
+    with pytest.raises(CoworkerRuntimeUnavailable, match="archived"):
+        handle.preview_brief_adoption(**kwargs)

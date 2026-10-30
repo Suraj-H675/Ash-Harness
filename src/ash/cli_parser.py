@@ -115,7 +115,7 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     brief_actions = crew_brief.add_subparsers(
         dest="crew_brief_action", required=True
     )
-    for action in ("show", "set", "clear"):
+    for action in ("show", "set", "clear", "adopt"):
         item = brief_actions.add_parser(
             action, help=f"{action.title()} the owner-curated coworker brief"
         )
@@ -125,6 +125,13 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
             item.add_argument(
                 "--text", required=True,
                 help="Owner-authored context; avoid shell-history secrets",
+            )
+        if action == "adopt":
+            for field in ("run-id", "session-id", "request-id"):
+                item.add_argument("--" + field, required=True)
+            item.add_argument(
+                "--excerpt", required=True,
+                help="Exact single-line substring of the completed model response",
             )
     crew_inbox = crew_subparsers.add_parser(
         "inbox", help="Show recent local run and approval activity"

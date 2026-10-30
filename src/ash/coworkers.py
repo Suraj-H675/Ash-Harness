@@ -361,6 +361,15 @@ def _validate_coworker_brief(text: str) -> None:
 
 
 @dataclass(frozen=True)
+class CoworkerBriefAdoption:
+    """Preview of one owner-selected excerpt from a completed model turn."""
+
+    text: str
+    expected_revision: int
+    source_response_sha256: str
+
+
+@dataclass(frozen=True)
 class _CoworkerModelTurnAdmission:
     turn_id: str
     run_id: str
@@ -3161,7 +3170,10 @@ class CoworkerDirectory:
         with closing(self._connect()) as conn:
             return self._brief_for_record(current, conn)
 
-    def _set_brief(self, handle: "CoworkerHandle", text: str) -> CoworkerBrief:
+    def _set_brief(
+        self, handle: "CoworkerHandle", text: str,
+        *, expected_revision: int | None = None,
+    ) -> CoworkerBrief:
         _validate_coworker_brief(text)
         with closing(self._connect_durable()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -3174,6 +3186,13 @@ class CoworkerDirectory:
             if any(secret and secret in text for secret in secrets):
                 raise ValueError("coworker brief contains a bound provider secret")
             previous = self._brief_for_record(current, conn)
+            if (
+                expected_revision is not None
+                and previous.revision != expected_revision
+            ):
+                raise CoworkerRuntimeUnavailable(
+                    "coworker brief changed since owner review"
+                )
             if previous.text == text:
                 return previous
             revision = previous.revision + 1
@@ -3186,6 +3205,78 @@ class CoworkerDirectory:
                 (current.coworker_id, current.owner_id, current.owner_uid, text, revision),
             )
             return CoworkerBrief(text=text, revision=revision)
+
+    def _prepare_brief_adoption(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        run_id: str,
+        session_id: str,
+        request_id: str,
+        excerpt: str,
+    ) -> CoworkerBriefAdoption:
+        """Validate one owner-selected response excerpt without changing state."""
+
+        if not isinstance(excerpt, str) or not excerpt or excerpt != excerpt.strip():
+            raise ValueError("excerpt must be a nonempty exact response substring")
+        _validate_coworker_brief(excerpt)
+        if "\n" in excerpt or "\r" in excerpt or len(excerpt.encode("utf-8")) > 512:
+            raise ValueError("excerpt must be a single line of at most 512 UTF-8 bytes")
+        if "[REDACTED]" in excerpt:
+            raise ValueError("redacted model output cannot be saved as context")
+        current, source, _, _, response_sha256 = self._require_completed_coworker_turn(
+            handle, run_id=run_id, session_id=session_id, request_id=request_id,
+            require_active=False,
+            model_only=True,
+        )
+        if current.lifecycle_status == "archived":
+            raise CoworkerRuntimeUnavailable("archived coworker brief cannot be changed")
+        if excerpt not in source.messages[1].content:
+            raise ValueError("excerpt must exactly match completed model output")
+        previous = self._read_brief(handle)
+        new_entry = f"- [run {run_id}] {excerpt}"
+        if new_entry in previous.text.splitlines():
+            raise ValueError("this model excerpt is already in the coworker brief")
+        text = previous.text + ("\n" if previous.text else "") + new_entry
+        _validate_coworker_brief(text)
+        return CoworkerBriefAdoption(
+            text=text,
+            expected_revision=previous.revision,
+            source_response_sha256=response_sha256,
+        )
+
+    def _adopt_brief_from_run(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        run_id: str,
+        session_id: str,
+        request_id: str,
+        excerpt: str,
+        expected_revision: int,
+        expected_response_sha256: str,
+    ) -> CoworkerBrief:
+        """Commit only the exact, still-current preview after owner confirmation."""
+
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("expected brief revision is invalid")
+        preview = self._prepare_brief_adoption(
+            handle,
+            run_id=run_id,
+            session_id=session_id,
+            request_id=request_id,
+            excerpt=excerpt,
+        )
+        if (
+            preview.expected_revision != expected_revision
+            or preview.source_response_sha256 != expected_response_sha256
+        ):
+            raise CoworkerRuntimeUnavailable(
+                "source transcript or coworker brief changed since review"
+            )
+        return self._set_brief(
+            handle, preview.text, expected_revision=expected_revision,
+        )
 
     def _get_owned(self, owner_id: str, coworker_id: str) -> Coworker:
         owner = _normalize_owner_id(owner_id)
@@ -4503,7 +4594,7 @@ class CoworkerDirectory:
     ) -> Coworker:
         return self._validate_handle_binding(handle, conn)
 
-    def _require_completed_atlas_turn(
+    def _require_completed_coworker_turn(
         self,
         handle: "CoworkerHandle",
         *,
@@ -4511,13 +4602,15 @@ class CoworkerDirectory:
         session_id: str,
         request_id: str,
         require_active: bool = True,
+        atlas_only: bool = False,
+        model_only: bool = False,
     ) -> tuple[Coworker, Session, tuple[int, int], str, str]:
         current = (
             self._require_local_coworker_owner(handle)
             if require_active
             else self._require_coworker_owner_binding(handle)
         )
-        if current.profile_name != "atlas":
+        if atlas_only and current.profile_name != "atlas":
             raise CoworkerRuntimeUnavailable(
                 "file corrections require the Atlas profile-bound coworker"
             )
@@ -4549,7 +4642,11 @@ class CoworkerDirectory:
             or row["workspace_inode"] is None
         ):
             raise CoworkerRuntimeUnavailable(
-                "source must be a completed owner-bound Atlas read-only turn"
+                "source must be a completed owner-bound read-only turn"
+            )
+        if model_only and row["execution_kind"] != "model":
+            raise CoworkerRuntimeUnavailable(
+                "brief adoption requires a completed model-backed turn"
             )
         if row["responsibility_id"] is None:
             # Old standalone model turns predate the execution_kind column.
@@ -4750,11 +4847,12 @@ class CoworkerDirectory:
             workspace_identity,
             prompt_sha256,
             response_sha256,
-        ) = self._require_completed_atlas_turn(
+        ) = self._require_completed_coworker_turn(
             handle,
             run_id=run_id,
             session_id=session_id,
             request_id=request_id,
+            atlas_only=True,
         )
         target_path = _validate_file_approval_path(target_path, label="target path")
         if replacement_file_path is not None:
@@ -5170,11 +5268,12 @@ class CoworkerDirectory:
         check_policy: bool,
     ) -> tuple[Coworker, SafetyGuard, Path]:
         current, session, workspace_identity, prompt_hash, response_hash = (
-            self._require_completed_atlas_turn(
+            self._require_completed_coworker_turn(
                 handle,
                 run_id=approval.source_run_id,
                 session_id=approval.source_session_id,
                 request_id=approval.source_request_id,
+                atlas_only=True,
             )
         )
         if (
@@ -5524,12 +5623,13 @@ class CoworkerDirectory:
         observed_sha256: str | None = None
         try:
             current, session, workspace_identity, prompt_hash, response_hash = (
-                self._require_completed_atlas_turn(
+                self._require_completed_coworker_turn(
                     handle,
                     run_id=approval.source_run_id,
                     session_id=approval.source_session_id,
                     request_id=approval.source_request_id,
                     require_active=False,
+                    atlas_only=True,
                 )
             )
             if (
@@ -5782,6 +5882,28 @@ class CoworkerHandle:
         """Replace or clear the owner-curated brief."""
 
         return self._directory._set_brief(self, text)
+
+    def preview_brief_adoption(
+        self, *, run_id: str, session_id: str, request_id: str, excerpt: str
+    ) -> CoworkerBriefAdoption:
+        """Preview a source-bound excerpt without persisting it."""
+
+        return self._directory._prepare_brief_adoption(
+            self, run_id=run_id, session_id=session_id,
+            request_id=request_id, excerpt=excerpt,
+        )
+
+    def adopt_brief_from_run(
+        self, *, run_id: str, session_id: str, request_id: str,
+        excerpt: str, expected_revision: int, expected_response_sha256: str,
+    ) -> CoworkerBrief:
+        """Save an exact reviewed excerpt with a stale-state interlock."""
+
+        return self._directory._adopt_brief_from_run(
+            self, run_id=run_id, session_id=session_id, request_id=request_id,
+            excerpt=excerpt, expected_revision=expected_revision,
+            expected_response_sha256=expected_response_sha256,
+        )
 
     def pause(self) -> Coworker:
         """Stop new work while retaining this coworker's history and decisions."""

@@ -156,6 +156,8 @@ def _list(args: argparse.Namespace) -> int:
 def _brief(args: argparse.Namespace) -> int:
     try:
         handle = _open_coworker_handle(args)
+        if args.crew_brief_action == "adopt":
+            return _adopt_brief(args, handle)
         if args.crew_brief_action == "set":
             brief = handle.set_brief(args.text)
         elif args.crew_brief_action == "clear":
@@ -178,6 +180,57 @@ def _brief(args: argparse.Namespace) -> int:
         "This context is untrusted reference data in future coworker model turns, "
         "not a permission or instruction grant."
     )
+    return 0
+
+
+def _adopt_brief(args: argparse.Namespace, handle: CoworkerHandle) -> int:
+    """One owner-confirmed promotion of model text, never automatic memory."""
+
+    try:
+        preview = handle.preview_brief_adoption(
+            run_id=args.run_id,
+            session_id=args.session_id,
+            request_id=args.request_id,
+            excerpt=args.excerpt,
+        )
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        OSError, SafetyViolation, SessionStorageError, ValueError,
+    ) as exc:
+        _write_error(f"Model finding could not be reviewed: {_safe_error(exc)}")
+        return 2
+    _write_line(f"Source run: {args.run_id}")
+    _write_line(f"Source response SHA-256: {preview.source_response_sha256}")
+    _write_line(f"Current brief revision: {preview.expected_revision}")
+    _write_line("Proposed full coworker brief:")
+    _write_line(_safe_text(preview.text))
+    _write_line(
+        "This is model-generated, unverified reference data, not an instruction "
+        "or permission grant."
+    )
+    challenge = (
+        f"ADOPT {args.run_id} {preview.expected_revision} "
+        f"{preview.source_response_sha256}"
+    )
+    if not _require_tty_confirmation(challenge):
+        _write_error(
+            "Blocked. Adoption requires an interactive local TTY and the exact challenge."
+        )
+        return 2
+    try:
+        saved = handle.adopt_brief_from_run(
+            run_id=args.run_id, session_id=args.session_id,
+            request_id=args.request_id, excerpt=args.excerpt,
+            expected_revision=preview.expected_revision,
+            expected_response_sha256=preview.source_response_sha256,
+        )
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        OSError, SafetyViolation, SessionStorageError, ValueError,
+    ) as exc:
+        _write_error(f"Model finding was not saved: {_safe_error(exc)}")
+        return 2
+    _write_line(f"Brief updated. New revision: {saved.revision}")
     return 0
 
 

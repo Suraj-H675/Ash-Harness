@@ -15,6 +15,32 @@ ash crew brief show --owner local --coworker-id ATLAS_UUID
 ash crew brief clear --owner local --coworker-id ATLAS_UUID
 ~~~
 
+## Adopt a reviewed model finding
+
+A completed **model-backed** Atlas or Scout turn has immutable source
+run/session/request IDs in its CLI output. Select one **exact single-line excerpt
+from the assistant response**, review the complete proposed brief, and confirm
+the displayed source hash and revision through the required local TTY challenge:
+
+~~~bash
+ash crew brief adopt --owner local --coworker-id COWORKER_UUID   --run-id RUN_UUID --session-id SESSION_UUID --request-id REQUEST_UUID   --excerpt "The exact finding to keep."
+~~~
+
+The excerpt must appear verbatim in the source response, have no leading or
+trailing whitespace, fit within 512 UTF-8 bytes, and pass the existing brief
+secret and control-character checks. The saved line includes its source run ID.
+The combined brief remains capped at 2,048 UTF-8 bytes. Duplicate entries are
+rejected. This is **not automatic memory**: without an exact local owner
+confirmation, nothing is saved. Preview and commit recheck owner/coworker
+binding, completed no-tool model transcript, source response hash, and the
+brief's previous revision; a concurrent update refuses the save. A paused
+coworker can still be curated, but an archived one cannot.
+
+This records an **owner-selected excerpt**, not a claim that the finding is
+factually verified. External source text and prior model responses can contain
+mistakes or prompt injection; the excerpt remains untrusted reference data on
+future turns. Review any technical facts before selecting them.
+
 Set replaces the entire brief; clear removes the content. The current
 revision is shown for inspection. Avoid typing credentials or confidential
 content into terminal arguments (which may appear in shell history or process
