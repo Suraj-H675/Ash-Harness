@@ -4044,3 +4044,136 @@ def test_missing_provider_keeps_model_schedule_due_without_dispatch(
         responsibility.next_fire_at
     )
     assert reopened.list_responsibility_runs(responsibility.responsibility_id) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_owner_curated_brief_survives_turns_restart_and_stays_coworker_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, atlas_workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    observed, _ = _install_readiness_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas",
+        profile_name="atlas", workspace=atlas_workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout",
+        profile_name="scout", workspace=scout_workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    command = ["crew", "brief"]
+    target = ["--owner", "local", "--coworker-id", atlas.coworker_id]
+    old_text = "Staging checks use the forty-two acceptance baseline."
+    assert main(command + ["set", *target, "--text", old_text]) == 0
+    assert handle.read_brief().text == old_text
+    assert handle.read_brief().revision == 1
+    assert main(_ask_args(atlas.coworker_id, "What was the baseline?", turn_id="memory-1")) == 0
+    assert old_text in str(observed[-1]["prompt"])
+    assert '"coworker_brief"' in str(observed[-1]["prompt"])
+    assert main(_ask_args(scout.coworker_id, "What is my baseline?", turn_id="memory-scout")) == 0
+    assert old_text not in str(observed[-1]["prompt"])
+    assert '"coworker_brief"' not in str(observed[-1]["prompt"])
+
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    assert reopened.read_brief().text == old_text
+    import subprocess
+    child = subprocess.run(
+        [
+            sys.executable, "-m", "ash", "crew", "brief", "show",
+            "--owner", "local", "--coworker-id", atlas.coworker_id,
+        ],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert child.returncode == 0, child.stderr
+    assert old_text in child.stdout
+    responsibility = reopened.create_responsibility(
+        scope="Staging result", objective="Report the accepted baseline.",
+    )
+    asyncio.run(reopened.run_model_responsibility(
+        responsibility.responsibility_id, event_id="brief-manual-one",
+    ))
+    assert old_text in str(observed[-1]["prompt"])
+
+    new_text = "Staging checks now use the forty-three acceptance baseline."
+    assert main(command + ["set", *target, "--text", new_text]) == 0
+    assert reopened.read_brief().revision == 2
+    assert main(_ask_args(atlas.coworker_id, "What changed?", turn_id="memory-2")) == 0
+    assert new_text in str(observed[-1]["prompt"])
+    assert old_text not in str(observed[-1]["prompt"])
+    assert main(command + ["clear", *target]) == 0
+    assert reopened.read_brief().revision == 3
+    assert main(_ask_args(atlas.coworker_id, "Brief is cleared?", turn_id="memory-3")) == 0
+    assert new_text not in str(observed[-1]["prompt"])
+    assert '"coworker_brief"' not in str(observed[-1]["prompt"])
+    assert main(command + ["show", "--owner", "someone-else", "--coworker-id", atlas.coworker_id]) == 2
+    capsys.readouterr()
+    assert main(command + ["set", *target, "--text", "gsk_abcdefghijklmnopqrstuvwxyz012345"]) == 2
+    assert main(command + ["set", *target, "--text", "x" * 2049]) == 2
+    assert reopened.read_brief().text == ""
+    assert reopened.set_brief(old_text).revision == 4
+    reopened.pause()
+    assert reopened.read_brief().text == old_text
+    reopened.archive()
+    assert reopened.read_brief().text == old_text
+    assert main(command + ["set", *target, "--text", new_text]) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_changed_brief_blocks_model_dispatch_before_durable_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    observed, _ = _install_readiness_registry(monkeypatch)
+    identity = CoworkerDirectory.open(ash_dir).create(
+        owner_id="local", display_name="Atlas", profile_name="atlas", workspace=workspace,
+    )
+    handle = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    handle.set_brief("Initial accepted baseline.")
+    original = CoworkerDirectory._claim_responsibility_turn
+
+    def change_before_claim(self: CoworkerDirectory, **kwargs: Any) -> Any:
+        self._set_brief(kwargs["handle"], "Newly updated baseline.")
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(CoworkerDirectory, "_claim_responsibility_turn", change_before_claim)
+    assert main(_ask_args(identity.coworker_id, "What is the baseline?", turn_id="stale-brief")) == 2
+    assert "brief changed before claim" in capsys.readouterr().err
+    assert observed == []
+    assert handle.list_readonly_turn_history() == ()
+    assert handle.read_brief().revision == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_coworker_brief_v10_migration_and_invalid_row_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas", workspace=workspace,
+    )
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute("DROP TABLE coworker_briefs")
+        connection.execute("UPDATE coworker_directory_meta SET schema_version = 10")
+    migrated = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    assert migrated.read_brief().revision == 0
+    assert migrated.set_brief("Owner-selected context.").revision == 1
+    assert CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    ).read_brief().text == "Owner-selected context."
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "UPDATE coworker_briefs SET owner_uid = owner_uid + 1 WHERE coworker_id = ?",
+            (identity.coworker_id,),
+        )
+    with pytest.raises(Exception, match="coworker brief owner binding changed"):
+        CoworkerDirectory.open(ash_dir)

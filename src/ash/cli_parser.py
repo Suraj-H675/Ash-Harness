@@ -109,6 +109,23 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         "--limit", type=int, default=5,
         help="Maximum responsibility summaries and activity entries (1-20)",
     )
+    crew_brief = crew_subparsers.add_parser(
+        "brief", help="Show, set or clear one coworker's owner-curated context"
+    )
+    brief_actions = crew_brief.add_subparsers(
+        dest="crew_brief_action", required=True
+    )
+    for action in ("show", "set", "clear"):
+        item = brief_actions.add_parser(
+            action, help=f"{action.title()} the owner-curated coworker brief"
+        )
+        item.add_argument("--owner", required=True)
+        item.add_argument("--coworker-id", required=True)
+        if action == "set":
+            item.add_argument(
+                "--text", required=True,
+                help="Owner-authored context; avoid shell-history secrets",
+            )
     crew_inbox = crew_subparsers.add_parser(
         "inbox", help="Show recent local run and approval activity"
     )

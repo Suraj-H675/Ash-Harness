@@ -1366,7 +1366,7 @@ def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
         assert connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall() == []
@@ -1513,7 +1513,7 @@ def test_v5_coworker_directory_migration_adds_cursor_and_preserves_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -2461,7 +2461,7 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
@@ -2544,7 +2544,7 @@ def test_coworker_directory_v3_migration_preserves_dispatch_history(
     with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
         columns = {
             str(row[1])
             for row in connection.execute(
@@ -3591,7 +3591,7 @@ def test_v2_coworker_directory_migration_adds_file_approval_boundary(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
         assert connection.execute(
             "SELECT COUNT(*) FROM coworker_file_approvals"
         ).fetchone() == (0,)
@@ -3640,7 +3640,7 @@ def test_v6_coworker_directory_migration_keeps_legacy_dispatch_unbound(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
 
 
 def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
@@ -3757,7 +3757,7 @@ def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
         columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(coworker_turn_dispatches)")
@@ -3813,7 +3813,7 @@ def test_v8_coworker_directory_migration_grants_no_ambient_evidence(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
         assert connection.execute(
             "SELECT evidence_paths_json FROM coworker_responsibilities "
             "WHERE responsibility_id = ?",
@@ -3910,7 +3910,7 @@ def test_v9_lifecycle_migration_preserves_responsibility_schedule_and_claims(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")

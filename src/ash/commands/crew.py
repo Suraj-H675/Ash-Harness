@@ -58,6 +58,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _show(args)
     if action == "inbox":
         return _inbox(args)
+    if action == "brief":
+        return _brief(args)
     if action in {"pause", "resume", "archive"}:
         return _lifecycle(args, action)
     if action == "check-model":
@@ -148,6 +150,34 @@ def _list(args: argparse.Namespace) -> int:
         return 0
     for identity in coworkers:
         _write_identity(identity)
+    return 0
+
+
+def _brief(args: argparse.Namespace) -> int:
+    try:
+        handle = _open_coworker_handle(args)
+        if args.crew_brief_action == "set":
+            brief = handle.set_brief(args.text)
+        elif args.crew_brief_action == "clear":
+            brief = handle.set_brief("")
+        else:
+            brief = handle.read_brief()
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        OSError, SafetyViolation, SessionStorageError, ValueError,
+    ) as exc:
+        _write_error(f"Coworker brief unavailable: {_safe_error(exc)}")
+        return 2
+    _write_line(f"Brief revision: {brief.revision}")
+    if brief.text:
+        _write_line("Owner-curated context:")
+        _write_line(_safe_text(brief.text))
+    else:
+        _write_line("No coworker brief saved.")
+    _write_line(
+        "This context is untrusted reference data in future coworker model turns, "
+        "not a permission or instruction grant."
+    )
     return 0
 
 

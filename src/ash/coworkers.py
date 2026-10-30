@@ -87,9 +87,10 @@ from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
 _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION = 9
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 10
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 11
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
+_MAX_COWORKER_BRIEF_BYTES = 2048
 _MAX_RESPONSIBILITY_SCOPE_BYTES = 2048
 _MAX_RESPONSIBILITY_OBJECTIVE_BYTES = 6144
 _MAX_RESPONSIBILITY_CRITERIA = 8
@@ -331,6 +332,35 @@ class _PreparedCoworkerModelProvider:
 
 
 @dataclass(frozen=True)
+class CoworkerBrief:
+    """Owner-curated context for one coworker, not inferred model memory."""
+
+    text: str = ""
+    revision: int = 0
+
+
+def _validate_coworker_brief(text: str) -> None:
+    if not isinstance(text, str):
+        raise ValueError("coworker brief must be text")
+    try:
+        byte_count = len(text.encode("utf-8", errors="strict"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("coworker brief must be valid UTF-8") from exc
+    if byte_count > _MAX_COWORKER_BRIEF_BYTES:
+        raise ValueError("coworker brief exceeds 2048 UTF-8 bytes")
+    if any(
+        unicodedata.category(char) in {"Cc", "Cf", "Cs"}
+        and char not in {"\n", "\r", "\t"}
+        for char in text
+    ):
+        raise ValueError("coworker brief contains control characters")
+    if redact_known_secrets(text) != text or any(
+        pattern.search(text) for pattern in _SECRET_CONTENT_PATTERNS
+    ):
+        raise ValueError("coworker brief contains a recognized secret")
+
+
+@dataclass(frozen=True)
 class _CoworkerModelTurnAdmission:
     turn_id: str
     run_id: str
@@ -346,6 +376,7 @@ class _CoworkerModelTurnAdmission:
     responsibility_revision: int | None = None
     evidence_files: tuple[RepositoryEvidence, ...] = ()
     draft_correction: bool = False
+    brief: CoworkerBrief = CoworkerBrief()
 
     def __post_init__(self) -> None:
         if self.draft_correction and (
@@ -471,9 +502,15 @@ def _validate_model_turn_text(value: str, field_name: str, *, required: bool) ->
         raise ValueError(f"{field_name} contains a recognized secret marker")
 
 
-def _readonly_turn_prompt(request: CoworkerTurnRequest) -> str:
+def _readonly_turn_prompt(
+    request: CoworkerTurnRequest, *, brief: CoworkerBrief = CoworkerBrief()
+) -> str:
     encoded_input = json.dumps(
-        {"question": request.question, "evidence": request.evidence},
+        {
+            "question": request.question,
+            "evidence": request.evidence,
+            **({"coworker_brief": brief.text} if brief.text else {}),
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -1174,6 +1211,7 @@ def _responsibility_model_prompt(
     scheduled_for: datetime | None = None,
     evidence_files: Sequence[RepositoryEvidence] = (),
     draft_correction: bool = False,
+    brief: CoworkerBrief = CoworkerBrief(),
 ) -> str:
     if draft_correction and not evidence_files:
         raise ValueError("Atlas correction drafting requires explicit file evidence")
@@ -1197,6 +1235,8 @@ def _responsibility_model_prompt(
     }
     if evidence_files:
         contract["evidence"] = evidence_manifest(evidence_files)
+    if brief.text:
+        contract["coworker_brief"] = brief.text
     if draft_correction:
         contract["response_contract"] = "atlas-file-correction-v1"
     untrusted_values = (
@@ -2543,6 +2583,7 @@ class CoworkerDirectory:
                     )
                 }
                 dispatch_was_present = "coworker_turn_dispatches" in tables
+                fresh_directory = not tables
                 if not tables:
                     conn.execute(
                         "CREATE TABLE coworker_directory_meta "
@@ -2621,6 +2662,7 @@ class CoworkerDirectory:
                     6,
                     7,
                     8,
+                    10,
                     _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION,
                     _COWORKER_DIRECTORY_SCHEMA_VERSION,
                 }:
@@ -2637,14 +2679,14 @@ class CoworkerDirectory:
                         "coworker directory owner binding schema is incomplete"
                     )
                 if (
-                    original_version < _COWORKER_DIRECTORY_SCHEMA_VERSION
+                    original_version < 10
                     and "lifecycle_status" in columns
                 ):
                     raise CoworkerDirectoryError(
                         "coworker lifecycle schema version was downgraded"
                     )
                 if "lifecycle_status" not in columns:
-                    if original_version >= _COWORKER_DIRECTORY_SCHEMA_VERSION:
+                    if original_version >= 10:
                         raise CoworkerDirectoryError(
                             "coworker lifecycle schema is incomplete"
                         )
@@ -3044,6 +3086,45 @@ class CoworkerDirectory:
                     raise CoworkerDirectoryError(
                         "coworker responsibility schedule schema is incomplete"
                     )
+                if (
+                    original_version == 11
+                    and not fresh_directory
+                    and "coworker_briefs" not in tables
+                ):
+                    raise CoworkerDirectoryError("coworker brief schema is incomplete")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coworker_briefs (
+                        coworker_id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
+                        owner_uid INTEGER NOT NULL,
+                        text TEXT NOT NULL,
+                        revision INTEGER NOT NULL CHECK(revision >= 1),
+                        FOREIGN KEY(owner_id, coworker_id)
+                            REFERENCES coworkers(owner_id, coworker_id)
+                    )
+                    """
+                )
+                columns = {
+                    str(column["name"])
+                    for column in conn.execute("PRAGMA table_info(coworker_briefs)")
+                }
+                if columns != {
+                    "coworker_id", "owner_id", "owner_uid", "text", "revision"
+                }:
+                    raise CoworkerDirectoryError("coworker brief schema is incomplete")
+                for brief_row in conn.execute(
+                    "SELECT brief.*, coworker.owner_uid AS actual_uid "
+                    "FROM coworker_briefs AS brief LEFT JOIN coworkers AS coworker "
+                    "ON coworker.owner_id = brief.owner_id "
+                    "AND coworker.coworker_id = brief.coworker_id"
+                ):
+                    if (
+                        brief_row["actual_uid"] is None
+                        or brief_row["actual_uid"] != brief_row["owner_uid"]
+                    ):
+                        raise CoworkerDirectoryError("coworker brief owner binding changed")
+                    self._brief_from_row(brief_row)
                 _create_coworker_file_approval_tables(conn)
                 conn.execute(
                     "UPDATE coworker_directory_meta SET schema_version = ?",
@@ -3053,6 +3134,58 @@ class CoworkerDirectory:
             raise CoworkerDirectoryError(
                 f"could not open coworker directory {self.db_path}: {exc}"
             ) from exc
+
+    @staticmethod
+    def _brief_from_row(row: sqlite3.Row) -> CoworkerBrief:
+        text, revision = row["text"], row["revision"]
+        if not isinstance(text, str) or type(revision) is not int or revision < 1:
+            raise CoworkerDirectoryError("coworker brief record is invalid")
+        try:
+            _validate_coworker_brief(text)
+        except ValueError as exc:
+            raise CoworkerDirectoryError("stored coworker brief is invalid") from exc
+        return CoworkerBrief(text=text, revision=revision)
+
+    def _brief_for_record(
+        self, current: Coworker, conn: sqlite3.Connection
+    ) -> CoworkerBrief:
+        row = conn.execute(
+            "SELECT * FROM coworker_briefs WHERE owner_id = ? "
+            "AND coworker_id = ? AND owner_uid = ?",
+            (current.owner_id, current.coworker_id, current.owner_uid),
+        ).fetchone()
+        return self._brief_from_row(row) if row is not None else CoworkerBrief()
+
+    def _read_brief(self, handle: "CoworkerHandle") -> CoworkerBrief:
+        current = self._require_coworker_owner_binding(handle)
+        with closing(self._connect()) as conn:
+            return self._brief_for_record(current, conn)
+
+    def _set_brief(self, handle: "CoworkerHandle", text: str) -> CoworkerBrief:
+        _validate_coworker_brief(text)
+        with closing(self._connect_durable()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._require_coworker_owner_binding(handle, conn)
+            if current.lifecycle_status == "archived":
+                raise CoworkerRuntimeUnavailable(
+                    "archived coworker brief cannot be changed"
+                )
+            secrets = _profile_provider_secrets(self._effective_config(current))
+            if any(secret and secret in text for secret in secrets):
+                raise ValueError("coworker brief contains a bound provider secret")
+            previous = self._brief_for_record(current, conn)
+            if previous.text == text:
+                return previous
+            revision = previous.revision + 1
+            conn.execute(
+                "INSERT INTO coworker_briefs "
+                "(coworker_id, owner_id, owner_uid, text, revision) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(coworker_id) DO UPDATE SET "
+                "text = excluded.text, revision = excluded.revision",
+                (current.coworker_id, current.owner_id, current.owner_uid, text, revision),
+            )
+            return CoworkerBrief(text=text, revision=revision)
 
     def _get_owned(self, owner_id: str, coworker_id: str) -> Coworker:
         owner = _normalize_owner_id(owner_id)
@@ -3942,6 +4075,7 @@ class CoworkerDirectory:
         responsibility_revision: int | None = None,
         evidence_files: Sequence[RepositoryEvidence] = (),
         draft_correction: bool = False,
+        brief: CoworkerBrief = CoworkerBrief(),
     ) -> CoworkerScheduleTickResult | CoworkerModelScheduleTickResult | None:
         """Durably consume one run key before model or worker dispatch."""
 
@@ -4040,6 +4174,12 @@ class CoworkerDirectory:
                     raise CoworkerRuntimeUnavailable(
                         self._lifecycle_admission_message(current.lifecycle_status)
                     )
+                if execution_kind == "model" and self._brief_for_record(
+                    current, conn
+                ) != brief:
+                    raise CoworkerRuntimeUnavailable(
+                        "coworker brief changed before claim; no provider request was sent"
+                    )
                 if workspace_identity is not None:
                     SafetyGuard(
                         current.workspace,
@@ -4121,6 +4261,7 @@ class CoworkerDirectory:
                             event_key=normalized_event_key,
                             scheduled_for=schedule_at,
                             evidence_files=evidence_files,
+                            brief=brief,
                         )
                         if execution_kind == "model"
                         else _responsibility_prompt(responsibility_record)
@@ -4258,6 +4399,7 @@ class CoworkerDirectory:
                                 event_payload=event_payload,
                                 evidence_files=evidence_files,
                                 draft_correction=draft_correction,
+                                brief=brief,
                             )
                             if prompt != expected_prompt:
                                 raise CoworkerRuntimeUnavailable(
@@ -5631,6 +5773,16 @@ class CoworkerHandle:
 
         return self._directory._require_coworker_owner_binding(self)
 
+    def read_brief(self) -> CoworkerBrief:
+        """Read this coworker's private brief, including after archive."""
+
+        return self._directory._read_brief(self)
+
+    def set_brief(self, text: str) -> CoworkerBrief:
+        """Replace or clear the owner-curated brief."""
+
+        return self._directory._set_brief(self, text)
+
     def pause(self) -> Coworker:
         """Stop new work while retaining this coworker's history and decisions."""
 
@@ -5822,11 +5974,13 @@ class CoworkerHandle:
             responsibility,
             workspace_identity,
         )
+        brief = self.read_brief()
         prompt = _responsibility_model_prompt(
             responsibility,
             trigger_type="manual",
             event_key=event_key,
             evidence_files=evidence_files,
+            brief=brief,
         )
         result = await self._run_profile_model_turn(
             _CoworkerModelTurnAdmission(
@@ -5843,6 +5997,7 @@ class CoworkerHandle:
                 responsibility_updated_at=responsibility.updated_at,
                 responsibility_revision=responsibility.revision,
                 evidence_files=evidence_files,
+                brief=brief,
             ),
             check_model=check_model,
         )
@@ -5895,6 +6050,7 @@ class CoworkerHandle:
             responsibility,
             workspace_identity,
         )
+        brief = self.read_brief()
         prompt = _responsibility_model_prompt(
             responsibility,
             trigger_type="event",
@@ -5902,6 +6058,7 @@ class CoworkerHandle:
             event_payload=event.payload,
             evidence_files=evidence_files,
             draft_correction=draft_correction,
+            brief=brief,
         )
         run_id = _signed_event_run_id(identifier, event.event_key)
         result = await self._run_profile_model_turn(
@@ -5919,6 +6076,7 @@ class CoworkerHandle:
                 responsibility_updated_at=responsibility.updated_at,
                 responsibility_revision=responsibility.revision,
                 evidence_files=evidence_files,
+                brief=brief,
             ),
             check_model=check_model,
         )
@@ -5956,12 +6114,14 @@ class CoworkerHandle:
             responsibility,
             workspace_identity,
         )
+        brief = self.read_brief()
         prompt = _responsibility_model_prompt(
             responsibility,
             trigger_type="scheduled",
             event_key=event_key,
             scheduled_for=scheduled_for,
             evidence_files=evidence_files,
+            brief=brief,
         )
         result = await self._run_profile_model_turn(
             _CoworkerModelTurnAdmission(
@@ -5977,6 +6137,7 @@ class CoworkerHandle:
                 responsibility_updated_at=responsibility.updated_at,
                 responsibility_revision=responsibility.revision,
                 evidence_files=evidence_files,
+                brief=brief,
             ),
             check_model=check_model,
         )
@@ -6073,13 +6234,15 @@ class CoworkerHandle:
                 "workspace identity cannot be bound for this read-only turn"
             )
         workspace_guard.ensure_project_root_current()
+        brief = self.read_brief()
         result = await self._run_profile_model_turn(
             _CoworkerModelTurnAdmission(
                 turn_id=request.turn_id,
                 run_id=run_id,
                 request_id=request_id,
-                prompt=_readonly_turn_prompt(request),
+                prompt=_readonly_turn_prompt(request, brief=brief),
                 workspace_identity=workspace_identity,
+                brief=brief,
             ),
             check_model=check_model,
         )
@@ -6225,6 +6388,7 @@ class CoworkerHandle:
                     responsibility_revision=admission.responsibility_revision,
                     evidence_files=admission.evidence_files,
                     draft_correction=admission.draft_correction,
+                    brief=admission.brief,
                 )
             except CoworkerRuntimeUnavailable as exc:
                 if not check_model:
