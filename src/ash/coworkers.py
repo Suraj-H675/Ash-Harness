@@ -396,11 +396,14 @@ class _CoworkerModelTurnAdmission:
     fresh_chat: bool = False
 
     def __post_init__(self) -> None:
-        if (self.syntax_proposal or self.inspection_proposal) and (
-            self.responsibility_id is not None or self.chat_request is not None
+        if (
+            (self.syntax_proposal and
+             (self.responsibility_id is not None or self.chat_request is not None))
+            or (self.inspection_proposal and self.chat_request is not None)
             or (self.syntax_proposal and self.inspection_proposal)
+            or (self.inspection_proposal and self.draft_correction)
         ):
-            raise ValueError("tool proposals must be standalone read-only turns")
+            raise ValueError("conflicting coworker model tool contracts")
         if self.fresh_chat and self.chat_request is None:
             raise ValueError("fresh chat requires a chat request")
         if self.chat_request is not None and self.responsibility_id is not None:
@@ -1128,6 +1131,7 @@ class CoworkerModelScheduleTickResult:
     event_key: str | None = None
     turn: CoworkerModelTurnResult | None = None
     skip_reason: str | None = None
+    analysis: CoworkerModelTurnResult | None = None
 
     def __post_init__(self) -> None:
         if self.status == "idle":
@@ -1138,6 +1142,7 @@ class CoworkerModelScheduleTickResult:
                     self.event_key,
                     self.turn,
                     self.skip_reason,
+                    self.analysis,
                 )
             ):
                 raise ValueError("idle model schedule result cannot carry an occurrence")
@@ -1147,6 +1152,7 @@ class CoworkerModelScheduleTickResult:
                 self.responsibility_id is None
                 or self.event_key is None
                 or self.turn is not None
+                or self.analysis is not None
                 or self.skip_reason not in {"misfire_grace_expired", "evidence_unchanged"}
             ):
                 raise ValueError("skipped model schedule result is incomplete")
@@ -1160,6 +1166,13 @@ class CoworkerModelScheduleTickResult:
             or self.turn.responsibility_id != self.responsibility_id
             or self.turn.trigger_type != "scheduled"
             or self.turn.event_key != self.event_key
+            or (
+                self.analysis is not None
+                and (
+                    self.analysis.responsibility_id is not None
+                    or self.analysis.trigger_type is not None
+                )
+            )
         ):
             raise ValueError("completed model schedule result is incomplete")
 
@@ -1393,6 +1406,42 @@ def _snapshot_responsibility_evidence(
         raise CoworkerRuntimeUnavailable(
             "responsibility evidence is unavailable or changed; no claim was made"
         ) from None
+
+
+def _responsibility_inspection_prompt(
+    responsibility: CoworkerResponsibility,
+    *,
+    trigger_type: CoworkerResponsibilityRunTrigger,
+    event_key: str,
+    evidence_files: Sequence[RepositoryEvidence],
+    event_payload: str = "",
+    brief: CoworkerBrief = CoworkerBrief(),
+) -> str:
+    if not evidence_files:
+        raise ValueError("responsibility investigation requires explicit evidence")
+    if event_payload and trigger_type != "event":
+        raise ValueError("only signed events carry event payload")
+    context = {
+        "responsibility": {
+            "scope": responsibility.scope,
+            "objective": responsibility.objective,
+            "success_criteria": list(responsibility.success_criteria),
+        },
+        "trigger": {"type": trigger_type, "event_key": event_key},
+        "event_payload": event_payload,
+    }
+    request = CoworkerTurnRequest(
+        turn_id=str(uuid5(UUID(responsibility.responsibility_id),
+                          f"inspection:{trigger_type}:{event_key}")),
+        question=json.dumps(context, ensure_ascii=False, separators=(",", ":"),
+                            sort_keys=True),
+        evidence=json.dumps([
+            {"path": file.relative_path, "sha256": file.sha256,
+             "size_bytes": file.size_bytes}
+            for file in evidence_files
+        ], ensure_ascii=False, separators=(",", ":")),
+    )
+    return _inspection_prompt(request, brief)
 
 
 def _responsibility_model_prompt(
@@ -4559,6 +4608,7 @@ class CoworkerDirectory:
         responsibility_revision: int | None = None,
         evidence_files: Sequence[RepositoryEvidence] = (),
         draft_correction: bool = False,
+        inspection_proposal: bool = False,
         brief: CoworkerBrief = CoworkerBrief(),
     ) -> CoworkerScheduleTickResult | CoworkerModelScheduleTickResult | None:
         """Durably consume one run key before model or worker dispatch."""
@@ -4739,7 +4789,13 @@ class CoworkerDirectory:
                             "scheduled occurrence binding changed before claim"
                         )
                     expected_prompt = (
-                        _responsibility_model_prompt(
+                        _responsibility_inspection_prompt(
+                            responsibility_record, trigger_type="scheduled",
+                            event_key=normalized_event_key,
+                            evidence_files=evidence_files, brief=brief,
+                        )
+                        if execution_kind == "model" and inspection_proposal
+                        else _responsibility_model_prompt(
                             responsibility_record,
                             trigger_type="scheduled",
                             event_key=normalized_event_key,
@@ -4876,14 +4932,25 @@ class CoworkerDirectory:
                             )
                         if execution_kind == "model":
                             assert responsibility_record is not None
-                            expected_prompt = _responsibility_model_prompt(
-                                responsibility_record,
-                                trigger_type=trigger_type,
-                                event_key=normalized_event_key,
-                                event_payload=event_payload,
-                                evidence_files=evidence_files,
-                                draft_correction=draft_correction,
-                                brief=brief,
+                            expected_prompt = (
+                                _responsibility_inspection_prompt(
+                                    responsibility_record,
+                                    trigger_type=trigger_type,
+                                    event_key=normalized_event_key,
+                                    event_payload=event_payload,
+                                    evidence_files=evidence_files,
+                                    brief=brief,
+                                )
+                                if inspection_proposal
+                                else _responsibility_model_prompt(
+                                    responsibility_record,
+                                    trigger_type=trigger_type,
+                                    event_key=normalized_event_key,
+                                    event_payload=event_payload,
+                                    evidence_files=evidence_files,
+                                    draft_correction=draft_correction,
+                                    brief=brief,
+                                )
                             )
                             if prompt != expected_prompt:
                                 raise CoworkerRuntimeUnavailable(
@@ -5162,6 +5229,43 @@ class CoworkerDirectory:
             raise CoworkerRuntimeUnavailable(
                 "owner-granted inspection files changed after proposal"
             )
+        responsibility_id = session.messages[0].metadata.get(
+            "coworker_responsibility_id"
+        )
+        if responsibility_id is not None:
+            responsibility = self._get_responsibility(handle, responsibility_id)
+            if responsibility.status != "active" or tuple(paths) != (
+                responsibility.evidence_paths
+            ):
+                raise CoworkerRuntimeUnavailable(
+                    "responsibility investigation grant was revoked or changed"
+                )
+            try:
+                context = _strict_correction_json(source["question"])
+            except (ValueError, TypeError, KeyError) as exc:
+                raise CoworkerRuntimeUnavailable(
+                    "responsibility inspection source context is invalid"
+                ) from exc
+            expected_responsibility = {
+                "scope": responsibility.scope,
+                "objective": responsibility.objective,
+                "success_criteria": list(responsibility.success_criteria),
+            }
+            expected_trigger = {
+                "type": session.messages[0].metadata.get("coworker_trigger_type"),
+                "event_key": session.messages[0].metadata.get("coworker_event_id"),
+            }
+            if (
+                set(context) != {"responsibility", "trigger", "event_payload"}
+                or context["responsibility"] != expected_responsibility
+                or context["trigger"] != expected_trigger
+                or (
+                    expected_trigger["type"] != "event" and context["event_payload"]
+                )
+            ):
+                raise CoworkerRuntimeUnavailable(
+                    "responsibility context changed since investigation plan"
+                )
         selection = _strict_correction_json(session.messages[1].content)
         if set(selection) != {"action", "files", "query"} or (
             selection["action"] != "search_literal"
@@ -6595,6 +6699,7 @@ class CoworkerHandle:
         event_id: str,
         check_model: bool = False,
         draft_correction: bool = False,
+        investigate: bool = False,
     ) -> CoworkerModelTurnResult:
         """Run one active responsibility from an explicit local owner trigger."""
 
@@ -6610,6 +6715,8 @@ class CoworkerHandle:
             raise CoworkerRuntimeUnavailable(
                 "correction drafting requires the Atlas profile-bound coworker"
             )
+        if draft_correction and investigate:
+            raise ValueError("choose correction drafting or investigation, not both")
         workspace_identity = SafetyGuard(
             current.workspace
         ).project_root_identity
@@ -6623,13 +6730,19 @@ class CoworkerHandle:
             workspace_identity,
         )
         brief = self.read_brief()
-        prompt = _responsibility_model_prompt(
-            responsibility,
-            trigger_type="manual",
-            event_key=event_key,
-            evidence_files=evidence_files,
-            draft_correction=draft_correction,
-            brief=brief,
+        prompt = (
+            _responsibility_inspection_prompt(
+                responsibility, trigger_type="manual",
+                event_key=event_key, evidence_files=evidence_files, brief=brief,
+            )
+            if investigate else _responsibility_model_prompt(
+                responsibility,
+                trigger_type="manual",
+                event_key=event_key,
+                evidence_files=evidence_files,
+                draft_correction=draft_correction,
+                brief=brief,
+            )
         )
         result = await self._run_profile_model_turn(
             _CoworkerModelTurnAdmission(
@@ -6644,6 +6757,7 @@ class CoworkerHandle:
                 trigger_type="manual",
                 event_key=event_key,
                 draft_correction=draft_correction,
+                inspection_proposal=investigate,
                 responsibility_updated_at=responsibility.updated_at,
                 responsibility_revision=responsibility.revision,
                 evidence_files=evidence_files,
@@ -6665,6 +6779,7 @@ class CoworkerHandle:
         responsibility_id: str,
         check_model: bool = False,
         draft_correction: bool = False,
+        investigate: bool = False,
     ) -> CoworkerModelTurnResult:
         """Verify and consume one signed event for its explicit responsibility."""
 
@@ -6688,6 +6803,8 @@ class CoworkerHandle:
             raise CoworkerRuntimeUnavailable(
                 "correction drafting requires the Atlas profile-bound coworker"
             )
+        if draft_correction and investigate:
+            raise ValueError("choose correction drafting or investigation, not both")
         workspace_identity = SafetyGuard(
             current.workspace
         ).project_root_identity
@@ -6701,14 +6818,21 @@ class CoworkerHandle:
             workspace_identity,
         )
         brief = self.read_brief()
-        prompt = _responsibility_model_prompt(
-            responsibility,
-            trigger_type="event",
-            event_key=event.event_key,
-            event_payload=event.payload,
-            evidence_files=evidence_files,
-            draft_correction=draft_correction,
-            brief=brief,
+        prompt = (
+            _responsibility_inspection_prompt(
+                responsibility, trigger_type="event",
+                event_key=event.event_key, event_payload=event.payload,
+                evidence_files=evidence_files, brief=brief,
+            )
+            if investigate else _responsibility_model_prompt(
+                responsibility,
+                trigger_type="event",
+                event_key=event.event_key,
+                event_payload=event.payload,
+                evidence_files=evidence_files,
+                draft_correction=draft_correction,
+                brief=brief,
+            )
         )
         run_id = _signed_event_run_id(identifier, event.event_key)
         result = await self._run_profile_model_turn(
@@ -6723,6 +6847,7 @@ class CoworkerHandle:
                 event_key=event.event_key,
                 event_payload=event.payload,
                 draft_correction=draft_correction,
+                inspection_proposal=investigate,
                 responsibility_updated_at=responsibility.updated_at,
                 responsibility_revision=responsibility.revision,
                 evidence_files=evidence_files,
@@ -6736,14 +6861,78 @@ class CoworkerHandle:
             )
         return result
 
+    async def analyze_responsibility_investigation(
+        self, plan: CoworkerModelTurnResult,
+    ) -> CoworkerModelTurnResult:
+        """Finish one owner-bound responsibility plan with a claimed analysis turn."""
+
+        if not isinstance(plan, CoworkerModelTurnResult):
+            raise TypeError("investigation plan must be a completed model turn")
+        run_id = plan.session_ref.run_id
+        if run_id is None:
+            raise CoworkerDirectoryError("investigation plan lacks a durable run ID")
+        if plan.request_id is None:
+            raise CoworkerDirectoryError("investigation plan lacks a request ID")
+        proposal, results = self.execute_readonly_inspection(
+            run_id=run_id, session_id=plan.session_ref.session_id,
+            request_id=plan.request_id,
+        )
+        source, _ = self.load_session(plan.session_ref.session_id)
+        responsibility_id = source.messages[0].metadata.get(
+            "coworker_responsibility_id"
+        )
+        if not isinstance(responsibility_id, str):
+            raise CoworkerRuntimeUnavailable(
+                "inspection plan was not linked to a responsibility"
+            )
+        responsibility = self.get_responsibility(responsibility_id)
+        context = {
+            "source_run_id": run_id,
+            "source_response_sha256": proposal.response_sha256,
+            "responsibility_id": responsibility_id,
+            "trigger_type": source.messages[0].metadata.get("coworker_trigger_type"),
+            "event_key": source.messages[0].metadata.get("coworker_event_id"),
+            "tool": "read_only_literal_search_v1",
+            "results": json.loads(results),
+        }
+        if context["trigger_type"] == "event":
+            source_json = _strict_correction_json(
+                source.messages[0].content.split(_INSPECTION_MARKER, 1)[1]
+            )
+            event_context = _strict_correction_json(source_json["question"])
+            payload = event_context["event_payload"]
+            if not isinstance(payload, str):
+                raise CoworkerRuntimeUnavailable("signed event context is invalid")
+            context["event_payload_excerpt"] = payload[:512]
+            context["event_payload_truncated"] = len(payload) > 512
+        current = self._directory._require_local_coworker_owner(self)
+        guard = SafetyGuard(current.workspace)
+        return await self.run_readonly_turn(CoworkerTurnRequest(
+            turn_id=str(uuid5(UUID(run_id), "responsibility-inspection-analysis-v1")),
+            question=(
+                "Finish this standing coworker responsibility using only the "
+                "verified, bounded literal-search results. Do not claim any "
+                "source edits or other effects occurred. Report findings, "
+                "uncertainty, and any proposed next step. Scope: "
+                + responsibility.scope + ". Objective: " + responsibility.objective
+            ),
+            evidence=json.dumps(context, ensure_ascii=False, separators=(",", ":")),
+            workspace_identity=guard.project_root_identity,
+        ))
+
     async def run_due_model_responsibilities_once(
         self,
         *,
         check_model: bool = False,
         only_if_changed: bool = False,
+        investigate: bool = False,
     ) -> CoworkerModelScheduleTickResult:
         """Run at most one due responsibility through the selected profile model."""
 
+        if investigate and only_if_changed:
+            raise ValueError(
+                "change-only monitoring cannot skip multi-step investigations"
+            )
         responsibility = self._directory._next_due_responsibility(self)
         if responsibility is None:
             return CoworkerModelScheduleTickResult(status="idle")
@@ -6773,13 +6962,19 @@ class CoworkerHandle:
             )
             if skipped is not None:
                 return skipped
-        prompt = _responsibility_model_prompt(
-            responsibility,
-            trigger_type="scheduled",
-            event_key=event_key,
-            scheduled_for=scheduled_for,
-            evidence_files=evidence_files,
-            brief=brief,
+        prompt = (
+            _responsibility_inspection_prompt(
+                responsibility, trigger_type="scheduled", event_key=event_key,
+                evidence_files=evidence_files, brief=brief,
+            )
+            if investigate else _responsibility_model_prompt(
+                responsibility,
+                trigger_type="scheduled",
+                event_key=event_key,
+                scheduled_for=scheduled_for,
+                evidence_files=evidence_files,
+                brief=brief,
+            )
         )
         result = await self._run_profile_model_turn(
             _CoworkerModelTurnAdmission(
@@ -6792,6 +6987,7 @@ class CoworkerHandle:
                 trigger_type="scheduled",
                 event_key=event_key,
                 scheduled_for=scheduled_for,
+                inspection_proposal=investigate,
                 responsibility_updated_at=responsibility.updated_at,
                 responsibility_revision=responsibility.revision,
                 evidence_files=evidence_files,
@@ -6801,11 +6997,16 @@ class CoworkerHandle:
         )
         if isinstance(result, CoworkerModelScheduleTickResult):
             return result
+        analysis = (
+            await self.analyze_responsibility_investigation(result)
+            if investigate else None
+        )
         return CoworkerModelScheduleTickResult(
             status="completed",
             responsibility_id=responsibility.responsibility_id,
             event_key=event_key,
             turn=result,
+            analysis=analysis,
         )
 
     def effective_config(self) -> AshConfig:
@@ -7195,6 +7396,7 @@ class CoworkerHandle:
                     responsibility_revision=admission.responsibility_revision,
                     evidence_files=admission.evidence_files,
                     draft_correction=admission.draft_correction,
+                    inspection_proposal=admission.inspection_proposal,
                     brief=admission.brief,
                 )
             except CoworkerRuntimeUnavailable as exc:

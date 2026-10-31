@@ -64,6 +64,7 @@ def _install_fake_registry(
     *,
     atlas_answer: str = "Atlas found the failed assertion and proposes a fix. ",
     atlas_draft_answer: str | None = None,
+    scout_draft_answer: str | None = None,
     started: asyncio.Event | None = None,
     release: asyncio.Event | None = None,
 ) -> tuple[ProviderRegistry, list[dict[str, Any]]]:
@@ -134,6 +135,8 @@ def _install_fake_registry(
                 answer = (
                     "4"
                     if is_readiness_probe
+                    else scout_draft_answer
+                    if scout_draft_answer is not None
                     else "Scout found an independent research note. scout-profile-secret"
                 )
             yield StreamChunk(content=answer)
@@ -5167,3 +5170,299 @@ def test_coworker_literal_search_limits_results_and_never_interprets_regex() -> 
         size_bytes=8, text="acb\nqrx",
     ),), query="a.b"))
     assert none["total_matching_lines"] == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+def test_responsibility_investigation_manual_and_revoked_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_draft_answer='{"action":"search_literal","files":["ci.log"],"query":"FAILED"}',
+    )
+    (workspace / "ci.log").write_text("PASS smoke\nFAILED expected 42 received 41\n")
+    (workspace / "hidden.log").write_text("SECRET_UNGRANTED_EVIDENCE\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=identity.coworker_id)
+    responsibility = handle.create_responsibility(
+        scope="CI diagnostics", objective="Explain the failure",
+        success_criteria=("Report failing assertion.",),
+        evidence_paths=("ci.log",),
+    )
+    args = [
+        "crew", "responsibility", "run",
+        "--owner", "local", "--coworker-id", identity.coworker_id,
+        "--responsibility-id", responsibility.responsibility_id,
+        "--event-id", "investigation-manual-one", "--investigate",
+    ]
+    assert main(args) == 0
+    output = capsys.readouterr().out
+    assert "Investigation plan persisted" in output
+    assert output.count("Run ID:") == 2
+    assert len(observed) == 2
+    assert "FAILED expected" not in str(observed[0]["messages"])
+    assert "FAILED expected" in str(observed[1]["messages"])
+    assert "SECRET_UNGRANTED" not in str(observed[1]["messages"])
+    assert all(call["tools"] is None for call in observed)
+    assert main(args) == 2
+    assert len(observed) == 2
+    capsys.readouterr()
+    runs = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert len(runs) == 1 and runs[0].status == "completed"
+    assert len(handle.list_readonly_turn_history()) == 1
+    from ash.coworkers import CoworkerRuntimeUnavailable
+    other = directory.open_coworker(owner_id="local", coworker_id=scout.coworker_id)
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        other.execute_readonly_inspection(
+            run_id=runs[0].run_id, session_id=runs[0].session_id,
+            request_id=runs[0].request_id,
+        )
+    # A plan completed before a subsequent change no longer grants inspection.
+    next_plan = asyncio.run(handle.run_model_responsibility(
+        responsibility.responsibility_id, event_id="investigation-manual-two",
+        investigate=True,
+    ))
+    assert len(observed) == 3
+    handle.set_responsibility_status(responsibility.responsibility_id, "paused")
+    with pytest.raises(CoworkerRuntimeUnavailable, match="revoked or changed"):
+        asyncio.run(handle.analyze_responsibility_investigation(next_plan))
+    assert len(observed) == 3
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        asyncio.run(handle.run_model_responsibility(
+            responsibility.responsibility_id, event_id="investigation-manual-two",
+            investigate=True,
+        ))
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+def test_signed_event_investigation_and_due_investigation_use_separate_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import hmac
+    from datetime import datetime, timedelta, timezone
+    from ash.automation.schedules import build_schedule
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_draft_answer='{"action":"search_literal","files":["status.log"],"query":"FAILED"}',
+    )
+    (workspace / "status.log").write_text("FAILED source failure one\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas", workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=identity.coworker_id)
+    origin = datetime.now(timezone.utc).replace(microsecond=0)
+    monkeypatch.setattr("ash.crew_events.utc_now", lambda: origin)
+    task = handle.create_responsibility(
+        scope="Watch CI", objective="Explain status",
+        evidence_paths=("status.log",),
+    )
+    signing = bytes(range(32))
+    key_file = tmp_path / "signing.key"
+    key_file.write_text(signing.hex() + "\n")
+    key_file.chmod(0o600)
+    data: dict[str, object] = {
+        "version": 1, "source": "ci", "id": "broken-1",
+        "issued_at": origin.isoformat(),
+        "responsibility_id": task.responsibility_id,
+        "payload": "Synthetic CI event: inspect granted status.log",
+    }
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    data["signature"] = hmac.new(signing, canonical, hashlib.sha256).hexdigest()
+    event_file = tmp_path / "signed.json"
+    event_file.write_text(json.dumps(data))
+    event_args = [
+        "crew", "event", "--owner", "local",
+        "--coworker-id", identity.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--key-file", str(key_file), "--input", str(event_file), "--investigate",
+    ]
+    assert main(event_args) == 0
+    assert len(observed) == 2
+    assert "Signed-event investigation plan persisted" in capsys.readouterr().out
+    assert "FAILED source failure" in str(observed[-1]["messages"])
+    assert "Synthetic CI event" in str(observed[-1]["messages"])
+    assert main(event_args) == 2
+    assert len(observed) == 2
+    capsys.readouterr()
+
+    scheduled = handle.create_responsibility(
+        scope="Scheduled CI", objective="Explain status",
+        evidence_paths=("status.log",),
+        schedule=build_schedule(every="10s", now=origin),
+    )
+    assert scheduled.first_fire_at is not None
+    monkeypatch.setattr("ash.coworkers._current_time", lambda: scheduled.first_fire_at)
+    with pytest.raises(ValueError, match="cannot skip"):
+        asyncio.run(handle.run_due_model_responsibilities_once(
+            investigate=True, only_if_changed=True,
+        ))
+    assert len(observed) == 2
+    result = asyncio.run(handle.run_due_model_responsibilities_once(
+        investigate=True,
+    ))
+    assert result.status == "completed" and result.turn is not None
+    assert result.analysis is not None
+    assert result.turn.responsibility_id == scheduled.responsibility_id
+    assert result.analysis.responsibility_id is None
+    assert len(observed) == 4
+    assert "FAILED source failure" not in str(observed[2]["messages"])
+    assert "FAILED source failure" in str(observed[3]["messages"])
+    scheduled_runs = handle.list_responsibility_runs(scheduled.responsibility_id)
+    assert len(scheduled_runs) == 1
+    assert scheduled_runs[0].status == "completed"
+    assert scheduled_runs[0].trigger_type == "scheduled"
+    assert handle.get_responsibility(scheduled.responsibility_id).next_fire_at == (
+        scheduled.first_fire_at + timedelta(seconds=10)
+    )
+    assert asyncio.run(handle.run_due_model_responsibilities_once(
+        investigate=True,
+    )).status == "idle"
+    assert len(observed) == 4
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+def test_investigation_second_turn_failure_does_not_replay_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.coworkers import CoworkerRuntimeUnavailable
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_draft_answer='{"action":"search_literal","files":["status.log"],"query":"FAILED"}',
+    )
+    source = workspace / "status.log"
+    source.write_text("FAILED initial\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=identity.coworker_id)
+    task = handle.create_responsibility(
+        scope="CI", objective="Report failure", evidence_paths=("status.log",),
+    )
+    plan = asyncio.run(handle.run_model_responsibility(
+        task.responsibility_id, event_id="once-only-two-step", investigate=True,
+    ))
+    assert len(observed) == 1
+    source.write_text("FAILED changed after source plan\n")
+    with pytest.raises(CoworkerRuntimeUnavailable, match="changed after proposal"):
+        asyncio.run(handle.analyze_responsibility_investigation(plan))
+    assert len(observed) == 1
+    runs = handle.list_responsibility_runs(task.responsibility_id)
+    assert len(runs) == 1 and runs[0].status == "completed"
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        asyncio.run(handle.run_model_responsibility(
+            task.responsibility_id, event_id="once-only-two-step", investigate=True,
+        ))
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+def test_investigation_invalid_combinations_and_missing_scheduled_evidence_do_not_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import datetime, timezone
+    from ash.automation.schedules import build_schedule
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    observed, _ = _install_readiness_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    task = handle.create_responsibility(
+        scope="No evidence", objective="Explain errors",
+    )
+    assert main([
+        "crew", "responsibility", "run",
+        "--owner", "local", "--coworker-id", identity.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--event-id", "invalid-both", "--investigate", "--draft-correction",
+    ]) == 2
+    assert not handle.list_responsibility_runs(task.responsibility_id)
+    assert main([
+        "crew", "responsibility", "run",
+        "--owner", "local", "--coworker-id", identity.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--event-id", "missing-evidence", "--investigate",
+    ]) == 2
+    assert not handle.list_responsibility_runs(task.responsibility_id)
+    capsys.readouterr()
+    from datetime import timedelta
+    fixed = datetime.now(timezone.utc).replace(microsecond=0)
+    due = handle.create_responsibility(
+        scope="Scheduled without files", objective="Explain failures",
+        schedule=build_schedule(
+            at=(fixed + timedelta(seconds=10)).isoformat(), now=fixed,
+        ),
+    )
+    assert due.first_fire_at is not None
+    monkeypatch.setattr("ash.coworkers._current_time", lambda: due.first_fire_at)
+    assert main([
+        "crew", "tick", "--owner", "local", "--coworker-id", identity.coworker_id,
+        "--investigate",
+    ]) == 2
+    assert not handle.list_responsibility_runs(due.responsibility_id)
+    assert len(observed) == 0
+    assert main([
+        "crew", "worker", "--owner", "local", "--coworker-id", identity.coworker_id,
+        "--investigate", "--only-if-changed",
+    ]) == 2
+    assert "cannot run together" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+def test_scout_can_investigate_its_own_responsibility_without_atlas_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, atlas_workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        scout_draft_answer='{"action":"search_literal","files":["scout.log"],"query":"FAILED"}',
+    )
+    (atlas_workspace / "atlas.log").write_text("ATLAS_ONLY_PRIVATE\n")
+    (scout_workspace / "scout.log").write_text("FAILED Scout own evidence\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=atlas_workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=scout.coworker_id)
+    task = handle.create_responsibility(
+        scope="Scout diagnosis", objective="Report log error",
+        evidence_paths=("scout.log",),
+    )
+    assert main([
+        "crew", "responsibility", "run", "--owner", "local",
+        "--coworker-id", scout.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--event-id", "scout-first-investigation", "--investigate",
+    ]) == 0
+    assert "Investigation plan persisted" in capsys.readouterr().out
+    assert len(observed) == 2
+    assert all(call["model"] == "gpt-scout" for call in observed)
+    assert "FAILED Scout own evidence" not in str(observed[0]["messages"])
+    assert "FAILED Scout own evidence" in str(observed[1]["messages"])
+    assert "ATLAS_ONLY_PRIVATE" not in str(observed)
+    assert all(call["tools"] is None for call in observed)

@@ -988,9 +988,14 @@ def _responsibility(args: argparse.Namespace) -> int:
                     event_id=args.event_id,
                     check_model=args.check_model,
                     draft_correction=args.draft_correction,
+                    investigate=args.investigate,
                 )
             )
             _render_model_turn(result)
+            if args.investigate:
+                _write_line("Investigation plan persisted; running bounded search and analysis.")
+                analysis = asyncio.run(handle.analyze_responsibility_investigation(result))
+                _render_model_turn(analysis)
             return 0
         if action == "runs":
             runs = handle.list_responsibility_runs(
@@ -1023,7 +1028,13 @@ def _responsibility(args: argparse.Namespace) -> int:
         SessionStorageError,
         ValueError,
     ) as exc:
-        if action == "run" and any(
+        if action == "run" and args.investigate:
+            _write_error(
+                "Investigation incomplete or outcome unknown; the first model "
+                "turn may already be consumed. Inspect responsibility runs and "
+                f"coworker history: {_safe_error(exc)}"
+            )
+        elif action == "run" and any(
             marker in str(exc).casefold()
             for marker in ("evidence", "prompt exceeds")
         ):
@@ -1065,9 +1076,14 @@ def _event(args: argparse.Namespace) -> int:
                 responsibility_id=args.responsibility_id,
                 check_model=args.check_model,
                 draft_correction=args.draft_correction,
+                investigate=args.investigate,
             )
         )
         _render_model_turn(result)
+        if args.investigate:
+            _write_line("Signed-event investigation plan persisted; analyzing search results.")
+            analysis = asyncio.run(handle.analyze_responsibility_investigation(result))
+            _render_model_turn(analysis)
         return 0
     except CoworkerRuntimeUnavailable as exc:
         if isinstance(exc, CoworkerModelReadinessError):
@@ -1079,7 +1095,13 @@ def _event(args: argparse.Namespace) -> int:
         _write_model_admission_error(exc, scheduled=False)
         return 2
     except (CoworkerNotFound, ValueError) as exc:
-        _write_error(f"Blocked before model dispatch: {_safe_error(exc)}")
+        if args.investigate:
+            _write_error(
+                "Signed-event investigation incomplete; the signed event may "
+                f"already be consumed. Inspect Crew history: {_safe_error(exc)}"
+            )
+        else:
+            _write_error(f"Blocked before model dispatch: {_safe_error(exc)}")
         return 2
     except (
         CoworkerDirectoryError,
@@ -1088,7 +1110,13 @@ def _event(args: argparse.Namespace) -> int:
         SafetyViolation,
         SessionStorageError,
     ) as exc:
-        if "evidence" in str(exc).casefold():
+        if args.investigate:
+            _write_error(
+                "Signed-event investigation incomplete or outcome unknown. "
+                "Inspect responsibility runs and coworker history: "
+                f"{_safe_error(exc)}"
+            )
+        elif "evidence" in str(exc).casefold():
             _write_error(f"Signed event blocked before provider dispatch: {_safe_error(exc)}")
         else:
             _write_error(
@@ -1118,6 +1146,7 @@ def _tick(args: argparse.Namespace) -> int:
             handle.run_due_model_responsibilities_once(
                 check_model=args.check_model,
                 only_if_changed=args.only_if_changed,
+                investigate=args.investigate,
             )
         )
         if result.status == "idle":
@@ -1135,6 +1164,9 @@ def _tick(args: argparse.Namespace) -> int:
         if result.turn is None:
             raise CoworkerDirectoryError("completed model schedule tick has no turn")
         _render_model_turn(result.turn)
+        if result.analysis is not None:
+            _write_line("Scheduled investigation analysis:")
+            _render_model_turn(result.analysis)
         return 0
     except CoworkerRuntimeUnavailable as exc:
         if isinstance(exc, CoworkerModelReadinessError):
@@ -1155,7 +1187,13 @@ def _tick(args: argparse.Namespace) -> int:
         SafetyViolation,
         SessionStorageError,
     ) as exc:
-        if "evidence" in str(exc).casefold():
+        if args.investigate:
+            _write_error(
+                "Scheduled investigation may be partial: the due occurrence "
+                "may already have been claimed and advanced. Inspect responsibility "
+                f"runs and coworker history: {_safe_error(exc)}"
+            )
+        elif "evidence" in str(exc).casefold():
             _write_error(
                 "Scheduled turn blocked before provider dispatch. "
                 "The occurrence remains due: "
@@ -1187,6 +1225,11 @@ def _worker(args: argparse.Namespace) -> int:
     if not 10 <= args.poll_seconds <= 3600:
         _write_error("Worker polling interval must be between 10 and 3600 seconds.")
         return 2
+    if args.investigate and args.only_if_changed:
+        _write_error(
+            "Investigation and change-only monitoring cannot run together."
+        )
+        return 2
     try:
         handle = _open_coworker_handle(args)
         if handle.require_owner_binding().lifecycle_status == "archived":
@@ -1194,6 +1237,7 @@ def _worker(args: argparse.Namespace) -> int:
             return 2
         asyncio.run(_run_crew_worker(
             handle, args.poll_seconds, only_if_changed=args.only_if_changed,
+            investigate=args.investigate,
         ))
         _write_line("Crew worker stopped.")
         return 0
@@ -1221,6 +1265,7 @@ async def _run_crew_worker(
     *,
     stop: asyncio.Event | None = None,
     only_if_changed: bool = False,
+    investigate: bool = False,
 ) -> None:
     """One serial, bounded Crew model tick per poll; no independent dispatch path."""
     stopping = stop if stop is not None else asyncio.Event()
@@ -1249,11 +1294,17 @@ async def _run_crew_worker(
                 try:
                     result = await handle.run_due_model_responsibilities_once(
                         only_if_changed=only_if_changed,
+                        investigate=investigate,
                     )
                     if result.status == "completed":
                         if result.turn is None:
                             raise CoworkerDirectoryError(
                                 "completed scheduled turn has no persisted result"
+                            )
+                        if result.analysis is not None:
+                            _write_line(
+                                "Scheduled investigation analysis saved: "
+                                f"{result.analysis.session_ref.session_id}"
                             )
                         _write_line(
                             "Scheduled Crew turn completed; "

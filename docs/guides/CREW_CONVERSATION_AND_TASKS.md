@@ -155,3 +155,52 @@ This is a fixed read-only diagnostic action, not a general terminal, web,
 repository traversal, test runner or autonomous coding loop. It currently
 supports one model-selected search followed by one analysis; it does not
 silently use arbitrary Ash tools or apply model-generated fixes.
+
+## Investigations for standing responsibilities
+
+The same bounded, model-selected literal search can now run for a stored
+responsibility using only its existing owner-granted evidence files. This
+supports manual runs, authenticated signed events and due scheduled work.
+
+For a manual trigger:
+
+~~~bash
+ash crew responsibility run --owner local --coworker-id ATLAS_UUID \
+  --responsibility-id RESPONSIBILITY_UUID \
+  --event-id investigation-001 --investigate
+~~~
+
+For an already authenticated event, add --investigate to the existing
+ash crew event command, keeping its owner-provisioned key file, signed
+envelope and responsibility ID. To investigate due scheduled work, choose
+ash crew tick --investigate or ash crew worker --investigate.
+The flags are opt-in; ordinary task behavior is unchanged.
+
+The plan remains a durable responsibility run with its normal manual,
+signed-event or scheduled trigger attribution. Its model receives the task
+scope, objective, success criteria, trigger context and hashes/sizes of
+granted files, **not the file contents**. After validating that completed
+plan and its still-active grant, Ash performs one fixed literal search.
+A second, separately claimed no-tool model turn analyzes the bounded
+results. For signed events, that analysis can also receive a bounded
+excerpt of the authenticated event payload. Run and session records
+remain inspectable through the responsibility ledger and coworker
+history, respectively.
+
+For scheduled investigations, the schedule result retains the
+responsibility-bound plan and separately records the analysis result.
+If the second step fails after the first completes, the first run is
+still consumed and the follow-up may be incomplete. Ash will not infer
+that the investigation succeeded or automatically replay it. A subsequent
+new occurrence can run normally.
+
+The investigate option cannot be combined with draft-correction in the
+same manual or signed-event invocation. If Atlas identifies a correction
+worth making, use a separate, explicitly authorized correction workflow
+and the existing exact-owner-approval gates. Scheduled investigations
+also cannot combine investigate with only-if-changed: no-change
+skipping is verified for ordinary scheduled model turns, not for the
+two-step investigation contract.
+
+This is still not unrestricted filesystem discovery, shell execution,
+test running, remote webhook serving or unsupervised source editing.

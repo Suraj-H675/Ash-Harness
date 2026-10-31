@@ -305,6 +305,10 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     responsibility_run.add_argument("--responsibility-id", required=True)
     responsibility_run.add_argument("--event-id", required=True)
     responsibility_run.add_argument(
+        "--investigate", action="store_true",
+        help="Plan a bounded search of granted evidence, then analyze the results",
+    )
+    responsibility_run.add_argument(
         "--draft-correction", action="store_true",
         help="Ask Atlas for an exact correction to an explicitly granted source file",
     )
@@ -343,6 +347,10 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         help="Probe the selected profile model before claiming this event",
     )
     crew_event.add_argument(
+        "--investigate", action="store_true",
+        help="Investigate this signed event with an approved-file literal search",
+    )
+    crew_event.add_argument(
         "--draft-correction",
         action="store_true",
         help="Ask Atlas to return a strict, owner-reviewable file correction JSON",
@@ -357,6 +365,10 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         help="Seconds between due checks (10-3600, default: 60)",
     )
     crew_worker.add_argument(
+        "--investigate", action="store_true",
+        help="Investigate each due task through a bounded search and analysis",
+    )
+    crew_worker.add_argument(
         "--only-if-changed", action="store_true",
         help="Skip scheduled model work when granted evidence matches the last completed run",
     )
@@ -365,6 +377,10 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     )
     crew_tick.add_argument("--owner", required=True)
     crew_tick.add_argument("--coworker-id", required=True)
+    crew_tick.add_argument(
+        "--investigate", action="store_true",
+        help="Run a bounded search and analysis for a due responsibility",
+    )
     crew_tick.add_argument(
         "--only-if-changed", action="store_true",
         help="Skip a due run if its granted evidence and scope match its last completed run",
