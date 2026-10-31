@@ -4552,3 +4552,237 @@ def test_coworker_chat_context_drops_oldest_history_before_new_message() -> None
             CoworkerTurnRequest(turn_id="too-large", question="z" * 16000),
             history, brief=CoworkerBrief(),
         )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="fixed syntax staging is Linux-only")
+def test_model_proposed_syntax_requires_exact_owner_confirmation_and_is_non_replayable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.sandbox.manager import SandboxResult
+
+    ash_dir, workspace, other_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    answer = '{"action":"python_syntax","files":["selected.py"]}'
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_draft_answer=answer,
+    )
+    (workspace / "selected.py").write_text("VALUE = 42\n", encoding="utf-8")
+    (workspace / "ungranted.py").write_text("VALUE = 99\n", encoding="utf-8")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=other_workspace,
+    )
+    assert main(
+        _ask_args(atlas.coworker_id, "Select a useful syntax check.",
+                  "selected.py", turn_id="syntax-source-1")
+        + ["--propose-syntax"]
+    ) == 0
+    lines = capsys.readouterr().out.splitlines()
+    ids = {
+        key: next(
+            item.split(": ", 1)[1] for item in lines
+            if item.startswith(f"{key}: ")
+        )
+        for key in ("Run ID", "Session ID", "Request ID")
+    }
+    assert "Syntax proposal data (untrusted JSON)" in str(observed[-1]["messages"])
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    proposal = handle.preview_syntax_proposal(
+        run_id=ids["Run ID"], session_id=ids["Session ID"],
+        request_id=ids["Request ID"],
+    )
+    assert proposal.files == ("selected.py",)
+    assert proposal.file_sha256 == ((
+        "selected.py", hashlib.sha256(b"VALUE = 42\n").hexdigest()
+    ),)
+    other = directory.open_coworker(
+        owner_id="local", coworker_id=scout.coworker_id,
+    )
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        other.preview_syntax_proposal(
+            run_id=ids["Run ID"], session_id=ids["Session ID"],
+            request_id=ids["Request ID"],
+        )
+    args = [
+        "crew", "syntax", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--source-run-id", ids["Run ID"],
+        "--source-session-id", ids["Session ID"],
+        "--source-request-id", ids["Request ID"],
+    ]
+    assert main(args) == 2
+    assert "exact local TTY confirmation" in capsys.readouterr().err
+    seen: list[tuple[str, ...]] = []
+
+    class FixedSandbox:
+        def __init__(self, **kwargs: Any) -> None:
+            assert kwargs["network"] is False
+            assert kwargs["workspace_read_only"] is True
+            assert kwargs["allow_scoped_fallback"] is False
+            self.backend_name = "docker"
+
+        def has_aggregate_resource_limits(self) -> bool:
+            return True
+
+        async def run_supervised_process(
+            self, command: Sequence[str], *, cwd: Path, timeout: int,
+        ) -> SandboxResult:
+            seen.append(tuple(sorted(path.name for path in cwd.iterdir())))
+            assert command[0] == "/usr/local/bin/python"
+            assert timeout == 30
+            assert (cwd / "selected.py").read_text() == "VALUE = 42\n"
+            return SandboxResult(
+                exit_code=0,
+                stdout='{"files":[{"name":"selected.py","ok":true,"line":null,"column":null}]}',
+                stderr="", tier=3, backend_name="docker",
+            )
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", FixedSandbox)
+
+    def confirm(challenge: str) -> bool:
+        assert challenge == (
+            f"CHECK SYNTAX {ids['Run ID']} {proposal.source_response_sha256}"
+        )
+        return True
+    monkeypatch.setattr(
+        "ash.commands.crew._require_tty_confirmation", confirm,
+    )
+    assert main(args) == 0
+    assert seen == [("selected.py",)]
+    assert "valid syntax" in capsys.readouterr().out
+    assert main(args) == 2
+    assert seen == [("selected.py",)]
+    assert "already claimed" in capsys.readouterr().err.casefold()
+
+    assert main(
+        _ask_args(atlas.coworker_id, "Select syntax checks.", "selected.py",
+                  turn_id="syntax-source-2") + ["--propose-syntax"]
+    ) == 0
+    lines = capsys.readouterr().out.splitlines()
+    next_ids = {
+        key: next(line.split(": ", 1)[1] for line in lines
+                  if line.startswith(f"{key}: "))
+        for key in ("Run ID", "Session ID", "Request ID")
+    }
+    (workspace / "selected.py").write_text("VALUE = 13\n", encoding="utf-8")
+    assert main([
+        "crew", "syntax", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--source-run-id", next_ids["Run ID"],
+        "--source-session-id", next_ids["Session ID"],
+        "--source-request-id", next_ids["Request ID"],
+    ]) == 2
+    assert "changed" in capsys.readouterr().err
+    assert seen == [("selected.py",)]
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs owner UID")
+@pytest.mark.parametrize("model_answer", [
+    '{"action":"python_syntax","files":["outside.py"]}',
+    '{"action":"python_syntax","files":["selected.py","selected.py"]}',
+    '{"action":"python_syntax","files":["selected.py"],"command":"rm -rf ."}',
+    '{"action":"python_syntax","files":["selected.py"],"files":["other.py"]}',
+    '{"action":"shell","files":["selected.py"]}',
+    'not a JSON object',
+])
+def test_model_syntax_proposal_refuses_ungrounded_or_extended_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], model_answer: str,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _install_fake_registry(monkeypatch, atlas_draft_answer=model_answer)
+    (workspace / "selected.py").write_text("safe = True\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas",
+        profile_name="atlas", workspace=workspace,
+    )
+    assert main(
+        _ask_args(identity.coworker_id, "Choose checks", "selected.py",
+                  turn_id="adversarial-syntax-source") + ["--propose-syntax"]
+    ) == 0
+    lines = capsys.readouterr().out.splitlines()
+    ids = {
+        key: next(line.split(": ", 1)[1] for line in lines
+                  if line.startswith(f"{key}: "))
+        for key in ("Run ID", "Session ID", "Request ID")
+    }
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    with pytest.raises((ValueError, CoworkerRuntimeUnavailable)):
+        handle.preview_syntax_proposal(
+            run_id=ids["Run ID"], session_id=ids["Session ID"],
+            request_id=ids["Request ID"],
+        )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="fixed syntax staging is Linux-only")
+def test_syntax_proposal_file_hash_change_at_staging_fails_before_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.coworkers import CoworkerHandle
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _install_fake_registry(
+        monkeypatch, atlas_draft_answer='{"action":"python_syntax","files":["safe.py"]}',
+    )
+    file = workspace / "safe.py"
+    file.write_text("value = 1\n")
+    identity = CoworkerDirectory.open(ash_dir).create(
+        owner_id="local", display_name="Atlas",
+        profile_name="atlas", workspace=workspace,
+    )
+    assert main(
+        _ask_args(identity.coworker_id, "Choose a syntax check.", "safe.py",
+                  turn_id="stage-hash-source") + ["--propose-syntax"]
+    ) == 0
+    lines = capsys.readouterr().out.splitlines()
+    ids = {
+        name: next(item.split(": ", 1)[1] for item in lines
+                   if item.startswith(f"{name}: "))
+        for name in ("Run ID", "Session ID", "Request ID")
+    }
+    original = CoworkerHandle.check_python_syntax
+
+    async def changed_after_confirmation(
+        self: CoworkerHandle, *, run_id: str,
+        permitted_files: Sequence[str],
+        expected_sha256: dict[str, str] | None = None,
+    ) -> Any:
+        assert expected_sha256 == {
+            "safe.py": hashlib.sha256(b"value = 1\n").hexdigest()
+        }
+        file.write_text("value = 2\n")
+        return await original(
+            self, run_id=run_id, permitted_files=permitted_files,
+            expected_sha256=expected_sha256,
+        )
+
+    monkeypatch.setattr(CoworkerHandle, "check_python_syntax",
+                        changed_after_confirmation)
+    monkeypatch.setattr(
+        "ash.commands.crew._require_tty_confirmation", lambda _: True,
+    )
+
+    class NoDocker:
+        def __init__(self, **kwargs: Any) -> None:
+            raise AssertionError("Changed content must never reach Docker")
+
+    monkeypatch.setattr("ash.coworkers.SandboxManager", NoDocker)
+    assert main([
+        "crew", "syntax", "--owner", "local",
+        "--coworker-id", identity.coworker_id,
+        "--source-run-id", ids["Run ID"],
+        "--source-session-id", ids["Session ID"],
+        "--source-request-id", ids["Request ID"],
+    ]) == 2
+    assert "changed after model proposal" in capsys.readouterr().err

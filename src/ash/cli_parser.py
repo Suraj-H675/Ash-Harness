@@ -175,6 +175,10 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         help="Explicit read-only evidence file; repeat for each file",
     )
     crew_ask.add_argument(
+        "--propose-syntax", action="store_true",
+        help="Ask the model to choose one syntax check from explicitly granted root Python files",
+    )
+    crew_ask.add_argument(
         "--check-model",
         action="store_true",
         help="Probe the selected profile model before claiming this turn",
@@ -206,10 +210,15 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     crew_syntax.add_argument("--coworker-id", required=True)
     crew_syntax.add_argument("--run-id", help="One-shot run ID; generated when omitted")
     crew_syntax.add_argument(
-        "--file", dest="files", action="append", required=True,
+        "--file", dest="files", action="append", default=[],
         metavar="WORKSPACE_RELATIVE_PYTHON_PATH",
-        help="Explicit workspace Python file to check; repeat for each file",
+        help="Explicit workspace-root Python file to check; repeat as needed",
     )
+    for field in ("source-run-id", "source-session-id", "source-request-id"):
+        crew_syntax.add_argument(
+            "--" + field,
+            help="Completed read-only model proposal source; use all three IDs together",
+        )
     crew_model_check = crew_subparsers.add_parser(
         "check-model",
         help="Send one synthetic readiness probe without creating a Crew run",

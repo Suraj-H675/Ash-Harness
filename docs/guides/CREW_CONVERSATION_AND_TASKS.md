@@ -63,3 +63,48 @@ This is a deliberately narrow governed capability. It does not grant the model
 a shell, a general tool dispatcher, dependency installation, source mutation,
 or permission to run arbitrary code. Consequential file corrections remain
 under the existing source-bound crew propose / approve / apply protocol.
+
+## Model-selected, owner-confirmed syntax task
+
+To let a coworker **choose a syntax check**, first explicitly grant it one or
+more small Python files at the workspace root. The model sees only those source
+snapshots, must propose one fixed python_syntax action and cannot execute it:
+
+~~~bash
+ash crew ask --owner local --coworker-id COWORKER_UUID \
+  --question "Which of these Python files should be syntax checked?" \
+  --evidence example.py --evidence helper.py --propose-syntax
+~~~
+
+A valid model response is one JSON object, for example:
+
+~~~json
+{"action":"python_syntax","files":["helper.py"]}
+~~~
+
+Copy the source **Run ID, Session ID, and Request ID** printed by the
+completed request. Review and run the model suggestion via:
+
+~~~bash
+ash crew syntax --owner local --coworker-id COWORKER_UUID \
+  --source-run-id RUN_UUID --source-session-id SESSION_UUID \
+  --source-request-id REQUEST_UUID
+~~~
+
+Ash verifies the exact completed, owner-bound no-tool transcript and its
+versioned syntax proposal prompt. A suggested filename must occur in the
+explicit evidence grant: additional filenames, duplicate files, command
+arguments, extra JSON properties, or unknown action names are refused.
+The original granted source bytes are rechecked against their recorded
+SHA-256 hashes. Ash shows the selected files and response hash; **a local
+interactive TTY confirmation is required**, followed by another source check.
+At staging, each file is compared again to its original hash. The fixed
+networkless Docker worker runs at most once for a deterministic task run ID,
+even across restart. No shell, unrestricted tool invocation, or file
+mutation is delegated to the model.
+
+The current implementation deliberately supports **workspace-root Python
+filenames** for model-selected tasks. Other files and deeper paths are not
+silently added to the grant. This is the first constrained action type,
+not a generalized autonomous task engine. An incorrect or inconclusive model
+response may simply be rejected rather than guessed into an executable tool.

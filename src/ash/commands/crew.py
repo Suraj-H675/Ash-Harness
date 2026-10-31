@@ -484,15 +484,66 @@ def _lifecycle(args: argparse.Namespace, action: str) -> int:
 def _syntax(args: argparse.Namespace) -> int:
     """Expose only the already fixed, non-executing Docker syntax worker."""
 
+    source_ids = (
+        args.source_run_id, args.source_session_id, args.source_request_id,
+    )
+    source_requested = any(value is not None for value in source_ids)
+    if source_requested and (
+        not all(source_ids) or args.files or args.run_id
+    ):
+        _write_error(
+            "Choose either explicit --file paths or exactly three source IDs; "
+            "model-derived checks generate their own one-shot run ID."
+        )
+        return 2
+    if not source_requested and not args.files:
+        _write_error("Select at least one --file or a complete model source.")
+        return 2
     run_id = args.run_id or str(uuid4())
-    _write_line(f"Run ID: {_safe_text(run_id, single_line=True)}")
     try:
         handle = _open_coworker_handle(args)
-        report = asyncio.run(
-            handle.check_python_syntax(
-                run_id=run_id, permitted_files=tuple(args.files),
+        if source_requested:
+            proposal = handle.preview_syntax_proposal(
+                run_id=args.source_run_id,
+                session_id=args.source_session_id,
+                request_id=args.source_request_id,
             )
-        )
+            run_id = proposal.task_run_id
+            _write_line(f"Model source run: {args.source_run_id}")
+            _write_line(f"Model response SHA-256: {proposal.source_response_sha256}")
+            for name, sha256 in proposal.file_sha256:
+                _write_line(f"Owner-granted file: {_safe_text(name, single_line=True)} ({sha256})")
+            _write_line(
+                "This is an untrusted model suggestion, not permission to run "
+                "arbitrary commands. Only fixed syntax parsing is permitted."
+            )
+            challenge = (
+                f"CHECK SYNTAX {args.source_run_id} "
+                f"{proposal.source_response_sha256}"
+            )
+            if not _require_tty_confirmation(challenge):
+                _write_error(
+                    "Blocked. Model-selected checks require exact local TTY confirmation."
+                )
+                return 2
+            if handle.preview_syntax_proposal(
+                run_id=args.source_run_id,
+                session_id=args.source_session_id,
+                request_id=args.source_request_id,
+            ) != proposal:
+                raise CoworkerRuntimeUnavailable(
+                    "syntax proposal or evidence changed since owner confirmation"
+                )
+            _write_line(f"Task run ID: {run_id}")
+            report = asyncio.run(handle.check_python_syntax(
+                run_id=run_id, permitted_files=proposal.files,
+                expected_sha256=dict(proposal.file_sha256),
+            ))
+        else:
+            _write_line(f"Run ID: {_safe_text(run_id, single_line=True)}")
+            report = asyncio.run(handle.check_python_syntax(
+                run_id=run_id, permitted_files=tuple(args.files),
+            ))
     except (
         CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
         AshError, OSError, SafetyViolation, SessionStorageError,
@@ -593,7 +644,10 @@ def _ask(args: argparse.Namespace) -> int:
                 request, fresh=args.new, check_model=args.check_model,
             )
             if is_chat
-            else handle.run_readonly_turn(request, check_model=args.check_model)
+            else handle.run_readonly_turn(
+                request, check_model=args.check_model,
+                propose_syntax=args.propose_syntax,
+            )
         )
     except CoworkerRuntimeUnavailable as exc:
         if isinstance(exc, CoworkerModelReadinessError):
