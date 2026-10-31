@@ -10,6 +10,7 @@ import sys
 from collections.abc import AsyncGenerator, Sequence
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -4328,3 +4329,226 @@ def test_brief_adoption_rereads_revision_and_provenance_before_commit(
     handle.archive()
     with pytest.raises(CoworkerRuntimeUnavailable, match="archived"):
         handle.preview_brief_adoption(**kwargs)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires POSIX owner UID")
+def test_coworker_chat_reuses_completed_history_after_restart_with_new_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, atlas_workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    observed, providers = _install_readiness_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=atlas_workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_workspace,
+    )
+    (atlas_workspace / "first.log").write_text("INITIAL_EVIDENCE_ONLY\n")
+    def chat(identity: Any, message: str, turn_id: str, *extra: str) -> int:
+        return main([
+            "crew", "chat", "--owner", "local", "--coworker-id", identity.coworker_id,
+            "--message", message, "--turn-id", turn_id, *extra,
+        ])
+
+    assert chat(atlas, "My project codename is comet.", "chat-one",
+                "--evidence", "first.log") == 0
+    first_prompt = str(observed[-1]["prompt"])
+    assert "INITIAL_EVIDENCE_ONLY" in first_prompt
+    assert "previous_completed_chat_turns" in first_prompt
+    assert "comet." in first_prompt
+    assert chat(atlas, "What is my project codename?", "chat-two") == 0
+    second_prompt = str(observed[-1]["prompt"])
+    assert "My project codename is comet." in second_prompt
+    assert "real Crew response" in second_prompt
+    assert "INITIAL_EVIDENCE_ONLY" not in second_prompt
+    import subprocess
+    child = subprocess.run(
+        [
+            sys.executable, "-c",
+            "from ash.coworkers import CoworkerDirectory; "
+            f"h=CoworkerDirectory.open().open_coworker(owner_id='local', "
+            f"coworker_id={atlas.coworker_id!r}); "
+            "print(h._completed_chat_history()[-1][0])",
+        ],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert child.returncode == 0, child.stderr
+    assert "What is my project codename?" in child.stdout
+    assert observed[-1]["tools"] is None
+    assert all(provider.closed for provider in providers)
+    assert chat(scout, "What is my codename?", "scout-chat") == 0
+    assert "comet." not in str(observed[-1]["prompt"])
+    assert chat(atlas, "Start an unrelated conversation.", "chat-reset", "--new") == 0
+    assert "comet." not in str(observed[-1]["prompt"])
+    assert chat(atlas, "What's the new topic?", "chat-three") == 0
+    followup = str(observed[-1]["prompt"])
+    assert "Start an unrelated conversation." in followup
+    assert "comet." not in followup
+    handle = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    assert len(handle.list_readonly_turn_history()) == 4
+    assert chat(atlas, "What's the new topic?", "chat-three") == 2
+    assert "comet." not in str(observed[-1]["prompt"])
+    assert chat(atlas, "Another turn.", "chat-four") == 0
+    assert "Start an unrelated conversation." in str(observed[-1]["prompt"])
+    capsys.readouterr()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires POSIX owner UID")
+def test_coworker_chat_only_uses_valid_completed_transcripts_and_does_not_replay_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    observed, _ = _install_readiness_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    from ash.coworkers import CoworkerTurnRequest
+    request = CoworkerTurnRequest(turn_id="prior-turn", question="An early question.")
+    first = asyncio.run(handle.run_chat_turn(request))
+    assert first.response == "real Crew response"
+    assert first.session_ref.session_id != first.session_ref.canonical_session_id
+    stored, binding = handle.load_session(first.session_ref.session_id)
+    assert stored.messages[0].metadata["coworker_conversation_kind"] == "chat"
+    assert stored.messages[0].metadata["coworker_chat_question"] == "An early question."
+    assert stored.tool_calls == []
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        asyncio.run(handle.run_chat_turn(request))
+    assert len(observed) == 1
+    assert asyncio.run(handle.run_readonly_turn(
+        CoworkerTurnRequest(turn_id="ordinary-ask", question="Ordinary evidence.")
+    )).response == "real Crew response"
+    assert asyncio.run(handle.run_chat_turn(
+        CoworkerTurnRequest(turn_id="followup", question="Recall only chat.")
+    )).response == "real Crew response"
+    assert "An early question." in str(observed[-1]["prompt"])
+    assert "Ordinary evidence." not in str(observed[-1]["prompt"])
+    from ash.coworkers import CoworkerDirectoryError
+    original_load = handle.load_session
+
+    def altered_question(session_id: str) -> Any:
+        session, binding = original_load(session_id)
+        if session_id == first.session_ref.session_id:
+            original = session.messages[0]
+            altered = original.model_copy(update={
+                "metadata": {
+                    **original.metadata,
+                    "coworker_chat_question": "forged earlier question",
+                },
+            })
+            session = session.model_copy(
+                update={"messages": [altered, session.messages[1]]},
+            )
+        return session, binding
+
+    monkeypatch.setattr(handle, "load_session", altered_question)
+    with pytest.raises(CoworkerDirectoryError, match="does not match its source"):
+        asyncio.run(handle.run_chat_turn(
+            CoworkerTurnRequest(turn_id="altered-question", question="Continue.")
+        ))
+    monkeypatch.setattr(handle, "load_session", original_load)
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "UPDATE coworker_turn_dispatches SET request_id = ? "
+            "WHERE run_id = ?", (str(uuid4()), first.session_ref.run_id),
+        )
+    from ash.coworkers import CoworkerDirectoryError
+    with pytest.raises(CoworkerDirectoryError, match="request identity changed"):
+        asyncio.run(handle.run_chat_turn(
+            CoworkerTurnRequest(turn_id="corrupt-history", question="Continue.")
+        ))
+    assert len(observed) == 3
+    capsys.readouterr()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires POSIX owner UID")
+def test_coworker_syntax_cli_requires_owner_selected_files_and_reports_worker_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    identity = CoworkerDirectory.open(ash_dir).create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    from ash.coworkers import (
+        CoworkerHandle, CoworkerPythonSyntaxFile, CoworkerPythonSyntaxReport,
+        CoworkerSessionRef,
+    )
+    observed: list[tuple[str, tuple[str, ...]]] = []
+    async def fixed_worker(
+        self: CoworkerHandle, *, run_id: str, permitted_files: Sequence[str],
+    ) -> CoworkerPythonSyntaxReport:
+        observed.append((run_id, tuple(permitted_files)))
+        return CoworkerPythonSyntaxReport(
+            session_ref=CoworkerSessionRef(
+                coworker_id=identity.coworker_id,
+                session_id=str(uuid4()),
+                canonical_session_id=identity.canonical_session_id,
+                run_id=run_id,
+            ),
+            files=tuple(
+                CoworkerPythonSyntaxFile(
+                    name=name, valid=name != "broken.py",
+                    line=1 if name == "broken.py" else None,
+                    column=4 if name == "broken.py" else None,
+                )
+                for name in permitted_files
+            ),
+        )
+    monkeypatch.setattr(CoworkerHandle, "check_python_syntax", fixed_worker)
+    base = [
+        "crew", "syntax", "--owner", "local",
+        "--coworker-id", identity.coworker_id,
+    ]
+    assert main(base + ["--run-id", "fixture-syntax-1", "--file", "good.py"]) == 0
+    assert observed == [("fixture-syntax-1", ("good.py",))]
+    assert "valid syntax" in capsys.readouterr().out
+    assert main(base + ["--run-id", "fixture-syntax-2",
+                        "--file", "good.py", "--file", "broken.py"]) == 1
+    assert observed[-1] == ("fixture-syntax-2", ("good.py", "broken.py"))
+    assert "invalid syntax (line 1, column 4)" in capsys.readouterr().out
+    assert main(["crew", "syntax", "--owner", "wrong",
+                 "--coworker-id", identity.coworker_id,
+                 "--run-id", "fixture-syntax-3", "--file", "good.py"]) == 2
+    assert len(observed) == 2
+
+
+def test_coworker_chat_context_drops_oldest_history_before_new_message() -> None:
+    from ash.coworkers import (
+        CoworkerBrief, CoworkerTurnRequest, _chat_turn_prompt,
+    )
+    current = CoworkerTurnRequest(
+        turn_id="current", question="Tell me the last accepted result?",
+        evidence="Current-run-only evidence.",
+    )
+    history = tuple(
+        (f"Question {i}", f"Previous answer {i} " + "x" * 1700)
+        for i in range(4)
+    )
+    prompt = _chat_turn_prompt(current, history, brief=CoworkerBrief("Rule: concise.", 1))
+    assert "Question 3" in prompt
+    assert "Question 0" in prompt
+    current = CoworkerTurnRequest(
+        turn_id="long-current", question="y" * 9000,
+    )
+    prompt = _chat_turn_prompt(current, history, brief=CoworkerBrief("Rule: concise.", 1))
+    assert "Question 0" not in prompt
+    assert "Question 3" in prompt
+    assert "y" * 9000 in prompt
+    with pytest.raises(ValueError, match="chat prompt limit"):
+        _chat_turn_prompt(
+            CoworkerTurnRequest(turn_id="too-large", question="z" * 16000),
+            history, brief=CoworkerBrief(),
+        )

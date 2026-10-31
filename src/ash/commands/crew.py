@@ -64,8 +64,10 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _lifecycle(args, action)
     if action == "check-model":
         return _check_model(args)
-    if action == "ask":
+    if action in {"ask", "chat"}:
         return _ask(args)
+    if action == "syntax":
+        return _syntax(args)
     if action == "history":
         return _history(args)
     if action == "responsibility":
@@ -479,6 +481,53 @@ def _lifecycle(args: argparse.Namespace, action: str) -> int:
     return 0
 
 
+def _syntax(args: argparse.Namespace) -> int:
+    """Expose only the already fixed, non-executing Docker syntax worker."""
+
+    run_id = args.run_id or str(uuid4())
+    _write_line(f"Run ID: {_safe_text(run_id, single_line=True)}")
+    try:
+        handle = _open_coworker_handle(args)
+        report = asyncio.run(
+            handle.check_python_syntax(
+                run_id=run_id, permitted_files=tuple(args.files),
+            )
+        )
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        AshError, OSError, SafetyViolation, SessionStorageError,
+        ScopedIOError, ValueError,
+    ) as exc:
+        _write_error(
+            f"Syntax check refused or outcome unknown: {_safe_error(exc)}. "
+            "Do not reuse the run ID after an uncertain dispatch."
+        )
+        return 2
+    except KeyboardInterrupt:
+        _write_error(
+            "Syntax check interrupted; outcome unknown. Do not reuse the run ID."
+        )
+        return 130
+    except Exception as exc:
+        _write_error(
+            f"Syntax check failed ({type(exc).__name__}); outcome may be unknown."
+        )
+        return 2
+    _write_line(f"Session ID: {report.session_ref.session_id}")
+    for entry in report.files:
+        if entry.valid:
+            _write_line(f"{_safe_text(entry.name, single_line=True)}: valid syntax")
+        else:
+            _write_line(
+                f"{_safe_text(entry.name, single_line=True)}: invalid syntax "
+                f"(line {entry.line}, column {entry.column})"
+            )
+    _write_line(
+        "No Python source was executed and no workspace files were changed."
+    )
+    return 0 if report.valid else 1
+
+
 def _ask(args: argparse.Namespace) -> int:
     turn_id = args.turn_id or str(uuid4())
     _write_line(f"Turn ID: {_safe_text(turn_id, single_line=True)}")
@@ -533,10 +582,18 @@ def _ask(args: argparse.Namespace) -> int:
     _write_line(
         f"Coworker ID: {_safe_text(identity.coworker_id, single_line=True)}"
     )
-    _write_line("Status: attempting one read-only model turn.")
+    is_chat = args.crew_action == "chat"
+    _write_line(
+        "Status: continuing bounded read-only conversation."
+        if is_chat else "Status: attempting one read-only model turn."
+    )
     try:
         result = asyncio.run(
-            handle.run_readonly_turn(request, check_model=args.check_model)
+            handle.run_chat_turn(
+                request, fresh=args.new, check_model=args.check_model,
+            )
+            if is_chat
+            else handle.run_readonly_turn(request, check_model=args.check_model)
         )
     except CoworkerRuntimeUnavailable as exc:
         if isinstance(exc, CoworkerModelReadinessError):

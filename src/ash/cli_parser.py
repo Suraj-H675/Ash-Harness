@@ -179,6 +179,37 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         action="store_true",
         help="Probe the selected profile model before claiming this turn",
     )
+    crew_chat = crew_subparsers.add_parser(
+        "chat", help="Continue a bounded conversation with prior completed chat turns"
+    )
+    crew_chat.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_chat.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_chat.add_argument("--message", dest="question", required=True)
+    crew_chat.add_argument("--turn-id", help="One-shot turn ID; generated when omitted")
+    crew_chat.add_argument(
+        "--new", action="store_true",
+        help="Start a new conversation without earlier chat context",
+    )
+    crew_chat.add_argument(
+        "--evidence", action="append", default=[],
+        metavar="WORKSPACE_RELATIVE_PATH",
+        help="Grant one workspace file for this turn only; repeat if needed",
+    )
+    crew_chat.add_argument(
+        "--check-model", action="store_true",
+        help="Probe the profile model before claiming this turn",
+    )
+    crew_syntax = crew_subparsers.add_parser(
+        "syntax", help="Run an owner-selected, non-executing Python syntax check in Docker"
+    )
+    crew_syntax.add_argument("--owner", required=True)
+    crew_syntax.add_argument("--coworker-id", required=True)
+    crew_syntax.add_argument("--run-id", help="One-shot run ID; generated when omitted")
+    crew_syntax.add_argument(
+        "--file", dest="files", action="append", required=True,
+        metavar="WORKSPACE_RELATIVE_PYTHON_PATH",
+        help="Explicit workspace Python file to check; repeat for each file",
+    )
     crew_model_check = crew_subparsers.add_parser(
         "check-model",
         help="Send one synthetic readiness probe without creating a Crew run",
