@@ -41,6 +41,12 @@ class VerifiedCrewEvent:
         return f"{self.source}:{self.event_id}"
 
 
+def validate_crew_event_key_file(key_file: Path, *, workspace: Path) -> None:
+    """Preflight the same owner-private signing key check used per event."""
+
+    _read_owner_key(key_file, workspace=workspace)
+
+
 def parse_signed_crew_event(
     envelope: bytes,
     *,

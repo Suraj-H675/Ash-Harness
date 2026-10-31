@@ -5466,3 +5466,322 @@ def test_scout_can_investigate_its_own_responsibility_without_atlas_context(
     assert "FAILED Scout own evidence" in str(observed[1]["messages"])
     assert "ATLAS_ONLY_PRIVATE" not in str(observed)
     assert all(call["tools"] is None for call in observed)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+def test_loopback_event_cli_dispatch_uses_real_signed_event_claim_and_replay_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import hmac
+    from datetime import datetime, timezone
+
+    from ash.crew_ingress import CrewIngressRefusal
+
+    ash_dir, workspace, other_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_answer="Atlas read-only result",
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    other = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=other_workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="Synthetic CI event", objective="Report incoming CI failures",
+    )
+    second = directory.open_coworker(owner_id="local", coworker_id=other.coworker_id)
+    other_task = second.create_responsibility(
+        scope="Scout's independent event", objective="Investigate Scout input",
+    )
+    key = bytes(range(32))
+    key_file = tmp_path / "signed-event.key"
+    key_file.write_text(key.hex() + "\n")
+    key_file.chmod(0o600)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    monkeypatch.setattr("ash.crew_events.utc_now", lambda: now)
+
+    def envelope(*, event_id: str, target: str, valid: bool = True) -> bytes:
+        fields: dict[str, object] = {
+            "version": 1, "source": "local-ci",
+            "id": event_id, "issued_at": now.isoformat(),
+            "responsibility_id": target,
+            "payload": "Signed CI failure input.",
+        }
+        canonical = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
+        fields["signature"] = (
+            hmac.new(key, canonical, hashlib.sha256).hexdigest()
+            if valid else "0" * 64
+        )
+        return json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
+
+    async def inspect_listener(
+        process: Any, *, port: int, ready: Any,
+    ) -> None:
+        assert port == 8781
+        ready(port)
+        with pytest.raises(CrewIngressRefusal) as invalid:
+            await process(envelope(event_id="forged", target=task.responsibility_id,
+                                   valid=False))
+        assert invalid.value.status == 403
+        assert not observed
+        with pytest.raises(CrewIngressRefusal) as wrong_target:
+            await process(envelope(event_id="foreign", target=other_task.responsibility_id))
+        assert wrong_target.value.status == 422
+        assert not observed
+        accepted = await process(envelope(
+            event_id="ci-1", target=task.responsibility_id,
+        ))
+        assert accepted.run_id
+        assert accepted.session_id
+        assert accepted.request_id
+        assert accepted.analysis_session_id is None
+        assert len(observed) == 1
+        assert observed[0]["tools"] is None
+        with pytest.raises(CrewIngressRefusal) as repeated:
+            await process(envelope(
+                event_id="ci-1", target=task.responsibility_id,
+            ))
+        assert repeated.value.status == 409
+        assert len(observed) == 1
+
+    monkeypatch.setattr("ash.commands.crew.serve_crew_ingress", inspect_listener)
+    args = [
+        "crew", "listen", "--owner", "local", "--coworker-id", atlas.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--key-file", str(key_file), "--port", "8781",
+    ]
+    assert main(args) == 0
+    assert "127.0.0.1:8781" in capsys.readouterr().out
+    runs = handle.list_responsibility_runs(task.responsibility_id)
+    assert len(runs) == 1
+    assert runs[0].status == "completed"
+    assert runs[0].trigger_type == "event"
+    assert second.list_responsibility_runs(other_task.responsibility_id) == []
+    key_file.chmod(0o644)
+    assert main(args) == 2
+    assert "key file permissions" in capsys.readouterr().err
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+def test_loopback_event_cli_requires_owner_and_disallows_unsafe_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="Synthetic event", objective="Track failures",
+    )
+    key_file = tmp_path / "listener.key"
+    key_file.write_text(bytes(range(32)).hex() + "\n")
+    key_file.chmod(0o600)
+    args = [
+        "crew", "listen", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--key-file", str(key_file), "--port", "8781",
+    ]
+    assert main(args + ["--investigate", "--draft-correction"]) == 2
+    assert "not both" in capsys.readouterr().err
+    assert main(args[:-1] + ["0"]) == 2
+    assert "port must be" in capsys.readouterr().err
+    wrong_owner = args.copy()
+    wrong_owner[wrong_owner.index("--owner") + 1] = "foreign"
+    assert main(wrong_owner) == 2
+    assert "no coworker matches" in capsys.readouterr().err
+    handle.set_responsibility_status(task.responsibility_id, "paused")
+    assert main(args) == 2
+    assert "not active" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+@pytest.mark.asyncio
+async def test_loopback_http_socket_to_signed_crew_dispatch_and_duplicate_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hmac
+    import threading
+    from datetime import datetime, timezone
+
+    from ash.crew_ingress import serve_crew_ingress as actual_serve
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_answer="Verified synthetic incident report",
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    responsibility = handle.create_responsibility(
+        scope="CI failures", objective="Summarize approved failures",
+    )
+    signing = bytes(range(32))
+    key_file = tmp_path / "http-event.key"
+    key_file.write_text(signing.hex() + "\n")
+    key_file.chmod(0o600)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    monkeypatch.setattr("ash.crew_events.utc_now", lambda: now)
+
+    def signed(event_id: str, *, valid: bool = True) -> bytes:
+        data: dict[str, object] = {
+            "version": 1, "source": "local-ci", "id": event_id,
+            "issued_at": now.isoformat(),
+            "responsibility_id": responsibility.responsibility_id,
+            "payload": "CI failed.",
+        }
+        canonical = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+        data["signature"] = (
+            hmac.new(signing, canonical, hashlib.sha256).hexdigest()
+            if valid else "0" * 64
+        )
+        return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+
+    bound: list[int] = []
+    service_loop: list[asyncio.AbstractEventLoop] = []
+    stopping: list[asyncio.Event] = []
+    signaled = threading.Event()
+
+    async def local_listener(
+        process: Any, *, port: int, ready: Any,
+    ) -> None:
+        assert port == 8781  # CLI contract; test uses a free ephemeral socket.
+        stop = asyncio.Event()
+        stopping.append(stop)
+        service_loop.append(asyncio.get_running_loop())
+        await actual_serve(
+            process, port=0, stop=stop,
+            ready=lambda bound_port: (
+                ready(bound_port), bound.append(bound_port), signaled.set(),
+            ),
+        )
+
+    monkeypatch.setattr("ash.commands.crew.serve_crew_ingress", local_listener)
+    args = [
+        "crew", "listen", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--responsibility-id", responsibility.responsibility_id,
+        "--key-file", str(key_file), "--port", "8781",
+    ]
+    task = asyncio.create_task(asyncio.to_thread(main, args))
+    try:
+        assert await asyncio.to_thread(signaled.wait, 3)
+        assert len(bound) == 1
+        from ash.crew_ingress import _REQUEST_PATH
+
+        async def send(envelope: bytes) -> tuple[int, dict[str, object]]:
+            reader, writer = await asyncio.open_connection("127.0.0.1", bound[0])
+            raw = (
+                f"POST {_REQUEST_PATH} HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{bound[0]}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(envelope)}\r\n\r\n"
+            ).encode() + envelope
+            writer.write(raw)
+            await writer.drain()
+            content = await asyncio.wait_for(reader.read(-1), timeout=4)
+            writer.close()
+            await writer.wait_closed()
+            head, body = content.split(b"\r\n\r\n", 1)
+            return int(head.split(b"\r\n", 1)[0].split()[1]), json.loads(body)
+
+        assert (await send(signed("forged", valid=False)))[0] == 403
+        assert len(observed) == 0
+        code, body = await send(signed("ci-1"))
+        assert code == 200
+        assert body["status"] == "completed"
+        assert body["run_id"] and body["session_id"]
+        assert len(observed) == 1
+        code, body = await send(signed("ci-1"))
+        assert code == 409
+        assert body["status"] == "refused"
+        assert len(observed) == 1
+    finally:
+        if stopping and service_loop:
+            service_loop[0].call_soon_threadsafe(stopping[0].set)
+        assert await asyncio.wait_for(task, timeout=4) == 0
+
+    runs = handle.list_responsibility_runs(responsibility.responsibility_id)
+    assert len(runs) == 1 and runs[0].status == "completed"
+    assert runs[0].trigger_type == "event"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+def test_loopback_event_investigation_returns_both_durable_sessions_without_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import hmac
+    from datetime import datetime, timezone
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"search_literal","files":["ci.log"],"query":"FAILED"}',
+    )
+    log = workspace / "ci.log"
+    log.write_text("PASS setup\nFAILED expected value 42 got 41\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="CI monitoring", objective="Explain CI failure",
+        evidence_paths=("ci.log",),
+    )
+    key = bytes(range(32))
+    key_file = tmp_path / "http-key"
+    key_file.write_text(key.hex() + "\n")
+    key_file.chmod(0o600)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    monkeypatch.setattr("ash.crew_events.utc_now", lambda: now)
+    body: dict[str, object] = {
+        "version": 1, "source": "local-ci", "id": "investigate",
+        "issued_at": now.isoformat(),
+        "responsibility_id": task.responsibility_id,
+        "payload": "CI failed in answer test",
+    }
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    body["signature"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    envelope = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+
+    async def inspect_listener(process: Any, *, port: int, ready: Any) -> None:
+        ready(port)
+        receipt = await process(envelope)
+        assert receipt.run_id and receipt.session_id
+        assert receipt.analysis_session_id
+        assert receipt.analysis_session_id != receipt.session_id
+        assert len(observed) == 2
+        assert "FAILED expected" not in str(observed[0]["messages"])
+        assert "FAILED expected" in str(observed[1]["messages"])
+        assert all(call["tools"] is None for call in observed)
+        assert log.read_text() == "PASS setup\nFAILED expected value 42 got 41\n"
+
+    monkeypatch.setattr("ash.commands.crew.serve_crew_ingress", inspect_listener)
+    assert main([
+        "crew", "listen", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--key-file", str(key_file), "--investigate",
+    ]) == 0
+    assert "Loopback only" in capsys.readouterr().out
+    runs = handle.list_responsibility_runs(task.responsibility_id)
+    assert len(runs) == 1
+    assert runs[0].status == "completed"
+    assert len(handle.list_readonly_turn_history()) == 1

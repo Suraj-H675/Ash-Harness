@@ -14,7 +14,12 @@ from pathlib import Path
 from uuid import UUID, uuid4, uuid5
 
 from ash.automation.schedules import build_schedule, render_schedule
-from ash.crew_events import MAX_CREW_EVENT_BYTES
+from ash.crew_events import (
+    MAX_CREW_EVENT_BYTES, CrewEventError, validate_crew_event_key_file,
+)
+from ash.crew_ingress import (
+    CrewIngressReceipt, CrewIngressRefusal, serve_crew_ingress,
+)
 from ash.core.redaction import redact_known_secrets
 from ash.coworker_evidence import (
     read_explicit_evidence,
@@ -77,6 +82,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _responsibility(args)
     if action == "event":
         return _event(args)
+    if action == "listen":
+        return _listen(args)
     if action == "tick":
         return _tick(args)
     if action == "worker":
@@ -1136,6 +1143,97 @@ def _event(args: argparse.Namespace) -> int:
             "Signed event turn failed or its outcome is unknown "
             f"({type(exc).__name__}). Inspect responsibility runs before retrying."
         )
+        return 2
+
+
+def _listen(args: argparse.Namespace) -> int:
+    """Bounded local HTTP transport into the existing signed-event dispatcher."""
+
+    if not 1 <= args.port <= 65535:
+        _write_error("Crew ingress port must be between 1 and 65535.")
+        return 2
+    if args.draft_correction and args.investigate:
+        _write_error("Choose investigation or correction drafting, not both.")
+        return 2
+    try:
+        handle = _open_coworker_handle(args)
+        current = handle.require_local_owner()
+        if args.draft_correction and current.profile_name != "atlas":
+            raise CoworkerRuntimeUnavailable("correction drafting requires Atlas")
+        responsibility = handle.get_responsibility(args.responsibility_id)
+        if responsibility.status != "active":
+            raise CoworkerRuntimeUnavailable("event responsibility is not active")
+        validate_crew_event_key_file(args.key_file, workspace=current.workspace)
+
+        async def receive(envelope: bytes) -> CrewIngressReceipt:
+            try:
+                result = await handle.run_signed_event(
+                    envelope, key_file=args.key_file,
+                    responsibility_id=args.responsibility_id,
+                    investigate=args.investigate,
+                    draft_correction=args.draft_correction,
+                )
+            except CrewEventError as exc:
+                raise CrewIngressRefusal(403, "invalid_signature_or_event") from exc
+            except CoworkerModelReadinessError as exc:
+                raise CrewIngressRefusal(
+                    503 if not exc.provider_request_attempted else 500,
+                    "model_unavailable" if not exc.provider_request_attempted
+                    else "dispatch_outcome_unknown",
+                ) from exc
+            except CoworkerRuntimeUnavailable as exc:
+                message = str(exc).casefold()
+                consumed = "already claimed" in message or "already used" in message
+                invalid_scope = any(marker in message for marker in (
+                    "not active", "paused", "target does not match",
+                ))
+                raise CrewIngressRefusal(
+                    409 if consumed else 422 if invalid_scope else 500,
+                    "duplicate_or_claimed" if consumed
+                    else "responsibility_unavailable" if invalid_scope
+                    else "dispatch_outcome_unknown",
+                ) from exc
+            # A completed provider response is not an approved or applied effect.
+            analysis_session_id = None
+            if args.investigate:
+                analysis = await handle.analyze_responsibility_investigation(result)
+                analysis_session_id = analysis.session_ref.session_id
+            return CrewIngressReceipt(
+                run_id=result.session_ref.run_id or "",
+                session_id=result.session_ref.session_id,
+                request_id=result.request_id,
+                analysis_session_id=analysis_session_id,
+            )
+
+        def announce_bound(bound_port: int) -> None:
+            _write_line(
+                f"Signed Crew event ingress: http://127.0.0.1:{bound_port}/crew/event"
+            )
+            _write_line(
+                "Loopback only. Signed events are processed serially; HTTP success "
+                "means the model turn finished, not that a correction was approved. "
+                "An interrupted request may have an unknown outcome. Inspect Crew history."
+            )
+            sys.stdout.flush()
+
+        asyncio.run(serve_crew_ingress(
+            receive, port=args.port, ready=announce_bound,
+        ))
+        return 0
+    except KeyboardInterrupt:
+        _write_error(
+            "Ingress stopped. An in-flight event may have been consumed; "
+            "inspect Crew responsibility runs before retrying."
+        )
+        return 130
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        CrewEventError, OSError, SafetyViolation, SessionStorageError, ValueError,
+    ) as exc:
+        _write_error(f"Signed Crew ingress unavailable: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"Signed Crew ingress unavailable ({type(exc).__name__}).")
         return 2
 
 

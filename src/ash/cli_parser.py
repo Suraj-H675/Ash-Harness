@@ -372,6 +372,28 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         "--only-if-changed", action="store_true",
         help="Skip scheduled model work when granted evidence matches the last completed run",
     )
+    crew_listen = crew_subparsers.add_parser(
+        "listen", help="Receive HMAC-signed Crew events on 127.0.0.1 only",
+    )
+    crew_listen.add_argument("--owner", required=True)
+    crew_listen.add_argument("--coworker-id", required=True)
+    crew_listen.add_argument("--responsibility-id", required=True)
+    crew_listen.add_argument(
+        "--key-file", required=True, type=Path,
+        help="Owner-provisioned private 0600 event HMAC key outside the workspace",
+    )
+    crew_listen.add_argument(
+        "--port", type=int, default=8781,
+        help="Loopback-only HTTP port (1–65535; default 8781)",
+    )
+    crew_listen.add_argument(
+        "--investigate", action="store_true",
+        help="Run a bounded read-only investigation after verifying the event",
+    )
+    crew_listen.add_argument(
+        "--draft-correction", action="store_true",
+        help="Have Atlas draft an exact correction, still requiring owner approval",
+    )
     crew_tick = crew_subparsers.add_parser(
         "tick", help="Run at most one due scheduled responsibility and exit"
     )
