@@ -876,6 +876,7 @@ def _responsibility(args: argparse.Namespace) -> int:
                     args.responsibility_id,
                     event_id=args.event_id,
                     check_model=args.check_model,
+                    draft_correction=args.draft_correction,
                 )
             )
             _render_model_turn(result)
@@ -1005,13 +1006,18 @@ def _tick(args: argparse.Namespace) -> int:
         result = asyncio.run(
             handle.run_due_model_responsibilities_once(
                 check_model=args.check_model,
+                only_if_changed=args.only_if_changed,
             )
         )
         if result.status == "idle":
             _write_line("No due scheduled responsibility.")
             return 0
         if result.status == "skipped":
-            _write_line("Status: skipped after the configured misfire grace.")
+            _write_line(
+                "Status: skipped (granted evidence unchanged since last completed run)."
+                if result.skip_reason == "evidence_unchanged"
+                else "Status: skipped after the configured misfire grace."
+            )
             _write_line(f"Responsibility ID: {result.responsibility_id}")
             _write_line(f"Event key: {_safe_text(result.event_key or '', single_line=True)}")
             return 0
@@ -1075,7 +1081,9 @@ def _worker(args: argparse.Namespace) -> int:
         if handle.require_owner_binding().lifecycle_status == "archived":
             _write_error("Archived coworkers cannot start a scheduled worker.")
             return 2
-        asyncio.run(_run_crew_worker(handle, args.poll_seconds))
+        asyncio.run(_run_crew_worker(
+            handle, args.poll_seconds, only_if_changed=args.only_if_changed,
+        ))
         _write_line("Crew worker stopped.")
         return 0
     except KeyboardInterrupt:
@@ -1101,6 +1109,7 @@ async def _run_crew_worker(
     poll_seconds: int,
     *,
     stop: asyncio.Event | None = None,
+    only_if_changed: bool = False,
 ) -> None:
     """One serial, bounded Crew model tick per poll; no independent dispatch path."""
     stopping = stop if stop is not None else asyncio.Event()
@@ -1127,7 +1136,9 @@ async def _run_crew_worker(
                 return
             if identity.lifecycle_status == "active":
                 try:
-                    result = await handle.run_due_model_responsibilities_once()
+                    result = await handle.run_due_model_responsibilities_once(
+                        only_if_changed=only_if_changed,
+                    )
                     if result.status == "completed":
                         if result.turn is None:
                             raise CoworkerDirectoryError(
@@ -1141,8 +1152,12 @@ async def _run_crew_worker(
                         )
                     elif result.status == "skipped":
                         _write_line(
-                            "Scheduled Crew occurrence skipped after misfire grace; "
-                            f"responsibility {result.responsibility_id}."
+                            (
+                                "Scheduled Crew occurrence skipped: evidence unchanged; "
+                                if result.skip_reason == "evidence_unchanged"
+                                else "Scheduled Crew occurrence skipped after misfire grace; "
+                            )
+                            + f"responsibility {result.responsibility_id}."
                         )
                 except CoworkerModelReadinessError as exc:
                     _write_error(

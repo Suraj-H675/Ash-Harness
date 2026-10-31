@@ -87,7 +87,7 @@ from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
 _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION = 9
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 11
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 12
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
 _MAX_COWORKER_BRIEF_BYTES = 2048
@@ -403,9 +403,9 @@ class _CoworkerModelTurnAdmission:
         if self.chat_request is not None and self.responsibility_id is not None:
             raise ValueError("chat cannot carry responsibility authority")
         if self.draft_correction and (
-            self.trigger_type != "event" or not self.evidence_files
+            self.trigger_type not in {"event", "manual"} or not self.evidence_files
         ):
-            raise ValueError("Atlas correction draft requires event evidence")
+            raise ValueError("Atlas correction draft requires manual or event evidence")
         has_responsibility = self.responsibility_id is not None
         if has_responsibility != (self.trigger_type is not None):
             raise ValueError("model turn responsibility attribution is incomplete")
@@ -1044,7 +1044,7 @@ class CoworkerScheduleTickResult:
                 self.responsibility_id is None
                 or self.event_key is None
                 or self.turn is not None
-                or self.skip_reason != "misfire_grace_expired"
+                or self.skip_reason not in {"misfire_grace_expired", "evidence_unchanged"}
             ):
                 raise ValueError("skipped schedule result is incomplete")
             return
@@ -1089,7 +1089,7 @@ class CoworkerModelScheduleTickResult:
                 self.responsibility_id is None
                 or self.event_key is None
                 or self.turn is not None
-                or self.skip_reason != "misfire_grace_expired"
+                or self.skip_reason not in {"misfire_grace_expired", "evidence_unchanged"}
             ):
                 raise ValueError("skipped model schedule result is incomplete")
             return
@@ -1655,7 +1655,7 @@ def _responsibility_run_from_row(row: sqlite3.Row) -> CoworkerResponsibilityRun:
                 trigger_type != "scheduled"
                 or session_id is not None
                 or request_id is not None
-                or skip_reason != "misfire_grace_expired"
+                or skip_reason not in {"misfire_grace_expired", "evidence_unchanged"}
                 or scheduled_for_text is None
             ):
                 raise ValueError("invalid skipped occurrence")
@@ -2192,6 +2192,7 @@ def _create_coworker_turn_dispatches(
         "coworker_turn_dispatches",
         "coworker_turn_dispatches_v6",
         "coworker_turn_dispatches_v8",
+        "coworker_turn_dispatches_v12",
     }:
         raise ValueError("invalid coworker dispatch table name")
     conn.execute(
@@ -2236,7 +2237,7 @@ def _create_coworker_turn_dispatches(
                     AND request_id IS NOT NULL AND skip_reason IS NULL)
                 OR (status = 'skipped' AND trigger_type = 'scheduled'
                     AND session_id IS NULL AND request_id IS NULL
-                    AND skip_reason = 'misfire_grace_expired')
+                    AND skip_reason IN ('misfire_grace_expired', 'evidence_unchanged'))
             )
         )
         """
@@ -2807,6 +2808,7 @@ class CoworkerDirectory:
                     7,
                     8,
                     10,
+                    11,
                     _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION,
                     _COWORKER_DIRECTORY_SCHEMA_VERSION,
                 }:
@@ -3156,6 +3158,50 @@ class CoworkerDirectory:
                         "PRAGMA table_info(coworker_turn_dispatches)"
                     )
                 }
+                # v12 permits an audited no-change skip without weakening the
+                # existing one-shot dispatch and missed-occurrence constraints.
+                dispatch_schema_row = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'coworker_turn_dispatches'"
+                ).fetchone()
+                dispatch_schema = (
+                    str(dispatch_schema_row["sql"]).casefold()
+                    if dispatch_schema_row is not None else ""
+                )
+                if "evidence_unchanged" not in dispatch_schema:
+                    if original_version >= 12:
+                        raise CoworkerDirectoryError(
+                            "coworker dispatch skip schema is incomplete"
+                        )
+                    conn.execute(
+                        "DROP INDEX IF EXISTS "
+                        "idx_coworker_turn_dispatches_responsibility_event"
+                    )
+                    conn.execute(
+                        "DROP INDEX IF EXISTS idx_coworker_turn_dispatches_event_replay"
+                    )
+                    conn.execute(
+                        "ALTER TABLE coworker_turn_dispatches "
+                        "RENAME TO coworker_turn_dispatches_legacy"
+                    )
+                    _create_coworker_turn_dispatches(
+                        conn, table_name="coworker_turn_dispatches_v12"
+                    )
+                    names = (
+                        "owner_id, coworker_id, run_id, session_id, request_id, "
+                        "status, execution_kind, responsibility_id, trigger_type, "
+                        "event_key, created_at, completed_at, scheduled_for, "
+                        "skip_reason, workspace_device, workspace_inode"
+                    )
+                    conn.execute(
+                        f"INSERT INTO coworker_turn_dispatches_v12 ({names}) "
+                        f"SELECT {names} FROM coworker_turn_dispatches_legacy"
+                    )
+                    conn.execute("DROP TABLE coworker_turn_dispatches_legacy")
+                    conn.execute(
+                        "ALTER TABLE coworker_turn_dispatches_v12 "
+                        "RENAME TO coworker_turn_dispatches"
+                    )
                 required_dispatch_columns.add("execution_kind")
                 if dispatch_columns != required_dispatch_columns:
                     raise CoworkerDirectoryError(
@@ -4071,6 +4117,160 @@ class CoworkerDirectory:
         if row is None:
             raise CoworkerNotFound("coworker responsibility not found")
         return _responsibility_from_row(row)
+
+    def _skip_unchanged_model_schedule(
+        self,
+        handle: "CoworkerHandle",
+        responsibility: CoworkerResponsibility,
+        *,
+        evidence_files: tuple[RepositoryEvidence, ...],
+        brief: CoworkerBrief,
+        workspace_identity: tuple[int, int],
+    ) -> CoworkerModelScheduleTickResult | None:
+        """Skip only against a verified successful prior scheduled model turn."""
+
+        if not evidence_files or responsibility.next_fire_at is None:
+            raise ValueError("change-only schedule requires explicitly granted evidence")
+        current = self._require_local_coworker_owner(handle)
+        with closing(self._connect()) as conn:
+            prior = conn.execute(
+                "SELECT run_id, session_id, request_id, status "
+                "FROM coworker_turn_dispatches WHERE owner_id = ? "
+                "AND coworker_id = ? AND responsibility_id = ? "
+                "AND trigger_type = 'scheduled' AND status != 'skipped' "
+                "ORDER BY scheduled_for DESC, run_id DESC LIMIT 1",
+                (current.owner_id, current.coworker_id, responsibility.responsibility_id),
+            ).fetchone()
+        if prior is None or prior["status"] != "completed":
+            return None
+        try:
+            _, prior_session, _, _, _ = self._require_completed_coworker_turn(
+                handle,
+                run_id=str(prior["run_id"]),
+                session_id=str(prior["session_id"]),
+                request_id=str(prior["request_id"]),
+                model_only=True,
+            )
+        except (CoworkerRuntimeUnavailable, CoworkerDirectoryError, ValueError):
+            return None
+
+        past_prompt = prior_session.messages[0].content
+        now_prompt = _responsibility_model_prompt(
+            responsibility,
+            trigger_type="scheduled",
+            event_key=_scheduled_event_key(responsibility.next_fire_at),
+            scheduled_for=responsibility.next_fire_at,
+            evidence_files=evidence_files,
+            brief=brief,
+        )
+        try:
+            past_prefix, past_json = past_prompt.rsplit("\n", 1)
+            now_prefix, now_json = now_prompt.rsplit("\n", 1)
+            past_contract = _strict_correction_json(past_json)
+            now_contract = _strict_correction_json(now_json)
+        except ValueError:
+            return None
+        if (
+            past_prefix != now_prefix
+            or not past_prefix.endswith("Return findings only.")
+            or past_contract.get("trigger", {}).get("type") != "scheduled"
+            or now_contract.get("trigger", {}).get("type") != "scheduled"
+            or prior_session.model != self._effective_config(current).model
+        ):
+            return None
+        past_contract.pop("trigger", None)
+        now_contract.pop("trigger", None)
+        if past_contract != now_contract:
+            return None
+
+        scheduled_for = responsibility.next_fire_at
+        event_key = _scheduled_event_key(scheduled_for)
+        skip_id = _scheduled_run_id(responsibility.responsibility_id, scheduled_for)
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            checked = self._require_local_coworker_owner(handle, conn)
+            if checked.lifecycle_status != "active":
+                raise CoworkerRuntimeUnavailable("coworker is not active")
+            if self._brief_for_record(checked, conn) != brief:
+                raise CoworkerRuntimeUnavailable(
+                    "coworker brief changed before change-only schedule check"
+                )
+            stored = conn.execute(
+                _RESPONSIBILITY_SELECT
+                + " WHERE responsibility.owner_id = ? "
+                "AND responsibility.coworker_id = ? "
+                "AND responsibility.responsibility_id = ?",
+                (checked.owner_id, checked.coworker_id, responsibility.responsibility_id),
+            ).fetchone()
+            if stored is None or _responsibility_from_row(stored) != responsibility:
+                raise CoworkerRuntimeUnavailable(
+                    "scheduled responsibility changed before change-only check"
+                )
+            # Re-read the explicitly granted bytes under the transaction before
+            # deciding that the model need not run.
+            if _snapshot_responsibility_evidence(
+                checked.workspace, responsibility, workspace_identity
+            ) != evidence_files:
+                raise CoworkerRuntimeUnavailable(
+                    "scheduled evidence changed before no-change skip"
+                )
+            latest = conn.execute(
+                "SELECT run_id, status FROM coworker_turn_dispatches "
+                "WHERE owner_id = ? AND coworker_id = ? AND responsibility_id = ? "
+                "AND trigger_type = 'scheduled' AND status != 'skipped' "
+                "ORDER BY scheduled_for DESC, run_id DESC LIMIT 1",
+                (checked.owner_id, checked.coworker_id, responsibility.responsibility_id),
+            ).fetchone()
+            if (
+                latest is None or latest["run_id"] != prior["run_id"]
+                or latest["status"] != "completed"
+            ):
+                raise CoworkerRuntimeUnavailable(
+                    "scheduled baseline changed before no-change skip"
+                )
+            now = _current_time()
+            if scheduled_for > now or (
+                responsibility.misfire_grace_seconds is not None
+                and now - scheduled_for >
+                timedelta(seconds=responsibility.misfire_grace_seconds)
+            ):
+                return None
+            schedule = responsibility.schedule
+            if schedule is None:
+                raise CoworkerDirectoryError("change-only occurrence lost its schedule")
+            next_fire = (
+                None if schedule.kind == "at"
+                else next_fire_time(schedule, previous=scheduled_for, now=now)
+            )
+            conn.execute(
+                "INSERT INTO coworker_turn_dispatches ("
+                "owner_id, coworker_id, run_id, session_id, request_id, status, "
+                "execution_kind, responsibility_id, trigger_type, event_key, "
+                "created_at, completed_at, scheduled_for, skip_reason) "
+                "VALUES (?, ?, ?, NULL, NULL, 'skipped', 'model', ?, 'scheduled', "
+                "?, ?, NULL, ?, 'evidence_unchanged')",
+                (
+                    checked.owner_id, checked.coworker_id, skip_id,
+                    responsibility.responsibility_id, event_key,
+                    now.isoformat(), scheduled_for.isoformat(),
+                ),
+            )
+            cursor = conn.execute(
+                "UPDATE coworker_responsibility_schedules "
+                "SET next_fire_at = ? WHERE owner_id = ? AND coworker_id = ? "
+                "AND responsibility_id = ? AND next_fire_at = ?",
+                (
+                    next_fire.isoformat() if next_fire is not None else None,
+                    checked.owner_id, checked.coworker_id,
+                    responsibility.responsibility_id, scheduled_for.isoformat(),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CoworkerDirectoryError("change-only schedule cursor changed")
+        return CoworkerModelScheduleTickResult(
+            status="skipped", responsibility_id=responsibility.responsibility_id,
+            event_key=event_key, skip_reason="evidence_unchanged",
+        )
 
     def _next_due_responsibility(
         self,
@@ -6266,6 +6466,7 @@ class CoworkerHandle:
         *,
         event_id: str,
         check_model: bool = False,
+        draft_correction: bool = False,
     ) -> CoworkerModelTurnResult:
         """Run one active responsibility from an explicit local owner trigger."""
 
@@ -6276,6 +6477,10 @@ class CoworkerHandle:
         if responsibility.status != "active":
             raise CoworkerRuntimeUnavailable(
                 "coworker responsibility is not active for manual dispatch"
+            )
+        if draft_correction and current.profile_name != "atlas":
+            raise CoworkerRuntimeUnavailable(
+                "correction drafting requires the Atlas profile-bound coworker"
             )
         workspace_identity = SafetyGuard(
             current.workspace
@@ -6295,6 +6500,7 @@ class CoworkerHandle:
             trigger_type="manual",
             event_key=event_key,
             evidence_files=evidence_files,
+            draft_correction=draft_correction,
             brief=brief,
         )
         result = await self._run_profile_model_turn(
@@ -6309,6 +6515,7 @@ class CoworkerHandle:
                 responsibility_id=identifier,
                 trigger_type="manual",
                 event_key=event_key,
+                draft_correction=draft_correction,
                 responsibility_updated_at=responsibility.updated_at,
                 responsibility_revision=responsibility.revision,
                 evidence_files=evidence_files,
@@ -6405,6 +6612,7 @@ class CoworkerHandle:
         self,
         *,
         check_model: bool = False,
+        only_if_changed: bool = False,
     ) -> CoworkerModelScheduleTickResult:
         """Run at most one due responsibility through the selected profile model."""
 
@@ -6430,6 +6638,13 @@ class CoworkerHandle:
             workspace_identity,
         )
         brief = self.read_brief()
+        if only_if_changed:
+            skipped = self._directory._skip_unchanged_model_schedule(
+                self, responsibility, evidence_files=evidence_files, brief=brief,
+                workspace_identity=workspace_identity,
+            )
+            if skipped is not None:
+                return skipped
         prompt = _responsibility_model_prompt(
             responsibility,
             trigger_type="scheduled",

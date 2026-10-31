@@ -286,6 +286,10 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     responsibility_run.add_argument("--responsibility-id", required=True)
     responsibility_run.add_argument("--event-id", required=True)
     responsibility_run.add_argument(
+        "--draft-correction", action="store_true",
+        help="Ask Atlas for an exact correction to an explicitly granted source file",
+    )
+    responsibility_run.add_argument(
         "--check-model",
         action="store_true",
         help="Probe the selected profile model before claiming this run",
@@ -333,11 +337,19 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         "--poll-seconds", type=int, default=60,
         help="Seconds between due checks (10-3600, default: 60)",
     )
+    crew_worker.add_argument(
+        "--only-if-changed", action="store_true",
+        help="Skip scheduled model work when granted evidence matches the last completed run",
+    )
     crew_tick = crew_subparsers.add_parser(
         "tick", help="Run at most one due scheduled responsibility and exit"
     )
     crew_tick.add_argument("--owner", required=True)
     crew_tick.add_argument("--coworker-id", required=True)
+    crew_tick.add_argument(
+        "--only-if-changed", action="store_true",
+        help="Skip a due run if its granted evidence and scope match its last completed run",
+    )
     crew_tick.add_argument(
         "--check-model",
         action="store_true",

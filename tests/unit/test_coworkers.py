@@ -1366,7 +1366,7 @@ def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
         assert connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall() == []
@@ -1513,7 +1513,7 @@ def test_v5_coworker_directory_migration_adds_cursor_and_preserves_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -2461,7 +2461,7 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
@@ -2544,7 +2544,7 @@ def test_coworker_directory_v3_migration_preserves_dispatch_history(
     with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
         columns = {
             str(row[1])
             for row in connection.execute(
@@ -3591,7 +3591,7 @@ def test_v2_coworker_directory_migration_adds_file_approval_boundary(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
         assert connection.execute(
             "SELECT COUNT(*) FROM coworker_file_approvals"
         ).fetchone() == (0,)
@@ -3640,7 +3640,7 @@ def test_v6_coworker_directory_migration_keeps_legacy_dispatch_unbound(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
 
 
 def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
@@ -3757,7 +3757,7 @@ def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
         columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(coworker_turn_dispatches)")
@@ -3813,7 +3813,7 @@ def test_v8_coworker_directory_migration_grants_no_ambient_evidence(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
         assert connection.execute(
             "SELECT evidence_paths_json FROM coworker_responsibilities "
             "WHERE responsibility_id = ?",
@@ -3910,7 +3910,7 @@ def test_v9_lifecycle_migration_preserves_responsibility_schedule_and_claims(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (11,)
+        ).fetchone() == (12,)
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
@@ -3995,3 +3995,91 @@ def test_competing_resume_and_archive_leave_archive_terminal(
     assert reopened.archive().lifecycle_status == "archived"
     with pytest.raises(CoworkerRuntimeUnavailable, match="from archived to active"):
         reopened.resume()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local owner UID")
+def test_v11_change_only_skip_migration_preserves_previous_dispatch_and_constraints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Upgrade the actual older CHECK constraint without losing run history."""
+
+    import sqlite3
+    from ash.coworkers import CoworkerDirectory, _manual_responsibility_run_id
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, identity, handle = _ready_coworker(ash_dir, workspace)
+    responsibility = handle.create_responsibility(
+        scope="Old schedule", objective="Review the synthetic result",
+    )
+    # Claim one existing manual run so migration must preserve real attribution.
+    run_id = _manual_responsibility_run_id(
+        responsibility.responsibility_id, "v11-legacy-manual",
+    )
+    request_id = str(uuid5(UUID(run_id), "request"))
+    background = handle.begin_background_run(run_id)
+    directory = CoworkerDirectory.open(ash_dir)
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "INSERT INTO coworker_turn_dispatches "
+            "(owner_id, coworker_id, run_id, session_id, request_id, "
+            "status, execution_kind, responsibility_id, trigger_type, "
+            "event_key, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'claimed', 'model', ?, 'manual', ?, ?)",
+            (
+                "owner-label", identity.coworker_id, run_id,
+                background.session_id, request_id,
+                responsibility.responsibility_id, "v11-legacy-manual",
+                "2026-10-31T12:00:00+00:00",
+            ),
+        )
+        existing_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'coworker_turn_dispatches'"
+        ).fetchone()[0]
+        assert "evidence_unchanged" in existing_sql
+        connection.execute(
+            "DROP INDEX idx_coworker_turn_dispatches_responsibility_event"
+        )
+        connection.execute("DROP INDEX idx_coworker_turn_dispatches_event_replay")
+        connection.execute(
+            "ALTER TABLE coworker_turn_dispatches RENAME TO coworker_dispatch_v12"
+        )
+        previous_sql = existing_sql.replace(
+            "skip_reason IN ('misfire_grace_expired', 'evidence_unchanged')",
+            "skip_reason = 'misfire_grace_expired'",
+        )
+        assert "evidence_unchanged" not in previous_sql
+        connection.execute(previous_sql)
+        columns = (
+            "owner_id, coworker_id, run_id, session_id, request_id, "
+            "status, execution_kind, responsibility_id, trigger_type, "
+            "event_key, created_at, completed_at, scheduled_for, "
+            "skip_reason, workspace_device, workspace_inode"
+        )
+        connection.execute(
+            f"INSERT INTO coworker_turn_dispatches ({columns}) "
+            f"SELECT {columns} FROM coworker_dispatch_v12"
+        )
+        connection.execute("DROP TABLE coworker_dispatch_v12")
+        connection.execute(
+            "UPDATE coworker_directory_meta SET schema_version = 11"
+        )
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="owner-label", coworker_id=identity.coworker_id,
+    )
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (12,)
+        sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'coworker_turn_dispatches'"
+        ).fetchone()[0]
+        assert "evidence_unchanged" in sql
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    run, = reopened.list_responsibility_runs(responsibility.responsibility_id)
+    assert run.run_id == run_id
+    assert run.request_id == request_id
+    assert run.status == "claimed"

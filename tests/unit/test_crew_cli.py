@@ -4786,3 +4786,222 @@ def test_syntax_proposal_file_hash_change_at_staging_fails_before_worker(
         "--source-request-id", ids["Request ID"],
     ]) == 2
     assert "changed after model proposal" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_atlas_manual_responsibility_drafts_exact_correction_with_full_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    model_answer = json.dumps({
+        "action": "replace", "target": "src/check.py", "replacement": "VALUE = 2\n",
+    })
+    ash_dir, workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _install_fake_registry(monkeypatch, atlas_draft_answer=model_answer)
+    (workspace / "src").mkdir()
+    target = workspace / "src/check.py"
+    target.write_text("VALUE = 1\n")
+    (workspace / "failure.log").write_text("FAIL expected VALUE = 2, got VALUE = 1\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas", workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=identity.coworker_id)
+    task = handle.create_responsibility(
+        scope="Synthetic CI failure", objective="Propose the exact correction",
+        success_criteria=("Source should equal 2.",),
+        evidence_paths=("src/check.py", "failure.log"),
+    )
+    command = [
+        "crew", "responsibility", "run", "--owner", "local",
+        "--coworker-id", identity.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--event-id", "manual-correction-one", "--draft-correction",
+    ]
+    assert main(command) == 0
+    output = capsys.readouterr().out
+    ids = {
+        label: next(
+            line.split(": ", 1)[1]
+            for line in output.splitlines() if line.startswith(label + ": ")
+        ) for label in ("Run ID", "Session ID", "Request ID")
+    }
+    run, = handle.list_responsibility_runs(task.responsibility_id)
+    assert run.trigger_type == "manual" and run.status == "completed"
+    assert target.read_bytes() == b"VALUE = 1\n"
+    assert main(_model_draft_stage_args(identity, ids, "failure.log")) == 2
+    assert "must match the selected evidence target" in capsys.readouterr().err
+    assert main(_model_draft_stage_args(identity, ids)) == 0
+    output = capsys.readouterr().out
+    approval_id = next(
+        line.split(": ", 1)[1] for line in output.splitlines()
+        if line.startswith("Approval ID: ")
+    )
+    approval, _ = handle.inspect_file_approval(approval_id)
+    assert approval.status == "pending"
+    assert approval.replacement_content == b"VALUE = 2\n"
+    assert target.read_bytes() == b"VALUE = 1\n"
+    other = directory.open_coworker(owner_id="local", coworker_id=scout.coworker_id)
+    from ash.coworkers import CoworkerNotFound
+    with pytest.raises(CoworkerNotFound):
+        other.inspect_file_approval(approval_id)
+    assert main(command) == 2  # claimed manual event cannot be replayed
+    capsys.readouterr()
+
+    expected = iter([
+        f"APPROVE {approval_id} {approval.approval_digest}",
+        f"APPLY {approval_id} {approval.approval_digest}",
+    ])
+    monkeypatch.setattr(
+        "ash.commands.crew._require_tty_confirmation",
+        lambda challenge: challenge == next(expected),
+    )
+    for action in ("approve", "apply"):
+        assert main([
+            "crew", action, "--owner", "local",
+            "--coworker-id", identity.coworker_id, "--approval-id", approval_id,
+        ]) == 0
+    assert target.read_bytes() == b"VALUE = 2\n"
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    final, events = reopened.inspect_file_approval(approval_id)
+    assert final.status == "succeeded"
+    assert [event.status for event in events] == [
+        "pending", "approved", "dispatching", "succeeded",
+    ]
+    assert main(_model_draft_stage_args(identity, ids)) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_change_only_model_schedule_skips_unchanged_and_uses_completed_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import datetime, timedelta, timezone
+    from ash.automation.schedules import build_schedule
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    observed, _ = _install_readiness_registry(monkeypatch)
+    initial = datetime(2026, 10, 31, 10, tzinfo=timezone.utc)
+    now = [initial]
+    monkeypatch.setattr("ash.coworkers._now", lambda: now[0].isoformat())
+    file = workspace / "ci-status.log"
+    file.write_text("CI red: failure A\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=identity.coworker_id)
+    responsibility = handle.create_responsibility(
+        scope="CI monitor", objective="Investigate the granted CI status",
+        success_criteria=("Explain failures.",),
+        evidence_paths=("ci-status.log",),
+        schedule=build_schedule(every="10s", now=initial),
+    )
+    first = responsibility.first_fire_at
+    assert first is not None
+    now[0] = first
+    assert main([
+        "crew", "tick", "--owner", "local", "--coworker-id", identity.coworker_id,
+        "--only-if-changed",
+    ]) == 0
+    assert "Status: completed." in capsys.readouterr().out
+    assert len(observed) == 1
+    now[0] = first + timedelta(seconds=10)
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    assert main([
+        "crew", "tick", "--owner", "local", "--coworker-id", identity.coworker_id,
+        "--only-if-changed",
+    ]) == 0
+    assert "evidence unchanged" in capsys.readouterr().out
+    assert len(observed) == 1
+    runs = reopened.list_responsibility_runs(responsibility.responsibility_id)
+    assert len(runs) == 2
+    assert runs[0].status == "skipped"
+    assert runs[0].skip_reason == "evidence_unchanged"
+    assert runs[0].session_id is None
+    assert runs[1].status == "completed"
+    assert reopened.get_responsibility(
+        responsibility.responsibility_id
+    ).next_fire_at == first + timedelta(seconds=20)
+
+    now[0] = first + timedelta(seconds=20)
+    file.write_text("CI red: failure B\n")
+    assert asyncio.run(reopened.run_due_model_responsibilities_once(
+        only_if_changed=True,
+    )).status == "completed"
+    assert len(observed) == 2
+    now[0] = first + timedelta(seconds=30)
+    reopened.set_brief("Recheck after owner instructions change.")
+    assert asyncio.run(reopened.run_due_model_responsibilities_once(
+        only_if_changed=True,
+    )).status == "completed"
+    assert len(observed) == 3
+    now[0] = first + timedelta(seconds=40)
+    assert asyncio.run(reopened.run_due_model_responsibilities_once(
+        only_if_changed=True,
+    )).status == "skipped"
+    assert len(observed) == 3
+    # An uncertain previous run is not proof that the current input was handled.
+    with sqlite3.connect(directory.db_path) as conn:
+        most_recent = conn.execute(
+            "SELECT run_id FROM coworker_turn_dispatches "
+            "WHERE responsibility_id = ? AND status = 'completed' "
+            "ORDER BY scheduled_for DESC LIMIT 1",
+            (responsibility.responsibility_id,),
+        ).fetchone()
+        assert most_recent is not None
+        conn.execute(
+            "UPDATE coworker_turn_dispatches SET status = 'claimed', "
+            "completed_at = NULL WHERE run_id = ?",
+            (most_recent[0],),
+        )
+    now[0] = first + timedelta(seconds=50)
+    assert asyncio.run(reopened.run_due_model_responsibilities_once(
+        only_if_changed=True,
+    )).status == "completed"
+    assert len(observed) == 4
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_change_only_schedule_requires_evidence_and_never_suppresses_first_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime, timezone
+    from ash.automation.schedules import build_schedule
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    observed, _ = _install_readiness_registry(monkeypatch)
+    initial = datetime(2026, 10, 31, 10, tzinfo=timezone.utc)
+    clock = [initial]
+    monkeypatch.setattr("ash.coworkers._now", lambda: clock[0].isoformat())
+    identity = CoworkerDirectory.open(ash_dir).create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    scheduled = handle.create_responsibility(
+        scope="Periodic summary", objective="Summarize every interval.",
+        success_criteria=("Supply latest findings.",),
+        schedule=build_schedule(every="10s", now=initial),
+    )
+    assert scheduled.first_fire_at is not None
+    clock[0] = scheduled.first_fire_at
+    with pytest.raises(ValueError, match="requires explicitly granted evidence"):
+        asyncio.run(handle.run_due_model_responsibilities_once(
+            only_if_changed=True,
+        ))
+    assert observed == []
+    assert handle.list_responsibility_runs(scheduled.responsibility_id) == []
+    assert asyncio.run(handle.run_due_model_responsibilities_once()).status == "completed"
+    assert len(observed) == 1

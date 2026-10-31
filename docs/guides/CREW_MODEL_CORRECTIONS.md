@@ -62,3 +62,32 @@ For an owner-created replacement file, the existing `ash crew propose
 --replacement-file src/example.fixed.py` remains unchanged. The draft path
 does not install a listener, monitor GitHub itself, expand evidence grants,
 add multi-user authentication or permit arbitrary model tools.
+
+## Manually assigned Atlas corrections (no signed event required)
+
+An owner can now run an existing Atlas responsibility with a correction draft,
+using the same strict correction response contract as signed events. The
+responsibility must explicitly grant the relevant log and source file:
+
+~~~bash
+ash crew responsibility run --owner local --coworker-id ATLAS_UUID \
+  --responsibility-id RESPONSIBILITY_UUID \
+  --event-id unique-investigation-id --draft-correction
+~~~
+
+The result is a read-only, single-use model turn. It neither writes a file nor
+grants new permissions. If the strict JSON is useful, take its printed
+Run ID, Session ID and Request ID and stage an exact proposal:
+
+~~~bash
+ash crew propose --owner local --coworker-id ATLAS_UUID \
+  --run-id RUN_UUID --session-id SESSION_UUID --request-id REQUEST_UUID \
+  --target src/failing_file.py --from-response
+~~~
+
+The unchanged, explicitly granted target, complete replacement text, current
+write policy and exact diff are verified as in the signed-event pathway.
+Separate ash crew approve and ash crew apply commands require exact local owner
+confirmations; denial, stale source or approval expiry blocks the write.
+The manually triggered event ID is consumed once even when the model fails or
+the result is not accepted. Scout cannot draft Atlas corrections.

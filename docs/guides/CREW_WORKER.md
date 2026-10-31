@@ -106,3 +106,36 @@ service-manager stop command. Inspect `ash crew show`, `ash crew inbox`, and
 A worker handles exactly one coworker; give another coworker its own user
 service. Use separate names/labels for service definitions. Profile credentials
 stay in each coworker's selected profile, never in the service arguments.
+
+## Opt-in change-only evidence monitoring
+
+A scheduled responsibility with explicit workspace evidence can opt in to
+change-only checks, avoiding a model request when its inputs and task context
+are identical to a previous **completed** scheduled model run:
+
+~~~bash
+ash crew tick --owner local --coworker-id COWORKER_UUID --only-if-changed
+ash crew worker --owner local --coworker-id COWORKER_UUID \
+  --poll-seconds 60 --only-if-changed
+~~~
+
+Normal scheduling remains unchanged when this option is absent. The flag
+applies to the running worker or current tick, not the saved responsibility.
+It requires a nonempty, explicit evidence grant; it does not scan repositories
+or infer whether an external CI service has changed.
+
+Ash verifies the latest non-skipped scheduled model run, its owner/coworker
+binding, durable two-message transcript, configured model, granted evidence
+manifest, responsibility objective/criteria, and current owner-curated brief.
+If all still match, it records skipped: evidence_unchanged in the dispatch
+journal and advances the existing cursor atomically, **without making a model
+request**. View these quiet outcomes with ash crew inbox --include-skipped or
+ash crew responsibility runs.
+
+There is no skip without a valid completed prior run: first runs, uncertain
+claims, changed evidence/brief/objectives, invalid history, and expired
+misfire-grace windows follow the existing conservative admission path.
+Current evidence is rechecked before writing the skip; concurrent
+schedule changes refuse the skip. This is input change detection, not
+semantic validation or an autonomous CI/webhook monitor. It cannot replace
+a genuine external event receiver.
