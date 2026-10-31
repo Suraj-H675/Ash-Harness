@@ -203,6 +203,25 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         "--check-model", action="store_true",
         help="Probe the profile model before claiming this turn",
     )
+    crew_investigate = crew_subparsers.add_parser(
+        "investigate",
+        help="Let a coworker select a fixed literal search from owner-granted files, then analyze it",
+    )
+    crew_investigate.add_argument("--owner", required=True)
+    crew_investigate.add_argument("--coworker-id", required=True)
+    crew_investigate.add_argument("--question", required=True)
+    crew_investigate.add_argument(
+        "--investigation-id", help="Non-replayable investigation ID; generated if omitted",
+    )
+    crew_investigate.add_argument(
+        "--file", dest="files", action="append", required=True,
+        metavar="WORKSPACE_RELATIVE_PATH",
+        help="Explicitly granted text file; repeat to grant up to eight",
+    )
+    crew_investigate.add_argument(
+        "--check-model", action="store_true",
+        help="Probe the profile model before starting the first turn",
+    )
     crew_syntax = crew_subparsers.add_parser(
         "syntax", help="Run an owner-selected, non-executing Python syntax check in Docker"
     )

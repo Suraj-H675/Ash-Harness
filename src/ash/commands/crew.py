@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import difflib
+import json
 import os
 import signal
 import sys
@@ -68,6 +69,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _ask(args)
     if action == "syntax":
         return _syntax(args)
+    if action == "investigate":
+        return _investigate(args)
     if action == "history":
         return _history(args)
     if action == "responsibility":
@@ -577,6 +580,114 @@ def _syntax(args: argparse.Namespace) -> int:
         "No Python source was executed and no workspace files were changed."
     )
     return 0 if report.valid else 1
+
+
+def _investigate(args: argparse.Namespace) -> int:
+    """Two persisted no-tool turns around one fixed, owner-scoped literal search."""
+
+    investigation_id = args.investigation_id or str(uuid4())
+    _write_line(f"Investigation ID: {_safe_text(investigation_id, single_line=True)}")
+    phase = "preflight"
+    try:
+        # Keep operator-supplied identifiers bounded, printable and stable.
+        CoworkerTurnRequest(turn_id=investigation_id, question=args.question)
+        handle = _open_coworker_handle(args)
+        current = handle.require_local_owner()
+        guard = SafetyGuard(current.workspace)
+        identity = guard.project_root_identity
+        if identity is None:
+            raise CoworkerRuntimeUnavailable("investigation workspace is not bound")
+        snapshots = read_explicit_evidence(
+            current.workspace, tuple(args.files), guard=guard,
+        )
+        if not snapshots or len({item.relative_path for item in snapshots}) != len(snapshots):
+            raise ValueError("investigation needs unique explicitly granted text files")
+        descriptors = [
+            {"path": item.relative_path, "sha256": item.sha256,
+             "size_bytes": item.size_bytes}
+            for item in snapshots
+        ]
+        # Stable, independent run IDs ensure that neither model phase can be
+        # replayed after uncertain dispatch, including across process restart.
+        plan_id = str(uuid5(UUID(current.coworker_id),
+                            f"ash-crew-inspect:{investigation_id}:plan"))
+        analysis_id = str(uuid5(UUID(current.coworker_id),
+                                f"ash-crew-inspect:{investigation_id}:analysis"))
+        phase = "plan"
+        _write_line("Planning a bounded literal search (no file content sent yet).")
+        plan = asyncio.run(handle.run_readonly_turn(
+            CoworkerTurnRequest(
+                turn_id=plan_id, question=args.question,
+                evidence=json.dumps(descriptors, separators=(",", ":")),
+                workspace_identity=identity,
+            ), check_model=args.check_model, propose_inspection=True,
+        ))
+        _write_line(f"Plan run ID: {plan.session_ref.run_id}")
+        _write_line(f"Plan session ID: {plan.session_ref.session_id}")
+        _write_line(f"Plan request ID: {plan.request_id}")
+        phase = "search"
+        if plan.session_ref.run_id is None or plan.request_id is None:
+            raise CoworkerDirectoryError("inspection plan lacks durable source IDs")
+        proposal, matches = handle.execute_readonly_inspection(
+            run_id=plan.session_ref.run_id,
+            session_id=plan.session_ref.session_id,
+            request_id=plan.request_id or "",
+        )
+        report = json.loads(matches)
+        _write_line(f"Selected literal: {_safe_text(proposal.query, single_line=True)}")
+        for filename in proposal.files:
+            _write_line(f"Selected granted file: {_safe_text(filename, single_line=True)}")
+        _write_line(f"Matching lines: {report['total_matching_lines']}")
+        _write_line(f"Matches omitted: {report['matches_omitted']}")
+        phase = "analysis"
+        evidence = json.dumps({
+            "tool": "read_only_literal_search_v1",
+            "source_run_id": plan.session_ref.run_id,
+            "source_response_sha256": proposal.response_sha256,
+            "results": report,
+        }, ensure_ascii=False, separators=(",", ":"))
+        analysis = asyncio.run(handle.run_readonly_turn(
+            CoworkerTurnRequest(
+                turn_id=analysis_id,
+                question=(
+                    "Analyze these fixed, read-only, owner-granted literal search "
+                    "results for the original question. Report grounded findings "
+                    "and uncertainty. No tools or changes. Original question: "
+                    + args.question
+                ),
+                evidence=evidence,
+                workspace_identity=identity,
+            ),
+        ))
+        _write_line("Investigation completed, no files changed.")
+        _write_line(f"Analysis run ID: {analysis.session_ref.run_id}")
+        _write_line(f"Analysis session ID: {analysis.session_ref.session_id}")
+        _write_line(f"Analysis request ID: {analysis.request_id}")
+        _write_line("Findings:")
+        _write_line(_safe_text(analysis.response))
+        return 0
+    except KeyboardInterrupt:
+        _write_error(
+            f"Investigation interrupted during {phase}; dispatched model turns "
+            "must not be retried with the same investigation ID."
+        )
+        return 130
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        AshError, OSError, SafetyViolation, SessionStorageError, ScopedIOError,
+        ValueError,
+    ) as exc:
+        _write_error(
+            f"Investigation stopped at {phase}: {_safe_error(exc)}. "
+            "Inspect Crew history; do not replay an already dispatched investigation."
+        )
+        return 2
+    except Exception as exc:
+        _write_error(
+            f"Investigation stopped at {phase} ({type(exc).__name__}); "
+            "outcome may be unknown. Inspect Crew history, never replay blindly."
+        )
+        return 2
 
 
 def _ask(args: argparse.Namespace) -> int:

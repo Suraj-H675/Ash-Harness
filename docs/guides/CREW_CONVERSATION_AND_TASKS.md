@@ -108,3 +108,50 @@ filenames** for model-selected tasks. Other files and deeper paths are not
 silently added to the grant. This is the first constrained action type,
 not a generalized autonomous task engine. An incorrect or inconclusive model
 response may simply be rejected rather than guessed into an executable tool.
+
+## Bounded, model-selected investigation
+
+A coworker can choose and perform one predefined read-only text-search action
+before producing a grounded analysis. The local owner supplies the complete
+allowlist:
+
+~~~bash
+ash crew investigate --owner local --coworker-id COWORKER_UUID \
+  --investigation-id inspect-ci-001 \
+  --question "Find the failing assertion in the CI log" \
+  --file ci.log --file tests.log
+~~~
+
+The allowlist accepts up to eight explicitly selected UTF-8 text files under
+the existing evidence budget (6 KiB per file, 8 KiB total). Sensitive paths,
+symlinks, stale reads, binary content and known secret markers retain their
+existing evidence checks. The **first model turn receives only filenames,
+sizes and SHA-256 hashes**, not the file text. Its only valid tool proposal is
+a strict JSON object:
+
+~~~json
+{"action":"search_literal","files":["ci.log"],"query":"FAILED"}
+~~~
+
+Ash rejects extra keys, duplicate keys, unknown actions, regex/command
+options, path escapes, unauthorized files and malformed queries. After
+verifying the first turn is completed, owner-bound and tool-free, Ash
+re-snapshots the exact owner-granted files and refuses changed input. Its
+fixed search compares a case-insensitive literal string; it runs **no
+commands**, network requests or user source code. The search returns at most
+24 matching lines, excerpts limited to 220 characters, plus source file
+hashes and omission counts. A second independently claimed, persisted
+no-tool model turn receives only those results and the original question,
+then explains findings and uncertainty.
+
+Both model turns have stable, separate run identities. The first completed
+turn alone does not imply the second turn succeeded. Interruptions, model
+failures, invalid proposals or changed files do not automatically retry
+or expand grants. Use a **new investigation ID** for new work, and inspect
+Crew history after ambiguous outcomes. The existing coworker
+identity, approval and correction boundaries remain unchanged.
+
+This is a fixed read-only diagnostic action, not a general terminal, web,
+repository traversal, test runner or autonomous coding loop. It currently
+supports one model-selected search followed by one analysis; it does not
+silently use arbitrary Ash tools or apply model-generated fixes.

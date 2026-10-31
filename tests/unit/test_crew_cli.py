@@ -10,7 +10,7 @@ import sys
 from collections.abc import AsyncGenerator, Sequence
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 
@@ -5005,3 +5005,165 @@ def test_change_only_schedule_requires_evidence_and_never_suppresses_first_run(
     assert handle.list_responsibility_runs(scheduled.responsibility_id) == []
     assert asyncio.run(handle.run_due_model_responsibilities_once()).status == "completed"
     assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+def test_coworker_investigate_performs_bounded_model_selected_search_and_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"search_literal","files":["ci.log"],"query":"FAILED"}',
+    )
+    (workspace / "ci.log").write_text(
+        "PASS first\nFAILED: expected VALUE=42, got VALUE=41\nPASS third\n"
+    )
+    (workspace / "extra.log").write_text("UNGRANTED_TO_MODEL_SEARCH\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_workspace,
+    )
+    command = [
+        "crew", "investigate", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--investigation-id", "synthetic-inspection-1",
+        "--question", "Why did CI fail?",
+        "--file", "ci.log", "--file", "extra.log",
+    ]
+    assert main(command) == 0
+    output = capsys.readouterr().out
+    assert "Investigation completed" in output
+    assert "Matching lines: 1" in output
+    assert "Selected granted file: ci.log" in output
+    assert "Analysis run ID:" in output
+    assert len(observed) == 2
+    first = str(observed[0]["messages"])
+    second = str(observed[1]["messages"])
+    assert "ci.log" in first and "extra.log" in first
+    assert "FAILED: expected VALUE=42" not in first
+    assert "UNGRANTED_TO_MODEL_SEARCH" not in first
+    assert "FAILED: expected VALUE=42" in second
+    assert "UNGRANTED_TO_MODEL_SEARCH" not in second
+    assert all(item["tools"] is None for item in observed)
+    assert main(command) == 2
+    assert len(observed) == 2
+    assert "already used" in capsys.readouterr().err
+    assert (workspace / "ci.log").read_text().startswith("PASS first")
+    handle = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    assert len(handle.list_readonly_turn_history()) == 2
+    other = directory.open_coworker(owner_id="local", coworker_id=scout.coworker_id)
+    source = handle.list_readonly_turn_history()
+    first_ref = next(
+        item.session_ref for item in source
+        if item.session_ref.session_id in output
+        and item.session_ref.run_id is not None
+    )
+    from ash.coworkers import CoworkerRuntimeUnavailable
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        other.execute_readonly_inspection(
+            run_id=first_ref.run_id,
+            session_id=first_ref.session_id,
+            request_id=str(uuid5(UUID(first_ref.run_id), "request")),
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+@pytest.mark.parametrize("answer", [
+    '{"action":"search_literal","files":["../ci.log"],"query":"FAILED"}',
+    '{"action":"search_literal","files":["other.log"],"query":"FAILED"}',
+    '{"action":"search_literal","files":["ci.log","ci.log"],"query":"FAILED"}',
+    '{"action":"shell","files":["ci.log"],"query":"FAILED"}',
+    '{"action":"search_literal","files":["ci.log"],"query":"FAILED","command":"cat .env"}',
+    '{"action":"search_literal","files":["ci.log"],"files":["other.log"],"query":"FAILED"}',
+    '{"action":"search_literal","files":["ci.log"],"query":"."}',
+    '{"action":"search_literal","files":["ci.log"],"query":"FA\\u202eILED"}',
+])
+def test_coworker_inspection_rejects_expanded_or_malformed_model_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], answer: str,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_draft_answer=answer,
+    )
+    (workspace / "ci.log").write_text("FAILED original\n")
+    (workspace / "other.log").write_text("DO NOT INSPECT\n")
+    identity = CoworkerDirectory.open(ash_dir).create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    assert main([
+        "crew", "investigate", "--owner", "local",
+        "--coworker-id", identity.coworker_id,
+        "--investigation-id", "adversarial-" + str(uuid4()),
+        "--question", "Why did CI fail?", "--file", "ci.log",
+    ]) == 2
+    assert "Investigation stopped at search" in capsys.readouterr().err
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew needs local UID")
+def test_inspection_refuses_stale_grant_before_second_model_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.coworkers import CoworkerHandle
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"search_literal","files":["ci.log"],"query":"FAILED"}',
+    )
+    granted = workspace / "ci.log"
+    granted.write_text("FAILED old\n")
+    identity = CoworkerDirectory.open(ash_dir).create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    original = CoworkerHandle.execute_readonly_inspection
+
+    def mutate_before_read(self: CoworkerHandle, **kwargs: Any) -> Any:
+        granted.write_text("FAILED newly modified\n")
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(CoworkerHandle, "execute_readonly_inspection",
+                        mutate_before_read)
+    assert main([
+        "crew", "investigate", "--owner", "local",
+        "--coworker-id", identity.coworker_id,
+        "--investigation-id", "stale-read",
+        "--question", "Why?", "--file", "ci.log",
+    ]) == 2
+    assert "changed after proposal" in capsys.readouterr().err
+    assert len(observed) == 1
+
+
+def test_coworker_literal_search_limits_results_and_never_interprets_regex() -> None:
+    from ash.coworker_inspection import literal_inspection
+    from ash.coworker_evidence import RepositoryEvidence
+    content = "\n".join(
+        ["ONE" + "x" * 120 + "a.b" + "z" * 180] * 35
+    )
+    report = json.loads(literal_inspection((RepositoryEvidence(
+        relative_path="test.log", sha256="a" * 64,
+        size_bytes=len(content.encode()), text=content,
+    ),), query="a.b"))
+    assert report["total_matching_lines"] == 35
+    assert len(report["matches"]) == 24
+    assert report["matches_omitted"] == 11
+    assert all(len(row["excerpt"]) <= 220 for row in report["matches"])
+    assert report["matches"][0]["line"] == 1
+    assert report["matches"][0]["truncated_right"] is True
+    none = json.loads(literal_inspection((RepositoryEvidence(
+        relative_path="test.log", sha256="a" * 64,
+        size_bytes=8, text="acb\nqrx",
+    ),), query="a.b"))
+    assert none["total_matching_lines"] == 0
