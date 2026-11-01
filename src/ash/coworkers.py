@@ -1022,6 +1022,19 @@ class CoworkerResponsibilityRun:
     execution_kind: CoworkerResponsibilityExecutionKind = "legacy"
 
 
+@dataclass(frozen=True)
+class CoworkerResponsibilityTimelineEntry:
+    """Persisted responsibility occurrence with independently verified follow-up."""
+
+    run: CoworkerResponsibilityRun
+    workflow: Literal["ordinary", "investigation"]
+    analysis_status: Literal["not_applicable", "not_started", "claimed", "completed"]
+    analysis_run_id: str | None = None
+    analysis_session_id: str | None = None
+    approval_id: str | None = None
+    approval_status: CoworkerFileApprovalStatus | None = None
+
+
 CoworkerActivityCause = Literal["ask", "manual", "event", "scheduled"]
 
 
@@ -4494,6 +4507,162 @@ class CoworkerDirectory:
             ).fetchall()
         return [_responsibility_run_from_row(row) for row in rows]
 
+    def _responsibility_timeline(
+        self,
+        handle: "CoworkerHandle",
+        responsibility_id: str,
+        *,
+        limit: int,
+    ) -> tuple[CoworkerResponsibilityTimelineEntry, ...]:
+        """Join completed plans, follow-up claims and exact approval journals.
+
+        Read-only: no provider calls, no correction reconciliation, and no
+        inferred completion when a separate investigation phase is missing.
+        """
+
+        runs = self._list_responsibility_runs(
+            handle, responsibility_id, limit=limit,
+        )
+        current = self._require_coworker_owner_binding(handle)
+        entries: list[CoworkerResponsibilityTimelineEntry] = []
+        for run in runs:
+            workflow: Literal["ordinary", "investigation"] = "ordinary"
+            status: Literal[
+                "not_applicable", "not_started", "claimed", "completed"
+            ] = "not_applicable"
+            analysis_run_id: str | None = None
+            analysis_session_id: str | None = None
+            approval_id: str | None = None
+            approval_status: CoworkerFileApprovalStatus | None = None
+            if run.status == "completed" and run.execution_kind == "model":
+                if run.session_id is None or run.request_id is None:
+                    raise CoworkerDirectoryError(
+                        "completed timeline run lacks persisted source identity"
+                    )
+                _, session, _, _, response_hash = (
+                    self._require_completed_coworker_turn(
+                        handle, run_id=run.run_id,
+                        session_id=run.session_id,
+                        request_id=run.request_id,
+                        require_active=False,
+                        model_only=True,
+                    )
+                )
+                if session.messages[0].metadata.get(
+                    "coworker_inspection_proposal_v1"
+                ) is True:
+                    workflow = "investigation"
+                    status = "not_started"
+                    analysis_turn_id = str(uuid5(
+                        UUID(run.run_id),
+                        "responsibility-inspection-analysis-v1",
+                    ))
+                    analysis_run_id = str(uuid5(
+                        UUID(current.coworker_id),
+                        f"ash-crew-readonly-turn:{analysis_turn_id}",
+                    ))
+                    with closing(self._connect()) as conn:
+                        row = conn.execute(
+                            "SELECT run_id, session_id, request_id, status, "
+                            "responsibility_id, trigger_type, execution_kind "
+                            "FROM coworker_turn_dispatches WHERE owner_id = ? "
+                            "AND coworker_id = ? AND run_id = ?",
+                            (current.owner_id, current.coworker_id, analysis_run_id),
+                        ).fetchone()
+                    if row is not None:
+                        if (
+                            row["responsibility_id"] is not None
+                            or row["trigger_type"] is not None
+                            or row["execution_kind"] != "model"
+                            or row["request_id"] != str(
+                                uuid5(UUID(analysis_run_id), "request")
+                            )
+                            or not isinstance(row["session_id"], str)
+                            or row["status"] not in {"claimed", "completed"}
+                        ):
+                            raise CoworkerDirectoryError(
+                                "investigation follow-up claim has inconsistent attribution"
+                            )
+                        analysis_session_id = str(row["session_id"])
+                        if row["status"] == "claimed":
+                            status = "claimed"
+                        else:
+                            _, analysis_session, _, _, _ = (
+                                self._require_completed_coworker_turn(
+                                    handle, run_id=analysis_run_id,
+                                    session_id=analysis_session_id,
+                                    request_id=str(row["request_id"]),
+                                    require_active=False,
+                                    model_only=True,
+                                )
+                            )
+                            marker = "Untrusted request data:\n"
+                            raw = analysis_session.messages[0].content
+                            if raw.count(marker) != 1:
+                                raise CoworkerDirectoryError(
+                                    "investigation follow-up format changed"
+                                )
+                            envelope = _strict_correction_json(
+                                raw.split(marker, 1)[1]
+                            )
+                            if not isinstance(envelope.get("evidence"), str):
+                                raise CoworkerDirectoryError(
+                                    "investigation follow-up lacks evidence"
+                                )
+                            provenance = _strict_correction_json(
+                                envelope["evidence"]
+                            )
+                            if (
+                                provenance.get("source_run_id") != run.run_id
+                                or provenance.get("source_response_sha256")
+                                != response_hash
+                                or provenance.get("responsibility_id")
+                                != run.responsibility_id
+                                or provenance.get("trigger_type") != run.trigger_type
+                                or provenance.get("event_key") != run.event_key
+                                or provenance.get("tool")
+                                != "read_only_literal_search_v1"
+                            ):
+                                raise CoworkerDirectoryError(
+                                    "investigation follow-up source binding changed"
+                                )
+                            status = "completed"
+
+                with closing(self._connect()) as conn:
+                    approval_row = conn.execute(
+                        "SELECT * FROM coworker_file_approvals "
+                        "WHERE owner_id = ? AND coworker_id = ? "
+                        "AND source_run_id = ?",
+                        (current.owner_id, current.coworker_id, run.run_id),
+                    ).fetchone()
+                    if approval_row is not None:
+                        approval = _approval_from_row(approval_row)
+                        self._file_approval_events(
+                            conn, approval_id=approval.approval_id,
+                            status=approval.status,
+                        )
+                        if (
+                            approval.owner_uid != current.owner_uid
+                            or approval.profile_name != current.profile_name
+                            or approval.workspace != current.workspace
+                            or approval.canonical_session_id
+                            != current.canonical_session_id
+                            or approval.source_session_id != run.session_id
+                            or approval.source_request_id != run.request_id
+                        ):
+                            raise CoworkerDirectoryError(
+                                "timeline approval source binding changed"
+                            )
+                        approval_id = approval.approval_id
+                        approval_status = approval.status
+            entries.append(CoworkerResponsibilityTimelineEntry(
+                run=run, workflow=workflow, analysis_status=status,
+                analysis_run_id=analysis_run_id,
+                analysis_session_id=analysis_session_id,
+                approval_id=approval_id, approval_status=approval_status,
+            ))
+        return tuple(entries)
+
     def _list_readonly_turn_history(
         self,
         handle: "CoworkerHandle",
@@ -6574,6 +6743,15 @@ class CoworkerHandle:
             target_path=target_path,
             replacement_file_path=replacement_file_path,
             from_response=from_response,
+        )
+
+    def responsibility_timeline(
+        self, responsibility_id: str, *, limit: int = 20,
+    ) -> tuple[CoworkerResponsibilityTimelineEntry, ...]:
+        """Read a durable, owner-bound timeline without retrying or applying work."""
+
+        return self._directory._responsibility_timeline(
+            self, responsibility_id, limit=limit,
         )
 
     def list_file_approvals(

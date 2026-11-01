@@ -1004,6 +1004,51 @@ def _responsibility(args: argparse.Namespace) -> int:
                 analysis = asyncio.run(handle.analyze_responsibility_investigation(result))
                 _render_model_turn(analysis)
             return 0
+        if action == "timeline":
+            entries = handle.responsibility_timeline(
+                args.responsibility_id, limit=args.limit,
+            )
+            if not entries:
+                _write_line("No recorded occurrences for this responsibility.")
+                return 0
+            for entry in entries:
+                run = entry.run
+                _write_line(
+                    f"Occurrence: {_safe_text(run.event_key, single_line=True)} "
+                    f"({run.trigger_type})"
+                )
+                _write_line(f"Plan/run status: {run.status}")
+                _write_line(f"Run ID: {run.run_id}")
+                if run.session_id:
+                    _write_line(f"Run session ID: {run.session_id}")
+                _write_line(f"Workflow: {entry.workflow}")
+                if run.status == "claimed":
+                    _write_line(
+                        "Initial outcome unknown; claim consumed. No automatic replay."
+                    )
+                if run.skip_reason:
+                    _write_line(f"Skip reason: {run.skip_reason}")
+                if entry.workflow == "investigation":
+                    _write_line(f"Analysis status: {entry.analysis_status}")
+                    if entry.analysis_run_id:
+                        _write_line(f"Analysis run ID: {entry.analysis_run_id}")
+                    if entry.analysis_session_id:
+                        _write_line(
+                            f"Analysis session ID: {entry.analysis_session_id}"
+                        )
+                    if entry.analysis_status != "completed":
+                        _write_line(
+                            "Investigation not confirmed complete; inspect session "
+                            "history before planning new work."
+                        )
+                if entry.approval_id is not None:
+                    _write_line(f"Correction approval ID: {entry.approval_id}")
+                    _write_line(f"Correction approval status: {entry.approval_status}")
+                    _write_line(
+                        "Approval state is separate from investigation completion."
+                    )
+                _write_line("")
+            return 0
         if action == "runs":
             runs = handle.list_responsibility_runs(
                 args.responsibility_id,

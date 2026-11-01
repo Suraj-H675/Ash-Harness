@@ -74,3 +74,11 @@ authentication, TLS, source trust and operational security. There is no
 durable pre-ingress queue or guaranteed remote delivery; a host shutdown
 before a run claim may lose an HTTP event if the sender does not reconcile.
 Remote hosting and push alerts remain separate capabilities.
+
+For post-event recovery, the owner can inspect the authenticated event's
+responsibility with ash crew responsibility timeline --owner local
+--coworker-id ID --responsibility-id ID. This verifies any separately
+claimed investigation analysis and reported correction approval status even
+after a process restart, without redispatching the event. A completed plan
+with no completed analysis remains **partial**, even if the original HTTP
+connection closed before a response reached the sender.

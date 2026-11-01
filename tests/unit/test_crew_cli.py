@@ -4847,6 +4847,11 @@ def test_atlas_manual_responsibility_drafts_exact_correction_with_full_approval(
     approval, _ = handle.inspect_file_approval(approval_id)
     assert approval.status == "pending"
     assert approval.replacement_content == b"VALUE = 2\n"
+    before, = handle.responsibility_timeline(task.responsibility_id)
+    assert before.workflow == "ordinary"
+    assert before.approval_id == approval_id
+    assert before.approval_status == "pending"
+    assert before.analysis_status == "not_applicable"
     assert target.read_bytes() == b"VALUE = 1\n"
     other = directory.open_coworker(owner_id="local", coworker_id=scout.coworker_id)
     from ash.coworkers import CoworkerNotFound
@@ -4874,6 +4879,10 @@ def test_atlas_manual_responsibility_drafts_exact_correction_with_full_approval(
     )
     final, events = reopened.inspect_file_approval(approval_id)
     assert final.status == "succeeded"
+    timeline, = reopened.responsibility_timeline(task.responsibility_id)
+    assert timeline.approval_id == approval_id
+    assert timeline.approval_status == "succeeded"
+    assert timeline.run.status == "completed"
     assert [event.status for event in events] == [
         "pending", "approved", "dispatching", "succeeded",
     ]
@@ -4932,6 +4941,11 @@ def test_change_only_model_schedule_skips_unchanged_and_uses_completed_baseline(
     assert runs[0].skip_reason == "evidence_unchanged"
     assert runs[0].session_id is None
     assert runs[1].status == "completed"
+    timeline = reopened.responsibility_timeline(responsibility.responsibility_id)
+    assert len(timeline) == 2
+    assert timeline[0].run.skip_reason == "evidence_unchanged"
+    assert timeline[0].analysis_status == "not_applicable"
+    assert timeline[1].workflow == "ordinary"
     assert reopened.get_responsibility(
         responsibility.responsibility_id
     ).next_fire_at == first + timedelta(seconds=20)
@@ -5785,3 +5799,341 @@ def test_loopback_event_investigation_returns_both_durable_sessions_without_writ
     assert len(runs) == 1
     assert runs[0].status == "completed"
     assert len(handle.list_readonly_turn_history()) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_responsibility_timeline_reconstructs_completed_and_partial_investigations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.coworkers import CoworkerNotFound
+
+    ash_dir, workspace, other_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"search_literal","files":["ci.log"],"query":"FAILED"}',
+    )
+    (workspace / "ci.log").write_text("FAILED expected 42 got 41\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas",
+        profile_name="atlas", workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout",
+        profile_name="scout", workspace=other_workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    task = handle.create_responsibility(
+        scope="Investigate CI", objective="Explain failure",
+        evidence_paths=("ci.log",),
+    )
+    initial = handle.responsibility_timeline(task.responsibility_id)
+    assert initial == ()
+    done = asyncio.run(handle.run_model_responsibility(
+        task.responsibility_id, event_id="complete-investigation",
+        investigate=True,
+    ))
+    completed = asyncio.run(handle.analyze_responsibility_investigation(done))
+    partial = asyncio.run(handle.run_model_responsibility(
+        task.responsibility_id, event_id="partial-investigation",
+        investigate=True,
+    ))
+    assert completed.session_ref.session_id != done.session_ref.session_id
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    entries = reopened.responsibility_timeline(task.responsibility_id)
+    assert len(entries) == 2
+    assert entries[0].run.event_key == "partial-investigation"
+    assert entries[0].workflow == "investigation"
+    assert entries[0].run.status == "completed"
+    assert entries[0].analysis_status == "not_started"
+    assert entries[0].analysis_run_id is not None
+    assert entries[0].analysis_session_id is None
+    assert entries[1].run.event_key == "complete-investigation"
+    assert entries[1].analysis_status == "completed"
+    assert entries[1].analysis_session_id == completed.session_ref.session_id
+    assert len(observed) == 3
+    command = [
+        "crew", "responsibility", "timeline", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+    ]
+    assert main(command) == 0
+    result = capsys.readouterr().out
+    assert "Analysis status: not_started" in result
+    assert "Analysis status: completed" in result
+    assert "No automatic replay" not in result
+    assert "Investigation not confirmed complete" in result
+    other = directory.open_coworker(
+        owner_id="local", coworker_id=scout.coworker_id,
+    )
+    with pytest.raises(CoworkerNotFound):
+        other.responsibility_timeline(task.responsibility_id)
+    with pytest.raises(ValueError):
+        reopened.responsibility_timeline(task.responsibility_id, limit=101)
+    assert main(command + ["--limit", "1"]) == 0
+    assert capsys.readouterr().out.count("Occurrence:") == 1
+    assert partial.session_ref.run_id == entries[0].run.run_id
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_responsibility_timeline_shows_uncertain_followup_claim_without_replaying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"search_literal","files":["ci.log"],"query":"FAILED"}',
+    )
+    (workspace / "ci.log").write_text("FAILED synthetic incident\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas",
+        profile_name="atlas", workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="CI monitoring", objective="Investigate",
+        evidence_paths=("ci.log",),
+    )
+    plan = asyncio.run(handle.run_model_responsibility(
+        task.responsibility_id, event_id="ambiguous-analysis",
+        investigate=True,
+    ))
+    assert plan.session_ref.run_id is not None
+    analysis_turn_id = str(uuid5(
+        UUID(plan.session_ref.run_id), "responsibility-inspection-analysis-v1",
+    ))
+    followup = str(uuid5(
+        UUID(atlas.coworker_id), f"ash-crew-readonly-turn:{analysis_turn_id}",
+    ))
+    background = handle.begin_background_run(followup)
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "INSERT INTO coworker_turn_dispatches "
+            "(owner_id,coworker_id,run_id,session_id,request_id,status,"
+            "execution_kind,created_at,workspace_device,workspace_inode) "
+            "VALUES (?,?,?,?,?,'claimed','model',?,?,?)",
+            (
+                "local", atlas.coworker_id, followup, background.session_id,
+                str(uuid5(UUID(followup), "request")),
+                "2026-10-31T12:00:00+00:00", workspace.stat().st_dev,
+                workspace.stat().st_ino,
+            ),
+        )
+    fresh = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    entry, = fresh.responsibility_timeline(task.responsibility_id)
+    assert entry.analysis_status == "claimed"
+    assert entry.analysis_session_id == background.session_id
+    assert len(observed) == 1
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        asyncio.run(fresh.analyze_responsibility_investigation(plan))
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_crew_atlas_scout_integrated_acceptance_timeline_and_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two real coworker profiles, two distinct triggers, durable review and exact effect."""
+
+    import hmac
+    from datetime import datetime, timezone
+    from ash.automation.schedules import build_schedule
+
+    ash_dir, atlas_root, scout_root = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"search_literal","files":["ci.log"],"query":"FAILED"}',
+        scout_draft_answer='{"action":"search_literal","files":["scout.log"],"query":"FAILED"}',
+    )
+    (atlas_root / "ci.log").write_text("FAILED expected ANSWER=42 got 41\n")
+    (scout_root / "scout.log").write_text("FAILED new research check\n")
+    (atlas_root / "answer.py").write_text("ANSWER = 41\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=atlas_root,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_root,
+    )
+    ah = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    sh = directory.open_coworker(owner_id="local", coworker_id=scout.coworker_id)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    monkeypatch.setattr("ash.crew_events.utc_now", lambda: now)
+    atlas_task = ah.create_responsibility(
+        scope="Monitor Atlas CI", objective="Investigate CI error",
+        evidence_paths=("ci.log",),
+    )
+    scout_task = sh.create_responsibility(
+        scope="Monitor Scout research", objective="Report check failures",
+        evidence_paths=("scout.log",),
+        schedule=build_schedule(every="10s", now=now),
+    )
+    signing = bytes(range(32))
+    private_key = tmp_path / "ci-signing.key"
+    private_key.write_text(signing.hex() + "\n")
+    private_key.chmod(0o600)
+    envelope: dict[str, object] = {
+        "version": 1, "source": "ci", "id": "ci-acceptance-1",
+        "issued_at": now.isoformat(),
+        "responsibility_id": atlas_task.responsibility_id,
+        "payload": "Synthetic CI error report",
+    }
+    canonical = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
+    envelope["signature"] = hmac.new(signing, canonical, hashlib.sha256).hexdigest()
+    atlas_source = asyncio.run(ah.run_signed_event(
+        json.dumps(envelope).encode(), key_file=private_key,
+        responsibility_id=atlas_task.responsibility_id, investigate=True,
+    ))
+    atlas_analysis = asyncio.run(ah.analyze_responsibility_investigation(
+        atlas_source,
+    ))
+    assert atlas_analysis.session_ref.session_id != atlas_source.session_ref.session_id
+    assert scout_task.first_fire_at is not None
+    monkeypatch.setattr("ash.coworkers._current_time",
+                        lambda: scout_task.first_fire_at)
+    scout_result = asyncio.run(sh.run_due_model_responsibilities_once(
+        investigate=True,
+    ))
+    assert scout_result.status == "completed"
+    assert scout_result.analysis is not None
+    assert len(observed) == 4
+    assert [item["model"] for item in observed] == [
+        "gpt-atlas", "gpt-atlas", "gpt-scout", "gpt-scout",
+    ]
+    assert all(item["tools"] is None for item in observed)
+    assert "FAILED new research" not in str(observed[:2])
+    assert "FAILED expected ANSWER=42" not in str(observed[2:])
+    assert (atlas_root / "answer.py").read_text() == "ANSWER = 41\n"
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        asyncio.run(ah.run_signed_event(
+            json.dumps(envelope).encode(), key_file=private_key,
+            responsibility_id=atlas_task.responsibility_id, investigate=True,
+        ))
+    assert len(observed) == 4
+
+    # Owner explicitly chooses a second, separately authorized correction task.
+    _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer=json.dumps({
+            "action": "replace", "target": "answer.py",
+            "replacement": "ANSWER = 42\n",
+        }),
+    )
+    correction_task = ah.create_responsibility(
+        scope="Correct accepted CI failure", objective="Prepare exact correction",
+        evidence_paths=("ci.log", "answer.py"),
+    )
+    correction = asyncio.run(ah.run_model_responsibility(
+        correction_task.responsibility_id, event_id="approved-correction-1",
+        draft_correction=True,
+    ))
+    assert correction.session_ref.run_id is not None
+    approval = ah.prepare_file_approval(
+        run_id=correction.session_ref.run_id,
+        session_id=correction.session_ref.session_id,
+        request_id=correction.request_id,
+        target_path="answer.py", from_response=True,
+    )
+    assert approval.status == "pending"
+    assert (atlas_root / "answer.py").read_text() == "ANSWER = 41\n"
+
+    # Reopen from stored data, not the in-memory CoworkerDirectory object.
+    reopened = CoworkerDirectory.open(ash_dir)
+    atlas_again = reopened.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    scout_again = reopened.open_coworker(
+        owner_id="local", coworker_id=scout.coworker_id,
+    )
+    event_timeline, = atlas_again.responsibility_timeline(
+        atlas_task.responsibility_id,
+    )
+    assert event_timeline.run.trigger_type == "event"
+    assert event_timeline.analysis_status == "completed"
+    assert event_timeline.analysis_session_id == atlas_analysis.session_ref.session_id
+    scout_timeline, = scout_again.responsibility_timeline(
+        scout_task.responsibility_id,
+    )
+    assert scout_timeline.run.trigger_type == "scheduled"
+    assert scout_timeline.analysis_status == "completed"
+    staged, = atlas_again.responsibility_timeline(
+        correction_task.responsibility_id,
+    )
+    assert staged.approval_status == "pending"
+    assert staged.approval_id == approval.approval_id
+
+    expected = iter([
+        f"APPROVE {approval.approval_id} {approval.approval_digest}",
+        f"APPLY {approval.approval_id} {approval.approval_digest}",
+    ])
+    monkeypatch.setattr(
+        "ash.commands.crew._require_tty_confirmation",
+        lambda challenge: challenge == next(expected),
+    )
+    for action in ("approve", "apply"):
+        assert main([
+            "crew", action, "--owner", "local",
+            "--coworker-id", atlas.coworker_id,
+            "--approval-id", approval.approval_id,
+        ]) == 0
+    assert (atlas_root / "answer.py").read_text() == "ANSWER = 42\n"
+    finished, = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    ).responsibility_timeline(correction_task.responsibility_id)
+    assert finished.approval_status == "succeeded"
+    assert scout_again.responsibility_timeline(scout_task.responsibility_id)[
+        0
+    ].analysis_status == "completed"
+    assert "status: succeeded" in capsys.readouterr().out.lower()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_responsibility_timeline_rejects_unrelated_followup_with_matching_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.coworkers import CoworkerDirectoryError, CoworkerTurnRequest
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"search_literal","files":["ci.log"],"query":"FAILED"}',
+    )
+    (workspace / "ci.log").write_text("FAILED expected 42\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="CI", objective="Find failure", evidence_paths=("ci.log",),
+    )
+    plan = asyncio.run(handle.run_model_responsibility(
+        task.responsibility_id, event_id="source", investigate=True,
+    ))
+    assert plan.session_ref.run_id is not None
+    turn_id = str(uuid5(
+        UUID(plan.session_ref.run_id),
+        "responsibility-inspection-analysis-v1",
+    ))
+    # A separately claimed readonly turn with the same computed identity
+    # cannot masquerade as analysis of this source.
+    asyncio.run(handle.run_readonly_turn(
+        CoworkerTurnRequest(
+            turn_id=turn_id,
+            question="Unrelated summary", evidence='{"tool":"some_other_tool"}',
+        ),
+    ))
+    with pytest.raises(CoworkerDirectoryError, match="source binding changed"):
+        handle.responsibility_timeline(task.responsibility_id)

@@ -204,3 +204,37 @@ two-step investigation contract.
 
 This is still not unrestricted filesystem discovery, shell execution,
 test running, remote webhook serving or unsupervised source editing.
+
+## Inspect one responsibility's complete execution timeline
+
+Use the owner-bound timeline after a manual run, signed event, scheduled tick,
+process restart, or interrupted two-stage investigation:
+
+~~~bash
+ash crew responsibility timeline --owner local \
+  --coworker-id COWORKER_UUID \
+  --responsibility-id RESPONSIBILITY_UUID --limit 20
+~~~
+
+The timeline reads existing durable records; **it does not call a model,
+redispatch an event, reconcile or apply a file effect**. For each occurrence it
+shows its trigger, consumed run claim and status. For model-backed investigation
+plans, it derives the deterministic follow-up run identity and verifies the
+separately persisted source response hash, responsibility, trigger and event
+provenance before reporting Analysis status: completed.
+
+not_started means no matching follow-up claim exists; claimed means a
+follow-up claim exists but its completed outcome is unverified. Neither means
+success, and neither authorizes automatic replay. A claimed original run
+likewise has an unknown outcome. For ordinary runs the analysis field is
+not_applicable. The timeline also reports any owner-scoped correction
+approval independently as pending, approved, denied, dispatching, succeeded,
+failed, blocked or ambiguous. Only the approval journal, not model text or a
+completed investigation, establishes an applied effect.
+
+For full model responses, inspect crew responsibility runs and crew history,
+or examine the persisted session IDs through Crew's existing facilities.
+Invalid source/follow-up identity or tampered approval evidence makes the
+timeline fail closed; it never fabricates a successful workflow. This does not
+create a durable pre-ingress queue or guarantee delivery of HTTP requests
+while the listener is offline.

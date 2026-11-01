@@ -324,6 +324,14 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     responsibility_runs.add_argument("--coworker-id", required=True)
     responsibility_runs.add_argument("--responsibility-id", required=True)
     responsibility_runs.add_argument("--limit", type=int, default=10)
+    responsibility_timeline = crew_responsibility_subparsers.add_parser(
+        "timeline",
+        help="Show one responsibility's durable investigation, follow-up and approval",
+    )
+    responsibility_timeline.add_argument("--owner", required=True)
+    responsibility_timeline.add_argument("--coworker-id", required=True)
+    responsibility_timeline.add_argument("--responsibility-id", required=True)
+    responsibility_timeline.add_argument("--limit", type=int, default=20)
     crew_event = crew_subparsers.add_parser(
         "event", help="Admit one signed event from stdin or a local file"
     )
