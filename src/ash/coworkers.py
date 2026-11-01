@@ -82,13 +82,13 @@ from ash.coworker_worker import (
     WORKER_MODEL,
     WORKER_RESPONSE,
 )
-from ash.crew_events import parse_signed_crew_event
+from ash.crew_events import MAX_CREW_EVENT_BYTES, VerifiedCrewEvent, parse_signed_crew_event
 from ash.sandbox.docker import COWORKER_IMAGE, DEFAULT_IMAGE
 from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
 _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION = 9
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 12
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 13
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
 _MAX_COWORKER_BRIEF_BYTES = 2048
@@ -1020,6 +1020,29 @@ class CoworkerResponsibilityRun:
     scheduled_for: datetime | None = None
     skip_reason: str | None = None
     execution_kind: CoworkerResponsibilityExecutionKind = "legacy"
+
+
+@dataclass(frozen=True)
+class CoworkerAcceptedEvent:
+    """One persisted signed envelope; receipt status never grants replay rights."""
+
+    responsibility_id: str
+    event_key: str
+    status: Literal["accepted", "dispatching", "completed", "unknown"]
+    received_at: str
+    investigate: bool
+    draft_correction: bool
+    run_id: str | None = None
+    session_id: str | None = None
+    analysis_session_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CoworkerAcceptedEventDispatch:
+    """One explicit delivery attempt and its separately persisted analysis."""
+
+    plan: CoworkerModelTurnResult
+    analysis: CoworkerModelTurnResult | None = None
 
 
 @dataclass(frozen=True)
@@ -2929,6 +2952,7 @@ class CoworkerDirectory:
                     8,
                     10,
                     11,
+                    12,
                     _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION,
                     _COWORKER_DIRECTORY_SCHEMA_VERSION,
                 }:
@@ -3436,6 +3460,53 @@ class CoworkerDirectory:
                         raise CoworkerDirectoryError("coworker brief owner binding changed")
                     self._brief_from_row(brief_row)
                 _create_coworker_file_approval_tables(conn)
+                if (
+                    not fresh_directory and original_version >= 13
+                    and "coworker_accepted_events" not in tables
+                ):
+                    raise CoworkerDirectoryError(
+                        "coworker accepted event schema is incomplete"
+                    )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coworker_accepted_events (
+                        owner_id TEXT NOT NULL,
+                        owner_uid INTEGER NOT NULL,
+                        coworker_id TEXT NOT NULL,
+                        responsibility_id TEXT NOT NULL,
+                        event_key TEXT NOT NULL,
+                        envelope BLOB NOT NULL,
+                        envelope_sha256 TEXT NOT NULL,
+                        received_at TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK(status IN (
+                            'accepted', 'dispatching', 'completed', 'unknown'
+                        )),
+                        investigate INTEGER NOT NULL CHECK(investigate IN (0,1)),
+                        draft_correction INTEGER NOT NULL CHECK(draft_correction IN (0,1)),
+                        run_id TEXT,
+                        session_id TEXT,
+                        analysis_session_id TEXT,
+                        PRIMARY KEY(owner_id,coworker_id,responsibility_id,event_key),
+                        FOREIGN KEY(responsibility_id)
+                            REFERENCES coworker_responsibilities(responsibility_id),
+                        CHECK(NOT (investigate = 1 AND draft_correction = 1))
+                    )
+                    """
+                )
+                accepted_columns = {
+                    str(column["name"]) for column in conn.execute(
+                        "PRAGMA table_info(coworker_accepted_events)"
+                    )
+                }
+                if accepted_columns != {
+                    "owner_id", "owner_uid", "coworker_id", "responsibility_id",
+                    "event_key", "envelope", "envelope_sha256", "received_at",
+                    "status", "investigate", "draft_correction",
+                    "run_id", "session_id", "analysis_session_id",
+                }:
+                    raise CoworkerDirectoryError(
+                        "coworker accepted event schema is incomplete"
+                    )
                 conn.execute(
                     "UPDATE coworker_directory_meta SET schema_version = ?",
                     (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
@@ -4506,6 +4577,216 @@ class CoworkerDirectory:
                 (current.owner_id, current.coworker_id, identifier, limit),
             ).fetchall()
         return [_responsibility_run_from_row(row) for row in rows]
+
+    @staticmethod
+    def _accepted_event_from_row(
+        row: sqlite3.Row, current: Coworker,
+    ) -> CoworkerAcceptedEvent:
+        if (
+            row["owner_id"] != current.owner_id
+            or row["owner_uid"] != current.owner_uid
+            or row["coworker_id"] != current.coworker_id
+            or row["status"] not in {"accepted", "dispatching", "completed", "unknown"}
+            or row["investigate"] not in (0, 1)
+            or row["draft_correction"] not in (0, 1)
+            or (row["investigate"] and row["draft_correction"])
+        ):
+            raise CoworkerDirectoryError("accepted event owner or status changed")
+        envelope = row["envelope"]
+        if not isinstance(envelope, bytes):
+            raise CoworkerDirectoryError("accepted event stored bytes are invalid")
+        if row["status"] == "accepted":
+            if (
+                not 0 < len(envelope) <= MAX_CREW_EVENT_BYTES
+                or hashlib.sha256(envelope).hexdigest() != row["envelope_sha256"]
+            ):
+                raise CoworkerDirectoryError("accepted event evidence changed")
+        elif envelope:
+            raise CoworkerDirectoryError("consumed event retained private payload")
+        try:
+            stamp = datetime.fromisoformat(str(row["received_at"]))
+            if stamp.tzinfo is None or stamp.utcoffset() is None:
+                raise ValueError("missing UTC offset")
+            responsibility_id = _normalize_responsibility_id(row["responsibility_id"])
+            event_key = _normalize_responsibility_event_key(row["event_key"])
+        except (ValueError, TypeError) as exc:
+            raise CoworkerDirectoryError("accepted event identity changed") from exc
+        return CoworkerAcceptedEvent(
+            responsibility_id=responsibility_id, event_key=event_key,
+            status=row["status"], received_at=stamp.isoformat(),
+            investigate=bool(row["investigate"]),
+            draft_correction=bool(row["draft_correction"]),
+            run_id=row["run_id"], session_id=row["session_id"],
+            analysis_session_id=row["analysis_session_id"],
+        )
+
+    def _accept_signed_event(
+        self, handle: "CoworkerHandle", envelope: bytes, *,
+        key_file: Path, responsibility_id: str,
+        investigate: bool, draft_correction: bool,
+    ) -> CoworkerAcceptedEvent:
+        current = self._require_local_coworker_owner(handle)
+        identifier = _normalize_responsibility_id(responsibility_id)
+        if investigate and draft_correction:
+            raise ValueError("cannot combine investigation and correction drafting")
+        if draft_correction and current.profile_name != "atlas":
+            raise CoworkerRuntimeUnavailable("correction drafting requires Atlas")
+        received_at = datetime.now(timezone.utc)
+        event = parse_signed_crew_event(
+            envelope, key_file=key_file, workspace=current.workspace,
+            now=received_at,
+        )
+        if event.responsibility_id != identifier:
+            raise CoworkerRuntimeUnavailable(
+                "signed event target does not match the requested responsibility"
+            )
+        with closing(self._connect_durable()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            verified = self._require_local_coworker_owner(handle, conn)
+            if verified.lifecycle_status != "active":
+                raise CoworkerRuntimeUnavailable("coworker is not active")
+            responsibility = conn.execute(
+                "SELECT status FROM coworker_responsibilities WHERE "
+                "owner_id=? AND coworker_id=? AND responsibility_id=?",
+                (current.owner_id, current.coworker_id, identifier),
+            ).fetchone()
+            if responsibility is None or responsibility["status"] != "active":
+                raise CoworkerRuntimeUnavailable("event responsibility is not active")
+            previous = conn.execute(
+                "SELECT 1 FROM coworker_turn_dispatches WHERE "
+                "owner_id=? AND coworker_id=? AND responsibility_id=? "
+                "AND trigger_type='event' AND event_key=?",
+                (current.owner_id, current.coworker_id, identifier, event.event_key),
+            ).fetchone()
+            if previous is not None:
+                raise CoworkerRuntimeUnavailable(
+                    "event already claimed; duplicate intake refused"
+                )
+            count = conn.execute(
+                "SELECT COUNT(*) FROM coworker_accepted_events WHERE "
+                "owner_id=? AND coworker_id=? AND status='accepted'",
+                (current.owner_id, current.coworker_id),
+            ).fetchone()[0]
+            if count >= 128:
+                raise CoworkerRuntimeUnavailable("accepted event backlog is full")
+            try:
+                conn.execute(
+                    "INSERT INTO coworker_accepted_events "
+                    "(owner_id,owner_uid,coworker_id,responsibility_id,event_key,"
+                    "envelope,envelope_sha256,received_at,status,investigate,draft_correction) "
+                    "VALUES (?,?,?,?,?,?,?,?,'accepted',?,?)",
+                    (
+                        current.owner_id, current.owner_uid, current.coworker_id,
+                        identifier, event.event_key, envelope,
+                        hashlib.sha256(envelope).hexdigest(),
+                        received_at.isoformat(), int(investigate), int(draft_correction),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise CoworkerRuntimeUnavailable(
+                    "event already accepted; duplicate intake refused"
+                ) from exc
+            row = conn.execute(
+                "SELECT * FROM coworker_accepted_events WHERE owner_id=? "
+                "AND coworker_id=? AND responsibility_id=? AND event_key=?",
+                (current.owner_id, current.coworker_id, identifier, event.event_key),
+            ).fetchone()
+            return self._accepted_event_from_row(row, current)
+
+    def _list_accepted_events(
+        self, handle: "CoworkerHandle", *, limit: int,
+    ) -> tuple[CoworkerAcceptedEvent, ...]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("accepted event limit must be between 1 and 100")
+        current = self._require_coworker_owner_binding(handle)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM coworker_accepted_events WHERE owner_id=? "
+                "AND coworker_id=? ORDER BY received_at DESC,event_key LIMIT ?",
+                (current.owner_id, current.coworker_id, limit),
+            ).fetchall()
+        return tuple(self._accepted_event_from_row(row, current) for row in rows)
+
+    def _reserve_accepted_event(
+        self, handle: "CoworkerHandle", *, responsibility_id: str,
+        event_key: str, key_file: Path,
+    ) -> tuple[VerifiedCrewEvent, CoworkerAcceptedEvent]:
+        current = self._require_local_coworker_owner(handle)
+        identifier = _normalize_responsibility_id(responsibility_id)
+        event_key = _normalize_responsibility_event_key(event_key)
+        with closing(self._connect_durable()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            verified = self._require_local_coworker_owner(handle, conn)
+            if verified.lifecycle_status != "active":
+                raise CoworkerRuntimeUnavailable("coworker is not active")
+            row = conn.execute(
+                "SELECT * FROM coworker_accepted_events WHERE owner_id=? "
+                "AND coworker_id=? AND responsibility_id=? AND event_key=?",
+                (current.owner_id, current.coworker_id, identifier, event_key),
+            ).fetchone()
+            if row is None:
+                raise CoworkerNotFound("accepted event not found")
+            stored = self._accepted_event_from_row(row, current)
+            if stored.status != "accepted":
+                raise CoworkerRuntimeUnavailable(
+                    "accepted event already reserved; refusing replay"
+                )
+            responsibility = conn.execute(
+                "SELECT status FROM coworker_responsibilities WHERE "
+                "owner_id=? AND coworker_id=? AND responsibility_id=?",
+                (current.owner_id, current.coworker_id, identifier),
+            ).fetchone()
+            if responsibility is None or responsibility["status"] != "active":
+                raise CoworkerRuntimeUnavailable("event responsibility is not active")
+            event = parse_signed_crew_event(
+                row["envelope"], key_file=key_file,
+                workspace=current.workspace,
+                now=datetime.fromisoformat(stored.received_at),
+            )
+            if event.responsibility_id != identifier or event.event_key != event_key:
+                raise CoworkerDirectoryError("accepted signed event identity changed")
+            previous = conn.execute(
+                "SELECT 1 FROM coworker_turn_dispatches WHERE owner_id=? "
+                "AND coworker_id=? AND responsibility_id=? "
+                "AND trigger_type='event' AND event_key=?",
+                (current.owner_id, current.coworker_id, identifier, event_key),
+            ).fetchone()
+            if previous is not None:
+                raise CoworkerRuntimeUnavailable(
+                    "accepted event already consumed by another dispatch"
+                )
+            updated = conn.execute(
+                "UPDATE coworker_accepted_events SET status='dispatching',"
+                "envelope=X'' WHERE owner_id=? AND coworker_id=? "
+                "AND responsibility_id=? AND event_key=? AND status='accepted'",
+                (current.owner_id, current.coworker_id, identifier, event_key),
+            )
+            if updated.rowcount != 1:
+                raise CoworkerDirectoryError("accepted event reservation changed")
+        return event, stored
+
+    def _finish_accepted_event(
+        self, handle: "CoworkerHandle", *, responsibility_id: str,
+        event_key: str, run_id: str | None, session_id: str | None,
+        analysis_session_id: str | None,
+    ) -> None:
+        current = self._require_coworker_owner_binding(handle)
+        with closing(self._connect_durable()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE coworker_accepted_events SET "
+                "status=?,run_id=?,session_id=?,analysis_session_id=? "
+                "WHERE owner_id=? AND coworker_id=? AND responsibility_id=? "
+                "AND event_key=? AND status='dispatching'",
+                (
+                    "completed" if session_id else "unknown",
+                    run_id, session_id, analysis_session_id,
+                    current.owner_id, current.coworker_id,
+                    responsibility_id, event_key,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CoworkerDirectoryError("accepted event finish status changed")
 
     def _responsibility_timeline(
         self,
@@ -6745,6 +7026,64 @@ class CoworkerHandle:
             from_response=from_response,
         )
 
+    def accept_signed_event(
+        self, envelope: bytes, *, key_file: Path, responsibility_id: str,
+        investigate: bool = False, draft_correction: bool = False,
+    ) -> CoworkerAcceptedEvent:
+        """Persist authenticated input without dispatching any model."""
+
+        return self._directory._accept_signed_event(
+            self, envelope, key_file=key_file,
+            responsibility_id=responsibility_id, investigate=investigate,
+            draft_correction=draft_correction,
+        )
+
+    def list_accepted_events(
+        self, *, limit: int = 50,
+    ) -> tuple[CoworkerAcceptedEvent, ...]:
+        """Read owner-bound, metadata-only accepted event receipts."""
+
+        return self._directory._list_accepted_events(self, limit=limit)
+
+    async def dispatch_accepted_event(
+        self, *, responsibility_id: str, event_key: str, key_file: Path,
+    ) -> CoworkerAcceptedEventDispatch:
+        """Consume an accepted receipt once, before any potential model request."""
+
+        event, receipt = self._directory._reserve_accepted_event(
+            self, responsibility_id=responsibility_id,
+            event_key=event_key, key_file=key_file,
+        )
+        plan: CoworkerModelTurnResult | None = None
+        analysis: CoworkerModelTurnResult | None = None
+        try:
+            plan = await self._run_verified_signed_event(
+                event, responsibility_id=responsibility_id,
+                check_model=False, investigate=receipt.investigate,
+                draft_correction=receipt.draft_correction,
+            )
+            if receipt.investigate:
+                analysis = await self.analyze_responsibility_investigation(plan)
+        except BaseException:
+            # A crash between reservation and completion leaves a distinct,
+            # non-replayable dispatching receipt for the owner's investigation.
+            self._directory._finish_accepted_event(
+                self, responsibility_id=responsibility_id,
+                event_key=event_key, run_id=(
+                    plan.session_ref.run_id if plan is not None else None
+                ), session_id=None, analysis_session_id=None,
+            )
+            raise
+        self._directory._finish_accepted_event(
+            self, responsibility_id=responsibility_id,
+            event_key=event_key, run_id=plan.session_ref.run_id,
+            session_id=plan.session_ref.session_id,
+            analysis_session_id=(
+                analysis.session_ref.session_id if analysis is not None else None
+            ),
+        )
+        return CoworkerAcceptedEventDispatch(plan=plan, analysis=analysis)
+
     def responsibility_timeline(
         self, responsibility_id: str, *, limit: int = 20,
     ) -> tuple[CoworkerResponsibilityTimelineEntry, ...]:
@@ -6968,6 +7307,19 @@ class CoworkerHandle:
             key_file=key_file,
             workspace=current.workspace,
         )
+        return await self._run_verified_signed_event(
+            event, responsibility_id=identifier, check_model=check_model,
+            investigate=investigate, draft_correction=draft_correction,
+        )
+
+    async def _run_verified_signed_event(
+        self, event: VerifiedCrewEvent, *, responsibility_id: str,
+        check_model: bool, investigate: bool, draft_correction: bool,
+    ) -> CoworkerModelTurnResult:
+        """Run only an already authenticated and owner/receipt-bound event."""
+
+        current = self._directory._require_local_coworker_owner(self)
+        identifier = _normalize_responsibility_id(responsibility_id)
         if event.responsibility_id != identifier:
             raise CoworkerRuntimeUnavailable(
                 "signed event target does not match the requested responsibility"

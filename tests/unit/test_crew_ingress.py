@@ -252,3 +252,24 @@ async def test_ingress_unknown_post_dispatch_refusal_is_never_reported_as_denial
         }
 
     await _with_listener(dispatch, action)
+
+
+@pytest.mark.asyncio
+async def test_loopback_ingress_returns_202_only_for_durably_accepted_receipt() -> None:
+    async def store(envelope: bytes) -> CrewIngressReceipt:
+        assert envelope == b"signed-input"
+        return CrewIngressReceipt(
+            run_id="", session_id="", request_id=None,
+            accepted_event_key="local-ci:123",
+        )
+
+    async def action(port: int) -> None:
+        code, body = await _send(port, _request(port, b"signed-input"))
+        assert code == 202
+        assert body == {
+            "status": "accepted",
+            "event_key": "local-ci:123",
+            "note": "durable_receipt_only_no_model_dispatch",
+        }
+
+    await _with_listener(store, action)

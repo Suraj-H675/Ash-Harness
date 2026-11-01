@@ -380,6 +380,32 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         "--only-if-changed", action="store_true",
         help="Skip scheduled model work when granted evidence matches the last completed run",
     )
+    crew_intake = crew_subparsers.add_parser(
+        "intake", help="Accept, inspect and explicitly dispatch durable signed events",
+    )
+    intake_actions = crew_intake.add_subparsers(
+        dest="crew_intake_action", required=True,
+    )
+    for action, help_text in (
+        ("accept", "Persist a validated signed event without model dispatch"),
+        ("list", "Show persisted event receipts and dispatch outcomes"),
+        ("dispatch", "Consume one accepted event through the Crew model exactly once"),
+    ):
+        command = intake_actions.add_parser(action, help=help_text)
+        command.add_argument("--owner", required=True)
+        command.add_argument("--coworker-id", required=True)
+        if action in {"accept", "dispatch"}:
+            command.add_argument("--responsibility-id", required=True)
+            command.add_argument("--key-file", type=Path, required=True)
+        if action == "accept":
+            command.add_argument("--input", default="-")
+            command.add_argument("--investigate", action="store_true")
+            command.add_argument("--draft-correction", action="store_true")
+        if action == "dispatch":
+            command.add_argument("--event-key", required=True)
+        if action == "list":
+            command.add_argument("--limit", type=int, default=50)
+
     crew_listen = crew_subparsers.add_parser(
         "listen", help="Receive HMAC-signed Crew events on 127.0.0.1 only",
     )
@@ -389,6 +415,10 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     crew_listen.add_argument(
         "--key-file", required=True, type=Path,
         help="Owner-provisioned private 0600 event HMAC key outside the workspace",
+    )
+    crew_listen.add_argument(
+        "--store-only", action="store_true",
+        help="Persist authenticated events for explicit later dispatch; return HTTP 202",
     )
     crew_listen.add_argument(
         "--port", type=int, default=8781,

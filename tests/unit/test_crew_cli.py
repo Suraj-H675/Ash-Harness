@@ -15,7 +15,7 @@ from uuid import UUID, uuid4, uuid5
 import pytest
 
 from ash.cli import main
-from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
+from ash.coworkers import CoworkerDirectory, CoworkerNotFound, CoworkerRuntimeUnavailable
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.messages import MessageInput
 from ash.providers.registry import ProviderRegistry
@@ -6137,3 +6137,356 @@ def test_responsibility_timeline_rejects_unrelated_followup_with_matching_run_id
     ))
     with pytest.raises(CoworkerDirectoryError, match="source binding changed"):
         handle.responsibility_timeline(task.responsibility_id)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_durable_signed_intake_survives_restart_dispatches_once_without_renewing_signature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import hmac
+    from datetime import datetime, timedelta, timezone
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_answer="Read-only CI outcome",
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="CI", objective="Report signed failure",
+    )
+    key = bytes(range(32))
+    key_file = tmp_path / "ingress.key"
+    key_file.write_text(key.hex() + "\n")
+    key_file.chmod(0o600)
+    issued = datetime.now(timezone.utc).replace(microsecond=0)
+    document: dict[str, object] = {
+        "version": 1, "source": "ci", "id": "durable-1",
+        "issued_at": issued.isoformat(),
+        "responsibility_id": task.responsibility_id,
+        "payload": "CI failed; no secrets",
+    }
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    document["signature"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    path = tmp_path / "signed-event.json"
+    path.write_text(json.dumps(document))
+    base = [
+        "--owner", "local", "--coworker-id", atlas.coworker_id,
+    ]
+    assert main([
+        "crew", "intake", "accept", *base,
+        "--responsibility-id", task.responsibility_id,
+        "--key-file", str(key_file), "--input", str(path),
+    ]) == 0
+    assert "Durably stored; no model run" in capsys.readouterr().out
+    assert len(observed) == 0
+    first, = handle.list_accepted_events()
+    assert first.status == "accepted"
+    assert first.event_key == "ci:durable-1"
+    with pytest.raises(CoworkerRuntimeUnavailable, match="duplicate"):
+        handle.accept_signed_event(
+            path.read_bytes(), key_file=key_file,
+            responsibility_id=task.responsibility_id,
+        )
+    # Freshness was authenticated at acceptance. Long-lived durable receipt
+    # rechecks the same original signature against the stored receipt instant.
+    monkeypatch.setattr("ash.crew_events.utc_now", lambda: issued + timedelta(hours=6))
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    assert reopened.list_accepted_events()[0].status == "accepted"
+    assert main([
+        "crew", "intake", "dispatch", *base,
+        "--responsibility-id", task.responsibility_id,
+        "--key-file", str(key_file), "--event-key", "ci:durable-1",
+    ]) == 0
+    assert "Durably accepted event dispatched once" in capsys.readouterr().out
+    assert len(observed) == 1
+    finished, = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    ).list_accepted_events()
+    assert finished.status == "completed"
+    assert finished.run_id and finished.session_id
+    assert not finished.analysis_session_id
+    with sqlite3.connect(directory.db_path) as conn:
+        row, = conn.execute(
+            "SELECT envelope FROM coworker_accepted_events "
+            "WHERE coworker_id=?", (atlas.coworker_id,),
+        ).fetchone()
+        assert row == b""
+    assert main([
+        "crew", "intake", "dispatch", *base,
+        "--responsibility-id", task.responsibility_id,
+        "--key-file", str(key_file), "--event-key", "ci:durable-1",
+    ]) == 2
+    assert len(observed) == 1
+    assert "reserved" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_signed_intake_refuses_forged_or_cross_coworker_event_and_marks_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hmac
+    from datetime import datetime, timezone
+
+    ash_dir, workspace, other_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_answer="Read-only outcome",
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=other_workspace,
+    )
+    ah = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    sh = directory.open_coworker(owner_id="local", coworker_id=scout.coworker_id)
+    task = ah.create_responsibility(scope="CI", objective="Analyze receipt")
+    key = bytes(range(32))
+    key_file = tmp_path / "ingress.key"
+    key_file.write_text(key.hex() + "\n")
+    key_file.chmod(0o600)
+    document: dict[str, object] = {
+        "version": 1, "source": "ci", "id": "uncertain",
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "responsibility_id": task.responsibility_id,
+        "payload": "CI failed",
+    }
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    document["signature"] = "0" * 64
+    with pytest.raises(ValueError):
+        ah.accept_signed_event(
+            json.dumps(document).encode(), key_file=key_file,
+            responsibility_id=task.responsibility_id,
+        )
+    assert ah.list_accepted_events() == ()
+    document["signature"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    envelope = json.dumps(document).encode()
+    with pytest.raises(CoworkerRuntimeUnavailable, match="does not match"):
+        sh.accept_signed_event(
+            envelope, key_file=key_file,
+            responsibility_id=str(uuid4()),
+        )
+    accepted = ah.accept_signed_event(
+        envelope, key_file=key_file, responsibility_id=task.responsibility_id,
+    )
+    with pytest.raises(CoworkerNotFound):
+        sh._directory._reserve_accepted_event(
+            sh, responsibility_id=task.responsibility_id,
+            event_key=accepted.event_key, key_file=key_file,
+        )
+    # Once the receipt was reserved, a crash must not make it dispatchable.
+    event, prior = ah._directory._reserve_accepted_event(
+        ah, responsibility_id=task.responsibility_id,
+        event_key=accepted.event_key, key_file=key_file,
+    )
+    assert event.event_key == accepted.event_key
+    assert prior.status == "accepted"
+    fresh = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    in_flight, = fresh.list_accepted_events()
+    assert in_flight.status == "dispatching"
+    with pytest.raises(CoworkerRuntimeUnavailable, match="reserved"):
+        asyncio.run(fresh.dispatch_accepted_event(
+            responsibility_id=task.responsibility_id,
+            event_key=accepted.event_key, key_file=key_file,
+        ))
+    assert len(observed) == 0
+    with sqlite3.connect(directory.db_path) as conn:
+        row, = conn.execute(
+            "SELECT envelope FROM coworker_accepted_events "
+            "WHERE coworker_id=?", (atlas.coworker_id,),
+        ).fetchone()
+    assert row == b""
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_queued_investigation_from_signed_event_preserves_two_turn_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hmac
+    from datetime import datetime, timezone
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"search_literal","files":["ci.log"],"query":"FAILED"}',
+    )
+    (workspace / "ci.log").write_text("PASS baseline\nFAILED expected 42 got 41\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="CI", objective="Report error", evidence_paths=("ci.log",),
+    )
+    key = bytes(range(32))
+    key_file = tmp_path / "key"
+    key_file.write_text(key.hex() + "\n")
+    key_file.chmod(0o600)
+    doc: dict[str, object] = {
+        "version": 1, "source": "ci", "id": "investigate-queue",
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "responsibility_id": task.responsibility_id,
+        "payload": "Investigate failure",
+    }
+    canonical = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+    doc["signature"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    accepted = handle.accept_signed_event(
+        json.dumps(doc).encode(),
+        key_file=key_file, responsibility_id=task.responsibility_id,
+        investigate=True,
+    )
+    assert len(observed) == 0
+    fresh = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    result = asyncio.run(fresh.dispatch_accepted_event(
+        responsibility_id=task.responsibility_id,
+        event_key=accepted.event_key, key_file=key_file,
+    ))
+    assert result.analysis is not None
+    assert len(observed) == 2
+    assert "FAILED expected" not in str(observed[0]["messages"])
+    assert "FAILED expected" in str(observed[1]["messages"])
+    assert all(call["tools"] is None for call in observed)
+    finished, = fresh.list_accepted_events()
+    assert finished.status == "completed"
+    assert finished.run_id == result.plan.session_ref.run_id
+    assert finished.analysis_session_id == result.analysis.session_ref.session_id
+    timeline, = fresh.responsibility_timeline(task.responsibility_id)
+    assert timeline.analysis_status == "completed"
+    assert timeline.analysis_session_id == result.analysis.session_ref.session_id
+    assert (workspace / "ci.log").read_text().startswith("PASS baseline")
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        asyncio.run(fresh.dispatch_accepted_event(
+            responsibility_id=task.responsibility_id,
+            event_key=accepted.event_key, key_file=key_file,
+        ))
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_accepted_event_failed_after_reservation_remains_unknown_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hmac
+    from datetime import datetime, timezone
+    from ash.coworkers import CoworkerHandle
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="CI", objective="Report event",
+    )
+    key = bytes(range(32))
+    path = tmp_path / "key"
+    path.write_text(key.hex() + "\n")
+    path.chmod(0o600)
+    doc: dict[str, object] = {
+        "version": 1, "source": "ci", "id": "fail-once",
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "responsibility_id": task.responsibility_id,
+        "payload": "Synthetic dispatch failure",
+    }
+    canonical = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
+    doc["signature"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    accepted = handle.accept_signed_event(
+        json.dumps(doc).encode(), key_file=path,
+        responsibility_id=task.responsibility_id,
+    )
+
+    async def fail_after_reservation(self: CoworkerHandle, event: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("synthetic unknown dispatch outcome")
+
+    monkeypatch.setattr(CoworkerHandle, "_run_verified_signed_event",
+                        fail_after_reservation)
+    with pytest.raises(RuntimeError):
+        asyncio.run(handle.dispatch_accepted_event(
+            responsibility_id=task.responsibility_id,
+            event_key=accepted.event_key, key_file=path,
+        ))
+    fresh = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    receipt, = fresh.list_accepted_events()
+    assert receipt.status == "unknown"
+    assert len(observed) == 0
+    with pytest.raises(CoworkerRuntimeUnavailable, match="reserved"):
+        asyncio.run(fresh.dispatch_accepted_event(
+            responsibility_id=task.responsibility_id,
+            event_key=accepted.event_key, key_file=path,
+        ))
+    assert len(observed) == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_loopback_store_only_requires_auth_and_has_no_model_side_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hmac
+    from datetime import datetime, timezone
+    from ash.crew_ingress import CrewIngressRefusal
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(scope="CI", objective="Read CI status")
+    key = bytes(range(32))
+    key_file = tmp_path / "key"
+    key_file.write_text(key.hex() + "\n")
+    key_file.chmod(0o600)
+    data: dict[str, object] = {
+        "version": 1, "source": "ci", "id": "http-queue",
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "responsibility_id": task.responsibility_id, "payload": "Signed CI incident",
+    }
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    data["signature"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    message = json.dumps(data).encode()
+
+    async def listener(process: Any, *, port: int, ready: Any) -> None:
+        ready(port)
+        bad = data.copy()
+        bad["signature"] = "0" * 64
+        with pytest.raises(CrewIngressRefusal) as denied:
+            await process(json.dumps(bad).encode())
+        assert denied.value.status == 403
+        receipt = await process(message)
+        assert receipt.accepted_event_key == "ci:http-queue"
+        with pytest.raises(CrewIngressRefusal) as duplicate:
+            await process(message)
+        assert duplicate.value.status == 409
+
+    monkeypatch.setattr("ash.commands.crew.serve_crew_ingress", listener)
+    assert main([
+        "crew", "listen", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--key-file", str(key_file), "--store-only",
+    ]) == 0
+    assert len(observed) == 0
+    stored, = handle.list_accepted_events()
+    assert stored.status == "accepted"

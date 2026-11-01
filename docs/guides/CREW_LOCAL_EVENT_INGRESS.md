@@ -82,3 +82,64 @@ claimed investigation analysis and reported correction approval status even
 after a process restart, without redispatching the event. A completed plan
 with no completed analysis remains **partial**, even if the original HTTP
 connection closed before a response reached the sender.
+
+## Optional durable intake (explicit owner-controlled dispatch)
+
+If the model must not run during HTTP admission, start the same loopback
+listener with --store-only. For valid HMAC-signed events this returns HTTP
+202 Accepted **only after** the signed envelope has been committed to the
+owner-bound SQLite database. A 202 does not indicate model execution.
+The old synchronous listener remains the default when this flag is omitted.
+
+~~~bash
+ash crew listen --owner local --coworker-id COWORKER_UUID \
+  --responsibility-id RESPONSIBILITY_UUID \
+  --key-file /private/path/crew-event.key --port 8781 --store-only
+~~~
+
+Inspect and explicitly deliver a stored event when the owner wants Crew to
+work on it:
+
+~~~bash
+ash crew intake list --owner local --coworker-id COWORKER_UUID
+ash crew intake dispatch --owner local --coworker-id COWORKER_UUID \
+  --responsibility-id RESPONSIBILITY_UUID \
+  --event-key ci:unique-event-id \
+  --key-file /private/path/crew-event.key
+~~~
+
+A local owner can also store a previously authenticated envelope from a
+private file or stdin without launching the server:
+
+~~~bash
+ash crew intake accept --owner local --coworker-id COWORKER_UUID \
+  --responsibility-id RESPONSIBILITY_UUID \
+  --key-file /private/path/crew-event.key --input signed-event.json \
+  --investigate
+~~~
+
+At acceptance Crew validates owner, active coworker/responsibility, target,
+the signing key, HMAC, five-minute timestamp freshness, event identity and
+the configured follow-up mode. It stores the exact signed bytes with their
+SHA-256 digest and receipt time. A maximum of 128 not-yet-dispatched events
+per coworker is permitted. At explicit dispatch Crew verifies the original
+signature again using the trusted persisted acceptance time; queued events
+can therefore be delivered after their original signature has aged beyond
+five minutes without accepting fresh *expired* events from callers. The same
+private key must remain available.
+
+Before the model can be contacted, Crew atomically reserves the receipt as
+dispatching and erases its persisted event body. After successful processing
+it records completed run/session identities; on an ordinary failure it
+records unknown, and after a crash the older dispatching receipt remains
+**uncertain**. Neither state is automatically replayed. Duplicates, including
+a receipt with an already-consumed signed event identity, are rejected.
+The existing responsibility-run and investigation timelines can be used to
+reconcile downstream model outcomes.
+
+This does **not** provide a durable network queue while the computer is
+powered off. Requests only enter the receipt journal while the loopback
+listener is running and reaches SQLite; a sender must still deal with
+connection failures. It also does not run the backlog autonomously: an
+owner explicitly dispatches individual accepted receipts. A successful
+HTTP 202 confirms storage only, not processing or an applied correction.

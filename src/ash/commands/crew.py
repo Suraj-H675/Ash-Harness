@@ -84,6 +84,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _event(args)
     if action == "listen":
         return _listen(args)
+    if action == "intake":
+        return _intake(args)
     if action == "tick":
         return _tick(args)
     if action == "worker":
@@ -1191,6 +1193,74 @@ def _event(args: argparse.Namespace) -> int:
         return 2
 
 
+def _intake(args: argparse.Namespace) -> int:
+    """Owner-driven recovery surface; never silently retry an ambiguous event."""
+
+    try:
+        handle = _open_coworker_handle(args)
+        action = args.crew_intake_action
+        if action == "accept":
+            receipt = handle.accept_signed_event(
+                _read_event_envelope(args.input),
+                key_file=args.key_file, responsibility_id=args.responsibility_id,
+                investigate=args.investigate,
+                draft_correction=args.draft_correction,
+            )
+            _write_line(f"Accepted event: {_safe_text(receipt.event_key, single_line=True)}")
+            _write_line("Durably stored; no model run was dispatched.")
+            return 0
+        if action == "list":
+            receipts = handle.list_accepted_events(limit=args.limit)
+            if not receipts:
+                _write_line("No accepted event receipts found.")
+            for receipt in receipts:
+                _write_line(
+                    f"Event: {_safe_text(receipt.event_key, single_line=True)} "
+                    f"Responsibility: {receipt.responsibility_id} "
+                    f"Status: {receipt.status}"
+                )
+                if receipt.run_id is not None:
+                    _write_line(f"Run ID: {receipt.run_id}")
+                if receipt.session_id is not None:
+                    _write_line(f"Session ID: {receipt.session_id}")
+                if receipt.analysis_session_id is not None:
+                    _write_line(f"Analysis session ID: {receipt.analysis_session_id}")
+            return 0
+        if action == "dispatch":
+            result = asyncio.run(handle.dispatch_accepted_event(
+                responsibility_id=args.responsibility_id,
+                event_key=args.event_key, key_file=args.key_file,
+            ))
+            _write_line("Durably accepted event dispatched once.")
+            _render_model_turn(result.plan)
+            if result.analysis is not None:
+                _write_line("Verified investigation analysis:")
+                _render_model_turn(result.analysis)
+            return 0
+        raise ValueError("unsupported accepted event action")
+    except KeyboardInterrupt:
+        _write_error(
+            "Event intake interrupted; dispatch outcome may be unknown. "
+            "Inspect intake list and responsibility timeline before any new action."
+        )
+        return 130
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        CrewEventError, AshError, OSError, SafetyViolation,
+        SessionStorageError, ValueError,
+    ) as exc:
+        _write_error(
+            "Event intake blocked or incomplete. Inspect durable receipts "
+            f"before retrying: {_safe_error(exc)}"
+        )
+        return 2
+    except Exception as exc:
+        _write_error(
+            f"Event intake outcome unknown ({type(exc).__name__}); inspect receipts."
+        )
+        return 2
+
+
 def _listen(args: argparse.Namespace) -> int:
     """Bounded local HTTP transport into the existing signed-event dispatcher."""
 
@@ -1211,6 +1281,30 @@ def _listen(args: argparse.Namespace) -> int:
         validate_crew_event_key_file(args.key_file, workspace=current.workspace)
 
         async def receive(envelope: bytes) -> CrewIngressReceipt:
+            if args.store_only:
+                try:
+                    stored = handle.accept_signed_event(
+                        envelope, key_file=args.key_file,
+                        responsibility_id=args.responsibility_id,
+                        investigate=args.investigate,
+                        draft_correction=args.draft_correction,
+                    )
+                    return CrewIngressReceipt(
+                        run_id="", session_id="", request_id=None,
+                        accepted_event_key=stored.event_key,
+                    )
+                except CrewEventError as exc:
+                    raise CrewIngressRefusal(
+                        403, "invalid_signature_or_event",
+                    ) from exc
+                except CoworkerRuntimeUnavailable as exc:
+                    message = str(exc).casefold()
+                    duplicate = "already" in message or "duplicate" in message
+                    raise CrewIngressRefusal(
+                        409 if duplicate else 422,
+                        "duplicate_or_claimed" if duplicate
+                        else "responsibility_unavailable",
+                    ) from exc
             try:
                 result = await handle.run_signed_event(
                     envelope, key_file=args.key_file,
@@ -1254,11 +1348,18 @@ def _listen(args: argparse.Namespace) -> int:
             _write_line(
                 f"Signed Crew event ingress: http://127.0.0.1:{bound_port}/crew/event"
             )
-            _write_line(
-                "Loopback only. Signed events are processed serially; HTTP success "
-                "means the model turn finished, not that a correction was approved. "
-                "An interrupted request may have an unknown outcome. Inspect Crew history."
-            )
+            if args.store_only:
+                _write_line(
+                    "Loopback only. HTTP 202 means signed bytes were committed "
+                    "durably, with no model dispatch. Run crew intake dispatch "
+                    "explicitly after inspecting the backlog."
+                )
+            else:
+                _write_line(
+                    "Loopback only. Signed events are processed serially; HTTP success "
+                    "means the model turn finished, not that a correction was approved. "
+                    "An interrupted request may have an unknown outcome. Inspect Crew history."
+                )
             sys.stdout.flush()
 
         asyncio.run(serve_crew_ingress(

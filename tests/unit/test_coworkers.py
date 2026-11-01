@@ -1366,7 +1366,7 @@ def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
         assert connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall() == []
@@ -1513,7 +1513,7 @@ def test_v5_coworker_directory_migration_adds_cursor_and_preserves_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -2461,7 +2461,7 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
@@ -2544,7 +2544,7 @@ def test_coworker_directory_v3_migration_preserves_dispatch_history(
     with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
         columns = {
             str(row[1])
             for row in connection.execute(
@@ -3591,7 +3591,7 @@ def test_v2_coworker_directory_migration_adds_file_approval_boundary(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
         assert connection.execute(
             "SELECT COUNT(*) FROM coworker_file_approvals"
         ).fetchone() == (0,)
@@ -3640,7 +3640,7 @@ def test_v6_coworker_directory_migration_keeps_legacy_dispatch_unbound(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
 
 
 def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
@@ -3757,7 +3757,7 @@ def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
         columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(coworker_turn_dispatches)")
@@ -3813,7 +3813,7 @@ def test_v8_coworker_directory_migration_grants_no_ambient_evidence(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
         assert connection.execute(
             "SELECT evidence_paths_json FROM coworker_responsibilities "
             "WHERE responsibility_id = ?",
@@ -3910,7 +3910,7 @@ def test_v9_lifecycle_migration_preserves_responsibility_schedule_and_claims(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
@@ -4072,7 +4072,7 @@ def test_v11_change_only_skip_migration_preserves_previous_dispatch_and_constrai
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
         sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' "
             "AND name = 'coworker_turn_dispatches'"
@@ -4083,3 +4083,35 @@ def test_v11_change_only_skip_migration_preserves_previous_dispatch_and_constrai
     assert run.run_id == run_id
     assert run.request_id == request_id
     assert run.status == "claimed"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew owner binding requires UID")
+def test_v12_durable_event_migration_preserves_crew_state_and_rejects_v13_missing_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+    from ash.coworkers import CoworkerDirectory, CoworkerDirectoryError
+
+    root = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(root, workspace)
+    task = handle.create_responsibility(
+        scope="Persist migration", objective="Keep existing task",
+    )
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute("DROP TABLE coworker_accepted_events")
+        conn.execute("UPDATE coworker_directory_meta SET schema_version=12")
+    reopened = CoworkerDirectory.open(root)
+    assert reopened.open_coworker(
+        owner_id=identity.owner_id, coworker_id=identity.coworker_id,
+    ).get_responsibility(task.responsibility_id).scope == "Persist migration"
+    with sqlite3.connect(directory.db_path) as conn:
+        assert conn.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (13,)
+        assert conn.execute("SELECT COUNT(*) FROM coworker_accepted_events"
+                           ).fetchone() == (0,)
+        conn.execute("DROP TABLE coworker_accepted_events")
+    with pytest.raises(CoworkerDirectoryError, match="accepted event schema is incomplete"):
+        CoworkerDirectory.open(root)

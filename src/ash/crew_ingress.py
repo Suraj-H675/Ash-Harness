@@ -23,6 +23,7 @@ class CrewIngressReceipt:
     session_id: str
     request_id: str | None
     analysis_session_id: str | None = None
+    accepted_event_key: str | None = None
 
 
 class CrewIngressRefusal(Exception):
@@ -81,7 +82,7 @@ async def _respond(
     writer: asyncio.StreamWriter, status: int, payload: dict[str, Any],
 ) -> None:
     reasons = {
-        200: "OK", 400: "Bad Request", 403: "Forbidden",
+        200: "OK", 202: "Accepted", 400: "Bad Request", 403: "Forbidden",
         404: "Not Found", 409: "Conflict", 413: "Content Too Large",
         415: "Unsupported Media Type", 422: "Unprocessable Content",
         429: "Too Many Requests", 500: "Internal Server Error",
@@ -158,14 +159,21 @@ async def serve_crew_ingress(
             in_flight = True
             try:
                 receipt = await process(envelope)
-                await _respond(writer, 200, {
-                    "status": "completed",
-                    "run_id": receipt.run_id,
-                    "session_id": receipt.session_id,
-                    "request_id": receipt.request_id,
-                    "analysis_session_id": receipt.analysis_session_id,
-                    "note": "no_source_changes_or_approvals_implied",
-                })
+                if receipt.accepted_event_key is not None:
+                    await _respond(writer, 202, {
+                        "status": "accepted",
+                        "event_key": receipt.accepted_event_key,
+                        "note": "durable_receipt_only_no_model_dispatch",
+                    })
+                else:
+                    await _respond(writer, 200, {
+                        "status": "completed",
+                        "run_id": receipt.run_id,
+                        "session_id": receipt.session_id,
+                        "request_id": receipt.request_id,
+                        "analysis_session_id": receipt.analysis_session_id,
+                        "note": "no_source_changes_or_approvals_implied",
+                    })
             finally:
                 in_flight = False
         except CrewIngressRefusal as exc:
