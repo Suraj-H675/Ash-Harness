@@ -6490,3 +6490,112 @@ def test_loopback_store_only_requires_auth_and_has_no_model_side_effect(
     assert len(observed) == 0
     stored, = handle.list_accepted_events()
     assert stored.status == "accepted"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_accepted_event_receipt_refuses_forged_completed_run_attribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The receipt is not independent proof that a model call completed."""
+    import hmac
+    from datetime import datetime, timezone
+    from ash.coworkers import CoworkerDirectoryError
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(scope="CI", objective="Explain failure")
+    key = bytes(range(32))
+    key_file = tmp_path / "intake.key"
+    key_file.write_text(key.hex() + "\n")
+    key_file.chmod(0o600)
+    document: dict[str, object] = {
+        "version": 1, "source": "ci", "id": "forged-completion",
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "responsibility_id": task.responsibility_id,
+        "payload": "Synthetic incident",
+    }
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    document["signature"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    handle.accept_signed_event(
+        json.dumps(document).encode(), key_file=key_file,
+        responsibility_id=task.responsibility_id,
+    )
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "UPDATE coworker_accepted_events SET status='completed',envelope=X'',"
+            "run_id=?,session_id=? WHERE coworker_id=?",
+            (str(uuid4()), str(uuid4()), atlas.coworker_id),
+        )
+    with pytest.raises(CoworkerDirectoryError, match="completed receipt"):
+        CoworkerDirectory.open(ash_dir).open_coworker(
+            owner_id="local", coworker_id=atlas.coworker_id,
+        ).list_accepted_events()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_accepted_investigation_receipt_refuses_unrelated_completed_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed plan is not evidence that its analysis also completed."""
+
+    import hmac
+    from datetime import datetime, timezone
+    from ash.coworkers import CoworkerDirectoryError
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"search_literal","files":["ci.log"],"query":"FAILED"}',
+    )
+    (workspace / "ci.log").write_text("FAILED synthetic incident\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    task = handle.create_responsibility(
+        scope="CI", objective="Investigate", evidence_paths=("ci.log",),
+    )
+    key = bytes(range(32))
+    key_file = tmp_path / "intake.key"
+    key_file.write_text(key.hex() + "\n")
+    key_file.chmod(0o600)
+    document: dict[str, object] = {
+        "version": 1, "source": "ci", "id": "analysis-integrity",
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "responsibility_id": task.responsibility_id, "payload": "CI failure",
+    }
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    document["signature"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    receipt = handle.accept_signed_event(
+        json.dumps(document).encode(), key_file=key_file,
+        responsibility_id=task.responsibility_id, investigate=True,
+    )
+    processed = asyncio.run(handle.dispatch_accepted_event(
+        responsibility_id=task.responsibility_id,
+        event_key=receipt.event_key, key_file=key_file,
+    ))
+    assert processed.analysis is not None
+    assert len(observed) == 2
+    assert handle.list_accepted_events()[0].status == "completed"
+
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "UPDATE coworker_accepted_events SET analysis_session_id=? "
+            "WHERE coworker_id=?",
+            (str(uuid4()), atlas.coworker_id),
+        )
+    fresh = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    with pytest.raises(CoworkerDirectoryError, match="completed receipt"):
+        fresh.list_accepted_events()
+    assert len(observed) == 2

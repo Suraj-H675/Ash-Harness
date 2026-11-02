@@ -143,3 +143,19 @@ listener is running and reaches SQLite; a sender must still deal with
 connection failures. It also does not run the backlog autonomously: an
 owner explicitly dispatches individual accepted receipts. A successful
 HTTP 202 confirms storage only, not processing or an applied correction.
+
+## Completed receipt verification
+
+The crew intake list operation does not trust a receipt's completed flag on
+its own. For each completed event it verifies the deterministic signed-event
+run identity against the actual persisted, owner/coworker-bound, tool-free
+model transcript and its responsibility/trigger. For a queued investigation
+it also verifies the distinct completed analysis session and its original
+response SHA-256, trigger, event and responsibility binding. A missing,
+altered or unrelated underlying record causes the listing to fail closed
+instead of reporting an unearned completion.
+
+An unknown or dispatching receipt remains non-replayable, even if
+subsequent inspection finds that some work completed. Use the responsibility
+timeline to investigate a partial outcome; the intake reader performs no
+model calls, network operations, status changes or automatic retries.

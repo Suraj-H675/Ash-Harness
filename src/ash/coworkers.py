@@ -4603,6 +4603,17 @@ class CoworkerDirectory:
                 raise CoworkerDirectoryError("accepted event evidence changed")
         elif envelope:
             raise CoworkerDirectoryError("consumed event retained private payload")
+        if (
+            (row["status"] in {"accepted", "dispatching"}
+             and (row["run_id"] is not None or row["session_id"] is not None
+                  or row["analysis_session_id"] is not None))
+            or (row["status"] == "unknown"
+                and (row["session_id"] is not None
+                     or row["analysis_session_id"] is not None))
+            or (row["status"] == "completed"
+                and (row["run_id"] is None or row["session_id"] is None))
+        ):
+            raise CoworkerDirectoryError("accepted event receipt state is inconsistent")
         try:
             stamp = datetime.fromisoformat(str(row["received_at"]))
             if stamp.tzinfo is None or stamp.utcoffset() is None:
@@ -4693,6 +4704,96 @@ class CoworkerDirectory:
             ).fetchone()
             return self._accepted_event_from_row(row, current)
 
+    def _verify_completed_accepted_event(
+        self, handle: "CoworkerHandle", receipt: CoworkerAcceptedEvent,
+    ) -> None:
+        """Require real, source-bound model evidence before reporting completion."""
+
+        if receipt.status != "completed":
+            return
+        if (
+            receipt.run_id != _signed_event_run_id(
+                receipt.responsibility_id, receipt.event_key
+            )
+            or receipt.session_id is None
+        ):
+            raise CoworkerDirectoryError(
+                "completed receipt does not match its signed event run"
+            )
+        try:
+            _, plan, _, _, response_hash = self._require_completed_coworker_turn(
+                handle, run_id=receipt.run_id,
+                session_id=receipt.session_id,
+                request_id=str(uuid5(UUID(receipt.run_id), "request")),
+                require_active=False, model_only=True,
+            )
+            source = plan.messages[0].metadata
+            if (
+                source.get("coworker_responsibility_id") != receipt.responsibility_id
+                or source.get("coworker_trigger_type") != "event"
+                or source.get("coworker_event_id") != receipt.event_key
+                or (
+                    source.get("coworker_inspection_proposal_v1") is True
+                ) != receipt.investigate
+            ):
+                raise CoworkerDirectoryError(
+                    "completed receipt source attribution changed"
+                )
+            if not receipt.investigate:
+                if receipt.analysis_session_id is not None:
+                    raise CoworkerDirectoryError(
+                        "ordinary completed receipt has unrelated analysis"
+                    )
+                return
+            if receipt.analysis_session_id is None:
+                raise CoworkerDirectoryError(
+                    "completed receipt lacks required investigation analysis"
+                )
+            turn_id = str(uuid5(
+                UUID(receipt.run_id), "responsibility-inspection-analysis-v1",
+            ))
+            current = self._require_coworker_owner_binding(handle)
+            analysis_run_id = str(uuid5(
+                UUID(current.coworker_id), f"ash-crew-readonly-turn:{turn_id}",
+            ))
+            _, analysis, _, _, _ = self._require_completed_coworker_turn(
+                handle, run_id=analysis_run_id,
+                session_id=receipt.analysis_session_id,
+                request_id=str(uuid5(UUID(analysis_run_id), "request")),
+                require_active=False, model_only=True,
+            )
+            marker = "Untrusted request data:\n"
+            raw = analysis.messages[0].content
+            if raw.count(marker) != 1:
+                raise CoworkerDirectoryError(
+                    "completed receipt analysis format is invalid"
+                )
+            request = _strict_correction_json(raw.split(marker, 1)[1])
+            evidence = request.get("evidence")
+            if not isinstance(evidence, str):
+                raise CoworkerDirectoryError(
+                    "completed receipt analysis evidence is missing"
+                )
+            provenance = _strict_correction_json(evidence)
+            if (
+                provenance.get("source_run_id") != receipt.run_id
+                or provenance.get("source_response_sha256") != response_hash
+                or provenance.get("responsibility_id") != receipt.responsibility_id
+                or provenance.get("trigger_type") != "event"
+                or provenance.get("event_key") != receipt.event_key
+                or provenance.get("tool") != "read_only_literal_search_v1"
+            ):
+                raise CoworkerDirectoryError(
+                    "completed receipt analysis provenance changed"
+                )
+        except (
+            ValueError, CoworkerRuntimeUnavailable, CoworkerNotFound,
+            SessionStorageError,
+        ) as exc:
+            raise CoworkerDirectoryError(
+                "completed receipt has missing or invalid durable model evidence"
+            ) from exc
+
     def _list_accepted_events(
         self, handle: "CoworkerHandle", *, limit: int,
     ) -> tuple[CoworkerAcceptedEvent, ...]:
@@ -4705,7 +4806,10 @@ class CoworkerDirectory:
                 "AND coworker_id=? ORDER BY received_at DESC,event_key LIMIT ?",
                 (current.owner_id, current.coworker_id, limit),
             ).fetchall()
-        return tuple(self._accepted_event_from_row(row, current) for row in rows)
+        receipts = tuple(self._accepted_event_from_row(row, current) for row in rows)
+        for receipt in receipts:
+            self._verify_completed_accepted_event(handle, receipt)
+        return receipts
 
     def _reserve_accepted_event(
         self, handle: "CoworkerHandle", *, responsibility_id: str,
