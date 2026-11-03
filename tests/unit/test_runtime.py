@@ -2536,3 +2536,89 @@ def test_runtime_builds_user_opt_in_mcp_interaction_controller(tmp_path) -> None
     assert controller.supports_sampling is True
     assert controller.supports_elicitation is True
     assert controller.sampling_max_tokens == 321
+
+
+@pytest.mark.asyncio
+async def test_turn_only_runtime_refuses_tool_dispatch_even_after_registry_mutation(
+    tmp_path: Path,
+) -> None:
+    """A future native Crew tool executor must not borrow the model turn runtime."""
+    from ash.sdk import AshClient
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.git import GitDiffTool
+
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    client = await AshClient.create(
+        config=config,
+        provider=RuntimeProvider(),
+        run_maintenance=False,
+        runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+    )
+    try:
+        assert client.loop._tool_dispatch_disabled is True
+        # Even a later accidental tool registration cannot grant authority.
+        client.loop.tools["git_diff"] = GitDiffTool(SafetyGuard(tmp_path))
+        with pytest.raises(RuntimeError, match="tool-disabled runtime"):
+            await client.loop.execute_tool("git_diff", {"path": "example.py"})
+        with pytest.raises(RuntimeError, match="tool-disabled runtime"):
+            await client.loop._execute_tool_in_standalone_turn(
+                "git_diff", {"path": "example.py"}
+            )
+        assert client.loop.current_session is not None
+        with pytest.raises(RuntimeError, match="tool-disabled runtime"):
+            await client.loop._execute_tool_calls(
+                [{"call_id": "forced-call", "name": "git_diff", "arguments": {}}],
+                client.loop.current_session,
+            )
+        assert client.loop.current_session.tool_calls == []
+    finally:
+        await client.close()
+
+
+def test_tool_disabled_loop_cannot_start_with_registered_tools(tmp_path: Path) -> None:
+    from ash.core.loop import AshLoop
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.git import GitDiffTool
+
+    guard = SafetyGuard(tmp_path)
+    with pytest.raises(ValueError, match="cannot register tools"):
+        AshLoop(
+            session_store=SessionStore(tmp_path / "sessions.db"),
+            provider=RuntimeProvider(),
+            safety_guard=guard,
+            ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+            project_root=tmp_path,
+            tools={"git_diff": GitDiffTool(guard)},
+            _tool_dispatch_disabled=True,
+        )
+
+
+def test_coworker_bound_loop_always_disables_tool_dispatch(tmp_path: Path) -> None:
+    from ash.core.loop import AshLoop
+    from ash.core.session import CoworkerWorkerSessionBinding
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.git import GitDiffTool
+
+    guard = SafetyGuard(tmp_path)
+    binding = CoworkerWorkerSessionBinding(
+        session_id="session", canonical_session_id="canonical", owner_id="owner",
+        coworker_id="coworker", project_key="project",
+        runtime_project_root=tmp_path,
+        runtime_directory_identity=(tmp_path.stat().st_dev, tmp_path.stat().st_ino),
+        database_path=str(tmp_path / "sessions.db"),
+        database_identity=(1, 2, 3, 4),
+    )
+    with pytest.raises(ValueError, match="cannot register tools"):
+        AshLoop(
+            session_store=SessionStore(tmp_path / "sessions.db"),
+            provider=RuntimeProvider(), safety_guard=guard,
+            ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+            project_root=tmp_path,
+            tools={"git_diff": GitDiffTool(guard)},
+            _coworker_worker_binding=binding,
+        )

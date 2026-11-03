@@ -1399,6 +1399,7 @@ class AshLoop:
         max_steering_messages: int = 20,
         event_observer: "RuntimeEventObserver | None" = None,
         _coworker_worker_binding: CoworkerWorkerSessionBinding | None = None,
+        _tool_dispatch_disabled: bool = False,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -1410,6 +1411,11 @@ class AshLoop:
             raise ValueError("runtime workspace does not match SafetyGuard workspace")
         self._project_root_identity = _directory_identity(self.project_root)
         self._coworker_worker_binding = _coworker_worker_binding
+        self._tool_dispatch_disabled = (
+            _tool_dispatch_disabled or _coworker_worker_binding is not None
+        )
+        if self._tool_dispatch_disabled and tools:
+            raise ValueError("tool-disabled runtime cannot register tools")
         if (
             _coworker_worker_binding is not None
             and _coworker_worker_binding.runtime_project_root != self.project_root
@@ -5760,6 +5766,8 @@ class AshLoop:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
+        if self._tool_dispatch_disabled:
+            raise RuntimeError("tool-disabled runtime refuses tool execution")
         if self._closing or self._closed:
             raise RuntimeError("Ash runtime is closed")
         if self.current_session is None:
@@ -5858,6 +5866,8 @@ class AshLoop:
         ambiguous-outcome handling remain identical to model-originated calls.
         """
 
+        if self._tool_dispatch_disabled:
+            raise RuntimeError("tool-disabled runtime refuses tool execution")
         session = self.current_session
         if session is None:
             raise RuntimeError("cannot execute a tool without an active session")
@@ -5889,6 +5899,8 @@ class AshLoop:
     ) -> list[dict[str, Any]]:
         """Execute approved tool calls, gating each on the safety guard."""
 
+        if self._tool_dispatch_disabled and tool_calls:
+            raise RuntimeError("tool-disabled runtime refuses tool dispatch")
         active_tools = self.tools if tools_snapshot is None else tools_snapshot
 
         def parallel_safe(call: dict[str, Any]) -> bool:

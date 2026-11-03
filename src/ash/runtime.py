@@ -537,6 +537,7 @@ def _build_turn_only_runtime(
         max_steering_messages=config.steering_queue_limit,
         event_observer=None,
         _coworker_worker_binding=coworker_worker_binding,
+        _tool_dispatch_disabled=True,
     )
     return RuntimeComponents(
         loop=loop,
