@@ -139,3 +139,41 @@ Current evidence is rechecked before writing the skip; concurrent
 schedule changes refuse the skip. This is input change detection, not
 semantic validation or an autonomous CI/webhook monitor. It cannot replace
 a genuine external event receiver.
+
+## Revising an existing responsibility
+
+Owners can revise the objective, success criteria, scope, and explicit evidence
+grant without changing the responsibility ID or schedule. Read its current
+revision using the normal responsibility list or show command, then specify
+that revision when editing:
+
+~~~bash
+ash crew responsibility revise --owner local \
+  --coworker-id COWORKER_UUID \
+  --responsibility-id RESPONSIBILITY_UUID --expected-revision 1 \
+  --objective "Investigate the latest approved CI logs" \
+  --success-criterion "Cite the failing assertion" \
+  --evidence logs/ci.log
+~~~
+
+Each supplied list replaces its entire previous list; omitted fields retain
+their values. Use --clear-evidence or --clear-success-criteria to empty a
+list. An actual change increments the revision; unchanged values do not.
+The owner must use the currently reported revision, so stale editors
+cannot overwrite a newer decision.
+
+Ash validates file grants using its existing scoped evidence reader and
+serializes revisions against approved workspace file effects. A revision is
+refused while a signed event is accepted but undispatched, an event is
+dispatching, or a model turn for the responsibility remains claimed/uncertain.
+This prevents a previously accepted trigger from silently acquiring broader
+file access. Resolve queued work and inspect its ledger before revising, or
+create a new responsibility where uncertain work cannot be resolved. Previously
+completed runs retain their original prompt and provenance; a previously
+proposed file correction is invalidated for future approval/application
+if its source responsibility scope, objective, criteria or evidence grant
+changes. Archived coworkers and completed responsibilities cannot be revised.
+
+This command intentionally does not edit schedule timing, auth keys, or
+existing run history. The current next-fire cursor is preserved; to change
+timing, complete the old responsibility and create a newly scheduled one.

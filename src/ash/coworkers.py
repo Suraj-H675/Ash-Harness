@@ -4272,6 +4272,159 @@ class CoworkerDirectory:
             ) from exc
         return self._get_responsibility(handle, identifier)
 
+    def _revise_responsibility(
+        self,
+        handle: "CoworkerHandle",
+        responsibility_id: str,
+        *,
+        expected_revision: int,
+        scope: str | None = None,
+        objective: str | None = None,
+        success_criteria: Sequence[str] | None = None,
+        evidence_paths: Sequence[str] | None = None,
+    ) -> CoworkerResponsibility:
+        """Owner-authorized compare-and-swap change of a standing objective.
+
+        Scheduled timing and all previously claimed runs remain immutable.
+        Do not let accepted-but-unconsumed events gain a new scope.
+        """
+
+        identifier = _normalize_responsibility_id(responsibility_id)
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise ValueError("expected_revision must be a positive integer")
+        if all(
+            value is None for value in (
+                scope, objective, success_criteria, evidence_paths,
+            )
+        ):
+            raise ValueError("supply at least one responsibility field to revise")
+        normalized_scope = (
+            _normalize_responsibility_text(
+                scope, "scope", _MAX_RESPONSIBILITY_SCOPE_BYTES,
+            ) if scope is not None else None
+        )
+        normalized_objective = (
+            _normalize_responsibility_text(
+                objective, "objective", _MAX_RESPONSIBILITY_OBJECTIVE_BYTES,
+            ) if objective is not None else None
+        )
+        criteria = (
+            _normalize_success_criteria(success_criteria)
+            if success_criteria is not None else None
+        )
+        paths = (
+            validate_evidence_paths(evidence_paths)
+            if evidence_paths is not None else None
+        )
+        try:
+            with workspace_mutation_lock():
+                with closing(self._connect_durable()) as conn, conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    current = self._require_local_coworker_owner(handle, conn)
+                    if current.lifecycle_status == "archived":
+                        raise CoworkerRuntimeUnavailable(
+                            "archived coworkers cannot revise responsibilities"
+                        )
+                    row = conn.execute(
+                        _RESPONSIBILITY_SELECT
+                        + " WHERE responsibility.owner_id = ? AND "
+                        "responsibility.coworker_id = ? AND "
+                        "responsibility.responsibility_id = ?",
+                        (current.owner_id, current.coworker_id, identifier),
+                    ).fetchone()
+                    if row is None:
+                        raise CoworkerNotFound("coworker responsibility not found")
+                    stored = _responsibility_from_row(row)
+                    if stored.revision != expected_revision:
+                        raise CoworkerRuntimeUnavailable(
+                            "responsibility revision changed; inspect before retrying"
+                        )
+                    if stored.status == "completed":
+                        raise CoworkerRuntimeUnavailable(
+                            "completed responsibilities cannot be revised"
+                        )
+                    next_scope = normalized_scope if normalized_scope is not None else stored.scope
+                    next_objective = (
+                        normalized_objective if normalized_objective is not None
+                        else stored.objective
+                    )
+                    next_criteria = criteria if criteria is not None else stored.success_criteria
+                    next_paths = paths if paths is not None else stored.evidence_paths
+                    if (
+                        (next_scope, next_objective, next_criteria, next_paths)
+                        == (
+                            stored.scope, stored.objective,
+                            stored.success_criteria, stored.evidence_paths,
+                        )
+                    ):
+                        return stored
+                    pending = conn.execute(
+                        "SELECT 1 FROM coworker_accepted_events WHERE owner_id=? "
+                        "AND coworker_id=? AND responsibility_id=? "
+                        "AND status IN ('accepted','dispatching') LIMIT 1",
+                        (current.owner_id, current.coworker_id, identifier),
+                    ).fetchone()
+                    if pending is not None:
+                        raise CoworkerRuntimeUnavailable(
+                            "responsibility has an accepted or dispatching event; "
+                            "resolve it before changing its scope"
+                        )
+                    claimed = conn.execute(
+                        "SELECT 1 FROM coworker_turn_dispatches WHERE owner_id=? "
+                        "AND coworker_id=? AND responsibility_id=? "
+                        "AND status='claimed' LIMIT 1",
+                        (current.owner_id, current.coworker_id, identifier),
+                    ).fetchone()
+                    if claimed is not None:
+                        raise CoworkerRuntimeUnavailable(
+                            "responsibility has a claimed turn with an unknown outcome; "
+                            "create a new responsibility instead of changing its scope"
+                        )
+                    # Source files are grants, not mere descriptive labels. The same
+                    # policy and workspace guards used by creation must pass for edits.
+                    guard = SafetyGuard(current.workspace)
+                    guard.ensure_project_root_current()
+                    read_explicit_evidence(current.workspace, next_paths, guard=guard)
+                    proposed = replace(
+                        stored, scope=next_scope, objective=next_objective,
+                        success_criteria=next_criteria, evidence_paths=next_paths,
+                    )
+                    _responsibility_prompt(proposed)
+                    now = _now()
+                    cursor = conn.execute(
+                        "UPDATE coworker_responsibilities SET scope=?, objective=?, "
+                        "success_criteria_json=?, evidence_paths_json=?, updated_at=?, "
+                        "revision=revision+1 WHERE owner_id=? AND coworker_id=? "
+                        "AND responsibility_id=? AND revision=? AND status=?",
+                        (
+                            next_scope, next_objective,
+                            json.dumps(next_criteria, ensure_ascii=False, separators=(",", ":")),
+                            json.dumps(next_paths, ensure_ascii=False, separators=(",", ":")),
+                            now, current.owner_id, current.coworker_id,
+                            identifier, expected_revision, stored.status,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise CoworkerRuntimeUnavailable(
+                            "responsibility changed before revision was committed"
+                        )
+                    result = conn.execute(
+                        _RESPONSIBILITY_SELECT
+                        + " WHERE responsibility.owner_id=? AND responsibility.coworker_id=? "
+                        "AND responsibility.responsibility_id=?",
+                        (current.owner_id, current.coworker_id, identifier),
+                    ).fetchone()
+                    if result is None:
+                        raise CoworkerDirectoryError(
+                            "responsibility disappeared after revision"
+                        )
+                    return _responsibility_from_row(result)
+        except ScopedIOError as exc:
+            raise CoworkerRuntimeUnavailable(
+                "responsibility revision could not acquire the file-effect "
+                "mutation boundary; retry after the current effect finishes"
+            ) from exc
+
     def _list_responsibilities(
         self,
         handle: "CoworkerHandle",
@@ -6033,6 +6186,7 @@ class CoworkerDirectory:
             request_id=request_id,
             atlas_only=True,
         )
+        self._require_current_approval_responsibility(handle, session)
         target_path = _validate_file_approval_path(target_path, label="target path")
         if replacement_file_path is not None:
             replacement_file_path = _validate_file_approval_path(
@@ -6438,6 +6592,47 @@ class CoworkerDirectory:
             failure_code="expired",
         )
 
+    def _require_current_approval_responsibility(
+        self, handle: "CoworkerHandle", session: Session,
+    ) -> None:
+        """A stale responsibility model turn must not authorize a later effect."""
+
+        responsibility_id = session.messages[0].metadata.get(
+            "coworker_responsibility_id"
+        )
+        if responsibility_id is None:
+            return
+        try:
+            responsibility = self._get_responsibility(handle, responsibility_id)
+            contract = _strict_correction_json(
+                session.messages[0].content.rsplit("\n", 1)[1]
+            )
+            description = contract["responsibility"]
+            evidence = contract.get("evidence", [])
+            if not isinstance(evidence, list):
+                raise ValueError("invalid source evidence")
+            paths = tuple(
+                entry["path"] for entry in evidence
+                if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+            )
+        except (ValueError, KeyError, TypeError, CoworkerNotFound) as exc:
+            raise CoworkerRuntimeUnavailable(
+                "approved source responsibility is no longer verifiable"
+            ) from exc
+        if (
+            responsibility.status != "active"
+            or description != {
+                "scope": responsibility.scope,
+                "objective": responsibility.objective,
+                "success_criteria": list(responsibility.success_criteria),
+            }
+            or len(paths) != len(evidence)
+            or paths != responsibility.evidence_paths
+        ):
+            raise CoworkerRuntimeUnavailable(
+                "approved source responsibility grant or objective changed"
+            )
+
     def _verify_file_approval_context(
         self,
         handle: "CoworkerHandle",
@@ -6469,6 +6664,7 @@ class CoworkerDirectory:
             or response_hash != approval.source_response_sha256
         ):
             raise CoworkerRuntimeUnavailable("file approval source binding changed")
+        self._require_current_approval_responsibility(handle, session)
         guard, target, snapshot, mode = self._file_effect_target_snapshot(
             current=current,
             workspace_identity=workspace_identity,
@@ -7267,6 +7463,20 @@ class CoworkerHandle:
             trigger_type=trigger_type,
             schedule=schedule,
             misfire_grace_seconds=misfire_grace_seconds,
+        )
+
+    def revise_responsibility(
+        self, responsibility_id: str, *, expected_revision: int,
+        scope: str | None = None, objective: str | None = None,
+        success_criteria: Sequence[str] | None = None,
+        evidence_paths: Sequence[str] | None = None,
+    ) -> CoworkerResponsibility:
+        """Revise a responsibility by exact owner-controlled revision number."""
+
+        return self._directory._revise_responsibility(
+            self, responsibility_id, expected_revision=expected_revision,
+            scope=scope, objective=objective,
+            success_criteria=success_criteria, evidence_paths=evidence_paths,
         )
 
     def list_responsibilities(

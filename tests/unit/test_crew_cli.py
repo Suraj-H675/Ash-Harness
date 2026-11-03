@@ -6599,3 +6599,319 @@ def test_accepted_investigation_receipt_refuses_unrelated_completed_analysis(
     with pytest.raises(CoworkerDirectoryError, match="completed receipt"):
         fresh.list_accepted_events()
     assert len(observed) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_owner_can_revise_responsibility_with_cas_and_preserved_schedule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import CoworkerNotFound
+
+    ash_dir, workspace, other_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    (workspace / "old.log").write_text("old granted log\n")
+    (workspace / "new.log").write_text("new granted log\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=other_workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="Watch errors", objective="Find old failures",
+        success_criteria=("Report before writing.",),
+        evidence_paths=("old.log",),
+        schedule=build_schedule(every="1h"),
+    )
+    assert task.revision == 1
+    args = [
+        "crew", "responsibility", "revise",
+        "--owner", "local", "--coworker-id", atlas.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--expected-revision", "1",
+        "--scope", "Monitor the updated CI evidence",
+        "--objective", "Explain new failures",
+        "--success-criterion", "Cite source evidence.",
+        "--evidence", "new.log",
+    ]
+    assert main(args) == 0
+    output = capsys.readouterr().out
+    assert "Revision: 2" in output
+    assert "Evidence grant: new.log" in output
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    updated = reopened.get_responsibility(task.responsibility_id)
+    assert updated.revision == 2
+    assert updated.scope == "Monitor the updated CI evidence"
+    assert updated.objective == "Explain new failures"
+    assert updated.success_criteria == ("Cite source evidence.",)
+    assert updated.evidence_paths == ("new.log",)
+    assert updated.next_fire_at == task.next_fire_at
+    assert updated.schedule == task.schedule
+    assert reopened.revise_responsibility(
+        task.responsibility_id, expected_revision=2,
+        objective=updated.objective,
+    ).revision == 2
+    assert main(args) == 2
+    assert "revision changed" in capsys.readouterr().err
+    with pytest.raises(CoworkerRuntimeUnavailable, match="revision changed"):
+        reopened.revise_responsibility(
+            task.responsibility_id, expected_revision=1,
+            evidence_paths=("old.log",),
+        )
+    with pytest.raises(ValueError):
+        reopened.revise_responsibility(
+            task.responsibility_id, expected_revision=2,
+            evidence_paths=("../private",),
+        )
+    with pytest.raises(ValueError, match="at least one"):
+        reopened.revise_responsibility(
+            task.responsibility_id, expected_revision=2,
+        )
+    with pytest.raises(CoworkerNotFound):
+        directory.open_coworker(
+            owner_id="local", coworker_id=scout.coworker_id,
+        ).revise_responsibility(
+            task.responsibility_id, expected_revision=2,
+            objective="Steal other coworker's scope",
+        )
+    assert reopened.get_responsibility(task.responsibility_id) == updated
+    assert main([
+        "crew", "responsibility", "revise", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--responsibility-id", task.responsibility_id,
+        "--expected-revision", "2",
+        "--clear-success-criteria", "--clear-evidence",
+    ]) == 0
+    cleared = reopened.get_responsibility(task.responsibility_id)
+    assert cleared.revision == 3
+    assert cleared.success_criteria == ()
+    assert cleared.evidence_paths == ()
+    reopened.set_responsibility_status(task.responsibility_id, "completed")
+    with pytest.raises(CoworkerRuntimeUnavailable, match="completed"):
+        reopened.revise_responsibility(
+            task.responsibility_id, expected_revision=4,
+            objective="Should stay closed",
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_responsibility_revision_refuses_pending_signed_events_and_preserves_old_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hmac
+    from datetime import datetime, timezone
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_answer="Original scoped analysis",
+    )
+    (workspace / "old.log").write_text("old evidence\n")
+    (workspace / "new.log").write_text("new evidence\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="Watch first log", objective="Explain old evidence",
+        evidence_paths=("old.log",),
+    )
+    key = bytes(range(32))
+    key_file = tmp_path / "intake.key"
+    key_file.write_text(key.hex() + "\n")
+    key_file.chmod(0o600)
+    document: dict[str, object] = {
+        "version": 1, "source": "ci", "id": "pending-old-grant",
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "responsibility_id": task.responsibility_id,
+        "payload": "Event awaiting model",
+    }
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    document["signature"] = hmac.new(key, canonical, hashlib.sha256).hexdigest()
+    receipt = handle.accept_signed_event(
+        json.dumps(document).encode(), key_file=key_file,
+        responsibility_id=task.responsibility_id,
+    )
+    with pytest.raises(CoworkerRuntimeUnavailable, match="accepted or dispatching"):
+        handle.revise_responsibility(
+            task.responsibility_id, expected_revision=1,
+            evidence_paths=("new.log",), objective="Explain broader evidence",
+        )
+    assert handle.get_responsibility(task.responsibility_id).revision == 1
+    assert handle.list_accepted_events()[0].status == "accepted"
+    assert len(observed) == 0
+    asyncio.run(handle.dispatch_accepted_event(
+        responsibility_id=task.responsibility_id,
+        event_key=receipt.event_key, key_file=key_file,
+    ))
+    assert len(observed) == 1
+    assert "old evidence" in str(observed[0]["messages"])
+    assert "new evidence" not in str(observed[0]["messages"])
+    revised = handle.revise_responsibility(
+        task.responsibility_id, expected_revision=1,
+        evidence_paths=("new.log",), objective="Explain updated evidence",
+    )
+    assert revised.revision == 2
+    assert revised.evidence_paths == ("new.log",)
+    assert handle.list_accepted_events()[0].status == "completed"
+    assert len(handle.list_responsibility_runs(task.responsibility_id)) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_revised_responsibility_revokes_old_model_correction_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer=json.dumps({
+            "action": "replace", "target": "answer.py",
+            "replacement": "ANSWER = 42\n",
+        }),
+    )
+    target = workspace / "answer.py"
+    target.write_text("ANSWER = 41\n")
+    (workspace / "error.log").write_text("FAIL wrong answer\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="CI", objective="Correct the failing answer",
+        evidence_paths=("answer.py", "error.log"),
+    )
+    turn = asyncio.run(handle.run_model_responsibility(
+        task.responsibility_id, event_id="original-model-draft",
+        draft_correction=True,
+    ))
+    assert turn.session_ref.run_id is not None and turn.request_id is not None
+    approval = handle.prepare_file_approval(
+        run_id=turn.session_ref.run_id,
+        session_id=turn.session_ref.session_id,
+        request_id=turn.request_id,
+        target_path="answer.py", from_response=True,
+    )
+    assert approval.status == "pending"
+    assert len(observed) == 1
+    changed = handle.revise_responsibility(
+        task.responsibility_id, expected_revision=1,
+        objective="Investigate only; do not correct any source",
+        evidence_paths=("error.log",),
+    )
+    assert changed.revision == 2
+    # A previously staged approval remains visible but cannot be authorized
+    # using an obsolete source grant, even by a formerly valid local owner.
+    monkeypatch.setattr(
+        "ash.commands.crew._require_tty_confirmation",
+        lambda challenge: True,
+    )
+    assert main([
+        "crew", "approve", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--approval-id", approval.approval_id,
+    ]) == 2
+    assert "source, target, or policy changed" in capsys.readouterr().err
+    assert target.read_text() == "ANSWER = 41\n"
+    with pytest.raises(CoworkerRuntimeUnavailable, match="grant or objective changed"):
+        handle.prepare_file_approval(
+            run_id=turn.session_ref.run_id,
+            session_id=turn.session_ref.session_id,
+            request_id=turn.request_id,
+            target_path="answer.py", from_response=True,
+        )
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_responsibility_revision_waits_for_claimed_model_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    started, release = asyncio.Event(), asyncio.Event()
+    _, observed = _install_fake_registry(
+        monkeypatch, started=started, release=release,
+        atlas_answer="Scoped result",
+    )
+    (workspace / "old.log").write_text("original grant\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="CI", objective="Find original problem", evidence_paths=("old.log",),
+    )
+
+    async def exercise() -> None:
+        pending = asyncio.create_task(handle.run_model_responsibility(
+            task.responsibility_id, event_id="in-flight-revision",
+        ))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            with pytest.raises(CoworkerRuntimeUnavailable, match="claimed turn"):
+                handle.revise_responsibility(
+                    task.responsibility_id, expected_revision=1,
+                    objective="A new objective while running",
+                )
+            assert handle.get_responsibility(task.responsibility_id).revision == 1
+        finally:
+            release.set()
+        result = await asyncio.wait_for(pending, timeout=10)
+        assert result.responsibility_id == task.responsibility_id
+
+    asyncio.run(exercise())
+    assert len(observed) == 1
+    revised = handle.revise_responsibility(
+        task.responsibility_id, expected_revision=1,
+        objective="Safe new objective after a completed run",
+    )
+    assert revised.revision == 2
+    assert len(handle.list_responsibility_runs(task.responsibility_id)) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_responsibility_revision_fails_closed_while_file_effect_lock_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+    from collections.abc import Iterator
+    from ash.safety.scoped_io import ScopedIOError
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    task = handle.create_responsibility(
+        scope="CI", objective="Original owner task",
+    )
+
+    @contextmanager
+    def unavailable() -> Iterator[None]:
+        raise ScopedIOError("another Ash workspace mutation is active")
+        yield
+
+    monkeypatch.setattr("ash.coworkers.workspace_mutation_lock", unavailable)
+    with pytest.raises(CoworkerRuntimeUnavailable, match="mutation boundary"):
+        handle.revise_responsibility(
+            task.responsibility_id, expected_revision=1,
+            objective="Must not update concurrently with file effect",
+        )
+    assert handle.get_responsibility(task.responsibility_id).revision == 1
+    assert handle.get_responsibility(task.responsibility_id).objective == (
+        "Original owner task"
+    )

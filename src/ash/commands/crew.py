@@ -968,6 +968,31 @@ def _responsibility(args: argparse.Namespace) -> int:
             _write_line("Responsibility created.")
             _render_responsibility(responsibility)
             return 0
+        if action == "revise":
+            if args.clear_success_criteria and args.success_criterion is not None:
+                raise ValueError(
+                    "cannot supply success criteria and clear them together"
+                )
+            if args.clear_evidence and args.evidence is not None:
+                raise ValueError(
+                    "cannot supply evidence and clear it together"
+                )
+            responsibility = handle.revise_responsibility(
+                args.responsibility_id,
+                expected_revision=args.expected_revision,
+                scope=args.scope,
+                objective=args.objective,
+                success_criteria=(
+                    () if args.clear_success_criteria
+                    else args.success_criterion
+                ),
+                evidence_paths=(
+                    () if args.clear_evidence else args.evidence
+                ),
+            )
+            _write_line("Responsibility revision saved.")
+            _render_responsibility(responsibility)
+            return 0
         if action == "list":
             responsibilities = handle.list_responsibilities()
             if not responsibilities:
@@ -1665,6 +1690,7 @@ def _render_responsibility(responsibility: CoworkerResponsibility) -> None:
     _write_line(f"Responsibility ID: {responsibility.responsibility_id}")
     _write_line(f"Coworker ID: {responsibility.coworker_id}")
     _write_line(f"Status: {responsibility.status}")
+    _write_line(f"Revision: {responsibility.revision}")
     _write_line(f"Scope: {_safe_text(responsibility.scope, single_line=True)}")
     _write_line(f"Objective: {_safe_text(responsibility.objective, single_line=True)}")
     for criterion in responsibility.success_criteria:

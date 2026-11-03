@@ -283,6 +283,27 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     responsibility_create.add_argument("--cron")
     responsibility_create.add_argument("--timezone", default="UTC")
     responsibility_create.add_argument("--misfire-grace-seconds", type=int, default=86_400)
+    responsibility_revise = crew_responsibility_subparsers.add_parser(
+        "revise",
+        help="Revise a responsibility's objective and evidence with owner CAS",
+    )
+    responsibility_revise.add_argument("--owner", required=True)
+    responsibility_revise.add_argument("--coworker-id", required=True)
+    responsibility_revise.add_argument("--responsibility-id", required=True)
+    responsibility_revise.add_argument("--expected-revision", type=int, required=True)
+    responsibility_revise.add_argument("--scope")
+    responsibility_revise.add_argument("--objective")
+    responsibility_revise.add_argument("--success-criterion", action="append")
+    responsibility_revise.add_argument(
+        "--clear-success-criteria", action="store_true",
+    )
+    responsibility_revise.add_argument(
+        "--evidence", action="append",
+        metavar="WORKSPACE_RELATIVE_PATH",
+    )
+    responsibility_revise.add_argument(
+        "--clear-evidence", action="store_true",
+    )
     responsibility_list = crew_responsibility_subparsers.add_parser(
         "list", help="List responsibilities for one coworker"
     )
