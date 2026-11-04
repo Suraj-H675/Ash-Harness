@@ -6915,3 +6915,352 @@ def test_responsibility_revision_fails_closed_while_file_effect_lock_unavailable
     assert handle.get_responsibility(task.responsibility_id).objective == (
         "Original owner task"
     )
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_native_git_diff_uses_mediated_tool_and_survives_restart_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import subprocess
+
+    ash_dir, workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    source = workspace / "app.py"
+    source.write_text("VALUE = 1\n")
+    subprocess.run(["git", "add", "--", "app.py"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Fixture", "-c", "user.email=x@localhost",
+         "commit", "-qm", "base"], cwd=workspace, check=True,
+    )
+    source.write_text("VALUE = 2\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_workspace,
+    )
+    key = str(uuid4())
+    confirmations: list[str] = []
+
+    def consent(challenge: str) -> bool:
+        confirmations.append(challenge)
+        return True
+
+    monkeypatch.setattr("ash.commands.crew._require_tty_confirmation", consent)
+    argv = [
+        "crew", "git-diff", "run", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--run-id", key, "--file", "app.py",
+    ]
+    assert main(argv) == 0
+    output = capsys.readouterr().out
+    assert "-VALUE = 1" in output
+    assert "+VALUE = 2" in output
+    assert confirmations[0].startswith(f"GIT DIFF {key} ")
+    receipt = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    ).native_git_diff_status(key)
+    assert receipt.status == "completed"
+    assert receipt.tool_session_id is not None
+    assert receipt.output_sha256 is not None
+    assert receipt.source_sha256 in confirmations[0]
+    assert source.read_text() == "VALUE = 2\n"
+    assert main([
+        "crew", "git-diff", "status", "--owner", "local",
+        "--coworker-id", atlas.coworker_id, "--run-id", key,
+    ]) == 0
+    assert "Status: completed" in capsys.readouterr().out
+    assert main([
+        "crew", "git-diff", "status", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--run-id", key, "--show-output",
+    ]) == 0
+    saved = capsys.readouterr().out
+    assert "Recorded Git patch (no new execution)" in saved
+    assert "+VALUE = 2" in saved
+    assert main(argv) == 2
+    assert "already claimed" in capsys.readouterr().err
+    with pytest.raises(CoworkerNotFound):
+        directory.open_coworker(
+            owner_id="local", coworker_id=scout.coworker_id,
+        ).native_git_diff_status(key)
+
+    tool_db = ash_dir / "profiles" / "atlas" / "db" / "crew_native_tool_sessions.db"
+    with sqlite3.connect(tool_db) as conn:
+        calls = conn.execute(
+            "SELECT tool_name, executed, dispatched, success FROM tool_calls"
+        ).fetchall()
+    assert len(calls) == 1
+    assert calls[0][0] == "git_diff"
+    assert calls[0][1:] == (1, 1, 1)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_native_git_diff_tty_denial_and_changed_evidence_do_not_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import subprocess
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    source = workspace / "app.py"
+    source.write_text("VALUE = 1\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    run_id = str(uuid4())
+    args = [
+        "crew", "git-diff", "run", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--run-id", run_id, "--file", "app.py",
+    ]
+    monkeypatch.setattr("ash.commands.crew._require_tty_confirmation", lambda _: False)
+    assert main(args) == 2
+    assert "Exact local TTY approval" in capsys.readouterr().err
+    with pytest.raises(CoworkerNotFound):
+        handle.native_git_diff_status(run_id)
+
+    def change_source(_: str) -> bool:
+        source.write_text("VALUE = 9\n")
+        return True
+
+    monkeypatch.setattr("ash.commands.crew._require_tty_confirmation", change_source)
+    assert main(args) == 2
+    assert "changed since owner confirmation" in capsys.readouterr().err
+    with pytest.raises(CoworkerNotFound):
+        handle.native_git_diff_status(run_id)
+    assert not (
+        ash_dir / "profiles" / "atlas" / "db" / "crew_native_tool_sessions.db"
+    ).exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_native_git_diff_interruption_stays_unknown_and_nonreplayable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    source = workspace / "app.py"
+    source.write_text("VALUE = 2\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    run_id = str(uuid4())
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    async def fail_after_claim(**kwargs: Any) -> Any:
+        raise RuntimeError("synthetic interrupted native tool process")
+
+    monkeypatch.setattr("ash.coworker_git.mediated_git_diff", fail_after_claim)
+    with pytest.raises(RuntimeError, match="synthetic interrupted"):
+        asyncio.run(handle.run_native_git_diff(
+            run_id=run_id, path="app.py", expected_sha256=digest,
+        ))
+    receipt = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    ).native_git_diff_status(run_id)
+    assert receipt.status == "unknown"
+    with pytest.raises(CoworkerRuntimeUnavailable, match="already claimed"):
+        asyncio.run(handle.run_native_git_diff(
+            run_id=run_id, path="app.py", expected_sha256=digest,
+        ))
+    assert source.read_text() == "VALUE = 2\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_native_git_completed_receipt_requires_matching_mediated_tool_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+    from ash.coworkers import CoworkerDirectoryError
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    source = workspace / "code.py"
+    source.write_text("SAFE = True\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    run_id = str(uuid4())
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "INSERT INTO coworker_native_git_diffs "
+            "(owner_id,owner_uid,coworker_id,run_id,path,source_sha256,"
+            "workspace_device,workspace_inode,status,tool_session_id,"
+            "output_sha256,created_at,finished_at) VALUES "
+            "(?,?,?,?,?,?,?,?,'completed',?,?,?,?)",
+            (
+                atlas.owner_id, atlas.owner_uid, atlas.coworker_id, run_id,
+                "code.py", digest, workspace.stat().st_dev,
+                workspace.stat().st_ino, str(uuid4()), "0" * 64,
+                "2026-11-04T00:00:00+00:00", "2026-11-04T00:00:01+00:00",
+            ),
+        )
+    tool_db = ash_dir / "profiles" / "atlas" / "db" / "crew_native_tool_sessions.db"
+    assert not tool_db.exists()
+    with pytest.raises(CoworkerDirectoryError, match="missing or altered"):
+        handle.native_git_diff_status(run_id)
+    assert not tool_db.exists(), "read-only receipt inspection must not create a journal"
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "UPDATE coworker_native_git_diffs SET status='unknown',"
+            "output_sha256=NULL WHERE run_id=?", (run_id,),
+        )
+    assert handle.native_git_diff_status(run_id).status == "unknown"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_native_git_diff_concurrent_claim_prevents_double_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    source = workspace / "code.py"
+    source.write_text("SAFE = True\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    run_id = str(uuid4())
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    started, release = asyncio.Event(), asyncio.Event()
+    invoked = 0
+
+    async def hold_tool(**kwargs: Any) -> Any:
+        nonlocal invoked
+        invoked += 1
+        started.set()
+        await release.wait()
+        raise RuntimeError("synthetic uncertain process")
+
+    monkeypatch.setattr("ash.coworker_git.mediated_git_diff", hold_tool)
+
+    async def exercise() -> None:
+        first = asyncio.create_task(handle.run_native_git_diff(
+            run_id=run_id, path="code.py", expected_sha256=digest,
+        ))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            with pytest.raises(CoworkerRuntimeUnavailable, match="already claimed"):
+                await handle.run_native_git_diff(
+                    run_id=run_id, path="code.py", expected_sha256=digest,
+                )
+            assert handle.native_git_diff_status(run_id).status == "claimed"
+        finally:
+            release.set()
+        with pytest.raises(RuntimeError, match="synthetic"):
+            await asyncio.wait_for(first, timeout=10)
+
+    asyncio.run(exercise())
+    assert invoked == 1
+    assert handle.native_git_diff_status(run_id).status == "unknown"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_native_git_diff_never_exposes_git_history_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import subprocess
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    path = workspace / "app.py"
+    prior_secret = "OPENAI_API_KEY=sk-" + "x" * 36
+    path.write_text(prior_secret + "\n")
+    subprocess.run(["git", "add", "--", "app.py"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Fixture", "-c", "user.email=x@localhost",
+         "commit", "-qm", "base"], cwd=workspace, check=True,
+    )
+    path.write_text("VALUE = 'safe'\n")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    run_id = str(uuid4())
+    monkeypatch.setattr(
+        "ash.commands.crew._require_tty_confirmation", lambda challenge: True,
+    )
+    assert main([
+        "crew", "git-diff", "run", "--owner", "local",
+        "--coworker-id", atlas.coworker_id, "--run-id", run_id,
+        "--file", "app.py",
+    ]) == 2
+    output = capsys.readouterr()
+    assert prior_secret not in output.out + output.err
+    assert "bounded read-only output policy" in output.err
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    assert handle.native_git_diff_status(run_id).status == "blocked"
+    tool_db = ash_dir / "profiles" / "atlas" / "db" / "crew_native_tool_sessions.db"
+    with sqlite3.connect(tool_db) as conn:
+        result, = conn.execute("SELECT result FROM tool_calls").fetchone()
+        audit_rows = conn.execute("SELECT details_json FROM audit_logs").fetchall()
+    assert result == ""
+    assert prior_secret not in repr(audit_rows)
+    with pytest.raises(CoworkerRuntimeUnavailable, match="non-completed"):
+        handle.native_git_diff_output(run_id)
+    assert path.read_text() == "VALUE = 'safe'\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_native_git_diff_refuses_untrusted_repo_diff_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    path = workspace / "app.py"
+    path.write_text("VALUE = 1\n")
+    subprocess.run(["git", "add", "--", "app.py"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Fixture", "-c", "user.email=x@localhost",
+         "commit", "-qm", "base"], cwd=workspace, check=True,
+    )
+    path.write_text("VALUE = 2\n")
+    sentinel = tmp_path / "helper-executed"
+    (workspace / ".gitattributes").write_text("*.py diff=evil\n")
+    # Native GitDiffTool must never evaluate repository-owned textconv code.
+    subprocess.run(
+        ["git", "config", "--local", "diff.evil.textconv",
+         f"touch {sentinel}"],
+        cwd=workspace, check=True,
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    run_id = str(uuid4())
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    receipt, patch = asyncio.run(handle.run_native_git_diff(
+        run_id=run_id, path="app.py", expected_sha256=digest,
+    ))
+    assert not sentinel.exists()
+    assert receipt.status == "completed"
+    assert "+VALUE = 2" in patch
+    assert path.read_text() == "VALUE = 2\n"

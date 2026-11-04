@@ -74,6 +74,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _ask(args)
     if action == "syntax":
         return _syntax(args)
+    if action == "git-diff":
+        return _git_diff(args)
     if action == "investigate":
         return _investigate(args)
     if action == "history":
@@ -491,6 +493,90 @@ def _lifecycle(args: argparse.Namespace, action: str) -> int:
     else:
         _write_line("Coworker active. New work is enabled.")
     return 0
+
+
+def _git_diff(args: argparse.Namespace) -> int:
+    """Keep the explicit owner TTY decision separate from model turns."""
+
+    run_id = args.run_id
+    if args.crew_git_action == "run" and run_id is None:
+        run_id = str(uuid4())
+    _write_line(f"Native tool run ID: {_safe_text(run_id, single_line=True)}")
+    try:
+        handle = CoworkerDirectory.open().open_coworker(
+            owner_id=args.owner, coworker_id=args.coworker_id,
+        )
+        if args.crew_git_action == "status":
+            receipt = handle.native_git_diff_status(run_id)
+            _write_line(f"Status: {receipt.status}")
+            _write_line(f"Path: {_safe_text(receipt.path, single_line=True)}")
+            _write_line(f"Owner-granted SHA-256: {receipt.source_sha256}")
+            if receipt.tool_session_id:
+                _write_line(f"Native tool session: {receipt.tool_session_id}")
+            if receipt.output_sha256:
+                _write_line(f"Output SHA-256: {receipt.output_sha256}")
+            if receipt.status in {"claimed", "unknown"}:
+                _write_line(
+                    "Outcome uncertain; do not retry this run ID. "
+                    "Inspect the separate native tool journal."
+                )
+            if args.show_output:
+                _write_line("Recorded Git patch (no new execution):")
+                recorded = handle.native_git_diff_output(run_id)
+                _write_line(
+                    _safe_text(recorded) if recorded else "(no unstaged change)"
+                )
+            return 0
+        current = handle.require_local_owner()
+        guard = SafetyGuard(current.workspace)
+        evidence, = read_explicit_evidence(
+            current.workspace, (args.file,), guard=guard,
+        )
+        _write_line(
+            f"Selected path: {_safe_text(evidence.relative_path, single_line=True)}"
+        )
+        _write_line(f"Current SHA-256: {evidence.sha256}")
+        _write_line(
+            "Only this file's unstaged Git diff will be inspected. "
+            "No model, shell, plugin, MCP or write tool is authorized."
+        )
+        challenge = (
+            f"GIT DIFF {run_id} {evidence.sha256}"
+        )
+        if not _require_tty_confirmation(challenge):
+            _write_error("Blocked. Exact local TTY approval is required.")
+            return 2
+        receipt, output = asyncio.run(handle.run_native_git_diff(
+            run_id=run_id, path=evidence.relative_path,
+            expected_sha256=evidence.sha256,
+        ))
+        _write_line(f"Status: {receipt.status}")
+        _write_line(f"Native tool session: {receipt.tool_session_id}")
+        _write_line(f"Output SHA-256: {receipt.output_sha256}")
+        _write_line("Git patch (read-only):")
+        _write_line(_safe_text(output) if output else "(no unstaged change)")
+        return 0
+    except KeyboardInterrupt:
+        _write_error(
+            "Native tool interrupted; inspect the run status. Do not replay."
+        )
+        return 130
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        AshError, OSError, SafetyViolation, SessionStorageError, ScopedIOError,
+        ValueError,
+    ) as exc:
+        _write_error(
+            f"Native Git diagnostic blocked or uncertain: {_safe_error(exc)}. "
+            "Inspect its run status; never reuse a claimed ID."
+        )
+        return 2
+    except Exception as exc:
+        _write_error(
+            f"Native Git diagnostic outcome uncertain ({type(exc).__name__}); "
+            "inspect the run status before any new request."
+        )
+        return 2
 
 
 def _syntax(args: argparse.Namespace) -> int:

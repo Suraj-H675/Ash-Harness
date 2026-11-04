@@ -238,6 +238,31 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
             "--" + field,
             help="Completed read-only model proposal source; use all three IDs together",
         )
+    crew_git = crew_subparsers.add_parser(
+        "git-diff",
+        help="Owner-confirmed one-shot native read-only Git diff using Ash tool mediation",
+    )
+    git_actions = crew_git.add_subparsers(
+        dest="crew_git_action", required=True,
+    )
+    git_run = git_actions.add_parser(
+        "run", help="Confirm and dispatch a single file-scoped Git diff",
+    )
+    git_run.add_argument("--owner", required=True)
+    git_run.add_argument("--coworker-id", required=True)
+    git_run.add_argument("--run-id", help="One-shot UUID; generated if omitted")
+    git_run.add_argument("--file", required=True, metavar="WORKSPACE_RELATIVE_PATH")
+    git_status = git_actions.add_parser(
+        "status", help="Inspect the durable outcome of one native Git diff",
+    )
+    git_status.add_argument("--owner", required=True)
+    git_status.add_argument("--coworker-id", required=True)
+    git_status.add_argument("--run-id", required=True)
+    git_status.add_argument(
+        "--show-output", action="store_true",
+        help="Display only a verified, completed recorded diff; never dispatch again",
+    )
+
     crew_model_check = crew_subparsers.add_parser(
         "check-model",
         help="Send one synthetic readiness probe without creating a Crew run",

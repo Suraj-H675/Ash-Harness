@@ -88,7 +88,7 @@ from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
 _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION = 9
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 13
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 14
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
 _MAX_COWORKER_BRIEF_BYTES = 2048
@@ -1020,6 +1020,18 @@ class CoworkerResponsibilityRun:
     scheduled_for: datetime | None = None
     skip_reason: str | None = None
     execution_kind: CoworkerResponsibilityExecutionKind = "legacy"
+
+
+@dataclass(frozen=True)
+class CoworkerNativeGitDiff:
+    """Owner-bound one-shot native Git diagnostic receipt."""
+
+    run_id: str
+    path: str
+    source_sha256: str
+    status: Literal["claimed", "completed", "blocked", "unknown"]
+    tool_session_id: str | None
+    output_sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -2953,6 +2965,7 @@ class CoworkerDirectory:
                     10,
                     11,
                     12,
+                    13,
                     _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION,
                     _COWORKER_DIRECTORY_SCHEMA_VERSION,
                 }:
@@ -3506,6 +3519,56 @@ class CoworkerDirectory:
                 }:
                     raise CoworkerDirectoryError(
                         "coworker accepted event schema is incomplete"
+                    )
+                if (
+                    not fresh_directory and original_version >= 14
+                    and "coworker_native_git_diffs" not in tables
+                ):
+                    raise CoworkerDirectoryError(
+                        "coworker native Git diagnostic schema is incomplete"
+                    )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coworker_native_git_diffs (
+                        owner_id TEXT NOT NULL,
+                        owner_uid INTEGER NOT NULL,
+                        coworker_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        source_sha256 TEXT NOT NULL,
+                        workspace_device INTEGER NOT NULL,
+                        workspace_inode INTEGER NOT NULL,
+                        status TEXT NOT NULL CHECK(status IN (
+                            'claimed', 'completed', 'blocked', 'unknown'
+                        )),
+                        tool_session_id TEXT,
+                        output_sha256 TEXT,
+                        created_at TEXT NOT NULL,
+                        finished_at TEXT,
+                        PRIMARY KEY(owner_id, coworker_id, run_id),
+                        FOREIGN KEY(owner_id, coworker_id)
+                            REFERENCES coworkers(owner_id, coworker_id),
+                        CHECK (
+                            (status = 'claimed' AND finished_at IS NULL
+                                AND output_sha256 IS NULL)
+                            OR (status != 'claimed' AND finished_at IS NOT NULL)
+                        )
+                    )
+                    """
+                )
+                native_columns = {
+                    str(column["name"]) for column in conn.execute(
+                        "PRAGMA table_info(coworker_native_git_diffs)"
+                    )
+                }
+                if native_columns != {
+                    "owner_id", "owner_uid", "coworker_id", "run_id",
+                    "path", "source_sha256", "workspace_device",
+                    "workspace_inode", "status", "tool_session_id",
+                    "output_sha256", "created_at", "finished_at",
+                }:
+                    raise CoworkerDirectoryError(
+                        "coworker native Git diagnostic schema is incomplete"
                     )
                 conn.execute(
                     "UPDATE coworker_directory_meta SET schema_version = ?",
@@ -5044,6 +5107,161 @@ class CoworkerDirectory:
             )
             if cursor.rowcount != 1:
                 raise CoworkerDirectoryError("accepted event finish status changed")
+
+    @staticmethod
+    def _native_git_diff_from_row(
+        row: sqlite3.Row, current: Coworker,
+    ) -> CoworkerNativeGitDiff:
+        if (
+            row["owner_id"] != current.owner_id
+            or row["owner_uid"] != current.owner_uid
+            or row["coworker_id"] != current.coworker_id
+            or row["status"] not in {"claimed", "completed", "blocked", "unknown"}
+        ):
+            raise CoworkerDirectoryError("native tool receipt owner or status changed")
+        try:
+            run_id = str(UUID(str(row["run_id"])))
+            path, = validate_evidence_paths((row["path"],))
+            sha = str(row["source_sha256"])
+            if re.fullmatch(r"[a-f0-9]{64}", sha) is None:
+                raise ValueError("invalid source digest")
+            if (
+                row["status"] == "completed"
+                and (row["tool_session_id"] is None or row["output_sha256"] is None)
+            ):
+                raise ValueError("completed tool record lacks evidence")
+            if row["output_sha256"] is not None and (
+                re.fullmatch(r"[a-f0-9]{64}", row["output_sha256"]) is None
+            ):
+                raise ValueError("invalid output digest")
+        except (TypeError, ValueError) as exc:
+            raise CoworkerDirectoryError("native Git receipt is invalid") from exc
+        return CoworkerNativeGitDiff(
+            run_id=run_id, path=path, source_sha256=sha,
+            status=row["status"], tool_session_id=row["tool_session_id"],
+            output_sha256=row["output_sha256"],
+        )
+
+    def _claim_native_git_diff(
+        self, handle: "CoworkerHandle", *, run_id: str, path: str,
+        source_sha256: str, workspace_identity: tuple[int, int],
+    ) -> None:
+        with closing(self._connect_durable()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._require_local_coworker_owner(handle, conn)
+            if current.lifecycle_status != "active":
+                raise CoworkerRuntimeUnavailable(
+                    "inactive coworker cannot dispatch a native tool"
+                )
+            existing = conn.execute(
+                "SELECT 1 FROM coworker_native_git_diffs WHERE "
+                "owner_id=? AND coworker_id=? AND run_id=?",
+                (current.owner_id, current.coworker_id, run_id),
+            ).fetchone()
+            if existing is not None:
+                raise CoworkerRuntimeUnavailable(
+                    "native tool run already claimed; refusing replay"
+                )
+            try:
+                conn.execute(
+                    "INSERT INTO coworker_native_git_diffs "
+                    "(owner_id,owner_uid,coworker_id,run_id,path,source_sha256,"
+                    "workspace_device,workspace_inode,status,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,'claimed',?)",
+                    (
+                        current.owner_id, current.owner_uid, current.coworker_id,
+                        run_id, path, source_sha256, *workspace_identity, _now(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise CoworkerRuntimeUnavailable(
+                    "native tool run already claimed; refusing replay"
+                ) from exc
+
+    def _finish_native_git_diff(
+        self, handle: "CoworkerHandle", *, run_id: str, status: str,
+        tool_session_id: str | None, output_sha256: str | None,
+    ) -> None:
+        if status not in {"completed", "blocked", "unknown"}:
+            raise ValueError("invalid native tool outcome")
+        current = self._require_coworker_owner_binding(handle)
+        with closing(self._connect_durable()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            updated = conn.execute(
+                "UPDATE coworker_native_git_diffs SET status=?, "
+                "tool_session_id=?,output_sha256=?,finished_at=? "
+                "WHERE owner_id=? AND coworker_id=? AND run_id=? AND status='claimed'",
+                (
+                    status, tool_session_id, output_sha256, _now(),
+                    current.owner_id, current.coworker_id, run_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CoworkerDirectoryError(
+                    "native tool claim changed before recording its outcome"
+                )
+
+    def _verify_native_git_diff_completion(
+        self, current: Coworker, row: sqlite3.Row,
+        receipt: CoworkerNativeGitDiff,
+    ) -> None:
+        if receipt.status != "completed":
+            return
+        try:
+            guard = SafetyGuard(current.workspace)
+            if guard.project_root_identity != (
+                row["workspace_device"], row["workspace_inode"]
+            ):
+                raise ValueError("workspace identity changed")
+            tool_database = (
+                self._profile_database_directory(current)
+                / "crew_native_tool_sessions.db"
+            )
+            if not tool_database.is_file():
+                raise ValueError("native tool session journal is missing")
+            store = SessionStore(tool_database)
+            if receipt.tool_session_id is None:
+                raise ValueError("missing mediated tool session")
+            store.require_session_project(receipt.tool_session_id, current.workspace)
+            session = store.load_session(receipt.tool_session_id)
+            if (
+                session.permission_mode != "plan"
+                or len(session.tool_calls) != 1
+                or session.tool_calls[0].tool_name != "git_diff"
+                or session.tool_calls[0].arguments != {
+                    "staged": False, "path": receipt.path
+                }
+                or not session.tool_calls[0].approved
+                or not session.tool_calls[0].executed
+                or not session.tool_calls[0].dispatched
+                or session.tool_calls[0].success is not True
+                or session.tool_calls[0].error is not None
+                or session.tool_calls[0].result is None
+                or hashlib.sha256(
+                    session.tool_calls[0].result.encode("utf-8")
+                ).hexdigest() != receipt.output_sha256
+            ):
+                raise ValueError("mediated Git tool record is not a matching success")
+        except (SessionStorageError, KeyError, ValueError, OSError) as exc:
+            raise CoworkerDirectoryError(
+                "native Git completed receipt has missing or altered tool evidence"
+            ) from exc
+
+    def _get_native_git_diff(
+        self, handle: "CoworkerHandle", run_id: str,
+    ) -> CoworkerNativeGitDiff:
+        current = self._require_coworker_owner_binding(handle)
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM coworker_native_git_diffs WHERE "
+                "owner_id=? AND coworker_id=? AND run_id=?",
+                (current.owner_id, current.coworker_id, run_id),
+            ).fetchone()
+        if row is None:
+            raise CoworkerNotFound("native Git diagnostic not found")
+        receipt = self._native_git_diff_from_row(row, current)
+        self._verify_native_git_diff_completion(current, row, receipt)
+        return receipt
 
     def _responsibility_timeline(
         self,
@@ -7383,6 +7601,141 @@ class CoworkerHandle:
             ),
         )
         return CoworkerAcceptedEventDispatch(plan=plan, analysis=analysis)
+
+    def native_git_diff_status(self, run_id: str) -> CoworkerNativeGitDiff:
+        """Inspect the durable one-shot diagnostic after an interrupted process."""
+
+        normalized = str(UUID(run_id))
+        return self._directory._get_native_git_diff(self, normalized)
+
+    def native_git_diff_output(self, run_id: str) -> str:
+        """Read only the exact previously verified, durable tool output."""
+
+        receipt = self.native_git_diff_status(run_id)
+        if receipt.status != "completed" or receipt.tool_session_id is None:
+            raise CoworkerRuntimeUnavailable(
+                "native tool output is unavailable for a non-completed run"
+            )
+        current = self._directory._require_coworker_owner_binding(self)
+        store = SessionStore(
+            self._directory._profile_database_directory(current)
+            / "crew_native_tool_sessions.db"
+        )
+        stored = store.load_session(receipt.tool_session_id)
+        output = stored.tool_calls[0].result
+        if (
+            not isinstance(output, str)
+            or len(output.encode("utf-8")) > 16_384
+            or redact_known_secrets(output) != output
+            or any(
+                unicodedata.category(char) in {"Cc", "Cf", "Cs"}
+                and char not in {"\r", "\n", "\t"} for char in output
+            )
+        ):
+            raise CoworkerRuntimeUnavailable(
+                "native tool persisted output failed safe replay inspection"
+            )
+        return output
+
+    async def run_native_git_diff(
+        self, *, run_id: str, path: str, expected_sha256: str,
+    ) -> tuple[CoworkerNativeGitDiff, str]:
+        """Owner-requested Git diff through a distinct tool-only AshLoop."""
+
+        from ash.coworker_git import mediated_git_diff
+
+        normalized_run = str(UUID(run_id))
+        if normalized_run != run_id:
+            raise ValueError("native tool run ID must be a canonical UUID")
+        normalized_path, = validate_evidence_paths((path,))
+        if re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None:
+            raise ValueError("expected source SHA-256 must be a lowercase hex digest")
+        current = self._directory._require_local_coworker_owner(self)
+        if current.lifecycle_status != "active":
+            raise CoworkerRuntimeUnavailable("coworker is not active")
+        git_dir = current.workspace / ".git"
+        if not git_dir.exists() or not stat.S_ISDIR(git_dir.lstat().st_mode):
+            raise CoworkerRuntimeUnavailable(
+                "native Git diagnostics require a repository rooted in this workspace"
+            )
+        guard = SafetyGuard(current.workspace)
+        identity = guard.project_root_identity
+        if identity is None:
+            raise CoworkerRuntimeUnavailable("workspace identity is unavailable")
+        before, = read_explicit_evidence(
+            current.workspace, (normalized_path,), guard=guard,
+        )
+        if before.sha256 != expected_sha256:
+            raise CoworkerRuntimeUnavailable(
+                "Git evidence changed since owner confirmation"
+            )
+        self._directory._claim_native_git_diff(
+            self, run_id=run_id, path=normalized_path,
+            source_sha256=expected_sha256, workspace_identity=identity,
+        )
+        tool_session_id: str | None = None
+        try:
+            active = self._directory._require_local_coworker_owner(self)
+            guard.ensure_project_root_current()
+            after, = read_explicit_evidence(
+                active.workspace, (normalized_path,), guard=guard,
+            )
+            if after.sha256 != expected_sha256:
+                raise CoworkerRuntimeUnavailable(
+                    "Git evidence changed after durable tool claim"
+                )
+            tool_session_id, tool_result = await mediated_git_diff(
+                workspace=active.workspace,
+                session_database=(
+                    self._directory._profile_database_directory(active)
+                    / "crew_native_tool_sessions.db"
+                ),
+                path=normalized_path,
+            )
+            output = tool_result.get("output")
+            if (
+                tool_result.get("success") is not True
+                or tool_result.get("truncated") is True
+                or tool_result.get("ambiguous") is True
+                or not isinstance(output, str)
+                or len(output.encode("utf-8")) > 16_384
+                or redact_known_secrets(output) != output
+                or any(
+                    unicodedata.category(char) in {"Cc", "Cf", "Cs"}
+                    and char not in {"\r", "\n", "\t"} for char in output
+                )
+            ):
+                self._directory._finish_native_git_diff(
+                    self, run_id=run_id, status="blocked",
+                    tool_session_id=tool_session_id, output_sha256=None,
+                )
+                raise CoworkerRuntimeUnavailable(
+                    "native Git result failed the bounded read-only output policy"
+                )
+            # Git history/index or the workspace can change during the tool.
+            # A source mismatch fails closed even for a completed read.
+            latest, = read_explicit_evidence(
+                active.workspace, (normalized_path,), guard=guard,
+            )
+            if latest.sha256 != expected_sha256:
+                raise CoworkerRuntimeUnavailable(
+                    "Git evidence changed during native tool execution"
+                )
+            digest = hashlib.sha256(output.encode("utf-8")).hexdigest()
+            self._directory._finish_native_git_diff(
+                self, run_id=run_id, status="completed",
+                tool_session_id=tool_session_id, output_sha256=digest,
+            )
+            return self.native_git_diff_status(run_id), output
+        except BaseException:
+            # A dispatched Git process may have completed before interruption.
+            # A finished receipt is never transitioned back or replayed.
+            if self.native_git_diff_status(run_id).status == "claimed":
+                self._directory._finish_native_git_diff(
+                    self, run_id=run_id, status="unknown",
+                    tool_session_id=tool_session_id, output_sha256=None,
+                )
+            raise
 
     def responsibility_timeline(
         self, responsibility_id: str, *, limit: int = 20,
