@@ -63,6 +63,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _list(args)
     if action == "show":
         return _show(args)
+    if action == "rename":
+        return _rename(args)
     if action == "inbox":
         return _inbox(args)
     if action == "usage":
@@ -543,6 +545,33 @@ def _render_inbox_approval(entry: CoworkerApprovalInboxEntry) -> None:
             f"{entry.lifecycle_status}."
         )
     _write_line(f"Status: {_safe_text(status, single_line=True)}")
+
+
+def _rename(args: argparse.Namespace) -> int:
+    """Rename only the owner-bound display label, never the stable coworker ID."""
+
+    try:
+        handle = _open_coworker_handle(args)
+        if handle.require_owner_binding().display_name != args.expected_name:
+            raise CoworkerRuntimeUnavailable(
+                "coworker display name changed since owner review"
+            )
+        renamed = handle.rename(args.name)
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        SessionStorageError, OSError, ValueError,
+    ) as exc:
+        _write_error(f"Coworker rename blocked: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"Coworker rename blocked ({type(exc).__name__}).")
+        return 2
+    _write_identity(renamed)
+    _write_line(
+        "Only the display name changed; coworker ID, profile, workspace, "
+        "sessions and responsibilities remain bound to their original identity."
+    )
+    return 0
 
 
 def _lifecycle(args: argparse.Namespace, action: str) -> int:

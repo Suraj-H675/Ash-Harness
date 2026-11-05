@@ -1416,7 +1416,10 @@ def _normalize_display_name(display_name: str) -> str:
     if (
         not normalized
         or len(normalized) > _MAX_COWORKER_NAME_CHARS
-        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+        or any(
+            unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+            for character in normalized
+        )
     ):
         raise ValueError("display_name must be non-empty, bounded, and printable")
     return normalized
@@ -7873,21 +7876,72 @@ class CoworkerDirectory:
         owner_id: str,
         coworker_id: str,
         display_name: str,
+        expected_display_name: str | None = None,
     ) -> Coworker:
-        """Change presentation only; ID, owner, profile, and workspace stay fixed."""
+        """Owner-only rename; immutable identity, profile and runs are preserved."""
 
         owner = _normalize_owner_id(owner_id)
         identity = _normalize_coworker_id(coworker_id)
         name = _normalize_display_name(display_name)
-        with closing(self._connect()) as conn, conn:
+        if expected_display_name is not None:
+            if (
+                not isinstance(expected_display_name, str)
+                or expected_display_name != _normalize_display_name(
+                    expected_display_name
+                )
+            ):
+                raise ValueError("expected display name must be exact")
+        with closing(self._connect_durable()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM coworkers WHERE owner_id=? AND coworker_id=?",
+                (owner, identity),
+            ).fetchone()
+            if row is None:
+                raise CoworkerNotFound("coworker not found")
+            current = _record_from_row(row)
+            if (
+                current.owner_uid is None
+                or current.owner_uid != _current_owner_uid()
+                or current.state != "ready"
+            ):
+                raise CoworkerRuntimeUnavailable(
+                    "coworker rename requires its verified local owner"
+                )
+            if current.lifecycle_status == "archived":
+                raise CoworkerRuntimeUnavailable(
+                    "archived coworker identity cannot be renamed"
+                )
+            if (
+                expected_display_name is not None
+                and expected_display_name != current.display_name
+            ):
+                raise CoworkerRuntimeUnavailable(
+                    "coworker display name changed since owner review"
+                )
+            if name == current.display_name:
+                return current
             cursor = conn.execute(
-                "UPDATE coworkers SET display_name = ?, updated_at = ? "
-                "WHERE owner_id = ? AND coworker_id = ?",
-                (name, _now(), owner, identity),
+                "UPDATE coworkers SET display_name=?, updated_at=? "
+                "WHERE owner_id=? AND coworker_id=? AND owner_uid=? "
+                "AND display_name=? AND state='ready' "
+                "AND lifecycle_status IN ('active','paused')",
+                (
+                    name, _now(), owner, identity,
+                    current.owner_uid, current.display_name,
+                ),
             )
             if cursor.rowcount != 1:
-                raise CoworkerNotFound("coworker not found")
-        return self._get_owned(owner, identity)
+                raise CoworkerRuntimeUnavailable(
+                    "coworker rename changed during owner confirmation"
+                )
+            updated = conn.execute(
+                "SELECT * FROM coworkers WHERE owner_id=? AND coworker_id=?",
+                (owner, identity),
+            ).fetchone()
+            if updated is None:
+                raise CoworkerDirectoryError("coworker disappeared during rename")
+            return _record_from_row(updated)
 
     def open_coworker(self, *, owner_id: str, coworker_id: str) -> "CoworkerHandle":
         """Open a coworker only through its persisted owner and immutable ID."""
@@ -7964,6 +8018,16 @@ class CoworkerHandle:
             self, run_id=run_id, session_id=session_id, request_id=request_id,
             excerpt=excerpt, expected_revision=expected_revision,
             expected_response_sha256=expected_response_sha256,
+        )
+
+    def rename(self, display_name: str) -> Coworker:
+        """Rename this owned coworker if its original name is still current."""
+
+        return self._directory.rename(
+            owner_id=self._identity.owner_id,
+            coworker_id=self._identity.coworker_id,
+            display_name=display_name,
+            expected_display_name=self._identity.display_name,
         )
 
     def pause(self) -> Coworker:

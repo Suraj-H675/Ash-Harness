@@ -8046,3 +8046,115 @@ def test_model_budget_prevents_second_concurrent_provider_turn(
     assert second.model_budget().used_attempts == 1
     assert second.model_budget().remaining_attempts == 0
     assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_coworker_rename_cli_preserves_identity_and_completed_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    responsibility = handle.create_responsibility(
+        scope="Local test repository", objective="Observe CI regressions",
+    )
+    assert main(_ask_args(
+        atlas.coworker_id, "Keep this run.",
+        turn_id="rename-history-preserved",
+    )) == 0
+    capsys.readouterr()
+    assert len(observed) == 1
+    args = [
+        "crew", "rename", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--expected-name", "Atlas", "--name", "Release Watch",
+    ]
+    assert main(args) == 0
+    output = capsys.readouterr().out
+    assert "Release Watch" in output
+    assert atlas.coworker_id in output
+
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    identity = reopened.identity
+    assert identity.display_name == "Release Watch"
+    assert identity.coworker_id == atlas.coworker_id
+    assert identity.canonical_session_id == atlas.canonical_session_id
+    assert identity.owner_uid == atlas.owner_uid
+    assert identity.workspace == atlas.workspace
+    assert identity.profile_name == atlas.profile_name
+    assert reopened.get_responsibility(
+        responsibility.responsibility_id
+    ).coworker_id == atlas.coworker_id
+    assert len(reopened.list_readonly_turn_history()) == 1
+    assert len(observed) == 1
+
+    assert main(args) == 2
+    assert "changed since owner review" in capsys.readouterr().err
+    with pytest.raises(CoworkerRuntimeUnavailable, match="changed since owner"):
+        handle.rename("A stale second rename")
+    assert reopened.pause().lifecycle_status == "paused"
+    assert main([
+        "crew", "rename", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--expected-name", "Release Watch", "--name", "Paused Research",
+    ]) == 0
+    capsys.readouterr()
+    assert reopened.archive().lifecycle_status == "archived"
+    assert main([
+        "crew", "rename", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--expected-name", "Paused Research", "--name", "Invalid Archive Rename",
+    ]) == 2
+    assert "archived" in capsys.readouterr().err
+    assert CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    ).identity.display_name == "Paused Research"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_coworker_directory_rename_requires_verified_uid_and_safe_display_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    with pytest.raises(ValueError, match="printable"):
+        directory.rename(
+            owner_id="local", coworker_id=atlas.coworker_id,
+            display_name="Hidden\u202eDisplay",
+        )
+    with pytest.raises(ValueError, match="exact"):
+        directory.rename(
+            owner_id="local", coworker_id=atlas.coworker_id,
+            display_name="New Name", expected_display_name=" Atlas ",
+        )
+    with pytest.raises(CoworkerNotFound):
+        directory.rename(
+            owner_id="different-owner", coworker_id=atlas.coworker_id,
+            display_name="New Name",
+        )
+    # owner_id is not a permission. A different local UID must not rename
+    # even with the full coworker UUID and original owner label.
+    assert atlas.owner_uid is not None
+    monkeypatch.setattr(
+        "ash.coworkers._current_owner_uid", lambda: atlas.owner_uid + 1,
+    )
+    with pytest.raises(CoworkerRuntimeUnavailable, match="verified local owner"):
+        directory.rename(
+            owner_id="local", coworker_id=atlas.coworker_id,
+            display_name="Hacked Display",
+        )
+    assert directory._get_owned("local", atlas.coworker_id).display_name == "Atlas"

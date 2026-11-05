@@ -109,6 +109,17 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         "--limit", type=int, default=5,
         help="Maximum responsibility summaries and activity entries (1-20)",
     )
+    crew_rename = crew_subparsers.add_parser(
+        "rename", help="Change a coworker's display name without changing its identity",
+    )
+    crew_rename.add_argument("--owner", required=True)
+    crew_rename.add_argument("--coworker-id", required=True)
+    crew_rename.add_argument("--name", required=True)
+    crew_rename.add_argument(
+        "--expected-name", required=True,
+        help="Current display name shown by crew show; prevents stale rename",
+    )
+
     crew_brief = crew_subparsers.add_parser(
         "brief", help="Show, set or clear one coworker's owner-curated context"
     )

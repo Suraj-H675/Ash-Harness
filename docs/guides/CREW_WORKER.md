@@ -240,3 +240,25 @@ even a claimed turn with an interrupted/unknown outcome can incur cost.
 Explicit readiness tests and provider calls outside Crew are not governed
 by this lifetime model-claim cap. Use crew usage for local observed
 accounting and provider-side account limits for a true financial ceiling.
+
+## Rename a coworker without changing its identity
+
+An existing coworker's display label can be changed without reprovisioning a
+profile or losing its standing duties, conversation or run history:
+
+    ash crew show --owner local --coworker-id COWORKER_UUID
+    ash crew rename --owner local --coworker-id COWORKER_UUID \
+      --expected-name "Atlas" --name "Release Watch"
+
+Supply the exact current display name as expected-name. A stale rename is
+rejected, rather than silently overwriting another owner action. Renaming
+requires the original local owner UID and the immutable coworker ID inside
+a durable transaction. It does not switch the coworker's provider, profile,
+workspace, permissions, responsibility assignments, or persisted sessions.
+Pausing the coworker still permits a presentation-only rename. Archived
+coworkers are permanently closed for edits; their original identity and
+recorded work remain available for inspection.
+
+Display names are printable presentation labels, not authorization keys.
+Control and Unicode format characters (including bidirectional overrides)
+are rejected; use the immutable coworker ID for references and automation.
