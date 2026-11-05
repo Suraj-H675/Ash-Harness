@@ -89,10 +89,11 @@ from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
 _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION = 9
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 14
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 15
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
 _MAX_COWORKER_BRIEF_BYTES = 2048
+_MAX_COWORKER_MODEL_ATTEMPT_BUDGET = 100_000
 _MAX_RESPONSIBILITY_SCOPE_BYTES = 2048
 _MAX_RESPONSIBILITY_OBJECTIVE_BYTES = 6144
 _MAX_RESPONSIBILITY_CRITERIA = 8
@@ -1094,6 +1095,21 @@ class CoworkerResponsibilityRun:
     scheduled_for: datetime | None = None
     skip_reason: str | None = None
     execution_kind: CoworkerResponsibilityExecutionKind = "legacy"
+
+
+@dataclass(frozen=True)
+class CoworkerModelBudget:
+    """Lifetime model-claim limit. None is unlimited, not a dollar limit."""
+
+    max_attempts: int | None
+    used_attempts: int
+    revision: int
+
+    @property
+    def remaining_attempts(self) -> int | None:
+        if self.max_attempts is None:
+            return None
+        return max(0, self.max_attempts - self.used_attempts)
 
 
 @dataclass(frozen=True)
@@ -3075,6 +3091,7 @@ class CoworkerDirectory:
                     11,
                     12,
                     13,
+                    14,
                     _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION,
                     _COWORKER_DIRECTORY_SCHEMA_VERSION,
                 }:
@@ -3678,6 +3695,42 @@ class CoworkerDirectory:
                 }:
                     raise CoworkerDirectoryError(
                         "coworker native Git diagnostic schema is incomplete"
+                    )
+                if (
+                    not fresh_directory and original_version >= 15
+                    and "coworker_model_budgets" not in tables
+                ):
+                    raise CoworkerDirectoryError(
+                        "coworker model budget schema is incomplete"
+                    )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coworker_model_budgets (
+                        owner_id TEXT NOT NULL,
+                        coworker_id TEXT NOT NULL,
+                        owner_uid INTEGER NOT NULL,
+                        max_attempts INTEGER CHECK (
+                            max_attempts IS NULL OR
+                            max_attempts BETWEEN 0 AND 100000
+                        ),
+                        revision INTEGER NOT NULL CHECK(revision >= 1),
+                        PRIMARY KEY(owner_id, coworker_id),
+                        FOREIGN KEY(owner_id, coworker_id)
+                            REFERENCES coworkers(owner_id, coworker_id)
+                    )
+                    """
+                )
+                budget_columns = {
+                    str(column["name"]) for column in conn.execute(
+                        "PRAGMA table_info(coworker_model_budgets)"
+                    )
+                }
+                if budget_columns != {
+                    "owner_id", "coworker_id", "owner_uid",
+                    "max_attempts", "revision",
+                }:
+                    raise CoworkerDirectoryError(
+                        "coworker model budget schema is incomplete"
                     )
                 conn.execute(
                     "UPDATE coworker_directory_meta SET schema_version = ?",
@@ -4873,6 +4926,99 @@ class CoworkerDirectory:
             if updated is None:
                 raise CoworkerDirectoryError("responsibility changed during transition")
             return _responsibility_from_row(updated)
+
+    @staticmethod
+    def _model_attempt_count(
+        conn: sqlite3.Connection, current: Coworker,
+    ) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS consumed FROM coworker_turn_dispatches "
+            "WHERE owner_id=? AND coworker_id=? "
+            "AND execution_kind='model' AND status IN ('claimed','completed')",
+            (current.owner_id, current.coworker_id),
+        ).fetchone()
+        if row is None or type(row["consumed"]) is not int or row["consumed"] < 0:
+            raise CoworkerDirectoryError("model attempt ledger is invalid")
+        return int(row["consumed"])
+
+    @staticmethod
+    def _model_budget_from_connection(
+        conn: sqlite3.Connection, current: Coworker,
+    ) -> CoworkerModelBudget:
+        row = conn.execute(
+            "SELECT owner_uid,max_attempts,revision FROM coworker_model_budgets "
+            "WHERE owner_id=? AND coworker_id=?",
+            (current.owner_id, current.coworker_id),
+        ).fetchone()
+        if row is None:
+            limit, revision = None, 0
+        else:
+            limit, revision = row["max_attempts"], row["revision"]
+            if (
+                row["owner_uid"] != current.owner_uid
+                or type(revision) is not int or revision < 1
+                or (limit is not None and (
+                    type(limit) is not int
+                    or not 0 <= limit <= _MAX_COWORKER_MODEL_ATTEMPT_BUDGET
+                ))
+            ):
+                raise CoworkerDirectoryError("coworker model budget binding is invalid")
+        return CoworkerModelBudget(
+            max_attempts=limit,
+            used_attempts=CoworkerDirectory._model_attempt_count(conn, current),
+            revision=revision,
+        )
+
+    def _read_model_budget(self, handle: "CoworkerHandle") -> CoworkerModelBudget:
+        current = self._require_coworker_owner_binding(handle)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN")
+            current = self._require_coworker_owner_binding(handle, conn)
+            result = self._model_budget_from_connection(conn, current)
+            conn.commit()
+            return result
+
+    def _set_model_budget(
+        self, handle: "CoworkerHandle", *,
+        max_attempts: int | None, expected_revision: int,
+    ) -> CoworkerModelBudget:
+        if max_attempts is not None and (
+            type(max_attempts) is not int
+            or not 0 <= max_attempts <= _MAX_COWORKER_MODEL_ATTEMPT_BUDGET
+        ):
+            raise ValueError("model attempt limit must be between 0 and 100000")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("expected revision must be nonnegative")
+        with closing(self._connect_durable()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._require_local_coworker_owner(handle, conn)
+            if current.lifecycle_status == "archived":
+                raise CoworkerRuntimeUnavailable(
+                    "archived coworker budget cannot be changed"
+                )
+            previous = self._model_budget_from_connection(conn, current)
+            if previous.revision != expected_revision:
+                raise CoworkerRuntimeUnavailable(
+                    "model budget changed since owner review"
+                )
+            if previous.max_attempts == max_attempts:
+                return previous
+            revision = previous.revision + 1
+            conn.execute(
+                "INSERT INTO coworker_model_budgets "
+                "(owner_id,coworker_id,owner_uid,max_attempts,revision) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(owner_id,coworker_id) "
+                "DO UPDATE SET max_attempts=excluded.max_attempts, "
+                "revision=excluded.revision",
+                (
+                    current.owner_id, current.coworker_id, current.owner_uid,
+                    max_attempts, revision,
+                ),
+            )
+            return CoworkerModelBudget(
+                max_attempts=max_attempts, used_attempts=previous.used_attempts,
+                revision=revision,
+            )
 
     def _model_usage_summary(
         self, handle: "CoworkerHandle",
@@ -6139,6 +6285,18 @@ class CoworkerDirectory:
                     raise CoworkerRuntimeUnavailable(
                         "coworker run was already claimed; refusing replay"
                     )
+                # The transaction serializes all budget changes and claims.
+                # Scheduled no-model skips above remain permitted at the cap.
+                if execution_kind == "model":
+                    budget = self._model_budget_from_connection(conn, current)
+                    if (
+                        budget.max_attempts is not None
+                        and budget.used_attempts >= budget.max_attempts
+                    ):
+                        raise CoworkerRuntimeUnavailable(
+                            "coworker model attempt budget exhausted; no provider "
+                            "request was sent"
+                        )
                 conn.execute(
                     "INSERT INTO coworker_turn_dispatches "
                     "(owner_id, coworker_id, run_id, session_id, request_id, "
@@ -8172,6 +8330,20 @@ class CoworkerHandle:
             status,
         )
 
+    def model_budget(self) -> CoworkerModelBudget:
+        """Inspect the current lifetime model-claim cap and consumed count."""
+
+        return self._directory._read_model_budget(self)
+
+    def set_model_budget(
+        self, *, max_attempts: int | None, expected_revision: int,
+    ) -> CoworkerModelBudget:
+        """Owner-only compare-and-swap update of the durable model-claim cap."""
+
+        return self._directory._set_model_budget(
+            self, max_attempts=max_attempts, expected_revision=expected_revision,
+        )
+
     def model_usage_summary(self) -> CoworkerModelUsage:
         """Read owner-bound model run accounting; never request a provider."""
 
@@ -8812,6 +8984,13 @@ class CoworkerHandle:
             if current.canonical_session_id != canonical.session_id:
                 raise CoworkerDirectoryError("canonical coworker binding changed")
             if check_model:
+                # Readiness probing sends a separate provider request before
+                # the durable claim; do not permit it to bypass an enabled cap.
+                if self.model_budget().max_attempts is not None:
+                    raise CoworkerModelReadinessError(
+                        "budgeted_turn_disallows_unmetered_preflight",
+                        provider_request_attempted=False,
+                    )
                 prepared = _prepare_coworker_model_provider(
                     config,
                     prompt=prompt,

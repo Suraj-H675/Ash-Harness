@@ -203,3 +203,40 @@ exists. No provider request or external network call is made to display this
 report. A missing or cross-coworker session binding is rejected rather
 than silently included. Enforcing future spending/model-attempt limits is
 a separate capability and is not implied by this command.
+
+## Lifetime model-attempt budget
+
+Each coworker can have a durable, owner-controlled limit on model-turn
+claims, shared by manual asks, chat turns, investigations, signed events,
+and scheduled model responsibilities. It defaults to unlimited.
+
+    ash crew budget show --owner local --coworker-id COWORKER_UUID
+    ash crew budget set --owner local --coworker-id COWORKER_UUID \
+      --max-attempts 10 --expected-revision 0
+    ash crew budget clear --owner local --coworker-id COWORKER_UUID \
+      --expected-revision 1
+
+Use the current revision shown by the show command; changes are compare-and-swap,
+so stale owner commands cannot silently overwrite later limits. A cap of
+zero blocks all new model claims. The counter is lifetime, not per-day:
+it includes every completed or uncertain model claim already recorded for
+that coworker, including claims made before the cap was configured.
+Scheduled no-model skips consume no slots. Decreasing the cap below the
+already-used count stops new work without erasing old claims. Clearing the
+cap requires an explicit owner command and does not erase history.
+
+Budget admission and durable model-run claiming occur in the same SQLite
+write transaction. Two concurrent claimants cannot both consume the last
+slot. Exhaustion is refused before model dispatch, with no automatic
+retry or rollback of previously claimed work. While a cap is configured,
+an optional extra --check-model probe within a model turn is disabled
+because that probe would contact the provider before the recorded claim.
+The separate explicit crew check-model readiness diagnostic remains an
+owner-invoked provider test and is not counted by the turn budget.
+
+This mechanism is not a hard dollar, token, or provider-call budget.
+Provider charges and token totals can be late, estimated, or unavailable;
+even a claimed turn with an interrupted/unknown outcome can incur cost.
+Explicit readiness tests and provider calls outside Crew are not governed
+by this lifetime model-claim cap. Use crew usage for local observed
+accounting and provider-side account limits for a true financial ceiling.

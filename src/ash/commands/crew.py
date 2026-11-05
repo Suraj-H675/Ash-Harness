@@ -67,6 +67,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _inbox(args)
     if action == "usage":
         return _usage(args)
+    if action == "budget":
+        return _budget(args)
     if action == "brief":
         return _brief(args)
     if action in {"pause", "resume", "archive"}:
@@ -312,6 +314,50 @@ def _show(args: argparse.Namespace) -> int:
         "Schedules run through an explicit tick or started Crew worker; "
         "there is no automatically installed background service or "
         "remote notification channel."
+    )
+    return 0
+
+
+def _budget(args: argparse.Namespace) -> int:
+    """Conservative lifetime model-turn cap, not a dollar spending promise."""
+
+    try:
+        handle = _open_coworker_handle(args)
+        action = args.crew_budget_action
+        if action == "show":
+            budget = handle.model_budget()
+        else:
+            budget = handle.set_model_budget(
+                max_attempts=args.max_attempts if action == "set" else None,
+                expected_revision=args.expected_revision,
+            )
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        SessionStorageError, OSError, ValueError,
+    ) as exc:
+        _write_error(f"Coworker model budget is unavailable: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"Coworker model budget is unavailable ({type(exc).__name__}).")
+        return 2
+    _write_line(f"Budget revision: {budget.revision}")
+    _write_line(
+        "Lifetime model attempt cap: "
+        + ("unlimited" if budget.max_attempts is None else str(budget.max_attempts))
+    )
+    _write_line(f"Durably claimed model attempts: {budget.used_attempts}")
+    _write_line(
+        "Remaining attempts: "
+        + (
+            "unlimited" if budget.remaining_attempts is None
+            else str(budget.remaining_attempts)
+        )
+    )
+    _write_line(
+        "Claimed and uncertain turns consume a slot. Scheduled skips do not. "
+        "This is a lifetime admission cap, not a USD/token limit; changing it "
+        "cannot cancel a dispatched turn. Explicit readiness tests and native "
+        "tool-only operations have separate accounting."
     )
     return 0
 

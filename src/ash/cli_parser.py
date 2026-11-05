@@ -133,6 +133,26 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
                 "--excerpt", required=True,
                 help="Exact single-line substring of the completed model response",
             )
+    crew_budget = crew_subparsers.add_parser(
+        "budget", help="Set or inspect a per-coworker lifetime model-attempt cap",
+    )
+    crew_budget_actions = crew_budget.add_subparsers(
+        dest="crew_budget_action", required=True,
+    )
+    for action in ("show", "set", "clear"):
+        item = crew_budget_actions.add_parser(
+            action, help=f"{action.title()} an owner-controlled model-attempt cap",
+        )
+        item.add_argument("--owner", required=True)
+        item.add_argument("--coworker-id", required=True)
+        if action != "show":
+            item.add_argument("--expected-revision", required=True, type=int)
+        if action == "set":
+            item.add_argument(
+                "--max-attempts", type=int, required=True,
+                help="Total claimed model turns allowed, 0..100000, across restarts",
+            )
+
     crew_usage = crew_subparsers.add_parser(
         "usage", help="Inspect persisted per-coworker model usage and pricing gaps",
     )

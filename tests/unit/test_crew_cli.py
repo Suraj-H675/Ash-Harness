@@ -7801,3 +7801,248 @@ def test_usage_excludes_no_change_model_schedule_skip_without_creating_session_d
     assert "Model attempts: 0" in output
     assert "Scheduled skips without a model call: 1" in output
     assert not observed
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_owner_model_budget_caps_durable_claims_and_can_be_revised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, other_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_answer="Scoped budget result",
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=other_workspace,
+    )
+    args = ["crew", "budget", "set", "--owner", "local",
+            "--coworker-id", atlas.coworker_id,
+            "--expected-revision", "0", "--max-attempts", "1"]
+    assert main(args) == 0
+    out = capsys.readouterr().out
+    assert "Budget revision: 1" in out
+    assert "Remaining attempts: 1" in out
+    assert main(_ask_args(
+        atlas.coworker_id, "First allowed turn", turn_id="budget-one",
+    )) == 0
+    capsys.readouterr()
+    assert len(observed) == 1
+    assert main(_ask_args(
+        atlas.coworker_id, "Denied second turn", turn_id="budget-two",
+    )) == 2
+    assert "budget exhausted" in capsys.readouterr().err
+    assert len(observed) == 1
+    reopened = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    assert reopened.model_budget().used_attempts == 1
+    assert reopened.model_budget().remaining_attempts == 0
+    assert main(args) == 2
+    assert "budget changed since owner review" in capsys.readouterr().err
+    assert main([
+        "crew", "budget", "set", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--expected-revision", "1", "--max-attempts", "2",
+    ]) == 0
+    capsys.readouterr()
+    assert main(_ask_args(
+        atlas.coworker_id, "Now allowed", turn_id="budget-two",
+    )) == 0
+    capsys.readouterr()
+    assert len(observed) == 2
+    assert main(_ask_args(
+        scout.coworker_id, "Scout is independent", turn_id="scout-budget",
+    )) == 0
+    capsys.readouterr()
+    assert len(observed) == 3
+    assert directory.open_coworker(
+        owner_id="local", coworker_id=scout.coworker_id,
+    ).model_budget().max_attempts is None
+    assert main([
+        "crew", "budget", "clear", "--owner", "local",
+        "--coworker-id", atlas.coworker_id, "--expected-revision", "2",
+    ]) == 0
+    capsys.readouterr()
+    cleared = reopened.model_budget()
+    assert cleared.revision == 3
+    assert cleared.max_attempts is None
+    assert cleared.used_attempts == 2
+    assert main(_ask_args(
+        atlas.coworker_id, "Unlimited again", turn_id="budget-three",
+    )) == 0
+    capsys.readouterr()
+    assert len(observed) == 4
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_zero_budget_blocks_model_and_preflight_before_provider_and_counts_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    with pytest.raises(ValueError, match="between 0 and 100000"):
+        handle.set_model_budget(max_attempts=-1, expected_revision=0)
+    with pytest.raises(ValueError, match="expected revision"):
+        handle.set_model_budget(max_attempts=1, expected_revision=-1)
+    assert handle.set_model_budget(
+        max_attempts=0, expected_revision=0,
+    ).remaining_attempts == 0
+    assert main(_ask_args(
+        atlas.coworker_id, "No provider allowed.", turn_id="zero-budget",
+    )) == 2
+    assert "budget exhausted" in capsys.readouterr().err
+    assert len(observed) == 0
+    assert main(_ask_args(
+        atlas.coworker_id, "No unmetered check.", turn_id="zero-probe",
+    ) + ["--check-model"]) == 2
+    assert "budgeted_turn_disallows_unmetered_preflight" in capsys.readouterr().err
+    assert len(observed) == 0
+    assert handle.model_budget().used_attempts == 0
+    assert handle.set_model_budget(
+        max_attempts=1, expected_revision=1,
+    ).remaining_attempts == 1
+    assert main(_ask_args(
+        atlas.coworker_id, "Claim one turn.", turn_id="one-claim",
+    )) == 0
+    capsys.readouterr()
+    assert len(observed) == 1
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "UPDATE coworker_turn_dispatches SET status='claimed', "
+            "completed_at=NULL WHERE coworker_id=? AND execution_kind='model'",
+            (atlas.coworker_id,),
+        )
+    assert handle.model_budget().used_attempts == 1
+    assert main(_ask_args(
+        atlas.coworker_id, "Cannot retry uncertain work.",
+        turn_id="two-claims",
+    )) == 2
+    assert "budget exhausted" in capsys.readouterr().err
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_model_budget_excludes_scheduled_skips_and_rejects_forged_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime, timezone
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import CoworkerDirectoryError
+
+    ash_dir, workspace, other_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=other_workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    task = handle.create_responsibility(
+        scope="CI", objective="Check new logs",
+        schedule=build_schedule(every="1h"),
+    )
+    handle.set_model_budget(max_attempts=0, expected_revision=0)
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "INSERT INTO coworker_turn_dispatches ("
+            "owner_id,coworker_id,run_id,session_id,request_id,status,"
+            "execution_kind,responsibility_id,trigger_type,event_key,"
+            "created_at,completed_at,scheduled_for,skip_reason"
+            ") VALUES (?,?,?,NULL,NULL,'skipped','model',?,'scheduled',"
+            "?,?,NULL,?,'evidence_unchanged')",
+            (
+                atlas.owner_id, atlas.coworker_id, str(uuid4()),
+                task.responsibility_id, "skip-budget",
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    assert handle.model_budget().used_attempts == 0
+    assert handle.model_budget().remaining_attempts == 0
+    with pytest.raises(CoworkerNotFound):
+        directory.open_coworker(
+            owner_id="local", coworker_id=scout.coworker_id,
+        ).get_responsibility(task.responsibility_id)
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "UPDATE coworker_model_budgets SET owner_uid=owner_uid+1 "
+            "WHERE coworker_id=?", (atlas.coworker_id,),
+        )
+    with pytest.raises(CoworkerDirectoryError, match="budget binding"):
+        handle.model_budget()
+    with pytest.raises(CoworkerDirectoryError, match="budget binding"):
+        handle.set_model_budget(max_attempts=None, expected_revision=1)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_model_budget_prevents_second_concurrent_provider_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.coworkers import CoworkerTurnRequest
+    from ash.core.session import SessionStorageError
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    started, release = asyncio.Event(), asyncio.Event()
+    _, observed = _install_fake_registry(
+        monkeypatch, started=started, release=release,
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    first = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    second = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    first.set_model_budget(max_attempts=1, expected_revision=0)
+
+    async def exercise() -> None:
+        pending = asyncio.create_task(first.run_readonly_turn(
+            CoworkerTurnRequest(
+                turn_id="budget-inflight-one", question="First model call",
+            ),
+        ))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert first.model_budget().used_attempts == 1
+            with pytest.raises(SessionStorageError, match="active in another"):
+                await second.run_readonly_turn(CoworkerTurnRequest(
+                    turn_id="budget-inflight-two", question="Second model call",
+                ))
+            assert len(observed) == 1
+        finally:
+            release.set()
+        result = await asyncio.wait_for(pending, timeout=10)
+        assert result.session_ref.run_id is not None
+        with pytest.raises(CoworkerRuntimeUnavailable, match="budget exhausted"):
+            await second.run_readonly_turn(CoworkerTurnRequest(
+                turn_id="budget-inflight-three", question="After completion",
+            ))
+
+    asyncio.run(exercise())
+    assert second.model_budget().used_attempts == 1
+    assert second.model_budget().remaining_attempts == 0
+    assert len(observed) == 1
