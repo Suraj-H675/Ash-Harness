@@ -134,10 +134,6 @@ def _generated_ash_launcher(directory: str) -> str:
     return str(Path(directory) / name)
 
 
-def _current_runtime_python() -> str:
-    return f"{sys.version_info.major}.{sys.version_info.minor}"
-
-
 def test_installer_capability_extras_match_published_package_extras() -> None:
     project = tomllib.loads(
         Path("pyproject.toml").read_text(encoding="utf-8")
@@ -1311,7 +1307,7 @@ def test_uv_is_a_supported_fallback_when_pipx_is_unavailable() -> None:
         "--force",
         "--reinstall",
         "--python",
-        _current_runtime_python(),
+        "3.14",
         "ash-ai @ git+https://github.com/Suraj-H675/Ash-Harness.git",
     ]
     assert outcome.manager == "uv"
@@ -1501,7 +1497,10 @@ def test_public_installer_bridges_old_bootstrap_to_supported_runtime() -> None:
     assert "Ash is ready" in stdout.getvalue()
 
 
-def test_public_installer_pins_supported_bootstrap_runtime() -> None:
+@pytest.mark.parametrize("host_python", [(3, 12), (3, 13), (3, 14), (3, 15)])
+def test_public_installer_uses_managed_runtime_independent_of_host_python(
+    host_python: tuple[int, int],
+) -> None:
     calls: list[dict[str, object]] = []
 
     def fake_install(**kwargs):
@@ -1514,12 +1513,12 @@ def test_public_installer_pins_supported_bootstrap_runtime() -> None:
             installer=fake_install,
             stdout=io.StringIO(),
             stderr=io.StringIO(),
-            python_version=(3, 12),
+            python_version=host_python,
         )
         == 0
     )
     assert calls == [
-        {"extras": [], "ref": "ash-v0.1.0", "runtime_python": "3.12"}
+        {"extras": [], "ref": "ash-v0.1.0", "runtime_python": "3.14"}
     ]
 
 
@@ -1780,7 +1779,7 @@ def test_uv_state_scopes_extras_and_executable_to_ash_tool() -> None:
         "--force",
         "--reinstall",
         "--python",
-        _current_runtime_python(),
+        "3.14",
         "ash-ai[browser] @ git+https://github.com/Suraj-H675/Ash-Harness.git",
     ] in calls
     assert outcome.executable == "/isolated/bin/ash"

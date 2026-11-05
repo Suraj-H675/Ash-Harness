@@ -62,6 +62,7 @@ jobs:
           .smoke-sdist-venv/bin/python tests/packaging/smoke_minimal_install.py
 
   test:
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -89,7 +90,77 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked --group dev --extra server --extra browser --extra acp --extra a2a --extra aws --extra azure --extra gcp --extra local-embeddings
-      - run: uv run --locked pytest -v --timeout=120 --timeout-method=thread
+      - name: Full test suite (macOS Explorer tests run separately)
+        shell: bash
+        run: |
+          args=(--timeout=120 --timeout-method=thread --durations=30 --durations-min=1 -ra)
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            args+=(--ignore=tests/e2e/test_ash_explorer.py --ignore=tests/e2e/test_ash_explorer_controller.py)
+          fi
+          uv run --locked pytest -v "${args[@]}"
+
+  macos-explorer-e2e:
+    timeout-minutes: 35
+    # Real Explorer/controller subprocess tests dominate macOS suite runtime.
+    # Run them concurrently with the rest of the suite for each supported Python.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --locked --group dev --extra server --extra browser --extra acp --extra a2a --extra aws --extra azure --extra gcp --extra local-embeddings
+      - name: Real macOS Explorer subprocess coverage
+        run: >-
+          uv run --locked pytest -v
+          tests/e2e/test_ash_explorer.py tests/e2e/test_ash_explorer_controller.py
+          --timeout=120 --timeout-method=thread --durations=30 --durations-min=1 -ra
+
+  artifact-install-smoke:
+    timeout-minutes: 20
+    # Test the same installed CLI users receive, on each supported native OS.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+          python-version: "3.14"
+      - name: Build release wheel from sdist
+        shell: bash
+        run: |
+          uv build --sdist --out-dir dist --clear
+          sdist="$(printf '%s\n' dist/*.tar.gz)"
+          uv build --wheel "$sdist" --out-dir dist
+      - name: Install isolated CLI via uv tool
+        shell: bash
+        run: |
+          export UV_TOOL_DIR="$RUNNER_TEMP/ash-tool"
+          export UV_TOOL_BIN_DIR="$RUNNER_TEMP/ash-bin"
+          uv tool install --python 3.14 dist/*.whl
+          "$UV_TOOL_BIN_DIR/ash" --version
+          "$UV_TOOL_BIN_DIR/ash" --help >/dev/null
+      - name: Run packaged CLI, provider and subagent smoke
+        shell: bash
+        run: |
+          uv venv "$RUNNER_TEMP/ash-smoke" --python 3.14
+          uv pip install --python "$RUNNER_TEMP/ash-smoke/bin/python" dist/*.whl
+          "$RUNNER_TEMP/ash-smoke/bin/python" tests/packaging/smoke_minimal_install.py
 
   minimum-dependencies:
     runs-on: ubuntu-latest
@@ -284,3 +355,39 @@ jobs:
         env:
           ASH_RUN_PTY_TESTS: "1"
         run: uv run --locked pytest -q tests/e2e/test_terminal_pty.py --timeout=30 --timeout-method=thread
+
+  ci-gate:
+    # Branch protection can require this one check without missing new test lanes.
+    name: CI gate
+    if: always()
+    needs:
+      - quality
+      - test
+      - macos-explorer-e2e
+      - artifact-install-smoke
+      - minimum-dependencies
+      - browser-e2e
+      - docker-sandbox-e2e
+      - native-sandbox-e2e
+      - lsp-conformance-e2e
+      - mcp-conformance-e2e
+      - viewport-pty-e2e
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every validation lane to pass
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYCODE'
+          import json
+          import os
+
+          jobs = json.loads(os.environ["JOB_RESULTS"])
+          failed = {name: job["result"] for name, job in jobs.items()
+                    if job["result"] != "success"}
+          for name, result in sorted(failed.items()):
+              print(f"CI lane {name} did not succeed: {result}")
+          if failed:
+              raise SystemExit(1)
+          print(f"All {len(jobs)} CI lanes succeeded")
+          PYCODE

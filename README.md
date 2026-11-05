@@ -47,7 +47,11 @@ The bootstrap owns the installation machinery for the user. If necessary it
 bootstraps `uv` and a supported Python runtime, resolves the latest immutable
 Ash release, verifies the standalone installer against GitHub's release SHA-256
 metadata, and then installs the verified release wheel through Ash's existing
-pipx/uv installer. No GitHub CLI or manual release/tag handling is required.
+pipx/uv installer. Fresh managed installations use Python 3.14 in an isolated
+tool environment regardless of the system Python version; they do not modify
+the system interpreter. Existing installations keep their package-manager
+ownership when updated. The Python SDK remains compatible with the declared
+Python 3.12–3.14 range. No GitHub CLI or manual release/tag handling is required.
 
 Run the same command again at any time. If Ash is not installed, it installs
 the latest release. If the managed installation is older, it updates through

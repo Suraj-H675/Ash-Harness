@@ -81,6 +81,39 @@ def test_bootstrap_installer_bootstraps_uv_when_runtime_manager_is_missing(
     ]
 
 
+def test_bootstrap_uses_managed_python_when_system_python_is_missing(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    home = tmp_path / "home"
+    bin_dir.mkdir()
+    home.mkdir()
+    log = tmp_path / "uv-args"
+    _write_executable(bin_dir / "uname", "#!/bin/sh\necho Linux\n")
+    _write_executable(
+        bin_dir / "uv",
+        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {log}\n",
+    )
+    _write_executable(bin_dir / "curl", "#!/bin/sh\nprintf '#!/bin/sh\\nexit 0\\n'\n")
+    for name in ("sh", "dirname"):
+        resolved = shutil.which(name)
+        assert resolved is not None
+        (bin_dir / name).symlink_to(Path(resolved))
+
+    completed = subprocess.run(
+        ["/bin/sh", str(BOOTSTRAP)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"HOME": str(home), "PATH": str(bin_dir)},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == [
+        "run", "--python", "3.14", "--no-project", "python", "-I", "-",
+    ]
+
+
 def test_release_workflow_publishes_bootstrap_as_attested_asset() -> None:
     source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
 

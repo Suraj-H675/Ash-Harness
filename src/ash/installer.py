@@ -86,7 +86,7 @@ _SIGKILL = getattr(signal, "SIGKILL", None)
 _BOOTSTRAP_MIN_PYTHON = (3, 10)
 _RUNTIME_MIN_PYTHON = (3, 12)
 _RUNTIME_MAX_PYTHON = (3, 15)
-_RUNTIME_FALLBACK_PYTHON = "3.14"
+_DEFAULT_RUNTIME_PYTHON = "3.14"
 _SUPPORTED_NATIVE_PLATFORMS = frozenset({"linux", "darwin"})
 _INSTALLER_ENV_KEYS = frozenset(
     {
@@ -401,7 +401,7 @@ def install(
     environment = _installer_environment(os.environ if environ is None else environ)
     resolver = which or (lambda name: _resolve_install_manager(name, environment=environment))
     if runtime_python is None:
-        runtime_python = _runtime_python_override(sys.version_info[:2])
+        runtime_python = _DEFAULT_RUNTIME_PYTHON
     pipx = resolver("pipx")
     uv = resolver("uv")
     existing_ash = resolver("ash")
@@ -1516,16 +1516,6 @@ def _supported_runtime_minor(value: object) -> str | None:
     return None
 
 
-def _runtime_python_override(python_version: Sequence[int]) -> str:
-    """Select an explicit supported runtime for package-manager installation."""
-
-    major, minor = int(python_version[0]), int(python_version[1])
-    version = (major, minor)
-    if _RUNTIME_MIN_PYTHON <= version < _RUNTIME_MAX_PYTHON:
-        return f"{major}.{minor}"
-    return _RUNTIME_FALLBACK_PYTHON
-
-
 def _release_wheel(
     ref: str,
     *,
@@ -1785,7 +1775,7 @@ def main(
         result = installer(
             extras=args.extra,
             ref=args.ref,
-            runtime_python=_runtime_python_override(python_version),
+            runtime_python=_DEFAULT_RUNTIME_PYTHON,
         )
     except InstallError as exc:
         print(f"Ash installation could not continue: {exc}", file=errors)
