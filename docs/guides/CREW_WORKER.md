@@ -177,3 +177,29 @@ changes. Archived coworkers and completed responsibilities cannot be revised.
 This command intentionally does not edit schedule timing, auth keys, or
 existing run history. The current next-fire cursor is preserved; to change
 timing, complete the old responsibility and create a newly scheduled one.
+
+## Model usage accounting
+
+Inspect recorded model usage for a single coworker with:
+
+    ash crew usage --owner local --coworker-id COWORKER_UUID
+
+The report joins the coworker's owner-bound durable model-run claims to
+its separate profile session accounting, including manual, scheduled and
+event-triggered turns and separate model analysis turns. Scheduled skipped
+occurrences are shown separately and never counted as provider attempts.
+It reports recorded prompt/completion/cache tokens, estimated-token subsets
+within the recorded token totals, recorded priced
+USD cost, estimated USD cost, and runs without reliable pricing. Completed
+turns with no token records are explicitly marked **unmetered**; claims
+without confirmed completion are **uncertain**, not treated as free work.
+
+These totals are local historical observations, not a current provider
+invoice, account balance, provider quota or budget. Pricing may be unknown,
+and model-readiness preflight probes and standalone native tool sessions
+are not included in the claimed model-run totals. Never interpret a shown
+$0 value as proof of no provider charges when incomplete or unpriced work
+exists. No provider request or external network call is made to display this
+report. A missing or cross-coworker session binding is rejected rather
+than silently included. Enforcing future spending/model-attempt limits is
+a separate capability and is not implied by this command.

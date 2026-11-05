@@ -7596,3 +7596,208 @@ def test_git_proposal_preflight_rejects_mixed_flags_and_missing_grants(
     ]) == 2
     assert "exactly three model source IDs" in capsys.readouterr().err
     assert not observed
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_coworker_usage_reports_persisted_cost_and_unknowns_without_model_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.core.session import SessionStore
+
+    ash_dir, workspace, other_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch, atlas_answer="Recorded result")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=other_workspace,
+    )
+    argv = ["crew", "usage", "--owner", "local",
+            "--coworker-id", atlas.coworker_id]
+    assert main(argv) == 0
+    initial = capsys.readouterr().out
+    assert "Model attempts: 0" in initial
+    assert not observed
+    session_ids: list[str] = []
+    for label in ("usage-1", "usage-2"):
+        assert main(_ask_args(
+            atlas.coworker_id, "Report tracked use.", turn_id=label,
+        )) == 0
+        lines = capsys.readouterr().out.splitlines()
+        session_ids.append(next(
+            line.split(": ", 1)[1] for line in lines
+            if line.startswith("Session ID: ")
+        ))
+    assert main(_ask_args(
+        scout.coworker_id, "Independent data.",
+        turn_id="usage-scout",
+    )) == 0
+    capsys.readouterr()
+    assert len(observed) == 3
+    store = SessionStore(ash_dir / "profiles" / "atlas" / "db" / "sessions.db")
+    store.save_session_token_stats(
+        session_ids[0], total_prompt_tokens=100,
+        total_completion_tokens=25, turn_cost_usd=0.007,
+        cache_read_tokens=5, estimated_prompt_tokens=4,
+        cost_known=True,
+    )
+    store.save_session_token_stats(
+        session_ids[1], total_prompt_tokens=60,
+        total_completion_tokens=15, turn_cost_usd=0.0,
+        estimated_completion_tokens=7, estimated_cost_usd=0.002,
+        cost_known=False,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    result = handle.model_usage_summary()
+    assert result.model_attempts == 2
+    assert result.completed_runs == 2
+    assert result.uncertain_runs == 0
+    assert result.unmetered_completed_runs == 0
+    persisted = [store.get_session_usage(session_id) for session_id in session_ids]
+    for field in (
+        "prompt_tokens", "completion_tokens", "cache_read_tokens",
+        "cache_write_tokens", "estimated_prompt_tokens",
+        "estimated_completion_tokens", "pricing_unknown_turns",
+    ):
+        assert getattr(result, field) == sum(
+            getattr(item, field) for item in persisted
+        )
+    assert result.pricing_unknown_turns >= 1
+    assert result.known_cost_usd == pytest.approx(0.007)
+    assert result.estimated_cost_usd == pytest.approx(0.002)
+    assert result.full_cost_known is False
+    assert main(argv) == 0
+    output = capsys.readouterr().out
+    assert f"Recorded tokens: {result.total_tokens}" in output
+    assert "Total actual cost is UNKNOWN" in output
+    assert "Recorded priced cost (USD): 0.007000" in output
+    assert len(observed) == 3, "reading usage must not contact a model"
+    scout_usage = directory.open_coworker(
+        owner_id="local", coworker_id=scout.coworker_id,
+    ).model_usage_summary()
+    assert scout_usage.model_attempts == 1
+    assert scout_usage.total_tokens > 0
+    assert scout_usage.total_tokens != result.total_tokens
+    assert scout_usage.known_cost_usd == 0.0
+    assert scout_usage.full_cost_known is False
+    assert (
+        scout_usage.unmetered_completed_runs > 0
+        or scout_usage.pricing_unknown_turns > 0
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_coworker_usage_preserves_uncertainty_and_refuses_foreign_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from ash.coworkers import CoworkerDirectoryError
+    from ash.core.session import SessionStorageError
+
+    ash_dir, workspace, other_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch, atlas_answer="Completed")
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=other_workspace,
+    )
+    for coworker, turn in ((atlas, "usage-atlas"), (scout, "usage-scout")):
+        assert main(_ask_args(
+            coworker.coworker_id, "Report.", turn_id=turn,
+        )) == 0
+        capsys.readouterr()
+    assert len(observed) == 2
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "UPDATE coworker_turn_dispatches SET status='claimed', "
+            "completed_at=NULL WHERE coworker_id=?",
+            (atlas.coworker_id,),
+        )
+    uncertain = handle.model_usage_summary()
+    assert uncertain.model_attempts == 1
+    assert uncertain.completed_runs == 0
+    assert uncertain.uncertain_runs == 1
+    assert uncertain.full_cost_known is False
+    with sqlite3.connect(directory.db_path) as conn:
+        foreign, = conn.execute(
+            "SELECT session_id FROM coworker_turn_dispatches "
+            "WHERE coworker_id=?", (scout.coworker_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE coworker_turn_dispatches SET session_id=? "
+            "WHERE coworker_id=?", (foreign, atlas.coworker_id),
+        )
+    with pytest.raises((CoworkerDirectoryError, SessionStorageError)):
+        handle.model_usage_summary()
+    assert main([
+        "crew", "usage", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+    ]) == 2
+    assert "usage is unavailable" in capsys.readouterr().err
+    assert len(observed) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_usage_excludes_no_change_model_schedule_skip_without_creating_session_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import datetime, timezone
+    from ash.automation.schedules import build_schedule
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    task = handle.create_responsibility(
+        scope="CI", objective="Report changed evidence",
+        schedule=build_schedule(every="1h"),
+    )
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "INSERT INTO coworker_turn_dispatches ("
+            "owner_id,coworker_id,run_id,session_id,request_id,status,"
+            "execution_kind,responsibility_id,trigger_type,event_key,"
+            "created_at,completed_at,scheduled_for,skip_reason"
+            ") VALUES (?,?,?,NULL,NULL,'skipped','model',?,'scheduled',"
+            "?,?,NULL,?,'evidence_unchanged')",
+            (
+                atlas.owner_id, atlas.coworker_id, str(uuid4()),
+                task.responsibility_id, "unchanged-fixture",
+                timestamp, timestamp,
+            ),
+        )
+    assert not observed
+    usage = handle.model_usage_summary()
+    assert usage.model_attempts == 0
+    assert usage.skipped_occurrences == 1
+    assert usage.total_tokens == 0
+    assert usage.pricing_unknown_turns == 0
+    assert main([
+        "crew", "usage", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+    ]) == 0
+    output = capsys.readouterr().out
+    assert "Model attempts: 0" in output
+    assert "Scheduled skips without a model call: 1" in output
+    assert not observed

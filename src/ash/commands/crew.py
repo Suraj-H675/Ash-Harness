@@ -65,6 +65,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _show(args)
     if action == "inbox":
         return _inbox(args)
+    if action == "usage":
+        return _usage(args)
     if action == "brief":
         return _brief(args)
     if action in {"pause", "resume", "archive"}:
@@ -310,6 +312,62 @@ def _show(args: argparse.Namespace) -> int:
         "Schedules run through an explicit tick or started Crew worker; "
         "there is no automatically installed background service or "
         "remote notification channel."
+    )
+    return 0
+
+
+def _usage(args: argparse.Namespace) -> int:
+    """Summarize only durable, owner-bound model session accounting."""
+
+    try:
+        handle = _open_coworker_handle(args)
+        summary = handle.model_usage_summary()
+    except (
+        CoworkerDirectoryError, CoworkerNotFound, CoworkerRuntimeUnavailable,
+        SessionStorageError, OSError, ValueError,
+    ) as exc:
+        _write_error(f"Coworker usage is unavailable: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(
+            f"Coworker usage is unavailable ({type(exc).__name__})."
+        )
+        return 2
+    _write_line(f"Model attempts: {summary.model_attempts}")
+    _write_line(f"Completed: {summary.completed_runs}")
+    _write_line(f"Claimed / uncertain: {summary.uncertain_runs}")
+    _write_line(f"Scheduled skips without a model call: {summary.skipped_occurrences}")
+    _write_line(f"Unmetered completed turns: {summary.unmetered_completed_runs}")
+    _write_line(f"Recorded tokens: {summary.total_tokens}")
+    _write_line(
+        f"  Prompt: {summary.prompt_tokens}; "
+        f"completion: {summary.completion_tokens}"
+    )
+    _write_line(
+        f"  Cache read: {summary.cache_read_tokens}; "
+        f"cache write: {summary.cache_write_tokens}"
+    )
+    _write_line(
+        "Estimated token subset of recorded totals: "
+        f"prompt {summary.estimated_prompt_tokens}, "
+        f"completion {summary.estimated_completion_tokens}"
+    )
+    _write_line(f"Recorded priced cost (USD): {summary.known_cost_usd:.6f}")
+    _write_line(f"Estimated cost (USD): {summary.estimated_cost_usd:.6f}")
+    _write_line(f"Turns with unknown pricing: {summary.pricing_unknown_turns}")
+    if not summary.full_cost_known:
+        _write_line(
+            "Total actual cost is UNKNOWN: incomplete/uncertain runs, "
+            "missing token accounting, or missing pricing prevent a reliable total."
+        )
+    else:
+        _write_line(
+            "Recorded cost is fully priced for the accounted model turns only."
+        )
+    _write_line(
+        "This is historical local session accounting, not a provider invoice, "
+        "live balance, spending limit, or guarantee of zero charges. "
+        "Preflight readiness probes and native tool-only sessions are excluded."
     )
     return 0
 

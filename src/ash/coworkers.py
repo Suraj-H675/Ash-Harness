@@ -1097,6 +1097,41 @@ class CoworkerResponsibilityRun:
 
 
 @dataclass(frozen=True)
+class CoworkerModelUsage:
+    """Persisted session usage only; not a live provider balance or a cost cap."""
+
+    model_attempts: int
+    completed_runs: int
+    uncertain_runs: int
+    skipped_occurrences: int
+    unmetered_completed_runs: int
+    prompt_tokens: int
+    completion_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    estimated_prompt_tokens: int
+    estimated_completion_tokens: int
+    known_cost_usd: float
+    estimated_cost_usd: float
+    pricing_unknown_turns: int
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def full_cost_known(self) -> bool:
+        return (
+            self.uncertain_runs == 0
+            and self.unmetered_completed_runs == 0
+            and self.pricing_unknown_turns == 0
+            and self.estimated_prompt_tokens == 0
+            and self.estimated_completion_tokens == 0
+            and self.estimated_cost_usd == 0
+        )
+
+
+@dataclass(frozen=True)
 class CoworkerNativeGitDiff:
     """Owner-bound one-shot native Git diagnostic receipt."""
 
@@ -4839,6 +4874,146 @@ class CoworkerDirectory:
                 raise CoworkerDirectoryError("responsibility changed during transition")
             return _responsibility_from_row(updated)
 
+    def _model_usage_summary(
+        self, handle: "CoworkerHandle",
+    ) -> CoworkerModelUsage:
+        """Attribute known session accounting only to verified coworker runs.
+
+        A completed model run with no accounting is reported as unmetered;
+        a claimed run remains uncertain, not zero cost. Synthetic readiness
+        probes are not included because they have no durable run attribution.
+        """
+
+        current = self._require_coworker_owner_binding(handle)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT run_id, session_id, request_id, status "
+                "FROM coworker_turn_dispatches WHERE owner_id=? "
+                "AND coworker_id=? AND execution_kind='model' "
+                "ORDER BY created_at, run_id",
+                (current.owner_id, current.coworker_id),
+            ).fetchall()
+        totals: dict[str, int | float] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "estimated_prompt_tokens": 0,
+            "estimated_completion_tokens": 0,
+            "known_cost_usd": 0.0,
+            "estimated_cost_usd": 0.0,
+            "pricing_unknown_turns": 0,
+        }
+        completed = 0
+        uncertain = 0
+        skipped = 0
+        unmetered = 0
+        store = (
+            self._session_store_for_record(current)
+            if any(row["status"] in {"claimed", "completed"} for row in rows)
+            else None
+        )
+        for row in rows:
+            if row["status"] == "skipped":
+                if row["session_id"] is not None or row["request_id"] is not None:
+                    raise CoworkerDirectoryError(
+                        "skipped model occurrence unexpectedly has a session"
+                    )
+                skipped += 1
+                continue
+            if row["status"] not in {"claimed", "completed"}:
+                raise CoworkerDirectoryError("model usage run has an invalid status")
+            if (
+                not isinstance(row["session_id"], str)
+                or not isinstance(row["request_id"], str)
+            ):
+                raise CoworkerDirectoryError("model usage attribution is incomplete")
+            try:
+                run_id = str(UUID(str(row["run_id"])))
+                if row["request_id"] != str(uuid5(UUID(run_id), "request")):
+                    raise ValueError("model run request identity changed")
+                session, binding = handle.load_session(row["session_id"])
+                if (
+                    binding.run_id != run_id
+                    or binding.coworker_id != current.coworker_id
+                    or session.session_id != row["session_id"]
+                ):
+                    raise ValueError("model usage session binding changed")
+                if row["status"] == "completed":
+                    if (
+                        len(session.messages) != 2
+                        or [message.role for message in session.messages]
+                        != ["user", "assistant"]
+                        or session.tool_calls
+                        or session.messages[0].metadata.get("coworker_request_id")
+                        != row["request_id"]
+                        or session.messages[0].metadata.get(
+                            "coworker_execution_kind"
+                        ) != "model"
+                    ):
+                        raise ValueError("model usage completed transcript changed")
+                if store is None:
+                    raise ValueError("model usage journal is unavailable")
+                usage = store.get_session_usage(session.session_id)
+            except (KeyError, TypeError, ValueError, SessionStorageError) as exc:
+                raise CoworkerDirectoryError(
+                    "coworker model usage evidence is invalid or missing"
+                ) from exc
+            metrics = (
+                usage.prompt_tokens, usage.completion_tokens,
+                usage.cache_read_tokens, usage.cache_write_tokens,
+                usage.estimated_prompt_tokens, usage.estimated_completion_tokens,
+                usage.pricing_unknown_turns,
+            )
+            if any(type(value) is not int or value < 0 for value in metrics):
+                raise CoworkerDirectoryError(
+                    "coworker model usage contains invalid token accounting"
+                )
+            costs = (usage.cost_usd, usage.estimated_cost_usd)
+            if any(
+                not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0
+                for value in costs
+            ):
+                raise CoworkerDirectoryError(
+                    "coworker model usage contains invalid cost accounting"
+                )
+            for field in (
+                "prompt_tokens", "completion_tokens",
+                "cache_read_tokens", "cache_write_tokens",
+                "estimated_prompt_tokens", "estimated_completion_tokens",
+                "pricing_unknown_turns",
+            ):
+                totals[field] += getattr(usage, field)
+            totals["known_cost_usd"] += usage.cost_usd
+            totals["estimated_cost_usd"] += usage.estimated_cost_usd
+            if row["status"] == "claimed":
+                uncertain += 1
+            else:
+                completed += 1
+                if (
+                    usage.total_tokens == 0
+                    and usage.estimated_prompt_tokens == 0
+                    and usage.estimated_completion_tokens == 0
+                    and usage.cache_read_tokens == 0
+                    and usage.cache_write_tokens == 0
+                ):
+                    unmetered += 1
+        return CoworkerModelUsage(
+            model_attempts=completed + uncertain, completed_runs=completed,
+            uncertain_runs=uncertain, skipped_occurrences=skipped,
+            unmetered_completed_runs=unmetered,
+            prompt_tokens=int(totals["prompt_tokens"]),
+            completion_tokens=int(totals["completion_tokens"]),
+            cache_read_tokens=int(totals["cache_read_tokens"]),
+            cache_write_tokens=int(totals["cache_write_tokens"]),
+            estimated_prompt_tokens=int(totals["estimated_prompt_tokens"]),
+            estimated_completion_tokens=int(totals["estimated_completion_tokens"]),
+            known_cost_usd=float(totals["known_cost_usd"]),
+            estimated_cost_usd=float(totals["estimated_cost_usd"]),
+            pricing_unknown_turns=int(totals["pricing_unknown_turns"]),
+        )
+
     def _list_responsibility_runs(
         self,
         handle: "CoworkerHandle",
@@ -7996,6 +8171,11 @@ class CoworkerHandle:
             responsibility_id,
             status,
         )
+
+    def model_usage_summary(self) -> CoworkerModelUsage:
+        """Read owner-bound model run accounting; never request a provider."""
+
+        return self._directory._model_usage_summary(self)
 
     def list_responsibility_runs(
         self,
