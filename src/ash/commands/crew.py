@@ -22,6 +22,7 @@ from ash.crew_ingress import (
 )
 from ash.core.redaction import redact_known_secrets
 from ash.coworker_evidence import (
+    evidence_metadata_manifest,
     read_explicit_evidence,
     serialize_evidence,
 )
@@ -499,9 +500,28 @@ def _git_diff(args: argparse.Namespace) -> int:
     """Keep the explicit owner TTY decision separate from model turns."""
 
     run_id = args.run_id
-    if args.crew_git_action == "run" and run_id is None:
-        run_id = str(uuid4())
-    _write_line(f"Native tool run ID: {_safe_text(run_id, single_line=True)}")
+    source_ids = (
+        getattr(args, "source_run_id", None),
+        getattr(args, "source_session_id", None),
+        getattr(args, "source_request_id", None),
+    )
+    from_model = any(source_ids)
+    source_values = tuple(str(value) for value in source_ids)
+    if args.crew_git_action == "run":
+        if from_model and (
+            not all(source_ids) or args.file is not None or run_id is not None
+        ):
+            _write_error(
+                "Use exactly three model source IDs without --file or --run-id."
+            )
+            return 2
+        if not from_model and not args.file:
+            _write_error("Select --file or a complete model proposal source.")
+            return 2
+        if run_id is None and not from_model:
+            run_id = str(uuid4())
+    if run_id is not None:
+        _write_line(f"Native tool run ID: {_safe_text(run_id, single_line=True)}")
     try:
         handle = CoworkerDirectory.open().open_coworker(
             owner_id=args.owner, coworker_id=args.coworker_id,
@@ -527,28 +547,51 @@ def _git_diff(args: argparse.Namespace) -> int:
                     _safe_text(recorded) if recorded else "(no unstaged change)"
                 )
             return 0
-        current = handle.require_local_owner()
-        guard = SafetyGuard(current.workspace)
-        evidence, = read_explicit_evidence(
-            current.workspace, (args.file,), guard=guard,
-        )
-        _write_line(
-            f"Selected path: {_safe_text(evidence.relative_path, single_line=True)}"
-        )
-        _write_line(f"Current SHA-256: {evidence.sha256}")
+        if from_model:
+            proposal = handle.preview_git_diff_proposal(
+                run_id=source_values[0],
+                session_id=source_values[1],
+                request_id=source_values[2],
+            )
+            run_id = proposal.task_run_id
+            selected_path, sha256 = proposal.path, proposal.sha256
+            _write_line(f"Native tool run ID: {run_id}")
+            _write_line(f"Model source run: {proposal.source_run_id}")
+            _write_line(f"Model response SHA-256: {proposal.response_sha256}")
+            _write_line(
+                "This untrusted model choice is not owner permission. "
+                "Only an exact read-only Git diff of the selected path is possible."
+            )
+        else:
+            current = handle.require_local_owner()
+            guard = SafetyGuard(current.workspace)
+            evidence, = read_explicit_evidence(
+                current.workspace, (args.file,), guard=guard,
+            )
+            selected_path, sha256 = evidence.relative_path, evidence.sha256
+        _write_line(f"Selected path: {_safe_text(selected_path, single_line=True)}")
+        _write_line(f"Current SHA-256: {sha256}")
         _write_line(
             "Only this file's unstaged Git diff will be inspected. "
             "No model, shell, plugin, MCP or write tool is authorized."
         )
-        challenge = (
-            f"GIT DIFF {run_id} {evidence.sha256}"
-        )
+        challenge = f"GIT DIFF {run_id} {sha256}"
+        if from_model:
+            challenge += f" {proposal.response_sha256}"
         if not _require_tty_confirmation(challenge):
             _write_error("Blocked. Exact local TTY approval is required.")
             return 2
+        if from_model and handle.preview_git_diff_proposal(
+            run_id=source_values[0],
+            session_id=source_values[1],
+            request_id=source_values[2],
+        ) != proposal:
+            raise CoworkerRuntimeUnavailable(
+                "Git proposal or owner-granted evidence changed after approval"
+            )
         receipt, output = asyncio.run(handle.run_native_git_diff(
-            run_id=run_id, path=evidence.relative_path,
-            expected_sha256=evidence.sha256,
+            run_id=run_id, path=selected_path,
+            expected_sha256=sha256,
         ))
         _write_line(f"Status: {receipt.status}")
         _write_line(f"Native tool session: {receipt.tool_session_id}")
@@ -803,7 +846,17 @@ def _ask(args: argparse.Namespace) -> int:
             tuple(args.evidence),
             guard=workspace_guard,
         )
-        evidence = serialize_evidence(evidence_files)
+        if args.crew_action == "ask" and args.propose_git_diff:
+            if args.propose_syntax:
+                raise ValueError("select only one model proposal kind")
+            if not evidence_files:
+                raise ValueError("Git diff proposal requires an explicit evidence grant")
+            evidence = json.dumps(
+                evidence_metadata_manifest(evidence_files),
+                ensure_ascii=False, separators=(",", ":"),
+            )
+        else:
+            evidence = serialize_evidence(evidence_files)
         request = CoworkerTurnRequest(
             turn_id=turn_id,
             question=args.question,
@@ -853,6 +906,7 @@ def _ask(args: argparse.Namespace) -> int:
             else handle.run_readonly_turn(
                 request, check_model=args.check_model,
                 propose_syntax=args.propose_syntax,
+                propose_git_diff=args.propose_git_diff,
             )
         )
     except CoworkerRuntimeUnavailable as exc:

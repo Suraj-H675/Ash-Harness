@@ -67,3 +67,43 @@ reviewed capability/approval interface.
 Inspecting a purported completed result with a missing tool journal fails
 closed; status inspection does not create a replacement journal to make the
 receipt appear valid.
+
+## Model-proposed, owner-confirmed Git diagnostic
+
+Atlas or Scout can suggest one path from an exact owner-selected list using
+a separate, persisted, tool-free model turn. The proposal sees file
+names, sizes and SHA-256 digests, not source file contents or Git history.
+
+    ash crew ask --owner local --coworker-id COWORKER_UUID \
+      --question "Which granted file is most useful for a Git diff?" \
+      --evidence src/one.py --evidence src/two.py \
+      --propose-git-diff
+
+Record the Run ID, Session ID and Request ID printed by the completed
+turn. Then review the model suggestion and explicitly approve it:
+
+    ash crew git-diff run --owner local --coworker-id COWORKER_UUID \
+      --source-run-id MODEL_RUN_UUID \
+      --source-session-id MODEL_SESSION_UUID \
+      --source-request-id MODEL_REQUEST_UUID
+
+Do not combine the model source IDs with --file or --run-id. The tool
+run ID is derived deterministically from the completed source run ID.
+The model must return strictly the object with action git_diff and one
+path from the grant. Any extra flags, commands, keys, out-of-grant paths,
+invalid JSON or no_change response does not authorize execution.
+
+Crew verifies the complete source model transcript, source marker,
+owner/coworker/session binding, original allowlist, every granted file
+snapshot, and the exact selected file before showing a confirmation
+challenge. The TTY challenge binds the deterministic tool-run ID,
+file SHA-256, and model response SHA-256. Crew re-verifies the source
+after owner confirmation, then uses the existing native tool claim and
+mediated dispatcher. Changed or revoked files fail closed before dispatch.
+Reusing the model source cannot produce a second tool dispatch because
+the derived tool run ID is single-use.
+
+This does not give models direct tool access or automatic approval.
+The model's proposed path never becomes a shell command; it is passed
+only as the verified file path to Ash's fixed read-only Git tool. No
+other tool and no automatic model follow-up is started by this command.

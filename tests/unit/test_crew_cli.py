@@ -7264,3 +7264,335 @@ def test_native_git_diff_refuses_untrusted_repo_diff_helper(
     assert receipt.status == "completed"
     assert "+VALUE = 2" in patch
     assert path.read_text() == "VALUE = 2\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_model_selected_git_diff_requires_owner_confirmation_and_is_nonreplayable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import subprocess
+
+    ash_dir, workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    selected = workspace / "selected.py"
+    rejected = workspace / "not-granted.py"
+    selected.write_text("VALUE = 1\n")
+    rejected.write_text("HIDDEN = 99\n")
+    subprocess.run(["git", "add", "--", "selected.py"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Fixture", "-c", "user.email=x@localhost",
+         "commit", "-qm", "base"], cwd=workspace, check=True,
+    )
+    selected.write_text("VALUE = 2\n")
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"git_diff","path":"selected.py"}',
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_workspace,
+    )
+    assert main(
+        _ask_args(atlas.coworker_id, "Choose the useful Git diff.",
+                  "selected.py", turn_id="model-git-source-1")
+        + ["--propose-git-diff"]
+    ) == 0
+    output = capsys.readouterr().out
+    ids = {
+        label: next(line.split(": ", 1)[1] for line in output.splitlines()
+                    if line.startswith(f"{label}: "))
+        for label in ("Run ID", "Session ID", "Request ID")
+    }
+    assert len(observed) == 1
+    assert observed[0]["tools"] is None
+    model_prompt = str(observed[0]["messages"])
+    assert "Untrusted Git diff proposal data:" in model_prompt
+    assert "selected.py" in model_prompt
+    assert "not-granted.py" not in model_prompt
+    assert "VALUE = 2" not in model_prompt
+    handle = CoworkerDirectory.open(ash_dir).open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    proposal = handle.preview_git_diff_proposal(
+        run_id=ids["Run ID"], session_id=ids["Session ID"],
+        request_id=ids["Request ID"],
+    )
+    assert proposal.path == "selected.py"
+    assert proposal.sha256 == hashlib.sha256(b"VALUE = 2\n").hexdigest()
+    assert proposal.task_run_id == str(uuid5(
+        UUID(ids["Run ID"]), "ash-crew-native-git-diff-proposal-v1",
+    ))
+    with pytest.raises(CoworkerRuntimeUnavailable):
+        directory.open_coworker(
+            owner_id="local", coworker_id=scout.coworker_id,
+        ).preview_git_diff_proposal(
+            run_id=ids["Run ID"], session_id=ids["Session ID"],
+            request_id=ids["Request ID"],
+        )
+    args = [
+        "crew", "git-diff", "run", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--source-run-id", ids["Run ID"],
+        "--source-session-id", ids["Session ID"],
+        "--source-request-id", ids["Request ID"],
+    ]
+    assert main(args) == 2
+    assert "Exact local TTY approval" in capsys.readouterr().err
+    with pytest.raises(CoworkerNotFound):
+        handle.native_git_diff_status(proposal.task_run_id)
+    approvals: list[str] = []
+
+    def owner_approval(challenge: str) -> bool:
+        approvals.append(challenge)
+        return True
+
+    monkeypatch.setattr(
+        "ash.commands.crew._require_tty_confirmation", owner_approval,
+    )
+    assert main(args) == 0
+    completed = capsys.readouterr().out
+    assert "-VALUE = 1" in completed and "+VALUE = 2" in completed
+    assert approvals == [
+        f"GIT DIFF {proposal.task_run_id} "
+        f"{proposal.sha256} {proposal.response_sha256}"
+    ]
+    assert selected.read_text() == "VALUE = 2\n"
+    assert rejected.read_text() == "HIDDEN = 99\n"
+    receipt = handle.native_git_diff_status(proposal.task_run_id)
+    assert receipt.status == "completed"
+    assert receipt.path == proposal.path
+    assert len(observed) == 1
+    assert main(args) == 2
+    assert "already claimed" in capsys.readouterr().err
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+@pytest.mark.parametrize("suggestion", [
+    '{"action":"git_diff","path":"not-granted.py"}',
+    '{"action":"git_diff","path":"../outside.py"}',
+    '{"action":"git_diff","path":"selected.py","command":"git reset --hard"}',
+    '{"action":"git_diff","path":"selected.py","staged":true}',
+    '{"action":"no_change"}',
+    "I suggest running git diff -- selected.py",
+])
+def test_model_git_diff_rejects_untrusted_selection_without_native_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], suggestion: str,
+) -> None:
+    import subprocess
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    (workspace / "selected.py").write_text("VALUE = 2\n")
+    (workspace / "not-granted.py").write_text("SENSITIVE = False\n")
+    _, observed = _install_fake_registry(
+        monkeypatch, atlas_draft_answer=suggestion,
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    assert main(
+        _ask_args(atlas.coworker_id, "Choose a Git diff.", "selected.py",
+                  turn_id="model-git-invalid-1") + ["--propose-git-diff"]
+    ) == 0
+    output = capsys.readouterr().out
+    ids = {
+        label: next(line.split(": ", 1)[1] for line in output.splitlines()
+                    if line.startswith(f"{label}: "))
+        for label in ("Run ID", "Session ID", "Request ID")
+    }
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    with pytest.raises((CoworkerRuntimeUnavailable, ValueError)):
+        handle.preview_git_diff_proposal(
+            run_id=ids["Run ID"], session_id=ids["Session ID"],
+            request_id=ids["Request ID"],
+        )
+    assert main([
+        "crew", "git-diff", "run", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--source-run-id", ids["Run ID"],
+        "--source-session-id", ids["Session ID"],
+        "--source-request-id", ids["Request ID"],
+    ]) == 2
+    assert len(observed) == 1
+    assert "blocked or uncertain" in capsys.readouterr().err.lower()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_model_git_diff_stale_grant_and_owner_review_change_fail_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import subprocess
+
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    source = workspace / "selected.py"
+    other = workspace / "other.py"
+    source.write_text("VALUE = 2\n")
+    other.write_text("OTHER = 1\n")
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"git_diff","path":"selected.py"}',
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    assert main(
+        _ask_args(atlas.coworker_id, "Select a diff.", "selected.py", "other.py",
+                  turn_id="model-git-stale-grants") + ["--propose-git-diff"]
+    ) == 0
+    lines = capsys.readouterr().out.splitlines()
+    ids = {
+        label: next(line.split(": ", 1)[1] for line in lines
+                    if line.startswith(f"{label}: "))
+        for label in ("Run ID", "Session ID", "Request ID")
+    }
+    args = [
+        "crew", "git-diff", "run", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+        "--source-run-id", ids["Run ID"],
+        "--source-session-id", ids["Session ID"],
+        "--source-request-id", ids["Request ID"],
+    ]
+    handle = directory.open_coworker(owner_id="local", coworker_id=atlas.coworker_id)
+    proposal = handle.preview_git_diff_proposal(
+        run_id=ids["Run ID"], session_id=ids["Session ID"],
+        request_id=ids["Request ID"],
+    )
+    # Entire grant, not only the model-selected file, must stay unchanged.
+    other.write_text("OTHER = 2\n")
+    assert main(args) == 2
+    assert "changed" in capsys.readouterr().err
+    with pytest.raises(CoworkerNotFound):
+        handle.native_git_diff_status(proposal.task_run_id)
+    other.write_text("OTHER = 1\n")
+
+    def mutate_selected_during_confirmation(challenge: str) -> bool:
+        source.write_text("VALUE = 3\n")
+        return True
+
+    monkeypatch.setattr(
+        "ash.commands.crew._require_tty_confirmation",
+        mutate_selected_during_confirmation,
+    )
+    assert main(args) == 2
+    assert "changed" in capsys.readouterr().err
+    with pytest.raises(CoworkerNotFound):
+        handle.native_git_diff_status(proposal.task_run_id)
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_scout_model_git_proposal_uses_own_profile_and_owner_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import subprocess
+
+    ash_dir, atlas_workspace, scout_workspace = _prepare_profiles(
+        tmp_path, monkeypatch,
+    )
+    subprocess.run(["git", "init", "-q"], cwd=scout_workspace, check=True)
+    selected = scout_workspace / "scout.py"
+    selected.write_text("STATUS = 1\n")
+    subprocess.run(["git", "add", "--", "scout.py"], cwd=scout_workspace, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Fixture", "-c", "user.email=x@localhost",
+         "commit", "-qm", "base"], cwd=scout_workspace, check=True,
+    )
+    selected.write_text("STATUS = 2\n")
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        scout_draft_answer='{"action":"git_diff","path":"scout.py"}',
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=atlas_workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_workspace,
+    )
+    assert main(
+        _ask_args(scout.coworker_id, "Select one Git diagnostic.", "scout.py",
+                  turn_id="scout-git-native-1") + ["--propose-git-diff"]
+    ) == 0
+    lines = capsys.readouterr().out.splitlines()
+    ids = {
+        label: next(line.split(": ", 1)[1] for line in lines
+                    if line.startswith(f"{label}: "))
+        for label in ("Run ID", "Session ID", "Request ID")
+    }
+    assert len(observed) == 1
+    assert observed[0]["model"] == "gpt-scout"
+    assert observed[0]["tools"] is None
+    monkeypatch.setattr(
+        "ash.commands.crew._require_tty_confirmation", lambda _: True,
+    )
+    assert main([
+        "crew", "git-diff", "run", "--owner", "local",
+        "--coworker-id", scout.coworker_id,
+        "--source-run-id", ids["Run ID"],
+        "--source-session-id", ids["Session ID"],
+        "--source-request-id", ids["Request ID"],
+    ]) == 0
+    assert "+STATUS = 2" in capsys.readouterr().out
+    assert selected.read_text() == "STATUS = 2\n"
+    assert len(observed) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_git_proposal_preflight_rejects_mixed_flags_and_missing_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _, observed = _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer='{"action":"git_diff","path":"selected.py"}',
+    )
+    (workspace / "selected.py").write_text("VALUE = 1\n")
+    atlas = CoworkerDirectory.open(ash_dir).create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    assert main(_ask_args(
+        atlas.coworker_id, "Choose a path.",
+        turn_id="git-no-grant",
+    ) + ["--propose-git-diff"]) == 2
+    assert "explicit evidence grant" in capsys.readouterr().err
+    assert main(_ask_args(
+        atlas.coworker_id, "Choose a path.", "selected.py",
+        turn_id="git-conflict",
+    ) + ["--propose-git-diff", "--propose-syntax"]) == 2
+    assert "only one model proposal kind" in capsys.readouterr().err
+    assert not observed
+    command = [
+        "crew", "git-diff", "run", "--owner", "local",
+        "--coworker-id", atlas.coworker_id,
+    ]
+    assert main(command + [
+        "--source-run-id", str(uuid4()), "--file", "selected.py",
+    ]) == 2
+    assert "exactly three model source IDs" in capsys.readouterr().err
+    assert main(command + [
+        "--source-run-id", str(uuid4()),
+        "--source-session-id", str(uuid4()),
+        "--source-request-id", str(uuid4()),
+        "--file", "selected.py",
+    ]) == 2
+    assert "exactly three model source IDs" in capsys.readouterr().err
+    assert not observed

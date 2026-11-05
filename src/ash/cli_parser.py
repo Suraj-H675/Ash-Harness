@@ -179,6 +179,10 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         help="Ask the model to choose one syntax check from explicitly granted root Python files",
     )
     crew_ask.add_argument(
+        "--propose-git-diff", action="store_true",
+        help="Suggest one Git diff from owner-granted file metadata; no tools run",
+    )
+    crew_ask.add_argument(
         "--check-model",
         action="store_true",
         help="Probe the selected profile model before claiming this turn",
@@ -251,7 +255,12 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     git_run.add_argument("--owner", required=True)
     git_run.add_argument("--coworker-id", required=True)
     git_run.add_argument("--run-id", help="One-shot UUID; generated if omitted")
-    git_run.add_argument("--file", required=True, metavar="WORKSPACE_RELATIVE_PATH")
+    git_run.add_argument("--file", metavar="WORKSPACE_RELATIVE_PATH")
+    for field in ("source-run-id", "source-session-id", "source-request-id"):
+        git_run.add_argument(
+            "--" + field,
+            help="Completed model Git proposal source; provide all three IDs",
+        )
     git_status = git_actions.add_parser(
         "status", help="Inspect the durable outcome of one native Git diff",
     )

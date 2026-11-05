@@ -129,6 +129,21 @@ def read_explicit_evidence(
     return tuple(evidence)
 
 
+def evidence_metadata_manifest(
+    items: Sequence[RepositoryEvidence],
+) -> list[dict[str, str | int]]:
+    """Grant paths and immutable snapshots without sending source text."""
+
+    return [
+        {
+            "path": item.relative_path,
+            "sha256": item.sha256,
+            "size_bytes": item.size_bytes,
+        }
+        for item in items
+    ]
+
+
 def evidence_manifest(items: Sequence[RepositoryEvidence]) -> list[dict[str, str | int]]:
     return [
         {
