@@ -173,7 +173,7 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     crew_inbox = crew_subparsers.add_parser(
         "inbox", help="Show recent local run and approval activity"
     )
-    crew_inbox.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_inbox.add_argument("--owner", help="Explicit local owner label")
     crew_inbox.add_argument(
         "--limit",
         type=int,
@@ -185,6 +185,17 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         action="store_true",
         help="Include scheduled runs skipped after their misfire grace period",
     )
+    crew_inbox.add_argument(
+        "--unacknowledged",
+        action="store_true",
+        help="Show only activity revisions not yet acknowledged by this owner",
+    )
+    crew_inbox_actions = crew_inbox.add_subparsers(dest="crew_inbox_action")
+    crew_inbox_ack = crew_inbox_actions.add_parser(
+        "ack", help="Acknowledge one exact run or approval event revision",
+    )
+    crew_inbox_ack.add_argument("--owner", required=True)
+    crew_inbox_ack.add_argument("--event-id", required=True)
     for action, help_text in (
         ("pause", "Stop new coworker work while retaining history and decisions"),
         ("resume", "Resume a paused coworker"),
@@ -193,6 +204,12 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         lifecycle = crew_subparsers.add_parser(action, help=help_text)
         lifecycle.add_argument("--owner", required=True, help="Explicit local owner label")
         lifecycle.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_remove = crew_subparsers.add_parser(
+        "remove",
+        help="Review and remove archived coworker-owned local state",
+    )
+    crew_remove.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_remove.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
     crew_ask = crew_subparsers.add_parser(
         "ask",
         help="Ask one read-only question with explicitly listed workspace files",

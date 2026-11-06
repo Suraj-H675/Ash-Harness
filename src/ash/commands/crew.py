@@ -38,6 +38,7 @@ from ash.coworkers import (
     CoworkerModelReadinessResult,
     CoworkerModelTurnResult,
     CoworkerNotFound,
+    CoworkerRemovalPreview,
     CoworkerResponsibility,
     CoworkerResponsibilityRun,
     CoworkerResponsibilityStatus,
@@ -67,6 +68,8 @@ def run_crew_command(args: argparse.Namespace) -> int:
         return _rename(args)
     if action == "inbox":
         return _inbox(args)
+    if action == "remove":
+        return _remove(args)
     if action == "usage":
         return _usage(args)
     if action == "budget":
@@ -421,11 +424,18 @@ def _usage(args: argparse.Namespace) -> int:
 
 
 def _inbox(args: argparse.Namespace) -> int:
+    if getattr(args, "crew_inbox_action", None) == "ack":
+        return _inbox_ack(args)
+    owner_id = getattr(args, "owner", None)
+    if not isinstance(owner_id, str) or not owner_id:
+        _write_error("Local activity inbox requires an explicit owner label.")
+        return 2
     try:
         entries = CoworkerDirectory.open().list_inbox(
-            owner_id=args.owner,
+            owner_id=owner_id,
             limit=args.limit,
             include_skipped=args.include_skipped,
+            unacknowledged_only=args.unacknowledged,
         )
     except (
         CoworkerDirectoryError,
@@ -445,7 +455,13 @@ def _inbox(args: argparse.Namespace) -> int:
         _write_line("No Crew activity found for this owner label.")
         return 0
     for entry in entries:
-        _write_line(f"Entry ID: {_safe_text(entry.entry_id, single_line=True)}")
+        if isinstance(entry, CoworkerApprovalInboxEntry):
+            _write_line(f"Entry ID: {_safe_text(entry.entry_id, single_line=True)}")
+        _write_line(f"Inbox event ID: {_safe_text(entry.event_id, single_line=True)}")
+        if entry.acknowledged_at is None:
+            _write_line("Acknowledged: no")
+        else:
+            _write_line(f"Acknowledged: {entry.acknowledged_at.isoformat()}")
         _write_line(
             "Coworker: "
             f"{_safe_text(entry.coworker_name, single_line=True)} "
@@ -465,6 +481,30 @@ def _inbox(args: argparse.Namespace) -> int:
         elif isinstance(entry, CoworkerApprovalInboxEntry):
             _render_inbox_approval(entry)
         _write_line("")
+    return 0
+
+
+def _inbox_ack(args: argparse.Namespace) -> int:
+    try:
+        acknowledged_at = CoworkerDirectory.open().acknowledge_inbox_event(
+            owner_id=args.owner,
+            event_id=args.event_id,
+        )
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        OSError,
+        ValueError,
+    ) as exc:
+        _write_error(f"Inbox event could not be acknowledged: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"Inbox event acknowledgement failed ({type(exc).__name__}).")
+        return 2
+    _write_line(f"Acknowledged inbox event: {_safe_text(args.event_id, single_line=True)}")
+    _write_line(f"Acknowledged at: {acknowledged_at.isoformat()}")
+    _write_line("Run and approval lifecycle state was not changed.")
     return 0
 
 
@@ -627,6 +667,133 @@ def _lifecycle(args: argparse.Namespace, action: str) -> int:
     else:
         _write_line("Coworker active. New work is enabled.")
     return 0
+
+
+def _remove(args: argparse.Namespace) -> int:
+    try:
+        directory = CoworkerDirectory.open()
+        preview = directory.preview_archived_removal(
+            owner_id=args.owner,
+            coworker_id=args.coworker_id,
+        )
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        OSError,
+        SessionStorageError,
+        ValueError,
+    ) as exc:
+        _write_error(f"Coworker removal preview failed: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"Coworker removal preview failed ({type(exc).__name__}).")
+        return 2
+
+    _render_removal_preview(preview)
+    if preview.operation_state == "completed":
+        _write_line("Logical removal was already completed; no state was changed.")
+        _write_removal_retention_note()
+        return 0
+
+    challenge = f"REMOVE {preview.plan.coworker_id} {preview.plan.sha256}"
+    if not _require_tty_confirmation(challenge):
+        _write_error(
+            "Coworker removal requires that exact confirmation in an interactive "
+            "local TTY; no state was changed."
+        )
+        return 2
+
+    try:
+        removed = directory.remove_archived_coworker(
+            owner_id=args.owner,
+            coworker_id=args.coworker_id,
+            expected_plan_sha256=preview.plan.sha256,
+        )
+    except (
+        CoworkerDirectoryError,
+        CoworkerNotFound,
+        CoworkerRuntimeUnavailable,
+        OSError,
+        SessionStorageError,
+        ValueError,
+    ) as exc:
+        _write_error(f"Coworker removal did not complete: {_safe_error(exc)}")
+        return 2
+    except Exception as exc:
+        _write_error(f"Coworker removal did not complete ({type(exc).__name__}).")
+        return 2
+
+    _write_line(
+        f"Logical removal completed for coworker {removed.coworker_id}."
+    )
+    _write_removal_retention_note()
+    return 0
+
+
+def _render_removal_preview(preview: CoworkerRemovalPreview) -> None:
+    plan = preview.plan
+    state = {
+        "new": "new removal plan",
+        "pending": "resume of a previously confirmed interrupted removal",
+        "completed": "completed removal",
+    }[preview.operation_state]
+    _write_line(f"Coworker removal preview ({state}; logical deletion only):")
+    _write_line(f"Owner label: {_safe_text(plan.owner_id, single_line=True)}")
+    _write_line(
+        f"Coworker: {_safe_text(plan.display_name, single_line=True)} "
+        f"({plan.coworker_id})"
+    )
+    _write_line(f"Profile: {_safe_text(plan.profile_name, single_line=True)}")
+    _write_line(f"Workspace retained: {_safe_text(plan.workspace_path, single_line=True)}")
+    _write_line(
+        "Coworker directory rows to remove: "
+        f"{sum(count for _table, count in plan.row_counts)}"
+    )
+    for table, count in plan.row_counts:
+        _write_line(f"  {table}: {count}")
+    profile_state = "present" if preview.profile_sessions_present else "already removed"
+    profile_count = preview.current_retained_profile_session_count
+    native_count = preview.current_retained_native_session_count
+    count_time = "at confirmation" if profile_count is None else "currently"
+    _write_line(
+        f"Coworker-owned profile sessions: {len(plan.profile_session_ids)} "
+        f"({profile_state}); unrelated profile sessions {count_time}: "
+        f"{plan.retained_profile_session_count if profile_count is None else profile_count}"
+    )
+    native_state = "present" if preview.native_sessions_present else "already removed"
+    native_count_time = "at confirmation" if native_count is None else "currently"
+    _write_line(
+        f"Coworker-owned native tool sessions: {len(plan.native_session_ids)} "
+        f"({native_state}); unrelated native sessions {native_count_time}: "
+        f"{plan.retained_native_session_count if native_count is None else native_count}"
+    )
+    if preview.operation_state == "pending" and (
+        profile_count != plan.retained_profile_session_count
+        or native_count != plan.retained_native_session_count
+    ):
+        _write_line(
+            "Unrelated session counts changed after confirmation; "
+            "these sessions are outside the removal targets."
+        )
+    _write_line(f"Exact confirmation digest: {plan.sha256}")
+    _write_line(
+        "Deleted local records include stored briefs, run history, inbox "
+        "acknowledgements, and any staged pending file approvals. Pending approvals "
+        "are discarded, never executed."
+    )
+    _write_line(
+        "Retained: shared profile and workspace files, credentials, external accounts, "
+        "unrelated sessions, and a small immutable removal record."
+    )
+
+
+def _write_removal_retention_note() -> None:
+    _write_line(
+        "This removes the listed SQLite rows and exact Coworker-owned session IDs. "
+        "It does not securely erase SQLite WAL pages, backups, snapshots, or other "
+        "filesystem copies."
+    )
 
 
 def _git_diff(args: argparse.Namespace) -> int:

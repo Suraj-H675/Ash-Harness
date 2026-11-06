@@ -59,6 +59,171 @@ def _prepare_profiles(
     return ash_dir, atlas_workspace, scout_workspace
 
 
+def test_crew_inbox_ack_cli_is_durable_and_revision_specific(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from ash.automation.schedules import build_schedule
+
+    ash_dir, workspace, _scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local",
+        display_name="Atlas",
+        profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local",
+        coworker_id=identity.coworker_id,
+    )
+    created_at = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr("ash.coworkers._now", lambda: created_at.isoformat())
+    responsibility = handle.create_responsibility(
+        scope="Release review",
+        objective="Review the current release status.",
+        schedule=build_schedule(every="10s", now=created_at),
+        misfire_grace_seconds=0,
+    )
+    first_fire = responsibility.first_fire_at
+    assert first_fire is not None
+    monkeypatch.setattr(
+        "ash.coworkers._now",
+        lambda: (first_fire + timedelta(seconds=1)).isoformat(),
+    )
+    assert main([
+        "crew", "tick", "--owner", "local", "--coworker-id", identity.coworker_id,
+    ]) == 0
+    capsys.readouterr()
+
+    assert main([
+        "crew", "inbox", "--owner", "local", "--include-skipped",
+    ]) == 0
+    shown = capsys.readouterr().out
+    entry, = CoworkerDirectory.open(ash_dir).list_inbox(
+        owner_id="local", include_skipped=True,
+    )
+    assert entry.entry_id == f"run:{identity.coworker_id}:{entry.run_id}"
+    assert entry.event_id == f"run:{identity.coworker_id}:{entry.run_id}:skipped"
+    assert entry.event_id in shown
+    assert "Acknowledged: no" in shown
+
+    assert main([
+        "crew", "inbox", "ack", "--owner", "local", "--event-id", entry.event_id,
+    ]) == 0
+    assert "lifecycle state was not changed" in capsys.readouterr().out
+    assert main([
+        "crew", "inbox", "--owner", "local", "--include-skipped",
+        "--unacknowledged",
+    ]) == 0
+    assert "No Crew activity found" in capsys.readouterr().out
+
+    reopened = CoworkerDirectory.open(ash_dir)
+    persisted, = reopened.list_inbox(
+        owner_id="local", include_skipped=True,
+    )
+    assert persisted.event_id == entry.event_id
+    assert persisted.acknowledged_at is not None
+    assert handle.list_responsibility_runs(responsibility.responsibility_id)[0].status == (
+        "skipped"
+    )
+
+
+def test_crew_remove_requires_preview_and_exact_local_tty_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
+    for name in tuple(os.environ):
+        if name.startswith("ASH_"):
+            monkeypatch.delenv(name, raising=False)
+    ash_dir = home / ".ash"
+    (ash_dir / "profiles" / "worker").mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="owner-label",
+        display_name="Synthetic worker",
+        profile_name="worker",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    handle.archive()
+    args = [
+        "crew", "remove", "--owner", identity.owner_id,
+        "--coworker-id", identity.coworker_id,
+    ]
+
+    assert main(args) == 2
+    non_tty = capsys.readouterr()
+    assert "Coworker removal preview" in non_tty.out
+    assert "Exact confirmation digest:" in non_tty.out
+    assert "Pending approvals are discarded, never executed." in non_tty.out
+    assert "interactive local TTY" in non_tty.err
+    assert directory.open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    ).require_owner_binding().lifecycle_status == "archived"
+    plan = directory.preview_archived_removal(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    ).plan
+    challenge = f"REMOVE {identity.coworker_id} {plan.sha256}"
+
+    class TtyInput(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    class TtyOutput:
+        def __init__(self, stream: Any) -> None:
+            self.stream = stream
+
+        def isatty(self) -> bool:
+            return True
+
+        def write(self, value: str) -> int:
+            return self.stream.write(value)
+
+        def flush(self) -> None:
+            self.stream.flush()
+
+    captured_stdout = sys.stdout
+
+    def run_tty(answer: str) -> int:
+        monkeypatch.setattr(sys, "stdin", TtyInput(f"{answer}\n"))
+        monkeypatch.setattr(sys, "stdout", TtyOutput(captured_stdout))
+        return main(args)
+
+    assert run_tty(challenge + " extra") == 2
+    wrong = capsys.readouterr()
+    assert "exact confirmation" in wrong.err
+    assert directory.open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    ).require_owner_binding().lifecycle_status == "archived"
+
+    assert run_tty(challenge) == 0
+    completed = capsys.readouterr().out
+    assert "Logical removal completed" in completed
+    assert "does not securely erase SQLite WAL pages" in completed
+    with pytest.raises(CoworkerNotFound):
+        CoworkerDirectory.open(ash_dir).open_coworker(
+            owner_id=identity.owner_id,
+            coworker_id=identity.coworker_id,
+        )
+
+
 def _install_fake_registry(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1449,6 +1614,27 @@ def test_atlas_file_approval_is_durable_exact_and_single_use(
         for line in proposal_output.splitlines()
         if line.startswith("Approval digest: ")
     )
+    inbox_directory = CoworkerDirectory.open()
+    pending_approval_entry = next(
+        entry
+        for entry in inbox_directory.list_inbox(owner_id="local")
+        if entry.entry_id == f"approval:{approval_id}"
+    )
+    old_approval_event_id = pending_approval_entry.event_id
+    assert old_approval_event_id.startswith(
+        f"approval:{atlas_id}:{approval_id}:"
+    )
+    inbox_directory.acknowledge_inbox_event(
+        owner_id="local",
+        event_id=old_approval_event_id,
+    )
+    acknowledged_pending = next(
+        entry
+        for entry in CoworkerDirectory.open().list_inbox(owner_id="local")
+        if entry.entry_id == f"approval:{approval_id}"
+    )
+    assert acknowledged_pending.event_id == old_approval_event_id
+    assert acknowledged_pending.acknowledged_at is not None
     assert main(
         [
             "crew",
@@ -1531,6 +1717,19 @@ def test_atlas_file_approval_is_durable_exact_and_single_use(
     approved_inbox = capsys.readouterr().out
     assert approved_inbox.count(f"approval:{approval_id}") == 1
     assert "Status: Approved; waiting for an explicit local apply." in approved_inbox
+    approved_approval_entry = next(
+        entry
+        for entry in CoworkerDirectory.open().list_inbox(owner_id="local")
+        if entry.entry_id == f"approval:{approval_id}"
+    )
+    assert approved_approval_entry.event_id != old_approval_event_id
+    assert approved_approval_entry.acknowledged_at is None
+    assert approved_approval_entry.event_id in {
+        entry.event_id
+        for entry in CoworkerDirectory.open().list_inbox(
+            owner_id="local", unacknowledged_only=True,
+        )
+    }
 
     assert run_tty_action(apply_args, "APPLY") == 0
     assert "Status: succeeded." in capsys.readouterr().out

@@ -48,6 +48,7 @@ from ash.core.session import (
     SessionStore,
     get_db_connection,
 )
+from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
 from ash.core.redaction import redact_known_secrets
 from ash.providers.base import (
     CompletionStopCategory,
@@ -89,7 +90,35 @@ from ash.sandbox.manager import SandboxBackendUnavailable, SandboxManager
 
 
 _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION = 9
-_COWORKER_DIRECTORY_SCHEMA_VERSION = 15
+_COWORKER_DIRECTORY_SCHEMA_VERSION = 17
+_COWORKER_REMOVAL_TABLES = frozenset({
+    "coworker_directory_meta",
+    "coworkers",
+    "coworker_responsibilities",
+    "coworker_turn_dispatches",
+    "coworker_responsibility_schedules",
+    "coworker_briefs",
+    "coworker_file_approvals",
+    "coworker_file_approval_events",
+    "coworker_accepted_events",
+    "coworker_native_git_diffs",
+    "coworker_model_budgets",
+    "coworker_inbox_acknowledgements",
+    "coworker_removal_operations",
+})
+_COWORKER_REMOVAL_DELETE_ORDER = (
+    "coworker_file_approval_events",
+    "coworker_file_approvals",
+    "coworker_accepted_events",
+    "coworker_responsibility_schedules",
+    "coworker_turn_dispatches",
+    "coworker_native_git_diffs",
+    "coworker_inbox_acknowledgements",
+    "coworker_briefs",
+    "coworker_model_budgets",
+    "coworker_responsibilities",
+    "coworkers",
+)
 _MAX_OWNER_ID_CHARS = 128
 _MAX_COWORKER_NAME_CHARS = 128
 _MAX_COWORKER_BRIEF_BYTES = 2048
@@ -256,6 +285,47 @@ CoworkerLifecycleStatus = Literal["active", "paused", "archived"]
 
 
 @dataclass(frozen=True)
+class CoworkerInboxEventId:
+    """One exact revision of a run status or approval journal event."""
+
+    kind: Literal["run", "approval"]
+    coworker_id: str
+    record_id: str
+    revision: str
+
+    @classmethod
+    def parse(cls, value: str) -> "CoworkerInboxEventId":
+        if not isinstance(value, str) or len(value) > 512:
+            raise ValueError("inbox event ID is invalid")
+        parts = value.split(":")
+        if len(parts) != 4:
+            raise ValueError("inbox event ID is invalid")
+        if parts[0] == "run":
+            kind: Literal["run", "approval"] = "run"
+        elif parts[0] == "approval":
+            kind = "approval"
+        else:
+            raise ValueError("inbox event ID is invalid")
+        coworker_id = _normalize_coworker_id(parts[1])
+        try:
+            record_id = str(UUID(parts[2]))
+        except (ValueError, TypeError) as exc:
+            raise ValueError("inbox event ID is invalid") from exc
+        revision = parts[3]
+        if kind == "run":
+            if revision not in {"claimed", "completed", "skipped"}:
+                raise ValueError("inbox event ID is invalid")
+        elif not revision.isascii() or not revision.isdecimal() or int(revision) < 1:
+            raise ValueError("inbox event ID is invalid")
+        if value != f"{kind}:{coworker_id}:{record_id}:{revision}":
+            raise ValueError("inbox event ID is invalid")
+        return cls(kind=kind, coworker_id=coworker_id, record_id=record_id, revision=revision)
+
+    def __str__(self) -> str:
+        return f"{self.kind}:{self.coworker_id}:{self.record_id}:{self.revision}"
+
+
+@dataclass(frozen=True)
 class Coworker:
     """Persisted identity; only ``display_name`` may change after creation."""
 
@@ -268,6 +338,211 @@ class Coworker:
     canonical_session_id: str
     state: Literal["provisioning", "ready"]
     lifecycle_status: CoworkerLifecycleStatus
+
+
+@dataclass(frozen=True)
+class CoworkerRemovalPlan:
+    """Immutable exact deletion scope for one archived coworker."""
+
+    owner_id: str
+    owner_uid: int
+    coworker_id: str
+    display_name: str
+    profile_name: str
+    workspace_path: str
+    canonical_session_id: str
+    directory_database_identity: tuple[int, int, int, int]
+    profile_database_path: str
+    profile_database_identity: tuple[int, int, int, int]
+    profile_session_ids: tuple[str, ...]
+    retained_profile_session_count: int
+    native_database_path: str | None
+    native_database_identity: tuple[int, int, int, int] | None
+    native_session_ids: tuple[str, ...]
+    retained_native_session_count: int
+    row_manifest: tuple[tuple[str, tuple[str, ...], str], ...]
+
+    @property
+    def row_counts(self) -> tuple[tuple[str, int], ...]:
+        counts: dict[str, int] = {}
+        for table, _key, _row_sha256 in self.row_manifest:
+            counts[table] = counts.get(table, 0) + 1
+        return tuple(sorted(counts.items()))
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "owner_id": self.owner_id,
+            "owner_uid": self.owner_uid,
+            "coworker_id": self.coworker_id,
+            "display_name": self.display_name,
+            "profile_name": self.profile_name,
+            "workspace_path": self.workspace_path,
+            "canonical_session_id": self.canonical_session_id,
+            "directory_database_identity": list(self.directory_database_identity),
+            "profile_database_path": self.profile_database_path,
+            "profile_database_identity": list(self.profile_database_identity),
+            "profile_session_ids": list(self.profile_session_ids),
+            "retained_profile_session_count": self.retained_profile_session_count,
+            "native_database_path": self.native_database_path,
+            "native_database_identity": (
+                list(self.native_database_identity)
+                if self.native_database_identity is not None
+                else None
+            ),
+            "native_session_ids": list(self.native_session_ids),
+            "retained_native_session_count": self.retained_native_session_count,
+            "row_manifest": [
+                [table, list(key), row_sha256]
+                for table, key, row_sha256 in self.row_manifest
+            ],
+        }
+
+    def canonical_json(self) -> str:
+        return json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+
+    @classmethod
+    def from_json(cls, encoded: str) -> "CoworkerRemovalPlan":
+        try:
+            value = json.loads(encoded)
+            if not isinstance(value, dict) or set(value) != {
+                "owner_id", "owner_uid", "coworker_id", "display_name",
+                "profile_name", "workspace_path", "canonical_session_id",
+                "directory_database_identity", "profile_database_path",
+                "profile_database_identity", "profile_session_ids",
+                "retained_profile_session_count", "native_database_path",
+                "native_database_identity", "native_session_ids",
+                "retained_native_session_count", "row_manifest",
+            }:
+                raise ValueError("unknown removal manifest fields")
+            for field in (
+                "owner_id", "coworker_id", "display_name", "profile_name",
+                "workspace_path", "canonical_session_id", "profile_database_path",
+            ):
+                if not isinstance(value[field], str):
+                    raise ValueError("invalid removal manifest text")
+            owner_uid = value["owner_uid"]
+            if type(owner_uid) is not int or owner_uid < 0:
+                raise ValueError("invalid removal manifest UID")
+
+            def identity(name: str) -> tuple[int, int, int, int]:
+                raw = value[name]
+                if (
+                    not isinstance(raw, list)
+                    or len(raw) != 4
+                    or any(type(item) is not int or item < 0 for item in raw)
+                    or raw[1] <= 0
+                    or raw[3] <= 0
+                ):
+                    raise ValueError("invalid removal database identity")
+                return (raw[0], raw[1], raw[2], raw[3])
+
+            raw_native_identity = value["native_database_identity"]
+            if raw_native_identity is None:
+                native_identity = None
+            else:
+                native_identity = identity("native_database_identity")
+            raw_native_path = value["native_database_path"]
+            if raw_native_path is not None and not isinstance(raw_native_path, str):
+                raise ValueError("invalid native tool database path")
+            raw_profile_ids = value["profile_session_ids"]
+            raw_native_ids = value["native_session_ids"]
+            if (
+                not isinstance(raw_profile_ids, list)
+                or not isinstance(raw_native_ids, list)
+                or any(not isinstance(item, str) for item in (*raw_profile_ids, *raw_native_ids))
+            ):
+                raise ValueError("invalid removal session ID set")
+            raw_rows = value["row_manifest"]
+            if not isinstance(raw_rows, list):
+                raise ValueError("invalid removal row manifest")
+            rows: list[tuple[str, tuple[str, ...], str]] = []
+            for item in raw_rows:
+                if (
+                    not isinstance(item, list)
+                    or len(item) != 3
+                    or not isinstance(item[0], str)
+                    or not isinstance(item[1], list)
+                    or any(not isinstance(key, str) for key in item[1])
+                    or not isinstance(item[2], str)
+                    or re.fullmatch(r"[a-f0-9]{64}", item[2]) is None
+                ):
+                    raise ValueError("invalid removal row manifest entry")
+                rows.append((item[0], tuple(item[1]), item[2]))
+            profile_count = value["retained_profile_session_count"]
+            native_count = value["retained_native_session_count"]
+            if (
+                type(profile_count) is not int
+                or profile_count < 0
+                or type(native_count) is not int
+                or native_count < 0
+            ):
+                raise ValueError("invalid retained session count")
+            if (raw_native_path is None) != (native_identity is None):
+                raise ValueError("native tool database path and identity disagree")
+            profile_ids = tuple(raw_profile_ids)
+            native_ids = tuple(raw_native_ids)
+            if (
+                not profile_ids
+                or len(profile_ids) != len(set(profile_ids))
+                or profile_ids != tuple(sorted(profile_ids))
+                or len(native_ids) != len(set(native_ids))
+                or native_ids != tuple(sorted(native_ids))
+            ):
+                raise ValueError("removal session IDs are ambiguous")
+            for session_id in (*profile_ids, *native_ids):
+                if str(UUID(session_id)) != session_id:
+                    raise ValueError("removal session ID is not canonical")
+            if str(UUID(value["canonical_session_id"])) != value["canonical_session_id"]:
+                raise ValueError("canonical session ID is invalid")
+            if _normalize_owner_id(value["owner_id"]) != value["owner_id"]:
+                raise ValueError("removal owner ID is not canonical")
+            if _normalize_coworker_id(value["coworker_id"]) != value["coworker_id"]:
+                raise ValueError("removal coworker ID is not canonical")
+            if not Path(value["workspace_path"]).is_absolute():
+                raise ValueError("removal workspace path is not absolute")
+            if not Path(value["profile_database_path"]).is_absolute():
+                raise ValueError("removal profile database path is not absolute")
+            if rows != sorted(rows) or len(rows) != len(set(rows)):
+                raise ValueError("removal row manifest is ambiguous")
+            if any(table not in _COWORKER_REMOVAL_TABLES for table, _key, _digest in rows):
+                raise ValueError("removal row manifest contains an unknown table")
+            return cls(
+                owner_id=value["owner_id"],
+                owner_uid=owner_uid,
+                coworker_id=value["coworker_id"],
+                display_name=value["display_name"],
+                profile_name=value["profile_name"],
+                workspace_path=value["workspace_path"],
+                canonical_session_id=value["canonical_session_id"],
+                directory_database_identity=identity("directory_database_identity"),
+                profile_database_path=value["profile_database_path"],
+                profile_database_identity=identity("profile_database_identity"),
+                profile_session_ids=profile_ids,
+                retained_profile_session_count=profile_count,
+                native_database_path=raw_native_path,
+                native_database_identity=native_identity,
+                native_session_ids=native_ids,
+                retained_native_session_count=native_count,
+                row_manifest=tuple(rows),
+            )
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise CoworkerDirectoryError("stored coworker removal manifest is invalid") from exc
+
+
+@dataclass(frozen=True)
+class CoworkerRemovalPreview:
+    """Reviewable removal plan plus the currently validated recovery state."""
+
+    plan: CoworkerRemovalPlan
+    operation_state: Literal["new", "pending", "completed"]
+    profile_sessions_present: bool
+    native_sessions_present: bool
+    current_retained_profile_session_count: int | None = None
+    current_retained_native_session_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1216,10 +1491,15 @@ class CoworkerRunInboxEntry:
     event_key: str | None = None
     scheduled_for: datetime | None = None
     skip_reason: str | None = None
+    acknowledged_at: datetime | None = None
 
     @property
     def entry_id(self) -> str:
         return f"run:{self.coworker_id}:{self.run_id}"
+
+    @property
+    def event_id(self) -> str:
+        return f"run:{self.coworker_id}:{self.run_id}:{self.status}"
 
 
 @dataclass(frozen=True)
@@ -1239,12 +1519,21 @@ class CoworkerApprovalInboxEntry:
     action: CoworkerFileApprovalAction
     target_path: str
     expires_at: datetime
+    latest_event_id: int
     responsibility_id: str | None = None
     event_key: str | None = None
+    acknowledged_at: datetime | None = None
 
     @property
     def entry_id(self) -> str:
         return f"approval:{self.approval_id}"
+
+    @property
+    def event_id(self) -> str:
+        return (
+            f"approval:{self.coworker_id}:{self.approval_id}:"
+            f"{self.latest_event_id}"
+        )
 
 
 CoworkerInboxEntry = CoworkerRunInboxEntry | CoworkerApprovalInboxEntry
@@ -2090,6 +2379,45 @@ def _record_from_row(row: sqlite3.Row) -> Coworker:
         state=str(row["state"]),  # type: ignore[arg-type]
         lifecycle_status=lifecycle_status,  # type: ignore[arg-type]
     )
+
+
+def _removal_json_value(value: object) -> object:
+    if isinstance(value, bytes):
+        return {"blob_bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+    if value is None or isinstance(value, (str, int, float)):
+        return value
+    raise CoworkerDirectoryError("coworker removal row contains an unknown SQLite value")
+
+
+def _removal_row_manifest_entry(
+    table: str,
+    row: sqlite3.Row,
+    primary_keys: tuple[str, ...],
+) -> tuple[str, tuple[str, ...], str]:
+    if not primary_keys:
+        raise CoworkerDirectoryError(
+            f"coworker removal table {table} has no verifiable primary key"
+        )
+    raw_key = tuple(row[name] for name in primary_keys)
+    if any(value is None or isinstance(value, (bytes, bytearray, memoryview)) for value in raw_key):
+        raise CoworkerDirectoryError(
+            f"coworker removal table {table} has an invalid primary key"
+        )
+    key = tuple(str(value) for value in raw_key)
+    payload = [
+        [str(name), _removal_json_value(row[name])]
+        for name in row.keys()
+    ]
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        .encode("utf-8")
+    ).hexdigest()
+    return table, key, digest
+
+
+def _normalized_sql(sql: str) -> str:
+    normalized = re.sub(r"\s+", " ", sql.strip()).casefold()
+    return re.sub(r"\s*([(),])\s*", r"\1", normalized)
 
 
 def _current_owner_uid() -> int | None:
@@ -2982,7 +3310,16 @@ class CoworkerDirectory:
             )
         self.ash_dir = root
         self.db_path = root / "coworkers.sqlite3"
-        self._initialize()
+        try:
+            self._database = PinnedSQLiteDatabase.prepare(
+                self.db_path,
+                label="coworker directory",
+            )
+            self._initialize()
+        except SQLitePathError as exc:
+            raise CoworkerDirectoryError(
+                f"could not pin coworker directory {self.db_path}"
+            ) from exc
 
     @classmethod
     def open(cls, ash_dir: Path | None = None) -> "CoworkerDirectory":
@@ -2992,12 +3329,744 @@ class CoworkerDirectory:
         return cls(root)
 
     def _connect(self) -> sqlite3.Connection:
-        return get_db_connection(self.db_path)
+        return get_db_connection(self.db_path, _database=self._database)
+
+    @property
+    def database_identity(self) -> tuple[int, int, int, int]:
+        """Return the pinned parent and file identities for this directory."""
+
+        database = self._database
+        return (
+            database.parent_device,
+            database.parent_inode,
+            database.file_device,
+            database.file_inode,
+        )
 
     def _connect_durable(self) -> sqlite3.Connection:
         connection = self._connect()
         connection.execute("PRAGMA synchronous=FULL;")
         return connection
+
+    def preview_archived_removal(
+        self, *, owner_id: str, coworker_id: str,
+    ) -> CoworkerRemovalPreview:
+        """Build a read-only exact plan for one archived coworker."""
+
+        owner = _normalize_owner_id(owner_id)
+        identity = _normalize_coworker_id(coworker_id)
+        owner_uid = _current_owner_uid()
+        if owner_uid is None:
+            raise CoworkerRuntimeUnavailable(
+                "local coworker owner identity could not be verified"
+            )
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN")
+                operation = conn.execute(
+                    "SELECT * FROM coworker_removal_operations WHERE coworker_id = ?",
+                    (identity,),
+                ).fetchone()
+                if operation is not None:
+                    if operation["owner_id"] != owner or operation["owner_uid"] != owner_uid:
+                        raise CoworkerNotFound("coworker not found")
+                    stored_plan = self._parse_removal_operation(operation)
+                    if operation["state"] == "completed":
+                        if (
+                            stored_plan.directory_database_identity
+                            != self.database_identity
+                        ):
+                            raise CoworkerRuntimeUnavailable(
+                                "coworker directory database identity changed"
+                            )
+                        if conn.execute(
+                            "SELECT 1 FROM coworkers WHERE coworker_id = ?", (identity,)
+                        ).fetchone() is not None:
+                            raise CoworkerDirectoryError(
+                                "completed coworker removal still has identity rows"
+                            )
+                        return CoworkerRemovalPreview(
+                            stored_plan, "completed", False, False
+                        )
+                    if operation["state"] != "pending":
+                        raise CoworkerDirectoryError(
+                            "coworker removal operation state is unknown"
+                        )
+                    preview, _, _ = self._build_archived_removal_preview(
+                        conn,
+                        owner=owner,
+                        coworker_id=identity,
+                        owner_uid=owner_uid,
+                        expected_plan=stored_plan,
+                    )
+                    return replace(preview, operation_state="pending")
+                preview, _, _ = self._build_archived_removal_preview(
+                    conn,
+                    owner=owner,
+                    coworker_id=identity,
+                    owner_uid=owner_uid,
+                    expected_plan=None,
+                )
+                return preview
+        except sqlite3.DatabaseError as exc:
+            raise CoworkerDirectoryError(
+                "coworker removal preview could not read durable state"
+            ) from exc
+
+    def remove_archived_coworker(
+        self,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        expected_plan_sha256: str,
+    ) -> CoworkerRemovalPlan:
+        """Commit and resume an exact immutable archived-removal plan."""
+
+        owner = _normalize_owner_id(owner_id)
+        identity = _normalize_coworker_id(coworker_id)
+        if re.fullmatch(r"[a-f0-9]{64}", expected_plan_sha256) is None:
+            raise ValueError("removal plan SHA-256 is invalid")
+        try:
+            with workspace_mutation_lock():
+                return self._commit_archived_removal(
+                    owner=owner,
+                    coworker_id=identity,
+                    expected_plan_sha256=expected_plan_sha256,
+                )
+        except ScopedIOError as exc:
+            raise CoworkerRuntimeUnavailable(
+                "coworker removal is blocked by an active workspace file effect"
+            ) from exc
+
+    def _commit_archived_removal(
+        self, *, owner: str, coworker_id: str, expected_plan_sha256: str,
+    ) -> CoworkerRemovalPlan:
+        from contextlib import ExitStack
+
+        owner_uid = _current_owner_uid()
+        if owner_uid is None:
+            raise CoworkerRuntimeUnavailable(
+                "local coworker owner identity could not be verified"
+            )
+        with closing(self._connect()) as reader:
+            reader.execute("BEGIN")
+            operation = reader.execute(
+                "SELECT * FROM coworker_removal_operations WHERE coworker_id = ?",
+                (coworker_id,),
+            ).fetchone()
+            expected = None
+            if operation is not None:
+                stored_plan = self._parse_removal_operation(operation)
+                if (
+                    stored_plan.owner_id != owner
+                    or stored_plan.owner_uid != owner_uid
+                    or stored_plan.coworker_id != coworker_id
+                ):
+                    raise CoworkerNotFound("coworker not found")
+                if stored_plan.directory_database_identity != self.database_identity:
+                    raise CoworkerRuntimeUnavailable(
+                        "coworker directory database identity changed"
+                    )
+                if operation["state"] == "completed":
+                    if stored_plan.sha256 != expected_plan_sha256:
+                        raise CoworkerRuntimeUnavailable(
+                            "completed removal plan does not match this confirmation"
+                        )
+                    return stored_plan
+                if operation["state"] != "pending":
+                    raise CoworkerDirectoryError(
+                        "coworker removal operation state is unknown"
+                    )
+                expected = stored_plan
+            initial, profile_store, native_store = self._build_archived_removal_preview(
+                reader,
+                owner=owner,
+                coworker_id=coworker_id,
+                owner_uid=owner_uid,
+                expected_plan=expected,
+            )
+            if initial.plan.sha256 != expected_plan_sha256:
+                raise CoworkerRuntimeUnavailable(
+                    "coworker removal plan changed since preview"
+                )
+
+        with ExitStack() as lease_stack:
+            profile_leases = lease_stack.enter_context(
+                profile_store.hold_removal_leases(initial.plan.profile_session_ids)
+            )
+            native_leases = None
+            if initial.plan.native_session_ids:
+                if native_store is None:
+                    raise CoworkerDirectoryError(
+                        "native tool store is missing for its removal manifest"
+                    )
+                native_leases = lease_stack.enter_context(
+                    native_store.hold_removal_leases(initial.plan.native_session_ids)
+                )
+
+            with closing(self._connect_durable()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._require_removal_database_identity(initial.plan)
+                operation = conn.execute(
+                    "SELECT * FROM coworker_removal_operations WHERE coworker_id = ?",
+                    (coworker_id,),
+                ).fetchone()
+                current_expected = None
+                if operation is not None:
+                    if operation["state"] != "pending":
+                        raise CoworkerRuntimeUnavailable(
+                            "coworker removal state changed during confirmation"
+                        )
+                    current_expected = self._parse_removal_operation(operation)
+                    if current_expected.sha256 != expected_plan_sha256:
+                        raise CoworkerRuntimeUnavailable(
+                            "pending removal plan changed during confirmation"
+                        )
+                current, checked_profile, checked_native = (
+                    self._build_archived_removal_preview(
+                        conn,
+                        owner=owner,
+                        coworker_id=coworker_id,
+                        owner_uid=owner_uid,
+                        expected_plan=current_expected,
+                        profile_store=profile_store,
+                        native_store=native_store,
+                    )
+                )
+                if (
+                    current.plan.sha256 != expected_plan_sha256
+                    or checked_profile.database_identity
+                    != initial.plan.profile_database_identity
+                    or (
+                        checked_native.database_identity
+                        if checked_native is not None else None
+                    ) != initial.plan.native_database_identity
+                ):
+                    raise CoworkerRuntimeUnavailable(
+                        "coworker removal plan changed during confirmation"
+                    )
+                if operation is None:
+                    conn.execute(
+                        "INSERT INTO coworker_removal_operations "
+                        "(coworker_id,owner_id,owner_uid,plan_sha256,plan_json,"
+                        "state,created_at,completed_at) "
+                        "VALUES (?,?,?,?,?,'pending',?,NULL)",
+                        (
+                            coworker_id,
+                            owner,
+                            owner_uid,
+                            expected_plan_sha256,
+                            current.plan.canonical_json(),
+                            _now(),
+                        ),
+                    )
+                conn.commit()
+
+            profile_store.remove_coworker_sessions(
+                owner_id=owner,
+                coworker_id=coworker_id,
+                canonical_session_id=initial.plan.canonical_session_id,
+                project_path=initial.plan.workspace_path,
+                session_ids=initial.plan.profile_session_ids,
+                expected_database_identity=initial.plan.profile_database_identity,
+                _lease_set=profile_leases,
+            )
+            if initial.plan.native_session_ids:
+                if native_store is None or native_leases is None:
+                    raise CoworkerDirectoryError(
+                        "native tool removal lease is missing"
+                    )
+                native_database_identity = initial.plan.native_database_identity
+                if native_database_identity is None:
+                    raise CoworkerDirectoryError(
+                        "native tool database identity is missing"
+                    )
+                native_store.remove_native_tool_sessions(
+                    project_path=initial.plan.workspace_path,
+                    session_ids=initial.plan.native_session_ids,
+                    expected_database_identity=native_database_identity,
+                    _lease_set=native_leases,
+                )
+
+            with closing(self._connect_durable()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                marker = conn.execute(
+                    "SELECT * FROM coworker_removal_operations WHERE coworker_id = ?",
+                    (coworker_id,),
+                ).fetchone()
+                if marker is None or marker["state"] != "pending":
+                    raise CoworkerRuntimeUnavailable(
+                        "pending removal marker disappeared before completion"
+                    )
+                stored_plan = self._parse_removal_operation(marker)
+                if stored_plan.sha256 != expected_plan_sha256:
+                    raise CoworkerRuntimeUnavailable(
+                        "pending removal marker changed before completion"
+                    )
+                current, _, _ = self._build_archived_removal_preview(
+                    conn,
+                    owner=owner,
+                    coworker_id=coworker_id,
+                    owner_uid=owner_uid,
+                    expected_plan=stored_plan,
+                    profile_store=profile_store,
+                    native_store=native_store,
+                )
+                if current.plan.sha256 != expected_plan_sha256:
+                    raise CoworkerRuntimeUnavailable(
+                        "coworker rows changed before final removal"
+                    )
+                self._delete_coworker_removal_rows(conn, stored_plan)
+                cursor = conn.execute(
+                    "UPDATE coworker_removal_operations SET state='completed', "
+                    "completed_at=? WHERE coworker_id=? AND owner_id=? "
+                    "AND owner_uid=? AND plan_sha256=? AND state='pending'",
+                    (_now(), coworker_id, owner, owner_uid, expected_plan_sha256),
+                )
+                if cursor.rowcount != 1:
+                    raise CoworkerDirectoryError(
+                        "coworker removal completion marker could not be committed"
+                    )
+                conn.commit()
+        return initial.plan
+
+    def _build_archived_removal_preview(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        owner: str,
+        coworker_id: str,
+        owner_uid: int,
+        expected_plan: CoworkerRemovalPlan | None,
+        profile_store: SessionStore | None = None,
+        native_store: SessionStore | None = None,
+    ) -> tuple[CoworkerRemovalPreview, SessionStore, SessionStore | None]:
+        if (
+            expected_plan is not None
+            and expected_plan.directory_database_identity != self.database_identity
+        ):
+            raise CoworkerRuntimeUnavailable("coworker directory identity changed")
+        row = conn.execute(
+            "SELECT * FROM coworkers WHERE owner_id=? AND coworker_id=?",
+            (owner, coworker_id),
+        ).fetchone()
+        if row is None:
+            raise CoworkerNotFound("coworker not found")
+        record = _record_from_row(row)
+        if record.owner_uid != owner_uid:
+            raise CoworkerNotFound("coworker not found")
+        if record.state != "ready" or record.lifecycle_status != "archived":
+            raise CoworkerRuntimeUnavailable(
+                "only a ready archived coworker can be removed"
+            )
+        if expected_plan is not None and (
+            expected_plan.owner_id != owner
+            or expected_plan.owner_uid != owner_uid
+            or expected_plan.coworker_id != coworker_id
+        ):
+            raise CoworkerRuntimeUnavailable("pending removal owner binding changed")
+        try:
+            guard = SafetyGuard(record.workspace)
+            guard.ensure_project_root_current()
+            if guard.project_root_identity is None:
+                raise SafetyViolation("workspace identity is unavailable")
+        except (SafetyViolation, OSError) as exc:
+            raise CoworkerRuntimeUnavailable(
+                "coworker workspace identity is unsafe or unavailable"
+            ) from exc
+
+        row_manifest, rows_by_table = self._coworker_removal_row_manifest(
+            conn, record, owner_uid
+        )
+        profile_path = self._profile_database_directory(record) / "sessions.db"
+        if expected_plan is not None and str(profile_path) != expected_plan.profile_database_path:
+            raise CoworkerRuntimeUnavailable("bound profile database path changed")
+        current_profile_store = profile_store or SessionStore.open_existing(profile_path)
+        if expected_plan is None:
+            profile_inventory = current_profile_store.coworker_session_removal_inventory(
+                owner_id=owner,
+                coworker_id=coworker_id,
+                canonical_session_id=record.canonical_session_id,
+                project_path=record.workspace,
+            )
+            profile_ids = profile_inventory.session_ids
+            profile_present = True
+            retained_profile = profile_inventory.unrelated_session_count
+        else:
+            profile_ids = expected_plan.profile_session_ids
+            profile_present = current_profile_store.validate_coworker_session_removal_set(
+                owner_id=owner,
+                coworker_id=coworker_id,
+                canonical_session_id=record.canonical_session_id,
+                project_path=record.workspace,
+                session_ids=profile_ids,
+            )
+            retained_profile = current_profile_store.count_unrelated_sessions_for_removal(
+                profile_ids
+            )
+        self._validate_removal_journals(
+            conn,
+            record=record,
+            rows_by_table=rows_by_table,
+            profile_session_ids=profile_ids,
+        )
+
+        native_ids = tuple(sorted({
+            str(item["tool_session_id"])
+            for item in rows_by_table["coworker_native_git_diffs"]
+            if item["tool_session_id"] is not None
+        }))
+        if expected_plan is not None and native_ids != expected_plan.native_session_ids:
+            raise CoworkerRuntimeUnavailable(
+                "native tool session references changed since preview"
+            )
+        native_path = self._profile_database_directory(record) / "crew_native_tool_sessions.db"
+        native_path_exists = (
+            native_path.exists()
+            or native_path.is_symlink()
+            or getattr(native_path, "is_junction", lambda: False)()
+        )
+        if native_ids and not native_path_exists:
+            raise CoworkerDirectoryError("native tool session database is missing")
+        if expected_plan is not None and (
+            (expected_plan.native_database_path is None) != (not native_path_exists)
+            or (
+                expected_plan.native_database_path is not None
+                and expected_plan.native_database_path != str(native_path)
+            )
+        ):
+            raise CoworkerRuntimeUnavailable(
+                "native tool database appeared or disappeared since preview"
+            )
+        current_native_store = (
+            (native_store or SessionStore.open_existing(native_path))
+            if native_path_exists else None
+        )
+        if native_ids:
+            if current_native_store is None:
+                raise CoworkerDirectoryError("native tool session store is unavailable")
+            if expected_plan is None:
+                native_inventory = current_native_store.native_tool_session_removal_inventory(
+                    project_path=record.workspace,
+                    session_ids=native_ids,
+                )
+                native_present = True
+                retained_native = native_inventory.unrelated_session_count
+            else:
+                native_present = current_native_store.validate_native_tool_session_removal_set(
+                    project_path=record.workspace,
+                    session_ids=native_ids,
+                )
+                retained_native = current_native_store.count_unrelated_sessions_for_removal(
+                    native_ids
+                )
+            if native_present:
+                for native_row in rows_by_table["coworker_native_git_diffs"]:
+                    receipt = self._native_git_diff_from_row(native_row, record)
+                    if receipt.status == "completed":
+                        self._verify_native_git_diff_completion(
+                            record, native_row, receipt, store=current_native_store
+                        )
+        elif current_native_store is not None:
+            native_present = True
+            retained_native = current_native_store.count_sessions_for_removal()
+        else:
+            native_present = True
+            retained_native = 0
+
+        current_retained_profile = retained_profile
+        current_retained_native = retained_native
+        if expected_plan is not None:
+            # Unrelated sessions may change during interrupted removal. Keep the
+            # confirmed deletion manifest immutable; report live retention separately.
+            retained_profile = expected_plan.retained_profile_session_count
+            retained_native = expected_plan.retained_native_session_count
+
+        plan = CoworkerRemovalPlan(
+            owner_id=owner,
+            owner_uid=owner_uid,
+            coworker_id=coworker_id,
+            display_name=record.display_name,
+            profile_name=record.profile_name,
+            workspace_path=str(record.workspace),
+            canonical_session_id=record.canonical_session_id,
+            directory_database_identity=self.database_identity,
+            profile_database_path=str(profile_path),
+            profile_database_identity=current_profile_store.database_identity,
+            profile_session_ids=profile_ids,
+            retained_profile_session_count=retained_profile,
+            native_database_path=str(native_path) if native_path_exists else None,
+            native_database_identity=(
+                current_native_store.database_identity
+                if current_native_store is not None else None
+            ),
+            native_session_ids=native_ids,
+            retained_native_session_count=retained_native,
+            row_manifest=row_manifest,
+        )
+        if expected_plan is not None and plan.sha256 != expected_plan.sha256:
+            raise CoworkerRuntimeUnavailable(
+                "coworker removal plan no longer matches its immutable manifest"
+            )
+        return CoworkerRemovalPreview(
+            plan,
+            "pending" if expected_plan is not None else "new",
+            profile_present,
+            native_present,
+            current_retained_profile,
+            current_retained_native,
+        ), current_profile_store, current_native_store
+
+    def _require_removal_database_identity(
+        self, plan: CoworkerRemovalPlan,
+    ) -> None:
+        if self.database_identity != plan.directory_database_identity:
+            raise CoworkerRuntimeUnavailable(
+                "coworker directory database identity changed"
+            )
+
+    @staticmethod
+    def _parse_removal_operation(row: sqlite3.Row) -> CoworkerRemovalPlan:
+        encoded = str(row["plan_json"])
+        plan = CoworkerRemovalPlan.from_json(encoded)
+        if (
+            plan.canonical_json() != encoded
+            or plan.sha256 != row["plan_sha256"]
+            or plan.coworker_id != row["coworker_id"]
+            or plan.owner_id != row["owner_id"]
+            or plan.owner_uid != row["owner_uid"]
+        ):
+            raise CoworkerDirectoryError(
+                "coworker removal operation does not match its immutable manifest"
+            )
+        return plan
+
+    def _coworker_removal_row_manifest(
+        self,
+        conn: sqlite3.Connection,
+        record: Coworker,
+        owner_uid: int,
+    ) -> tuple[
+        tuple[tuple[str, tuple[str, ...], str], ...],
+        dict[str, tuple[sqlite3.Row, ...]],
+    ]:
+        self._require_supported_removal_triggers(conn)
+        table_names = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        required = set(_COWORKER_REMOVAL_DELETE_ORDER)
+        if not required.issubset(table_names):
+            raise CoworkerDirectoryError(
+                "Coworker removal schema is incomplete or unknown"
+            )
+        ignored = {"coworker_directory_meta", "coworker_removal_operations"}
+        for table in sorted(table_names - set(_COWORKER_REMOVAL_TABLES)):
+            quoted = '"' + table.replace('"', '""') + '"'
+            columns = {
+                str(column["name"])
+                for column in conn.execute(f"PRAGMA table_info({quoted})")
+            }
+            foreign_keys = conn.execute(
+                f"PRAGMA foreign_key_list({quoted})"
+            ).fetchall()
+            if any(
+                str(key["table"]) in required or str(key["table"]) == "coworkers"
+                for key in foreign_keys
+            ):
+                raise CoworkerDirectoryError(
+                    f"unknown table {table} references Coworker-owned rows"
+                )
+            if "coworker_id" in columns:
+                if conn.execute(
+                    f"SELECT 1 FROM {quoted} WHERE coworker_id = ? LIMIT 1",
+                    (record.coworker_id,),
+                ).fetchone() is not None:
+                    raise CoworkerDirectoryError(
+                        f"unknown table {table} contains Coworker-owned rows"
+                    )
+
+        rows_by_table: dict[str, tuple[sqlite3.Row, ...]] = {}
+        manifest: list[tuple[str, tuple[str, ...], str]] = []
+        for table in _COWORKER_REMOVAL_DELETE_ORDER:
+            quoted = '"' + table.replace('"', '""') + '"'
+            info = conn.execute(f"PRAGMA table_info({quoted})").fetchall()
+            columns = {str(column["name"]) for column in info}
+            if table == "coworker_file_approval_events":
+                rows = tuple(
+                    conn.execute(
+                        "SELECT event.* FROM coworker_file_approval_events AS event "
+                        "JOIN coworker_file_approvals AS approval "
+                        "ON approval.approval_id = event.approval_id "
+                        "WHERE approval.owner_id = ? AND approval.owner_uid = ? "
+                        "AND approval.coworker_id = ? ORDER BY event.event_id",
+                        (record.owner_id, owner_uid, record.coworker_id),
+                    ).fetchall()
+                )
+            else:
+                if not {"owner_id", "coworker_id"}.issubset(columns):
+                    raise CoworkerDirectoryError(
+                        f"Coworker removal table {table} lacks owner binding columns"
+                    )
+                rows = tuple(
+                    conn.execute(
+                        f"SELECT * FROM {quoted} WHERE owner_id = ? "
+                        "AND coworker_id = ? ORDER BY rowid",
+                        (record.owner_id, record.coworker_id),
+                    ).fetchall()
+                )
+            if "owner_uid" in columns:
+                for row in rows:
+                    if row["owner_uid"] != owner_uid:
+                        raise CoworkerDirectoryError(
+                            f"Coworker removal owner UID changed in {table}"
+                        )
+            primary_keys = tuple(
+                str(column["name"])
+                for column in sorted(info, key=lambda item: int(item["pk"]))
+                if int(column["pk"]) > 0
+            )
+            rows_by_table[table] = rows
+            manifest.extend(
+                _removal_row_manifest_entry(table, row, primary_keys)
+                for row in rows
+            )
+        if ignored - table_names:
+            raise CoworkerDirectoryError(
+                "Coworker removal manifest tables are incomplete"
+            )
+        return tuple(sorted(manifest)), rows_by_table
+
+    @staticmethod
+    def _require_supported_removal_triggers(conn: sqlite3.Connection) -> None:
+        expected = {
+            "coworker_removal_manifest_immutable": (
+                "coworker_removal_operations",
+                _normalized_sql(
+                    "CREATE TRIGGER coworker_removal_manifest_immutable "
+                    "BEFORE UPDATE OF coworker_id, owner_id, owner_uid, plan_sha256, "
+                    "plan_json, created_at ON coworker_removal_operations BEGIN "
+                    "SELECT RAISE(ABORT, 'coworker removal manifest is immutable'); END"
+                ),
+            ),
+            "coworker_removal_state_transition": (
+                "coworker_removal_operations",
+                _normalized_sql(
+                    "CREATE TRIGGER coworker_removal_state_transition "
+                    "BEFORE UPDATE OF state, completed_at ON coworker_removal_operations "
+                    "WHEN NOT (OLD.state = 'pending' AND NEW.state = 'completed' "
+                    "AND OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL) "
+                    "BEGIN SELECT RAISE(ABORT, "
+                    "'coworker removal state transition is invalid'); END"
+                ),
+            ),
+        }
+        actual = {
+            str(row["name"]): (
+                str(row["tbl_name"]),
+                _normalized_sql(str(row["sql"])),
+            )
+            for row in conn.execute(
+                "SELECT name, tbl_name, sql FROM sqlite_master "
+                "WHERE type = 'trigger'"
+            )
+        }
+        if actual != expected:
+            raise CoworkerDirectoryError(
+                "coworker directory has unknown triggers; refusing removal"
+            )
+
+    @staticmethod
+    def _validate_removal_journals(
+        conn: sqlite3.Connection,
+        *,
+        record: Coworker,
+        rows_by_table: dict[str, tuple[sqlite3.Row, ...]],
+        profile_session_ids: tuple[str, ...],
+    ) -> None:
+        sessions = set(profile_session_ids)
+        dispatches = rows_by_table["coworker_turn_dispatches"]
+        if any(row["status"] == "claimed" for row in dispatches):
+            raise CoworkerRuntimeUnavailable(
+                "a Coworker turn is still claimed or has an unknown outcome"
+            )
+        accepted_events = rows_by_table["coworker_accepted_events"]
+        if any(row["status"] != "completed" for row in accepted_events):
+            raise CoworkerRuntimeUnavailable(
+                "an accepted Coworker event has not reached a final outcome"
+            )
+        approvals = rows_by_table["coworker_file_approvals"]
+        if any(row["status"] in {"dispatching", "ambiguous"} for row in approvals):
+            raise CoworkerRuntimeUnavailable(
+                "a Coworker file approval has an in-flight or ambiguous outcome"
+            )
+        native_diffs = rows_by_table["coworker_native_git_diffs"]
+        if any(row["status"] in {"claimed", "unknown"} for row in native_diffs):
+            raise CoworkerRuntimeUnavailable(
+                "a native Git diagnostic has an in-flight or ambiguous outcome"
+            )
+
+        def require_profile_session(value: object, label: str) -> None:
+            if value is not None and str(value) not in sessions:
+                raise CoworkerDirectoryError(
+                    f"{label} points outside the Coworker-owned session set"
+                )
+
+        for row in dispatches:
+            require_profile_session(row["session_id"], "Coworker dispatch")
+        for row in accepted_events:
+            require_profile_session(row["session_id"], "accepted event")
+            require_profile_session(row["analysis_session_id"], "accepted event")
+        for row in approvals:
+            if row["canonical_session_id"] != record.canonical_session_id:
+                raise CoworkerDirectoryError(
+                    "Coworker approval canonical session binding changed"
+                )
+            require_profile_session(row["source_session_id"], "file approval")
+
+    @staticmethod
+    def _delete_coworker_removal_rows(
+        conn: sqlite3.Connection,
+        plan: CoworkerRemovalPlan,
+    ) -> None:
+        grouped: dict[str, list[tuple[tuple[str, ...], str]]] = {}
+        for table, key, digest in plan.row_manifest:
+            grouped.setdefault(table, []).append((key, digest))
+        for table in _COWORKER_REMOVAL_DELETE_ORDER:
+            if table not in grouped:
+                continue
+            quoted = '"' + table.replace('"', '""') + '"'
+            info = conn.execute(f"PRAGMA table_info({quoted})").fetchall()
+            primary_keys = tuple(
+                str(column["name"])
+                for column in sorted(info, key=lambda item: int(item["pk"]))
+                if int(column["pk"]) > 0
+            )
+            for key, expected_digest in grouped[table]:
+                if len(key) != len(primary_keys) or not primary_keys:
+                    raise CoworkerDirectoryError(
+                        f"Coworker removal primary key changed in {table}"
+                    )
+                where = " AND ".join(f'"{column}" = ?' for column in primary_keys)
+                row = conn.execute(
+                    f"SELECT * FROM {quoted} WHERE {where}", key
+                ).fetchone()
+                if row is None or _removal_row_manifest_entry(
+                    table, row, primary_keys
+                )[2] != expected_digest:
+                    raise CoworkerRuntimeUnavailable(
+                        f"Coworker row changed during removal in {table}"
+                    )
+                cursor = conn.execute(
+                    f"DELETE FROM {quoted} WHERE {where}", key
+                )
+                if cursor.rowcount != 1:
+                    raise CoworkerDirectoryError(
+                        f"Coworker removal affected an unexpected row count in {table}"
+                    )
 
     def _initialize(self) -> None:
         try:
@@ -3095,6 +4164,8 @@ class CoworkerDirectory:
                     12,
                     13,
                     14,
+                    15,
+                    16,
                     _COWORKER_DIRECTORY_PREVIOUS_SCHEMA_VERSION,
                     _COWORKER_DIRECTORY_SCHEMA_VERSION,
                 }:
@@ -3735,6 +4806,103 @@ class CoworkerDirectory:
                     raise CoworkerDirectoryError(
                         "coworker model budget schema is incomplete"
                     )
+                if (
+                    not fresh_directory
+                    and original_version >= 16
+                    and "coworker_inbox_acknowledgements" not in tables
+                ):
+                    raise CoworkerDirectoryError(
+                        "coworker inbox acknowledgement schema is incomplete"
+                    )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coworker_inbox_acknowledgements (
+                        owner_id TEXT NOT NULL,
+                        owner_uid INTEGER NOT NULL CHECK(owner_uid >= 0),
+                        coworker_id TEXT NOT NULL,
+                        event_id TEXT NOT NULL,
+                        acknowledged_at TEXT NOT NULL,
+                        PRIMARY KEY(owner_id, owner_uid, coworker_id, event_id),
+                        FOREIGN KEY(owner_id, coworker_id)
+                            REFERENCES coworkers(owner_id, coworker_id)
+                    )
+                    """
+                )
+                acknowledgement_columns = {
+                    str(column["name"])
+                    for column in conn.execute(
+                        "PRAGMA table_info(coworker_inbox_acknowledgements)"
+                    )
+                }
+                if acknowledgement_columns != {
+                    "owner_id", "owner_uid", "coworker_id", "event_id",
+                    "acknowledged_at",
+                }:
+                    raise CoworkerDirectoryError(
+                        "coworker inbox acknowledgement schema is incomplete"
+                    )
+                if (
+                    not fresh_directory
+                    and original_version >= 17
+                    and "coworker_removal_operations" not in tables
+                ):
+                    raise CoworkerDirectoryError(
+                        "coworker removal operation schema is incomplete"
+                    )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS coworker_removal_operations (
+                        coworker_id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
+                        owner_uid INTEGER NOT NULL CHECK(owner_uid >= 0),
+                        plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64),
+                        plan_json TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN ('pending', 'completed')),
+                        created_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        CHECK(
+                            (state = 'pending' AND completed_at IS NULL)
+                            OR (state = 'completed' AND completed_at IS NOT NULL)
+                        )
+                    )
+                    """
+                )
+                removal_columns = {
+                    str(column["name"])
+                    for column in conn.execute(
+                        "PRAGMA table_info(coworker_removal_operations)"
+                    )
+                }
+                if removal_columns != {
+                    "coworker_id", "owner_id", "owner_uid", "plan_sha256",
+                    "plan_json", "state", "created_at", "completed_at",
+                }:
+                    raise CoworkerDirectoryError(
+                        "coworker removal operation schema is incomplete"
+                    )
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS coworker_removal_manifest_immutable
+                    BEFORE UPDATE OF coworker_id, owner_id, owner_uid, plan_sha256,
+                        plan_json, created_at ON coworker_removal_operations
+                    BEGIN
+                        SELECT RAISE(ABORT, 'coworker removal manifest is immutable');
+                    END
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS coworker_removal_state_transition
+                    BEFORE UPDATE OF state, completed_at ON coworker_removal_operations
+                    WHEN NOT (
+                        OLD.state = 'pending' AND NEW.state = 'completed'
+                        AND OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL
+                    )
+                    BEGIN
+                        SELECT RAISE(ABORT, 'coworker removal state transition is invalid');
+                    END
+                    """
+                )
                 conn.execute(
                     "UPDATE coworker_directory_meta SET schema_version = ?",
                     (_COWORKER_DIRECTORY_SCHEMA_VERSION,),
@@ -3915,6 +5083,7 @@ class CoworkerDirectory:
         limit: int = 20,
         include_skipped: bool = False,
         coworker_id: str | None = None,
+        unacknowledged_only: bool = False,
     ) -> tuple[CoworkerInboxEntry, ...]:
         """Derive a bounded owner inbox from durable run and approval records."""
 
@@ -3922,6 +5091,8 @@ class CoworkerDirectory:
             raise ValueError("inbox limit must be between 1 and 100")
         if type(include_skipped) is not bool:
             raise ValueError("include_skipped must be a boolean")
+        if type(unacknowledged_only) is not bool:
+            raise ValueError("unacknowledged_only must be a boolean")
         owner = _normalize_owner_id(owner_id)
         selected_id = (
             _normalize_coworker_id(coworker_id) if coworker_id is not None else None
@@ -3958,6 +5129,16 @@ class CoworkerDirectory:
                 return ()
 
             skipped_clause = "" if include_skipped else "AND dispatch.status != 'skipped'"
+            unacknowledged_run_clause = (
+                "AND NOT EXISTS (SELECT 1 FROM coworker_inbox_acknowledgements AS ack "
+                "WHERE ack.owner_id = dispatch.owner_id "
+                "AND ack.owner_uid = coworker.owner_uid "
+                "AND ack.coworker_id = dispatch.coworker_id "
+                "AND ack.event_id = 'run:' || dispatch.coworker_id || ':' || "
+                "dispatch.run_id || ':' || dispatch.status)"
+                if unacknowledged_only
+                else ""
+            )
             run_rows = conn.execute(
                 "SELECT dispatch.*, coworker.display_name, "
                 "coworker.lifecycle_status "
@@ -3966,7 +5147,7 @@ class CoworkerDirectory:
                 "AND coworker.coworker_id = dispatch.coworker_id "
                 "WHERE dispatch.owner_id = ? AND coworker.owner_uid = ? "
                 "AND coworker.state = 'ready' "
-                f"{joined_clause} {skipped_clause} "
+                f"{joined_clause} {skipped_clause} {unacknowledged_run_clause} "
                 "ORDER BY julianday(CASE WHEN dispatch.status = 'completed' "
                 "AND dispatch.completed_at IS NOT NULL THEN dispatch.completed_at "
                 "ELSE dispatch.created_at END) DESC, coworker.coworker_id, "
@@ -4057,6 +5238,17 @@ class CoworkerDirectory:
                     )
                 )
 
+            unacknowledged_approval_clause = (
+                "AND NOT EXISTS (SELECT 1 FROM "
+                "coworker_inbox_acknowledgements AS ack "
+                "WHERE ack.owner_id = approval.owner_id "
+                "AND ack.owner_uid = coworker.owner_uid "
+                "AND ack.coworker_id = approval.coworker_id "
+                "AND ack.event_id = 'approval:' || approval.coworker_id || ':' || "
+                "approval.approval_id || ':' || latest_event.event_id)"
+                if unacknowledged_only
+                else ""
+            )
             approval_rows = conn.execute(
                 "SELECT approval.approval_id, approval.owner_id, "
                 "approval.owner_uid, approval.coworker_id, approval.profile_name, "
@@ -4088,6 +5280,7 @@ class CoworkerDirectory:
                 "WHERE event.approval_id = approval.approval_id) "
                 "WHERE approval.owner_id = ? AND coworker.owner_uid = ? "
                 "AND coworker.state = 'ready' "
+                f"{unacknowledged_approval_clause} "
                 f"{joined_clause} "
                 "ORDER BY julianday(latest_event.occurred_at) DESC, "
                 "latest_event.event_id DESC, approval.approval_id LIMIT ?",
@@ -4112,6 +5305,8 @@ class CoworkerDirectory:
                     or row["source_run_execution_kind"] != "model"
                     or row["source_session_id"] != row["source_run_session_id"]
                     or row["source_request_id"] != row["source_run_request_id"]
+                    or type(row["latest_event_id"]) is not int
+                    or row["latest_event_id"] < 1
                 ):
                     raise CoworkerDirectoryError(
                         "inbox approval binding changed"
@@ -4220,14 +5415,101 @@ class CoworkerDirectory:
                         action=_parse_file_approval_action(row["action"]),
                         target_path=target_path,
                         expires_at=expires_at,
+                        latest_event_id=int(row["latest_event_id"]),
                         responsibility_id=responsibility_id,
                         event_key=event_key,
                     )
                 )
+            if entries:
+                coworker_ids = sorted({entry.coworker_id for entry in entries})
+                placeholders = ",".join("?" for _ in coworker_ids)
+                acknowledgement_rows = conn.execute(
+                    "SELECT coworker_id, event_id, acknowledged_at "
+                    "FROM coworker_inbox_acknowledgements "
+                    f"WHERE owner_id = ? AND owner_uid = ? "
+                    f"AND coworker_id IN ({placeholders})",
+                    (owner, owner_uid, *coworker_ids),
+                ).fetchall()
+                acknowledged_at = {
+                    (str(row["coworker_id"]), str(row["event_id"])):
+                    datetime.fromisoformat(str(row["acknowledged_at"]))
+                    for row in acknowledgement_rows
+                }
+                entries = [
+                    replace(
+                        entry,
+                        acknowledged_at=acknowledged_at.get(
+                            (entry.coworker_id, entry.event_id)
+                        ),
+                    )
+                    for entry in entries
+                ]
             conn.commit()
 
         entries.sort(key=lambda entry: (entry.occurred_at, entry.entry_id), reverse=True)
         return tuple(entries[:limit])
+
+    def acknowledge_inbox_event(
+        self, *, owner_id: str, event_id: str
+    ) -> datetime:
+        """Durably acknowledge exactly one currently visible inbox revision."""
+
+        owner = _normalize_owner_id(owner_id)
+        event = CoworkerInboxEventId.parse(event_id)
+        owner_uid = _current_owner_uid()
+        if owner_uid is None:
+            raise CoworkerRuntimeUnavailable(
+                "local coworker owner identity could not be verified"
+            )
+        try:
+            with closing(self._connect_durable()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM coworkers WHERE owner_id = ? "
+                    "AND coworker_id = ? AND owner_uid = ?",
+                    (owner, event.coworker_id, owner_uid),
+                ).fetchone()
+                if row is None:
+                    raise CoworkerNotFound("coworker not found")
+                current = _record_from_row(row)
+                self._require_coworker_owner_binding(
+                    CoworkerHandle(self, current), conn
+                )
+                existing = conn.execute(
+                    "SELECT acknowledged_at FROM coworker_inbox_acknowledgements "
+                    "WHERE owner_id = ? AND owner_uid = ? AND coworker_id = ? "
+                    "AND event_id = ?",
+                    (owner, owner_uid, event.coworker_id, str(event)),
+                ).fetchone()
+                if existing is not None:
+                    acknowledged = datetime.fromisoformat(
+                        str(existing["acknowledged_at"])
+                    )
+                    conn.commit()
+                    return acknowledged
+                visible = self.list_inbox(
+                    owner_id=owner,
+                    limit=100,
+                    include_skipped=True,
+                    coworker_id=event.coworker_id,
+                )
+                if not any(entry.event_id == str(event) for entry in visible):
+                    raise CoworkerRuntimeUnavailable(
+                        "inbox event is stale or outside the current owner view"
+                    )
+                now = _now()
+                conn.execute(
+                    "INSERT INTO coworker_inbox_acknowledgements "
+                    "(owner_id, owner_uid, coworker_id, event_id, acknowledged_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (owner, owner_uid, event.coworker_id, str(event), now),
+                )
+                conn.commit()
+                return datetime.fromisoformat(now)
+        except sqlite3.DatabaseError as exc:
+            raise CoworkerDirectoryError(
+                "inbox event acknowledgement could not be durably recorded"
+            ) from exc
 
     def _validate_handle_binding(
         self,
@@ -4269,6 +5551,23 @@ class CoworkerDirectory:
         if local_uid is None or current.owner_uid is None or current.owner_uid != local_uid:
             raise CoworkerRuntimeUnavailable(
                 "local coworker owner identity could not be verified"
+            )
+        operation = conn.execute(
+            "SELECT owner_id, owner_uid, state FROM coworker_removal_operations "
+            "WHERE coworker_id = ?",
+            (current.coworker_id,),
+        ).fetchone()
+        if operation is not None:
+            if (
+                operation["owner_id"] != current.owner_id
+                or operation["owner_uid"] != current.owner_uid
+                or operation["state"] != "pending"
+            ):
+                raise CoworkerDirectoryError(
+                    "coworker removal operation conflicts with its owner binding"
+                )
+            raise CoworkerRuntimeUnavailable(
+                "coworker removal is pending; a fresh owner confirmation is required"
             )
         return current
 
@@ -5602,6 +6901,7 @@ class CoworkerDirectory:
     def _verify_native_git_diff_completion(
         self, current: Coworker, row: sqlite3.Row,
         receipt: CoworkerNativeGitDiff,
+        *, store: SessionStore | None = None,
     ) -> None:
         if receipt.status != "completed":
             return
@@ -5617,7 +6917,7 @@ class CoworkerDirectory:
             )
             if not tool_database.is_file():
                 raise ValueError("native tool session journal is missing")
-            store = SessionStore(tool_database)
+            store = store or SessionStore.open_existing(tool_database)
             if receipt.tool_session_id is None:
                 raise ValueError("missing mediated tool session")
             store.require_session_project(receipt.tool_session_id, current.workspace)

@@ -1366,7 +1366,7 @@ def test_v4_coworker_directory_migration_preserves_manual_rows_and_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         assert connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall() == []
@@ -1513,7 +1513,7 @@ def test_v5_coworker_directory_migration_adds_cursor_and_preserves_dispatches(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -2461,7 +2461,7 @@ def test_coworker_directory_migration_does_not_infer_owner_authority(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         assert connection.execute(
             "SELECT owner_uid FROM coworkers WHERE coworker_id = ?",
             (coworker_id,),
@@ -2544,7 +2544,7 @@ def test_coworker_directory_v3_migration_preserves_dispatch_history(
     with sqlite3.connect(ash_dir / "coworkers.sqlite3") as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         columns = {
             str(row[1])
             for row in connection.execute(
@@ -3591,7 +3591,7 @@ def test_v2_coworker_directory_migration_adds_file_approval_boundary(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         assert connection.execute(
             "SELECT COUNT(*) FROM coworker_file_approvals"
         ).fetchone() == (0,)
@@ -3640,7 +3640,7 @@ def test_v6_coworker_directory_migration_keeps_legacy_dispatch_unbound(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
 
 
 def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
@@ -3757,7 +3757,7 @@ def test_v7_coworker_directory_migration_preserves_legacy_run_provenance(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(coworker_turn_dispatches)")
@@ -3813,7 +3813,7 @@ def test_v8_coworker_directory_migration_grants_no_ambient_evidence(
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         assert connection.execute(
             "SELECT evidence_paths_json FROM coworker_responsibilities "
             "WHERE responsibility_id = ?",
@@ -3910,7 +3910,7 @@ def test_v9_lifecycle_migration_preserves_responsibility_schedule_and_claims(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
@@ -4072,7 +4072,7 @@ def test_v11_change_only_skip_migration_preserves_previous_dispatch_and_constrai
     with sqlite3.connect(directory.db_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' "
             "AND name = 'coworker_turn_dispatches'"
@@ -4109,7 +4109,7 @@ def test_v12_durable_event_migration_preserves_crew_state_and_rejects_v13_missin
     with sqlite3.connect(directory.db_path) as conn:
         assert conn.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         assert conn.execute("SELECT COUNT(*) FROM coworker_accepted_events"
                            ).fetchone() == (0,)
         conn.execute("DROP TABLE coworker_accepted_events")
@@ -4138,7 +4138,7 @@ def test_v13_native_git_tool_journal_migration_preserves_existing_coworker(
     with sqlite3.connect(directory.db_path) as conn:
         assert conn.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         assert conn.execute(
             "SELECT COUNT(*) FROM coworker_native_git_diffs"
         ).fetchone() == (0,)
@@ -4172,7 +4172,775 @@ def test_coworker_model_budget_schema_migrates_v14_and_fails_closed_on_v15_damag
     with sqlite3.connect(directory.db_path) as conn:
         assert conn.execute(
             "SELECT schema_version FROM coworker_directory_meta"
-        ).fetchone() == (15,)
+        ).fetchone() == (17,)
         conn.execute("DROP TABLE coworker_model_budgets")
     with pytest.raises(CoworkerDirectoryError, match="model budget schema"):
         CoworkerDirectory.open(ash_dir)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_inbox_acknowledgement_is_durable_exact_and_concurrent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import sqlite3
+    from concurrent.futures import ThreadPoolExecutor
+
+    from ash.coworkers import CoworkerDirectory, CoworkerNotFound
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    responsibilities = [
+        handle.create_responsibility(
+            scope=f"Review {number}",
+            objective=f"Inspect release {number}.",
+        )
+        for number in (1, 2)
+    ]
+    _install_fake_offline_worker(monkeypatch, identity)
+    for number, responsibility in enumerate(responsibilities, start=1):
+        asyncio.run(
+            handle.run_responsibility(
+                responsibility.responsibility_id,
+                event_key=f"ack-event-{number}",
+            )
+        )
+
+    initial = directory.list_inbox(
+        owner_id=identity.owner_id,
+        limit=10,
+    )
+    assert len(initial) == 2
+    assert all(entry.status == "completed" for entry in initial)
+    assert all(
+        entry.event_id
+        == f"run:{identity.coworker_id}:{entry.run_id}:completed"
+        for entry in initial
+    )
+    assert all(
+        entry.entry_id == f"run:{identity.coworker_id}:{entry.run_id}"
+        for entry in initial
+    )
+
+    first_item, remaining_item = initial
+    directory.acknowledge_inbox_event(
+        owner_id=identity.owner_id,
+        event_id=first_item.event_id,
+    )
+    filtered = directory.list_inbox(
+        owner_id=identity.owner_id,
+        limit=1,
+        unacknowledged_only=True,
+    )
+    assert [entry.event_id for entry in filtered] == [remaining_item.event_id]
+
+    reopened = CoworkerDirectory.open(ash_dir)
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        acknowledgements = list(
+            workers.map(
+                lambda _index: reopened.acknowledge_inbox_event(
+                    owner_id=identity.owner_id,
+                    event_id=remaining_item.event_id,
+                ),
+                range(8),
+            )
+        )
+    assert len(set(acknowledgements)) == 1
+    persisted = CoworkerDirectory.open(ash_dir).list_inbox(
+        owner_id=identity.owner_id,
+        limit=10,
+    )
+    assert {entry.event_id for entry in persisted} == {
+        first_item.event_id,
+        remaining_item.event_id,
+    }
+    assert all(entry.acknowledged_at is not None for entry in persisted)
+    assert CoworkerDirectory.open(ash_dir).list_inbox(
+        owner_id=identity.owner_id,
+        unacknowledged_only=True,
+    ) == ()
+    assert all(
+        run.status == "completed"
+        for responsibility in responsibilities
+        for run in handle.list_responsibility_runs(responsibility.responsibility_id)
+    )
+    with pytest.raises(CoworkerNotFound):
+        reopened.acknowledge_inbox_event(
+            owner_id="another-owner",
+            event_id=remaining_item.event_id,
+        )
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coworker_inbox_acknowledgements "
+            "WHERE owner_id = 'another-owner'"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_coworker_v15_inbox_migration_preserves_existing_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, _handle = _ready_coworker(ash_dir, workspace)
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute("DROP TRIGGER coworker_removal_manifest_immutable")
+        connection.execute("DROP TRIGGER coworker_removal_state_transition")
+        connection.execute("DROP TABLE coworker_inbox_acknowledgements")
+        connection.execute("DROP TABLE coworker_removal_operations")
+        connection.execute(
+            "UPDATE coworker_directory_meta SET schema_version = 15"
+        )
+
+    migrated = CoworkerDirectory.open(ash_dir)
+    assert migrated.list_for_local_owner(owner_id=identity.owner_id)[0] == identity
+    with sqlite3.connect(directory.db_path) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM coworker_directory_meta"
+        ).fetchone() == (17,)
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coworker_inbox_acknowledgements"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_profile_session_removal_accepts_exact_canonical_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.core.session import SessionStore
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, _handle = _ready_coworker(ash_dir, workspace)
+    store = SessionStore.open_existing(
+        directory._profile_database_directory(identity) / "sessions.db"
+    )
+
+    inventory = store.coworker_session_removal_inventory(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+        canonical_session_id=identity.canonical_session_id,
+        project_path=workspace,
+    )
+
+    assert inventory.session_ids == (identity.canonical_session_id,)
+    assert inventory.unrelated_session_count == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_profile_session_removal_deletes_owned_audit_and_retains_other_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import closing
+
+    from ash.core.session import SessionStore
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, _handle = _ready_coworker(ash_dir, workspace)
+    store = SessionStore.open_existing(
+        directory._profile_database_directory(identity) / "sessions.db"
+    )
+    unrelated = store.create_session(str(workspace))
+    with closing(store.open_connection()) as conn, conn:
+        conn.executemany(
+            "INSERT INTO audit_logs "
+            "(session_id, action_type, target_resource, details_json, result) "
+            "VALUES (?, 'command_run', 'test', '{}', 'SUCCESS')",
+            ((identity.canonical_session_id,), (unrelated.session_id,)),
+        )
+
+    inventory = store.coworker_session_removal_inventory(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+        canonical_session_id=identity.canonical_session_id,
+        project_path=workspace,
+    )
+    assert inventory.unrelated_session_count == 1
+    durable_modes: list[int] = []
+    original_durable_connection = store._connect_durable
+
+    def inspect_removal_connection():
+        connection = original_durable_connection()
+        durable_modes.append(int(connection.execute("PRAGMA synchronous").fetchone()[0]))
+        return connection
+
+    monkeypatch.setattr(store, "_connect_durable", inspect_removal_connection)
+    assert store.remove_coworker_sessions(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+        canonical_session_id=identity.canonical_session_id,
+        project_path=workspace,
+        session_ids=inventory.session_ids,
+        expected_database_identity=store.database_identity,
+    )
+    assert durable_modes == [2]  # FULL: session removal must survive power loss.
+    assert not store.validate_coworker_session_removal_set(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+        canonical_session_id=identity.canonical_session_id,
+        project_path=workspace,
+        session_ids=inventory.session_ids,
+    )
+    with closing(store.open_connection()) as conn:
+        assert conn.execute(
+            "SELECT session_id FROM sessions"
+        ).fetchall()[0][0] == unrelated.session_id
+        assert conn.execute(
+            "SELECT session_id FROM audit_logs"
+        ).fetchall()[0][0] == unrelated.session_id
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_native_tool_session_removal_has_durable_commit_and_preserves_other_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import closing
+
+    from ash.core.session import SessionStore
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, _handle = _ready_coworker(ash_dir, workspace)
+    store = SessionStore(
+        directory._profile_database_directory(identity)
+        / "crew_native_tool_sessions.db"
+    )
+    owned = store.create_session(str(workspace))
+    unrelated = store.create_session(str(workspace))
+    inventory = store.native_tool_session_removal_inventory(
+        project_path=workspace, session_ids=(owned.session_id,),
+    )
+    assert inventory.unrelated_session_count == 1
+
+    observed_modes: list[int] = []
+    original = store._connect_durable
+
+    def inspect_removal_connection():
+        connection = original()
+        observed_modes.append(int(connection.execute("PRAGMA synchronous").fetchone()[0]))
+        return connection
+
+    monkeypatch.setattr(store, "_connect_durable", inspect_removal_connection)
+    assert store.remove_native_tool_sessions(
+        project_path=workspace,
+        session_ids=(owned.session_id,),
+        expected_database_identity=store.database_identity,
+    )
+    assert observed_modes == [2]
+    with closing(store.open_connection()) as connection:
+        assert [row[0] for row in connection.execute("SELECT session_id FROM sessions")] == [
+            unrelated.session_id
+        ]
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_profile_session_removal_refuses_mixed_target_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import closing
+    from uuid import uuid4
+
+    from ash.core.session import SessionStorageError, SessionStore
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, _handle = _ready_coworker(ash_dir, workspace)
+    store = SessionStore.open_existing(
+        directory._profile_database_directory(identity) / "sessions.db"
+    )
+    background = store.ensure_coworker_run(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+        run_id=str(uuid4()),
+        canonical_session_id=identity.canonical_session_id,
+        project_path=workspace,
+    )
+    with closing(store.open_connection()) as conn, conn:
+        conn.execute(
+            "DELETE FROM sessions WHERE session_id = ?", (background.session_id,)
+        )
+
+    with pytest.raises(SessionStorageError, match="mixed or incomplete"):
+        store.validate_coworker_session_removal_set(
+            owner_id=identity.owner_id,
+            coworker_id=identity.coworker_id,
+            canonical_session_id=identity.canonical_session_id,
+            project_path=workspace,
+            session_ids=(identity.canonical_session_id, background.session_id),
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_profile_session_removal_refuses_busy_runtime_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.core.session import SessionStorageError, SessionStore
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, _handle = _ready_coworker(ash_dir, workspace)
+    store = SessionStore.open_existing(
+        directory._profile_database_directory(identity) / "sessions.db"
+    )
+    inventory = store.coworker_session_removal_inventory(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+        canonical_session_id=identity.canonical_session_id,
+        project_path=workspace,
+    )
+    lease = store.acquire_session_runtime_lease(identity.canonical_session_id)
+    try:
+        with pytest.raises(SessionStorageError, match="runtime lease is busy"):
+            store.remove_coworker_sessions(
+                owner_id=identity.owner_id,
+                coworker_id=identity.coworker_id,
+                canonical_session_id=identity.canonical_session_id,
+                project_path=workspace,
+                session_ids=inventory.session_ids,
+                expected_database_identity=store.database_identity,
+            )
+    finally:
+        lease.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_profile_session_removal_refuses_unfinished_and_ambiguous_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import closing
+
+    from ash.core.session import SessionStorageError, SessionStore
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, _handle = _ready_coworker(ash_dir, workspace)
+    store = SessionStore.open_existing(
+        directory._profile_database_directory(identity) / "sessions.db"
+    )
+    session_id = identity.canonical_session_id
+    with closing(store.open_connection()) as conn, conn:
+        conn.execute(
+            "INSERT INTO turn_journal "
+            "(turn_id,session_id,status,user_input,started_at) "
+            "VALUES ('unfinished-turn',?,'started','synthetic','2026-11-01T00:00:00Z')",
+            (session_id,),
+        )
+
+    with pytest.raises(SessionStorageError, match="unfinished turn"):
+        store.coworker_session_removal_inventory(
+            owner_id=identity.owner_id,
+            coworker_id=identity.coworker_id,
+            canonical_session_id=session_id,
+            project_path=workspace,
+        )
+
+    with closing(store.open_connection()) as conn, conn:
+        conn.execute("DELETE FROM turn_journal WHERE turn_id='unfinished-turn'")
+        conn.execute(
+            "INSERT INTO tool_calls "
+            "(call_id,session_id,tool_name,arguments_json,approved,dispatched,executed) "
+            "VALUES ('ambiguous-call',?,'synthetic','{}',1,1,0)",
+            (session_id,),
+        )
+
+    with pytest.raises(SessionStorageError, match="unknown outcome"):
+        store.coworker_session_removal_inventory(
+            owner_id=identity.owner_id,
+            coworker_id=identity.coworker_id,
+            canonical_session_id=session_id,
+            project_path=workspace,
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_profile_session_removal_refuses_unknown_delete_trigger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from ash.core.session import SessionStorageError, SessionStore
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, _handle = _ready_coworker(ash_dir, workspace)
+    store = SessionStore.open_existing(
+        directory._profile_database_directory(identity) / "sessions.db"
+    )
+    unrelated = store.create_session(str(workspace))
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "CREATE TRIGGER coworker_removal_test_widen_delete "
+            "AFTER DELETE ON sessions BEGIN DELETE FROM sessions; END"
+        )
+
+    with pytest.raises(SessionStorageError, match="unknown triggers"):
+        store.coworker_session_removal_inventory(
+            owner_id=identity.owner_id,
+            coworker_id=identity.coworker_id,
+            canonical_session_id=identity.canonical_session_id,
+            project_path=workspace,
+        )
+    assert store.count_sessions_for_removal() == 2
+    assert store.load_session(unrelated.session_id).session_id == unrelated.session_id
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_archived_coworker_removal_is_owner_bound_and_preserves_shared_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from ash.core.session import SessionStore
+    from ash.coworkers import CoworkerDirectory, CoworkerNotFound
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker = workspace / "keep.txt"
+    marker.write_text("workspace stays", encoding="utf-8")
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    profile_dir = directory._profile_database_directory(identity)
+    profile_setting = profile_dir.parent / "ash.toml"
+    profile_setting.write_text("synthetic = true\n", encoding="utf-8")
+    profile_store = SessionStore.open_existing(profile_dir / "sessions.db")
+    unrelated_session = profile_store.create_session(str(workspace))
+
+    other_workspace = tmp_path / "other-workspace"
+    other_workspace.mkdir()
+    other_profile = ash_dir / "profiles" / "other"
+    other_profile.mkdir(parents=True)
+    other = directory.create(
+        owner_id=identity.owner_id,
+        display_name="Other",
+        profile_name="other",
+        workspace=other_workspace,
+    )
+    other_handle = directory.open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=other.coworker_id,
+    )
+    handle.archive()
+
+    with pytest.raises(CoworkerNotFound):
+        directory.preview_archived_removal(
+            owner_id="different-owner",
+            coworker_id=identity.coworker_id,
+        )
+    assert identity.owner_uid is not None
+    monkeypatch.setattr(
+        "ash.coworkers._current_owner_uid", lambda: identity.owner_uid + 1,
+    )
+    with pytest.raises(CoworkerNotFound):
+        directory.preview_archived_removal(
+            owner_id=identity.owner_id,
+            coworker_id=identity.coworker_id,
+        )
+    monkeypatch.setattr(
+        "ash.coworkers._current_owner_uid", lambda: identity.owner_uid,
+    )
+
+    preview = directory.preview_archived_removal(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert preview.operation_state == "new"
+    assert preview.profile_sessions_present
+    assert preview.plan.profile_session_ids == (identity.canonical_session_id,)
+    assert preview.plan.retained_profile_session_count == 1
+
+    removed = directory.remove_archived_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+        expected_plan_sha256=preview.plan.sha256,
+    )
+    assert removed == preview.plan
+    assert directory.list_for_local_owner(owner_id=identity.owner_id) == (other,)
+    assert other_handle.require_owner_binding() == other
+    assert marker.read_text(encoding="utf-8") == "workspace stays"
+    assert profile_setting.read_text(encoding="utf-8") == "synthetic = true\n"
+    assert profile_store.count_sessions_for_removal() == 1
+    with sqlite3.connect(profile_store.db_path) as conn:
+        assert conn.execute("SELECT session_id FROM sessions").fetchone() == (
+            unrelated_session.session_id,
+        )
+    with sqlite3.connect(directory.db_path) as conn:
+        state, = conn.execute(
+            "SELECT state FROM coworker_removal_operations WHERE coworker_id=?",
+            (identity.coworker_id,),
+        ).fetchone()
+        assert state == "completed"
+
+    completed = CoworkerDirectory.open(ash_dir).preview_archived_removal(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert completed.operation_state == "completed"
+    assert CoworkerDirectory.open(ash_dir).remove_archived_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+        expected_plan_sha256=preview.plan.sha256,
+    ) == preview.plan
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_archived_coworker_removal_resumes_after_session_store_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    handle.archive()
+    preview = directory.preview_archived_removal(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+
+    def interrupt_final_directory_commit(
+        _conn: object,
+        _plan: object,
+    ) -> None:
+        raise RuntimeError("synthetic interruption after profile session removal")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            directory,
+            "_delete_coworker_removal_rows",
+            interrupt_final_directory_commit,
+        )
+        with pytest.raises(RuntimeError, match="synthetic interruption"):
+            directory.remove_archived_coworker(
+                owner_id=identity.owner_id,
+                coworker_id=identity.coworker_id,
+                expected_plan_sha256=preview.plan.sha256,
+            )
+
+    reopened = CoworkerDirectory.open(ash_dir)
+    pending = reopened.preview_archived_removal(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    assert pending.operation_state == "pending"
+    assert not pending.profile_sessions_present
+    assert reopened.remove_archived_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+        expected_plan_sha256=preview.plan.sha256,
+    ) == preview.plan
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+@pytest.mark.parametrize("unrelated_change", ["create", "delete"])
+def test_pending_coworker_removal_preserves_unrelated_session_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unrelated_change: str,
+) -> None:
+    from contextlib import closing
+
+    from ash.core.session import SessionStore
+    from ash.coworkers import CoworkerDirectory
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    profile_directory = directory._profile_database_directory(identity)
+    profile = SessionStore.open_existing(profile_directory / "sessions.db")
+    native = SessionStore(profile_directory / "crew_native_tool_sessions.db")
+    profile_unrelated = profile.create_session(str(workspace))
+    native_unrelated = native.create_session(str(workspace))
+    handle.archive()
+    first = directory.preview_archived_removal(
+        owner_id=identity.owner_id, coworker_id=identity.coworker_id,
+    )
+    assert first.plan.retained_profile_session_count == 1
+    assert first.plan.retained_native_session_count == 1
+
+    def interrupted_directory_commit(_conn: object, _plan: object) -> None:
+        raise RuntimeError("simulated process crash after profile deletion")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(directory, "_delete_coworker_removal_rows", interrupted_directory_commit)
+        with pytest.raises(RuntimeError, match="simulated process crash"):
+            directory.remove_archived_coworker(
+                owner_id=identity.owner_id,
+                coworker_id=identity.coworker_id,
+                expected_plan_sha256=first.plan.sha256,
+            )
+
+    if unrelated_change == "create":
+        profile.create_session(str(workspace))
+        native.create_session(str(workspace))
+        expected_count = 2
+    else:
+        for store, session_id in (
+            (profile, profile_unrelated.session_id),
+            (native, native_unrelated.session_id),
+        ):
+            with closing(store.open_connection()) as connection, connection:
+                connection.execute(
+                    "DELETE FROM sessions WHERE session_id = ?", (session_id,)
+                )
+        expected_count = 0
+
+    reopened = CoworkerDirectory.open(ash_dir)
+    pending = reopened.preview_archived_removal(
+        owner_id=identity.owner_id, coworker_id=identity.coworker_id,
+    )
+    assert pending.operation_state == "pending"
+    assert pending.plan == first.plan
+    assert pending.current_retained_profile_session_count == expected_count
+    assert pending.current_retained_native_session_count == expected_count
+    assert reopened.remove_archived_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+        expected_plan_sha256=first.plan.sha256,
+    ) == first.plan
+    assert profile.count_sessions_for_removal() == expected_count
+    assert native.count_sessions_for_removal() == expected_count
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_archived_coworker_removal_refuses_concurrent_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from ash.coworkers import CoworkerDirectory, CoworkerRuntimeUnavailable
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    handle.archive()
+    preview = directory.preview_archived_removal(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    entered_commit = Event()
+    release_commit = Event()
+    original_commit = CoworkerDirectory._commit_archived_removal
+
+    def block_first_commit(
+        self: CoworkerDirectory,
+        *,
+        owner: str,
+        coworker_id: str,
+        expected_plan_sha256: str,
+    ) -> object:
+        entered_commit.set()
+        if not release_commit.wait(timeout=5):
+            raise AssertionError("timed out holding the first removal confirmation")
+        return original_commit(
+            self,
+            owner=owner,
+            coworker_id=coworker_id,
+            expected_plan_sha256=expected_plan_sha256,
+        )
+
+    monkeypatch.setattr(
+        CoworkerDirectory, "_commit_archived_removal", block_first_commit
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            directory.remove_archived_coworker,
+            owner_id=identity.owner_id,
+            coworker_id=identity.coworker_id,
+            expected_plan_sha256=preview.plan.sha256,
+        )
+        assert entered_commit.wait(timeout=5)
+        try:
+            with pytest.raises(
+                CoworkerRuntimeUnavailable,
+                match="active workspace file effect",
+            ):
+                CoworkerDirectory.open(ash_dir).remove_archived_coworker(
+                    owner_id=identity.owner_id,
+                    coworker_id=identity.coworker_id,
+                    expected_plan_sha256=preview.plan.sha256,
+                )
+        finally:
+            release_commit.set()
+        assert first.result(timeout=10) == preview.plan
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_archived_coworker_removal_refuses_unknown_coworker_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from ash.coworkers import CoworkerDirectoryError
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    handle.archive()
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "CREATE TABLE coworker_future_rows "
+            "(row_id TEXT PRIMARY KEY, coworker_id TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO coworker_future_rows VALUES ('future-row', ?)",
+            (identity.coworker_id,),
+        )
+
+    with pytest.raises(CoworkerDirectoryError, match="unknown table"):
+        directory.preview_archived_removal(
+            owner_id=identity.owner_id,
+            coworker_id=identity.coworker_id,
+        )
+    assert directory.open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    ).require_owner_binding().lifecycle_status == "archived"
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_archived_coworker_removal_refuses_unknown_delete_trigger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from ash.coworkers import CoworkerDirectoryError
+
+    ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(ash_dir, workspace)
+    handle.archive()
+    with sqlite3.connect(directory.db_path) as conn:
+        conn.execute(
+            "CREATE TRIGGER coworker_removal_test_widen_delete "
+            "AFTER DELETE ON coworkers BEGIN DELETE FROM coworkers; END"
+        )
+
+    with pytest.raises(CoworkerDirectoryError, match="unknown triggers"):
+        directory.preview_archived_removal(
+            owner_id=identity.owner_id,
+            coworker_id=identity.coworker_id,
+        )
+    assert directory.open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    ).require_owner_binding().lifecycle_status == "archived"
