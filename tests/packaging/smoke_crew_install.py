@@ -62,7 +62,9 @@ def main() -> None:
     thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="ash-crew-wheel-") as temporary:
-            root = Path(temporary)
+            # macOS /var is a symlink to /private/var. Ash correctly rejects
+            # symlinked state roots, so use the canonical fixture path.
+            root = Path(temporary).resolve(strict=True)
             home = root / "home"
             home.mkdir(mode=0o700)
             ash_dir = home / ".ash"
