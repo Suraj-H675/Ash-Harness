@@ -4182,11 +4182,14 @@ def test_coworker_model_budget_schema_migrates_v14_and_fails_closed_on_v15_damag
 def test_inbox_acknowledgement_is_durable_exact_and_concurrent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import asyncio
     import sqlite3
     from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timezone
+    from uuid import uuid4
 
-    from ash.coworkers import CoworkerDirectory, CoworkerNotFound
+    from ash.coworkers import (
+        CoworkerDirectory, CoworkerNotFound, _manual_responsibility_run_id,
+    )
 
     ash_dir = _isolated_ash_home(tmp_path, monkeypatch)
     workspace = tmp_path / "workspace"
@@ -4199,14 +4202,30 @@ def test_inbox_acknowledgement_is_durable_exact_and_concurrent(
         )
         for number in (1, 2)
     ]
-    _install_fake_offline_worker(monkeypatch, identity)
+    # This test exercises inbox revisions, persistence, and concurrent acknowledgements,
+    # not the Linux-only supervised worker. Seed two structurally valid local run
+    # journal entries; separate tests cover real worker dispatch and completion.
     for number, responsibility in enumerate(responsibilities, start=1):
-        asyncio.run(
-            handle.run_responsibility(
-                responsibility.responsibility_id,
-                event_key=f"ack-event-{number}",
-            )
+        event_key = f"ack-event-{number}"
+        run_id = _manual_responsibility_run_id(
+            responsibility.responsibility_id, event_key,
         )
+        background = handle.begin_background_run(run_id)
+        recorded_at = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(directory.db_path) as connection:
+            connection.execute(
+                "INSERT INTO coworker_turn_dispatches "
+                "(owner_id, coworker_id, run_id, session_id, request_id, "
+                "status, execution_kind, responsibility_id, trigger_type, "
+                "event_key, created_at, completed_at) "
+                "VALUES (?, ?, ?, ?, ?, 'completed', 'offline', ?, 'manual', ?, ?, ?)",
+                (
+                    identity.owner_id, identity.coworker_id, run_id,
+                    background.session_id, str(uuid4()),
+                    responsibility.responsibility_id, event_key,
+                    recorded_at, recorded_at,
+                ),
+            )
 
     initial = directory.list_inbox(
         owner_id=identity.owner_id,
