@@ -161,6 +161,7 @@ jobs:
           uv venv "$RUNNER_TEMP/ash-smoke" --python 3.14
           uv pip install --python "$RUNNER_TEMP/ash-smoke/bin/python" dist/*.whl
           "$RUNNER_TEMP/ash-smoke/bin/python" tests/packaging/smoke_minimal_install.py
+          "$RUNNER_TEMP/ash-smoke/bin/python" tests/packaging/smoke_crew_install.py
 
   minimum-dependencies:
     runs-on: ubuntu-latest
