@@ -4298,6 +4298,79 @@ def test_inbox_acknowledgement_is_durable_exact_and_concurrent(
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
+def test_inbox_ack_can_reach_older_visible_unacknowledged_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Acknowledged recent activity must not strand older visible inbox entries."""
+
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    from ash.automation.schedules import build_schedule
+    from ash.coworkers import (
+        CoworkerDirectory, _scheduled_event_key, _scheduled_run_id,
+    )
+
+    root = _isolated_ash_home(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory, identity, handle = _ready_coworker(root, workspace)
+    responsibility = handle.create_responsibility(
+        scope="Activity review", objective="Inspect existing run notices",
+        schedule=build_schedule(
+            every="10s", now=datetime(2026, 11, 1, tzinfo=timezone.utc),
+        ),
+    )
+    assert responsibility.first_fire_at is not None
+    oldest_event = ""
+    with sqlite3.connect(directory.db_path) as connection:
+        for number in range(101):
+            occurrence = responsibility.first_fire_at + timedelta(seconds=10 * number)
+            run_id = _scheduled_run_id(responsibility.responsibility_id, occurrence)
+            event_id = f"run:{identity.coworker_id}:{run_id}:skipped"
+            connection.execute(
+                "INSERT INTO coworker_turn_dispatches "
+                "(owner_id,coworker_id,run_id,status,execution_kind,"
+                "responsibility_id,trigger_type,event_key,created_at,"
+                "completed_at,scheduled_for,skip_reason) "
+                "VALUES (?,?,?,'skipped','offline',?,'scheduled',?, ?,NULL,?,"
+                "'misfire_grace_expired')",
+                (
+                    identity.owner_id, identity.coworker_id, run_id,
+                    responsibility.responsibility_id,
+                    _scheduled_event_key(occurrence), occurrence.isoformat(),
+                    occurrence.isoformat(),
+                ),
+            )
+            if number == 0:
+                oldest_event = event_id
+            else:
+                connection.execute(
+                    "INSERT INTO coworker_inbox_acknowledgements "
+                    "(owner_id,owner_uid,coworker_id,event_id,acknowledged_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        identity.owner_id, identity.owner_uid,
+                        identity.coworker_id, event_id, occurrence.isoformat(),
+                    ),
+                )
+
+    unacknowledged = directory.list_inbox(
+        owner_id=identity.owner_id, include_skipped=True,
+        unacknowledged_only=True,
+    )
+    assert [entry.event_id for entry in unacknowledged] == [oldest_event]
+    acknowledged = CoworkerDirectory.open(root).acknowledge_inbox_event(
+        owner_id=identity.owner_id, event_id=oldest_event,
+    )
+    assert acknowledged is not None
+    assert CoworkerDirectory.open(root).list_inbox(
+        owner_id=identity.owner_id, include_skipped=True,
+        unacknowledged_only=True,
+    ) == ()
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires local UID")
 def test_coworker_v15_inbox_migration_preserves_existing_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

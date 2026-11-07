@@ -5492,6 +5492,9 @@ class CoworkerDirectory:
                     limit=100,
                     include_skipped=True,
                     coworker_id=event.coworker_id,
+                    # Match the filtered owner inbox: older unread events remain
+                    # actionable even after >100 newer entries are acknowledged.
+                    unacknowledged_only=True,
                 )
                 if not any(entry.event_id == str(event) for entry in visible):
                     raise CoworkerRuntimeUnavailable(
