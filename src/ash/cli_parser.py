@@ -340,6 +340,13 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     crew_history.add_argument(
         "--limit", type=int, default=10, help="Number of recent outcomes to show (1-100)"
     )
+    crew_history.add_argument(
+        "--query",
+        help=(
+            "Search persisted user and assistant text from completed model turns; "
+            "every query term must match one message"
+        ),
+    )
     crew_responsibility = crew_subparsers.add_parser(
         "responsibility",
         help="Create, inspect, and control one coworker responsibility",

@@ -152,6 +152,16 @@ def main() -> None:
                 )
                 assert "completed" in history, history
                 assert f"smoke-{name}" in history, history
+                # The installed CLI searches the same coworker's completed
+                # persisted text, without exposing the other profile's answer.
+                search = run(
+                    "history", "--owner", "smoke", "--coworker-id", identities[name],
+                    "--query", f"CREW {name.upper()} SMOKE", "--limit", "2",
+                )
+                assert "Status: completed" in search, search
+                assert "Role: assistant" in search, search
+                assert f"CREW-{name.upper()}-SMOKE" in search, search
+                assert f"CREW-{other.upper()}-SMOKE" not in search, search
 
             # A deterministic claim survives the process exit and cannot be reused.
             run(

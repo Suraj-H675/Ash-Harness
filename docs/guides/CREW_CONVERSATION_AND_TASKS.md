@@ -28,6 +28,29 @@ IDs; interrupted/claimed turn IDs must never be reused. Use crew history
 to inspect persisted outcomes after restart. CLI conversations are sequential,
 not an always-open chat UI.
 
+## Search completed coworker history
+
+Use `--query` to find earlier persisted model-turn text for one owner-bound
+coworker:
+
+~~~bash
+ash crew history --owner local --coworker-id COWORKER_UUID \
+  --query "release cache regression" --limit 20
+~~~
+
+Search includes completed model-backed asks, chats, responsibility turns and
+investigation turns with an exact run and session binding. It omits claimed or
+uncertain work, offline worker turns, native tool transcripts and sessions
+without an exact coworker run binding. Each match shows its run, request and
+session IDs, message role, provenance and a short redacted excerpt. `--limit`
+caps results at 100 messages and defaults to 10. Without `--query`,
+`crew history` keeps its existing recent-outcome view.
+
+This is keyword search over persisted user and assistant messages. Every
+whitespace-separated query term must match the same message, but the terms can
+appear in any order. The search is not an exact-phrase, semantic or regex
+search. It cannot find provider context that the session did not persist.
+
 To start fresh and keep later turns separate from older chat history:
 
 ~~~bash

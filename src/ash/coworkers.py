@@ -44,9 +44,11 @@ from ash.config import AshConfig
 from ash.core.session import (
     CoworkerSessionBinding,
     Session,
+    SessionSearchHit,
     SessionStorageError,
     SessionStore,
     get_db_connection,
+    normalize_session_search_query,
 )
 from ash.sqlite_utils import PinnedSQLiteDatabase, SQLitePathError
 from ash.core.redaction import redact_known_secrets
@@ -129,6 +131,7 @@ _MAX_RESPONSIBILITY_CRITERIA = 8
 _MAX_RESPONSIBILITY_CRITERION_BYTES = 512
 _MAX_RESPONSIBILITY_EVENT_KEY_CHARS = 128
 _MAX_RESPONSIBILITY_RUNS = 100
+_MAX_HISTORY_SEARCH_EXCERPT_CHARS = 360
 _MAX_SYNTAX_FILES = 32
 _MAX_SYNTAX_FILE_BYTES = 1_048_576
 _MAX_SYNTAX_TOTAL_BYTES = 5_242_880
@@ -733,6 +736,19 @@ class CoworkerReadOnlyTurnHistory:
     completed_at: str | None
     response: str | None
     model: str | None
+
+
+@dataclass(frozen=True)
+class CoworkerHistorySearchHit:
+    """One redacted text match from a verified completed coworker model turn."""
+
+    run_id: str
+    session_id: str
+    request_id: str
+    role: Literal["user", "assistant"]
+    timestamp: datetime
+    provenance: str
+    excerpt: str
 
 
 CoworkerFileApprovalStatus = Literal[
@@ -7199,6 +7215,289 @@ class CoworkerDirectory:
             )
         return tuple(history)
 
+    def _search_readonly_turn_history(
+        self,
+        handle: "CoworkerHandle",
+        *,
+        query: str,
+        limit: int,
+    ) -> tuple[CoworkerHistorySearchHit, ...]:
+        if type(limit) is not int or not 1 <= limit <= _MAX_RESPONSIBILITY_RUNS:
+            raise ValueError(f"limit must be between 1 and {_MAX_RESPONSIBILITY_RUNS}")
+        normalized_query = normalize_session_search_query(query)
+        current = self._require_coworker_owner_binding(handle)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM coworker_turn_dispatches WHERE owner_id = ? "
+                "AND coworker_id = ? AND status = 'completed' "
+                "AND execution_kind = 'model' AND session_id IS NOT NULL "
+                "AND request_id IS NOT NULL "
+                "ORDER BY created_at DESC, run_id DESC",
+                (current.owner_id, current.coworker_id),
+            ).fetchall()
+
+        store = self._session_store_for_record(current)
+        search_bindings: list[CoworkerSessionBinding] = []
+        row_by_session: dict[str, sqlite3.Row] = {}
+        row_by_run: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            try:
+                run_id = str(UUID(str(row["run_id"])))
+                session_id = str(UUID(str(row["session_id"])))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise CoworkerDirectoryError(
+                    "completed coworker search journal has invalid IDs"
+                ) from exc
+            if (
+                row["run_id"] != run_id
+                or row["session_id"] != session_id
+                or session_id in row_by_session
+                or run_id in row_by_run
+            ):
+                raise CoworkerDirectoryError(
+                    "completed coworker search journal identity is ambiguous"
+                )
+            row_by_run[run_id] = row
+            row_by_session[session_id] = row
+            search_bindings.append(
+                CoworkerSessionBinding(
+                    owner_id=current.owner_id,
+                    coworker_id=current.coworker_id,
+                    session_id=session_id,
+                    canonical_session_id=current.canonical_session_id,
+                    run_id=run_id,
+                )
+            )
+
+        hits: list[SessionSearchHit] = store.search_coworker_session_messages(
+            owner_id=current.owner_id,
+            coworker_id=current.coworker_id,
+            canonical_session_id=current.canonical_session_id,
+            project_path=current.workspace,
+            session_bindings=search_bindings,
+            query=normalized_query,
+            limit=limit,
+        )
+        if not hits:
+            return ()
+        try:
+            matched_session_ids = tuple(dict.fromkeys(
+                hit.session_id for hit in hits
+            ))
+            rows = [row_by_session[session_id] for session_id in matched_session_ids]
+        except KeyError as exc:
+            raise CoworkerDirectoryError(
+                "coworker search result has no completed journal source"
+            ) from exc
+
+        turns: dict[str, tuple[sqlite3.Row, Session]] = {}
+        turns_by_session: dict[str, tuple[sqlite3.Row, Session]] = {}
+        for row in rows:
+            try:
+                run_id = str(UUID(str(row["run_id"])))
+                session_id = str(UUID(str(row["session_id"])))
+                request_id = str(UUID(str(row["request_id"])))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise CoworkerDirectoryError(
+                    "completed coworker search journal has invalid IDs"
+                ) from exc
+            if (
+                row["run_id"] != run_id
+                or row["session_id"] != session_id
+                or row["request_id"] != request_id
+                or request_id != str(uuid5(UUID(run_id), "request"))
+            ):
+                raise CoworkerDirectoryError(
+                    "completed coworker search journal identity changed"
+                )
+            try:
+                datetime.fromisoformat(str(row["created_at"]))
+                if row["completed_at"] is None:
+                    raise ValueError("completed dispatch lacks a completion time")
+                datetime.fromisoformat(str(row["completed_at"]))
+                _, session, _, _, _ = self._require_completed_coworker_turn(
+                    handle,
+                    run_id=run_id,
+                    session_id=session_id,
+                    request_id=request_id,
+                    require_active=False,
+                    model_only=True,
+                )
+            except (KeyError, TypeError, ValueError, CoworkerRuntimeUnavailable) as exc:
+                raise CoworkerDirectoryError(
+                    "completed coworker search source is invalid or stale"
+                ) from exc
+            if (
+                session.session_id != session_id
+                or len(session.messages) != 2
+                or tuple(message.role for message in session.messages)
+                != ("user", "assistant")
+                or session.tool_calls
+                or session.messages[0].metadata.get("coworker_request_id")
+                != request_id
+                or session.messages[0].metadata.get("coworker_execution_kind")
+                != "model"
+            ):
+                raise CoworkerDirectoryError(
+                    "completed coworker search transcript is invalid"
+                )
+            metadata = session.messages[0].metadata
+            responsibility_id = row["responsibility_id"]
+            if responsibility_id is None:
+                if row["trigger_type"] is not None or any(
+                    metadata.get(key) is not None
+                    for key in (
+                        "coworker_responsibility_id",
+                        "coworker_trigger_type",
+                        "coworker_event_id",
+                    )
+                ):
+                    raise CoworkerDirectoryError(
+                        "standalone coworker search source has responsibility data"
+                    )
+                if metadata.get("coworker_conversation_kind") not in (None, "chat"):
+                    raise CoworkerDirectoryError(
+                        "coworker search source has an unknown conversation kind"
+                    )
+            elif row["trigger_type"] not in {"manual", "event", "scheduled"}:
+                raise CoworkerDirectoryError(
+                    "responsibility search source has an invalid trigger"
+                )
+            turns[run_id] = (row, session)
+            turns_by_session[session_id] = (row, session)
+
+        provenance_by_session: dict[str, str] = {}
+        for row, session in turns.values():
+            run_id = str(row["run_id"])
+            session_id = str(row["session_id"])
+            responsibility_id = row["responsibility_id"]
+            if responsibility_id is not None:
+                provenance = (
+                    f"responsibility {responsibility_id} ({row['trigger_type']} trigger)"
+                )
+            elif session.messages[0].metadata.get("coworker_conversation_kind") == "chat":
+                provenance = "coworker chat turn"
+            elif session.messages[0].metadata.get(
+                "coworker_inspection_proposal_v1"
+            ) is True:
+                provenance = "coworker investigation plan"
+            else:
+                provenance = "completed coworker model turn"
+                marker = "Untrusted request data:\n"
+                prompt = session.messages[0].content
+                if prompt.count(marker) == 1:
+                    try:
+                        request_data = json.loads(prompt.split(marker, 1)[1])
+                    except (ValueError, TypeError):
+                        request_data = None
+                    evidence = (
+                        request_data.get("evidence")
+                        if isinstance(request_data, dict)
+                        else None
+                    )
+                    try:
+                        analysis_context = json.loads(evidence) if isinstance(
+                            evidence, str
+                        ) else None
+                    except (ValueError, TypeError):
+                        analysis_context = None
+                    if (
+                        isinstance(analysis_context, dict)
+                        and analysis_context.get("tool")
+                        == "read_only_literal_search_v1"
+                    ):
+                        source_run_id = analysis_context.get("source_run_id")
+                        source = turns.get(source_run_id) if isinstance(
+                            source_run_id, str
+                        ) else None
+                        if source is None and isinstance(source_run_id, str):
+                            # The planning turn need not contain this search term;
+                            # verify its journal and transcript independently.
+                            source_row = row_by_run.get(source_run_id)
+                            if source_row is not None:
+                                try:
+                                    _, source_session, _, _, _ = (
+                                        self._require_completed_coworker_turn(
+                                            handle,
+                                            run_id=source_run_id,
+                                            session_id=str(source_row["session_id"]),
+                                            request_id=str(source_row["request_id"]),
+                                            require_active=False,
+                                            model_only=True,
+                                        )
+                                    )
+                                except (
+                                    ValueError, CoworkerRuntimeUnavailable,
+                                    SessionStorageError, KeyError,
+                                ) as exc:
+                                    raise CoworkerDirectoryError(
+                                        "coworker investigation source is invalid"
+                                    ) from exc
+                                source = (source_row, source_session)
+                        if source is not None:
+                            source_row, source_session = source
+                            source_metadata = source_session.messages[0].metadata
+                            analysis_turn_id = str(
+                                uuid5(
+                                    UUID(source_run_id),
+                                    "responsibility-inspection-analysis-v1",
+                                )
+                            )
+                            expected_run_id = str(
+                                uuid5(
+                                    UUID(current.coworker_id),
+                                    f"ash-crew-readonly-turn:{analysis_turn_id}",
+                                )
+                            )
+                            response_hash = hashlib.sha256(
+                                source_session.messages[1].content.encode("utf-8")
+                            ).hexdigest()
+                            if run_id == expected_run_id:
+                                if (
+                                    source_metadata.get(
+                                        "coworker_inspection_proposal_v1"
+                                    ) is not True
+                                    or source_row["responsibility_id"] is None
+                                    or analysis_context.get("source_response_sha256")
+                                    != response_hash
+                                    or analysis_context.get("responsibility_id")
+                                    != source_row["responsibility_id"]
+                                    or analysis_context.get("trigger_type")
+                                    != source_row["trigger_type"]
+                                    or analysis_context.get("event_key")
+                                    != source_row["event_key"]
+                                ):
+                                    raise CoworkerDirectoryError(
+                                        "coworker investigation analysis provenance changed"
+                                    )
+                                provenance = (
+                                    "responsibility investigation analysis from run "
+                                    f"{source_run_id}"
+                                )
+            provenance_by_session[session_id] = provenance
+
+        results: list[CoworkerHistorySearchHit] = []
+        for hit in hits:
+            source = turns_by_session.get(hit.session_id)
+            matched_provenance = provenance_by_session.get(hit.session_id)
+            if source is None or matched_provenance is None:
+                raise CoworkerDirectoryError(
+                    "coworker search result lost its verified source"
+                )
+            row, _ = source
+            results.append(
+                CoworkerHistorySearchHit(
+                    run_id=str(row["run_id"]),
+                    session_id=hit.session_id,
+                    request_id=str(row["request_id"]),
+                    role=hit.role,
+                    timestamp=hit.timestamp,
+                    provenance=matched_provenance,
+                    excerpt=hit.excerpt[:_MAX_HISTORY_SEARCH_EXCERPT_CHARS],
+                )
+            )
+        return tuple(results)
+
     def _model_turn_claim_exists(
         self,
         handle: "CoworkerHandle",
@@ -9356,6 +9655,18 @@ class CoworkerHandle:
         """Return recent owner-checked one-shot model turns without profile data."""
 
         return self._directory._list_readonly_turn_history(self, limit=limit)
+
+    def search_history(
+        self,
+        *,
+        query: str,
+        limit: int = 20,
+    ) -> tuple[CoworkerHistorySearchHit, ...]:
+        """Search durable text from this coworker's verified completed model turns."""
+
+        return self._directory._search_readonly_turn_history(
+            self, query=query, limit=limit
+        )
 
     def prepare_file_approval(
         self,

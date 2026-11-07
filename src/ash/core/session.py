@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import unicodedata
 import weakref
 from contextlib import asynccontextmanager, closing, contextmanager
 from dataclasses import dataclass
@@ -889,6 +890,19 @@ def _normalize_session_search_query(query: str) -> str:
             "session search query exceeds "
             f"{MAX_SESSION_SEARCH_QUERY_CHARS} characters"
         )
+    return normalized
+
+
+def normalize_session_search_query(query: str) -> str:
+    """Validate text before a caller spends work preparing a scoped search."""
+
+    if not isinstance(query, str) or any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+        for character in query
+    ):
+        raise ValueError("session search query must be printable text")
+    normalized = _normalize_session_search_query(query)
+    _session_search_match_query(normalized)
     return normalized
 
 
@@ -5366,6 +5380,145 @@ class SessionStore:
             )
             for row in rows
         ]
+
+    def search_coworker_session_messages(
+        self,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        canonical_session_id: str,
+        project_path: str | Path,
+        session_bindings: Sequence[CoworkerSessionBinding],
+        query: str,
+        limit: int = 20,
+    ) -> list[SessionSearchHit]:
+        """Search only completed-turn sessions supplied by a verified Crew caller."""
+
+        normalized = normalize_session_search_query(query)
+        if type(limit) is not int or not 1 <= limit <= MAX_SESSION_SEARCH_LIMIT:
+            raise ValueError(
+                f"session search limit must be between 1 and {MAX_SESSION_SEARCH_LIMIT}"
+            )
+        self._validate_coworker_identity(owner_id, coworker_id)
+        try:
+            canonical_id = str(UUID(canonical_session_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("canonical_session_id must be a UUID") from exc
+        if canonical_id != canonical_session_id:
+            raise ValueError("canonical_session_id must be canonical")
+        if not isinstance(session_bindings, Sequence) or isinstance(
+            session_bindings, (str, bytes)
+        ):
+            raise ValueError("coworker session search scope is invalid")
+
+        validated: list[tuple[str, str]] = []
+        seen_session_ids: set[str] = set()
+        for binding in session_bindings:
+            if (
+                not isinstance(binding, CoworkerSessionBinding)
+                or binding.owner_id != owner_id
+                or binding.coworker_id != coworker_id
+                or binding.canonical_session_id != canonical_id
+                or binding.run_id is None
+            ):
+                raise ValueError("coworker session search scope is inconsistent")
+            try:
+                session_id = str(UUID(binding.session_id))
+                run_id = str(UUID(binding.run_id))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ValueError("coworker session search scope has invalid IDs") from exc
+            if (
+                session_id != binding.session_id
+                or run_id != binding.run_id
+                or session_id in seen_session_ids
+            ):
+                raise ValueError("coworker session search scope is ambiguous")
+            seen_session_ids.add(session_id)
+            validated.append((session_id, run_id))
+        if not validated:
+            return []
+
+        match_query = _session_search_match_query(normalized)
+        project_key = normalize_project_path(project_path)
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "CREATE TEMP TABLE coworker_search_scope ("
+                "session_id TEXT PRIMARY KEY, run_id TEXT NOT NULL) WITHOUT ROWID"
+            )
+            conn.executemany(
+                "INSERT INTO coworker_search_scope (session_id, run_id) VALUES (?, ?)",
+                validated,
+            )
+            stale_binding = conn.execute(
+                """
+                SELECT allowed.session_id
+                FROM coworker_search_scope AS allowed
+                LEFT JOIN coworker_session_bindings AS b
+                  ON b.session_id = allowed.session_id
+                 AND b.run_id = allowed.run_id
+                 AND b.owner_id = ?
+                 AND b.coworker_id = ?
+                 AND b.canonical_session_id = ?
+                 AND b.kind = 'background'
+                LEFT JOIN sessions AS s ON s.session_id = allowed.session_id
+                WHERE b.session_id IS NULL OR s.session_id IS NULL
+                   OR s.project_key != ?
+                LIMIT 1
+                """,
+                (owner_id, coworker_id, canonical_id, project_key),
+            ).fetchone()
+            if stale_binding is not None:
+                raise SessionStorageError(
+                    "coworker session search binding is stale or inconsistent"
+                )
+            rows = conn.execute(
+                """
+                SELECT m.message_id, m.session_id, s.title, m.role, m.timestamp,
+                       snippet(messages_fts, 0, '', '', ' … ', 24) AS excerpt
+                FROM coworker_search_scope AS allowed
+                JOIN coworker_session_bindings AS b
+                  ON b.session_id = allowed.session_id
+                 AND b.run_id = allowed.run_id
+                JOIN sessions AS s ON s.session_id = allowed.session_id
+                JOIN messages AS m ON m.session_id = allowed.session_id
+                JOIN messages_fts ON messages_fts.rowid = m.message_id
+                WHERE messages_fts MATCH ?
+                  AND b.owner_id = ?
+                  AND b.coworker_id = ?
+                  AND b.canonical_session_id = ?
+                  AND b.kind = 'background'
+                  AND s.project_key = ?
+                  AND m.role IN ('user', 'assistant')
+                ORDER BY bm25(messages_fts), m.timestamp DESC, m.message_id DESC
+                LIMIT ?
+                """,
+                (
+                    match_query,
+                    owner_id,
+                    coworker_id,
+                    canonical_id,
+                    project_key,
+                    limit,
+                ),
+            ).fetchall()
+        from ash.core.redaction import redact_text
+
+        try:
+            return [
+                SessionSearchHit(
+                    session_id=str(row["session_id"]),
+                    title=str(row["title"] or ""),
+                    message_id=int(row["message_id"]),
+                    role=row["role"],
+                    timestamp=_deserialize_datetime(str(row["timestamp"])),
+                    excerpt=redact_text(str(row["excerpt"] or ""))[
+                        :MAX_SESSION_SEARCH_EXCERPT_CHARS
+                    ],
+                )
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
 
     def fork_session(
         self,

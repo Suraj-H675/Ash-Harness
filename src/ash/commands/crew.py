@@ -1341,7 +1341,10 @@ def _history(args: argparse.Namespace) -> int:
             coworker_id=args.coworker_id,
         )
         handle.require_owner_binding()
-        entries = handle.list_readonly_turn_history(limit=args.limit)
+        if args.query is None:
+            recent_entries = handle.list_readonly_turn_history(limit=args.limit)
+        else:
+            search_entries = handle.search_history(query=args.query, limit=args.limit)
     except (
         CoworkerDirectoryError,
         CoworkerNotFound,
@@ -1356,28 +1359,49 @@ def _history(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - keep CLI failures secret-free
         _write_error(f"Coworker history is unavailable ({type(exc).__name__}).")
         return 2
-    if not entries:
+    if args.query is not None:
+        _write_line(
+            "Search covers persisted text in verified completed model turns. "
+            "Every query term must match the same user or assistant message; "
+            "term order does not matter."
+        )
+        _write_line("Provider context that was not persisted is not searchable.")
+        if not search_entries:
+            _write_line("No completed coworker text matched.")
+            return 0
+        for search_hit in search_entries:
+            _write_line("Status: completed")
+            _write_line(f"Provenance: {_safe_text(search_hit.provenance, single_line=True)}")
+            _write_line(f"Run ID: {search_hit.run_id}")
+            _write_line(f"Request ID: {search_hit.request_id}")
+            _write_line(f"Session ID: {search_hit.session_id}")
+            _write_line(f"Role: {search_hit.role}")
+            _write_line("Excerpt:")
+            _write_line(_safe_text(search_hit.excerpt))
+            _write_line("")
+        return 0
+    if not recent_entries:
         _write_line("No model turns recorded for this coworker.")
         return 0
 
-    for entry in entries:
+    for recent_hit in recent_entries:
         _write_line(
-            f"Status: {entry.status}"
-            if entry.status == "completed"
+            f"Status: {recent_hit.status}"
+            if recent_hit.status == "completed"
             else "Status: outcome unknown; claimed turns cannot be replayed."
         )
-        _write_line(f"Run ID: {entry.session_ref.run_id}")
-        _write_line(f"Session ID: {entry.session_ref.session_id}")
-        _write_line(f"Created: {_safe_text(entry.created_at, single_line=True)}")
-        if entry.completed_at is not None:
+        _write_line(f"Run ID: {recent_hit.session_ref.run_id}")
+        _write_line(f"Session ID: {recent_hit.session_ref.session_id}")
+        _write_line(f"Created: {_safe_text(recent_hit.created_at, single_line=True)}")
+        if recent_hit.completed_at is not None:
             _write_line(
-                f"Completed: {_safe_text(entry.completed_at, single_line=True)}"
+                f"Completed: {_safe_text(recent_hit.completed_at, single_line=True)}"
             )
-        if entry.model is not None:
-            _write_line(f"Model: {_safe_text(entry.model, single_line=True)}")
-        if entry.response is not None:
+        if recent_hit.model is not None:
+            _write_line(f"Model: {_safe_text(recent_hit.model, single_line=True)}")
+        if recent_hit.response is not None:
             _write_line("Response:")
-            _write_line(_safe_text(entry.response))
+            _write_line(_safe_text(recent_hit.response))
             _write_line("Proposal only. No files were changed.")
         _write_line("")
     return 0

@@ -1107,6 +1107,324 @@ def test_cli_runs_atlas_and_scout_with_isolated_profiles_evidence_and_history(
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_crew_history_search_is_durable_owner_scoped_and_preserves_recent_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import datetime, timezone
+
+    from ash.core.session import Message, SessionStorageError, SessionStore
+    from ash.coworkers import CoworkerDirectoryError
+    from ash.safety.guard import SafetyGuard
+
+    ash_dir, atlas_workspace, scout_workspace = _prepare_profiles(tmp_path, monkeypatch)
+    _install_fake_registry(
+        monkeypatch,
+        atlas_answer=(
+            "Atlas synthetic search response " + "responseword " * 180
+            + " atlas-profile-secret \u001b[31mred\u001b[0m\u202e"
+        ),
+        scout_draft_answer="Scout synthetic search response",
+    )
+    directory = CoworkerDirectory.open(ash_dir)
+    atlas = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=atlas_workspace,
+    )
+    scout = directory.create(
+        owner_id="local", display_name="Scout", profile_name="scout",
+        workspace=scout_workspace,
+    )
+    atlas_handle = directory.open_coworker(
+        owner_id="local", coworker_id=atlas.coworker_id,
+    )
+    scout_handle = directory.open_coworker(
+        owner_id="local", coworker_id=scout.coworker_id,
+    )
+
+    for index in range(12):
+        question = (
+            "archive needle oldatlas " + "detail " * 180
+            if index == 0
+            else f"routine atlas followup {index}"
+        )
+        assert main(_ask_args(
+            atlas.coworker_id,
+            question,
+            turn_id=f"history-search-{index}",
+        )) == 0
+        capsys.readouterr()
+    assert main([
+        "crew", "chat", "--owner", "local", "--coworker-id",
+        atlas.coworker_id, "--message", "needle chatscope", "--turn-id", "chat-search",
+    ]) == 0
+    capsys.readouterr()
+
+    responsibility = atlas_handle.create_responsibility(
+        scope="History search", objective="needle responsibilityscope",
+    )
+    asyncio.run(atlas_handle.run_model_responsibility(
+        responsibility.responsibility_id, event_id="history-search-event",
+    ))
+    capsys.readouterr()
+    assert main(_ask_args(
+        scout.coworker_id, "needle scoutscope", turn_id="scout-search",
+    )) == 0
+    capsys.readouterr()
+
+    claim_run_id = str(uuid4())
+    claim_ref = atlas_handle.begin_background_run(claim_run_id)
+    request_id = str(uuid5(UUID(claim_run_id), "request"))
+    directory._claim_responsibility_turn(
+        handle=atlas_handle,
+        run_id=claim_run_id,
+        session_id=claim_ref.session_id,
+        request_id=request_id,
+        execution_kind="model",
+        workspace_identity=SafetyGuard(atlas_workspace).project_root_identity,
+        brief=atlas_handle.read_brief(),
+    )
+    atlas_store = SessionStore(ash_dir / "profiles" / "atlas" / "db" / "sessions.db")
+    atlas_store.save_message(
+        claim_ref.session_id,
+        Message(
+            role="user",
+            content="needle claimedonly",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "coworker_request_id": request_id,
+                "coworker_execution_kind": "model",
+            },
+        ),
+    )
+    orphan = atlas_store.create_session(str(atlas_workspace))
+    atlas_store.save_message(
+        orphan.session_id,
+        Message(
+            role="user",
+            content="needle orphanonly",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+
+    oldest, = atlas_handle.search_history(
+        query="archive needle oldatlas", limit=1,
+    )
+    expected_run_id = str(uuid5(
+        UUID(atlas.coworker_id), "ash-crew-readonly-turn:history-search-0",
+    ))
+    assert oldest.run_id == expected_run_id
+    assert oldest.role == "user"
+    assert oldest.provenance == "completed coworker model turn"
+    assert len(oldest.excerpt) <= 360
+    assert "oldatlas" in oldest.excerpt.casefold()
+    assert atlas_handle.search_history(query="needle claimedonly") == ()
+    assert atlas_handle.search_history(query="needle orphanonly") == ()
+    assert atlas_handle.search_history(query="needle scoutscope") == ()
+    chat_hit, = atlas_handle.search_history(query="needle chatscope")
+    assert chat_hit.provenance == "coworker chat turn"
+    responsibility_hit, = atlas_handle.search_history(
+        query="needle responsibilityscope",
+    )
+    assert "responsibility " + responsibility.responsibility_id in (
+        responsibility_hit.provenance
+    )
+    scout_hit, = scout_handle.search_history(query="needle scoutscope")
+    assert scout_hit.session_id != oldest.session_id
+
+    assert main([
+        "crew", "history", "--owner", "local", "--coworker-id",
+        atlas.coworker_id, "--query", "archive needle oldatlas", "--limit", "1",
+    ]) == 0
+    output = capsys.readouterr().out
+    assert expected_run_id in output
+    assert "Status: completed" in output
+    assert "Role: user" in output
+    assert "order does not matter" in output
+    assert "Provider context that was not persisted is not searchable" in output
+    assert "scout synthetic search response" not in output.casefold()
+    assert "atlas-profile-secret" not in output
+    assert "\u001b" not in output
+    assert "\u202e" not in output
+
+    with sqlite3.connect(atlas_store.db_path) as connection:
+        connection.execute(
+            "UPDATE messages SET content = ? WHERE session_id = ? AND role = 'assistant'",
+            (
+                "needle assistantcontrol api_key='abcdefgh12345678' "
+                "\u001b[31mred\u001b[0m\u202e",
+                oldest.session_id,
+            ),
+        )
+    assistant_hit, = atlas_handle.search_history(query="assistantcontrol", limit=1)
+    assert assistant_hit.role == "assistant"
+    assert len(assistant_hit.excerpt) <= 360
+    assert "abcdefgh12345678" not in assistant_hit.excerpt
+    assert main([
+        "crew", "history", "--owner", "local", "--coworker-id",
+        atlas.coworker_id, "--query", "assistantcontrol", "--limit", "1",
+    ]) == 0
+    safe_output = capsys.readouterr().out
+    assert "Role: assistant" in safe_output
+    assert "atlas-profile-secret" not in safe_output
+    assert "\u001b" not in safe_output
+    assert "\u202e" not in safe_output
+
+    assert main([
+        "crew", "history", "--owner", "local", "--coworker-id",
+        scout.coworker_id, "--query", "needle scoutscope",
+    ]) == 0
+    scout_output = capsys.readouterr().out
+    assert "scoutscope" in scout_output
+    assert "oldatlas" not in scout_output
+
+    assert main([
+        "crew", "history", "--owner", "local", "--coworker-id",
+        atlas.coworker_id,
+    ]) == 0
+    old_history = capsys.readouterr().out
+    assert "Status: completed" in old_history
+    assert "Response:" in old_history
+    assert "Search covers persisted text" not in old_history
+
+    assert main([
+        "crew", "archive", "--owner", "local", "--coworker-id", atlas.coworker_id,
+    ]) == 0
+    capsys.readouterr()
+    assert main([
+        "crew", "history", "--owner", "local", "--coworker-id",
+        atlas.coworker_id, "--query", "archive needle oldatlas", "--limit", "1",
+    ]) == 0
+    assert expected_run_id in capsys.readouterr().out
+
+    assert main([
+        "crew", "history", "--owner", "other-owner", "--coworker-id",
+        atlas.coworker_id, "--query", "archive needle oldatlas",
+    ]) == 2
+    denied = capsys.readouterr()
+    assert "no coworker matches" in denied.err
+    assert "oldatlas" not in denied.out
+
+    for hostile_query in ("   ", "x" * 501, "needle\noldatlas"):
+        assert main([
+            "crew", "history", "--owner", "local", "--coworker-id",
+            atlas.coworker_id, "--query", hostile_query,
+        ]) == 2
+        assert "Coworker history is unavailable" in capsys.readouterr().err
+    assert main([
+        "crew", "history", "--owner", "local", "--coworker-id",
+        atlas.coworker_id, "--query", 'needle" OR *',
+    ]) == 0
+    assert "scoutscope" not in capsys.readouterr().out
+
+    import subprocess
+
+    reopened = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from ash.coworkers import CoworkerDirectory; "
+            "h=CoworkerDirectory.open().open_coworker(owner_id='local', "
+            f"coworker_id={atlas.coworker_id!r}); "
+            "print(h.search_history(query='archive needle oldatlas', limit=1)[0].run_id)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert reopened.returncode == 0, reopened.stderr
+    assert reopened.stdout.strip() == expected_run_id
+
+    with sqlite3.connect(atlas_store.db_path) as connection:
+        connection.execute(
+            "UPDATE coworker_session_bindings SET run_id = ? WHERE session_id = ?",
+            (str(uuid4()), oldest.session_id),
+        )
+    with pytest.raises(SessionStorageError, match="binding is stale"):
+        atlas_handle.search_history(query="archive needle oldatlas")
+    with sqlite3.connect(atlas_store.db_path) as connection:
+        connection.execute(
+            "UPDATE coworker_session_bindings SET run_id = ? WHERE session_id = ?",
+            (expected_run_id, oldest.session_id),
+        )
+
+    with sqlite3.connect(directory.db_path) as connection:
+        connection.execute(
+            "UPDATE coworker_turn_dispatches SET request_id = ? WHERE run_id = ?",
+            (str(uuid4()), expected_run_id),
+        )
+    with pytest.raises(CoworkerDirectoryError, match="search journal identity"):
+        atlas_handle.search_history(query="archive needle oldatlas")
+
+    with monkeypatch.context() as wrong_uid:
+        wrong_uid.setattr("ash.coworkers._current_owner_uid", lambda: os.geteuid() + 1)
+        with pytest.raises(CoworkerRuntimeUnavailable):
+            atlas_handle.search_history(query="archive needle oldatlas")
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
+def test_crew_history_search_attributes_completed_responsibility_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ash_dir, workspace, _ = _prepare_profiles(tmp_path, monkeypatch)
+    _install_fake_registry(
+        monkeypatch,
+        atlas_draft_answer=(
+            '{"action":"search_literal","files":["status.log"],'
+            '"query":"FAILED"}'
+        ),
+    )
+    (workspace / "status.log").write_text("FAILED release check\n", encoding="utf-8")
+    directory = CoworkerDirectory.open(ash_dir)
+    identity = directory.create(
+        owner_id="local", display_name="Atlas", profile_name="atlas",
+        workspace=workspace,
+    )
+    handle = directory.open_coworker(
+        owner_id="local", coworker_id=identity.coworker_id,
+    )
+    responsibility = handle.create_responsibility(
+        scope="needle analysis scope",
+        objective="Report the investigation result for analysispayload.",
+        evidence_paths=("status.log",),
+    )
+    plan = asyncio.run(handle.run_model_responsibility(
+        responsibility.responsibility_id,
+        event_id="history-analysis",
+        investigate=True,
+    ))
+    analysis = asyncio.run(handle.analyze_responsibility_investigation(plan))
+
+    hits = handle.search_history(query="needle analysispayload", limit=20)
+    analysis_hits = [hit for hit in hits if hit.run_id == analysis.session_ref.run_id]
+    assert analysis_hits
+    assert analysis_hits[0].session_id == analysis.session_ref.session_id
+    assert analysis_hits[0].provenance == (
+        "responsibility investigation analysis from run "
+        + plan.session_ref.run_id
+    )
+
+    # Simulate a completed analysis result with text not in the plan. Querying
+    # that response must still attribute the linked, source-verified plan.
+    from ash.core.session import SessionStore
+    store = SessionStore(ash_dir / "profiles" / "atlas" / "db" / "sessions.db")
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE messages SET content = ? WHERE session_id = ? AND role = 'assistant'",
+            ("onlyinanalysisresult", analysis.session_ref.session_id),
+        )
+    result_only = handle.search_history(query="onlyinanalysisresult")
+    assert result_only
+    assert all(
+        hit.provenance
+        == "responsibility investigation analysis from run " + plan.session_ref.run_id
+        for hit in result_only
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")
 def test_rejected_evidence_never_dispatches_fake_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
