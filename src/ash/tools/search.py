@@ -14,6 +14,7 @@ from typing import Any, TextIO
 import regex as regex_engine
 from pydantic import BaseModel, Field
 
+from ash.repo.ignore import DEFAULT_IGNORED_DIRS
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import (
     list_scoped_directory,
@@ -50,6 +51,8 @@ def _iter_workspace_paths(
     recursive: bool,
     max_depth: int | None = None,
     on_incomplete: Callable[[], None] | None = None,
+    ignored_dirs: frozenset[str] = frozenset(),
+    on_skipped: Callable[[str], None] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """Yield workspace entries lazily without descending through links."""
 
@@ -59,6 +62,10 @@ def _iter_workspace_paths(
         try:
             _, children = list_scoped_directory(directory, guard)
             for name, is_directory in sorted(children):
+                if is_directory and name in ignored_dirs:
+                    if on_skipped is not None:
+                        on_skipped(name)
+                    continue
                 path = directory / name
                 yield path, is_directory
                 if not recursive or (max_depth is not None and depth + 1 >= max_depth):
@@ -93,6 +100,16 @@ def _matches_workspace_glob(relative_path: str, pattern: str) -> bool:
     return fnmatch.fnmatchcase(relative_path, pattern) or (
         pattern.startswith("**/")
         and fnmatch.fnmatchcase(relative_path, pattern[3:])
+    )
+
+
+def _skipped_generated_note(skipped: set[str]) -> str:
+    if not skipped:
+        return ""
+    return (
+        "[skipped generated directories: "
+        + ", ".join(sorted(skipped))
+        + "; use directory_path to search one explicitly]"
     )
 
 
@@ -162,7 +179,10 @@ class GlobFilesArgs(BaseModel):
 class GlobFilesTool(BaseTool):
     name = "glob_files"
     execution_contract = ToolExecutionContract(parallel_safe=True)
-    description = "Find workspace files by a glob pattern such as '**/*.py'."
+    description = (
+        "Find workspace files by glob (e.g. '**/*.py'). Broad searches skip "
+        "known generated directories; set directory_path to include one."
+    )
     args_schema = GlobFilesArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
@@ -176,6 +196,7 @@ class GlobFilesTool(BaseTool):
         match_truncated = False
         scan_truncated = False
         scan_incomplete = False
+        skipped_generated: set[str] = set()
 
         def mark_incomplete() -> None:
             nonlocal scan_incomplete
@@ -188,6 +209,12 @@ class GlobFilesTool(BaseTool):
             recursive=True,
             max_depth=MAX_GLOB_DEPTH,
             on_incomplete=mark_incomplete,
+            ignored_dirs=(
+                DEFAULT_IGNORED_DIRS
+                if root == self.safety_guard.project_root
+                else frozenset()
+            ),
+            on_skipped=skipped_generated.add,
         ):
             scanned += 1
             if scanned > MAX_GLOB_SCAN_ENTRIES:
@@ -221,6 +248,9 @@ class GlobFilesTool(BaseTool):
             )
         elif scan_incomplete:
             output += ("\n" if output else "") + "[workspace glob incomplete]"
+        note = _skipped_generated_note(skipped_generated)
+        if note:
+            output += ("\n" if output else "") + note
         return ToolResult(
             success=True,
             output=output,
@@ -244,7 +274,8 @@ class SearchTextTool(BaseTool):
     name = "search_text"
     execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
-        "Search bounded workspace text in a directory or file with line locations."
+        "Search bounded workspace text with line locations; skip known generated "
+        "directories in broad searches, or set directory_path to search one."
     )
     args_schema = SearchTextArgs
 
@@ -359,6 +390,7 @@ class SearchTextTool(BaseTool):
         scan_incomplete = False
         skipped_file = False
         preview_truncated = False
+        skipped_generated: set[str] = set()
 
         def mark_scan_incomplete() -> None:
             nonlocal scan_incomplete
@@ -374,6 +406,12 @@ class SearchTextTool(BaseTool):
                 recursive=True,
                 max_depth=MAX_SEARCH_DEPTH,
                 on_incomplete=mark_scan_incomplete,
+                ignored_dirs=(
+                    DEFAULT_IGNORED_DIRS
+                    if root == self.safety_guard.project_root
+                    else frozenset()
+                ),
+                on_skipped=skipped_generated.add,
             )
         )
         for path, is_directory in candidates:
@@ -455,6 +493,9 @@ class SearchTextTool(BaseTool):
                 f"{separator}[workspace search incomplete: "
                 "skipped unreadable or invalid text files]"
             )
+        note = _skipped_generated_note(skipped_generated)
+        if note:
+            output += ("\n" if output else "") + note
         return ToolResult(
             success=True,
             output=output,

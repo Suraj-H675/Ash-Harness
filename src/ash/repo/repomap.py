@@ -31,6 +31,7 @@ from ash.safety.git import (
     read_only_git_environment,
     read_only_git_untrusted_config_keys,
 )
+from ash.repo.ignore import DEFAULT_IGNORED_DIRS
 from ash.repo.parser import (
     MAX_SOURCE_FILE_BYTES,
     SOURCE_SUFFIXES,
@@ -65,27 +66,6 @@ def _dot_quote(value: str) -> str:
         .replace("\t", "\\t")
     )
     return f'"{escaped}"'
-
-# Folders that should never be descended into when building a repo map.
-DEFAULT_IGNORED_DIRS = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        "__pycache__",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".venv",
-        "venv",
-        "env",
-        ".tox",
-        "node_modules",
-        "dist",
-        "build",
-        ".ash",
-    }
-)
 
 
 @dataclass(frozen=True)
