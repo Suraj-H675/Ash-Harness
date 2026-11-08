@@ -801,3 +801,58 @@ async def test_search_text_streams_lines(tmp_path) -> None:
 
     assert result.success is True
     assert result.output == "notes.txt:2:needle"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generated_name", [".venv", "node_modules"])
+async def test_workspace_wide_search_skips_generated_dependencies_but_keeps_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generated_name: str
+) -> None:
+    monkeypatch.setattr(search_module, "MAX_GLOB_SCAN_ENTRIES", 12)
+    monkeypatch.setattr(search_module, "MAX_SEARCH_SCAN_ENTRIES", 12)
+    dependencies = tmp_path / generated_name / "lib"
+    dependencies.mkdir(parents=True)
+    for index in range(24):
+        (dependencies / f"package_{index:03}.py").write_text(
+            "dependency_only_token\n", encoding="utf-8"
+        )
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "app.py").write_text("application_unique_token\n", encoding="utf-8")
+    guard = SafetyGuard(tmp_path)
+
+    filenames = await GlobFilesTool(guard).run(pattern="**/*.py")
+    contents = await SearchTextTool(guard).run(
+        pattern="application_unique_token", fixed_strings=True
+    )
+    for result in (filenames, contents):
+        assert result.success and not result.truncated
+        assert "src/app.py" in result.output
+        assert "package_" not in result.output
+        assert f"[skipped generated directories: {generated_name}" in result.output
+        assert "directory_path" in result.output
+
+    # An explicitly requested subtree remains discoverable, even if generated.
+    dependency_files = await GlobFilesTool(guard).run(
+        pattern="**/*.py", directory_path=generated_name
+    )
+    dependency_matches = await SearchTextTool(guard).run(
+        pattern="dependency_only_token",
+        fixed_strings=True,
+        directory_path=generated_name,
+    )
+    # Explicit searches still respect their configured scan budget.
+    assert dependency_files.truncated and "package_000.py" in dependency_files.output
+    assert (
+        dependency_matches.truncated
+        and "package_000.py:1" in dependency_matches.output
+    )
+    exact_file = await SearchTextTool(guard).run(
+        pattern="dependency_only_token",
+        fixed_strings=True,
+        directory_path=f"{generated_name}/lib/package_000.py",
+    )
+    assert not exact_file.truncated and "package_000.py:1" in exact_file.output
+
+    directory = await ListDirectoryTool(guard).run()
+    assert f"{generated_name}/" in directory.output
