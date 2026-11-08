@@ -270,12 +270,16 @@ jobs:
       - name: Build security-fixed Bubblewrap (Linux)
         if: runner.os == 'Linux'
         run: |
+          # GitHub release-asset downloads can return persistent 504 errors.
+          # Use the immutable upstream v0.13.0 tag commit; pin archive bytes too.
           curl --fail --location --silent --show-error \
-            --output /tmp/bubblewrap-0.13.0.tar.xz \
-            https://github.com/containers/bubblewrap/releases/download/v0.13.0/bubblewrap-0.13.0.tar.xz
-          echo "4734237473c0e5d695e4e9034a34e43b2dbf5164655bd13fa59ae376b2b7a765  /tmp/bubblewrap-0.13.0.tar.xz" | sha256sum --check
-          tar -C /tmp -xf /tmp/bubblewrap-0.13.0.tar.xz
-          cd /tmp/bubblewrap-0.13.0
+            --retry 3 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 10 --max-time 40 \
+            --output /tmp/bubblewrap-0.13.0-source.tar.gz \
+            https://codeload.github.com/containers/bubblewrap/tar.gz/719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0
+          echo "e55bdb06f051664ecd3297d449a8b679b7cd1c73adb292b73a81d9b03c5fc462  /tmp/bubblewrap-0.13.0-source.tar.gz" | sha256sum --check
+          tar -C /tmp -xf /tmp/bubblewrap-0.13.0-source.tar.gz
+          cd /tmp/bubblewrap-719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0
           sudo ./ci/builddeps.sh
           sudo ./ci/enable-userns.sh
           meson setup _build
