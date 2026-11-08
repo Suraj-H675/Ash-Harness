@@ -13,6 +13,7 @@ from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import (
     ScopedFileChanged,
     ScopedIOError,
+    atomic_write_scoped_bytes,
     atomic_write_scoped_text,
     atomic_write_scoped_text_chunks,
     list_scoped_directory,
@@ -20,6 +21,7 @@ from ash.safety.scoped_io import (
     remove_scoped_file,
     read_scoped_bytes,
     restore_scoped_file,
+    snapshot_scoped_file,
     stat_scoped_path,
     workspace_mutation_lock,
 )
@@ -110,6 +112,35 @@ def test_scoped_read_rejects_in_scope_symlink(tmp_path) -> None:
 
     with pytest.raises(SafetyViolation, match="symlink or junction"):
         read_scoped_bytes(link, SafetyGuard(tmp_path))
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_scoped_snapshot_can_reject_hardlinks_without_changing_default(
+    tmp_path,
+    fallback: bool,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("evidence", encoding="utf-8")
+    alias = tmp_path / "alias.txt"
+    try:
+        os.link(target, alias)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Hard-link creation is unavailable: {exc}")
+
+    mode = (
+        patch("ash.safety.scoped_io._supports_anchored_io", return_value=False)
+        if fallback
+        else nullcontext()
+    )
+    with mode:
+        _, ordinary_snapshot = snapshot_scoped_file(target, SafetyGuard(tmp_path))
+        assert ordinary_snapshot.content == b"evidence"
+        with pytest.raises(ScopedIOError, match="exactly one hard link"):
+            snapshot_scoped_file(
+                target,
+                SafetyGuard(tmp_path),
+                require_single_link=True,
+            )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptor")
@@ -451,3 +482,39 @@ def test_scoped_stat_reports_regular_files_and_directories(
 
     assert stat.S_ISDIR(directory_metadata.st_mode)
     assert stat.S_ISREG(file_metadata.st_mode)
+
+
+def test_atomic_write_can_refuse_parent_creation_and_hardlink_replacement(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    guard = SafetyGuard(workspace)
+    missing_parent = workspace / "not-created" / "target.txt"
+    with pytest.raises((FileNotFoundError, ScopedIOError)):
+        atomic_write_scoped_bytes(
+            missing_parent,
+            b"content",
+            guard,
+            overwrite=False,
+            create_parents=False,
+        )
+    assert not missing_parent.parent.exists()
+
+    target = workspace / "target.txt"
+    alias = workspace / "alias.txt"
+    target.write_bytes(b"old")
+    try:
+        os.link(target, alias)
+    except (NotImplementedError, OSError):
+        pytest.skip("hard links are unavailable")
+    with pytest.raises(ScopedIOError, match="hard link"):
+        atomic_write_scoped_bytes(
+            target,
+            b"new",
+            guard,
+            overwrite=True,
+            expected_sha256=hashlib.sha256(b"old").hexdigest(),
+            require_single_link=True,
+        )
+    assert target.read_bytes() == b"old"

@@ -180,6 +180,11 @@ def recover_interrupted_turns(
 ) -> RecoverySummary:
     """Compensate provably interrupted direct edits and flag unknown effects."""
 
+    # Idle sessions have no file state to inspect or restore. Their callers
+    # hold a session lease, so unrelated coworkers must not compete for the
+    # global write lock merely to establish that recovery is unnecessary.
+    if not store.recoverable_turns(session_id):
+        return RecoverySummary()
     with workspace_mutation_lock():
         return _recover_interrupted_turns_locked(
             store,

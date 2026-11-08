@@ -56,6 +56,7 @@ from ash.core.events import EventContext, envelope_event
 from ash.core.session import (
     AuditAction,
     AuditResult,
+    CoworkerWorkerSessionBinding,
     Message,
     Session,
     SessionStore,
@@ -1397,6 +1398,8 @@ class AshLoop:
         config: "AshConfig | None" = None,
         max_steering_messages: int = 20,
         event_observer: "RuntimeEventObserver | None" = None,
+        _coworker_worker_binding: CoworkerWorkerSessionBinding | None = None,
+        _tool_dispatch_disabled: bool = False,
     ) -> None:
         self.session_store = session_store
         self.provider = provider
@@ -1407,6 +1410,17 @@ class AshLoop:
         if self.safety_guard.project_root != self.project_root:
             raise ValueError("runtime workspace does not match SafetyGuard workspace")
         self._project_root_identity = _directory_identity(self.project_root)
+        self._coworker_worker_binding = _coworker_worker_binding
+        self._tool_dispatch_disabled = (
+            _tool_dispatch_disabled or _coworker_worker_binding is not None
+        )
+        if self._tool_dispatch_disabled and tools:
+            raise ValueError("tool-disabled runtime cannot register tools")
+        if (
+            _coworker_worker_binding is not None
+            and _coworker_worker_binding.runtime_project_root != self.project_root
+        ):
+            raise ValueError("runtime workspace does not match coworker worker binding")
         self.tools: dict[str, BaseTool] = dict(tools or {})
         self._started_tool_ids: set[int] = set()
         self._closed_tool_ids: set[int] = set()
@@ -2116,6 +2130,9 @@ class AshLoop:
         if self._closing or self._closed:
             raise RuntimeError("Ash runtime is closed")
         self._verify_project_root_identity()
+        worker_binding = self._coworker_worker_binding
+        if worker_binding is not None and session_id != worker_binding.session_id:
+            raise ValueError("coworker worker runtime is bound to one session")
         pending_session_id = self._pending_session_tool_start_id
         pending_tool_start = (
             self.current_session is not None
@@ -2129,7 +2146,14 @@ class AshLoop:
             )
             target_permission_mode = self.permission_policy.mode
         elif session_id is not None:
-            self.session_store.require_session_project(session_id, self.project_root)
+            if worker_binding is None:
+                self.session_store.require_session_project(session_id, self.project_root)
+            else:
+                self.session_store._require_coworker_worker_session(
+                    session_id,
+                    self.project_root,
+                    worker_binding,
+                )
             target_model = (
                 self.session_store.session_model(session_id)
                 or self._default_session_model
@@ -5356,7 +5380,8 @@ class AshLoop:
                                         detail = terminal_stop_reason or "error"
                                         raise ProviderCompletionError(
                                             "provider completion was not safe to "
-                                            f"finalize: {detail} (error)"
+                                            f"finalize: {detail} (error)",
+                                            stop_category=CompletionStopCategory.ERROR,
                                         )
                                     raise ProviderTerminalError(terminal_stop_reason)
                         stream_to_close = active_provider_stream
@@ -5470,7 +5495,8 @@ class AshLoop:
                     detail = terminal_stop_reason or stop_category.value
                     raise ProviderCompletionError(
                         "provider completion was not safe to finalize: "
-                        f"{detail} ({stop_category.value})"
+                        f"{detail} ({stop_category.value})",
+                        stop_category=stop_category,
                     )
                 if parser is not None:
                     try:
@@ -5740,6 +5766,8 @@ class AshLoop:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
+        if self._tool_dispatch_disabled:
+            raise RuntimeError("tool-disabled runtime refuses tool execution")
         if self._closing or self._closed:
             raise RuntimeError("Ash runtime is closed")
         if self.current_session is None:
@@ -5838,6 +5866,8 @@ class AshLoop:
         ambiguous-outcome handling remain identical to model-originated calls.
         """
 
+        if self._tool_dispatch_disabled:
+            raise RuntimeError("tool-disabled runtime refuses tool execution")
         session = self.current_session
         if session is None:
             raise RuntimeError("cannot execute a tool without an active session")
@@ -5869,6 +5899,8 @@ class AshLoop:
     ) -> list[dict[str, Any]]:
         """Execute approved tool calls, gating each on the safety guard."""
 
+        if self._tool_dispatch_disabled and tool_calls:
+            raise RuntimeError("tool-disabled runtime refuses tool dispatch")
         active_tools = self.tools if tools_snapshot is None else tools_snapshot
 
         def parallel_safe(call: dict[str, Any]) -> bool:

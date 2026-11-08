@@ -74,8 +74,13 @@ def snapshot_scoped_file(
     guard: SafetyGuard,
     *,
     max_bytes: int | None = None,
+    require_single_link: bool = False,
 ) -> tuple[Path, ScopedFileSnapshot]:
-    """Capture one regular file without following a changed path component."""
+    """Capture one regular file without following a changed path component.
+
+    When ``require_single_link`` is true, reject files that have more than one
+    hard link. The link count is checked on the anchored entry and opened file.
+    """
 
     if max_bytes is not None and max_bytes < 0:
         raise ValueError("max_bytes cannot be negative")
@@ -88,6 +93,8 @@ def snapshot_scoped_file(
                     return target, _missing_snapshot()
                 if not stat.S_ISREG(existing.st_mode):
                     raise ScopedIOError(f"not a regular file: {target}")
+                if require_single_link:
+                    _require_single_link(existing, target)
                 flags = os.O_RDONLY | _flag("O_CLOEXEC") | _flag("O_NOFOLLOW")
                 try:
                     fd = os.open(name, flags, dir_fd=parent_fd)
@@ -97,10 +104,14 @@ def snapshot_scoped_file(
                     raise _scoped_open_error(target, exc) from exc
                 try:
                     opened = os.fstat(fd)
+                    if require_single_link:
+                        _require_single_link(opened, target)
                     if not _same_file(existing, opened):
                         raise ScopedFileChanged(f"file changed while opening: {target}")
                     content = _read_all(fd, max_bytes=max_bytes)
                     finished = os.fstat(fd)
+                    if require_single_link:
+                        _require_single_link(finished, target)
                     if not _same_snapshot(opened, finished):
                         raise ScopedFileChanged(f"file changed while reading: {target}")
                     return target, ScopedFileSnapshot(
@@ -113,7 +124,12 @@ def snapshot_scoped_file(
                     os.close(fd)
         except FileNotFoundError:
             return target, _missing_snapshot()
-    return target, _fallback_snapshot(target, guard, max_bytes=max_bytes)
+    return target, _fallback_snapshot(
+        target,
+        guard,
+        max_bytes=max_bytes,
+        require_single_link=require_single_link,
+    )
 
 
 def stat_scoped_path(
@@ -317,6 +333,11 @@ def atomic_write_scoped_bytes(
     *,
     overwrite: bool,
     expected_sha256: str | None = None,
+    create_parents: bool = True,
+    require_single_link: bool = False,
+    expected_mode: int | None = None,
+    expected_uid: int | None = None,
+    expected_device: int | None = None,
 ) -> Path:
     """Atomically write bytes while retaining a workspace directory anchor."""
 
@@ -326,6 +347,11 @@ def atomic_write_scoped_bytes(
         guard,
         overwrite=overwrite,
         expected_sha256=expected_sha256,
+        create_parents=create_parents,
+        require_single_link=require_single_link,
+        expected_mode=expected_mode,
+        expected_uid=expected_uid,
+        expected_device=expected_device,
     )
 
 
@@ -336,6 +362,11 @@ def atomic_write_scoped_chunks(
     *,
     overwrite: bool,
     expected_sha256: str | None = None,
+    create_parents: bool = True,
+    require_single_link: bool = False,
+    expected_mode: int | None = None,
+    expected_uid: int | None = None,
+    expected_device: int | None = None,
 ) -> Path:
     """Atomically write byte chunks while retaining a workspace directory anchor."""
 
@@ -348,6 +379,11 @@ def atomic_write_scoped_chunks(
                 guard,
                 overwrite=overwrite,
                 expected_sha256=expected_sha256,
+                create_parents=create_parents,
+                require_single_link=require_single_link,
+                expected_mode=expected_mode,
+                expected_uid=expected_uid,
+                expected_device=expected_device,
             )
         else:
             _fallback_atomic_write_chunks(
@@ -356,6 +392,11 @@ def atomic_write_scoped_chunks(
                 guard,
                 overwrite=overwrite,
                 expected_sha256=expected_sha256,
+                create_parents=create_parents,
+                require_single_link=require_single_link,
+                expected_mode=expected_mode,
+                expected_uid=expected_uid,
+                expected_device=expected_device,
             )
     return target
 
@@ -548,13 +589,48 @@ def _anchored_atomic_write_chunks(
     *,
     overwrite: bool,
     expected_sha256: str | None,
+    create_parents: bool,
+    require_single_link: bool,
+    expected_mode: int | None,
+    expected_uid: int | None,
+    expected_device: int | None,
 ) -> None:
-    with _open_parent(target, guard, create=True) as (parent_fd, name):
+    if expected_sha256 == "missing" and overwrite:
+        raise ValueError("an absent-file precondition requires overwrite=False")
+    if expected_sha256 not in {None, "missing"} and expected_mode is not None:
+        if type(expected_mode) is not int or expected_mode < 0:
+            raise ValueError("expected_mode must be a non-negative integer")
+    with _open_parent(target, guard, create=create_parents) as (parent_fd, name):
+        parent_metadata = os.fstat(parent_fd)
+        _require_effect_identity(
+            parent_metadata,
+            target.parent,
+            expected_uid=expected_uid,
+            expected_device=expected_device,
+        )
         existing = _stat_entry(parent_fd, name)
         if existing is not None and not stat.S_ISREG(existing.st_mode):
             raise ScopedIOError(f"destination is not a regular file: {target}")
-        if expected_sha256 is not None:
-            actual = _hash_entry(parent_fd, name, target)
+        if existing is not None:
+            _require_effect_identity(
+                existing,
+                target,
+                expected_uid=expected_uid,
+                expected_device=expected_device,
+                expected_mode=expected_mode,
+            )
+            if require_single_link:
+                _require_single_link(existing, target)
+        if expected_sha256 == "missing" and existing is not None:
+            raise ScopedFileChanged(f"destination appeared before write: {target}")
+        if expected_sha256 is not None and expected_sha256 != "missing":
+            actual = _hash_entry(
+                parent_fd,
+                name,
+                target,
+                expected_entry=existing,
+                require_single_link=require_single_link,
+            )
             if actual != expected_sha256.casefold():
                 raise ScopedFileChanged(
                     f"file changed before write: expected {expected_sha256}, got {actual}"
@@ -585,6 +661,20 @@ def _anchored_atomic_write_chunks(
                     raise ScopedFileChanged(
                         f"destination changed before replace: {target}"
                     )
+                if expected_sha256 == "missing" and current is not None:
+                    raise ScopedFileChanged(
+                        f"destination appeared before write: {target}"
+                    )
+                if current is not None:
+                    _require_effect_identity(
+                        current,
+                        target,
+                        expected_uid=expected_uid,
+                        expected_device=expected_device,
+                        expected_mode=expected_mode,
+                    )
+                    if require_single_link:
+                        _require_single_link(current, target)
             if overwrite:
                 os.rename(temp_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             else:
@@ -776,12 +866,20 @@ def _require_expected(actual: str, expected: str, target: Path) -> None:
 
 
 def _fallback_read(
-    target: Path, guard: SafetyGuard, *, max_bytes: int | None = None
+    target: Path,
+    guard: SafetyGuard,
+    *,
+    max_bytes: int | None = None,
+    require_single_link: bool = False,
 ) -> bytes:
     before = _fallback_identity(target)
     assert before is not None
+    if require_single_link:
+        _require_single_link(before, target)
     with target.open("rb") as handle:
         opened = os.fstat(handle.fileno())
+        if require_single_link:
+            _require_single_link(opened, target)
         if not stat.S_ISREG(opened.st_mode) or not _same_file(before, opened):
             raise ScopedFileChanged(f"file changed while opening: {target}")
         data = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
@@ -790,6 +888,8 @@ def _fallback_read(
     guard.validate_mutation_path(target)
     after = _fallback_identity(target)
     assert after is not None
+    if require_single_link:
+        _require_single_link(after, target)
     if not _same_snapshot(opened, after):
         raise ScopedFileChanged(f"file changed while reading: {target}")
     return data
@@ -804,17 +904,31 @@ def _fallback_snapshot(
     guard: SafetyGuard,
     *,
     max_bytes: int | None,
+    require_single_link: bool = False,
 ) -> ScopedFileSnapshot:
     existing = _fallback_identity(target, missing_ok=True)
     if existing is None:
         return _missing_snapshot()
     if not stat.S_ISREG(existing.st_mode):
         raise ScopedIOError(f"not a regular file: {target}")
-    content = _fallback_read(target, guard, max_bytes=max_bytes)
+    if require_single_link:
+        _require_single_link(existing, target)
+    content = _fallback_read(
+        target,
+        guard,
+        max_bytes=max_bytes,
+        require_single_link=require_single_link,
+    )
+    finished = _fallback_identity(target)
+    assert finished is not None
+    if require_single_link:
+        _require_single_link(finished, target)
+    if not _same_snapshot(existing, finished):
+        raise ScopedFileChanged(f"file changed while reading: {target}")
     return ScopedFileSnapshot(
         exists=True,
         content=content,
-        mode=existing.st_mode,
+        mode=finished.st_mode,
         sha256=hashlib.sha256(content).hexdigest(),
     )
 
@@ -826,16 +940,49 @@ def _fallback_atomic_write_chunks(
     *,
     overwrite: bool,
     expected_sha256: str | None,
+    create_parents: bool,
+    require_single_link: bool,
+    expected_mode: int | None,
+    expected_uid: int | None,
+    expected_device: int | None,
 ) -> None:
     guard.validate_mutation_path(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if expected_sha256 == "missing" and overwrite:
+        raise ValueError("an absent-file precondition requires overwrite=False")
+    if create_parents:
+        target.parent.mkdir(parents=True, exist_ok=True)
     existing = _fallback_identity(target, missing_ok=True)
     if existing is not None and not stat.S_ISREG(existing.st_mode):
         raise ScopedIOError(f"destination is not a regular file: {target}")
-    if expected_sha256 is not None:
+    parent_metadata = target.parent.stat(follow_symlinks=False)
+    _require_effect_identity(
+        parent_metadata,
+        target.parent,
+        expected_uid=expected_uid,
+        expected_device=expected_device,
+    )
+    if existing is not None:
+        _require_effect_identity(
+            existing,
+            target,
+            expected_uid=expected_uid,
+            expected_device=expected_device,
+            expected_mode=expected_mode,
+        )
+        if require_single_link:
+            _require_single_link(existing, target)
+    if expected_sha256 == "missing" and existing is not None:
+        raise ScopedFileChanged(f"destination appeared before write: {target}")
+    if expected_sha256 is not None and expected_sha256 != "missing":
         if existing is None:
             raise ScopedFileChanged(f"file disappeared before write: {target}")
-        actual = hashlib.sha256(_fallback_read(target, guard)).hexdigest()
+        actual = hashlib.sha256(
+            _fallback_read(
+                target,
+                guard,
+                require_single_link=require_single_link,
+            )
+        ).hexdigest()
         if actual != expected_sha256.casefold():
             raise ScopedFileChanged(
                 f"file changed before write: expected {expected_sha256}, got {actual}"
@@ -861,6 +1008,25 @@ def _fallback_atomic_write_chunks(
         current = _fallback_identity(target, missing_ok=True)
         if not _same_optional_snapshot(existing, current):
             raise ScopedFileChanged(f"destination changed before replace: {target}")
+        parent_metadata = target.parent.stat(follow_symlinks=False)
+        _require_effect_identity(
+            parent_metadata,
+            target.parent,
+            expected_uid=expected_uid,
+            expected_device=expected_device,
+        )
+        if expected_sha256 == "missing" and current is not None:
+            raise ScopedFileChanged(f"destination appeared before write: {target}")
+        if current is not None:
+            _require_effect_identity(
+                current,
+                target,
+                expected_uid=expected_uid,
+                expected_device=expected_device,
+                expected_mode=expected_mode,
+            )
+            if require_single_link:
+                _require_single_link(current, target)
         if overwrite:
             os.replace(temp, target)
         else:
@@ -1004,6 +1170,8 @@ def _hash_entry(
     target: Path,
     *,
     max_bytes: int | None = None,
+    expected_entry: os.stat_result | None = None,
+    require_single_link: bool = False,
 ) -> str:
     flags = os.O_RDONLY | _flag("O_CLOEXEC") | _flag("O_NOFOLLOW")
     try:
@@ -1014,7 +1182,17 @@ def _hash_entry(
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
             raise ScopedIOError(f"not a regular file: {target}")
-        return hashlib.sha256(_read_all(fd, max_bytes=max_bytes)).hexdigest()
+        if expected_entry is not None and not _same_snapshot(expected_entry, metadata):
+            raise ScopedFileChanged(f"destination changed while opening: {target}")
+        if require_single_link:
+            _require_single_link(metadata, target)
+        digest = hashlib.sha256(_read_all(fd, max_bytes=max_bytes)).hexdigest()
+        finished = os.fstat(fd)
+        if not _same_snapshot(metadata, finished):
+            raise ScopedFileChanged(f"destination changed while hashing: {target}")
+        if require_single_link:
+            _require_single_link(finished, target)
+        return digest
     finally:
         os.close(fd)
 
@@ -1091,6 +1269,28 @@ def _same_optional_snapshot(
     if left is None or right is None:
         return left is right
     return _same_snapshot(left, right)
+
+
+def _require_single_link(metadata: os.stat_result, target: Path) -> None:
+    links = getattr(metadata, "st_nlink", None)
+    if type(links) is not int or links != 1:
+        raise ScopedIOError(f"file must have exactly one hard link: {target}")
+
+
+def _require_effect_identity(
+    metadata: os.stat_result,
+    target: Path,
+    *,
+    expected_uid: int | None,
+    expected_device: int | None,
+    expected_mode: int | None = None,
+) -> None:
+    if expected_uid is not None and getattr(metadata, "st_uid", None) != expected_uid:
+        raise ScopedIOError(f"file is not owned by the authorized local owner: {target}")
+    if expected_device is not None and metadata.st_dev != expected_device:
+        raise ScopedIOError(f"file is outside the workspace filesystem: {target}")
+    if expected_mode is not None and stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise ScopedFileChanged(f"file permissions changed before write: {target}")
 
 
 def _flag(name: str) -> int:

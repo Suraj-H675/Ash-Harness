@@ -235,6 +235,15 @@ class CompletionStopCategory(StrEnum):
 class ProviderCompletionError(RuntimeError):
     """Raised when a provider stream cannot produce a safe terminal outcome."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        stop_category: CompletionStopCategory | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.stop_category = stop_category
+
 
 class ProviderIncompleteStreamError(ProviderCompletionError):
     """Provider stream ended before a terminal chunk and is safe to retry."""

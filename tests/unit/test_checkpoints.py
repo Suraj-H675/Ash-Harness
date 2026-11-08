@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ from ash.core.checkpoints import (
 )
 from ash.core.session import Message, SessionStore, ToolCallRecord
 from ash.safety.guard import SafetyGuard
+from ash.safety.scoped_io import ScopedIOError, workspace_mutation_lock
 from ash.tools.base import ToolResult
 from ash.tools.filesystem import WholeEditTool
 
@@ -827,6 +829,50 @@ def _tool_record(
         result="done" if executed else None,
         timestamp=datetime.now(timezone.utc),
     )
+
+
+@pytest.mark.asyncio
+async def test_noop_session_recovery_does_not_contend_with_an_unrelated_file_mutation(
+    tmp_path,
+) -> None:
+    # The caller holds a distinct session lease. No pending turn means no
+    # compensating file effect and no reason to acquire the global write lock.
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    lease = store.acquire_session_runtime_lease(session.session_id)
+    try:
+        with workspace_mutation_lock():
+            summary = await asyncio.to_thread(
+                recover_interrupted_turns, store, SafetyGuard(tmp_path),
+                session.session_id,
+            )
+    finally:
+        lease.close()
+    assert summary.interrupted_turns == 0
+    assert summary.recovered_calls == ()
+
+
+@pytest.mark.asyncio
+async def test_pending_tool_recovery_still_requires_global_file_mutation_lock(
+    tmp_path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "pending action")
+    store.save_tool_call(
+        session.session_id,
+        _tool_record("call-1", "run_command", executed=False),
+        turn_id="turn-1",
+    )
+    with workspace_mutation_lock():
+        with pytest.raises(ScopedIOError):
+            await asyncio.to_thread(
+                recover_interrupted_turns, store, SafetyGuard(tmp_path),
+                session.session_id,
+            )
+    assert len(store.recoverable_turns(session.session_id)) == 1
+    summary = recover_interrupted_turns(store, SafetyGuard(tmp_path), session.session_id)
+    assert summary.unknown_calls == ("run_command (call-1)",)
 
 
 @pytest.mark.asyncio

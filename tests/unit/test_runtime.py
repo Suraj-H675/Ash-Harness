@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 
 from ash.context.instructions import MAX_INSTRUCTION_FILE_BYTES
-from ash.runtime import _memory_database_path, build_repo_map, build_runtime, build_tools
+from ash.runtime import (
+    RuntimeCapabilityProfile,
+    _memory_database_path,
+    build_repo_map,
+    build_runtime,
+    build_tools,
+)
 from ash.context.turn import TurnContext
 from ash.core.session import SessionStore
 from ash.config import AshConfig
@@ -52,6 +58,128 @@ def test_build_repo_map_defers_expensive_initial_index(
 
     assert isinstance(repo_map, FakeRepoMap)
     assert captured["defer_initial_refresh"] is True
+
+
+def test_build_runtime_rejects_coworker_bound_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.providers.registry import ProviderRegistry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
+    for name in (
+        "ASH_PROFILE",
+        "ASH_DB_DIRECTORY",
+        "ASH_SAFETY_TIER",
+        "ASH_ALLOW_UNSAFE_AUTO_APPROVE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    ash_dir = home / ".ash"
+    profile = ash_dir / "profiles" / "atlas"
+    profile.mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig._load_for_profile(
+        "atlas",
+        ash_dir=ash_dir,
+        workspace_root=workspace,
+    )
+    assert config._coworker_runtime_blocked is True
+
+    def reject_provider_build(self: ProviderRegistry, config: AshConfig) -> None:
+        del self, config
+        pytest.fail("coworker-bound runtime must not build a provider")
+
+    monkeypatch.setattr(ProviderRegistry, "build", reject_provider_build)
+    with pytest.raises(RuntimeError, match="cannot start a model runtime"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            workspace_trusted=False,
+            run_maintenance=False,
+        )
+    with pytest.raises(RuntimeError, match="cannot start a model runtime"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            workspace_trusted=False,
+            run_maintenance=False,
+            runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+        )
+
+    assert not config.db_directory.exists()
+    assert not (ash_dir / "plugins").exists()
+
+
+@pytest.mark.asyncio
+async def test_turn_only_runtime_runs_real_loop_without_tools(tmp_path: Path) -> None:
+    from ash.sdk import AshClient
+
+    class DeterministicProvider(RuntimeProvider):
+        def __init__(self) -> None:
+            self.tool_schema = None
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature
+            self.tool_schema = tools
+            yield StreamChunk(content="<response>turn completed</response>", is_done=True)
+
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    provider = DeterministicProvider()
+    client = await AshClient.create(
+        config=config,
+        provider=provider,
+        run_maintenance=False,
+        runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+    )
+    try:
+        assert client.loop.tools == {}
+        result = await client.prompt("Say hello")
+        assert result.response == "turn completed"
+        assert provider.tool_schema in (None, [])
+    finally:
+        await client.close()
+
+    reopened_store = SessionStore(config.db_directory / "sessions.db")
+    stored = reopened_store.load_session(result.session_id)
+    assert [message.role for message in stored.messages][-2:] == [
+        "user",
+        "assistant",
+    ]
+
+
+def test_turn_only_runtime_rejects_secondary_provider_factories(
+    tmp_path: Path,
+) -> None:
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    with pytest.raises(ValueError, match="does not accept tools, extensions, or callbacks"):
+        build_runtime(
+            config,
+            HeadlessUI(output_format="text", stream=io.StringIO()),
+            provider=RuntimeProvider(),
+            provider_factory=lambda _config: pytest.fail(
+                "turn-only runtime must not create a secondary provider"
+            ),
+            runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+            run_maintenance=False,
+        )
 
 
 @pytest.mark.asyncio
@@ -2408,3 +2536,89 @@ def test_runtime_builds_user_opt_in_mcp_interaction_controller(tmp_path) -> None
     assert controller.supports_sampling is True
     assert controller.supports_elicitation is True
     assert controller.sampling_max_tokens == 321
+
+
+@pytest.mark.asyncio
+async def test_turn_only_runtime_refuses_tool_dispatch_even_after_registry_mutation(
+    tmp_path: Path,
+) -> None:
+    """A future native Crew tool executor must not borrow the model turn runtime."""
+    from ash.sdk import AshClient
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.git import GitDiffTool
+
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+        repo_map_enabled=False,
+    )
+    client = await AshClient.create(
+        config=config,
+        provider=RuntimeProvider(),
+        run_maintenance=False,
+        runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+    )
+    try:
+        assert client.loop._tool_dispatch_disabled is True
+        # Even a later accidental tool registration cannot grant authority.
+        client.loop.tools["git_diff"] = GitDiffTool(SafetyGuard(tmp_path))
+        with pytest.raises(RuntimeError, match="tool-disabled runtime"):
+            await client.loop.execute_tool("git_diff", {"path": "example.py"})
+        with pytest.raises(RuntimeError, match="tool-disabled runtime"):
+            await client.loop._execute_tool_in_standalone_turn(
+                "git_diff", {"path": "example.py"}
+            )
+        assert client.loop.current_session is not None
+        with pytest.raises(RuntimeError, match="tool-disabled runtime"):
+            await client.loop._execute_tool_calls(
+                [{"call_id": "forced-call", "name": "git_diff", "arguments": {}}],
+                client.loop.current_session,
+            )
+        assert client.loop.current_session.tool_calls == []
+    finally:
+        await client.close()
+
+
+def test_tool_disabled_loop_cannot_start_with_registered_tools(tmp_path: Path) -> None:
+    from ash.core.loop import AshLoop
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.git import GitDiffTool
+
+    guard = SafetyGuard(tmp_path)
+    with pytest.raises(ValueError, match="cannot register tools"):
+        AshLoop(
+            session_store=SessionStore(tmp_path / "sessions.db"),
+            provider=RuntimeProvider(),
+            safety_guard=guard,
+            ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+            project_root=tmp_path,
+            tools={"git_diff": GitDiffTool(guard)},
+            _tool_dispatch_disabled=True,
+        )
+
+
+def test_coworker_bound_loop_always_disables_tool_dispatch(tmp_path: Path) -> None:
+    from ash.core.loop import AshLoop
+    from ash.core.session import CoworkerWorkerSessionBinding
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.git import GitDiffTool
+
+    guard = SafetyGuard(tmp_path)
+    binding = CoworkerWorkerSessionBinding(
+        session_id="session", canonical_session_id="canonical", owner_id="owner",
+        coworker_id="coworker", project_key="project",
+        runtime_project_root=tmp_path,
+        runtime_directory_identity=(tmp_path.stat().st_dev, tmp_path.stat().st_ino),
+        database_path=str(tmp_path / "sessions.db"),
+        database_identity=(1, 2, 3, 4),
+    )
+    with pytest.raises(ValueError, match="cannot register tools"):
+        AshLoop(
+            session_store=SessionStore(tmp_path / "sessions.db"),
+            provider=RuntimeProvider(), safety_guard=guard,
+            ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+            project_root=tmp_path,
+            tools={"git_diff": GitDiffTool(guard)},
+            _coworker_worker_binding=binding,
+        )

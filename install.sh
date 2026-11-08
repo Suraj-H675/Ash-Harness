@@ -56,7 +56,7 @@ run_bootstrap() {
   if [ -n "$python_cmd" ]; then
     "$python_cmd" -I - "$@"
   else
-    "$uv_cmd" run --python 3.12 --no-project python -I - "$@"
+    "$uv_cmd" run --python 3.14 --no-project python -I - "$@"
   fi
 }
 

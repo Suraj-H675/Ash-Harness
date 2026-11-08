@@ -617,8 +617,12 @@ def test_ash_owned_sdk_clients_disable_nested_retries(monkeypatch) -> None:
     assert len(openai_calls) == 3
     assert all(call["max_retries"] == 0 for call in openai_calls)
     assert all("http_client" in call for call in openai_calls)
-    assert openai_http_calls == [{"follow_redirects": False}] * 3
-    assert anthropic_http_calls == [{"follow_redirects": False}]
+    assert openai_http_calls == [
+        {"follow_redirects": False, "trust_env": True}
+    ] * 3
+    assert anthropic_http_calls == [
+        {"follow_redirects": False, "trust_env": True}
+    ]
     assert len(anthropic_calls) == 1
     assert anthropic_calls[0]["max_retries"] == 0
     assert anthropic_calls[0]["api_key"] == "key"
@@ -642,9 +646,13 @@ def test_ollama_owned_http_client_is_lazy(monkeypatch: pytest.MonkeyPatch) -> No
     assert calls == []
     assert provider._client is None
     assert provider._resolve_client() is client
-    assert calls == [{"timeout": 60.0}]
+    assert calls == [
+        {"timeout": 60.0, "trust_env": True, "follow_redirects": False}
+    ]
     assert provider._resolve_client() is client
-    assert calls == [{"timeout": 60.0}]
+    assert calls == [
+        {"timeout": 60.0, "trust_env": True, "follow_redirects": False}
+    ]
 
 
 def test_openai_message_translation_preserves_tool_call_ids():
@@ -2039,6 +2047,130 @@ async def test_openai_compatible_providers_handle_usage_only_terminal_chunk(
     assert client.closed is True
 
 
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.asyncio
+async def test_crew_groq_real_sdk_sse_contract_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+    finish_reason: str,
+) -> None:
+    import importlib
+    import json
+
+    import openai
+
+    from ash.coworkers import _BoundedReadOnlyProvider
+    from ash.providers import groq as groq_adapter
+    from ash.providers.groq import GroqProvider
+
+    # The OpenAI SDK uses httpx in older supported versions and httpx2 in
+    # newer ones; the test transport must match the SDK's own response type.
+    sdk_base = importlib.import_module("openai._base_client")
+    sdk_http = getattr(sdk_base, "httpx2", None) or getattr(sdk_base, "httpx")
+    requests: list[dict[str, Any]] = []
+
+    async def respond(request: Any) -> Any:
+        body = json.loads(request.content)
+        assert request.url.path == "/openai/v1/chat/completions"
+        assert request.headers["authorization"] == "Bearer fixture-key"
+        assert body["model"] == "openai/gpt-oss-20b"
+        assert body["stream"] is True
+        assert body["max_completion_tokens"] == 512
+        assert not body.get("tools")
+        requests.append(body)
+
+        def frame(choices: list[dict[str, Any]], usage: Any = None) -> str:
+            return "data: " + json.dumps(
+                {
+                    "id": "chatcmpl-fixture",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "openai/gpt-oss-20b",
+                    "choices": choices,
+                    "usage": usage,
+                }
+            ) + "\n\n"
+
+        stream = frame(
+            [{"index": 0, "delta": {"content": "4"}, "finish_reason": None}]
+        )
+        stream += frame(
+            [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+        )
+        stream += frame([], {"prompt_tokens": 12, "completion_tokens": 5})
+        stream += "data: [DONE]\n\n"
+        return sdk_http.Response(
+            200, headers={"content-type": "text/event-stream"}, content=stream
+        )
+
+    monkeypatch.setattr(
+        groq_adapter,
+        "_owned_openai_http_client",
+        lambda **kwargs: openai.DefaultAsyncHttpxClient(
+            transport=sdk_http.MockTransport(respond), **kwargs
+        ),
+    )
+    inner = GroqProvider("openai/gpt-oss-20b", "fixture-key")
+    inner.configure_max_tokens(512)
+    provider = _BoundedReadOnlyProvider(inner, ())
+    try:
+        chunks = [
+            chunk
+            async for chunk in provider.stream_chat(
+                [{"role": "user", "content": "2 + 2?"}]
+            )
+        ]
+    finally:
+        await provider.aclose()
+    assert len(requests) == 1
+    assert len(chunks) == 1
+    assert chunks[0].content == "4"
+    assert chunks[0].stop_reason == finish_reason
+    assert chunks[0].prompt_tokens == 12
+    assert chunks[0].completion_tokens == 5
+    assert chunks[0].usage_source == "provider"
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.asyncio
+async def test_crew_preserves_groq_terminal_reason_with_usage_only_trailer(
+    monkeypatch: pytest.MonkeyPatch,
+    finish_reason: str,
+) -> None:
+    from ash.coworkers import _BoundedReadOnlyProvider
+    from ash.providers.groq import GroqProvider
+
+    usage = SimpleNamespace(prompt_tokens=24, completion_tokens=12)
+    client = _FakeOpenAIClient(
+        [
+            _openai_chunk(content="bounded answer"),
+            _openai_chunk(finish_reason=finish_reason),
+            _openai_chunk(usage=usage),
+        ]
+    )
+    monkeypatch.setattr("ash.providers.groq.openai.AsyncOpenAI", lambda **_: client)
+    inner = GroqProvider("openai/gpt-oss-20b", "synthetic-key")
+    provider = _BoundedReadOnlyProvider(inner, ())
+    output = [
+        chunk
+        async for chunk in provider.stream_chat(
+            [{"role": "user", "content": "synthetic evidence"}]
+        )
+    ]
+
+    assert len(output) == 1
+    assert output[0].content == "bounded answer"
+    assert output[0].stop_reason == finish_reason
+    assert completion_stop_category(output[0].stop_reason) == (
+        CompletionStopCategory.COMPLETE
+        if finish_reason == "stop"
+        else CompletionStopCategory.TRUNCATED
+    )
+    assert output[0].prompt_tokens == 24
+    assert output[0].completion_tokens == 12
+    assert output[0].usage_source == "provider"
+    await provider.aclose()
+
+
 @pytest.mark.parametrize("provider_name", ["deepseek", "groq"])
 @pytest.mark.asyncio
 async def test_openai_compatible_usage_chunk_before_choice_terminal_is_incomplete(
@@ -2401,7 +2533,7 @@ async def test_anthropic_default_endpoint_preserves_sdk_api_key_fallback(
     ]
 
     assert "".join(chunk.content for chunk in chunks) == "hello"
-    assert http_calls == [{"follow_redirects": False}]
+    assert http_calls == [{"follow_redirects": False, "trust_env": True}]
     assert len(sdk_calls) == 1
     assert sdk_calls[0]["max_retries"] == 0
     assert sdk_calls[0]["http_client"].kind == "anthropic-http"

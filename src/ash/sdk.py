@@ -25,11 +25,16 @@ from ash.core.events import EVENT_SCHEMA_VERSION, envelope_event, event_data
 from ash.core.goals import GoalRecord
 from ash.core.loop import AshLoop
 from ash.core.redaction import redact_text
-from ash.core.session import SessionLineage, SessionSummary
+from ash.core.session import (
+    CoworkerWorkerSessionBinding,
+    SessionLineage,
+    SessionStore,
+    SessionSummary,
+)
 from ash.mcp.interactions import ElicitationCallback, SamplingReview
 from ash.mcp.server import MCPServerConfig
 from ash.providers.base import ProviderABC
-from ash.runtime import build_runtime
+from ash.runtime import RuntimeCapabilityProfile, RuntimeComponents, build_runtime
 from ash.safety.trust import is_workspace_trusted
 from ash.ui.headless import HeadlessUI
 
@@ -242,10 +247,14 @@ class AshClient:
         mcp_sampling_review: SamplingReview | None = None,
         mcp_elicitation_callback: ElicitationCallback | None = None,
         run_maintenance: bool = True,
+        runtime_capability_profile: RuntimeCapabilityProfile = (
+            RuntimeCapabilityProfile.GENERAL
+        ),
     ) -> "AshClient":
         """Create a client, honoring persisted workspace trust unless overridden."""
 
         runtime_config = config or AshConfig.load()
+        runtime_config._require_runtime_available()
         if workspace is not None:
             runtime_config = runtime_config.model_copy(
                 update={"workspace_root": workspace.resolve()}
@@ -262,7 +271,56 @@ class AshClient:
             mcp_sampling_review=mcp_sampling_review,
             mcp_elicitation_callback=mcp_elicitation_callback,
             run_maintenance=run_maintenance,
+            runtime_capability_profile=runtime_capability_profile,
         )
+        return await cls._client_from_runtime(runtime, runtime_config, session_id)
+
+    @classmethod
+    async def _create_coworker_turn(
+        cls,
+        *,
+        config: AshConfig,
+        provider: ProviderABC,
+        session_id: str,
+        session_store: SessionStore,
+        binding: CoworkerWorkerSessionBinding,
+    ) -> "AshClient":
+        """Create a no-tools TURN_ONLY runtime for one bound coworker session."""
+
+        if session_id != binding.session_id:
+            raise ValueError("coworker worker session ID does not match its binding")
+        if config.workspace_root.expanduser().resolve(strict=True) != (
+            binding.runtime_project_root
+        ):
+            raise ValueError("runtime workspace does not match coworker worker binding")
+        try:
+            runtime = build_runtime(
+                config,
+                ui=HeadlessUI(output_format="text", stream=io.StringIO()),
+                provider=provider,
+                session_store=session_store,
+                run_maintenance=False,
+                runtime_capability_profile=RuntimeCapabilityProfile.TURN_ONLY,
+                _coworker_worker_binding=binding,
+            )
+        except BaseException as primary_error:
+            try:
+                await provider.aclose()
+            except BaseException as cleanup_error:
+                primary_error.add_note(
+                    "coworker provider cleanup failed "
+                    f"({type(cleanup_error).__name__})"
+                )
+            raise
+        return await cls._client_from_runtime(runtime, config, session_id)
+
+    @classmethod
+    async def _client_from_runtime(
+        cls,
+        runtime: RuntimeComponents,
+        runtime_config: AshConfig,
+        session_id: str | None,
+    ) -> "AshClient":
         client = cls(runtime.loop, runtime_config)
         try:
             await client.start(session_id)

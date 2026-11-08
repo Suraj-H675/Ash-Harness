@@ -7,16 +7,19 @@ import hashlib
 import io
 import json
 import os
+import re
 import sqlite3
 import stat
 import sys
 import threading
+import unicodedata
 import weakref
 from contextlib import asynccontextmanager, closing, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Final, Iterable, Iterator, Literal, Sequence, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -57,7 +60,7 @@ AuditAction = Literal[
     "permission_mode",
 ]
 AuditResult = Literal["APPROVED", "DENIED", "BLOCKED_BY_GUARD", "SUCCESS", "FAILURE"]
-CURRENT_SCHEMA_VERSION = 22
+CURRENT_SCHEMA_VERSION = 23
 TURN_JOURNAL_INPUT_OMITTED: Final[str] = "<prompt omitted>"
 SQLITE_INTEGER_MAX = 2**63 - 1
 SQLITE_REAL_MAX = sys.float_info.max
@@ -73,6 +76,73 @@ MAX_RECENT_SESSION_CONTEXT_CHARS = 2000
 MAX_SESSION_LIST_LIMIT = 1000
 MAX_SESSION_SEARCH_LIMIT = 100
 MAX_SESSION_SEARCH_QUERY_CHARS = 500
+
+
+def _validate_coworker_run_id(run_id: str) -> str:
+    if not isinstance(run_id, str):
+        raise ValueError("run_id must be a string")
+    normalized = run_id.strip()
+    if (
+        not normalized
+        or len(normalized) > 256
+        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+    ):
+        raise ValueError("run_id must be non-empty, bounded, and printable")
+    return normalized
+
+
+def _normalize_removal_session_ids(session_ids: Sequence[str]) -> tuple[str, ...]:
+    if not isinstance(session_ids, Sequence) or isinstance(session_ids, (str, bytes)):
+        raise SessionStorageError("session removal manifest is invalid")
+    normalized: list[str] = []
+    for session_id in session_ids:
+        if not isinstance(session_id, str):
+            raise SessionStorageError("session removal manifest is invalid")
+        try:
+            canonical = str(UUID(session_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise SessionStorageError("session removal manifest is invalid") from exc
+        if canonical != session_id:
+            raise SessionStorageError("session removal manifest is not canonical")
+        normalized.append(canonical)
+    if not normalized or len(normalized) != len(set(normalized)):
+        raise SessionStorageError("session removal manifest is empty or ambiguous")
+    return tuple(sorted(normalized))
+
+
+def _normalized_sql(sql: str) -> str:
+    normalized = re.sub(r"\s+", " ", sql.strip()).casefold()
+    return re.sub(r"\s*([(),])\s*", r"\1", normalized)
+
+
+_SESSION_REMOVAL_TRIGGERS = {
+    "messages_fts_delete": (
+        "messages",
+        _normalized_sql(
+            "CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN "
+            "INSERT INTO messages_fts(messages_fts, rowid, content) "
+            "VALUES ('delete', old.message_id, old.content); END"
+        ),
+    ),
+    "messages_fts_insert": (
+        "messages",
+        _normalized_sql(
+            "CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN "
+            "INSERT INTO messages_fts(rowid, content) "
+            "VALUES (new.message_id, new.content); END"
+        ),
+    ),
+    "messages_fts_update": (
+        "messages",
+        _normalized_sql(
+            "CREATE TRIGGER messages_fts_update AFTER UPDATE OF content ON messages BEGIN "
+            "INSERT INTO messages_fts(messages_fts, rowid, content) "
+            "VALUES ('delete', old.message_id, old.content); "
+            "INSERT INTO messages_fts(rowid, content) "
+            "VALUES (new.message_id, new.content); END"
+        ),
+    ),
+}
 MAX_SESSION_SEARCH_TERMS = 20
 MAX_SESSION_SEARCH_EXCERPT_CHARS = 1200
 MAX_SESSION_PREVIEW_MESSAGES = 3
@@ -457,6 +527,59 @@ class Session(BaseModel):
         self._resident_message_offset += durable_count
 
 
+@dataclass(frozen=True)
+class CoworkerSessionBinding:
+    """A session association admitted through the owner-checked Crew seam."""
+
+    owner_id: str
+    coworker_id: str
+    session_id: str
+    canonical_session_id: str
+    run_id: str | None
+
+
+@dataclass(frozen=True)
+class SessionRemovalInventory:
+    """Exact validated session IDs and the unrelated rows a purge preserves."""
+
+    session_ids: tuple[str, ...]
+    unrelated_session_count: int
+
+
+@dataclass
+class _SessionRemovalLeaseSet:
+    store: "SessionStore"
+    session_ids: tuple[str, ...]
+    leases: tuple["_SessionRuntimeLease", ...]
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for lease in reversed(self.leases):
+            lease.close()
+
+
+@dataclass(frozen=True)
+class CoworkerWorkerSessionBinding:
+    """Bind one persisted coworker run to its fixed physical worker root.
+
+    The owner and coworker IDs snapshot the database relationship. They are not
+    authentication; the parent must validate the owner UID before dispatch.
+    """
+
+    session_id: str
+    canonical_session_id: str
+    owner_id: str
+    coworker_id: str
+    project_key: str
+    runtime_project_root: Path
+    runtime_directory_identity: tuple[int, int]
+    database_path: str
+    database_identity: tuple[int, int, int, int]
+
+
 MAX_SESSION_TITLE_CHARS = 256
 _SESSION_PERMISSION_MODES = frozenset(
     {"", "interactive", "auto_edit", "plan", "auto_approve", "dry_run"}
@@ -767,6 +890,19 @@ def _normalize_session_search_query(query: str) -> str:
             "session search query exceeds "
             f"{MAX_SESSION_SEARCH_QUERY_CHARS} characters"
         )
+    return normalized
+
+
+def normalize_session_search_query(query: str) -> str:
+    """Validate text before a caller spends work preparing a scoped search."""
+
+    if not isinstance(query, str) or any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs"}
+        for character in query
+    ):
+        raise ValueError("session search query must be printable text")
+    normalized = _normalize_session_search_query(query)
+    _session_search_match_query(normalized)
     return normalized
 
 
@@ -1185,6 +1321,46 @@ class SessionStore:
                 "Run 'ash storage check' and restore a backup if needed."
             ) from exc
 
+    @classmethod
+    def open_existing(cls, db_path: str | Path) -> "SessionStore":
+        """Pin an existing current-schema database without migration or backup."""
+
+        store = cls.__new__(cls)
+        try:
+            store._database = PinnedSQLiteDatabase.prepare(
+                _normalize_db_path(db_path),
+                label="session database",
+                create=False,
+            )
+            store.db_path = str(store._database.path)
+            version = store._schema_version()
+            if version != CURRENT_SCHEMA_VERSION:
+                raise SessionStorageError(
+                    "session database schema is not current; removal requires "
+                    "an explicit prior open and migration"
+                )
+        except (SessionStorageError, SQLitePathError) as exc:
+            if isinstance(exc, SQLitePathError):
+                raise SessionStorageError(str(exc)) from exc
+            raise
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            raise SessionStorageError(
+                f"Could not inspect existing session database: {type(exc).__name__}"
+            ) from exc
+        return store
+
+    @property
+    def database_identity(self) -> tuple[int, int, int, int]:
+        """Return the pinned parent and file device/inode identities."""
+
+        database = self._database
+        return (
+            database.parent_device,
+            database.parent_inode,
+            database.file_device,
+            database.file_inode,
+        )
+
     def acquire_session_runtime_lease(self, session_id: str) -> _SessionRuntimeLease:
         """Fail fast when another process is actively mutating this session."""
 
@@ -1249,6 +1425,633 @@ class SessionStore:
         """Open a coordinated connection bound to this store's database identity."""
 
         return self._connect()
+
+    def _connect_durable(self) -> sqlite3.Connection:
+        """Fsync removal commits before the separate directory completion marker."""
+
+        connection = self._connect()
+        try:
+            connection.execute("PRAGMA synchronous=FULL;")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    def coworker_session_removal_inventory(
+        self,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        canonical_session_id: str,
+        project_path: str | Path,
+    ) -> SessionRemovalInventory:
+        """Return only the exact validated session set bound to one coworker."""
+
+        self._validate_coworker_identity(owner_id, coworker_id)
+        project_key = normalize_project_path(project_path)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT owner_id, coworker_id, session_id, canonical_session_id, "
+                "kind, run_id FROM coworker_session_bindings "
+                "WHERE owner_id = ? AND coworker_id = ? ORDER BY session_id",
+                (owner_id, coworker_id),
+            ).fetchall()
+            if not rows:
+                raise SessionStorageError("coworker session ownership is missing")
+            session_ids = tuple(str(row["session_id"]) for row in rows)
+            if (
+                len(session_ids) != len(set(session_ids))
+                or canonical_session_id not in session_ids
+            ):
+                raise SessionStorageError("coworker session ownership is ambiguous")
+            canonical_rows = [row for row in rows if row["kind"] == "conversation"]
+            if len(canonical_rows) != 1:
+                raise SessionStorageError("coworker canonical session is ambiguous")
+            for row in rows:
+                if (
+                    row["owner_id"] != owner_id
+                    or row["coworker_id"] != coworker_id
+                    or row["canonical_session_id"] != canonical_session_id
+                ):
+                    raise SessionStorageError("coworker session owner binding changed")
+                if row["kind"] == "conversation":
+                    if (
+                        row["session_id"] != canonical_session_id
+                        or row["run_id"] is not None
+                    ):
+                        raise SessionStorageError("coworker canonical session is malformed")
+                elif row["kind"] == "background":
+                    if not isinstance(row["run_id"], str) or not row["run_id"]:
+                        raise SessionStorageError("coworker run session is malformed")
+                else:
+                    raise SessionStorageError("coworker session kind is unknown")
+            self._require_exclusive_coworker_bindings(
+                conn,
+                owner_id=owner_id,
+                coworker_id=coworker_id,
+                canonical_session_id=canonical_session_id,
+                session_ids=session_ids,
+            )
+            present = self._validate_exact_session_rows(
+                conn,
+                session_ids=session_ids,
+                project_key=project_key,
+                allow_absent=False,
+            )
+            if not present:
+                raise SessionStorageError("coworker sessions are already absent")
+            unrelated = self._unrelated_session_count(conn, session_ids)
+        return SessionRemovalInventory(session_ids, unrelated)
+
+    def count_unrelated_sessions_for_removal(
+        self, session_ids: Sequence[str],
+    ) -> int:
+        normalized_ids = _normalize_removal_session_ids(session_ids)
+        with closing(self._connect()) as conn:
+            return self._unrelated_session_count(conn, normalized_ids)
+
+    def count_sessions_for_removal(self) -> int:
+        """Count preserved sessions without exposing their stored content."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM sessions").fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    @contextmanager
+    def hold_removal_leases(
+        self, session_ids: Sequence[str],
+    ) -> Iterator[_SessionRemovalLeaseSet]:
+        """Hold every exact session runtime lease across a coordinated removal."""
+
+        normalized_ids = _normalize_removal_session_ids(session_ids)
+        leases: list[_SessionRuntimeLease] = []
+        lease_set: _SessionRemovalLeaseSet | None = None
+        try:
+            for session_id in normalized_ids:
+                lease = self._try_acquire_session_runtime_lease(session_id)
+                if lease is None:
+                    raise SessionStorageError("a target session runtime lease is busy")
+                leases.append(lease)
+            lease_set = _SessionRemovalLeaseSet(self, normalized_ids, tuple(leases))
+            yield lease_set
+        finally:
+            if lease_set is not None:
+                lease_set.closed = True
+            for lease in reversed(leases):
+                lease.close()
+
+    def validate_coworker_session_removal_set(
+        self,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        canonical_session_id: str,
+        project_path: str | Path,
+        session_ids: Sequence[str],
+    ) -> bool:
+        """Validate a manifest's profile sessions as all present or all absent."""
+
+        self._validate_coworker_identity(owner_id, coworker_id)
+        project_key = normalize_project_path(project_path)
+        normalized_ids = _normalize_removal_session_ids(session_ids)
+        with closing(self._connect()) as conn:
+            present = self._validate_exact_session_rows(
+                conn,
+                session_ids=normalized_ids,
+                project_key=project_key,
+                allow_absent=True,
+            )
+            self._require_exclusive_coworker_bindings(
+                conn,
+                owner_id=owner_id,
+                coworker_id=coworker_id,
+                canonical_session_id=canonical_session_id,
+                session_ids=normalized_ids,
+                allow_absent=not present,
+            )
+        return present
+
+
+    @staticmethod
+    def _require_supported_removal_triggers(conn: sqlite3.Connection) -> None:
+        actual = {
+            str(row["name"]): (
+                str(row["tbl_name"]),
+                _normalized_sql(str(row["sql"])),
+            )
+            for row in conn.execute(
+                "SELECT name, tbl_name, sql FROM sqlite_master "
+                "WHERE type = 'trigger'"
+            )
+        }
+        if actual != _SESSION_REMOVAL_TRIGGERS:
+            raise SessionStorageError(
+                "session database has unknown triggers; refusing session removal"
+            )
+
+    @staticmethod
+    def _require_sessions_are_quiescent(
+        conn: sqlite3.Connection,
+        session_ids: tuple[str, ...],
+    ) -> None:
+        placeholders = ",".join("?" for _ in session_ids)
+        unfinished_turn = conn.execute(
+            "SELECT 1 FROM turn_journal WHERE session_id IN "
+            f"({placeholders}) AND status NOT IN ('completed', 'interrupted') LIMIT 1",
+            session_ids,
+        ).fetchone()
+        if unfinished_turn is not None:
+            raise SessionStorageError("a target session has an unfinished turn")
+
+        active_mcp_task = conn.execute(
+            "SELECT 1 FROM mcp_tasks WHERE session_id IN "
+            f"({placeholders}) AND status NOT IN "
+            "('completed', 'cancelled', 'failed') LIMIT 1",
+            session_ids,
+        ).fetchone()
+        if active_mcp_task is not None:
+            raise SessionStorageError(
+                "a target session has an active or unknown MCP task"
+            )
+
+        tool_calls = conn.execute(
+            "SELECT approved, dispatched, executed FROM tool_calls WHERE session_id IN "
+            f"({placeholders})",
+            session_ids,
+        ).fetchall()
+        for call in tool_calls:
+            flags = (call["approved"], call["dispatched"], call["executed"])
+            if any(value not in (0, 1) for value in flags):
+                raise SessionStorageError(
+                    "a target session has an invalid tool-call state"
+                )
+            approved, dispatched, executed = (int(value) for value in flags)
+            if dispatched and not executed:
+                raise SessionStorageError(
+                    "a target session has a dispatched tool with an unknown outcome"
+                )
+            if executed and (not dispatched or not approved):
+                raise SessionStorageError(
+                    "a target session has an inconsistent tool-call state"
+                )
+
+    def remove_coworker_sessions(
+        self,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        canonical_session_id: str,
+        project_path: str | Path,
+        session_ids: Sequence[str],
+        expected_database_identity: tuple[int, int, int, int],
+        _lease_set: _SessionRemovalLeaseSet | None = None,
+    ) -> bool:
+        """Atomically delete one exact owner-bound session set or accept its absence."""
+
+        self._validate_coworker_identity(owner_id, coworker_id)
+        project_key = normalize_project_path(project_path)
+        normalized_ids = _normalize_removal_session_ids(session_ids)
+        if _lease_set is None:
+            with self.hold_removal_leases(normalized_ids) as lease_set:
+                return self.remove_coworker_sessions(
+                    owner_id=owner_id,
+                    coworker_id=coworker_id,
+                    canonical_session_id=canonical_session_id,
+                    project_path=project_path,
+                    session_ids=normalized_ids,
+                    expected_database_identity=expected_database_identity,
+                    _lease_set=lease_set,
+                )
+        if (
+            _lease_set.store is not self
+            or _lease_set.session_ids != normalized_ids
+            or _lease_set.closed
+        ):
+            raise SessionStorageError("profile session removal lease set is invalid")
+        if self.database_identity != expected_database_identity:
+            raise SessionStorageError("profile session database identity changed")
+        with closing(self._connect_durable()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if self.database_identity != expected_database_identity:
+                raise SessionStorageError("profile session database identity changed")
+            present = self._validate_exact_session_rows(
+                conn,
+                session_ids=normalized_ids,
+                project_key=project_key,
+                allow_absent=True,
+            )
+            self._require_exclusive_coworker_bindings(
+                conn,
+                owner_id=owner_id,
+                coworker_id=coworker_id,
+                canonical_session_id=canonical_session_id,
+                session_ids=normalized_ids,
+                allow_absent=not present,
+            )
+            if not present:
+                conn.commit()
+                return False
+            placeholders = ",".join("?" for _ in normalized_ids)
+            cursor = conn.execute(
+                f"DELETE FROM sessions WHERE session_id IN ({placeholders})",
+                normalized_ids,
+            )
+            if cursor.rowcount != len(normalized_ids):
+                raise SessionStorageError("profile session deletion was incomplete")
+            self._delete_owned_session_dependents(conn, normalized_ids)
+            conn.commit()
+        return True
+
+    def validate_native_tool_session_removal_set(
+        self,
+        *,
+        project_path: str | Path,
+        session_ids: Sequence[str],
+    ) -> bool:
+        """Validate exact validated native-tool sessions as all present or absent."""
+
+        project_key = normalize_project_path(project_path)
+        normalized_ids = _normalize_removal_session_ids(session_ids)
+        with closing(self._connect()) as conn:
+            present = self._validate_exact_session_rows(
+                conn,
+                session_ids=normalized_ids,
+                project_key=project_key,
+                allow_absent=True,
+            )
+            self._require_unbound_native_sessions(
+                conn, normalized_ids, allow_absent=not present,
+            )
+        return present
+
+    def native_tool_session_removal_inventory(
+        self,
+        *,
+        project_path: str | Path,
+        session_ids: Sequence[str],
+    ) -> SessionRemovalInventory:
+        """Validate the target native-tool sessions and count preserved sessions."""
+
+        project_key = normalize_project_path(project_path)
+        normalized_ids = _normalize_removal_session_ids(session_ids)
+        with closing(self._connect()) as conn:
+            present = self._validate_exact_session_rows(
+                conn,
+                session_ids=normalized_ids,
+                project_key=project_key,
+                allow_absent=False,
+            )
+            if not present:
+                raise SessionStorageError("native tool sessions are already absent")
+            self._require_unbound_native_sessions(conn, normalized_ids)
+            unrelated = self._unrelated_session_count(conn, normalized_ids)
+        return SessionRemovalInventory(normalized_ids, unrelated)
+
+    def remove_native_tool_sessions(
+        self,
+        *,
+        project_path: str | Path,
+        session_ids: Sequence[str],
+        expected_database_identity: tuple[int, int, int, int],
+        _lease_set: _SessionRemovalLeaseSet | None = None,
+    ) -> bool:
+        """Atomically delete only the exact previously validated tool-session set."""
+
+        project_key = normalize_project_path(project_path)
+        normalized_ids = _normalize_removal_session_ids(session_ids)
+        if _lease_set is None:
+            with self.hold_removal_leases(normalized_ids) as lease_set:
+                return self.remove_native_tool_sessions(
+                    project_path=project_path,
+                    session_ids=normalized_ids,
+                    expected_database_identity=expected_database_identity,
+                    _lease_set=lease_set,
+                )
+        if (
+            _lease_set.store is not self
+            or _lease_set.session_ids != normalized_ids
+            or _lease_set.closed
+        ):
+            raise SessionStorageError("native session removal lease set is invalid")
+        if self.database_identity != expected_database_identity:
+            raise SessionStorageError("native tool session database identity changed")
+        with closing(self._connect_durable()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if self.database_identity != expected_database_identity:
+                raise SessionStorageError("native tool session database identity changed")
+            present = self._validate_exact_session_rows(
+                conn,
+                session_ids=normalized_ids,
+                project_key=project_key,
+                allow_absent=True,
+            )
+            self._require_unbound_native_sessions(
+                conn, normalized_ids, allow_absent=not present,
+            )
+            if not present:
+                conn.commit()
+                return False
+            placeholders = ",".join("?" for _ in normalized_ids)
+            cursor = conn.execute(
+                f"DELETE FROM sessions WHERE session_id IN ({placeholders})",
+                normalized_ids,
+            )
+            if cursor.rowcount != len(normalized_ids):
+                raise SessionStorageError("native tool session deletion was incomplete")
+            self._delete_owned_session_dependents(conn, normalized_ids)
+            conn.commit()
+        return True
+
+    @staticmethod
+    def _require_exclusive_coworker_bindings(
+        conn: sqlite3.Connection,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        canonical_session_id: str,
+        session_ids: tuple[str, ...],
+        allow_absent: bool = False,
+    ) -> None:
+        placeholders = ",".join("?" for _ in session_ids)
+        referenced = conn.execute(
+            "SELECT owner_id, coworker_id, session_id, canonical_session_id, "
+            "kind, run_id FROM coworker_session_bindings "
+            f"WHERE session_id IN ({placeholders}) "
+            f"OR canonical_session_id IN ({placeholders})",
+            (*session_ids, *session_ids),
+        ).fetchall()
+        own = [
+            row for row in referenced
+            if row["owner_id"] == owner_id and row["coworker_id"] == coworker_id
+        ]
+        if any(row not in own for row in referenced):
+            raise SessionStorageError("another coworker references a target session")
+        if allow_absent:
+            if own:
+                raise SessionStorageError("absent profile sessions retain ownership rows")
+            remaining = conn.execute(
+                "SELECT session_id FROM coworker_session_bindings "
+                "WHERE owner_id = ? AND coworker_id = ?",
+                (owner_id, coworker_id),
+            ).fetchall()
+            if remaining:
+                raise SessionStorageError("profile session ownership set is partial")
+            return
+        if len(own) != len(session_ids):
+            raise SessionStorageError("profile session ownership set is incomplete")
+        by_session = {str(row["session_id"]): row for row in own}
+        if set(by_session) != set(session_ids):
+            raise SessionStorageError("profile session ownership set changed")
+        for session_id, row in by_session.items():
+            if row["canonical_session_id"] != canonical_session_id:
+                raise SessionStorageError("profile session canonical binding changed")
+            if row["kind"] == "conversation":
+                if session_id != canonical_session_id or row["run_id"] is not None:
+                    raise SessionStorageError("profile conversation binding is malformed")
+            elif row["kind"] == "background":
+                if not isinstance(row["run_id"], str) or not row["run_id"]:
+                    raise SessionStorageError("profile run binding is malformed")
+            else:
+                raise SessionStorageError("profile session binding kind is unknown")
+        if sum(row["kind"] == "conversation" for row in own) != 1:
+            raise SessionStorageError("profile canonical session binding is ambiguous")
+
+    @staticmethod
+    def _require_unbound_native_sessions(
+        conn: sqlite3.Connection,
+        session_ids: tuple[str, ...],
+        *,
+        allow_absent: bool = False,
+    ) -> None:
+        placeholders = ",".join("?" for _ in session_ids)
+        references = conn.execute(
+            "SELECT 1 FROM coworker_session_bindings "
+            f"WHERE session_id IN ({placeholders}) "
+            f"OR canonical_session_id IN ({placeholders}) LIMIT 1",
+            (*session_ids, *session_ids),
+        ).fetchone()
+        if references is not None:
+            raise SessionStorageError("native tool session is bound to a coworker")
+        if allow_absent and references is not None:
+            raise SessionStorageError("absent native tool sessions retain ownership rows")
+
+    @staticmethod
+    def _unrelated_session_count(
+        conn: sqlite3.Connection,
+        session_ids: tuple[str, ...],
+    ) -> int:
+        placeholders = ",".join("?" for _ in session_ids)
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM sessions "
+            f"WHERE session_id NOT IN ({placeholders})",
+            session_ids,
+        ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
+    @staticmethod
+    def _validate_exact_session_rows(
+        conn: sqlite3.Connection,
+        *,
+        session_ids: tuple[str, ...],
+        project_key: str,
+        allow_absent: bool,
+    ) -> bool:
+        placeholders = ",".join("?" for _ in session_ids)
+        rows = conn.execute(
+            "SELECT session_id, project_key, parent_session_id, root_session_id "
+            "FROM sessions "
+            f"WHERE session_id IN ({placeholders}) ORDER BY session_id",
+            session_ids,
+        ).fetchall()
+        if len(rows) == len(session_ids):
+            for row in rows:
+                session_id = str(row["session_id"])
+                if str(row["project_key"]) != project_key:
+                    raise SessionStorageError("target session belongs to another workspace")
+                if (
+                    row["parent_session_id"] is not None
+                    or row["root_session_id"] not in {None, "", session_id}
+                ):
+                    raise SessionStorageError("target session has a non-isolated lineage")
+            present = True
+        elif not rows and allow_absent:
+            present = False
+        else:
+            raise SessionStorageError("session target set is mixed or incomplete")
+
+        if present:
+            SessionStore._require_supported_removal_triggers(conn)
+            SessionStore._require_sessions_are_quiescent(conn, session_ids)
+
+        target_placeholders = ",".join("?" for _ in session_ids)
+        external = conn.execute(
+            "SELECT 1 FROM sessions WHERE session_id NOT IN "
+            f"({target_placeholders}) AND (parent_session_id IN "
+            f"({target_placeholders}) OR root_session_id IN ({target_placeholders})) "
+            "LIMIT 1",
+            (*session_ids, *session_ids, *session_ids),
+        ).fetchone()
+        if external is not None:
+            raise SessionStorageError("another session belongs to a target lineage")
+
+        for table_row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        ):
+            table = str(table_row["name"])
+            quoted_table = '"' + table.replace('"', '""') + '"'
+            columns = {
+                str(column["name"])
+                for column in conn.execute(f"PRAGMA table_info({quoted_table})")
+            }
+            if table == "sessions":
+                continue
+            for column in columns:
+                if column in {"parent_session_id", "root_session_id"}:
+                    row = conn.execute(
+                        f"SELECT 1 FROM {quoted_table} WHERE \"{column}\" "
+                        f"IN ({target_placeholders}) LIMIT 1",
+                        session_ids,
+                    ).fetchone()
+                    if row is not None:
+                        raise SessionStorageError(
+                            "a session metadata row references a target lineage"
+                        )
+            for reference_column in columns:
+                if "session_id" not in reference_column.casefold():
+                    continue
+                if table == "coworker_session_bindings" and reference_column == "canonical_session_id":
+                    # Background bindings intentionally reference their canonical
+                    # conversation session.
+                    continue
+                row = conn.execute(
+                    f"SELECT 1 FROM {quoted_table} WHERE \"{reference_column}\" "
+                    f"IN ({target_placeholders}) LIMIT 1",
+                    session_ids,
+                ).fetchone()
+                if row is None:
+                    continue
+                if table == "audit_logs" and reference_column == "session_id":
+                    columns_info = conn.execute(
+                        'PRAGMA table_info("audit_logs")'
+                    ).fetchall()
+                    expected_columns = {
+                        "log_id", "session_id", "timestamp", "action_type",
+                        "target_resource", "details_json", "result",
+                        "sha256_hash", "previous_hash",
+                    }
+                    if (
+                        {str(column["name"]) for column in columns_info}
+                        != expected_columns
+                        or sum(
+                            int(column["pk"]) > 0
+                            for column in columns_info
+                        ) != 1
+                        or not any(
+                            column["name"] == "log_id" and int(column["pk"]) == 1
+                            for column in columns_info
+                        )
+                    ):
+                        raise SessionStorageError(
+                            "audit log schema is unknown; refusing session removal"
+                        )
+                    if not present:
+                        raise SessionStorageError(
+                            "absent sessions retain owned audit rows"
+                        )
+                    continue
+                if reference_column != "session_id":
+                    raise SessionStorageError(
+                        "a session store contains a cross-session reference to target data"
+                    )
+                foreign_keys = conn.execute(
+                    f"PRAGMA foreign_key_list({quoted_table})"
+                ).fetchall()
+                cascades = any(
+                    str(key["table"]) == "sessions"
+                    and str(key["from"]) == reference_column
+                    and str(key["to"]) == "session_id"
+                    and str(key["on_delete"]).upper() == "CASCADE"
+                    for key in foreign_keys
+                )
+                if not cascades:
+                    raise SessionStorageError(
+                        "a session store row references target data without cascade ownership"
+                    )
+                if not present:
+                    raise SessionStorageError(
+                        "absent sessions retain dependent session data"
+                    )
+        return present
+
+    @staticmethod
+    def _delete_owned_session_dependents(
+        conn: sqlite3.Connection,
+        session_ids: tuple[str, ...],
+    ) -> None:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_logs'"
+        ).fetchone()
+        if table is None:
+            raise SessionStorageError("audit log table is missing from session store")
+        rows = conn.execute('PRAGMA table_info("audit_logs")').fetchall()
+        expected_columns = {
+            "log_id", "session_id", "timestamp", "action_type",
+            "target_resource", "details_json", "result", "sha256_hash",
+            "previous_hash",
+        }
+        if (
+            {str(row["name"]) for row in rows} != expected_columns
+            or not any(row["name"] == "log_id" and int(row["pk"]) == 1 for row in rows)
+        ):
+            raise SessionStorageError(
+                "audit log schema is unknown; refusing session removal"
+            )
+        placeholders = ",".join("?" for _ in session_ids)
+        conn.execute(
+            f"DELETE FROM audit_logs WHERE session_id IN ({placeholders})",
+            session_ids,
+        )
 
     def _schema_version(self) -> int:
         if not Path(self.db_path).exists():
@@ -1316,6 +2119,8 @@ class SessionStore:
                 self._migrate_v21(conn)
             if from_version < 22:
                 self._migrate_v22(conn)
+            if from_version < 23:
+                self._migrate_v23(conn)
 
     def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         """Migrate databases created before explicit schema tracking."""
@@ -1921,6 +2726,50 @@ class SessionStore:
             (22, _serialize_datetime(_utc_now())),
         )
 
+    def _migrate_v23(self, conn: sqlite3.Connection) -> None:
+        """Bind selected Ash sessions to one persisted coworker identity."""
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coworker_session_bindings (
+                owner_id TEXT NOT NULL,
+                coworker_id TEXT NOT NULL,
+                session_id TEXT NOT NULL UNIQUE,
+                canonical_session_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('conversation', 'background')),
+                run_id TEXT,
+                created_at TIMESTAMP NOT NULL,
+                PRIMARY KEY(owner_id, coworker_id, session_id),
+                FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(canonical_session_id) REFERENCES sessions(session_id)
+                    ON DELETE CASCADE,
+                CHECK(
+                    (kind = 'conversation' AND run_id IS NULL
+                     AND session_id = canonical_session_id)
+                    OR
+                    (kind = 'background' AND run_id IS NOT NULL
+                     AND session_id <> canonical_session_id)
+                )
+            );
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_coworker_one_conversation "
+            "ON coworker_session_bindings(coworker_id) "
+            "WHERE kind = 'conversation'"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_coworker_run_identity "
+            "ON coworker_session_bindings(coworker_id, run_id) "
+            "WHERE kind = 'background'"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) "
+            "VALUES (?, ?)",
+            (23, _serialize_datetime(_utc_now())),
+        )
+
     def backup(
         self, destination: str | Path | None = None, *, reason: str = "manual"
     ) -> Path:
@@ -2367,6 +3216,260 @@ class SessionStore:
                 permission_mode=permission_mode,
             )
 
+    @staticmethod
+    def _validate_coworker_identity(owner_id: str, coworker_id: str) -> None:
+        if not owner_id or len(owner_id) > 128 or any(ord(c) < 32 for c in owner_id):
+            raise ValueError("owner_id must be non-empty, bounded, and printable")
+        if not coworker_id or len(coworker_id) > 64:
+            raise ValueError("coworker_id must be non-empty and bounded")
+
+    @staticmethod
+    def _coworker_binding_from_row(row: sqlite3.Row) -> CoworkerSessionBinding:
+        return CoworkerSessionBinding(
+            owner_id=str(row["owner_id"]),
+            coworker_id=str(row["coworker_id"]),
+            session_id=str(row["session_id"]),
+            canonical_session_id=str(row["canonical_session_id"]),
+            run_id=str(row["run_id"]) if row["run_id"] is not None else None,
+        )
+
+    @staticmethod
+    def _require_project_session(
+        conn: sqlite3.Connection,
+        session_id: str,
+        canonical_project_path: str,
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT session_id, project_key FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise SessionStorageError("coworker session association is incomplete")
+        if str(row["project_key"]) != canonical_project_path:
+            raise SessionStorageError(
+                "coworker session belongs to a different workspace"
+            )
+        return row
+
+    @staticmethod
+    def _reject_unowned_sessions(conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM sessions s "
+            "LEFT JOIN coworker_session_bindings b ON b.session_id = s.session_id "
+            "WHERE b.session_id IS NULL"
+        ).fetchone()
+        if row is not None and int(row["count"]):
+            raise SessionStorageError(
+                "coworker profile contains unowned sessions; use an empty isolated profile"
+            )
+
+    def require_empty_for_coworker_profile(self) -> None:
+        """Refuse to share a named profile database with existing Ash history."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM sessions").fetchone()
+            if row is not None and int(row["count"]):
+                raise SessionStorageError(
+                    "coworker profile contains existing sessions; use an empty "
+                    "isolated profile"
+                )
+
+    def ensure_coworker_conversation(
+        self,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        session_id: str,
+        project_path: str | Path,
+    ) -> Session:
+        """Create or verify the one canonical session for a coworker.
+
+        The supplied session ID is preallocated in the central directory before
+        this method is called, making a crash between the two databases
+        restart-repairable. Existing unowned profile history is never adopted.
+        """
+
+        self._validate_coworker_identity(owner_id, coworker_id)
+        canonical_project_path = normalize_project_path(project_path)
+        if not session_id or len(session_id) > 64:
+            raise ValueError("session_id must be non-empty and bounded")
+
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM coworker_session_bindings "
+                "WHERE owner_id = ? AND coworker_id = ? AND kind = 'conversation'",
+                (owner_id, coworker_id),
+            ).fetchone()
+            if existing is not None:
+                binding = self._coworker_binding_from_row(existing)
+                if (
+                    binding.session_id != session_id
+                    or binding.canonical_session_id != session_id
+                ):
+                    raise SessionStorageError(
+                        "coworker already has a different canonical session"
+                    )
+                self._require_project_session(conn, session_id, canonical_project_path)
+                return self.load_session(session_id)
+
+            self._reject_unowned_sessions(conn)
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone():
+                raise SessionStorageError(
+                    "preallocated coworker session ID is already in use"
+                )
+            session = self._create_session_record(
+                conn,
+                canonical_project_path,
+                session_id=session_id,
+            )
+            conn.execute(
+                "INSERT INTO coworker_session_bindings "
+                "(owner_id, coworker_id, session_id, canonical_session_id, kind, "
+                "run_id, created_at) VALUES (?, ?, ?, ?, 'conversation', NULL, ?)",
+                (
+                    owner_id,
+                    coworker_id,
+                    session_id,
+                    session_id,
+                    _serialize_datetime(_utc_now()),
+                ),
+            )
+            return session
+
+    def get_coworker_run(
+        self,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        run_id: str,
+        canonical_session_id: str,
+        project_path: str | Path,
+    ) -> CoworkerSessionBinding | None:
+        """Read an existing run association without acquiring a runtime lease."""
+
+        self._validate_coworker_identity(owner_id, coworker_id)
+        canonical_project_path = normalize_project_path(project_path)
+        normalized_run_id = _validate_coworker_run_id(run_id)
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM coworker_session_bindings "
+                "WHERE owner_id = ? AND coworker_id = ? AND kind = 'background' "
+                "AND run_id = ?",
+                (owner_id, coworker_id, normalized_run_id),
+            ).fetchone()
+            if row is None:
+                return None
+            binding = self._coworker_binding_from_row(row)
+            if binding.canonical_session_id != canonical_session_id:
+                raise SessionStorageError(
+                    "coworker run is bound to a different canonical session"
+                )
+            self._require_project_session(
+                conn, binding.session_id, canonical_project_path
+            )
+            return binding
+
+    def ensure_coworker_run(
+        self,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        run_id: str,
+        canonical_session_id: str,
+        project_path: str | Path,
+    ) -> CoworkerSessionBinding:
+        """Create or return an isolated run session linked to the canonical ID."""
+
+        self._validate_coworker_identity(owner_id, coworker_id)
+        canonical_project_path = normalize_project_path(project_path)
+        normalized_run_id = _validate_coworker_run_id(run_id)
+
+        with closing(self._connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM coworker_session_bindings "
+                "WHERE owner_id = ? AND coworker_id = ? AND kind = 'background' "
+                "AND run_id = ?",
+                (owner_id, coworker_id, normalized_run_id),
+            ).fetchone()
+            if existing is not None:
+                binding = self._coworker_binding_from_row(existing)
+                if binding.canonical_session_id != canonical_session_id:
+                    raise SessionStorageError(
+                        "coworker run is bound to a different canonical session"
+                    )
+                self._require_project_session(
+                    conn, binding.session_id, canonical_project_path
+                )
+                return binding
+
+            canonical = conn.execute(
+                "SELECT * FROM coworker_session_bindings "
+                "WHERE owner_id = ? AND coworker_id = ? AND kind = 'conversation'",
+                (owner_id, coworker_id),
+            ).fetchone()
+            if canonical is None or str(canonical["session_id"]) != canonical_session_id:
+                raise SessionStorageError(
+                    "coworker canonical conversation is not bound"
+                )
+            self._require_project_session(
+                conn, canonical_session_id, canonical_project_path
+            )
+            self._reject_unowned_sessions(conn)
+            session_id = str(uuid4())
+            session = self._create_session_record(
+                conn,
+                canonical_project_path,
+                session_id=session_id,
+            )
+            conn.execute(
+                "INSERT INTO coworker_session_bindings "
+                "(owner_id, coworker_id, session_id, canonical_session_id, kind, "
+                "run_id, created_at) VALUES (?, ?, ?, ?, 'background', ?, ?)",
+                (
+                    owner_id,
+                    coworker_id,
+                    session.session_id,
+                    canonical_session_id,
+                    normalized_run_id,
+                    _serialize_datetime(_utc_now()),
+                ),
+            )
+            return CoworkerSessionBinding(
+                owner_id=owner_id,
+                coworker_id=coworker_id,
+                session_id=session.session_id,
+                canonical_session_id=canonical_session_id,
+                run_id=normalized_run_id,
+            )
+
+    def load_coworker_session(
+        self,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        session_id: str,
+        project_path: str | Path,
+    ) -> tuple[Session, CoworkerSessionBinding]:
+        """Load only a session explicitly associated with this owner and coworker."""
+
+        self._validate_coworker_identity(owner_id, coworker_id)
+        canonical_project_path = normalize_project_path(project_path)
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM coworker_session_bindings "
+                "WHERE owner_id = ? AND coworker_id = ? AND session_id = ?",
+                (owner_id, coworker_id, session_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError("coworker session not found")
+            binding = self._coworker_binding_from_row(row)
+            self._require_project_session(conn, session_id, canonical_project_path)
+        return self.load_session(session_id), binding
+
     def load_session(
         self,
         session_id: str,
@@ -2516,6 +3619,82 @@ class SessionStore:
             raise KeyError(f"Session not found: {session_id}")
         if str(row["project_key"]) != project_key:
             raise ValueError("session belongs to a different workspace")
+
+    def _bind_coworker_worker_session(
+        self,
+        session_id: str,
+        runtime_project_root: str | Path,
+    ) -> CoworkerWorkerSessionBinding:
+        """Map one persisted coworker background run to its physical worker root.
+
+        The persisted owner and coworker labels establish the session relationship,
+        but they do not authenticate a caller. The parent validates local ownership
+        before dispatch. This private receipt only permits a worker runtime to reopen
+        that exact background session under its staged container workspace.
+        """
+
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("coworker worker session ID is invalid")
+        project_root = Path(runtime_project_root).expanduser().resolve(strict=True)
+        metadata = project_root.stat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("coworker worker workspace is not a directory")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT b.owner_id, b.coworker_id, b.session_id,
+                       b.canonical_session_id, s.project_key
+                FROM coworker_session_bindings AS b
+                JOIN sessions AS s ON s.session_id = b.session_id
+                JOIN coworker_session_bindings AS c
+                  ON c.owner_id = b.owner_id
+                 AND c.coworker_id = b.coworker_id
+                 AND c.kind = 'conversation'
+                 AND c.session_id = b.canonical_session_id
+                 AND c.canonical_session_id = b.canonical_session_id
+                JOIN sessions AS canonical
+                  ON canonical.session_id = c.session_id
+                 AND canonical.project_key = s.project_key
+                WHERE b.session_id = ?
+                  AND b.kind = 'background'
+                  AND b.run_id IS NOT NULL
+                  AND b.session_id <> b.canonical_session_id
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("session is not a bound coworker background run")
+        database = self._database
+        return CoworkerWorkerSessionBinding(
+            session_id=str(row["session_id"]),
+            canonical_session_id=str(row["canonical_session_id"]),
+            owner_id=str(row["owner_id"]),
+            coworker_id=str(row["coworker_id"]),
+            project_key=str(row["project_key"]),
+            runtime_project_root=project_root,
+            runtime_directory_identity=(int(metadata.st_dev), int(metadata.st_ino)),
+            database_path=self.db_path,
+            database_identity=(
+                database.parent_device,
+                database.parent_inode,
+                database.file_device,
+                database.file_inode,
+            ),
+        )
+
+    def _require_coworker_worker_session(
+        self,
+        session_id: str,
+        project_root: str | Path,
+        binding: CoworkerWorkerSessionBinding,
+    ) -> None:
+        """Recheck the worker mapping against this store and physical root."""
+
+        if not isinstance(binding, CoworkerWorkerSessionBinding):
+            raise ValueError("coworker worker session binding is invalid")
+        current = self._bind_coworker_worker_session(session_id, project_root)
+        if current != binding:
+            raise ValueError("coworker worker session binding changed")
 
     def session_model(self, session_id: str) -> str:
         """Return the durable requested model route for one session."""
@@ -4201,6 +5380,145 @@ class SessionStore:
             )
             for row in rows
         ]
+
+    def search_coworker_session_messages(
+        self,
+        *,
+        owner_id: str,
+        coworker_id: str,
+        canonical_session_id: str,
+        project_path: str | Path,
+        session_bindings: Sequence[CoworkerSessionBinding],
+        query: str,
+        limit: int = 20,
+    ) -> list[SessionSearchHit]:
+        """Search only completed-turn sessions supplied by a verified Crew caller."""
+
+        normalized = normalize_session_search_query(query)
+        if type(limit) is not int or not 1 <= limit <= MAX_SESSION_SEARCH_LIMIT:
+            raise ValueError(
+                f"session search limit must be between 1 and {MAX_SESSION_SEARCH_LIMIT}"
+            )
+        self._validate_coworker_identity(owner_id, coworker_id)
+        try:
+            canonical_id = str(UUID(canonical_session_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("canonical_session_id must be a UUID") from exc
+        if canonical_id != canonical_session_id:
+            raise ValueError("canonical_session_id must be canonical")
+        if not isinstance(session_bindings, Sequence) or isinstance(
+            session_bindings, (str, bytes)
+        ):
+            raise ValueError("coworker session search scope is invalid")
+
+        validated: list[tuple[str, str]] = []
+        seen_session_ids: set[str] = set()
+        for binding in session_bindings:
+            if (
+                not isinstance(binding, CoworkerSessionBinding)
+                or binding.owner_id != owner_id
+                or binding.coworker_id != coworker_id
+                or binding.canonical_session_id != canonical_id
+                or binding.run_id is None
+            ):
+                raise ValueError("coworker session search scope is inconsistent")
+            try:
+                session_id = str(UUID(binding.session_id))
+                run_id = str(UUID(binding.run_id))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ValueError("coworker session search scope has invalid IDs") from exc
+            if (
+                session_id != binding.session_id
+                or run_id != binding.run_id
+                or session_id in seen_session_ids
+            ):
+                raise ValueError("coworker session search scope is ambiguous")
+            seen_session_ids.add(session_id)
+            validated.append((session_id, run_id))
+        if not validated:
+            return []
+
+        match_query = _session_search_match_query(normalized)
+        project_key = normalize_project_path(project_path)
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "CREATE TEMP TABLE coworker_search_scope ("
+                "session_id TEXT PRIMARY KEY, run_id TEXT NOT NULL) WITHOUT ROWID"
+            )
+            conn.executemany(
+                "INSERT INTO coworker_search_scope (session_id, run_id) VALUES (?, ?)",
+                validated,
+            )
+            stale_binding = conn.execute(
+                """
+                SELECT allowed.session_id
+                FROM coworker_search_scope AS allowed
+                LEFT JOIN coworker_session_bindings AS b
+                  ON b.session_id = allowed.session_id
+                 AND b.run_id = allowed.run_id
+                 AND b.owner_id = ?
+                 AND b.coworker_id = ?
+                 AND b.canonical_session_id = ?
+                 AND b.kind = 'background'
+                LEFT JOIN sessions AS s ON s.session_id = allowed.session_id
+                WHERE b.session_id IS NULL OR s.session_id IS NULL
+                   OR s.project_key != ?
+                LIMIT 1
+                """,
+                (owner_id, coworker_id, canonical_id, project_key),
+            ).fetchone()
+            if stale_binding is not None:
+                raise SessionStorageError(
+                    "coworker session search binding is stale or inconsistent"
+                )
+            rows = conn.execute(
+                """
+                SELECT m.message_id, m.session_id, s.title, m.role, m.timestamp,
+                       snippet(messages_fts, 0, '', '', ' … ', 24) AS excerpt
+                FROM coworker_search_scope AS allowed
+                JOIN coworker_session_bindings AS b
+                  ON b.session_id = allowed.session_id
+                 AND b.run_id = allowed.run_id
+                JOIN sessions AS s ON s.session_id = allowed.session_id
+                JOIN messages AS m ON m.session_id = allowed.session_id
+                JOIN messages_fts ON messages_fts.rowid = m.message_id
+                WHERE messages_fts MATCH ?
+                  AND b.owner_id = ?
+                  AND b.coworker_id = ?
+                  AND b.canonical_session_id = ?
+                  AND b.kind = 'background'
+                  AND s.project_key = ?
+                  AND m.role IN ('user', 'assistant')
+                ORDER BY bm25(messages_fts), m.timestamp DESC, m.message_id DESC
+                LIMIT ?
+                """,
+                (
+                    match_query,
+                    owner_id,
+                    coworker_id,
+                    canonical_id,
+                    project_key,
+                    limit,
+                ),
+            ).fetchall()
+        from ash.core.redaction import redact_text
+
+        try:
+            return [
+                SessionSearchHit(
+                    session_id=str(row["session_id"]),
+                    title=str(row["title"] or ""),
+                    message_id=int(row["message_id"]),
+                    role=row["role"],
+                    timestamp=_deserialize_datetime(str(row["timestamp"])),
+                    excerpt=redact_text(str(row["excerpt"] or ""))[
+                        :MAX_SESSION_SEARCH_EXCERPT_CHARS
+                    ],
+                )
+                for row in rows
+            ]
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise _invalid_stored_data_error(self.db_path) from exc
 
     def fork_session(
         self,

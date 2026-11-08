@@ -101,10 +101,15 @@ async def _strip_authorization_header(request: httpx.Request) -> None:
     request.headers.pop("Authorization", None)
 
 
-def _owned_openai_http_client(*, anonymous: bool = False) -> Any:
+def _owned_openai_http_client(
+    *, anonymous: bool = False, trust_env: bool = True
+) -> Any:
     """Build an Ash-owned SDK transport that never follows redirects."""
 
-    options: dict[str, Any] = {"follow_redirects": False}
+    options: dict[str, Any] = {
+        "follow_redirects": False,
+        "trust_env": trust_env,
+    }
     if anonymous:
         options["event_hooks"] = {"request": [_strip_authorization_header]}
     return openai.DefaultAsyncHttpxClient(**options)
@@ -256,7 +261,8 @@ class OpenAIProvider(ProviderABC):
             return self._client
         options = dict(self._client_options)
         options["http_client"] = _owned_openai_http_client(
-            anonymous=self._allow_anonymous
+            anonymous=self._allow_anonymous,
+            trust_env=not getattr(self, "_ash_disable_ambient_transport", False),
         )
         self._client = openai.AsyncOpenAI(**options)
         return self._client

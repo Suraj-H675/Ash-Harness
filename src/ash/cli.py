@@ -3033,6 +3033,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 )
             print(f"Error: {unsupported_platform}", file=sys.stderr)
             return 2
+    if args.command == "crew" and args.profile is not None:
+        parser.error(
+            "Crew uses its explicit coworker profile binding; omit the global --profile"
+        )
     if args.profile:
         from ash.profiles import validate_profile_name
 
@@ -3114,6 +3118,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
             args.output_format = "stream-json"
         if args.command == "setup":
             args.non_interactive = True
+
+    if args.command == "crew":
+        from ash.commands.crew import run_crew_command
+
+        return run_crew_command(args)
 
     from ash.config import AshConfig
     from ash.core.session import SessionStore

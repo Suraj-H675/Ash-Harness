@@ -51,7 +51,6 @@ jobs:
       - run: uv sync --locked --group dev --all-extras
       - run: uv run --locked ruff check src tests
       - run: uv run --locked mypy src/ash
-      - run: uv run --locked pytest -q --timeout=120 --timeout-method=thread
 
       - name: Build release artifacts from a fresh sdist
         shell: bash

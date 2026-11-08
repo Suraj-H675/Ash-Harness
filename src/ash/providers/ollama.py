@@ -57,7 +57,13 @@ class OllamaProvider(ProviderABC):
 
     def _resolve_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=60.0)
+            self._client = httpx.AsyncClient(
+                timeout=60.0,
+                trust_env=not getattr(
+                    self, "_ash_disable_ambient_transport", False
+                ),
+                follow_redirects=False,
+            )
         return self._client
 
     async def detect_capabilities(

@@ -37,9 +37,12 @@ from ash.sandbox._base import (
 )
 from ash.sandbox.bwrap import BubblewrapSandbox, probe_bwrap
 from ash.sandbox.docker import (
+    COWORKER_IMAGE,
+    COWORKER_WORKER_COMMAND,
     DEFAULT_IMAGE,
     DockerSandbox,
     docker_cli_environment,
+    docker_proxy_configuration_present,
     probe_docker,
 )
 from ash.sandbox.process_utils import (
@@ -524,12 +527,259 @@ class SandboxManager:
         self._available = available
         raise SandboxBackendUnavailable(error)
 
+    async def run_supervised_process(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: int,
+    ) -> SandboxResult:
+        """Run a one-shot child inside the strict Docker process boundary.
+
+        This entry point requires Docker with no external IP networking
+        (isolated loopback remains), aggregate resource limits, a read-only
+        workspace with nested mounts excluded, no proxy injection, and
+        fail-closed backend selection. Cleanup verifies an invocation-specific
+        label before removing by container ID on the pinned local endpoint.
+        Workspace contents remain visible, and accessible Unix sockets can be
+        connected to. It does not authorize an Ash runtime or its capabilities.
+        """
+
+        return await self._run_supervised_process(
+            command,
+            cwd=cwd,
+            timeout=timeout,
+            state_directory=None,
+            max_output_bytes=100_000,
+        )
+
+    async def _run_supervised_coworker_worker(
+        self,
+        *,
+        cwd: Path,
+        timeout: int,
+        state_directory: Path,
+    ) -> SandboxResult:
+        """Run only the installed offline turn worker with its session database."""
+
+        if self.docker_image != COWORKER_IMAGE:
+            raise SandboxBackendUnavailable(
+                "coworker turns require the fixed Ash worker image"
+            )
+        return await self._run_supervised_process(
+            COWORKER_WORKER_COMMAND,
+            cwd=cwd,
+            timeout=timeout,
+            state_directory=state_directory,
+            max_output_bytes=8_192,
+        )
+
+    async def _run_supervised_process(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path,
+        timeout: int,
+        state_directory: Path | None,
+        max_output_bytes: int,
+    ) -> SandboxResult:
+        """Shared fail-closed lifecycle for supervised Docker processes."""
+
+        if not command:
+            raise ValueError("command must be a non-empty sequence")
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero")
+        if max_output_bytes <= 0:
+            raise ValueError("max_output_bytes must be greater than zero")
+        if (
+            self.backend_name != "docker"
+            or not self.has_aggregate_resource_limits()
+            or self.network
+            or not self.workspace_read_only
+            or self.allow_scoped_fallback
+            or self.workspace_root is None
+        ):
+            raise SandboxBackendUnavailable(
+                "supervised processes require Docker with non-zero CPU and memory "
+                "limits, network disabled, a read-only workspace, and scoped "
+                "fallback disabled"
+            )
+        docker_environment = await self._capture_supervised_docker_environment()
+        if docker_proxy_configuration_present(docker_environment):
+            raise SandboxBackendUnavailable(
+                "supervised processes require Docker proxy injection to be absent"
+            )
+        supervised_token = secrets.token_hex(16)
+        container_name = f"ash-supervised-{supervised_token}"
+        try:
+            result = await self._run(
+                command,
+                cwd=cwd,
+                timeout=timeout,
+                stdin=asyncio.subprocess.DEVNULL,
+                env=docker_environment,
+                _docker_container_name=container_name,
+                _docker_supervised_token=supervised_token,
+                _docker_supervised_state_directory=state_directory,
+                _max_output_bytes=max_output_bytes,
+            )
+        except BaseException as primary_error:
+            cleanup_task = asyncio.create_task(
+                self._remove_supervised_container(
+                    container_name, supervised_token, docker_environment
+                )
+            )
+            cleanup_error, cleanup_cancelled = await _settle_cleanup_task(cleanup_task)
+            if cleanup_error is not None:
+                primary_error.add_note(
+                    f"Supervised Docker container cleanup failed: {cleanup_error}"
+                )
+            if cleanup_cancelled:
+                primary_error.add_note(
+                    "Supervised Docker container cleanup completed after cancellation"
+                )
+                if not isinstance(primary_error, asyncio.CancelledError):
+                    raise asyncio.CancelledError() from primary_error
+            raise
+        if (
+            result.exit_code != 0
+            or result.timed_out
+            or result.outcome_unknown
+            or result.output_truncated
+        ):
+            cleanup_task = asyncio.create_task(
+                self._remove_supervised_container(
+                    container_name, supervised_token, docker_environment
+                )
+            )
+            cleanup_error, cleanup_cancelled = await _settle_cleanup_task(cleanup_task)
+            if cleanup_error is not None:
+                if cleanup_cancelled:
+                    cancellation = asyncio.CancelledError()
+                    cancellation.add_note(
+                        f"Supervised Docker container cleanup failed: {cleanup_error}"
+                    )
+                    raise cancellation from cleanup_error
+                raise SandboxBackendUnavailable(
+                    "supervised Docker process ended ambiguously and its container "
+                    "could not be confirmed stopped"
+                ) from cleanup_error
+            if cleanup_cancelled:
+                raise asyncio.CancelledError()
+        return result
+
+    async def _capture_supervised_docker_environment(self) -> dict[str, str]:
+        docker_environment = docker_cli_environment()
+        if docker_environment.get("DOCKER_HOST") or docker_environment.get(
+            "DOCKER_CONTEXT"
+        ):
+            raise SandboxBackendUnavailable(
+                "supervised processes require the configured local Docker context "
+                "without DOCKER_HOST or DOCKER_CONTEXT overrides"
+            )
+        docker_path = resolve_host_executable(
+            "docker", workspace_root=self.workspace_root
+        )
+        if docker_path is None:
+            raise SandboxBackendUnavailable("Docker executable is unavailable")
+        context = await _run_docker_control(
+            [docker_path, "context", "show"],
+            timeout_seconds=5,
+            env=docker_environment,
+        )
+        context_name = context.decode("utf-8", errors="replace").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", context_name):
+            raise SandboxBackendUnavailable("Docker returned an invalid context name")
+        endpoint = await _run_docker_control(
+            [
+                docker_path,
+                "context",
+                "inspect",
+                "--format",
+                "{{.Endpoints.docker.Host}}",
+                context_name,
+            ],
+            timeout_seconds=5,
+            env=docker_environment,
+        )
+        endpoint_name = endpoint.decode("utf-8", errors="replace").strip()
+        endpoint_pattern = (
+            r"npipe:////(?:\.|localhost)/pipe/[A-Za-z0-9_.-]+"
+            if os.name == "nt"
+            else r"unix:///[^\s\x00]+"
+        )
+        if re.fullmatch(endpoint_pattern, endpoint_name) is None:
+            raise SandboxBackendUnavailable(
+                "supervised processes require a local Docker socket endpoint"
+            )
+        docker_environment["DOCKER_HOST"] = endpoint_name
+        docker_environment.pop("DOCKER_CONTEXT", None)
+        docker_environment.pop("SSH_AUTH_SOCK", None)
+        return docker_environment
+
+    async def _remove_supervised_container(
+        self,
+        container_name: str,
+        supervised_token: str,
+        docker_environment: dict[str, str],
+    ) -> None:
+        docker_path = resolve_host_executable(
+            "docker", workspace_root=self.workspace_root
+        )
+        if docker_path is None:
+            raise SandboxBackendUnavailable(
+                "Docker executable is unavailable for supervised process cleanup"
+            )
+        try:
+            inspection = await _run_docker_control(
+                [
+                    docker_path,
+                    "inspect",
+                    "--format",
+                    '{{.Id}} {{index .Config.Labels "ash.supervised.token"}}',
+                    container_name,
+                ],
+                timeout_seconds=15,
+                env=docker_environment,
+            )
+        except SandboxBackendUnavailable as exc:
+            if any(
+                marker in str(exc)
+                for marker in (
+                    f"No such object: {container_name}",
+                    f"No such container: {container_name}",
+                )
+            ):
+                return
+            raise
+        fields = inspection.decode("utf-8", errors="replace").strip().split()
+        if (
+            len(fields) != 2
+            or not re.fullmatch(r"[0-9a-f]{12,64}", fields[0])
+            or fields[1] != supervised_token
+        ):
+            raise SandboxBackendUnavailable(
+                "refusing to remove a Docker container without the matching "
+                "supervisor token"
+            )
+        try:
+            await _run_docker_control(
+                [docker_path, "rm", "--force", fields[0]],
+                timeout_seconds=15,
+                env=docker_environment,
+            )
+        except SandboxBackendUnavailable as exc:
+            if f"No such container: {fields[0]}" in str(exc):
+                return
+            raise
+
     async def run(
         self,
         command: Sequence[str],
         *,
         cwd: Path | None = None,
         timeout: int | None = None,
+        stdin: int | BinaryIO | None = None,
         env: dict[str, str] | None = None,
         passthrough_env_names: Sequence[str] = (),
         stream_callback: ProcessStreamCallback | None = None,
@@ -543,6 +793,35 @@ class SandboxManager:
         then reports the actual tier and ``fallback_used=True``.
         """
 
+        return await self._run(
+            command,
+            cwd=cwd,
+            timeout=timeout,
+            stdin=stdin,
+            env=env,
+            passthrough_env_names=passthrough_env_names,
+            stream_callback=stream_callback,
+            expected_cwd_identity=expected_cwd_identity,
+            _docker_container_name=None,
+            _docker_supervised_token=None,
+        )
+
+    async def _run(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        timeout: int | None = None,
+        stdin: int | BinaryIO | None = None,
+        env: dict[str, str] | None = None,
+        passthrough_env_names: Sequence[str] = (),
+        stream_callback: ProcessStreamCallback | None = None,
+        expected_cwd_identity: tuple[int, int] | None = None,
+        _docker_container_name: str | None,
+        _docker_supervised_token: str | None,
+        _docker_supervised_state_directory: Path | None = None,
+        _max_output_bytes: int = 100_000,
+    ) -> SandboxResult:
         if not command:
             raise ValueError("command must be a non-empty sequence")
 
@@ -562,10 +841,14 @@ class SandboxManager:
                     and self._workspace_identity is not None
                 ):
                     expected_cwd_identity = self._workspace_identity
-        with self.prepare_launch(
+        with self._prepare_launch(
             command,
             cwd=cwd,
             passthrough_env_names=passthrough_env_names,
+            pty=False,
+            docker_container_name=_docker_container_name,
+            docker_supervised_token=_docker_supervised_token,
+            docker_supervised_state_directory=_docker_supervised_state_directory,
         ) as invocation:
             if invocation.tier == SANDBOX_TIER_SCOPED:
                 return await _run_scoped(
@@ -576,9 +859,11 @@ class SandboxManager:
                     workspace_root=self.workspace_root,
                     fallback=invocation.fallback_used,
                     env=env,
+                    stdin=stdin,
                     stream_callback=stream_callback,
                     expected_cwd_identity=expected_cwd_identity,
                     expected_workspace_identity=self._workspace_identity,
+                    max_output_bytes=_max_output_bytes,
                 )
 
             return await _run_subprocess(
@@ -589,6 +874,7 @@ class SandboxManager:
                 backend_name=invocation.backend_name,
                 workspace_root=self.workspace_root,
                 env=env,
+                stdin=stdin,
                 stream_callback=stream_callback,
                 pass_fds=invocation.pass_fds,
                 expected_cwd_identity=expected_cwd_identity,
@@ -597,6 +883,7 @@ class SandboxManager:
                     if invocation.backend_name == "bubblewrap"
                     else self._workspace_identity
                 ),
+                max_output_bytes=_max_output_bytes,
             )
 
     @contextmanager
@@ -610,13 +897,61 @@ class SandboxManager:
     ) -> Iterator[SandboxInvocation]:
         """Prepare one spawn while holding any backend security anchors open."""
 
-        if self._selected_backend != "bubblewrap" or self.workspace_root is None:
-            yield self.prepare(
-                command,
-                cwd=cwd,
-                passthrough_env_names=passthrough_env_names,
-                pty=pty,
+        with self._prepare_launch(
+            command,
+            cwd=cwd,
+            passthrough_env_names=passthrough_env_names,
+            pty=pty,
+            docker_container_name=None,
+            docker_supervised_token=None,
+            docker_supervised_state_directory=None,
+        ) as invocation:
+            yield invocation
+
+    @contextmanager
+    def _prepare_launch(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: Path | None,
+        passthrough_env_names: Sequence[str],
+        pty: bool = False,
+        docker_container_name: str | None,
+        docker_supervised_token: str | None,
+        docker_supervised_state_directory: Path | None = None,
+    ) -> Iterator[SandboxInvocation]:
+
+        if (
+            docker_supervised_state_directory is not None
+            and docker_supervised_token is None
+        ):
+            raise SandboxBackendUnavailable(
+                "writable coworker state requires a supervised Docker launch"
             )
+
+        if self._selected_backend != "bubblewrap" or self.workspace_root is None:
+            if docker_supervised_token is None:
+                yield self.prepare(
+                    command,
+                    cwd=cwd,
+                    passthrough_env_names=passthrough_env_names,
+                    pty=pty,
+                )
+            else:
+                yield self._prepare(
+                    command,
+                    cwd=cwd,
+                    passthrough_env_names=passthrough_env_names,
+                    workspace_fd=None,
+                    read_only_fds=None,
+                    docker_workspace_volume=None,
+                    pty=pty,
+                    docker_container_name=docker_container_name,
+                    docker_supervised_token=docker_supervised_token,
+                    docker_supervised_state_directory=(
+                        docker_supervised_state_directory
+                    ),
+                )
             return
 
         resolved_cwd = Path(cwd).expanduser().resolve() if cwd is not None else None
@@ -659,6 +994,11 @@ class SandboxManager:
                     read_only_fds=tuple(read_only_fds),
                     docker_workspace_volume=None,
                     pty=pty,
+                    docker_container_name=docker_container_name,
+                    docker_supervised_token=docker_supervised_token,
+                    docker_supervised_state_directory=(
+                        docker_supervised_state_directory
+                    ),
                 )
                 if invocation.backend_name != "bubblewrap":
                     yield invocation
@@ -705,6 +1045,8 @@ class SandboxManager:
             read_only_fds=None,
             docker_workspace_volume=None,
             pty=pty,
+            docker_container_name=None,
+            docker_supervised_token=None,
         )
 
     @contextmanager
@@ -816,6 +1158,9 @@ class SandboxManager:
         read_only_fds: tuple[tuple[int, Path], ...] | None,
         docker_workspace_volume: str | None,
         pty: bool,
+        docker_container_name: str | None = None,
+        docker_supervised_token: str | None = None,
+        docker_supervised_state_directory: Path | None = None,
     ) -> SandboxInvocation:
         """Prepare argv, optionally binding Bubblewrap to a held workspace FD."""
 
@@ -873,6 +1218,10 @@ class SandboxManager:
                     cwd=cwd,
                     passthrough_env_names=passthrough_env_names,
                     workspace_volume=docker_workspace_volume,
+                    container_name=docker_container_name,
+                    supervised_token=docker_supervised_token,
+                    clear_proxy_environment=docker_supervised_token is not None,
+                    supervised_state_directory=docker_supervised_state_directory,
                 )
             else:
                 wrapped = backend.wrap(
@@ -1047,9 +1396,11 @@ async def _run_scoped(
     workspace_root: Path | None,
     fallback: bool,
     env: dict[str, str] | None = None,
+    stdin: int | BinaryIO | None = None,
     stream_callback: ProcessStreamCallback | None = None,
     expected_cwd_identity: tuple[int, int] | None = None,
     expected_workspace_identity: tuple[int, int] | None = None,
+    max_output_bytes: int = 100_000,
 ) -> SandboxResult:
     """Execute the command through the managed subprocess startup path."""
 
@@ -1078,6 +1429,7 @@ async def _run_scoped(
                 *launch.argv,
                 cwd=launch.cwd,
                 env=child_env,
+                stdin=stdin,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 pass_fds=launch.pass_fds or None,
@@ -1097,7 +1449,7 @@ async def _run_scoped(
             communicate_process(
                 process,
                 stream_callback=stream_callback,
-                max_output_bytes=100_000,
+                max_output_bytes=max_output_bytes,
                 process_tree_plan=process_tree_plan,
             ),
             timeout=deadline,
@@ -1180,10 +1532,12 @@ async def _run_subprocess(
     backend_name: str,
     workspace_root: Path | None,
     env: dict[str, str] | None = None,
+    stdin: int | BinaryIO | None = None,
     stream_callback: ProcessStreamCallback | None = None,
     pass_fds: tuple[int, ...] = (),
     expected_cwd_identity: tuple[int, int] | None = None,
     expected_workspace_identity: tuple[int, int] | None = None,
+    max_output_bytes: int = 100_000,
 ) -> SandboxResult:
     """Execute a pre-wrapped argv (e.g. bwrap or docker run) directly."""
 
@@ -1212,6 +1566,7 @@ async def _run_subprocess(
                 *launch.argv,
                 cwd=launch.cwd,
                 env=env,
+                stdin=stdin,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 pass_fds=inherited_fds or None,
@@ -1231,7 +1586,7 @@ async def _run_subprocess(
             communicate_process(
                 process,
                 stream_callback=stream_callback,
-                max_output_bytes=100_000,
+                max_output_bytes=max_output_bytes,
                 process_tree_plan=process_tree_plan,
             ),
             timeout=deadline,
@@ -1315,10 +1670,13 @@ async def _settle_cleanup_task(
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            cancelled = True
             current = asyncio.current_task()
-            if current is not None:
+            if current is not None and current.cancelling():
+                cancelled = True
                 current.uncancel()
+        except BaseException:
+            if not task.done():
+                raise
     try:
         task.result()
     except BaseException as exc:
@@ -1331,6 +1689,7 @@ async def _run_docker_control(
     *,
     stdin: BinaryIO | None = None,
     timeout_seconds: float = 60,
+    env: dict[str, str] | None = None,
     on_spawn: Callable[[], None] | None = None,
 ) -> bytes:
     """Run one bounded Docker CLI control command with managed cleanup."""
@@ -1350,7 +1709,7 @@ async def _run_docker_control(
             stdin=stdin if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=docker_cli_environment(),
+            env=env if env is not None else docker_cli_environment(),
             on_process_ready=(
                 (lambda _process: on_spawn()) if on_spawn is not None else None
             ),

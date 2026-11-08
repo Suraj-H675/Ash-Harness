@@ -67,6 +67,554 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
     )
     profile_remove.add_argument("name")
     profile_remove.add_argument("--yes", action="store_true")
+    crew_parser = subparsers.add_parser(
+        "crew",
+        help="Manage profile-scoped coworkers, responsibilities, and file approvals",
+        description=(
+            "Create and ask profile-scoped coworkers. Responsibility turns use one "
+            "no-tool model request. Signed events use a local HMAC key file, and "
+            "scheduled work runs through ash crew tick or an explicit crew worker."
+        ),
+    )
+    crew_subparsers = crew_parser.add_subparsers(
+        dest="crew_action", required=True
+    )
+    crew_create = crew_subparsers.add_parser(
+        "create", help="Bind a coworker to an existing named profile and workspace"
+    )
+    crew_create.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_create.add_argument("--name", required=True, help="Coworker display name")
+    crew_create.add_argument(
+        "--profile",
+        dest="crew_profile",
+        required=True,
+        help="Existing named Ash profile for this coworker",
+    )
+    crew_create.add_argument(
+        "--workspace",
+        required=True,
+        type=Path,
+        help="Existing workspace directory bound to this coworker",
+    )
+    crew_list = crew_subparsers.add_parser(
+        "list", help="List coworkers owned by the current local UID"
+    )
+    crew_list.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_show = crew_subparsers.add_parser(
+        "show", help="Inspect one coworker, its responsibilities, and recent activity"
+    )
+    crew_show.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_show.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_show.add_argument(
+        "--limit", type=int, default=5,
+        help="Maximum responsibility summaries and activity entries (1-20)",
+    )
+    crew_rename = crew_subparsers.add_parser(
+        "rename", help="Change a coworker's display name without changing its identity",
+    )
+    crew_rename.add_argument("--owner", required=True)
+    crew_rename.add_argument("--coworker-id", required=True)
+    crew_rename.add_argument("--name", required=True)
+    crew_rename.add_argument(
+        "--expected-name", required=True,
+        help="Current display name shown by crew show; prevents stale rename",
+    )
+
+    crew_brief = crew_subparsers.add_parser(
+        "brief", help="Show, set or clear one coworker's owner-curated context"
+    )
+    brief_actions = crew_brief.add_subparsers(
+        dest="crew_brief_action", required=True
+    )
+    for action in ("show", "set", "clear", "adopt"):
+        item = brief_actions.add_parser(
+            action, help=f"{action.title()} the owner-curated coworker brief"
+        )
+        item.add_argument("--owner", required=True)
+        item.add_argument("--coworker-id", required=True)
+        if action == "set":
+            item.add_argument(
+                "--text", required=True,
+                help="Owner-authored context; avoid shell-history secrets",
+            )
+        if action == "adopt":
+            for field in ("run-id", "session-id", "request-id"):
+                item.add_argument("--" + field, required=True)
+            item.add_argument(
+                "--excerpt", required=True,
+                help="Exact single-line substring of the completed model response",
+            )
+    crew_budget = crew_subparsers.add_parser(
+        "budget", help="Set or inspect a per-coworker lifetime model-attempt cap",
+    )
+    crew_budget_actions = crew_budget.add_subparsers(
+        dest="crew_budget_action", required=True,
+    )
+    for action in ("show", "set", "clear"):
+        item = crew_budget_actions.add_parser(
+            action, help=f"{action.title()} an owner-controlled model-attempt cap",
+        )
+        item.add_argument("--owner", required=True)
+        item.add_argument("--coworker-id", required=True)
+        if action != "show":
+            item.add_argument("--expected-revision", required=True, type=int)
+        if action == "set":
+            item.add_argument(
+                "--max-attempts", type=int, required=True,
+                help="Total claimed model turns allowed, 0..100000, across restarts",
+            )
+
+    crew_usage = crew_subparsers.add_parser(
+        "usage", help="Inspect persisted per-coworker model usage and pricing gaps",
+    )
+    crew_usage.add_argument("--owner", required=True)
+    crew_usage.add_argument("--coworker-id", required=True)
+
+    crew_inbox = crew_subparsers.add_parser(
+        "inbox", help="Show recent local run and approval activity"
+    )
+    crew_inbox.add_argument("--owner", help="Explicit local owner label")
+    crew_inbox.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of newest activity entries to show (1-100)",
+    )
+    crew_inbox.add_argument(
+        "--include-skipped",
+        action="store_true",
+        help="Include scheduled runs skipped after their misfire grace period",
+    )
+    crew_inbox.add_argument(
+        "--unacknowledged",
+        action="store_true",
+        help="Show only activity revisions not yet acknowledged by this owner",
+    )
+    crew_inbox_actions = crew_inbox.add_subparsers(dest="crew_inbox_action")
+    crew_inbox_ack = crew_inbox_actions.add_parser(
+        "ack", help="Acknowledge one exact run or approval event revision",
+    )
+    crew_inbox_ack.add_argument("--owner", required=True)
+    crew_inbox_ack.add_argument("--event-id", required=True)
+    for action, help_text in (
+        ("pause", "Stop new coworker work while retaining history and decisions"),
+        ("resume", "Resume a paused coworker"),
+        ("archive", "Permanently stop new work without deleting coworker data"),
+    ):
+        lifecycle = crew_subparsers.add_parser(action, help=help_text)
+        lifecycle.add_argument("--owner", required=True, help="Explicit local owner label")
+        lifecycle.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_remove = crew_subparsers.add_parser(
+        "remove",
+        help="Review and remove archived coworker-owned local state",
+    )
+    crew_remove.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_remove.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_ask = crew_subparsers.add_parser(
+        "ask",
+        help="Ask one read-only question with explicitly listed workspace files",
+    )
+    crew_ask.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_ask.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_ask.add_argument("--question", required=True, help="Question for this one-shot turn")
+    crew_ask.add_argument(
+        "--turn-id",
+        help="Stable printable one-shot ID; generated when omitted",
+    )
+    crew_ask.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        metavar="WORKSPACE_RELATIVE_PATH",
+        help="Explicit read-only evidence file; repeat for each file",
+    )
+    crew_ask.add_argument(
+        "--propose-syntax", action="store_true",
+        help="Ask the model to choose one syntax check from explicitly granted root Python files",
+    )
+    crew_ask.add_argument(
+        "--propose-git-diff", action="store_true",
+        help="Suggest one Git diff from owner-granted file metadata; no tools run",
+    )
+    crew_ask.add_argument(
+        "--check-model",
+        action="store_true",
+        help="Probe the selected profile model before claiming this turn",
+    )
+    crew_chat = crew_subparsers.add_parser(
+        "chat", help="Continue a bounded conversation with prior completed chat turns"
+    )
+    crew_chat.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_chat.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_chat.add_argument("--message", dest="question", required=True)
+    crew_chat.add_argument("--turn-id", help="One-shot turn ID; generated when omitted")
+    crew_chat.add_argument(
+        "--new", action="store_true",
+        help="Start a new conversation without earlier chat context",
+    )
+    crew_chat.add_argument(
+        "--evidence", action="append", default=[],
+        metavar="WORKSPACE_RELATIVE_PATH",
+        help="Grant one workspace file for this turn only; repeat if needed",
+    )
+    crew_chat.add_argument(
+        "--check-model", action="store_true",
+        help="Probe the profile model before claiming this turn",
+    )
+    crew_investigate = crew_subparsers.add_parser(
+        "investigate",
+        help="Let a coworker select a fixed literal search from owner-granted files, then analyze it",
+    )
+    crew_investigate.add_argument("--owner", required=True)
+    crew_investigate.add_argument("--coworker-id", required=True)
+    crew_investigate.add_argument("--question", required=True)
+    crew_investigate.add_argument(
+        "--investigation-id", help="Non-replayable investigation ID; generated if omitted",
+    )
+    crew_investigate.add_argument(
+        "--file", dest="files", action="append", required=True,
+        metavar="WORKSPACE_RELATIVE_PATH",
+        help="Explicitly granted text file; repeat to grant up to eight",
+    )
+    crew_investigate.add_argument(
+        "--check-model", action="store_true",
+        help="Probe the profile model before starting the first turn",
+    )
+    crew_syntax = crew_subparsers.add_parser(
+        "syntax", help="Run an owner-selected, non-executing Python syntax check in Docker"
+    )
+    crew_syntax.add_argument("--owner", required=True)
+    crew_syntax.add_argument("--coworker-id", required=True)
+    crew_syntax.add_argument("--run-id", help="One-shot run ID; generated when omitted")
+    crew_syntax.add_argument(
+        "--file", dest="files", action="append", default=[],
+        metavar="WORKSPACE_RELATIVE_PYTHON_PATH",
+        help="Explicit workspace-root Python file to check; repeat as needed",
+    )
+    for field in ("source-run-id", "source-session-id", "source-request-id"):
+        crew_syntax.add_argument(
+            "--" + field,
+            help="Completed read-only model proposal source; use all three IDs together",
+        )
+    crew_git = crew_subparsers.add_parser(
+        "git-diff",
+        help="Owner-confirmed one-shot native read-only Git diff using Ash tool mediation",
+    )
+    git_actions = crew_git.add_subparsers(
+        dest="crew_git_action", required=True,
+    )
+    git_run = git_actions.add_parser(
+        "run", help="Confirm and dispatch a single file-scoped Git diff",
+    )
+    git_run.add_argument("--owner", required=True)
+    git_run.add_argument("--coworker-id", required=True)
+    git_run.add_argument("--run-id", help="One-shot UUID; generated if omitted")
+    git_run.add_argument("--file", metavar="WORKSPACE_RELATIVE_PATH")
+    for field in ("source-run-id", "source-session-id", "source-request-id"):
+        git_run.add_argument(
+            "--" + field,
+            help="Completed model Git proposal source; provide all three IDs",
+        )
+    git_status = git_actions.add_parser(
+        "status", help="Inspect the durable outcome of one native Git diff",
+    )
+    git_status.add_argument("--owner", required=True)
+    git_status.add_argument("--coworker-id", required=True)
+    git_status.add_argument("--run-id", required=True)
+    git_status.add_argument(
+        "--show-output", action="store_true",
+        help="Display only a verified, completed recorded diff; never dispatch again",
+    )
+
+    crew_model_check = crew_subparsers.add_parser(
+        "check-model",
+        help="Send one synthetic readiness probe without creating a Crew run",
+    )
+    crew_model_check.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_model_check.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_history = crew_subparsers.add_parser(
+        "history", help="Show recent one-shot turn outcomes after reopening"
+    )
+    crew_history.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_history.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_history.add_argument(
+        "--limit", type=int, default=10, help="Number of recent outcomes to show (1-100)"
+    )
+    crew_history.add_argument(
+        "--query",
+        help=(
+            "Search persisted user and assistant text from completed model turns; "
+            "every query term must match one message"
+        ),
+    )
+    crew_responsibility = crew_subparsers.add_parser(
+        "responsibility",
+        help="Create, inspect, and control one coworker responsibility",
+    )
+    crew_responsibility_subparsers = crew_responsibility.add_subparsers(
+        dest="crew_responsibility_action",
+        required=True,
+    )
+    responsibility_create = crew_responsibility_subparsers.add_parser(
+        "create", help="Create a bounded owner-controlled responsibility"
+    )
+    responsibility_create.add_argument("--owner", required=True)
+    responsibility_create.add_argument("--coworker-id", required=True)
+    responsibility_create.add_argument("--responsibility-id", required=True)
+    responsibility_create.add_argument("--scope", required=True)
+    responsibility_create.add_argument("--objective", required=True)
+    responsibility_create.add_argument(
+        "--success-criterion", action="append", required=True
+    )
+    responsibility_create.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        metavar="WORKSPACE_RELATIVE_PATH",
+        help="Explicit read-only evidence file; repeat for each file",
+    )
+    responsibility_create.add_argument("--at")
+    responsibility_create.add_argument("--every")
+    responsibility_create.add_argument("--cron")
+    responsibility_create.add_argument("--timezone", default="UTC")
+    responsibility_create.add_argument("--misfire-grace-seconds", type=int, default=86_400)
+    responsibility_revise = crew_responsibility_subparsers.add_parser(
+        "revise",
+        help="Revise a responsibility's objective and evidence with owner CAS",
+    )
+    responsibility_revise.add_argument("--owner", required=True)
+    responsibility_revise.add_argument("--coworker-id", required=True)
+    responsibility_revise.add_argument("--responsibility-id", required=True)
+    responsibility_revise.add_argument("--expected-revision", type=int, required=True)
+    responsibility_revise.add_argument("--scope")
+    responsibility_revise.add_argument("--objective")
+    responsibility_revise.add_argument("--success-criterion", action="append")
+    responsibility_revise.add_argument(
+        "--clear-success-criteria", action="store_true",
+    )
+    responsibility_revise.add_argument(
+        "--evidence", action="append",
+        metavar="WORKSPACE_RELATIVE_PATH",
+    )
+    responsibility_revise.add_argument(
+        "--clear-evidence", action="store_true",
+    )
+    responsibility_list = crew_responsibility_subparsers.add_parser(
+        "list", help="List responsibilities for one coworker"
+    )
+    responsibility_list.add_argument("--owner", required=True)
+    responsibility_list.add_argument("--coworker-id", required=True)
+    for action, help_text in (
+        ("pause", "Pause one responsibility before a later trigger claim"),
+        ("resume", "Resume one paused responsibility"),
+        ("complete", "Complete one responsibility permanently"),
+    ):
+        command = crew_responsibility_subparsers.add_parser(action, help=help_text)
+        command.add_argument("--owner", required=True)
+        command.add_argument("--coworker-id", required=True)
+        command.add_argument("--responsibility-id", required=True)
+    responsibility_run = crew_responsibility_subparsers.add_parser(
+        "run", help="Run one active responsibility from a local owner trigger"
+    )
+    responsibility_run.add_argument("--owner", required=True)
+    responsibility_run.add_argument("--coworker-id", required=True)
+    responsibility_run.add_argument("--responsibility-id", required=True)
+    responsibility_run.add_argument("--event-id", required=True)
+    responsibility_run.add_argument(
+        "--investigate", action="store_true",
+        help="Plan a bounded search of granted evidence, then analyze the results",
+    )
+    responsibility_run.add_argument(
+        "--draft-correction", action="store_true",
+        help="Ask Atlas for an exact correction to an explicitly granted source file",
+    )
+    responsibility_run.add_argument(
+        "--check-model",
+        action="store_true",
+        help="Probe the selected profile model before claiming this run",
+    )
+    responsibility_runs = crew_responsibility_subparsers.add_parser(
+        "runs", help="Inspect durable trigger claims and persisted model responses"
+    )
+    responsibility_runs.add_argument("--owner", required=True)
+    responsibility_runs.add_argument("--coworker-id", required=True)
+    responsibility_runs.add_argument("--responsibility-id", required=True)
+    responsibility_runs.add_argument("--limit", type=int, default=10)
+    responsibility_timeline = crew_responsibility_subparsers.add_parser(
+        "timeline",
+        help="Show one responsibility's durable investigation, follow-up and approval",
+    )
+    responsibility_timeline.add_argument("--owner", required=True)
+    responsibility_timeline.add_argument("--coworker-id", required=True)
+    responsibility_timeline.add_argument("--responsibility-id", required=True)
+    responsibility_timeline.add_argument("--limit", type=int, default=20)
+    crew_event = crew_subparsers.add_parser(
+        "event", help="Admit one signed event from stdin or a local file"
+    )
+    crew_event.add_argument("--owner", required=True)
+    crew_event.add_argument("--coworker-id", required=True)
+    crew_event.add_argument("--responsibility-id", required=True)
+    crew_event.add_argument(
+        "--key-file",
+        required=True,
+        type=Path,
+        help="Owner-provisioned 0600 HMAC key file outside the coworker workspace",
+    )
+    crew_event.add_argument(
+        "--input",
+        default="-",
+        help="Signed JSON file path, or - to read stdin",
+    )
+    crew_event.add_argument(
+        "--check-model",
+        action="store_true",
+        help="Probe the selected profile model before claiming this event",
+    )
+    crew_event.add_argument(
+        "--investigate", action="store_true",
+        help="Investigate this signed event with an approved-file literal search",
+    )
+    crew_event.add_argument(
+        "--draft-correction",
+        action="store_true",
+        help="Ask Atlas to return a strict, owner-reviewable file correction JSON",
+    )
+    crew_worker = crew_subparsers.add_parser(
+        "worker", help="Poll one coworker's due schedules until stopped"
+    )
+    crew_worker.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_worker.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_worker.add_argument(
+        "--poll-seconds", type=int, default=60,
+        help="Seconds between due checks (10-3600, default: 60)",
+    )
+    crew_worker.add_argument(
+        "--investigate", action="store_true",
+        help="Investigate each due task through a bounded search and analysis",
+    )
+    crew_worker.add_argument(
+        "--only-if-changed", action="store_true",
+        help="Skip scheduled model work when granted evidence matches the last completed run",
+    )
+    crew_intake = crew_subparsers.add_parser(
+        "intake", help="Accept, inspect and explicitly dispatch durable signed events",
+    )
+    intake_actions = crew_intake.add_subparsers(
+        dest="crew_intake_action", required=True,
+    )
+    for action, help_text in (
+        ("accept", "Persist a validated signed event without model dispatch"),
+        ("list", "Show persisted event receipts and dispatch outcomes"),
+        ("dispatch", "Consume one accepted event through the Crew model exactly once"),
+    ):
+        command = intake_actions.add_parser(action, help=help_text)
+        command.add_argument("--owner", required=True)
+        command.add_argument("--coworker-id", required=True)
+        if action in {"accept", "dispatch"}:
+            command.add_argument("--responsibility-id", required=True)
+            command.add_argument("--key-file", type=Path, required=True)
+        if action == "accept":
+            command.add_argument("--input", default="-")
+            command.add_argument("--investigate", action="store_true")
+            command.add_argument("--draft-correction", action="store_true")
+        if action == "dispatch":
+            command.add_argument("--event-key", required=True)
+        if action == "list":
+            command.add_argument("--limit", type=int, default=50)
+
+    crew_listen = crew_subparsers.add_parser(
+        "listen", help="Receive HMAC-signed Crew events on 127.0.0.1 only",
+    )
+    crew_listen.add_argument("--owner", required=True)
+    crew_listen.add_argument("--coworker-id", required=True)
+    crew_listen.add_argument("--responsibility-id", required=True)
+    crew_listen.add_argument(
+        "--key-file", required=True, type=Path,
+        help="Owner-provisioned private 0600 event HMAC key outside the workspace",
+    )
+    crew_listen.add_argument(
+        "--store-only", action="store_true",
+        help="Persist authenticated events for explicit later dispatch; return HTTP 202",
+    )
+    crew_listen.add_argument(
+        "--port", type=int, default=8781,
+        help="Loopback-only HTTP port (1–65535; default 8781)",
+    )
+    crew_listen.add_argument(
+        "--investigate", action="store_true",
+        help="Run a bounded read-only investigation after verifying the event",
+    )
+    crew_listen.add_argument(
+        "--draft-correction", action="store_true",
+        help="Have Atlas draft an exact correction, still requiring owner approval",
+    )
+    crew_tick = crew_subparsers.add_parser(
+        "tick", help="Run at most one due scheduled responsibility and exit"
+    )
+    crew_tick.add_argument("--owner", required=True)
+    crew_tick.add_argument("--coworker-id", required=True)
+    crew_tick.add_argument(
+        "--investigate", action="store_true",
+        help="Run a bounded search and analysis for a due responsibility",
+    )
+    crew_tick.add_argument(
+        "--only-if-changed", action="store_true",
+        help="Skip a due run if its granted evidence and scope match its last completed run",
+    )
+    crew_tick.add_argument(
+        "--check-model",
+        action="store_true",
+        help="Probe the selected profile model before claiming a due run",
+    )
+    crew_propose = crew_subparsers.add_parser(
+        "propose",
+        help="Stage one exact owner-file or Atlas-drafted correction for review",
+    )
+    crew_propose.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_propose.add_argument("--coworker-id", required=True, help="Immutable Atlas coworker ID")
+    crew_propose.add_argument("--run-id", required=True, help="Completed Atlas run ID")
+    crew_propose.add_argument("--session-id", required=True, help="Completed Atlas session ID")
+    crew_propose.add_argument("--request-id", required=True, help="Completed Atlas request ID")
+    crew_propose.add_argument("--target", required=True, metavar="WORKSPACE_RELATIVE_PATH")
+    crew_propose_source = crew_propose.add_mutually_exclusive_group(required=True)
+    crew_propose_source.add_argument(
+        "--replacement-file",
+        metavar="WORKSPACE_RELATIVE_PATH",
+        help="Owner-supplied UTF-8 text file under the coworker's workspace",
+    )
+    crew_propose_source.add_argument(
+        "--from-response",
+        action="store_true",
+        help="Stage a validated exact correction drafted by Atlas from granted evidence",
+    )
+    crew_approvals = crew_subparsers.add_parser(
+        "approvals", help="List durable file approval states"
+    )
+    crew_approvals.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_approvals.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_approvals.add_argument("--limit", type=int, default=20)
+    crew_approval = crew_subparsers.add_parser(
+        "approval", help="Inspect one durable file approval after restart"
+    )
+    crew_approval_subparsers = crew_approval.add_subparsers(
+        dest="crew_approval_action", required=True
+    )
+    crew_approval_show = crew_approval_subparsers.add_parser(
+        "show", help="Show the exact file diff, decision history, and observed outcome"
+    )
+    crew_approval_show.add_argument("--owner", required=True, help="Explicit local owner label")
+    crew_approval_show.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+    crew_approval_show.add_argument("--approval-id", required=True, help="Immutable approval ID")
+    for action, help_text in (
+        ("approve", "Approve one exact pending file correction at a local TTY"),
+        ("deny", "Deny one exact pending file correction at a local TTY"),
+        ("revoke", "Revoke an approved correction before apply"),
+        ("apply", "Apply one approved correction exactly once at a local TTY"),
+    ):
+        command = crew_subparsers.add_parser(action, help=help_text)
+        command.add_argument("--owner", required=True, help="Explicit local owner label")
+        command.add_argument("--coworker-id", required=True, help="Immutable coworker ID")
+        command.add_argument("--approval-id", required=True, help="Immutable approval ID")
     providers_parser = subparsers.add_parser(
         "providers",
         help="List provider routes or test the active/provider model route",
