@@ -56,8 +56,9 @@ class WebFetchArgs(BaseModel):
 class WebFetchTool(BaseTool):
     name = "web_fetch"
     description = (
-        "Fetch a public HTTP(S) page with redirect, private-network, content-type, "
-        "and size protections. Requires normal network permission approval."
+        "Read a public webpage or URL by fetching its HTTP(S) text content. "
+        "Redirect, private-network, content-type and size protections apply. "
+        "Requires normal network permission approval."
     )
     args_schema = WebFetchArgs
 

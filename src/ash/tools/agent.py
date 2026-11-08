@@ -291,7 +291,10 @@ class SpawnAgentArgs(BaseModel):
 
 class SpawnAgentTool(BaseTool):
     name = "spawn_agent"
-    description = "Run a bounded provider-backed worker on a focused subtask."
+    description = (
+        "Launch another agent as a bounded provider-backed worker for a focused "
+        "subtask."
+    )
     args_schema = SpawnAgentArgs
 
     def __init__(

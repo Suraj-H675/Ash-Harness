@@ -524,6 +524,18 @@ async def test_iteration_tool_snapshot_survives_live_catalog_removal(tmp_path) -
     ("intent", "query", "expected_tool", "context_window"),
     [
         (
+            "Read the documentation at this public webpage.",
+            "read a webpage",
+            "web_fetch",
+            4_096,
+        ),
+        (
+            "Launch another agent for a focused coding investigation.",
+            "launch another agent",
+            "spawn_agent",
+            4_096,
+        ),
+        (
             "Hand this focused coding subtask to another agent to work in parallel.",
             "hand this focused coding subtask to another agent to work in parallel",
             "delegate_agents",
@@ -654,3 +666,80 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
     assert "concrete tool actions" in provider.initial_system_prompt.casefold()
     assert "Check requested behavior and edge cases" in provider.initial_system_prompt
     await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_discovery_recovers_a_distinctive_name_term_from_natural_language(
+    tmp_path,
+) -> None:
+    """Extra conversational words must not hide an exact catalog-name term."""
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=1)
+    catalog.update(
+        {
+            search.name: search,
+            "spawn_agent": DummyTool(
+                guard,
+                "spawn_agent",
+                "Run a bounded provider-backed worker on a focused subtask.",
+            ),
+            "send_email": DummyTool(guard, "send_email", "Send an email."),
+        }
+    )
+
+    result = await search.run(query="launch another agent")
+    assert [item["name"] for item in json.loads(result.output)["tools"]] == [
+        "spawn_agent"
+    ]
+    assert "spawn_agent" in search.visible_tools(catalog)
+
+
+@pytest.mark.asyncio
+async def test_webpage_read_intent_discovers_web_fetch_without_a_model_call(
+    tmp_path,
+) -> None:
+    """The advertised tool should match how developers ask to read a URL."""
+    from ash.tools.web import WebFetchTool
+
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=1)
+    catalog.update(
+        {
+            search.name: search,
+            "web_fetch": WebFetchTool(guard),
+            "send_email": DummyTool(guard, "send_email", "Send an email."),
+        }
+    )
+
+    result = await search.run(query="read a webpage")
+    assert [item["name"] for item in json.loads(result.output)["tools"]] == [
+        "web_fetch"
+    ]
+    assert "web_fetch" in search.visible_tools(catalog)
+
+
+@pytest.mark.asyncio
+async def test_one_term_name_fallback_does_not_pollute_stronger_matches(
+    tmp_path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=1)
+    catalog.update(
+        {
+            search.name: search,
+            "audit_lookup": DummyTool(
+                guard, "audit_lookup", "Inspect history of changes to your files."
+            ),
+            "history_backup": DummyTool(
+                guard, "history_backup", "Store a recovery archive."
+            ),
+        }
+    )
+
+    result = await search.run(query="inspect history of changes")
+    assert [item["name"] for item in json.loads(result.output)["tools"]] == [
+        "audit_lookup"
+    ]

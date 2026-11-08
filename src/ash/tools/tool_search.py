@@ -170,6 +170,7 @@ def _rank_tools(
     )
     normalized_name_query = re.sub(r"\s+", "_", normalized)
     ranked: list[tuple[str, BaseTool, int]] = []
+    name_fallbacks: list[tuple[str, BaseTool, int]] = []
     for name, tool in catalog.items():
         if name == SearchToolsTool.name:
             continue
@@ -200,14 +201,22 @@ def _rank_tools(
             score += _EXACT_NAME_MATCH_BOOST
         elif name_prefix_query:
             score += _PREFIX_NAME_MATCH_BOOST
-        if score and (
+        if not score:
+            continue
+        match = (name, tool, score)
+        if (
             len(terms) < _MIN_QUERY_MATCH_TERMS
             or matched_terms >= _MIN_QUERY_MATCH_TERMS
             or name_prefix_query
         ):
-            ranked.append((name, tool, score))
-    ranked.sort(key=lambda item: (-item[2], item[0]))
-    return ranked[:limit]
+            ranked.append(match)
+        elif matched_terms == 1 and any(term in name_words for term in terms):
+            # Prefer full-query matches. A distinctive tool-name term remains
+            # discoverable when a natural-language query includes extra words.
+            name_fallbacks.append(match)
+    candidates = ranked if ranked else name_fallbacks
+    candidates.sort(key=lambda item: (-item[2], item[0]))
+    return candidates[:limit]
 
 
 def _search_words(value: str) -> set[str]:
