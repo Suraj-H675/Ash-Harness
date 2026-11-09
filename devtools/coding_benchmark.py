@@ -106,6 +106,97 @@ HIDDEN_BILLING_ORACLE = (
     "assert total_due([Decimal('1.99'), Decimal('2.01')], Decimal('7.5')) == '4.30'\n"
     "assert total_due([Decimal('12.35')], Decimal('0')) == '12.35'\n"
 )
+# Original three-module integration fixture. Keep the behavioral oracle outside
+# the model-visible project: it probes variants beyond the visible example.
+EVENTLOG_PARSER = (
+    b"import json\n"
+    b"\n"
+    b"def parse_events(lines):\n"
+    b"    events = []\n"
+    b"    for line in lines:\n"
+    b"        if not line.strip():\n"
+    b"            continue\n"
+    b"        event = json.loads(line)  # BUG: one bad record aborts the stream\n"
+    b"        if event.get('request_id'):\n"
+    b"            events.append(event)\n"
+    b"    return events\n"
+)
+EVENTLOG_AGGREGATE = (
+    b"def aggregate(events):\n"
+    b"    results = {}\n"
+    b"    for event in events:\n"
+    b"        ms = event.get('duration_ms')\n"
+    b"        if not isinstance(ms, int) or ms < 0:\n"
+    b"            continue\n"
+    b"        key = event['request_id']\n"
+    b"        count, previous = results.get(key, (0, 0))\n"
+    b"        results[key] = (count + 1, ms or previous)  # BUG: 0 is meaningful\n"
+    b"    return results\n"
+)
+EVENTLOG_RENDER = (
+    b"def render_csv(summary):\n"
+    b"    return ''.join(\n"
+    b"        f'{key},{count},{ms}\\n'\n"
+    b"        for key, (count, ms) in sorted(summary.items(), reverse=True)\n"
+    b"    )  # BUG: report order is reversed\n"
+)
+EVENTLOG_TEST = (
+    b"from eventlog.parser import parse_events\n"
+    b"from eventlog.aggregate import aggregate\n"
+    b"from eventlog.render import render_csv\n"
+    b"\n"
+    b"lines = [\n"
+    b'    \'{"request_id":"z","duration_ms":12}\',\n'
+    b"    'not JSON',\n"
+    b"    'null',\n"
+    b'    \'{"request_id":"a","duration_ms":9}\',\n'
+    b'    \'{"request_id":"a","duration_ms":0}\',\n'
+    b'    \'{"request_id":"z","duration_ms":true}\',\n'
+    b'    \'{"request_id":"","duration_ms":2}\',\n'
+    b"    '\\n',\n"
+    b"]\n"
+    b"assert render_csv(aggregate(parse_events(lines))) == 'a,2,0\\nz,1,12\\n'\n"
+)
+EVENTLOG_README = (
+    b"# Eventlog integration repair\n"
+    b"Each line is an independent JSON record. Ignore blank lines, malformed JSON,\n"
+    b"non-object JSON, and objects without a nonempty string request_id. Preserve\n"
+    b"the order and fields of the remaining objects in parse_events(lines).\n"
+    b"aggregate(events) returns {request_id: (accepted_count, last_duration_ms)}.\n"
+    b"Accept only nonnegative integer duration_ms values, explicitly excluding\n"
+    b"booleans. The latest accepted duration wins, including zero. Invalid\n"
+    b"duration values do not increment count or replace the last valid duration.\n"
+    b"render_csv(summary) sorts identifiers lexicographically (case-sensitive),\n"
+    b"outputs request_id,count,last_duration_ms per line, and appends a newline\n"
+    b"to each row; the empty report is an empty string. Keep public APIs intact.\n"
+)
+HIDDEN_EVENTLOG_ORACLE = (
+    "from eventlog.parser import parse_events\n"
+    "from eventlog.aggregate import aggregate\n"
+    "from eventlog.render import render_csv\n"
+    "valid = {'request_id':'task-A','duration_ms':0,'extra':{'ok':True}}\n"
+    "assert parse_events(['', '\\n', 'bad-json', 'null', '[1]', '42',\n"
+    '    \'{"request_id":"","duration_ms":4}\',\n'
+    '    \'{"request_id":7,"duration_ms":4}\',\n'
+    '    \'{"request_id":"task-A","duration_ms":0,"extra":{"ok":true}}\']) == [valid]\n'
+    'assert parse_events([\'{"request_id":"ß","duration_ms":2}\']) == '
+    "[{'request_id':'ß','duration_ms':2}]\n"
+    "assert aggregate([]) == {}\n"
+    "assert aggregate([{'request_id':'a','duration_ms':4},\n"
+    " {'request_id':'a','duration_ms':0},\n"
+    " {'request_id':'a','duration_ms':False},\n"
+    " {'request_id':'a','duration_ms':-3},\n"
+    " {'request_id':'a','duration_ms':2.5},\n"
+    " {'request_id':'b','duration_ms':17}]) == {'a':(2,0),'b':(1,17)}\n"
+    "assert render_csv({'b':(1,17),'A':(3,0),'a':(2,99)}) == "
+    "'A,3,0\\na,2,99\\nb,1,17\\n'\n"
+    "assert render_csv({}) == ''\n"
+    "assert render_csv(aggregate(parse_events([\n"
+    ' \'{"request_id":"B","duration_ms":1}\',\n'
+    ' \'{"request_id":"B","duration_ms":0}\',\n'
+    ' \'{"request_id":"A","duration_ms":20}\'\n'
+    "]))) == 'A,1,20\\nB,2,0\\n'\n"
+)
 DEFAULT_TURN_TOKEN_BUDGET = 40_000
 MAX_EVAL_TURN_TOKEN_BUDGET = 250_000
 DEFAULT_EVAL_CONTEXT_TOKENS = 8_192
@@ -183,6 +274,27 @@ TASKS = {
         "python3 -B test_billing.py",
         "edit",
         frozenset({"billing/tax.py", "billing/receipt.py"}),
+    ),
+    "event-log": Task(
+        "A line-delimited JSON telemetry pipeline produces incorrect reports "
+        "and crashes on malformed input. Diagnose the package using README.md "
+        "and test_eventlog.py, fix all three modules in eventlog/, and execute "
+        "the exact command `python3 -B test_eventlog.py` with run_command. "
+        "Only this command is authorized. Preserve all public function names, "
+        "README.md, test_eventlog.py, eventlog/__init__.py, and keep.txt.",
+        {
+            "eventlog/__init__.py": b"",
+            "eventlog/parser.py": EVENTLOG_PARSER,
+            "eventlog/aggregate.py": EVENTLOG_AGGREGATE,
+            "eventlog/render.py": EVENTLOG_RENDER,
+            "test_eventlog.py": EVENTLOG_TEST,
+            "README.md": EVENTLOG_README,
+        },
+        "python3 -B test_eventlog.py",
+        "edit",
+        frozenset(
+            {"eventlog/parser.py", "eventlog/aggregate.py", "eventlog/render.py"}
+        ),
     ),
 }
 
@@ -280,14 +392,19 @@ def grade(task_name: str, workspace: Path) -> dict[str, Any]:
                 "hidden_oracle_exit": hidden.returncode,
                 "oracle_stderr": (visible.stderr + hidden.stderr)[-250:],
             }
-        if task_name == "two-file":
+        if task_name in {"two-file", "event-log"}:
             if any(
                 (workspace / name).is_symlink()
                 for name in TASKS[task_name].initial_files
             ):
                 return {"correct": False, "oracle_error": "fixture contains a symlink"}
-            visible = oracle_python(workspace, "test_billing.py")
-            hidden = oracle_python(workspace, code=HIDDEN_BILLING_ORACLE)
+            visible_script, hidden_test = (
+                ("test_billing.py", HIDDEN_BILLING_ORACLE)
+                if task_name == "two-file"
+                else ("test_eventlog.py", HIDDEN_EVENTLOG_ORACLE)
+            )
+            visible = oracle_python(workspace, visible_script)
+            hidden = oracle_python(workspace, code=hidden_test)
             return {
                 "correct": visible.returncode == 0 and hidden.returncode == 0,
                 "visible_oracle_exit": visible.returncode,
@@ -638,7 +755,7 @@ def main() -> int:
         "--task",
         choices=tuple(TASKS),
         action="append",
-        help="Repeat to select tasks; default is all five",
+        help="Repeat to select tasks; default is all six",
     )
     args = parser.parse_args()
     if args.task and len(args.task) != len(set(args.task)):

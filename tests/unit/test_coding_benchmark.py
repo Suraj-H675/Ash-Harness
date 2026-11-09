@@ -475,6 +475,86 @@ def test_two_file_oracle_rejects_partial_repairs_and_accepts_complete_fix(
     not sys.platform.startswith("linux") or shutil.which("bwrap") is None,
     reason="Linux Bubblewrap runtime required",
 )
+def test_event_log_oracle_rejects_partial_repairs_and_accepts_three_module_fix(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = TASKS["event-log"]
+    assert task.editable_files == frozenset(
+        {"eventlog/parser.py", "eventlog/aggregate.py", "eventlog/render.py"}
+    )
+    (workspace / "keep.txt").write_bytes(_benchmark.PRESERVED)
+    for filename, data in task.initial_files.items():
+        path = workspace / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+    assert grade("event-log", workspace)["correct"] is False
+    assert check_workspace_artifacts("event-log", workspace)[:2] == (True, False)
+
+    parser = workspace / "eventlog/parser.py"
+    parser.write_bytes(
+        _benchmark.EVENTLOG_PARSER.replace(
+            b"        event = json.loads(line)  # BUG: one bad record aborts the stream\n"
+            b"        if event.get('request_id'):\n",
+            b"        try:\n"
+            b"            event = json.loads(line)\n"
+            b"        except json.JSONDecodeError:\n"
+            b"            continue\n"
+            b"        if (isinstance(event, dict) and "
+            b"isinstance(event.get('request_id'), str) "
+            b"and event['request_id']):\n",
+        )
+    )
+    assert grade("event-log", workspace)["correct"] is False
+    assert check_workspace_artifacts("event-log", workspace)[:2] == (True, False)
+
+    aggregate = workspace / "eventlog/aggregate.py"
+    aggregate.write_bytes(
+        _benchmark.EVENTLOG_AGGREGATE.replace(
+            b"not isinstance(ms, int)", b"type(ms) is not int"
+        ).replace(b"ms or previous", b"ms")
+    )
+    assert grade("event-log", workspace)["correct"] is False
+    assert check_workspace_artifacts("event-log", workspace)[:2] == (True, False)
+
+    renderer = workspace / "eventlog/render.py"
+    renderer.write_bytes(_benchmark.EVENTLOG_RENDER.replace(b", reverse=True", b""))
+    final = grade("event-log", workspace)
+    assert final["correct"] is True, final
+    assert final["visible_oracle_exit"] == 0
+    assert final["hidden_oracle_exit"] == 0
+    protected, sources_changed, files = check_workspace_artifacts(
+        "event-log", workspace
+    )
+    assert protected is True
+    assert sources_changed is True
+    assert set(files) == {"keep.txt", *task.initial_files}
+
+    # A visible-example-specific shortcut must not satisfy the independent
+    # oracle, even if the exposed integration test remains green.
+    correct_parser = parser.read_bytes()
+    parser.write_bytes(
+        correct_parser.replace(
+            b"and event['request_id']):",
+            b"and event['request_id'] in ('a', 'z')):",
+        )
+    )
+    assert oracle_python(workspace, "test_eventlog.py").returncode == 0
+    assert grade("event-log", workspace)["correct"] is False
+    parser.write_bytes(correct_parser)
+
+    # The external hidden oracle is not a substitute for the protected-file
+    # contract: changing tests must still invalidate the scored workspace.
+    (workspace / "test_eventlog.py").write_bytes(b"pass\n")
+    assert check_workspace_artifacts("event-log", workspace)[:2] == (False, True)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or shutil.which("bwrap") is None,
+    reason="Linux Bubblewrap runtime required",
+)
 def test_multifile_oracle_rejects_visible_test_only_hack(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     (workspace / "inventory").mkdir(parents=True)

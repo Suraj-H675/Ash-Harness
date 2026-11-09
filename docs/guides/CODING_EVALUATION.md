@@ -51,8 +51,9 @@ PYTHONPATH=src .venv/bin/python devtools/coding_benchmark.py \
 ```
 
 Use a **new evidence path** for every invocation. `--task marker`,
-`--task build-run`, `--task repair-test`, `--task multi-file`, or
-`--task two-file` can select a single case, and `--task` can be repeated to
+`--task build-run`, `--task repair-test`, `--task multi-file`,
+`--task two-file`, or `--task event-log` can select a single case, and
+`--task` can be repeated to
 select cases. Use `--repeat 3` for three isolated Ash workspaces and sessions
 per case. Those trials **share the model server and any of its prompt/KV caches**;
 they are not independent inference environments. A before/after comparison
@@ -71,6 +72,13 @@ serving model/runtime supports that window. Both limits are recorded in each
 result. A turn that stops on `context` is not evidence that its *turn-total*
 budget was exhausted: these are independent constraints. Ash's production
 context policy has not been changed by either benchmark option.
+The `event-log` task is an **original, synthetic three-module integration
+repair**, not an upstream bug report or a substitute for a repository-scale
+benchmark. It combines malformed JSON handling, aggregation correctness, and
+report ordering. The grader requires all three modules to change, passes both
+visible and independent hidden input variants through an isolated Python
+oracle, and rejects modifications to fixture/test files. That improves our
+workflow coverage without implying real-world or multi-language success.
 The tool never launches
 a cloud inference route, passes through personal credentials, alters the user's
 Ash profile, or runs anything in the project being developed. The code tasks

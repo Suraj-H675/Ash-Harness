@@ -153,3 +153,39 @@ do **not** establish a statistically reliable success rate, causal latency
 improvement, or justify increasing the token/context limits silently for real
 users. No production context-compaction code or runtime defaults changed.
 Both model servers were stopped after the tests.
+
+## Original three-module event-log challenge (2026-11-09)
+
+The benchmark now also includes an **original synthetic** `event-log` task,
+designed to probe slightly broader repository editing without copying a public
+benchmark's memorized issue/patch. The agent must repair a JSON-lines parser,
+an aggregation function, and a deterministic report renderer. The task requires
+all three modules to change and the exact permitted test command to execute.
+Visible tests, independent hidden behavior checks, protected fixture bytes,
+and session audit integrity are all required. The oracle was verified to fail
+on the initial fixture and partial repairs, pass a complete three-module fix,
+and reject a fix hard-coded for the visible example.
+
+One real Ash CLI trial used Qwen3.5-4B Q4_K_M, llama.cpp b12223 with Vulkan,
+a **16,384-token context window**, **80,000 cumulative turn-token budget**,
+and the unchanged production loop at `0795e89`:
+
+| Metric | Observed result |
+|---|---|
+| Overall pass | **No** |
+| Wall time / model requests | 59.69s / 10 |
+| Estimated prompt / completion tokens | 75,883 / 1,768 |
+| Out-of-scope path calls | 7, all refused |
+| File modifications | All three required source files changed |
+| Visible / hidden tests | Both failed; the parser still dereferenced `None` |
+| Required test command | Not executed; the model added an unauthorized `cd` prefix, and permission policy denied it |
+| Protected fixture files / session audit | Intact / valid |
+| Stop condition | Reached 10 model-request iterations without successfully finishing |
+
+The result is a genuine **failed coding trial**, not a regression proved in
+Ash's runtime or a reason to relax path/command permissions. This single run
+demonstrates that the new fixture distinguishes a harder workflow than the
+previous passing `two-file` smoke; it does not estimate general success rates.
+The evidence stays local under
+`/var/tmp/ash-coding-eval-20261109/gpu-event-log-v1/`, and the benchmark's GPU
+model server was stopped after the trial.
