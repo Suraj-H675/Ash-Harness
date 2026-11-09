@@ -59,3 +59,42 @@ scoring**, not a claimed boost in coding performance. The sample is too small
 to estimate general reliability or infer an Ash defect from local-model
 behavior. Private raw run receipts were kept outside the repository under
 `/var/tmp/ash-coding-eval-20261109/` on the test host.
+
+## Follow-up: GPU runtime and parallel-read recovery (2026-11-09)
+
+The same GGUF was also exercised through llama.cpp **b12223**, with Vulkan
+offload to the NVIDIA RTX 3050 6GB Laptop GPU, 4 CPU threads, and the same
+16,384-token context and tool protocol. This is a **different runtime and
+hardware path** from the CPU baseline above; the following comparisons must
+not be attributed solely to Ash code changes.
+
+| Trial | Ash revision | Result | Wall time | Observed |
+|---|---|---|---:|---|
+| GPU marker smoke | `9805dfc` | Pass | 30.54s | Actual write tool succeeded; two model requests |
+| GPU multi-file 1 | `dbd0ed7` | Pass | 24.76s | Five model requests; no rejected edits |
+| GPU multi-file 2 | `9805dfc` | Pass | 29.08s | Seven requests; one rejected edit and recovery |
+| GPU multi-file 3 | `9805dfc` | Pass | 28.95s | Seven requests; one rejected edit and recovery |
+| GPU multi-file 4 | `dbd0ed7` | Pass | 26.21s | Seven requests; one rejected edit and recovery |
+
+The edit-feedback change did **not** demonstrate a measured improvement: both
+revisions passed 2/2, and the small sample favored the older revision on
+latency. The guard/error behavior remains independently valuable. These runs
+share a serving process/cache and are not statistically independent.
+
+The newly added `two-file` fixture is a genuinely coordinated repair requiring
+both `billing/tax.py` and `billing/receipt.py` to change, with a protected
+visible test and independent hidden oracle. Its first GPU trial on `9805dfc`
+failed in 9.07s after **one model request**: four invalid out-of-scope reads
+in one parallel batch hit the three-failure circuit breaker before the model
+could receive all results.
+
+With the breaker corrected to score a parallel-safe, read-only batch as one
+failed attempt (working tree based on `9805dfc`), the corresponding GPU trial
+ran **seven model requests** over 20.92s. All invalid paths remained denied,
+and no source files were changed. It ultimately stopped on the 40,000-token
+turn budget after repeatedly proposing forbidden paths, so **the full two-file
+task still failed**. This demonstrates narrower recovery progress, not task
+success or a generalized coding-performance improvement. Sequential operations
+retain immediate breaker behavior, and the circuit trips after consecutive
+failed parallel batches. Raw receipts remain private under the same external
+evidence directory; the model server was explicitly shut down after trials.

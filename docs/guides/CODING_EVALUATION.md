@@ -10,8 +10,12 @@ tool-call summaries, and the source revision.
 The initial tasks intentionally cover distinct workflow contracts: exact file
 creation; creating and executing a Python program; reading and repairing
 a failing Python test; and finding a percentage-calculation bug across a small
-multi-file package. The repair tasks are judged by hidden behavioral assertions
-in addition to their visible tests. This is a **smoke-scale baseline**, not a
+multi-file package. That original `multi-file` case **requires editing only one
+module**, despite reading multiple files. The newer `two-file` case requires
+separate fixes in both billing modules; both the visible test and a hidden
+behavioral oracle must pass, and both original source files must actually change.
+The other repair tasks also have hidden behavioral checks. This is still a
+**smoke-scale baseline**, not a
 statistically meaningful agent leaderboard, general model-quality claim, or
 replacement for larger, independently authored coding tasks. Run repeated trials
 before claiming an improvement in completion rate or latency.
@@ -47,9 +51,14 @@ PYTHONPATH=src .venv/bin/python devtools/coding_benchmark.py \
 ```
 
 Use a **new evidence path** for every invocation. `--task marker`,
-`--task build-run`, `--task repair-test`, or `--task multi-file` can select a
-single case, and `--task` can be repeated to select cases. Use `--repeat 3`
-for three independent repetitions of each selected case. The tool never launches
+`--task build-run`, `--task repair-test`, `--task multi-file`, or
+`--task two-file` can select a single case, and `--task` can be repeated to
+select cases. Use `--repeat 3` for three isolated Ash workspaces and sessions
+per case. Those trials **share the model server and any of its prompt/KV caches**;
+they are not independent inference environments. A before/after comparison
+should use the same serving binary, device, sampling configuration, and model,
+and should balance task order before interpreting small latency differences.
+The tool never launches
 a cloud inference route, passes through personal credentials, alters the user's
 Ash profile, or runs anything in the project being developed. The code tasks
 execute in `auto_edit` mode with no general command approval; only the exact
@@ -62,7 +71,8 @@ explicitly set to `native`.
 interpreter, endpoint, timeout, and per-task outcomes. A task passes only when
 all of the following are true: the CLI completes without timeout; the external
 oracle passes; required tools have actually succeeded; protected files are
-unchanged; and the session audit verifies. The oracle, tool activity, and final
+unchanged; all case-specific editable source files have changed; and the session
+audit verifies. The oracle, tool activity, and final
 model claim are recorded separately so a confident answer cannot substitute
 for a completed edit or successful test.
 

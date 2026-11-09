@@ -5914,12 +5914,21 @@ class AshLoop:
         persist_tool_messages: bool = False,
         tool_result_images: _TurnToolResultImages | None = None,
         _defer_terminal_persistence: bool = False,
+        _defer_breaker_outcomes: list[tuple[str, bool]] | None = None,
     ) -> list[dict[str, Any]]:
         """Execute approved tool calls, gating each on the safety guard."""
 
         if self._tool_dispatch_disabled and tool_calls:
             raise RuntimeError("tool-disabled runtime refuses tool dispatch")
         active_tools = self.tools if tools_snapshot is None else tools_snapshot
+
+        def record_breaker_outcome(tool_name: str, success: bool) -> None:
+            if _defer_breaker_outcomes is not None:
+                _defer_breaker_outcomes.append((tool_name, success))
+            elif success:
+                self.circuit_breaker.record_success()
+            else:
+                self.circuit_breaker.record_failure(tool_name)
 
         def parallel_safe(call: dict[str, Any]) -> bool:
             tool_name = call.get("name")
@@ -5933,6 +5942,15 @@ class AshLoop:
 
         if len(tool_calls) > 1 and all(parallel_safe(call) for call in tool_calls):
             concurrency = asyncio.Semaphore(MAX_PARALLEL_READ_ONLY_TOOL_CALLS)
+            # A parallel read batch comes from one model response. Collect its
+            # outcomes before scoring the breaker, so sibling failures cannot
+            # abort each other before the model receives the complete batch.
+            # Sequential side-effectful batches retain immediate trip behavior.
+            batch_outcomes = (
+                _defer_breaker_outcomes
+                if _defer_breaker_outcomes is not None
+                else []
+            )
 
             async def execute_read_only(call: dict[str, Any]) -> list[dict[str, Any]]:
                 async with concurrency:
@@ -5943,6 +5961,7 @@ class AshLoop:
                         _defer_terminal_persistence=(
                             persist_tool_messages or _defer_terminal_persistence
                         ),
+                        _defer_breaker_outcomes=batch_outcomes,
                     )
                     if persist_tool_messages:
                         # A sibling can stall or be cancelled after this read
@@ -5999,6 +6018,14 @@ class AshLoop:
                         call=call,
                         result=result,
                         tool_result_images=tool_result_images,
+                    )
+            if _defer_breaker_outcomes is None and batch_outcomes:
+                if any(success for _, success in batch_outcomes):
+                    self.circuit_breaker.record_success()
+                else:
+                    names = {name for name, _ in batch_outcomes}
+                    self.circuit_breaker.record_failure(
+                        next(iter(names)) if len(names) == 1 else "tool_batch"
                     )
             return flattened
 
@@ -6084,7 +6111,7 @@ class AshLoop:
                     arguments=record.arguments,
                     error=record.error,
                 )
-                self.circuit_breaker.record_failure(tool_name)
+                record_breaker_outcome(tool_name, False)
                 continue
 
             try:
@@ -6140,7 +6167,7 @@ class AshLoop:
                     arguments=record.arguments,
                     error=record.error,
                 )
-                self.circuit_breaker.record_failure(tool_name)
+                record_breaker_outcome(tool_name, False)
                 continue
 
             decision = self.permission_policy.evaluate(
@@ -6490,7 +6517,7 @@ class AshLoop:
                     arguments=record.arguments,
                     error=error,
                 )
-                self.circuit_breaker.record_failure(tool_name)
+                record_breaker_outcome(tool_name, False)
                 continue
             finally:
                 set_log_context(operation_id=previous_operation_id)
@@ -6617,11 +6644,11 @@ class AshLoop:
             self._record_repo_map_activity(tool_name, arguments, tool_result)
             self._record_turn_file_mutation(tool_name, arguments, tool_result)
             if tool_result.success:
-                self.circuit_breaker.record_success()
+                record_breaker_outcome(tool_name, True)
             else:
                 # A tool that ran cleanly but reported failure still counts
                 # as a failure for the breaker.
-                self.circuit_breaker.record_failure(tool_name)
+                record_breaker_outcome(tool_name, False)
 
             # Skill nudge check — suggest skills after N iterations of disuse.
             was_skill = self.tools_registry is not None and any(

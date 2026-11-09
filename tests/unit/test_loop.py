@@ -9271,6 +9271,201 @@ async def test_circuit_breaker_trip_persists_terminal_tool_result(
 
 
 @pytest.mark.asyncio
+async def test_parallel_read_failures_count_once_per_model_batch(tmp_path) -> None:
+    """One provider response with four bad paths gets one chance to recover."""
+    from ash.core.recovery import CircuitBreaker, CircuitBreakerError
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "parallel-failure-batch.db")
+    breaker = CircuitBreaker(max_failures=3)
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"read_file": ReadFileTool(guard)},
+        safety_tier="auto_approve",
+        circuit_breaker=breaker,
+    )
+    try:
+        session = await loop.start_session()
+
+        def bad_reads(batch: int) -> list[dict[str, Any]]:
+            return [
+                {
+                    "call_id": f"bad-{batch}-{index}",
+                    "name": "read_file",
+                    "arguments": {"file_path": f"../outside-{index}.txt"},
+                }
+                for index in range(4)
+            ]
+
+        for batch in (1, 2):
+            results = await loop._execute_tool_calls(
+                bad_reads(batch), session, persist_tool_messages=True
+            )
+            assert len(results) == 4
+            assert all(not result["success"] for result in results)
+            assert all("outside project scope" in result["error"] for result in results)
+            assert breaker.failure_counter == batch
+
+        with pytest.raises(CircuitBreakerError) as trapped:
+            await loop._execute_tool_calls(
+                bad_reads(3), session, persist_tool_messages=True
+            )
+        assert trapped.value.tool_name == "read_file"
+        assert trapped.value.failure_count == 3
+        persisted = store.load_session(session.session_id)
+        assert len(persisted.tool_calls) == 12
+        assert len([message for message in persisted.messages if message.role == "tool"]) == 12
+        assert all(record.error for record in persisted.tool_calls)
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parallel_read_batch_with_success_resets_failure_streak(tmp_path) -> None:
+    from ash.core.recovery import CircuitBreaker
+
+    (tmp_path / "exists.txt").write_text("present\n", encoding="utf-8")
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "parallel-partial-success.db")
+    breaker = CircuitBreaker(max_failures=3)
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"read_file": ReadFileTool(guard)},
+        safety_tier="auto_approve",
+        circuit_breaker=breaker,
+    )
+    try:
+        session = await loop.start_session()
+
+        def call(suffix: str, filename: str) -> dict[str, Any]:
+            return {
+                "call_id": suffix,
+                "name": "read_file",
+                "arguments": {"file_path": filename},
+            }
+
+        await loop._execute_tool_calls(
+            [call("a", "../outside-a"), call("b", "../outside-b")],
+            session,
+            persist_tool_messages=True,
+        )
+        assert breaker.failure_counter == 1
+        results = await loop._execute_tool_calls(
+            [call("c", "../outside-c"), call("d", "exists.txt")],
+            session,
+            persist_tool_messages=True,
+        )
+        assert [result["success"] for result in results] == [False, True]
+        assert breaker.failure_counter == 0
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parallel_read_denials_do_not_count_as_tool_failures(tmp_path) -> None:
+    """The breaker must not turn explicit permission refusal into a retry signal."""
+    from ash.core.recovery import CircuitBreaker
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "parallel-denials.db")
+    breaker = CircuitBreaker(max_failures=1)
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"read_file": ReadFileTool(guard)},
+        safety_tier="auto_approve",
+        circuit_breaker=breaker,
+    )
+    try:
+        loop.permission_policy.set_persistent_rules(
+            [PermissionRule.create(RuleEffect.DENY, "read_file")]
+        )
+        session = await loop.start_session()
+        results = await loop._execute_tool_calls(
+            [
+                {
+                    "call_id": f"denied-{i}",
+                    "name": "read_file",
+                    "arguments": {"file_path": "inside.txt"},
+                }
+                for i in range(4)
+            ],
+            session,
+            persist_tool_messages=True,
+        )
+        assert len(results) == 4
+        assert all(not result["success"] for result in results)
+        assert breaker.failure_counter == 0
+        records = store.load_session(session.session_id).tool_calls
+        assert len(records) == 4
+        assert all(not record.approved and not record.executed for record in records)
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sequential_failure_batch_still_stops_before_following_call(tmp_path) -> None:
+    """Never defer a stop across sequential calls that might have side effects."""
+    from ash.core.recovery import CircuitBreaker, CircuitBreakerError
+
+    attempts: list[int] = []
+
+    class FailingTool(MyTestTool):
+        async def run(self, **kwargs):
+            attempts.append(kwargs["index"])
+            return ToolResult(success=False, output="", error="unsuccessful operation")
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "sequential-breaker.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        tmp_path,
+        tools={"my_tool": FailingTool(guard)},
+        safety_tier="auto_approve",
+        circuit_breaker=CircuitBreaker(max_failures=3),
+    )
+    try:
+        session = await loop.start_session()
+        with pytest.raises(CircuitBreakerError):
+            await loop._execute_tool_calls(
+                [
+                    {
+                        "call_id": f"sequential-{index}",
+                        "name": "my_tool",
+                        "arguments": {"index": index},
+                    }
+                    for index in range(4)
+                ],
+                session,
+                persist_tool_messages=True,
+            )
+        assert attempts == [0, 1, 2]
+        saved = store.load_session(session.session_id)
+        assert len(saved.tool_calls) == 3
+        assert len([m for m in saved.messages if m.role == "tool"]) == 3
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_turn_can_resume_from_persisted_failure(tmp_path) -> None:
     from ash.core.recovery import CircuitBreaker
 

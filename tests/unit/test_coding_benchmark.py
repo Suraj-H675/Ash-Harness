@@ -25,6 +25,8 @@ CALC_TEST = _benchmark.CALC_TEST
 CHECKOUT = _benchmark.CHECKOUT
 CHECKOUT_TEST = _benchmark.CHECKOUT_TEST
 PRICING = _benchmark.PRICING
+TASKS = _benchmark.TASKS
+check_workspace_artifacts = _benchmark.check_workspace_artifacts
 grade = _benchmark.grade
 oracle_python = _benchmark.oracle_python
 summarize_operational_events = _benchmark.summarize_operational_events
@@ -314,6 +316,69 @@ def test_repair_oracle_rejects_constant_answer_that_passes_visible_test(
     outcome = grade("repair-test", workspace)
 
     assert outcome["correct"] is False
+
+
+def test_two_file_scoring_requires_both_original_sources_to_change(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "keep.txt").write_bytes(_benchmark.PRESERVED)
+    task = TASKS["two-file"]
+    assert task.editable_files == frozenset({"billing/tax.py", "billing/receipt.py"})
+    for filename, content in task.initial_files.items():
+        target = workspace / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+    protected, changed, files = check_workspace_artifacts("two-file", workspace)
+    assert protected is True
+    assert changed is False
+    assert set(files) == {"keep.txt", *task.initial_files}
+
+    tax_path = workspace / "billing/tax.py"
+    tax_path.write_bytes(
+        _benchmark.BILLING_TAX.replace(
+            b"return subtotal + subtotal * percent / Decimal('100')",
+            b"return subtotal * percent / Decimal('100')",
+        )
+    )
+    assert check_workspace_artifacts("two-file", workspace)[:2] == (True, False)
+
+    receipt_path = workspace / "billing/receipt.py"
+    receipt_path.write_bytes(_benchmark.BILLING_RECEIPT.replace(b":.1f}", b":.2f}"))
+    assert check_workspace_artifacts("two-file", workspace)[:2] == (True, True)
+
+    (workspace / "test_billing.py").write_text("pass\n", encoding="utf-8")
+    assert check_workspace_artifacts("two-file", workspace)[:2] == (False, True)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or shutil.which("bwrap") is None,
+    reason="Linux Bubblewrap runtime required",
+)
+def test_two_file_oracle_rejects_partial_repairs_and_accepts_complete_fix(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for filename, content in TASKS["two-file"].initial_files.items():
+        target = workspace / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+    assert grade("two-file", workspace)["correct"] is False
+    tax_path = workspace / "billing/tax.py"
+    tax_path.write_bytes(
+        _benchmark.BILLING_TAX.replace(
+            b"return subtotal + subtotal * percent / Decimal('100')",
+            b"return subtotal * percent / Decimal('100')",
+        )
+    )
+    assert grade("two-file", workspace)["correct"] is False
+    receipt_path = workspace / "billing/receipt.py"
+    receipt_path.write_bytes(_benchmark.BILLING_RECEIPT.replace(b":.1f}", b":.2f}"))
+    assert grade("two-file", workspace)["correct"] is True
 
 
 @pytest.mark.skipif(
