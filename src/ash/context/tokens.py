@@ -58,10 +58,10 @@ class OpenAITokenCounter:
             return 0
         if self._encoder is not None:
             return len(self._encoder.encode(text))  # type: ignore[attr-defined]
-        return _estimate_openai_tokens(text)
+        return estimate_text_tokens(text)
 
 
-def _estimate_openai_tokens(text: str) -> int:
+def estimate_text_tokens(text: str) -> int:
     """Return a conservative offline estimate for mixed code and Unicode text.
 
     ASCII-heavy text is estimated at three characters per token rather than the

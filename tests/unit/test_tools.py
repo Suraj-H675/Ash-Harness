@@ -2,11 +2,13 @@ import asyncio
 import codecs
 import hashlib
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel, Field
 
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.tools.command import (
@@ -19,7 +21,7 @@ from ash.tools.command import (
     extract_diagnostics,
     extract_diagnostic_summary,
 )
-from ash.tools.base import ToolExecutionOutcome, ToolResult
+from ash.tools.base import BaseTool, ToolExecutionOutcome, ToolResult
 from ash.tools.filesystem import (
     BINARY_FILE_ERROR,
     EXISTS_ERROR,
@@ -29,6 +31,7 @@ from ash.tools.filesystem import (
     WholeEditTool,
     WriteFileTool,
 )
+from ash.tools.base import count_output_tokens
 
 
 @pytest.fixture
@@ -55,6 +58,33 @@ def test_run_command_schema_rejects_oversized_command_and_cwd() -> None:
             command_line="echo ok",
             timeout_seconds=MAX_COMMAND_TIMEOUT_SECONDS + 1,
         )
+
+
+def test_provider_tool_schema_elides_generated_titles_but_preserves_fields(
+    guard: SafetyGuard,
+) -> None:
+    class NamedArgs(BaseModel):
+        title: str = Field(..., min_length=1)
+        count: int = Field(1, ge=1)
+
+    class NamedTool(BaseTool):
+        name = "named"
+        description = "Name a result."
+        args_schema = NamedArgs
+
+        async def run(self, **kwargs: object) -> ToolResult:
+            return ToolResult(success=True, output=str(kwargs))
+
+    original = NamedArgs.model_json_schema()
+    schema = NamedTool(guard).json_schema()
+    assert "title" in original["properties"]["title"]
+    assert "title" not in schema
+    assert "title" in schema["properties"]
+    assert "title" not in schema["properties"]["title"]
+    assert "title" not in schema["properties"]["count"]
+    assert schema["properties"]["title"]["minLength"] == 1
+    assert schema["properties"]["count"]["minimum"] == 1
+    assert schema["required"] == ["title"]
 
 
 def test_tool_result_structured_metadata_is_bounded(
@@ -231,6 +261,160 @@ async def test_read_file_truncation_reports_follow_up_range(
         "[read_file truncated: requested_lines=1-805; returned_lines=1-800; "
         "total_file_lines=805; omitted_lines=5; next_start_line=801]" in result.output
     )
+
+
+@pytest.mark.asyncio
+async def test_read_file_paginates_a_single_long_code_line_without_losing_text(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    line = "const payload = '" + "a" * 75000 + "';"
+    (project_root / "bundle.js").write_text(line + "\n", encoding="utf-8")
+    reader = ReadFileTool(guard)
+
+    first = await reader.run(file_path="bundle.js")
+    assert first.success and first.truncated
+    assert len(first.output) < 35_000
+    assert "next_start_line=1; next_start_column=" in first.output
+    assert first.token_count > 8_000
+
+    parts: list[str] = []
+    column = 1
+    for _ in range(8):
+        result = await reader.run(
+            file_path="bundle.js", start_line=1, end_line=1,
+            start_column=column, max_chars=20_000,
+        )
+        assert result.success
+        rendered = next(
+            re.fullmatch(r"1(?: \[column \d+\])?: (.*)", item)
+            for item in result.output.splitlines()
+            if re.fullmatch(r"1(?: \[column \d+\])?: (.*)", item)
+        )
+        # Column continuation labels do not become part of the source text.
+        parts.append(rendered[1])
+        if not result.truncated:
+            break
+        cursor = re.search(r"next_start_line=(\d+); next_start_column=(\d+)", result.output)
+        assert cursor is not None
+        assert int(cursor[1]) == 1
+        assert int(cursor[2]) > column
+        column = int(cursor[2])
+    assert "".join(parts) == line
+
+
+@pytest.mark.asyncio
+async def test_read_file_paginates_many_large_lines_and_can_resume_exactly(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    lines = [f"line_{index:04d}:" + "z" * 300 for index in range(1, 151)]
+    (project_root / "big.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    reader = ReadFileTool(guard)
+    first = await reader.run(file_path="big.py", max_chars=1000)
+    assert first.success and first.truncated
+    cursor = re.search(r"next_start_line=(\d+); next_start_column=(\d+)", first.output)
+    assert cursor is not None
+    next_line, next_column = int(cursor[1]), int(cursor[2])
+    assert next_line <= 4
+    resumed = await reader.run(
+        file_path="big.py", start_line=next_line, start_column=next_column,
+        max_chars=1000,
+    )
+    assert resumed.success
+    assert f"{next_line}" in resumed.output
+    assert len(resumed.output) < 1400
+
+
+@pytest.mark.asyncio
+async def test_read_file_rejects_invalid_continuation_column(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    (project_root / "short.txt").write_text("short\n")
+    result = await ReadFileTool(guard).run(
+        file_path="short.txt", start_column=100,
+    )
+    assert result.success is False
+    assert "start_column" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_read_file_continuation_refuses_changed_file(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "concurrent.py"
+    target.write_text("# " + "x" * 40_000 + "\n", encoding="utf-8")
+    reader = ReadFileTool(guard)
+    first = await reader.run(file_path="concurrent.py")
+    assert first.success and first.truncated
+    original_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    assert f"sha256={original_digest}" in first.output
+
+    target.write_text("# " + "y" * 40_000 + "\n", encoding="utf-8")
+    stale = await reader.run(
+        file_path="concurrent.py", start_column=32_769,
+        expected_sha256=original_digest,
+    )
+    assert stale.success is False
+    assert stale.output == ""
+    assert "File changed since it was read" in (stale.error or "")
+
+    fresh = await reader.run(
+        file_path="concurrent.py", start_column=32_769,
+        expected_sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
+    )
+    assert fresh.success is True
+    assert "[column 32769]" in fresh.output
+
+
+@pytest.mark.asyncio
+async def test_read_file_unicode_continuation_preserves_source_characters(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    text = "σ界🌱" * 100
+    target = project_root / "unicode.txt"
+    target.write_text(text + "\n", encoding="utf-16")
+    reader = ReadFileTool(guard)
+    first = await reader.run(file_path="unicode.txt", max_chars=17)
+    assert first.success and first.truncated
+    assert "encoding=utf-16-le" in first.output
+    assert "1: " + text[:17] in first.output
+    second = await reader.run(
+        file_path="unicode.txt", start_line=1, end_line=1,
+        start_column=18, max_chars=19,
+        expected_sha256=hashlib.sha256(target.read_bytes()).hexdigest(),
+    )
+    assert second.success and second.truncated
+    assert "1 [column 18]: " + text[17:36] in second.output
+    assert "next_start_line=1; next_start_column=37" in second.output
+
+
+@pytest.mark.asyncio
+async def test_read_file_exact_character_budget_does_not_fake_truncation(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    (project_root / "equal.txt").write_text("abcd\n")
+    reader = ReadFileTool(guard)
+    exact = await reader.run(file_path="equal.txt", max_chars=4)
+    assert exact.success and not exact.truncated
+    (project_root / "equal.txt").write_text("abcd\nmore\n")
+    next_line = await reader.run(file_path="equal.txt", max_chars=4)
+    assert next_line.success and next_line.truncated
+    assert "next_start_line=2; next_start_column=1" in next_line.output
+
+
+def test_tool_output_token_estimate_counts_dense_code_and_unicode() -> None:
+    from ash.context.tokens import OpenAITokenCounter
+
+    for output in ("x" * 90_000, "界" * 12_000, "print(1)\n" * 20_000):
+        count = count_output_tokens(output)
+        assert count >= len(output.encode("utf-8")) // 4
+        assert count == OpenAITokenCounter("test").count(output)
+    assert count_output_tokens("") == 0
 
 
 @pytest.mark.asyncio

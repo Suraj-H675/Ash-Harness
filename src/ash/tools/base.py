@@ -11,6 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from ash.context.tokens import estimate_text_tokens
 from ash.core.redaction import redact_value
 from ash.safety.guard import SafetyGuard
 
@@ -170,10 +171,21 @@ class BaseTool(ABC):
         if args_schema is None:
             return {}
         if hasattr(args_schema, "model_json_schema"):
-            return args_schema.model_json_schema()
-        if hasattr(args_schema, "schema"):
-            return args_schema.schema()
-        return {}
+            schema = args_schema.model_json_schema()
+        elif hasattr(args_schema, "schema"):
+            schema = args_schema.schema()
+        else:
+            return {}
+        # JSON Schema titles are annotations, not input validation. Omitting
+        # redundant generated labels from common tool parameters saves context
+        # without changing properties, required fields, or type constraints.
+        schema.pop("title", None)
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            for prop in properties.values():
+                if isinstance(prop, dict):
+                    prop.pop("title", None)
+        return schema
 
     def search_schema(self) -> dict[str, Any]:
         """Return schema metadata for discovery without changing provider semantics."""
@@ -272,8 +284,6 @@ class ToolMiddlewareSkip(Exception):
 
 
 def count_output_tokens(output: str) -> int:
-    """Return a lightweight token estimate until provider tokenizers are wired in."""
+    """Conservatively estimate tool-result tokens, including dense code/Unicode."""
 
-    if not output:
-        return 0
-    return len(output.split())
+    return estimate_text_tokens(output)

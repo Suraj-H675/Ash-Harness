@@ -29,6 +29,8 @@ from ash.tools.base import (
 
 BINARY_DETECTION_BYTES = 8192
 DEFAULT_MAX_READ_LINES = 800
+DEFAULT_MAX_READ_CHARS = 32_768
+HARD_MAX_READ_CHARS = 131_072
 MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024
 MAX_TEXT_ARGUMENT_CHARS = 8 * 1024 * 1024
 BINARY_FILE_ERROR = (
@@ -66,14 +68,24 @@ class TextEncodingError(ValueError):
 
 
 class ReadFileArgs(BaseModel):
-    file_path: str = Field(
-        ..., description="Absolute or relative path to the file to read."
+    file_path: str = Field(..., description="Workspace path.")
+    start_line: int = Field(1, ge=1, description="First line (1-based).")
+    end_line: int | None = Field(None, ge=1, description="Last line.")
+    start_column: int = Field(
+        1,
+        ge=1,
+        description="First-line column (1-based).",
     )
-    start_line: int = Field(
-        1, ge=1, description="1-indexed starting line number (inclusive)."
+    max_chars: int = Field(
+        DEFAULT_MAX_READ_CHARS,
+        ge=1,
+        le=HARD_MAX_READ_CHARS,
+        description="Source character limit.",
     )
-    end_line: int | None = Field(
-        None, ge=1, description="1-indexed ending line number (inclusive)."
+    expected_sha256: str | None = Field(
+        None,
+        pattern=r"^[a-fA-F0-9]{64}$",
+        description="Reject changed SHA-256.",
     )
 
 
@@ -192,8 +204,17 @@ class WholeEditArgs(BaseModel):
 class ReadFileTool(BaseTool):
     name = "read_file"
     execution_contract = ToolExecutionContract(parallel_safe=True)
-    description = "Read line-delimited text content from a workspace file."
+    description = "Read numbered file lines. Truncated results include next line/column and SHA-256."
     args_schema = ReadFileArgs
+
+    def json_schema(self) -> dict[str, Any]:
+        # Optional defaults are enforced by ReadFileArgs; omitting their schema
+        # annotations keeps this always-visible tool compact on small models.
+        schema = super().json_schema()
+        for prop in schema.get("properties", {}).values():
+            if isinstance(prop, dict):
+                prop.pop("default", None)
+        return schema
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ReadFileArgs(**kwargs)
@@ -220,6 +241,10 @@ class ReadFileTool(BaseTool):
             )
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
+        digest = _sha256_bytes(raw_content)
+        stale_error = _validate_expected_sha256(args.expected_sha256, digest)
+        if stale_error is not None:
+            return ToolResult(success=False, output="", error=stale_error)
         try:
             original_text, encoding = _decode_text_bytes(raw_content)
         except BinaryContentError:
@@ -240,24 +265,58 @@ class ReadFileTool(BaseTool):
         end_index = args.end_line if args.end_line is not None else len(lines)
         selected = lines[start_index:end_index]
         selected_count = len(selected)
+        visible = selected[:DEFAULT_MAX_READ_LINES]
+        remaining = args.max_chars
+        numbered_lines: list[str] = []
+        continuation: tuple[int, int] | None = None
+        for index, line in enumerate(visible):
+            line_number = args.start_line + index
+            column = args.start_column if index == 0 else 1
+            if column > len(line) + 1:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        f"Error: start_column {column} exceeds line {line_number} "
+                        f"length ({len(line)} characters)."
+                    ),
+                )
+            offset = column - 1
+            shown = line[offset : offset + remaining]
+            prefix = (
+                f"{line_number}: "
+                if column == 1
+                else f"{line_number} [column {column}]: "
+            )
+            numbered_lines.append(prefix + shown)
+            remaining -= len(shown)
+            if offset + len(shown) < len(line):
+                continuation = (line_number, column + len(shown))
+                break
+            if remaining == 0 and index + 1 < len(visible):
+                continuation = (line_number + 1, 1)
+                break
 
-        truncated = False
-        if len(selected) > DEFAULT_MAX_READ_LINES:
-            selected = selected[:DEFAULT_MAX_READ_LINES]
-            truncated = True
+        if continuation is None and remaining == 0 and len(visible) < selected_count:
+            continuation = (args.start_line + len(visible), 1)
+        truncated = continuation is not None or selected_count > DEFAULT_MAX_READ_LINES
 
         metadata = _format_read_metadata(
             resolved_path,
             lines,
-            raw_content,
+            digest,
             encoding,
         )
-        numbered_lines = "\n".join(
-            f"{line_number}: {line}"
-            for line_number, line in enumerate(selected, start=args.start_line)
-        )
-        output = metadata if not numbered_lines else f"{metadata}\n{numbered_lines}"
-        if truncated:
+        rendered_lines = "\n".join(numbered_lines)
+        output = metadata if not rendered_lines else f"{metadata}\n{rendered_lines}"
+        if continuation is not None:
+            next_line, next_column = continuation
+            output += (
+                "\n[read_file truncated: "
+                f"source_chars_limit={args.max_chars}; "
+                f"next_start_line={next_line}; next_start_column={next_column}]"
+            )
+        elif truncated:
             output = (
                 f"{output}\n"
                 f"{_format_read_truncation_metadata(args.start_line, end_index, len(lines), selected_count)}"
@@ -787,12 +846,12 @@ def _format_read_truncation_metadata(
 def _format_read_metadata(
     path: Path,
     lines: list[str],
-    content: bytes,
+    digest: str,
     encoding: TextEncoding,
 ) -> str:
     return (
         "[read_file metadata: "
-        f"path={path}; sha256={_sha256_bytes(content)}; encoding={encoding.label}; "
+        f"path={path}; sha256={digest}; encoding={encoding.label}; "
         f"total_file_lines={len(lines)}]"
     )
 

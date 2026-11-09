@@ -78,7 +78,8 @@ from the remaining non-sensitive arguments after informing the user.
 ## 2. Core Tool Definitions
 
 ### 2.1 `read_file`
-Retrieves line-delimited content from the local workspace.
+Retrieves numbered, bounded source text from the local workspace with a
+whole-file SHA-256 digest and detected text encoding. The read is non-mutating.
 
 *   **Arguments Schema**:
     ```python
@@ -86,17 +87,30 @@ Retrieves line-delimited content from the local workspace.
         file_path: str = Field(..., description="Absolute or relative path to the file to read.")
         start_line: int = Field(1, description="1-indexed starting line number (inclusive).")
         end_line: int | None = Field(None, description="1-indexed ending line number (inclusive).")
+        start_column: int = Field(1, description="1-indexed Unicode character offset within start_line.")
+        max_chars: int = Field(32768, ge=1, le=131072, description="Source characters per read, excluding metadata and line numbers.")
+        expected_sha256: str | None = Field(None, description="Optional digest from a prior read; reject changed files.")
     ```
 *   **Security & Safety Checks**:
-    1.  Resolve path via `SafetyGuard.validate_path()`.
-    2.  Check for binary signature: read first 8KB of file. If null bytes (`\x00`) are found, block execution unless explicitly overridden or flag set, returning `Error: Binary file detected. Use specialized image/binary viewer tools instead.`
-    3.  Limit output to maximum tool response size (default: 800 lines or 50,000 tokens). Truncate and mark `truncated = True` if exceeded.
+    1.  Resolve and descriptor-scope the file through `SafetyGuard` and scoped I/O. Refuse workspace escapes and unsafe file substitutions.
+    2.  Read at most 8 MiB; reject binary files and unsupported text encodings. Preserve the detected encoding in metadata for subsequent edits.
+    3.  If `expected_sha256` is provided, reject a changed file rather than returning a mismatched continuation page.
+    4.  Return at most 800 numbered lines **and** at most `max_chars` source characters per call. `max_chars` does not include metadata or line-number labels and is a character, not an exact provider-token, limit.
+    5.  On truncation, return an explicit next-page cursor. For a long line, use both `start_line=next_start_line` and `start_column=next_start_column`. Supply the first page's `sha256` as `expected_sha256` when reading further pages of the same snapshot.
 *   **Response Format (Success)**:
     ```
+    [read_file metadata: path=/workspace/example.py; sha256=...; encoding=utf-8; total_file_lines=3]
     1: # File Content Header
     2: import os
     3: ...
     ```
+    If the source-character limit is reached, the result also includes:
+    ```
+    [read_file truncated: source_chars_limit=32768; next_start_line=3; next_start_column=128]
+    ```
+    A page limited only by the 800-line cap retains the existing line-based
+    truncation metadata. Normal small reads retain their original numbering
+    and output shape.
 
 ### 2.2 `write_file`
 Creates a new file or overwrites an existing one.

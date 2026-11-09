@@ -52,6 +52,9 @@ class SessionProvider:
     def count_tokens(self, text: str) -> int:
         return len(text.split())
 
+    async def aclose(self) -> None:
+        pass
+
     async def stream_chat(
         self, messages: list[dict[str, Any]], temperature: float = 0.0, tools=None
     ) -> AsyncGenerator[StreamChunk, None]:
@@ -221,6 +224,85 @@ def test_e2e_session_writes_file_and_runs_command(tmp_path: Path) -> None:
         assert record.executed is True
         assert record.approved is True
         assert record.error is None
+
+
+def test_e2e_agent_pages_large_source_then_repairs_and_verifies(tmp_path: Path) -> None:
+    """The real agent loop carries read cursors into a successful edit/test turn."""
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    _git_init(workspace)
+    source = workspace / "calc.py"
+    source.write_text(
+        "# " + "x" * 33_000 + "\ndef answer():\n    return 41\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "s.db"
+    provider = SessionProvider(
+        scripts=[
+            [
+                '<call_tool name="read_file">',
+                '<arg name="file_path">calc.py</arg>',
+                "</call_tool>",
+            ],
+            [
+                '<call_tool name="read_file">',
+                '<arg name="file_path">calc.py</arg>',
+                '<arg name="start_line">1</arg>',
+                '<arg name="start_column">32769</arg>',
+                '<arg name="max_chars">2000</arg>',
+                "</call_tool>",
+            ],
+            [
+                '<call_tool name="replace_file_content">',
+                '<arg name="file_path">calc.py</arg>',
+                '<arg name="start_line">3</arg>',
+                '<arg name="end_line">3</arg>',
+                '<arg name="target_content">    return 41</arg>',
+                '<arg name="replacement_content">    return 42</arg>',
+                "</call_tool>",
+            ],
+            [
+                '<call_tool name="run_command">',
+                '<arg name="command_line">python3 -c "import calc; assert calc.answer() == 42; print(\'PASS\')"</arg>',
+                '<arg name="cwd">.</arg>',
+                "</call_tool>",
+            ],
+            ["<response>updated and verified the answer</response>"],
+        ]
+    )
+
+    async def driver() -> str:
+        loop = _make_loop(workspace, db_path, provider)
+        await loop.start_session()
+        try:
+            return await loop.run_turn(
+                "Inspect calc.py, correct the answer, and test it"
+            )
+        finally:
+            await loop.aclose()
+
+    response = asyncio.run(driver())
+    assert "updated and verified" in response
+    assert source.read_text().endswith("    return 42\n")
+    session = SessionStore(db_path).load_session(_latest_session_id(db_path))
+    records = [
+        r
+        for r in session.tool_calls
+        if r.tool_name in {"read_file", "replace_file_content", "run_command"}
+    ]
+    assert [r.tool_name for r in records] == [
+        "read_file",
+        "read_file",
+        "replace_file_content",
+        "run_command",
+    ]
+    assert all(
+        record.approved and record.executed and not record.error for record in records
+    )
+    assert "next_start_line=1; next_start_column=32769" in (records[0].result or "")
+    assert "1 [column 32769]" in (records[1].result or "")
+    assert "PASS" in (records[3].result or "")
 
 
 def test_e2e_session_auto_commits_each_turn(tmp_path: Path) -> None:

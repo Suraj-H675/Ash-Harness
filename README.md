@@ -269,7 +269,7 @@ Ash includes a broad coding-tool surface:
 
 | Area | Capabilities |
 | --- | --- |
-| Files | Ranged reads, file creation, atomic writes, exact replacement, multi-edit operations, whole-file edits, and patch application |
+| Files | Bounded, line/column-paginated reads with SHA-256 continuity checks; file creation, atomic writes, exact replacement, multi-edit operations, whole-file edits, and patch application |
 | Text and structure | Directory listing, bounded globbing, descriptor-scoped bounded text/regex search, symbol lookup, and reference lookup |
 | Code intelligence | Incremental Tree-sitter repository maps for Python, JavaScript/JSX, TypeScript/TSX, Go, Rust, Java, C, C++, and C# |
 | Git | Status, bounded diffs, log inspection, explicit-scope commits, secret scanning, Git-hook error reporting, and worktree-aware review |
