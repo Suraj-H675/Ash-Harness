@@ -47,6 +47,11 @@ wheel into a clean environment and running
 involving optional external services must remain explicitly opt-in and
 document their prerequisites.
 
+For real coding-agent performance, use the local-model, independently scored
+[coding evaluation](docs/guides/CODING_EVALUATION.md). It runs disposable
+workspaces and never uses personal inference credentials. Treat a small number
+of passing tasks as a smoke baseline, not a statistical reliability claim.
+
 The development test group includes Hypothesis for generated durable-state
 sequences and pyte for real-terminal screen assertions. The Toxiproxy OpenAI
 transport test uses only a synthetic loopback server and is opt-in. Install an
