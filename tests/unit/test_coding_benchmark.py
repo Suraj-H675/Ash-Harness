@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
+import importlib.util
 import shutil
 import sys
 from pathlib import Path
 
 import pytest
 
-from devtools.coding_benchmark import (
-    CALC_TEST,
-    CHECKOUT,
-    CHECKOUT_TEST,
-    HIDDEN_CHECKOUT_ORACLE,
-    PRICING,
-    grade,
-    oracle_python,
+
+_benchmark_path = Path(__file__).resolve().parents[2] / "devtools/coding_benchmark.py"
+_spec = importlib.util.spec_from_file_location(
+    "ash_coding_benchmark_under_test", _benchmark_path
 )
+assert _spec is not None and _spec.loader is not None
+_benchmark = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _benchmark
+_spec.loader.exec_module(_benchmark)
+
+CALC_TEST = _benchmark.CALC_TEST
+CHECKOUT = _benchmark.CHECKOUT
+CHECKOUT_TEST = _benchmark.CHECKOUT_TEST
+PRICING = _benchmark.PRICING
+grade = _benchmark.grade
+oracle_python = _benchmark.oracle_python
 
 
 def test_marker_scoring_rejects_a_symlink_to_outside_the_workspace(
@@ -84,8 +92,6 @@ def test_multifile_oracle_rejects_visible_test_only_hack(tmp_path: Path) -> None
     (workspace / "inventory/pricing.py").write_bytes(PRICING)
     (workspace / "inventory/checkout.py").write_bytes(CHECKOUT)
     (workspace / "test_checkout.py").write_bytes(CHECKOUT_TEST)
-    assert HIDDEN_CHECKOUT_ORACLE
-
     (workspace / "inventory/pricing.py").write_text(
         "from decimal import Decimal\n"
         "def discounted_total(prices: list[Decimal], discount_percent: Decimal) -> Decimal:\n"
