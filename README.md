@@ -29,11 +29,15 @@ Ash is a local-first, provider-neutral coding environment that can:
 
 ### Platform support
 
-Ash supports native **Linux** and **macOS** on Python 3.12 through 3.14.
-Windows users should run Ash inside **WSL2**, which follows the supported Linux
-runtime path. Native Windows is intentionally not supported yet; the CLI and
-public installer fail fast there instead of entering partially tested platform
-branches.
+**Linux is the primary development and validation platform**, especially Arch
+Linux. Native **macOS** remains supported as a secondary platform. Both use
+Python 3.12 through 3.14; future Linux-specific capabilities may not be
+available on macOS, and unavailable capabilities must fail safely.
+
+**WSL2 is an experimental, currently unverified route** for Windows users to
+try Ash's Linux runtime. It is not a tested support guarantee. Native Windows
+remains unsupported; the CLI and installer refuse to launch it as though it
+were a supported host.
 
 ### Installation
 
@@ -757,7 +761,8 @@ including [permissions and managed policy](docs/guides/PERMISSIONS.md),
 Ash deliberately reports unsupported or partial surfaces instead of pretending
 they are complete:
 
-- native Windows execution is not currently supported; use WSL2;
+- native Windows execution is not supported; WSL2 is an experimental and
+  currently unverified Linux-runtime option;
 - OpenAI ChatGPT-plan authentication is service-verified through real browser
   sign-in, model discovery, plan-backed Responses completion, and native
   function-call continuation;

@@ -7,7 +7,7 @@ uv_installer="https://astral.sh/uv/$uv_version/install.sh"
 case "$(uname -s 2>/dev/null || true)" in
   Linux|Darwin) ;;
   *)
-    printf '%s\n' "Ash supports Linux and macOS. On Windows, use WSL2." >&2
+    printf '%s\n' "Ash supports native Linux and macOS. WSL2 is experimental and unverified; native Windows is unsupported." >&2
     exit 1
     ;;
 esac

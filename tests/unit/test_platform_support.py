@@ -18,12 +18,14 @@ def test_linux_and_macos_are_supported() -> None:
     assert platform_support_error("darwin") is None
 
 
-def test_native_windows_redirects_users_to_wsl2() -> None:
+def test_native_windows_reports_experimental_wsl2_option() -> None:
     message = platform_support_error("win32")
 
     assert message is not None
     assert "Native Windows" in message
     assert "WSL2" in message
+    assert "experimental" in message
+    assert "not-yet-verified" in message
     assert native_platform_supported("win32") is False
 
 

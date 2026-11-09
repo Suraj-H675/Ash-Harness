@@ -434,14 +434,27 @@ Check as relevant:
 
 ---
 
-## 12. Cross-platform awareness
+## 12. Platform priorities and compatibility
 
-Ash supports Linux, macOS, and Windows-facing behavior even when development is
-performed on one platform.
+Ash is **Linux-first with a portable core**. Development, performance work,
+real coding-agent evaluation, and the most comprehensive security, sandbox,
+terminal, and recovery validation prioritize Linux (especially the owner's
+Arch Linux environment).
 
-Do not introduce platform assumptions without checking the affected path.
+macOS is a **secondary, supported native platform**. Preserve working behavior
+and valuable compatibility gates, but do not require immediate feature parity
+for new Linux-native capabilities when that would add disproportionate
+complexity. Windows through **WSL2 is secondary and experimental**: it follows
+Linux execution paths in principle, but no WSL2 support claim is justified
+without real WSL2 workflow evidence. Native Windows is deferred and unsupported.
 
-Pay particular attention to:
+Keep orchestration, providers, configuration, sessions, memory, and other
+naturally portable code portable when straightforward. Prefer justified
+Linux-native process, PTY, filesystem, and sandbox capabilities over speculative
+platform shims. Detect unavailable host capabilities and fail clearly and
+safely; never silently lower isolation, permissions, or resource boundaries.
+
+When changing platform-sensitive code, pay particular attention to:
 
 - path semantics;
 - signals and process trees;
@@ -452,8 +465,11 @@ Pay particular attention to:
 - filesystem locking;
 - symlink and junction differences.
 
-If a platform-specific path cannot be exercised locally, keep that limitation
-explicit and use available CI or focused tests as evidence.
+Keep existing macOS CI and meaningful cross-platform regression coverage.
+Treat Ubuntu CI and Arch Linux local tests as distinct evidence, not as proof
+of every Linux distribution. Add a real WSL2 lane only once that environment
+and relevant workflows can actually be exercised. Do not add ceremonial native
+Windows CI or reduce macOS coverage merely to shorten the matrix.
 
 ---
 

@@ -388,9 +388,9 @@ remains unimplemented.
 
 ## 4. Platform-Specific Command Safety Policies
 
-Ash supports native Linux and macOS hosts. Windows users run Ash inside WSL2,
-which uses the Linux command/process model. Native Windows PowerShell execution
-is intentionally not part of the supported runtime contract.
+Ash prioritizes Linux and preserves supported native macOS behavior. WSL2 can
+reuse the Linux command/process model experimentally, but its real workflows
+have not been verified. Native Windows PowerShell execution is not supported.
 
 Supported hosts enforce workspace-scoped executable resolution, destructive
 command blocking, bounded subprocess output, explicit timeouts, process-tree

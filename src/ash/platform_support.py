@@ -28,7 +28,8 @@ def platform_support_error(platform: str | None = None) -> str | None:
     if value == "win32":
         return (
             "Native Windows is not currently supported by Ash. "
-            "Use Ash inside WSL2, where it runs through the supported Linux path."
+            "WSL2 is an experimental, not-yet-verified option for running the "
+            "Linux version of Ash."
         )
     return (
         f"Ash does not currently support this native platform ({value}). "

@@ -6,9 +6,12 @@ unit-test expectations.
 
 ## Development Setup
 
-Python 3.12 through 3.14 and `uv` are required for Ash development. Supported
-native development hosts are Linux and macOS. On Windows, develop inside WSL2;
-native Windows is intentionally outside the supported/tested host matrix.
+Python 3.12 through 3.14 and `uv` are required for Ash development. **Linux is
+the primary target**, with Arch Linux as the main local development environment;
+hosted CI exercises Ubuntu. **macOS remains a supported secondary native host**
+with important regression and packaging checks. On Windows, WSL2 is an
+**experimental, not-yet-verified** way to reuse the Linux implementation;
+native Windows is deferred and unsupported.
 
 ```bash
 uv sync --group dev --extra server --extra acp --extra a2a
@@ -21,8 +24,11 @@ through `ash.*`. Do not add new top-level Python packages.
 
 ## Verification
 
-Run the checks that match the change, then run the complete local gate before
-committing:
+Prioritize real Linux coding workflows, permissions, sandboxing, interruption,
+recovery, and meaningful performance evaluations. Retain existing macOS checks
+for shared contracts and supported behavior; do not claim WSL2 verification
+from Linux CI alone. Run checks proportionate to the change, and the full local
+gate for major or cross-cutting work:
 
 ```bash
 uv run ruff check src tests
