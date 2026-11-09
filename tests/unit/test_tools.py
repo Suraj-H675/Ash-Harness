@@ -16,6 +16,8 @@ from ash.tools.command import (
     RunCommandArgs,
     RunCommandTool,
     decode_stream,
+    extract_diagnostics,
+    extract_diagnostic_summary,
 )
 from ash.tools.base import ToolExecutionOutcome, ToolResult
 from ash.tools.filesystem import (
@@ -257,6 +259,116 @@ async def test_run_command_extracts_bounded_structured_diagnostics(
     )
 
 
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (
+            "F401 [*] `os` imported but unused\n"
+            " --> src/app.py:1:8\n"
+            "F821 Undefined name `missing`\n"
+            " --> src/app.py:4:12\n",
+            [
+                ("src/app.py", 1, 8, "F401", "error"),
+                ("src/app.py", 4, 12, "F821", "error"),
+            ],
+        ),
+        (
+            "src/app.py:1:8: F401 `os` imported but unused\n",
+            [("src/app.py", 1, 8, "F401", "error")],
+        ),
+        (
+            "src/main.go:2:27: cannot use string as int\n",
+            [("src/main.go", 2, 27, None, "error")],
+        ),
+        (
+            "error[E0308]: mismatched types\n"
+            " --> src/main.rs:1:26\n",
+            [("src/main.rs", 1, 26, "E0308", "error")],
+        ),
+        (
+            "src/app.py:8: error: Incompatible types [assignment]\n"
+            "src/app.py:10: warning: Check this call\n"
+            "FAILED tests/unit/test_app.py::test_bad - AssertionError\n",
+            [
+                ("src/app.py", 8, None, None, "error"),
+                ("src/app.py", 10, None, None, "warning"),
+                ("tests/unit/test_app.py", None, None, None, "error"),
+            ],
+        ),
+    ],
+)
+def test_command_diagnostics_recognize_coding_tool_output(
+    output: str, expected: list[tuple[str, int | None, int | None, str | None, str]]
+) -> None:
+    diagnostics = extract_diagnostics(output, "")
+    assert [
+        (
+            item["path"],
+            item["line"],
+            item["column"],
+            item["code"],
+            item["severity"],
+        )
+        for item in diagnostics
+    ] == expected
+
+
+def test_ruff_summary_does_not_invent_pytest_or_mypy_failures() -> None:
+    output = (
+        "F401 [*] `os` imported but unused\n"
+        " --> src/app.py:1:8\n"
+        "Found 2 errors.\n"
+        "[*] 1 fixable with the `--fix` option.\n"
+    )
+    assert extract_diagnostic_summary(output, "") == {
+        "ruff_error_count": 2,
+        "ruff_fixable": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("stream", "truncated"),
+    [("stderr", True), ("stderr", False), ("stdout", False)],
+)
+@pytest.mark.asyncio
+async def test_sandboxed_command_redacts_truncated_stderr_and_diagnostics(
+    guard: SafetyGuard,
+    stream: str,
+    truncated: bool,
+) -> None:
+    from ash.sandbox import SANDBOX_TIER_BWRAP
+    from ash.sandbox.manager import SandboxResult
+
+    secret = "supersecretvalue"
+
+    class FakeSandbox:
+        tier = SANDBOX_TIER_BWRAP
+
+        async def run(self, *_args, **_kwargs) -> SandboxResult:
+            diagnostic = f"src/app.py:12:5: error: token={secret}\n"
+            return SandboxResult(
+                exit_code=1,
+                stdout=diagnostic if stream == "stdout" else "",
+                stderr=diagnostic if stream == "stderr" else "",
+                tier=SANDBOX_TIER_BWRAP,
+                backend_name="fixture",
+                output_truncated=truncated,
+            )
+
+    result = await RunCommandTool(guard, sandbox_manager=FakeSandbox()).run(
+        command_line="echo test"
+    )
+
+    assert result.success is False
+    assert result.truncated is truncated
+    assert secret not in result.model_dump_json()
+    if stream == "stderr":
+        assert "[REDACTED]" in (result.error or "")
+    else:
+        assert "[REDACTED]" in result.output
+    assert "[REDACTED]" in result.diagnostics[0]["message"]
+
+
 @pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
 @pytest.mark.asyncio
 async def test_run_command_pty_has_real_controlling_terminal(
@@ -398,7 +510,7 @@ async def test_run_command_aggregates_framework_summaries(
     assert result.diagnostic_summary == {
         "pytest_failed": 2,
         "pytest_passed": 7,
-        "pytest_errors": 3,
+        "pytest_errors": 1,
         "mypy_error_count": 3,
         "ruff_fixable": 1,
     }

@@ -60,6 +60,24 @@ MAX_COMMAND_OUTPUT_CHARS = 100_000
 OUTPUT_CAPTURE_LIMIT_NOTICE = "Process output capture limit reached."
 MAX_DIAGNOSTIC_ITEMS = 50
 MAX_SUMMARY_ITEMS = 8
+_RUFF_CODE = r"[A-Z]{1,4}\d{3,4}"
+_RUFF_HEADING = re.compile(rf"^(?P<code>{_RUFF_CODE})(?:\s+\[\*\])?\s+(?P<message>.+)$")
+_RUST_HEADING = re.compile(
+    r"^(?P<severity>error|warning)(?:\[(?P<code>[A-Z]\d{4})\])?: "
+    r"(?P<message>.+)$"
+)
+_COMPILER_LOCATION = re.compile(
+    r"^\s+-->\s+(?P<path>[^:\n]+):(?P<line>\d+):(?P<column>\d+)\s*$"
+)
+_PYTEST_SUMMARY_TIME = re.compile(r"\bin\s+\d+(?:\.\d+)?s\b")
+_PYTEST_SUMMARY_COUNT = re.compile(r"\b(\d+)\s+(failed|passed|errors?)\b", re.I)
+_MYPY_SUMMARY = re.compile(
+    r"^Found\s+(\d+)\s+errors?\s+in\s+\d+\s+files?\s+"
+    r"\(checked\s+\d+\s+source\s+files?\)",
+    re.I,
+)
+_RUFF_ERROR_SUMMARY = re.compile(r"^Found\s+(\d+)\s+errors?\.$", re.I)
+_RUFF_FIXABLE = re.compile(r"\b(\d+)\s+fixable\s+with\s+the\s+[`']?--fix", re.I)
 
 
 class RunCommandArgs(BaseModel):
@@ -108,6 +126,14 @@ def _diagnostic_from_line(line: str, *, severity: str) -> dict[str, Any] | None:
             r"^(?P<path>[^:\n]+\.py):(?P<line>\d+):\s+\[(?P<code>[A-Z0-9]+)\]\s+(?P<message>.+)$"
         ),
         re.compile(
+            rf"^(?P<path>[^:\n]+):(?P<line>\d+):(?P<column>\d+):\s+"
+            rf"(?P<code>{_RUFF_CODE})\s+(?P<message>.+)$"
+        ),
+        re.compile(
+            r"^(?P<path>[^:\n]+\.go):(?P<line>\d+):(?P<column>\d+):\s+"
+            r"(?P<message>.+)$"
+        ),
+        re.compile(
             r"^FAILED\s+(?P<path>tests/[^\s:]+)::(?P<symbol>[^\s]+)"
             r"(?:\s+-\s+(?P<message>.+))?$"
         ),
@@ -117,6 +143,17 @@ def _diagnostic_from_line(line: str, *, severity: str) -> dict[str, Any] | None:
         if match is None:
             continue
         values = match.groupdict()
+        explicit_severity = values.get("severity")
+        if explicit_severity:
+            item_severity = explicit_severity.lower()
+        elif (
+            values.get("code")
+            or values.get("symbol")
+            or (values.get("column") and values["path"].endswith(".go"))
+        ):
+            item_severity = "error"
+        else:
+            item_severity = severity
         return {
             "path": values.get("path", ""),
             "line": int(values["line"]) if values.get("line") else None,
@@ -124,10 +161,39 @@ def _diagnostic_from_line(line: str, *, severity: str) -> dict[str, Any] | None:
             "symbol": values.get("symbol"),
             "code": values.get("code"),
             "message": values.get("message") or "",
-            "severity": severity,
+            "severity": item_severity,
             "source_text": stripped[:500],
         }
     return None
+
+
+def _diagnostic_from_compiler_pair(header: str, location: str) -> dict[str, Any] | None:
+    match = _COMPILER_LOCATION.match(location)
+    if match is None:
+        return None
+    heading = _RUFF_HEADING.fullmatch(header.strip())
+    if heading is not None:
+        severity = "error"
+    else:
+        heading = _RUST_HEADING.fullmatch(header.strip())
+        if heading is None:
+            return None
+        severity = heading["severity"]
+    path = match["path"]
+    line = int(match["line"])
+    column = int(match["column"])
+    code = heading["code"]
+    message = heading["message"]
+    return {
+        "path": path,
+        "line": line,
+        "column": column,
+        "symbol": None,
+        "code": code,
+        "message": message,
+        "severity": severity,
+        "source_text": f"{path}:{line}:{column}: {code or severity} {message}"[:500],
+    }
 
 
 def extract_diagnostics(output: str, error: str) -> list[dict[str, Any]]:
@@ -136,8 +202,12 @@ def extract_diagnostics(output: str, error: str) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     seen: set[str] = set()
     for source, severity in ((error, "error"), (output, "warning")):
+        previous_line = ""
         for line in source.splitlines():
             diagnostic = _diagnostic_from_line(line, severity=severity)
+            if diagnostic is None:
+                diagnostic = _diagnostic_from_compiler_pair(previous_line, line)
+            previous_line = line
             if diagnostic is None:
                 continue
             key = diagnostic["source_text"]
@@ -155,34 +225,41 @@ def extract_diagnostic_summary(output: str, error: str) -> dict[str, int]:
 
     combined = "\n".join((error, output))
     counts: dict[str, int] = {}
-    patterns: tuple[tuple[str, re.Pattern[str]], ...] = (
-        (
-            "pytest_failed",
-            re.compile(r"^=+\s+(?:FAILED|\d+ failed)", re.IGNORECASE),
-        ),
-        ("pytest_passed", re.compile(r"(\d+)\s+passed")),
-        ("pytest_errors", re.compile(r"(\d+)\s+errors?")),
-        ("ruff_fixable", re.compile(r"(\d+)\s+fixable")),
-        (
-            "mypy_error_count",
-            re.compile(r"Found\s+(\d+)\s+error", re.IGNORECASE),
-        ),
+    lines = combined.splitlines()[:2000]
+    has_ruff_codes = any(
+        _RUFF_HEADING.fullmatch(line.strip())
+        or re.match(rf"^[^:\n]+:\d+:\d+:\s+{_RUFF_CODE}\s+", line)
+        for line in lines
     )
-    for line in combined.splitlines()[:2000]:
+    for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
-        if "failed" in stripped.casefold():
-            failed_matches = re.findall(r"(\d+)\s+failed", stripped, re.IGNORECASE)
-            if failed_matches:
-                counts["pytest_failed"] = sum(int(value) for value in failed_matches)
-            elif re.search(r"^=+\s+FAILED\b|^\s*FAILED\b", stripped, re.IGNORECASE):
-                counts["pytest_failed"] = max(counts.get("pytest_failed", 0), 1)
-        for name, pattern in patterns[1:]:
-            match = pattern.search(stripped)
-            if match:
-                value = int(match.group(1))
-                counts[name] = max(counts.get(name, 0), value)
+        if stripped.startswith("FAILED tests/"):
+            counts["pytest_failed"] = max(counts.get("pytest_failed", 0), 1)
+        if _PYTEST_SUMMARY_TIME.search(stripped):
+            for match in _PYTEST_SUMMARY_COUNT.finditer(stripped):
+                label = match[2].casefold()
+                name = {
+                    "failed": "pytest_failed",
+                    "passed": "pytest_passed",
+                }.get(label, "pytest_errors")
+                counts[name] = max(counts.get(name, 0), int(match[1]))
+        mypy_match = _MYPY_SUMMARY.match(stripped)
+        if mypy_match:
+            counts["mypy_error_count"] = max(
+                counts.get("mypy_error_count", 0), int(mypy_match[1])
+            )
+        ruff_match = _RUFF_ERROR_SUMMARY.match(stripped)
+        if has_ruff_codes and ruff_match:
+            counts["ruff_error_count"] = max(
+                counts.get("ruff_error_count", 0), int(ruff_match[1])
+            )
+        fixable_match = _RUFF_FIXABLE.search(stripped)
+        if fixable_match:
+            counts["ruff_fixable"] = max(
+                counts.get("ruff_fixable", 0), int(fixable_match[1])
+            )
         if len(counts) >= MAX_SUMMARY_ITEMS:
             break
     return {name: value for name, value in sorted(counts.items())}
@@ -529,7 +606,7 @@ class RunCommandTool(BaseTool):
             truncated = True
         if result.output_truncated and not result.stdout:
             error, _ = _truncate_command_output(
-                result.stderr,
+                redacted_stderr,
                 force=True,
                 notice=OUTPUT_CAPTURE_LIMIT_NOTICE,
             )
@@ -555,10 +632,10 @@ class RunCommandTool(BaseTool):
             ),
             token_count=count_output_tokens(output),
             truncated=truncated,
-            diagnostics=extract_diagnostics(result.stdout, result.stderr),
+            diagnostics=extract_diagnostics(redacted_stdout, redacted_stderr),
             diagnostic_summary=extract_diagnostic_summary(
-                result.stdout,
-                result.stderr,
+                redacted_stdout,
+                redacted_stderr,
             ),
         )
 
