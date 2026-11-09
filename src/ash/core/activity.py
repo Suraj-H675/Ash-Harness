@@ -24,6 +24,7 @@ METRIC_EVENT_FIELDS = {
     "turn.started": (),
     "context.usage": ("current", "maximum"),
     "model.request.started": ("attempt", "message_count", "tool_count", "native_tools"),
+    "model.request.first_output": ("attempt",),
     "model.request.completed": (
         "attempt",
         "prompt_tokens",
@@ -59,8 +60,12 @@ def summarize_operational_events(
 
     origin: float | None = None
     request_starts: dict[str, float] = {}
+    first_output_delays: dict[str, float] = {}
     tool_starts: dict[str, float] = {}
     model_seconds = 0.0
+    model_first_output_seconds = 0.0
+    model_after_first_output_seconds = 0.0
+    completed_requests_with_first_output = 0
     unsuccessful_model_seconds = 0.0
     completed_tool_seconds = 0.0
     model_requests = 0
@@ -91,7 +96,10 @@ def summarize_operational_events(
         for field in METRIC_EVENT_FIELDS[event_type]:
             value = event.get(field)
             if field in {
-                "tool", "usage_source", "stop_category", "stop_reason",
+                "tool",
+                "usage_source",
+                "stop_category",
+                "stop_reason",
                 "failure_category",
             }:
                 if isinstance(value, str) and _METRIC_NAME_PATTERN.fullmatch(value):
@@ -106,6 +114,15 @@ def summarize_operational_events(
             model_requests += 1
             if isinstance(request_id, str):
                 request_starts[request_id] = epoch
+        elif event_type == "model.request.first_output":
+            if (
+                isinstance(request_id, str)
+                and request_id in request_starts
+                and request_id not in first_output_delays
+            ):
+                delay = round(max(0.0, epoch - request_starts[request_id]), 3)
+                first_output_delays[request_id] = delay
+                entry["since_start_seconds"] = delay
         elif event_type in {
             "model.request.completed",
             "model.request.error",
@@ -116,8 +133,20 @@ def summarize_operational_events(
                 entry["duration_seconds"] = duration
                 if event_type == "model.request.completed":
                     model_seconds += duration
+                    if request_id in first_output_delays:
+                        first_output_seconds = min(
+                            duration, first_output_delays[request_id]
+                        )
+                        after_first_output = round(duration - first_output_seconds, 3)
+                        entry["first_output_seconds"] = first_output_seconds
+                        entry["after_first_output_seconds"] = after_first_output
+                        model_first_output_seconds += first_output_seconds
+                        model_after_first_output_seconds += after_first_output
+                        completed_requests_with_first_output += 1
                 else:
                     unsuccessful_model_seconds += duration
+            if isinstance(request_id, str):
+                first_output_delays.pop(request_id, None)
             if event_type == "model.request.completed":
                 completed_requests += 1
         elif event_type == "tool.started":
@@ -140,6 +169,11 @@ def summarize_operational_events(
         "model_requests_completed": completed_requests,
         "model_requests_still_open": len(request_starts),
         "completed_model_seconds": round(model_seconds, 3),
+        "completed_requests_with_first_output": completed_requests_with_first_output,
+        "completed_model_first_output_seconds": round(model_first_output_seconds, 3),
+        "completed_model_after_first_output_seconds": round(
+            model_after_first_output_seconds, 3
+        ),
         "unsuccessful_model_seconds": round(unsuccessful_model_seconds, 3),
         "completed_tool_seconds": round(completed_tool_seconds, 3),
         "tool_calls_still_open": len(tool_starts),

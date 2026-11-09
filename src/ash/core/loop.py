@@ -5282,6 +5282,17 @@ class AshLoop:
                                 raise ProviderCompletionError(
                                     "provider emitted output after its terminal chunk"
                                 )
+                            if chunk_has_output and not emitted_output:
+                                # Request latency alone cannot distinguish
+                                # waiting for the first provider output from
+                                # subsequent generation. Never persist output.
+                                self._emit_event(
+                                    {
+                                        "type": "model.request.first_output",
+                                        "operation_id": active_request_id,
+                                        "attempt": attempt,
+                                    }
+                                )
                             emitted_output = emitted_output or chunk_has_output
                             if chunk.content:
                                 response_fragments.append(chunk.content)

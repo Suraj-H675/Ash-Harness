@@ -47,6 +47,16 @@ def test_session_activity_inspects_bounded_pages_without_disclosing_content(
         ),
         envelope_event(
             {
+                "type": "model.request.first_output",
+                "session_id": session.session_id,
+                "event_id": "activity-first",
+                "operation_id": "request-one",
+                "timestamp": "2026-11-09T03:00:03+00:00",
+                "content": private_content,
+            }
+        ),
+        envelope_event(
+            {
                 "type": "model.request.completed",
                 "session_id": session.session_id,
                 "event_id": "activity-3",
@@ -123,6 +133,9 @@ def test_session_activity_inspects_bounded_pages_without_disclosing_content(
     assert payload["activity"]["model_requests"] == 1
     assert payload["activity"]["model_requests_completed"] == 1
     assert payload["activity"]["completed_model_seconds"] == 4
+    assert payload["activity"]["completed_requests_with_first_output"] == 1
+    assert payload["activity"]["completed_model_first_output_seconds"] == 2
+    assert payload["activity"]["completed_model_after_first_output_seconds"] == 2
     assert payload["activity"]["last_successful_edit_seconds"] == 6
     assert payload["activity"]["timeline"][-1]["type"] == "turn.completed"
 
@@ -137,7 +150,7 @@ def test_session_activity_inspects_bounded_pages_without_disclosing_content(
         "--session",
         session.session_id,
         "--limit",
-        "3",
+        "4",
         "--after-sequence",
         str(first_payload["next_cursor"]),
     )
@@ -145,11 +158,12 @@ def test_session_activity_inspects_bounded_pages_without_disclosing_content(
     second_payload = json.loads(second.stdout)
     assert second_payload["has_more"] is False
     assert second_payload["next_cursor"] == payload["next_cursor"]
-    assert len(second_payload["activity"]["timeline"]) == 3
+    assert len(second_payload["activity"]["timeline"]) == 4
 
     readable = invoke("--limit", "20")
     assert readable.returncode == 0, readable.stderr
     assert "Model requests: 1 started, 1 completed, 4.00s measured" in readable.stdout
+    assert "Model first-output split: 2.000s waiting, 2.000s after" in readable.stdout
     assert "write_file" in readable.stdout
     assert private_content not in readable.stdout
 

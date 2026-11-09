@@ -75,6 +75,17 @@ when a matching start event exists on the inspected page. The aggregates
 `completed_model_seconds`, `unsuccessful_model_seconds`, and
 `completed_tool_seconds` distinguish successful model completions and tool
 executions from failed or cancelled provider attempts.
+For new runtime events, `model.request.first_output` records the first retained
+provider output (text, tool call, reasoning, or replay state) **without its
+content**. Requests with a matching start and completion gain
+`first_output_seconds` (waiting for initial output) and
+`after_first_output_seconds` (remaining request duration). Their aggregate
+seconds and matched-request count are exposed separately. This is a
+first-output measurement, **not** a guaranteed first visible text token or
+model-prefill-only measurement; it cannot distinguish network latency from
+provider queueing or prefill. Older sessions and incomplete event pages may
+lack the intermediate event, so missing split timings must not be treated as
+zero.
 It never copies model text, command output, tool arguments, workspace paths,
 credentials, or free-form error messages into that projection. Raw stdout,
 stderr, and tool records elsewhere in the evidence directory remain private.

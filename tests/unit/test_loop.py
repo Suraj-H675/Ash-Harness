@@ -1966,6 +1966,89 @@ async def test_terminal_usage_tails_preserve_authoritative_accounting(
 
 
 @pytest.mark.asyncio
+async def test_first_provider_output_event_is_once_correlated_and_content_free(
+    tmp_path,
+) -> None:
+    private_text = "PRIVATE_MODEL_OUTPUT_DO_NOT_RECORD"
+
+    class ChunkedProvider(ProviderABC):
+        model_name = "chunked"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk()
+            yield StreamChunk(content=private_text[:7])
+            yield StreamChunk(content=private_text[7:])
+            yield StreamChunk(is_done=True, stop_reason="stop")
+
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "first-output.db"),
+        ChunkedProvider(),
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+    )
+
+    outcome = await loop._stream_one_completion([])
+    assert outcome.text == private_text
+    request_events = [
+        event
+        for event in ui.events
+        if event["type"].startswith("model.request.")
+    ]
+    assert [event["type"] for event in request_events] == [
+        "model.request.started",
+        "model.request.first_output",
+        "model.request.completed",
+    ]
+    assert len({event["operation_id"] for event in request_events}) == 1
+    assert request_events[1]["attempt"] == 1
+    assert private_text not in str(request_events[1])
+    assert "content" not in request_events[1]
+
+
+@pytest.mark.asyncio
+async def test_terminal_usage_only_does_not_count_as_first_provider_output(
+    tmp_path,
+) -> None:
+    class UsageOnlyProvider(ProviderABC):
+        model_name = "usage-only"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                is_done=True,
+                stop_reason="stop",
+                prompt_tokens=12,
+                completion_tokens=0,
+                usage_source="provider",
+            )
+
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "usage-only.db"),
+        UsageOnlyProvider(),
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+    )
+
+    assert (await loop._stream_one_completion([])).text == ""
+    assert [
+        item["type"]
+        for item in ui.events
+        if item["type"].startswith("model.request.")
+    ] == ["model.request.started", "model.request.completed"]
+
+
+@pytest.mark.asyncio
 async def test_missing_provider_usage_is_estimated_before_request_completion_event(
     tmp_path,
 ) -> None:
@@ -3619,9 +3702,11 @@ async def test_queued_steering_is_persisted_and_applied_to_running_turn(tmp_path
         "turn.started",
         "model.request.started",
         "turn.steering.queued",
+        "model.request.first_output",
         "model.request.completed",
         "turn.steering.applied",
         "model.request.started",
+        "model.request.first_output",
         "model.request.completed",
         "turn.usage",
         "turn.completed",
@@ -5370,11 +5455,13 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
     ] == [
         "turn.started",
         "model.request.started",
+        "model.request.first_output",
         "model.request.completed",
         "tool.requested",
         "tool.started",
         "tool.completed",
         "model.request.started",
+        "model.request.first_output",
         "model.request.completed",
         "turn.usage",
         "turn.completed",

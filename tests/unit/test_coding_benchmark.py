@@ -159,6 +159,50 @@ def test_coding_timeline_measures_only_successful_terminal_requests_and_tools() 
     ]
 
 
+def test_coding_timeline_splits_first_output_wait_and_remaining_generation() -> None:
+    def event(sequence: int, kind: str, **fields: object) -> StoredRuntimeEvent:
+        return StoredRuntimeEvent(
+            sequence=sequence,
+            event={
+                "type": kind,
+                "timestamp": f"2026-11-09T03:00:{sequence:02d}+00:00",
+                **fields,
+            },
+        )
+
+    evidence = summarize_operational_events(
+        [
+            event(1, "model.request.started", operation_id="a"),
+            event(
+                4,
+                "model.request.first_output",
+                operation_id="a",
+                content="PRIVATE-OUTPUT",
+            ),
+            event(5, "model.request.first_output", operation_id="a"),
+            event(9, "model.request.completed", operation_id="a"),
+            event(10, "model.request.started", operation_id="without-output"),
+            event(13, "model.request.completed", operation_id="without-output"),
+            event(14, "model.request.started", operation_id="failed"),
+            event(15, "model.request.first_output", operation_id="failed"),
+            event(17, "model.request.error", operation_id="failed"),
+        ]
+    )
+
+    assert evidence["model_requests_completed"] == 2
+    assert evidence["completed_model_seconds"] == 11
+    assert evidence["completed_requests_with_first_output"] == 1
+    assert evidence["completed_model_first_output_seconds"] == 3
+    assert evidence["completed_model_after_first_output_seconds"] == 5
+    assert evidence["unsuccessful_model_seconds"] == 3
+    assert evidence["timeline"][1]["since_start_seconds"] == 3
+    assert "since_start_seconds" not in evidence["timeline"][2]
+    assert evidence["timeline"][3]["first_output_seconds"] == 3
+    assert evidence["timeline"][3]["after_first_output_seconds"] == 5
+    assert "first_output_seconds" not in evidence["timeline"][5]
+    assert "PRIVATE-OUTPUT" not in str(evidence)
+
+
 def test_coding_timeline_bounded_and_rejects_untrusted_metadata() -> None:
     records = [
         StoredRuntimeEvent(

@@ -230,6 +230,14 @@ def render_session_activity(
         f"Completed tool time: {activity['completed_tool_seconds']:.3f}s; "
         f"failed/cancelled model time: {activity['unsuccessful_model_seconds']:.3f}s",
     ]
+    if activity["completed_requests_with_first_output"]:
+        lines.append(
+            "Model first-output split: "
+            f"{activity['completed_model_first_output_seconds']:.3f}s waiting, "
+            f"{activity['completed_model_after_first_output_seconds']:.3f}s after "
+            f"first output ({activity['completed_requests_with_first_output']} "
+            "matched requests)"
+        )
     for item in activity["timeline"]:
         details = " ".join(
             f"{key}={value}"
