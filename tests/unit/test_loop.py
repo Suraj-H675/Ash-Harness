@@ -18,6 +18,7 @@ from ash.core.loop import (
     MAX_PARALLEL_READ_ONLY_TOOL_CALLS,
     MAX_TOOL_CALLS_PER_COMPLETION,
 )
+from ash.core.activity import summarize_operational_events
 from ash.core.secret_middleware import SecretRedactionMiddleware
 from ash.tools.base import (
     BaseTool,
@@ -1932,11 +1933,12 @@ async def test_terminal_usage_tails_preserve_authoritative_accounting(
                 **(usage if usage_in_tail else {}),
             )
 
+    ui = EventUI()
     loop = AshLoop(
         SessionStore(tmp_path / f"usage-tail-{usage_in_tail}.db"),
         UsageTailProvider(),
         SafetyGuard(project_root=tmp_path),
-        EventUI(),
+        ui,
         tmp_path,
     )
 
@@ -1947,6 +1949,69 @@ async def test_terminal_usage_tails_preserve_authoritative_accounting(
     assert outcome.cache_read_tokens == 3
     assert outcome.cache_write_tokens == 2
     assert outcome.usage_source == "provider"
+    completed = [
+        event for event in ui.events if event["type"] == "model.request.completed"
+    ]
+    assert len(completed) == 1
+    assert {field: completed[0][field] for field in (
+        "prompt_tokens", "completion_tokens", "cache_read_tokens",
+        "cache_write_tokens", "usage_source",
+    )} == {
+        "prompt_tokens": 12,
+        "completion_tokens": 4,
+        "cache_read_tokens": 3,
+        "cache_write_tokens": 2,
+        "usage_source": "provider",
+    }
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_usage_is_estimated_before_request_completion_event(
+    tmp_path,
+) -> None:
+    class NoUsageProvider(ProviderABC):
+        model_name = "no-usage"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="fixed", is_done=True, stop_reason="stop")
+
+    store = SessionStore(tmp_path / "estimated-event.db")
+    ui = EventUI()
+    loop = AshLoop(
+        store,
+        NoUsageProvider(),
+        SafetyGuard(project_root=tmp_path),
+        ui,
+        tmp_path,
+    )
+    session = await loop.start_session()
+
+    assert await loop.run_turn("respond with a fixed word") == "fixed"
+
+    completed = [
+        event for event in ui.events if event["type"] == "model.request.completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0]["usage_source"] == "estimated"
+    assert completed[0]["prompt_tokens"] > 0
+    assert completed[0]["completion_tokens"] == len("fixed")
+    assert completed[0]["cache_read_tokens"] == 0
+    assert completed[0]["cache_write_tokens"] == 0
+    assert store.get_session_usage(session.session_id).prompt_tokens == completed[0][
+        "prompt_tokens"
+    ]
+    stored = [
+        item.event
+        for item in store.list_runtime_events(session.session_id)
+        if item.event["type"] == "model.request.completed"
+    ]
+    assert len(stored) == 1
+    assert stored[0]["usage_source"] == "estimated"
+    assert stored[0]["prompt_tokens"] == completed[0]["prompt_tokens"]
 
 
 @pytest.mark.asyncio
@@ -5327,6 +5392,14 @@ async def test_native_tool_calls_are_normalized_and_persisted(tmp_path):
         ).fetchone()
     completed = next(event for event in ui.events if event["type"] == "turn.completed")
     assert tool_turn["turn_id"] == completed["turn_id"]
+    activity = summarize_operational_events(
+        store.list_runtime_events(loop.current_session.session_id)
+    )
+    tool_completions = [
+        event for event in activity["timeline"] if event["type"] == "tool.completed"
+    ]
+    assert len(tool_completions) == 1
+    assert tool_completions[0]["duration_seconds"] >= 0
 
 
 @pytest.mark.asyncio

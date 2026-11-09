@@ -70,6 +70,11 @@ Each trial also includes `setup_seconds`, `cli_seconds`, and `performance`, a
 bounded projection of **persisted, content-free runtime event fields**. The
 projection includes request counts, completed provider-request durations,
 successful edit/command timing, and an event timeline capped at 300 entries.
+Terminal model/tool events also include their individual `duration_seconds`
+when a matching start event exists on the inspected page. The aggregates
+`completed_model_seconds`, `unsuccessful_model_seconds`, and
+`completed_tool_seconds` distinguish successful model completions and tool
+executions from failed or cancelled provider attempts.
 It never copies model text, command output, tool arguments, workspace paths,
 credentials, or free-form error messages into that projection. Raw stdout,
 stderr, and tool records elsewhere in the evidence directory remain private.

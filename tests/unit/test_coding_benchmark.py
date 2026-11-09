@@ -102,6 +102,63 @@ def test_coding_timeline_records_request_and_tool_timings_without_content() -> N
     assert "do not retain secret" not in serialized
 
 
+def test_coding_timeline_measures_only_successful_terminal_requests_and_tools() -> None:
+    def event(sequence: int, kind: str, **fields: object) -> StoredRuntimeEvent:
+        return StoredRuntimeEvent(
+            sequence=sequence,
+            event={
+                "type": kind,
+                "timestamp": f"2026-11-09T03:00:{sequence:02d}+00:00",
+                **fields,
+            },
+        )
+
+    evidence = summarize_operational_events(
+        [
+            event(1, "model.request.started", operation_id="failed"),
+            event(3, "model.request.error", operation_id="failed", retriable=True),
+            event(4, "model.request.started", operation_id="success"),
+            event(8, "model.request.completed", operation_id="success"),
+            event(9, "tool.started", operation_id="edited", tool="write_file"),
+            event(
+                11,
+                "tool.completed",
+                operation_id="edited",
+                tool="write_file",
+                success=True,
+            ),
+            event(12, "tool.started", operation_id="blocked", tool="run_command"),
+            event(
+                15,
+                "tool.error",
+                operation_id="blocked",
+                tool="run_command",
+                success=False,
+            ),
+        ]
+    )
+
+    assert evidence["model_requests"] == 2
+    assert evidence["model_requests_completed"] == 1
+    assert evidence["model_requests_still_open"] == 0
+    assert evidence["completed_model_seconds"] == 4
+    assert evidence["unsuccessful_model_seconds"] == 2
+    assert evidence["completed_tool_seconds"] == 2
+    assert evidence["tool_calls_still_open"] == 0
+    assert evidence["last_successful_edit_seconds"] == 10
+    assert evidence["last_successful_command_seconds"] is None
+    assert [item.get("duration_seconds") for item in evidence["timeline"]] == [
+        None,
+        2,
+        None,
+        4,
+        None,
+        2,
+        None,
+        3,
+    ]
+
+
 def test_coding_timeline_bounded_and_rejects_untrusted_metadata() -> None:
     records = [
         StoredRuntimeEvent(

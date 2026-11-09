@@ -30,6 +30,7 @@ METRIC_EVENT_FIELDS = {
         "completion_tokens",
         "cache_read_tokens",
         "cache_write_tokens",
+        "usage_source",
         "stop_category",
     ),
     "model.request.error": ("attempt", "retriable", "failure_category"),
@@ -58,7 +59,10 @@ def summarize_operational_events(
 
     origin: float | None = None
     request_starts: dict[str, float] = {}
+    tool_starts: dict[str, float] = {}
     model_seconds = 0.0
+    unsuccessful_model_seconds = 0.0
+    completed_tool_seconds = 0.0
     model_requests = 0
     completed_requests = 0
     last_successful_test: float | None = None
@@ -86,7 +90,10 @@ def summarize_operational_events(
         entry: dict[str, Any] = {"type": event_type, "at_seconds": elapsed}
         for field in METRIC_EVENT_FIELDS[event_type]:
             value = event.get(field)
-            if field in {"tool", "stop_category", "stop_reason", "failure_category"}:
+            if field in {
+                "tool", "usage_source", "stop_category", "stop_reason",
+                "failure_category",
+            }:
                 if isinstance(value, str) and _METRIC_NAME_PATTERN.fullmatch(value):
                     entry[field] = redact_text(value)
             elif type(value) in {int, bool}:
@@ -104,21 +111,38 @@ def summarize_operational_events(
             "model.request.error",
             "model.request.cancelled",
         }:
+            if isinstance(request_id, str) and request_id in request_starts:
+                duration = round(max(0.0, epoch - request_starts.pop(request_id)), 3)
+                entry["duration_seconds"] = duration
+                if event_type == "model.request.completed":
+                    model_seconds += duration
+                else:
+                    unsuccessful_model_seconds += duration
             if event_type == "model.request.completed":
                 completed_requests += 1
-            if isinstance(request_id, str) and request_id in request_starts:
-                model_seconds += max(0.0, epoch - request_starts.pop(request_id))
-        elif event_type == "tool.completed" and entry.get("success") is True:
-            if entry.get("tool") in EDIT_TOOL_NAMES:
-                last_successful_edit = elapsed
-            elif entry.get("tool") == "run_command":
-                last_successful_test = elapsed
+        elif event_type == "tool.started":
+            if isinstance(request_id, str):
+                tool_starts[request_id] = epoch
+        elif event_type in {"tool.completed", "tool.error", "tool.skipped"}:
+            if isinstance(request_id, str) and request_id in tool_starts:
+                duration = round(max(0.0, epoch - tool_starts.pop(request_id)), 3)
+                entry["duration_seconds"] = duration
+                if event_type == "tool.completed":
+                    completed_tool_seconds += duration
+            if event_type == "tool.completed" and entry.get("success") is True:
+                if entry.get("tool") in EDIT_TOOL_NAMES:
+                    last_successful_edit = elapsed
+                elif entry.get("tool") == "run_command":
+                    last_successful_test = elapsed
 
     return {
         "model_requests": model_requests,
         "model_requests_completed": completed_requests,
         "model_requests_still_open": len(request_starts),
         "completed_model_seconds": round(model_seconds, 3),
+        "unsuccessful_model_seconds": round(unsuccessful_model_seconds, 3),
+        "completed_tool_seconds": round(completed_tool_seconds, 3),
+        "tool_calls_still_open": len(tool_starts),
         "last_successful_edit_seconds": last_successful_edit,
         "last_successful_command_seconds": last_successful_test,
         "event_counts": event_counts,

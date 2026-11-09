@@ -227,6 +227,8 @@ def render_session_activity(
         f"Model requests: {activity['model_requests']} started, "
         f"{activity['model_requests_completed']} completed, "
         f"{activity['completed_model_seconds']:.2f}s measured",
+        f"Completed tool time: {activity['completed_tool_seconds']:.3f}s; "
+        f"failed/cancelled model time: {activity['unsuccessful_model_seconds']:.3f}s",
     ]
     for item in activity["timeline"]:
         details = " ".join(

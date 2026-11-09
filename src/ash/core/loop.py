@@ -5528,6 +5528,34 @@ class AshLoop:
                             "provider reused tool call ID within one session: "
                             f"{reused[0]}"
                         )
+                # Complete fallback usage accounting before publishing the
+                # request's terminal event. Streamed compatible providers may
+                # omit usage entirely; the durable turn already estimates it,
+                # so emitting pre-estimation zeros misreports the same request.
+                if usage_source == "unavailable":
+                    prompt_tokens = self._last_context_tokens or max(
+                        0,
+                        int(
+                            self.provider.count_tokens(
+                                json.dumps(
+                                    messages, default=str, separators=(",", ":")
+                                )
+                            )
+                        ),
+                    )
+                    completion_payload = "".join(response_fragments)
+                    if native_tool_calls_from_api:
+                        completion_payload += json.dumps(
+                            native_tool_calls_from_api,
+                            default=str,
+                            separators=(",", ":"),
+                        )
+                    completion_tokens = max(
+                        0, int(self.provider.count_tokens(completion_payload))
+                    )
+                    cache_read_tokens = 0
+                    cache_write_tokens = 0
+                    usage_source = "estimated"
                 self.provider_circuit_breaker.record_success(self._provider_circuit_key)
                 self._emit_event(
                     {
@@ -5611,27 +5639,6 @@ class AshLoop:
             tool_calls = [
                 _normalize_native_tool_call(call) for call in native_tool_calls_from_api
             ]
-
-        if usage_source == "unavailable":
-            prompt_tokens = self._last_context_tokens or max(
-                0,
-                int(
-                    self.provider.count_tokens(
-                        json.dumps(messages, default=str, separators=(",", ":"))
-                    )
-                ),
-            )
-            completion_payload = "".join(response_fragments)
-            if native_tool_calls_from_api:
-                completion_payload += json.dumps(
-                    native_tool_calls_from_api, default=str, separators=(",", ":")
-                )
-            completion_tokens = max(
-                0, int(self.provider.count_tokens(completion_payload))
-            )
-            cache_read_tokens = 0
-            cache_write_tokens = 0
-            usage_source = "estimated"
 
         return CompletionOutcome(
             text="".join(text_chunks),
