@@ -106,6 +106,10 @@ HIDDEN_BILLING_ORACLE = (
     "assert total_due([Decimal('1.99'), Decimal('2.01')], Decimal('7.5')) == '4.30'\n"
     "assert total_due([Decimal('12.35')], Decimal('0')) == '12.35'\n"
 )
+DEFAULT_TURN_TOKEN_BUDGET = 40_000
+MAX_EVAL_TURN_TOKEN_BUDGET = 250_000
+DEFAULT_EVAL_CONTEXT_TOKENS = 8_192
+MAX_EVAL_CONTEXT_TOKENS = 16_384
 
 
 @dataclass(frozen=True)
@@ -357,6 +361,8 @@ def run_trial(
     timeout: int,
     model_hash: str | None,
     trial_index: int = 1,
+    turn_token_budget: int = DEFAULT_TURN_TOKEN_BUDGET,
+    context_tokens: int = DEFAULT_EVAL_CONTEXT_TOKENS,
 ) -> dict[str, Any]:
     task = TASKS[task_name]
     trial_dir = evidence / (
@@ -368,6 +374,8 @@ def run_trial(
         "task": task_name,
         "trial": trial_index,
         "model_sha256": model_hash,
+        "turn_token_budget": turn_token_budget,
+        "context_tokens": context_tokens,
     }
     with tempfile.TemporaryDirectory(prefix="trial-", dir=trial_dir) as scratch_name:
         scratch = Path(scratch_name)
@@ -411,9 +419,9 @@ def run_trial(
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
             "ASH_MODEL": "eval/local-model",
-            "ASH_MAX_CONTEXT_TOKENS": "8192",
+            "ASH_MAX_CONTEXT_TOKENS": str(context_tokens),
             "ASH_MAX_COMPLETION_TOKENS": "384",
-            "ASH_MAX_TURN_TOTAL_TOKENS": "40000",
+            "ASH_MAX_TURN_TOTAL_TOKENS": str(turn_token_budget),
         }
         setup_started = time.monotonic()
         setup = command(
@@ -603,6 +611,24 @@ def main() -> int:
     )
     parser.add_argument("--timeout", type=int, default=285)
     parser.add_argument(
+        "--context-tokens",
+        type=int,
+        default=DEFAULT_EVAL_CONTEXT_TOKENS,
+        help=(
+            "Maximum per-request model context for isolated trials "
+            "(default 8192, up to 16384); server must support this context"
+        ),
+    )
+    parser.add_argument(
+        "--turn-token-budget",
+        type=int,
+        default=DEFAULT_TURN_TOKEN_BUDGET,
+        help=(
+            "Maximum prompt plus completion tokens per Ash trial (benchmark-only, "
+            "default 40000); changing it invalidates direct comparisons"
+        ),
+    )
+    parser.add_argument(
         "--repeat",
         type=int,
         default=1,
@@ -619,6 +645,14 @@ def main() -> int:
         parser.error("duplicate --task selection; use --repeat for independent trials")
     if not (20 <= args.timeout <= 300):
         parser.error("--timeout must be between 20 and 300 seconds")
+    if not (4_096 <= args.context_tokens <= MAX_EVAL_CONTEXT_TOKENS):
+        parser.error(
+            f"--context-tokens must be between 4096 and {MAX_EVAL_CONTEXT_TOKENS}"
+        )
+    if not (2_000 <= args.turn_token_budget <= MAX_EVAL_TURN_TOKEN_BUDGET):
+        parser.error(
+            f"--turn-token-budget must be between 2000 and {MAX_EVAL_TURN_TOKEN_BUDGET}"
+        )
     if not (1 <= args.repeat <= 5):
         parser.error("--repeat must be between 1 and 5")
     address = urlsplit(args.endpoint)
@@ -676,7 +710,14 @@ def main() -> int:
     for task_name in args.task or list(TASKS):
         for trial in range(1, args.repeat + 1):
             result = run_trial(
-                task_name, evidence, args.endpoint, args.timeout, model_hash, trial
+                task_name,
+                evidence,
+                args.endpoint,
+                args.timeout,
+                model_hash,
+                trial,
+                args.turn_token_budget,
+                args.context_tokens,
             )
             results.append(result)
             print(
@@ -701,6 +742,8 @@ def main() -> int:
         "model_sha256": model_hash,
         "advertised_model_ids": advertised_models,
         "timeout_seconds": args.timeout,
+        "turn_token_budget": args.turn_token_budget,
+        "context_tokens": args.context_tokens,
         "repeat": args.repeat,
         "tasks": [item["task"] for item in results],
         "passed": sum(bool(item["passed"]) for item in results),

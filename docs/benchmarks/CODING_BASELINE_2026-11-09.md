@@ -117,3 +117,39 @@ path-recovery sequence **within one failed run**, not a controlled success-rate
 improvement. The serving process and all benchmark child processes were shut
 down after the trial. Evidence is retained privately at
 `/var/tmp/ash-coding-eval-20261109/gpu-two-file-scope-feedback/`.
+
+## Follow-up: separate turn-budget and context-window limits (2026-11-09)
+
+The isolated evaluation runner imposed **two limits not representative of Ash's
+normal turn policy**: 40,000 cumulative input/output tokens across one turn,
+and 8,192 tokens of per-request context, despite the tested llama.cpp server
+having a 16,384-token context window. Normal Ash defaults to **no turn-wide
+token cap**. Its history compactor preserves the active turn and tool-call
+relationships, rather than silently discarding them to fit a small window.
+
+The runner now records and accepts distinct `--turn-token-budget` and
+`--context-tokens` settings. The old 40k/8k defaults remain available for
+historical comparisons. The new probes kept the same Qwen3.5-4B Q4_K_M model,
+llama.cpp b12223 Vulkan runtime, task, permission grants, independent oracle,
+and Ash runtime code from `2dc2ba4`; only evaluation limits changed between
+these two new runs:
+
+| Turn total / request context | Result | Requests | Time | Evidence |
+|---|---|---:|---:|---|
+| 80k / 8k | **Fail** | 7 | 40.96s | Both sources fixed; visible and hidden oracles pass, but a protected-current-turn context overflow occurs before the required test command |
+| 80k / 16k | **Pass** | 8 | 43.53s | Both sources fixed, allowed `python3 -B test_billing.py` executed successfully, visible/hidden oracles pass, unrelated files unchanged, audit intact |
+
+The 80k/16k trial required **49,639 estimated prompt tokens** and 1,524
+completion tokens across eight requests, not a 49k-token single model input.
+It still tried four forbidden paths; all were rejected, and the model corrected
+its path use. It did not need an exception to the permission policy. The
+successful trial's evidence is under the private
+`/var/tmp/ash-coding-eval-20261109/gpu-two-file-budget80k-context16k/` path.
+The 80k/8k evidence is in the adjacent `gpu-two-file-budget80k/` folder.
+
+These **single-trial, non-randomized, sequential** observations demonstrate
+that the restrictive benchmark budgets were real blockers in those runs. They
+do **not** establish a statistically reliable success rate, causal latency
+improvement, or justify increasing the token/context limits silently for real
+users. No production context-compaction code or runtime defaults changed.
+Both model servers were stopped after the tests.

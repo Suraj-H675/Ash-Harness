@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -30,6 +31,95 @@ check_workspace_artifacts = _benchmark.check_workspace_artifacts
 grade = _benchmark.grade
 oracle_python = _benchmark.oracle_python
 summarize_operational_events = _benchmark.summarize_operational_events
+
+
+def test_coding_benchmark_default_and_custom_turn_budget_reach_isolated_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[tuple[str, str]] = []
+
+    def successful_setup(
+        *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    def capture_launch(*args: object, **kwargs: object) -> None:
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        captured.append(
+            (
+                environment["ASH_MAX_TURN_TOTAL_TOKENS"],
+                environment["ASH_MAX_CONTEXT_TOKENS"],
+            )
+        )
+        raise RuntimeError("captured disposable evaluation environment")
+
+    monkeypatch.setattr(_benchmark, "command", successful_setup)
+    monkeypatch.setattr(_benchmark.subprocess, "Popen", capture_launch)
+    for index, (budget, context) in enumerate(
+        ((40_000, 8_192), (80_000, 16_384)), start=1
+    ):
+        evidence = tmp_path / f"evidence-{index}"
+        evidence.mkdir()
+        with pytest.raises(RuntimeError, match="captured disposable"):
+            _benchmark.run_trial(
+                "marker",
+                evidence,
+                "http://127.0.0.1:18105",
+                90,
+                None,
+                turn_token_budget=budget,
+                context_tokens=context,
+            )
+    assert captured == [("40000", "8192"), ("80000", "16384")]
+
+
+@pytest.mark.parametrize("budget", ["1999", "250001"])
+def test_coding_benchmark_rejects_out_of_range_turn_budget_before_connection(
+    tmp_path: Path, budget: str
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_benchmark_path),
+            "--evidence-dir",
+            str(tmp_path / "never-created"),
+            "--turn-token-budget",
+            budget,
+        ],
+        cwd=_benchmark.REPO,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "--turn-token-budget must be between" in result.stderr
+    assert not (tmp_path / "never-created").exists()
+
+
+@pytest.mark.parametrize("context", ["4095", "16385"])
+def test_coding_benchmark_rejects_out_of_range_context_before_connection(
+    tmp_path: Path, context: str
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_benchmark_path),
+            "--evidence-dir",
+            str(tmp_path / "never-created"),
+            "--context-tokens",
+            context,
+        ],
+        cwd=_benchmark.REPO,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "--context-tokens must be between" in result.stderr
+    assert not (tmp_path / "never-created").exists()
 
 
 def test_coding_timeline_records_request_and_tool_timings_without_content() -> None:

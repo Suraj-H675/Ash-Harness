@@ -58,6 +58,19 @@ per case. Those trials **share the model server and any of its prompt/KV caches*
 they are not independent inference environments. A before/after comparison
 should use the same serving binary, device, sampling configuration, and model,
 and should balance task order before interpreting small latency differences.
+The benchmark deliberately limits cumulative input plus output to **40,000
+tokens per trial**, unlike Ash's regular default of **no turn-wide token cap**.
+Use `--turn-token-budget 80000` for a bounded budget-sensitivity probe; this
+changes the experiment, not Ash's production defaults. The chosen value is
+written to both `summary.json` and each task result. Never compare runs with
+different budgets as if they had identical constraints.
+The benchmark independently defaults to **8,192 tokens of per-request context**
+even when the local model server is started with `--ctx-size 16384`. A
+context-sensitivity probe may use `--context-tokens 16384` **only when** the
+serving model/runtime supports that window. Both limits are recorded in each
+result. A turn that stops on `context` is not evidence that its *turn-total*
+budget was exhausted: these are independent constraints. Ash's production
+context policy has not been changed by either benchmark option.
 The tool never launches
 a cloud inference route, passes through personal credentials, alters the user's
 Ash profile, or runs anything in the project being developed. The code tasks
