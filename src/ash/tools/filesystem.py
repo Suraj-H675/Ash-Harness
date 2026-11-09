@@ -24,6 +24,7 @@ from ash.tools.base import (
     ToolExecutionContract,
     ToolResult,
     count_output_tokens,
+    scoped_path_refusal,
 )
 
 
@@ -230,7 +231,7 @@ class ReadFileTool(BaseTool):
         try:
             resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
         except SafetyViolation as exc:
-            return ToolResult(success=False, output="", error=str(exc))
+            return scoped_path_refusal(exc)
 
         if not resolved_path.exists():
             return ToolResult(

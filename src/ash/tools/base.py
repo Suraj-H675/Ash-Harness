@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ash.context.tokens import estimate_text_tokens
 from ash.core.redaction import redact_value
-from ash.safety.guard import SafetyGuard
+from ash.safety.guard import SafetyGuard, SafetyViolation
 
 
 class ToolExecutionOutcome(StrEnum):
@@ -125,6 +125,18 @@ class ToolResult(BaseModel):
                 f"{MAX_TOOL_RESULT_STRUCTURED_BYTES} UTF-8 bytes"
             )
         return self
+
+
+def scoped_path_refusal(error: SafetyViolation) -> ToolResult:
+    """Report a rejected path as a known failure; never remap or retry it."""
+    reason = str(error)
+    if "outside project scope" in reason:
+        reason += (
+            " Use a project-relative path from the Current Project Path "
+            "(for example, 'src/module.py'); use directory_path='.' to "
+            "inspect the project root. The denied path was not accessed."
+        )
+    return ToolResult(success=False, output="", error=reason)
 
 
 class ToolReplayPolicy(StrEnum):

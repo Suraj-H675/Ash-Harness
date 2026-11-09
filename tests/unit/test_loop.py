@@ -59,6 +59,7 @@ from ash.tools.browser import (
     build_browser_tools,
 )
 from ash.tools.filesystem import ReadFileTool
+from ash.tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
 from pathlib import Path
 import tempfile
 
@@ -9412,6 +9413,66 @@ async def test_parallel_read_denials_do_not_count_as_tool_failures(tmp_path) -> 
         records = store.load_session(session.session_id).tool_calls
         assert len(records) == 4
         assert all(not record.approved and not record.executed for record in records)
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_discovery_path_denials_are_known_and_persisted_without_ambiguity(
+    tmp_path,
+) -> None:
+    """Read-only path mistakes cannot masquerade as uncertain side effects."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "private.py"
+    outside.write_text("SECRET_CONTENT\n", encoding="utf-8")
+    guard = SafetyGuard(workspace)
+    store = SessionStore(tmp_path / "discovery-path-denials.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        EventUI(safety_tier="auto_approve"),
+        workspace,
+        tools={
+            "list_dir": ListDirectoryTool(guard),
+            "glob_files": GlobFilesTool(guard),
+            "search_text": SearchTextTool(guard),
+        },
+        safety_tier="auto_approve",
+    )
+    calls = [
+        {"call_id": "bad-list", "name": "list_dir", "arguments": {"directory_path": ".."}},
+        {
+            "call_id": "bad-glob",
+            "name": "glob_files",
+            "arguments": {"directory_path": "..", "pattern": "**/*.py"},
+        },
+        {
+            "call_id": "bad-search",
+            "name": "search_text",
+            "arguments": {"directory_path": "../private.py", "pattern": "SECRET_CONTENT"},
+        },
+    ]
+    try:
+        session = await loop.start_session()
+        result = await loop._execute_tool_calls(
+            calls, session, persist_tool_messages=True
+        )
+        assert len(result) == 3
+        assert all(item["success"] is False for item in result)
+        assert all("project-relative" in item["error"] for item in result)
+        assert all("side effect may have occurred" not in item["error"] for item in result)
+        saved = store.load_session(session.session_id)
+        assert [item.call_id for item in saved.tool_calls] == [
+            "bad-list", "bad-glob", "bad-search"
+        ]
+        assert all(item.executed and item.success is False for item in saved.tool_calls)
+        assert [m.metadata["call_id"] for m in saved.messages if m.role == "tool"] == [
+            "bad-list", "bad-glob", "bad-search"
+        ]
+        assert outside.read_text(encoding="utf-8") == "SECRET_CONTENT\n"
         assert store.verify_audit_log(session.session_id) == []
     finally:
         await loop.aclose()

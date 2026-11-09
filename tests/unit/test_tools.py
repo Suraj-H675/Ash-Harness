@@ -202,6 +202,24 @@ async def test_read_file_rejects_oversized_text(
 
 
 @pytest.mark.asyncio
+async def test_read_file_scope_refusal_guides_relative_path_without_rewriting(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "billing" / "tax.py"
+    target.parent.mkdir()
+    target.write_text("SAFE\n", encoding="utf-8")
+
+    result = await ReadFileTool(guard).run(file_path="/workspace/billing/tax.py")
+
+    assert result.success is False
+    assert "outside project scope" in (result.error or "")
+    assert "project-relative" in (result.error or "")
+    assert "/workspace/billing/tax.py" in (result.error or "")
+    assert "SAFE" not in result.output
+    assert (await ReadFileTool(guard).run(file_path="billing/tax.py")).success is True
+
+
+@pytest.mark.asyncio
 async def test_write_file_rejects_oversized_text(
     project_root: Path,
     guard: SafetyGuard,

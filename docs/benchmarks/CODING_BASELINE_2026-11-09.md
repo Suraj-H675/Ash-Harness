@@ -98,3 +98,22 @@ success or a generalized coding-performance improvement. Sequential operations
 retain immediate breaker behavior, and the circuit trips after consecutive
 failed parallel batches. Raw receipts remain private under the same external
 evidence directory; the model server was explicitly shut down after trials.
+
+## Follow-up: model-visible path refusal (2026-11-09)
+
+An additional local trial used the same Qwen GGUF and Vulkan serving binary,
+with a working-tree change to return **known, actionable scope refusals** from
+read-only discovery tools rather than treating thrown validation errors as
+ambiguous external effects. `read_file` also advised using project-relative
+paths instead of guessing `/workspace`. The guard still rejected every
+out-of-scope request without normalizing it into an authorized path.
+
+The `two-file` replay **failed** after 31.50s and six model requests: the
+40,000-token turn budget stopped it before it could repair both files. Unlike
+the preceding run, the model eventually issued a successful workspace listing
+and **four successful file reads**, then attempted an invalid edit and reread
+the source. Both sources remained unchanged. This demonstrates a successful
+path-recovery sequence **within one failed run**, not a controlled success-rate
+improvement. The serving process and all benchmark child processes were shut
+down after the trial. Evidence is retained privately at
+`/var/tmp/ash-coding-eval-20261109/gpu-two-file-scope-feedback/`.

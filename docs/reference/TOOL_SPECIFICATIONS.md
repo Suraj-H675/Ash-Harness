@@ -168,6 +168,14 @@ Performs structured Search and Replace operations on a contiguous block of text.
 ### 2.4 `list_dir`
 Scans workspace contents.
 
+`list_dir`, `glob_files`, and `search_text` return a known-completed,
+unsuccessful tool result when their root path is outside the workspace instead
+of raising an exception after dispatch. The refusal preserves the attempted
+path and suggests using a project-relative path or `directory_path="."` to
+discover workspace files; it never maps `/workspace` or another invented
+absolute prefix into the real project. `read_file` gives the same guidance.
+Neither read nor search is attempted at the denied location.
+
 *   **Arguments Schema**:
     ```python
     class ListDirArgs(BaseModel):

@@ -466,10 +466,13 @@ async def test_search_text_single_file_still_rejects_outside_workspace(tmp_path)
     workspace.mkdir()
     (tmp_path / "outside.py").write_text("secret\n")
 
-    with pytest.raises(Exception, match="outside project scope"):
-        await SearchTextTool(SafetyGuard(workspace)).run(
-            pattern="secret", directory_path="../outside.py"
-        )
+    result = await SearchTextTool(SafetyGuard(workspace)).run(
+        pattern="secret", directory_path="../outside.py"
+    )
+    assert result.success is False
+    assert "outside project scope" in (result.error or "")
+    assert "project-relative" in (result.error or "")
+    assert "secret" not in result.output
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX executable fixture")
@@ -624,11 +627,44 @@ async def test_search_text_fallback_does_not_read_file_swapped_to_external_symli
 
 @pytest.mark.asyncio
 async def test_search_text_rejects_out_of_scope_directory(tmp_path) -> None:
-    with pytest.raises(Exception, match="outside project scope"):
-        await SearchTextTool(SafetyGuard(tmp_path)).run(
-            pattern="x",
-            directory_path="../outside",
-        )
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="x", directory_path="../outside"
+    )
+    assert result.success is False
+    assert "outside project scope" in (result.error or "")
+    assert "project-relative" in (result.error or "")
+
+
+@pytest.mark.parametrize("tool_name", ["list_dir", "glob_files", "search_text"])
+@pytest.mark.asyncio
+async def test_discovery_tools_return_actionable_scope_refusal_without_exception(
+    tmp_path: Path, tool_name: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "secret.py"
+    outside.write_text("PRIVATE_CONTENT\n", encoding="utf-8")
+    guard = SafetyGuard(workspace)
+    tool, kwargs = {
+        "list_dir": (ListDirectoryTool(guard), {"directory_path": "../"}),
+        "glob_files": (
+            GlobFilesTool(guard),
+            {"directory_path": "../", "pattern": "**/*.py"},
+        ),
+        "search_text": (
+            SearchTextTool(guard),
+            {"directory_path": "../secret.py", "pattern": "PRIVATE_CONTENT"},
+        ),
+    }[tool_name]
+
+    result = await tool.run(**kwargs)
+
+    assert result.success is False
+    assert "outside project scope" in (result.error or "")
+    assert "project-relative" in (result.error or "")
+    assert "/workspace" not in result.output
+    assert "PRIVATE_CONTENT" not in result.output
+    assert outside.read_text(encoding="utf-8") == "PRIVATE_CONTENT\n"
 
 
 @pytest.mark.asyncio

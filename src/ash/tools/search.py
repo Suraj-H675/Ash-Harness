@@ -26,6 +26,7 @@ from ash.tools.base import (
     ToolExecutionContract,
     ToolResult,
     count_output_tokens,
+    scoped_path_refusal,
 )
 
 
@@ -127,7 +128,10 @@ class ListDirectoryTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ListDirectoryArgs(**kwargs)
-        root = self.safety_guard.validate_path(args.directory_path)
+        try:
+            root = self.safety_guard.validate_path(args.directory_path)
+        except SafetyViolation as exc:
+            return scoped_path_refusal(exc)
         if not _is_scoped_directory(root, self.safety_guard):
             return ToolResult(
                 success=False, output="", error=f"Not a directory: {root}"
@@ -187,7 +191,10 @@ class GlobFilesTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = GlobFilesArgs(**kwargs)
-        root = self.safety_guard.validate_path(args.directory_path)
+        try:
+            root = self.safety_guard.validate_path(args.directory_path)
+        except SafetyViolation as exc:
+            return scoped_path_refusal(exc)
         if not _is_scoped_directory(root, self.safety_guard):
             return ToolResult(
                 success=False, output="", error=f"Not a directory: {root}"
@@ -281,7 +288,10 @@ class SearchTextTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SearchTextArgs(**kwargs)
-        root = self.safety_guard.validate_path(args.directory_path)
+        try:
+            root = self.safety_guard.validate_path(args.directory_path)
+        except SafetyViolation as exc:
+            return scoped_path_refusal(exc)
         try:
             _, metadata = stat_scoped_path(root, self.safety_guard)
         except (OSError, SafetyViolation):
