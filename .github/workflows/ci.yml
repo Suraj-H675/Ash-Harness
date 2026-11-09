@@ -63,6 +63,11 @@ jobs:
 
   test:
     timeout-minutes: 40
+    # Linux is the primary host: exercise every supported Python version.
+    # Native macOS is a supported secondary host: run the full suite on the
+    # minimum Python version, with an installed Python 3.14 smoke below.
+    # Avoid multiplying the slow macOS suite across all Python minors: Python
+    # 3.13/3.14 compatibility is already exercised by the Linux matrix.
     strategy:
       fail-fast: false
       matrix:
@@ -75,10 +80,6 @@ jobs:
             python-version: "3.14"
           - os: macos-latest
             python-version: "3.12"
-          - os: macos-latest
-            python-version: "3.13"
-          - os: macos-latest
-            python-version: "3.14"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -102,11 +103,8 @@ jobs:
   macos-explorer-e2e:
     timeout-minutes: 35
     # Real Explorer/controller subprocess tests dominate macOS suite runtime.
-    # Run them concurrently with the rest of the suite for each supported Python.
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12", "3.13", "3.14"]
+    # Keep native subprocess coverage parallel with the macOS full suite,
+    # without repeating it for every Python minor.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -116,7 +114,7 @@ jobs:
         with:
           version: "0.12.17"
           enable-cache: true
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
       - run: uv sync --locked --group dev --extra server --extra browser --extra acp --extra a2a --extra aws --extra azure --extra gcp --extra local-embeddings
       - name: Real macOS Explorer subprocess coverage
         run: >-
