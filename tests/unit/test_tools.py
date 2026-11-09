@@ -895,6 +895,50 @@ async def test_write_file_blocks_paths_outside_project(
     assert outside.read_text(encoding="utf-8") == "original\n"
 
 
+@pytest.mark.parametrize(
+    ("tool_type", "arguments"),
+    [
+        (
+            ReplaceFileContentTool,
+            {"target_content": "original", "replacement_content": "changed"},
+        ),
+        (
+            ReplaceFileEditsTool,
+            {
+                "edits": [
+                    {
+                        "start_line": 1,
+                        "end_line": 1,
+                        "target_content": "original",
+                        "replacement_content": "changed",
+                    }
+                ]
+            },
+        ),
+        (WholeEditTool, {"content": "changed"}),
+    ],
+    ids=["replace_file_content", "replace_file_edits", "whole_edit"],
+)
+@pytest.mark.asyncio
+async def test_direct_edit_tools_refuse_out_of_scope_without_raising(
+    project_root: Path,
+    guard: SafetyGuard,
+    tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool] | type[WholeEditTool],
+    arguments: dict[str, object],
+) -> None:
+    outside = project_root.parent / "outside-edit.txt"
+    outside.write_text("original\n", encoding="utf-8")
+
+    result = await tool_type(guard).run(
+        file_path="../outside-edit.txt", **arguments
+    )
+
+    assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert "outside project scope" in (result.error or "")
+    assert outside.read_text(encoding="utf-8") == "original\n"
+
+
 @pytest.mark.asyncio
 async def test_write_file_does_not_clobber_file_created_during_write(
     project_root: Path,
@@ -1346,6 +1390,91 @@ async def test_replace_file_content_finds_unique_full_line_without_bounds(
     assert result.success is True
     assert "lines 2-2" in result.output
     assert target.read_text(encoding="utf-8") == "before\n    new text\nafter\n"
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_identical_target_and_replacement_is_refused(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = project_root / "doc.txt"
+    original = "before\n    old text\nafter\n"
+    target.write_text(original, encoding="utf-8")
+
+    def unexpected_write(*args: object, **kwargs: object) -> None:
+        raise AssertionError("no-op edit must not rewrite the source")
+
+    monkeypatch.setattr("ash.tools.filesystem.atomic_write_scoped_bytes", unexpected_write)
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        target_content="    old text",
+        replacement_content="    old text",
+    )
+
+    assert result.success is False
+    assert "identical" in (result.error or "")
+    assert "no edit" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_identical_nonexistent_lines_do_not_claim_success(
+    project_root: Path,
+    guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    original = "    return subtotal - discount_percent\n"
+    target.write_text(original, encoding="utf-8")
+    requested = "    return subtotal - subtotal * (discount_percent / Decimal('100'))"
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        target_content=requested,
+        replacement_content=requested,
+    )
+
+    assert result.success is False
+    assert "identical" in (result.error or "")
+    assert "no edit" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == original
+
+    recovered = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        target_content="    return subtotal - discount_percent",
+        replacement_content=requested,
+    )
+    assert recovered.success is True
+    assert target.read_text(encoding="utf-8") == requested + "\n"
+
+
+@pytest.mark.parametrize(
+    ("initial", "requested", "expected"),
+    [
+        (b"text", "text\n", b"text\n"),
+        (b"text\n", "text\r\n", b"text\r\n"),
+    ],
+    ids=["add-final-newline", "change-line-ending"],
+)
+@pytest.mark.asyncio
+async def test_replace_file_content_identical_arguments_can_change_line_endings(
+    project_root: Path,
+    guard: SafetyGuard,
+    initial: bytes,
+    requested: str,
+    expected: bytes,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_bytes(initial)
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        target_content=requested,
+        replacement_content=requested,
+    )
+
+    assert result.success is True
+    assert target.read_bytes() == expected
 
 
 @pytest.mark.asyncio
@@ -2250,8 +2379,12 @@ async def test_whole_edit_tool(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_whole_edit_blocks_paths_outside_project(guard: SafetyGuard) -> None:
-    with pytest.raises(SafetyViolation):
-        await WholeEditTool(guard).run(file_path="../outside.txt", content="nope")
+    result = await WholeEditTool(guard).run(
+        file_path="../outside.txt", content="nope"
+    )
+    assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert "outside project scope" in (result.error or "")
 
 
 def test_auto_commit_tool_is_in_default_tools():

@@ -40,6 +40,15 @@ EXISTS_ERROR = (
     "Error: Target file already exists. Set overwrite to true to replace it, "
     "or use replace_file_content to patch specific regions."
 )
+NO_OP_EDIT_ERROR = (
+    "Error: replacement would not change the file; no edit was made. "
+    "Supply a replacement with different content."
+)
+IDENTICAL_EDIT_ERROR = (
+    "Error: target_content and replacement_content are identical; "
+    "no edit was made. Use the actual old file lines as target_content "
+    "and the desired new lines as replacement_content."
+)
 
 
 @dataclass(frozen=True)
@@ -405,7 +414,10 @@ class ReplaceFileContentTool(BaseTool):
                 success=False, output="", error="Error: end_line must be >= start_line."
             )
 
-        resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        try:
+            resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        except SafetyViolation as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         if not resolved_path.exists():
             return ToolResult(
                 success=False,
@@ -446,6 +458,15 @@ class ReplaceFileContentTool(BaseTool):
         if args.start_line is None:
             span, match_error = _find_unique_line_span(original_text, normalized_target)
             if match_error is not None:
+                if (
+                    args.target_content == args.replacement_content
+                    and "does not match a complete block of lines" in match_error
+                ):
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=IDENTICAL_EDIT_ERROR,
+                    )
                 return ToolResult(success=False, output="", error=match_error)
             assert span is not None
             start_index, end_index = span
@@ -489,6 +510,16 @@ class ReplaceFileContentTool(BaseTool):
             lines, start_index, end_index, args.replacement_content
         )
         new_text = "".join(lines[:start_index] + replacement_lines + lines[end_index:])
+        if new_text == original_text:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    IDENTICAL_EDIT_ERROR
+                    if args.target_content == args.replacement_content
+                    else NO_OP_EDIT_ERROR
+                ),
+            )
 
         try:
             atomic_write_scoped_bytes(
@@ -524,7 +555,10 @@ class ReplaceFileEditsTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = ReplaceFileEditsArgs(**kwargs)
-        resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        try:
+            resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        except SafetyViolation as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         if not resolved_path.exists():
             return ToolResult(
                 success=False,
@@ -622,7 +656,10 @@ class WholeEditTool(BaseTool):
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = WholeEditArgs(**kwargs)
-        resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        try:
+            resolved_path = self.safety_guard.validate_mutation_path(args.file_path)
+        except SafetyViolation as exc:
+            return ToolResult(success=False, output="", error=str(exc))
         try:
             payload, expected_sha256 = _encode_for_write(
                 resolved_path,
