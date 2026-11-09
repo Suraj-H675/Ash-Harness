@@ -7,12 +7,14 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from ash.core.activity import summarize_operational_events
 from ash.core.redaction import redact_text, redact_value
 from ash.core.session import (
     SessionLineage,
     SessionSearchHit,
     SessionStore,
     SessionSummary,
+    StoredRuntimeEvent,
 )
 from ash.ui.safe_text import terminal_safe_text
 
@@ -193,6 +195,52 @@ def render_session_summaries(
             f"{session_id}  {title}  {session.message_count} messages  "
             f"{model}  {session.updated_at.isoformat()}  {project_path}"
         )
+    return "\n".join(lines)
+
+
+def render_session_activity(
+    session_id: str,
+    events: list[StoredRuntimeEvent],
+    *,
+    after_sequence: int,
+    has_more: bool,
+    json_output: bool = False,
+) -> str:
+    """Show bounded, content-free tool/model timing for one session event page."""
+
+    activity = summarize_operational_events(events)
+    next_cursor = events[-1].sequence if events else after_sequence
+    payload = {
+        "session_id": session_id,
+        "after_sequence": after_sequence,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "activity": activity,
+    }
+    if json_output:
+        return json.dumps(redact_value(payload), sort_keys=True)
+    if not events:
+        return "No stored runtime activity for this session at this cursor."
+    lines = [
+        f"Session {terminal_safe_text(session_id, single_line=True)} — "
+        f"activity after sequence {after_sequence}",
+        f"Model requests: {activity['model_requests']} started, "
+        f"{activity['model_requests_completed']} completed, "
+        f"{activity['completed_model_seconds']:.2f}s measured",
+    ]
+    for item in activity["timeline"]:
+        details = " ".join(
+            f"{key}={value}"
+            for key, value in item.items()
+            if key not in {"type", "at_seconds"}
+        )
+        lines.append(
+            f"  +{item['at_seconds']:.3f}s  {item['type']}"
+            + (f"  {details}" if details else "")
+        )
+    if activity["timeline_truncated"]:
+        lines.append("  [Content-free activity timeline capped at 300 events]")
+    lines.append(f"Next cursor: {next_cursor}" + (" (more events)" if has_more else ""))
     return "\n".join(lines)
 
 

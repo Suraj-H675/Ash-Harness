@@ -11,10 +11,10 @@ The initial tasks intentionally cover distinct workflow contracts: exact file
 creation; creating and executing a Python program; reading and repairing
 a failing Python test; and finding a percentage-calculation bug across a small
 multi-file package. The repair tasks are judged by hidden behavioral assertions
-in addition to their visible tests. This is a **smoke-scale baseline**, not a statistically
-meaningful agent leaderboard, general model-quality claim, or replacement for
-larger, independently authored coding tasks. Run repeated trials before claiming
-an improvement in completion rate or latency.
+in addition to their visible tests. This is a **smoke-scale baseline**, not a
+statistically meaningful agent leaderboard, general model-quality claim, or
+replacement for larger, independently authored coding tasks. Run repeated trials
+before claiming an improvement in completion rate or latency.
 
 ## Prerequisites
 
@@ -49,11 +49,12 @@ PYTHONPATH=src .venv/bin/python devtools/coding_benchmark.py \
 Use a **new evidence path** for every invocation. `--task marker`,
 `--task build-run`, `--task repair-test`, or `--task multi-file` can select a
 single case, and `--task` can be repeated to select cases. Use `--repeat 3`
-for three independent repetitions of each selected case. The tool never launches a cloud inference route,
-passes through personal credentials, alters the user's Ash profile, or runs
-anything in the project being developed. The code tasks execute in `auto_edit`
-mode with no general command approval; only the exact fixture test command is
-granted when needed. Ash's own command sandbox is explicitly set to `native`.
+for three independent repetitions of each selected case. The tool never launches
+a cloud inference route, passes through personal credentials, alters the user's
+Ash profile, or runs anything in the project being developed. The code tasks
+execute in `auto_edit` mode with no general command approval; only the exact
+fixture test command is granted when needed. Ash's own command sandbox is
+explicitly set to `native`.
 
 ## Reading the scores
 
@@ -64,6 +65,35 @@ oracle passes; required tools have actually succeeded; protected files are
 unchanged; and the session audit verifies. The oracle, tool activity, and final
 model claim are recorded separately so a confident answer cannot substitute
 for a completed edit or successful test.
+
+Each trial also includes `setup_seconds`, `cli_seconds`, and `performance`, a
+bounded projection of **persisted, content-free runtime event fields**. The
+projection includes request counts, completed provider-request durations,
+successful edit/command timing, and an event timeline capped at 300 entries.
+It never copies model text, command output, tool arguments, workspace paths,
+credentials, or free-form error messages into that projection. Raw stdout,
+stderr, and tool records elsewhere in the evidence directory remain private.
+
+Use these timings to separate provider latency and tool execution from a slow
+final response. A timed-out trial can have correct code and a successful test
+without a terminal `turn.completed` event. An open model request in the event
+projection means a request had no persisted terminal event, **not** proof the
+model itself hung; interruptions and bounded event persistence are confounders.
+
+For ordinary Ash sessions, the same content-free projection is available
+without running a benchmark or replaying a model prompt:
+
+```sh
+ash sessions activity --limit 100
+ash sessions activity --session SESSION_ID --limit 100 --json
+ash sessions activity --session SESSION_ID --after-sequence CURSOR --json
+```
+
+The inspection is read-only and scoped to the current project. `next_cursor`
+and `has_more` allow bounded pagination; a page's relative timings start at
+its first recorded event, so a page that omits a request start cannot measure
+that request's full latency. This is intentionally **not** a transcript or
+command-output inspection surface.
 
 Keep the server runtime build, model decoding/chat-template settings, host
 resource contention, and task budgets in the experiment notes: the evaluation

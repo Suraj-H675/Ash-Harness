@@ -4032,10 +4032,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
             return 2
 
     if args.command == "sessions":
+        from ash.core.activity import MAX_TIMELINE_EVENTS
         from ash.core.session import SessionResolutionError
         from ash.commands.sessions import (
             list_session_summaries,
             render_recovery_reports,
+            render_session_activity,
             render_session_search_hits,
             render_session_summaries,
             render_session_tree,
@@ -4084,6 +4086,48 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     return 2
                 print(render_recovery_reports(reports, json_output=args.json))
                 return 0
+            if args.sessions_action == "activity":
+                if args.all_projects:
+                    print(
+                        "Error: session activity is scoped to the current project",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if not 1 <= args.limit <= MAX_TIMELINE_EVENTS or args.after_sequence < 0:
+                    print(
+                        "Error: activity requires --limit 1..300 and "
+                        "--after-sequence >= 0",
+                        file=sys.stderr,
+                    )
+                    return 2
+                try:
+                    selected_summary = (
+                        store.resolve_session(
+                            args.session, str(sessions_config.workspace_root)
+                        )
+                        if args.session
+                        else store.latest_session(str(sessions_config.workspace_root))
+                    )
+                    if selected_summary is None:
+                        raise SessionResolutionError("no sessions found in this project")
+                    page = store.list_runtime_events(
+                        selected_summary.session_id,
+                        after_sequence=args.after_sequence,
+                        limit=args.limit + 1,
+                    )
+                except (KeyError, SessionResolutionError) as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 2
+                print(
+                    render_session_activity(
+                        selected_summary.session_id,
+                        page[: args.limit],
+                        after_sequence=args.after_sequence,
+                        has_more=len(page) > args.limit,
+                        json_output=args.json,
+                    )
+                )
+                return 0
             if args.sessions_action == "search":
                 if args.all_projects:
                     print(
@@ -4106,7 +4150,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 return 0
             if args.session:
                 print(
-                    "Error: --session requires 'sessions tree' or 'sessions recovery'",
+                    "Error: --session requires 'sessions tree' or 'sessions recovery' "
+                    "or 'sessions activity'",
                     file=sys.stderr,
                 )
                 return 2

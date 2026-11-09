@@ -345,7 +345,10 @@ versioned SQLite storage. Ash supports:
   bounded automatic continuation, no-spin suppression, explicit pause/resume/
   clear controls, and interruption-safe pausing; and
 - persisted token, cache, usage, and cost history with estimated portions
-  clearly labeled.
+  clearly labeled; and
+- bounded, content-free model/tool timing inspection through `ash sessions
+  activity [--session SESSION] [--limit 100] [--json]`, with event-sequence
+  pagination for longer sessions and no provider request or raw transcript export.
 
 Recovery is conservative: completed work is retained, direct file edits are
 compensated only when hashes prove what happened, and non-file side effects

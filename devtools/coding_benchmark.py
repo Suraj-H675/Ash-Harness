@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from ash.core.activity import EDIT_TOOL_NAMES, summarize_operational_events
 from ash.core.session import SessionStore
 
 
@@ -66,15 +67,6 @@ HIDDEN_CHECKOUT_ORACLE = (
     "assert quote([('a', '10.00'), ('b', '30.00')], '50') == '20.00'\n"
     "assert quote([('a', '7.50'), ('b', '2.50')], '20') == '8.00'\n"
     "assert quote([], '35') == '0.00'\n"
-)
-EDIT_TOOL_NAMES = frozenset(
-    {
-        "write_file",
-        "replace_file_content",
-        "replace_file_edits",
-        "whole_edit",
-        "apply_patch",
-    }
 )
 
 
@@ -304,6 +296,7 @@ def run_trial(
             "ASH_MAX_COMPLETION_TOKENS": "384",
             "ASH_MAX_TURN_TOTAL_TOKENS": "40000",
         }
+        setup_started = time.monotonic()
         setup = command(
             [str(PYTHON), "-m", "ash", "trust", "add", str(workspace)],
             cwd=workspace,
@@ -332,6 +325,7 @@ def run_trial(
                 raise RuntimeError(
                     f"isolated command grant failed: {grant.stderr[-400:]}"
                 )
+        setup_seconds = round(time.monotonic() - setup_started, 3)
 
         invocation = [
             str(PYTHON),
@@ -346,6 +340,7 @@ def run_trial(
             "--output-format",
             "json",
         ]
+        cli_started = time.monotonic()
         with (
             (trial_dir / "ash.stdout").open("wb") as stdout,
             (trial_dir / "ash.stderr").open("wb") as stderr,
@@ -369,6 +364,7 @@ def run_trial(
                 except subprocess.TimeoutExpired:
                     os.killpg(child.pid, signal.SIGKILL)
                     exit_code = child.wait(timeout=5)
+        cli_seconds = round(time.monotonic() - cli_started, 3)
 
         try:
             payload = json.loads((trial_dir / "ash.stdout").read_text())
@@ -381,6 +377,7 @@ def run_trial(
         usage: dict[str, int] = {}
         terminal_events: list[str] = []
         last_event_type: str | None = None
+        performance: dict[str, Any] = summarize_operational_events([])
         if sessions:
             session = store.load_session(sessions[0].session_id)
             calls = [
@@ -401,6 +398,7 @@ def run_trial(
                 "completion_tokens": used.completion_tokens,
             }
             events = store.list_runtime_events(session.session_id, limit=10_000)
+            performance = summarize_operational_events(events)
             if events:
                 last_event_type = str(events[-1].event.get("type", ""))
                 terminal_events = [
@@ -476,6 +474,9 @@ def run_trial(
                 "exit_code": exit_code,
                 "timed_out": timed_out,
                 "elapsed_seconds": round(time.monotonic() - start, 2),
+                "setup_seconds": setup_seconds,
+                "cli_seconds": cli_seconds,
+                "performance": performance,
                 "task_correct": outcome["correct"],
                 "oracle": outcome,
                 "protected_files_unchanged": protected,
