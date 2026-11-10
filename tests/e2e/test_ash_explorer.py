@@ -17,6 +17,7 @@ import tomllib
 import urllib.request
 from argparse import Namespace
 from pathlib import Path
+from typing import Callable
 from xml.sax.saxutils import escape as xml_escape
 
 import pytest
@@ -982,6 +983,40 @@ def _child_loopback_bind_error(environment: dict[str, str]) -> str | None:
     pytest.fail(f"child loopback capability probe failed: {payload!r}")
 
 
+def _replay_startup_stage(evidence: Path) -> str:
+    if (evidence / "trust-status.json").is_file():
+        return "trust command completed"
+    if (evidence / "trust-command.json").is_file():
+        return "trust command dispatched"
+    if (evidence / "manifest.json").is_file():
+        return "workspace prepared"
+    if evidence.is_dir():
+        return "evidence directory created"
+    return "process launch"
+
+
+def _wait_for_replay_start(
+    lines: queue.Queue[bytes | None],
+    evidence: Path,
+    timeout: float,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+) -> bytes | None:
+    """Extend startup only for new evidence milestones, never indefinitely."""
+    absolute_deadline = clock() + timeout * 4
+    idle_deadline = clock() + timeout
+    stage = "process launch"
+    while clock() < min(absolute_deadline, idle_deadline):
+        try:
+            return lines.get(timeout=0.1)
+        except queue.Empty:
+            current = _replay_startup_stage(evidence)
+            if current != stage:
+                stage = current
+                idle_deadline = clock() + timeout
+    raise queue.Empty(stage)
+
+
 def _replay_with_step_deadlines(
     command: list[str],
     *,
@@ -1025,19 +1060,6 @@ def _replay_with_step_deadlines(
     events: list[dict[str, object]] = []
     startup_stage = "process launch"
 
-    def observed_startup_stage() -> str:
-        if startup_evidence is None:
-            return startup_stage
-        if (startup_evidence / "trust-status.json").is_file():
-            return "trust command completed"
-        if (startup_evidence / "trust-command.json").is_file():
-            return "trust command dispatched"
-        if (startup_evidence / "manifest.json").is_file():
-            return "workspace prepared"
-        if startup_evidence.is_dir():
-            return "evidence directory created"
-        return "process launch"
-
     try:
         for expected in (
             "started",
@@ -1051,28 +1073,12 @@ def _replay_with_step_deadlines(
             }[expected]
             try:
                 if expected == "started" and startup_evidence is not None:
-                    # Explorer emits `started` only after its own bounded
-                    # subprocess has initialized project trust. A deadline
-                    # against the whole startup misclassifies healthy macOS
-                    # progress as a hang. Reset only on verified new stages,
-                    # with an independent absolute cap against busy loops.
-                    startup_deadline = time.monotonic() + timeout * 4
-                    idle_deadline = time.monotonic() + timeout
-                    line = None
-                    while time.monotonic() < min(startup_deadline, idle_deadline):
-                        try:
-                            line = lines.get(timeout=0.1)
-                            break
-                        except queue.Empty:
-                            current_stage = observed_startup_stage()
-                            if current_stage != startup_stage:
-                                startup_stage = current_stage
-                                idle_deadline = time.monotonic() + timeout
-                    if line is None:
-                        raise queue.Empty
+                    line = _wait_for_replay_start(lines, startup_evidence, timeout)
                 else:
                     line = lines.get(timeout=timeout)
-            except queue.Empty:
+            except queue.Empty as exc:
+                if exc.args:
+                    startup_stage = str(exc.args[0])
                 pytest.fail(
                     f"Explorer replay stalled before {expected} "
                     f"({len(events)} completed events, startup={startup_stage}, "
@@ -1148,49 +1154,51 @@ def test_replay_startup_uses_verified_progress_not_one_wall_clock(
     tmp_path: Path,
 ) -> None:
     evidence = tmp_path / "evidence"
-    code = (
-        "import json,pathlib,sys,time\n"
-        "root=pathlib.Path(sys.argv[1])\n"
-        "time.sleep(0.12)\n"
-        "root.mkdir()\n"
-        "time.sleep(0.12)\n"
-        "(root/'manifest.json').write_text('{}')\n"
-        "time.sleep(0.12)\n"
-        "(root/'trust-command.json').write_text('{}')\n"
-        "time.sleep(0.12)\n"
-        "(root/'trust-status.json').write_text('{}')\n"
-        "time.sleep(0.12)\n"
-        "for kind in ('started','observation','finished'):\n"
-        "    print(json.dumps({'type':kind}),flush=True)\n"
+
+    class ScriptedQueue(queue.Queue[bytes | None]):
+        def __init__(self) -> None:
+            super().__init__()
+            self.now = 0.0
+            self.calls = 0
+
+        def get(self, block: bool = True, timeout: float | None = None) -> bytes:
+            self.calls += 1
+            self.now += 0.09  # simulated time, not host scheduler time
+            if self.calls == 1:
+                evidence.mkdir()
+            elif self.calls == 2:
+                (evidence / "manifest.json").touch()
+            elif self.calls == 3:
+                (evidence / "trust-command.json").touch()
+            elif self.calls == 4:
+                (evidence / "trust-status.json").touch()
+            elif self.calls == 6:
+                return b'{"type":"started"}\n'
+            raise queue.Empty
+
+    events = ScriptedQueue()
+    assert (
+        _wait_for_replay_start(events, evidence, 0.3, clock=lambda: events.now)
+        == b'{"type":"started"}\n'
     )
-    events = _replay_with_step_deadlines(
-        [sys.executable, "-u", "-c", code, str(evidence)],
-        cwd=tmp_path,
-        environment=os.environ.copy(),
-        observations=1,
-        startup_timeout=0.26,
-        startup_evidence=evidence,
-    )
-    assert [event["type"] for event in events] == ["started", "observation", "finished"]
+    assert events.now > 0.3  # progressed beyond the original single deadline
 
 
 def test_replay_startup_stalls_even_with_an_unchanging_manifest(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence"
-    code = (
-        "import pathlib,sys,time\n"
-        "root=pathlib.Path(sys.argv[1]);root.mkdir()\n"
-        "(root/'manifest.json').write_text('{}')\n"
-        "time.sleep(5)\n"
-    )
-    with pytest.raises(pytest.fail.Exception, match="startup=workspace prepared"):
-        _replay_with_step_deadlines(
-            [sys.executable, "-u", "-c", code, str(evidence)],
-            cwd=tmp_path,
-            environment=os.environ.copy(),
-            observations=1,
-            startup_timeout=0.3,
-            startup_evidence=evidence,
-        )
+    evidence.mkdir()
+    (evidence / "manifest.json").touch()
+
+    class StalledQueue(queue.Queue[bytes | None]):
+        now = 0.0
+
+        def get(self, block: bool = True, timeout: float | None = None) -> bytes:
+            self.now += 0.1
+            raise queue.Empty
+
+    stalled = StalledQueue()
+    with pytest.raises(queue.Empty, match="workspace prepared"):
+        _wait_for_replay_start(stalled, evidence, 0.3, clock=lambda: stalled.now)
 
 
 def test_replay_progress_deadlines_stop_stalled_startup(tmp_path: Path) -> None:
