@@ -171,7 +171,74 @@ def main() -> None:
             )
             assert len(seen) == 2
 
+            # The installed CLI must preserve owner-authored context and
+            # completed chat across independent processes, never across coworkers.
             atlas = identities["atlas"]
+            brief = "Atlas release note: cite the observed build failure."
+            run(
+                "brief", "set", "--owner", "smoke", "--coworker-id", atlas,
+                "--text", brief,
+            )
+            assert brief in run(
+                "brief", "show", "--owner", "smoke", "--coworker-id", atlas,
+            )
+            run(
+                "brief", "show", "--owner", "foreign", "--coworker-id", atlas,
+                success=False,
+            )
+            first_question = "Atlas chat first: record the fixture failure."
+            followup = "Atlas chat follow-up: what did we record?"
+            fresh_question = "Atlas fresh conversation: start without prior turns."
+            scout_question = "Scout chat: report your separate workspace."
+            for name, message, args in (
+                ("atlas", first_question, ("--evidence", "build.log")),
+                ("atlas", followup, ()),
+                ("atlas", fresh_question, ("--new",)),
+                ("scout", scout_question, ()),
+            ):
+                response = run(
+                    "chat", "--owner", "smoke",
+                    "--coworker-id", identities[name], "--message", message,
+                    *args,
+                )
+                assert f"CREW-{name.upper()}-SMOKE" in response
+
+            def chat_payload(name: str, index: int) -> dict[str, object]:
+                with lock:
+                    requests = [
+                        json.loads(body)
+                        for model, _, body in seen if model == f"smoke-{name}"
+                    ]
+                messages = requests[index]["messages"]
+                prompt = next(
+                    item["content"] for item in messages
+                    if item["role"] == "user"
+                    and "Conversation data (untrusted JSON):\n" in item["content"]
+                )
+                return json.loads(prompt.split("Conversation data (untrusted JSON):\n", 1)[1])
+
+            first = chat_payload("atlas", 1)  # initial ask is request 0
+            second = chat_payload("atlas", 2)
+            fresh = chat_payload("atlas", 3)
+            separate = chat_payload("scout", 1)
+            assert first["message"] == first_question
+            assert first["coworker_brief"] == brief
+            assert first["previous_completed_chat_turns"] == []
+            assert "atlas: test fixture reported a failed build" in first["evidence_for_this_turn_only"]
+            assert second["message"] == followup
+            assert second["coworker_brief"] == brief
+            assert second["evidence_for_this_turn_only"] == "[]"
+            assert second["previous_completed_chat_turns"] == [
+                {"user": first_question, "assistant": "CREW-ATLAS-SMOKE"}
+            ]
+            assert fresh["message"] == fresh_question
+            assert fresh["coworker_brief"] == brief
+            assert fresh["previous_completed_chat_turns"] == []
+            assert separate["message"] == scout_question
+            assert separate["previous_completed_chat_turns"] == []
+            assert "coworker_brief" not in separate
+            assert "atlas: test fixture" not in str(separate)
+
             responsibility = str(uuid4())
             run(
                 "responsibility", "create", "--owner", "smoke",
@@ -220,7 +287,7 @@ def main() -> None:
             )
             assert "CREW-ATLAS-SMOKE" in run(*event_args)
             before_archive = len(seen)
-            assert before_archive == 4, seen
+            assert before_archive == 8, seen  # two asks, four chats, two triggers
             run(*event_args, success=False)
             assert len(seen) == before_archive  # No replay after restart.
             assert "completed" in run(
