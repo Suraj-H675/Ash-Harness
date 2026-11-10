@@ -173,6 +173,37 @@ def test_free_openrouter_cli_refuses_unapproved_requests_before_network_or_files
     assert not target.exists()
 
 
+def test_free_openrouter_runtime_requires_bubblewrap_before_catalog_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    evidence = tmp_path / "not-created"
+    monkeypatch.setenv("OPENROUTER_API_KEY", "FAKE-ONLY-NO-INFERENCE")
+    monkeypatch.setattr(_benchmark.shutil, "which", lambda name: None)
+
+    def unexpected_catalog(*args: object, **kwargs: object) -> None:
+        pytest.fail("No catalog or inference traffic before sandbox preflight")
+
+    monkeypatch.setattr(_benchmark.urllib.request, "urlopen", unexpected_catalog)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "coding_benchmark.py",
+            "--task",
+            "event-log",
+            "--openrouter-free-model",
+            "cohere/north-mini-code:free",
+            "--evidence-dir",
+            str(evidence),
+        ],
+    )
+    with pytest.raises(SystemExit) as raised:
+        _benchmark.main()
+    assert raised.value.code == 2
+    assert "Bubblewrap is required" in capsys.readouterr().err
+    assert not evidence.exists()
+
+
 def test_free_openrouter_trial_keeps_key_in_child_environment_not_config_or_argv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -894,10 +894,6 @@ def main() -> int:
     )
     if not (128 <= completion_tokens <= 16_384):
         parser.error("--completion-tokens must be between 128 and 16384")
-    if not PYTHON.is_file():
-        parser.error(f"repository virtual environment missing: {PYTHON}")
-    if not shutil.which("bwrap"):
-        parser.error("Bubblewrap is required to safely execute model-written code")
     remote_key: str | None = None
     if args.openrouter_free_model:
         if args.endpoint or args.model_file:
@@ -913,6 +909,14 @@ def main() -> int:
         remote_key = os.environ.get("OPENROUTER_API_KEY")
         if not remote_key:
             parser.error("OPENROUTER_API_KEY is required for free-model evaluation")
+    # Validate user options before checking Linux-only execution dependencies.
+    # Invalid free-model requests must fail consistently on macOS CI too;
+    # actual execution still requires Bubblewrap before any provider traffic.
+    if not PYTHON.is_file():
+        parser.error(f"repository virtual environment missing: {PYTHON}")
+    if not shutil.which("bwrap"):
+        parser.error("Bubblewrap is required to safely execute model-written code")
+    if args.openrouter_free_model:
         try:
             # Public catalog check is unauthenticated. Never send the key
             # here, or guess that a model is free from its name alone.
