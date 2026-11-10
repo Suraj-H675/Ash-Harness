@@ -150,6 +150,128 @@ for raw, expected in examples:
 assert _normalize_header_value("interior \t whitespace") == "interior \t whitespace"
 """
 
+URLLIB3_REDIRECT_VISIBLE = r"""import sys
+import types
+version = types.ModuleType("urllib3._version")
+version.__version__ = "0.0+repository-benchmark"
+sys.modules["urllib3._version"] = version
+sys.path.insert(0, "src")
+from urllib3.connectionpool import HTTPConnectionPool
+from urllib3.poolmanager import ProxyManager
+from urllib3.util.retry import Retry
+
+class Response:
+    status = 302
+    retries = Retry(total=2, redirect=2)
+    def __init__(self, location=None):
+        self.location = location
+        if location is None:
+            self.status = 200
+    def get_redirect_location(self):
+        return self.location or False
+    def drain_conn(self):
+        pass
+
+class RecordingProxyPool:
+    def __init__(self, redirect):
+        self.redirect = redirect
+        self.proxy_pool = HTTPConnectionPool("proxy.internal", 3128)
+        self.requests = []
+    def is_same_host(self, url):
+        return self.proxy_pool.is_same_host(url)
+    def urlopen(self, method, url, **kw):
+        self.requests.append((url, dict(kw["headers"])))
+        return Response(self.redirect if len(self.requests) == 1 else None)
+
+def exercise(first_url, redirect):
+    pool = RecordingProxyPool(redirect)
+    manager = ProxyManager("http://proxy.internal:3128")
+    manager.connection_from_host = lambda *args, **kw: pool
+    response = manager.urlopen(
+        "GET", first_url, headers={"Authorization": "secret", "Cookie": "id=123"},
+        retries=Retry(total=2, redirect=2),
+    )
+    assert response.status == 200
+    assert len(pool.requests) == 2
+    return pool.requests
+
+same = exercise("http://alpha.invalid/start", "/next")
+assert same[1][1]["Authorization"] == "secret"
+assert same[1][1]["Cookie"] == "id=123"
+assert same[1][1]["Host"] == "alpha.invalid"
+
+cross = exercise("http://alpha.invalid/start", "http://beta.invalid/next")
+assert "Authorization" not in cross[1][1]
+assert "Cookie" not in cross[1][1]
+assert cross[1][1]["Host"] == "beta.invalid"
+"""
+
+URLLIB3_REDIRECT_HIDDEN = r"""import sys
+import types
+version = types.ModuleType("urllib3._version")
+version.__version__ = "0.0+repository-benchmark"
+sys.modules["urllib3._version"] = version
+sys.path.insert(0, "src")
+from urllib3.connectionpool import HTTPConnectionPool
+from urllib3.poolmanager import ProxyManager
+from urllib3.util.retry import Retry
+
+class Response:
+    retries = Retry(total=2, redirect=2)
+    def __init__(self, location=None):
+        self.location = location
+        self.status = 302 if location else 200
+    def get_redirect_location(self):
+        return self.location or False
+    def drain_conn(self):
+        pass
+
+class RecordingProxyPool:
+    def __init__(self, redirect):
+        self.proxy_pool = HTTPConnectionPool("proxy.internal", 3128)
+        self.redirect = redirect
+        self.requests = []
+    def is_same_host(self, url):
+        return self.proxy_pool.is_same_host(url)
+    def urlopen(self, method, url, **kw):
+        self.requests.append((url, dict(kw["headers"])))
+        return Response(self.redirect if len(self.requests) == 1 else None)
+
+def exercise(first_url, location, headers):
+    pool = RecordingProxyPool(location)
+    manager = ProxyManager("http://proxy.internal:3128")
+    manager.connection_from_host = lambda *args, **kw: pool
+    manager.urlopen(
+        "GET", first_url, headers=headers, retries=Retry(total=2, redirect=2)
+    )
+    assert len(pool.requests) == 2
+    return pool.requests[1][1]
+
+case = exercise(
+    "http://alpha.invalid:80/start", "http://alpha.invalid/next",
+    {"Authorization": "keep", "Cookie": "id=keep", "Host": "alpha.invalid:80"},
+)
+assert case["Authorization"] == "keep"
+assert case["Cookie"] == "id=keep"
+assert case["Host"] == "alpha.invalid:80"
+
+case = exercise(
+    "http://alpha.invalid/start", "http://alpha.invalid:8080/next",
+    {"Authorization": "remove", "Cookie": "id=remove", "Host": "alpha.invalid"},
+)
+assert "Authorization" not in case
+assert "Cookie" not in case
+assert case["Host"] == "alpha.invalid:8080"
+
+case = exercise(
+    "http://alpha.invalid/start", "/same",
+    {"Authorization": "keep", "Cookie": "id=keep", "Host": "alpha.invalid"},
+)
+assert case["Authorization"] == "keep"
+assert case["Cookie"] == "id=keep"
+assert case["Host"] == "alpha.invalid"
+"""
+
 
 @dataclass(frozen=True)
 class RepositoryTask:
@@ -209,6 +331,37 @@ TASKS = {
             "change only src/urllib3/connection.py, and run exactly "
             "python3 -B qa_visible.py with run_command. No other commands "
             "are authorized. Preserve all public APIs and other files."
+        ),
+    ),
+    "urllib3-proxy-redirect": RepositoryTask(
+        source="urllib3/urllib3",
+        upstream="https://github.com/urllib3/urllib3.git",
+        base_sha="e349d97f2bf234b95d5dd9e689d056a521dfc3b0",
+        reference_fix_sha="01cd60b539f808a65e9c5aa93db1c48292432176",
+        editable=frozenset(
+            {
+                "src/urllib3/connectionpool.py",
+                "src/urllib3/poolmanager.py",
+            }
+        ),
+        visible_script="qa_visible.py",
+        visible_source=URLLIB3_REDIRECT_VISIBLE,
+        hidden_source=URLLIB3_REDIRECT_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Repair a historical proxy redirect bug in this pinned urllib3 "
+            "repository. Redirect origin comparison must use the original "
+            "request URL's origin rather than the connection pool's proxy host. "
+            "On a same-origin redirect, preserve Authorization and Cookie; "
+            "on a cross-origin redirect, strip sensitive redirect headers "
+            "and remove any previously set Host so the next request computes "
+            "its destination Host correctly. Keep scheme, normalized host "
+            "and default-port comparison consistent across the connection "
+            "pool and redirect manager via a shared internal comparison helper. "
+            "Inspect qa_visible.py and both modules; edit ONLY "
+            "src/urllib3/connectionpool.py and src/urllib3/poolmanager.py, "
+            "then run exactly python3 -B qa_visible.py with run_command. "
+            "No other commands are authorized. Preserve public APIs and tests."
         ),
     ),
 }

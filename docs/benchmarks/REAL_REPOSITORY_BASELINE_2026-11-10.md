@@ -71,3 +71,48 @@ evaluation constraints; it must not be represented as a competitive win.
 Next evaluation work should add predeclared multi-module and feature tasks on
 existing repositories, repeat enough trials to measure variability, and
 run a leading coding CLI comparator under genuinely comparable constraints.
+
+## First two-module historical regression: proxy redirect origin (2026-11-10)
+
+The third curated upstream task, `urllib3-proxy-redirect`, uses the
+real `urllib3/urllib3` Git revision
+`e349d97f2bf234b95d5dd9e689d056a521dfc3b0` immediately preceding
+the fix `01cd60b539f808a65e9c5aa93db1c48292432176`. The original fails
+both independently written redirection oracles; the upstream reference fix
+passes both. Both `src/urllib3/connectionpool.py` **and**
+`src/urllib3/poolmanager.py` are required to change. The visible and hidden
+oracles simulate proxy pools locally, without network connections, and check
+same-origin Authorization/Cookie preservation, cross-origin removal, Host
+regeneration, and default versus nondefault ports.
+
+Three **separate, non-equivalent budget probes** used GPT-6.1 Sol and the
+same protected source and permissions:
+
+| Per-request context / turn budget | Result | Model requests | Usage (prompt / completion tokens) | Total time |
+|---|---|---:|---:|---:|
+| 32,768 / 120,000 | **Fail**: context gate blocked further requests before any edit | 3 | 25,218 / 146 | 20.15s |
+| 65,536 / 120,000 | **Fail**: stopped at `token_budget` after partial edits in `connectionpool.py` only | 7 | 97,032 / 809 | 50.33s |
+| 65,536 / 250,000 | **Pass**: both production modules changed, exact authorized visible test executed, visible and hidden oracles passed, audit verified | 9 | 179,569 / 1,566 | 77.15s |
+
+The passing trial had 71.00s of CLI execution, no model transport errors,
+nine successful tool calls including four file edits and the exact authorized
+`python3 -B qa_visible.py` command, no out-of-scope commands, unchanged
+protected files, and a completed terminal event with exit status 0.
+The two failing trials correctly returned exit 1 rather than falsely
+signaling completion. All three kept the audit intact, honored file
+boundaries, and removed the temporary workspace and access-only credentials.
+
+Private individual receipts:
+`/var/tmp/ash-urllib3-proxy-redirect-sol-20261110/`,
+`/var/tmp/ash-urllib3-proxy-redirect-sol-64k-20261110/`, and
+`/var/tmp/ash-urllib3-proxy-redirect-sol-250k-20261110/`.
+No retained credential files or active model processes remained.
+
+**Interpretation:** This is the first real two-production-module Ash coding
+repair independently verified to completion. It is **not** evidence of
+reliable completion at a 32K context or 120K total budget. A 250K limit was
+needed for this trial, exposing substantial cumulative prompt/context
+consumption. Do not fold the changed-budget retries into the earlier 2/2
+single-module score or claim that increased budgets improved the harness
+itself. Compare with a leading CLI under matched model, budgets, tools, and
+permissions before drawing conclusions about operational efficiency.

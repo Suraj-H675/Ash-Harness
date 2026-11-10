@@ -35,6 +35,11 @@ _spec.loader.exec_module(bench)
             "https://github.com/urllib3/urllib3.git",
             {"src/urllib3/connection.py"},
         ),
+        (
+            "urllib3-proxy-redirect",
+            "https://github.com/urllib3/urllib3.git",
+            {"src/urllib3/connectionpool.py", "src/urllib3/poolmanager.py"},
+        ),
     ],
 )
 def test_upstream_tasks_are_pinned_and_oracles_sealed(
@@ -93,6 +98,23 @@ def test_repository_snapshot_and_protected_edits_refuse_unexpected_changes(
     assert bench.check_edits(
         baseline, bench.snapshot_files(tmp_path), frozenset({"h11/_readers.py"})
     ) == (False, False)
+
+
+def test_two_module_scoring_rejects_partial_repair_and_modified_qa() -> None:
+    required = bench.TASKS["urllib3-proxy-redirect"].editable
+    pool = "src/urllib3/connectionpool.py"
+    manager = "src/urllib3/poolmanager.py"
+    original = {
+        pool: "sha-original-pool",
+        manager: "sha-original-manager",
+        "qa_visible.py": "sha-test",
+    }
+    partially_fixed = {**original, pool: "sha-fixed-pool"}
+    assert bench.check_edits(original, partially_fixed, required) == (True, False)
+    both_fixed = {**partially_fixed, manager: "sha-fixed-manager"}
+    assert bench.check_edits(original, both_fixed, required) == (True, True)
+    altered_test = {**both_fixed, "qa_visible.py": "sha-altered-test"}
+    assert bench.check_edits(original, altered_test, required) == (False, True)
 
 
 def test_fetch_pinned_checks_out_only_exact_commit(

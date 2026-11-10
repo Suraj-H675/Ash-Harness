@@ -17,6 +17,7 @@ lifetime for the chosen trial. Model IDs are confirmed in the account catalog.
 |---|---|---|---|---|
 | `h11-chunk-footer` | [python-hyper/h11](https://github.com/python-hyper/h11) | `31e626c64e1e28db3cd73a6aa0ac057f1b915c18` | `dff7cc397a26ed4acdedd92d1bda6c8f18a6ed9f` | `h11/_readers.py` |
 | `urllib3-header-sanitization` | [urllib3/urllib3](https://github.com/urllib3/urllib3) | `8883fd900057ee65f553586389ecd70269f05e04` | `96449eb1ac8cfca8fb9605b8bbff7a5fe0081dd2` | `src/urllib3/connection.py` |
+| `urllib3-proxy-redirect` | [urllib3/urllib3](https://github.com/urllib3/urllib3) | `e349d97f2bf234b95d5dd9e689d056a521dfc3b0` | `01cd60b539f808a65e9c5aa93db1c48292432176` | `src/urllib3/connectionpool.py` and `src/urllib3/poolmanager.py` |
 
 Each original repository is fetched at the **exact pinned Git commit**, with
 no agent access to the later reference fix. Before inference, the benchmark
@@ -26,10 +27,15 @@ evaluation is scored**. These tasks ask the agent to reproduce behavior, not
 to copy a reference patch; alternative correct implementations can pass.
 
 The h11 test covers valid and invalid chunk footers, including fragmented
-input. The urllib3 test covers obsolete header folding, bare CR/LF, NUL and
-whitespace. Because urllib3 generates its `_version` module at installation,
-the evaluation scripts supply a noncredentialed runtime stub without changing
-the upstream checkout. The fixed oracles check behavior, not source text.
+input. The first urllib3 test covers obsolete header folding, bare CR/LF, NUL
+and whitespace. The second urllib3 test is a **two-production-module** proxy
+redirect regression: it checks same-origin Authorization/Cookie preservation,
+cross-origin sensitive-header removal, destination Host regeneration, and
+default versus nondefault port handling with deterministic recording proxy
+pools rather than live network connections. Because urllib3 generates its
+`_version` module at installation, the evaluation scripts supply a
+noncredentialed runtime stub without changing the upstream checkout.
+The fixed oracles check behavior, not source text.
 
 ## Example usage
 
@@ -64,8 +70,8 @@ The grader requires a successful one-shot CLI completion, required source
 edits, an executed authorized test, both external oracles passing, protected
 files unchanged, and verified session audit.
 
-Interpret each single trial narrowly. This first replay suite covers two
-real-world **single-module regression repairs**; it does not yet cover
-feature work, multi-module changes in an existing repository, language/build
-ecosystem diversity, interruption/resume, repeated reliability, or a fair
-same-model competitor baseline. Those remain open acceptance work.
+Interpret each trial narrowly. This replay suite contains two real-world
+**single-module regression repairs** and one **two-module regression repair**;
+it does not yet cover feature work, language/build ecosystem diversity,
+interruption/resume, repeated reliability, or a fair same-model competitor
+baseline. Those remain open acceptance work.

@@ -109,6 +109,20 @@ multi-module and feature/task-recovery gates, statistically useful repetitions,
 head-to-head leading-CLI comparison, and current public release remain open.
 **The “Ash is done” decision stays NOT YET ACCEPTED.**
 
+**Additional existing-repository evidence (2026-11-10):** A historical
+two-production-module `urllib3` proxy-redirect bug now also passed
+independent visible/hidden oracles after both `connectionpool.py` and
+`poolmanager.py` were edited through the real CLI. It took a 65,536-token
+request-context window and a 250,000-token total-turn budget (179,569
+prompt tokens across nine requests, 77.15 seconds total). Earlier separate
+trials failed at the artificially limited 32K context and 120K total budget,
+respectively, without violating permissions or falsely reporting success.
+See [budget-sensitive multi-module receipts](../benchmarks/REAL_REPOSITORY_BASELINE_2026-11-10.md).
+This is genuine progress on multi-module repair, **not** evidence of efficient
+context use or stable completion across repeated matched trials. Feature
+implementation, long-running recovery, larger navigation tasks, head-to-head
+comparison and public-release gates remain open.
+
 Reassess these gates from **current** source, supported-host runtime, and
 independent results. Explicitly state what remains open; do not repeat
 historical “parity closed” language as a fresh daily-driver endorsement.
