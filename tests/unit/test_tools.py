@@ -1952,6 +1952,43 @@ async def test_run_command_finishes_finite_verbose_test_before_reporting_success
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pty", [False, True])
+async def test_run_command_keeps_final_failure_summary_after_verbose_output(
+    guard: SafetyGuard, pty: bool
+) -> None:
+    script = (
+        "import sys,time;"
+        "sys.stdout.write('noise\\n'*20000);sys.stdout.flush();"
+        "time.sleep(.1);"
+        "sys.stdout.write("
+        "'FAILED tests/test_events.py::test_null - AssertionError\\n'"
+        "'1 failed, 2 passed in 0.12s\\n');"
+        "sys.stderr.write('src/parser.py:42:5: error: bad result\\n'"
+        "'token=supersecretvalue\\n');"
+        "sys.exit(1)"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+    result = await RunCommandTool(guard).run(
+        command_line=command, timeout_seconds=10, pty=pty
+    )
+
+    assert result.success is False
+    assert result.exit_code == 1
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert result.truncated is True
+    assert "Process output capture limit reached" in result.output
+    assert "FAILED tests/test_events.py::test_null" in result.output
+    assert "1 failed, 2 passed in 0.12s" in result.output
+    assert len(result.output) + len(result.error or "") <= 100_000
+    assert result.diagnostic_summary["pytest_failed"] == 1
+    assert result.diagnostic_summary["pytest_passed"] == 2
+    assert any(item["path"] == "src/parser.py" for item in result.diagnostics)
+    assert "supersecretvalue" not in result.model_dump_json()
+    assert "[REDACTED]" in result.model_dump_json()
+
+
+@pytest.mark.asyncio
 async def test_run_command_kills_runaway_output_before_continuing_side_effect(
     project_root: Path, guard: SafetyGuard, monkeypatch: pytest.MonkeyPatch
 ) -> None:

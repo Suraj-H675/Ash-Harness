@@ -57,6 +57,7 @@ MAX_COMMAND_TIMEOUT_SECONDS = 86_400
 MAX_COMMAND_INPUT_CHARS = 100_000
 MAX_COMMAND_CWD_CHARS = 4_096
 MAX_COMMAND_OUTPUT_CHARS = 100_000
+MAX_COMMAND_TAIL_CHARS = 12_000
 # Preserve a bounded live transcript while letting ordinary verbose test/build
 # commands finish. Truly runaway output still terminates the process tree.
 MAX_COMMAND_DRAIN_BYTES = 2_000_000
@@ -344,7 +345,7 @@ class RunCommandTool(BaseTool):
         streamer = _CommandEventStreamer(self.emit_event)
         try:
             if args.pty:
-                return await self._run_pty(
+                result = await self._run_pty(
                     ["/bin/sh", "-c", args.command_line],
                     args.timeout_seconds,
                     cwd,
@@ -355,10 +356,10 @@ class RunCommandTool(BaseTool):
                     stream_callback=streamer,
                     expected_cwd_identity=expected_cwd_identity,
                 )
-            if sandboxed:
+            elif sandboxed:
                 assert self.sandbox_manager is not None
                 argv = ["/bin/sh", "-c", args.command_line]
-                return await self._run_sandboxed(
+                result = await self._run_sandboxed(
                     argv,
                     args.timeout_seconds,
                     cwd,
@@ -370,18 +371,20 @@ class RunCommandTool(BaseTool):
                     expected_cwd_identity=expected_cwd_identity,
                 )
 
-            return await self._run_scoped(
-                args.command_line,
-                args.timeout_seconds,
-                cwd,
-                env=build_scrubbed_command_env(
-                    self.project_root, self.environment_allowlist
-                ),
-                stream_callback=streamer,
-                expected_cwd_identity=expected_cwd_identity,
-            )
+            else:
+                result = await self._run_scoped(
+                    args.command_line,
+                    args.timeout_seconds,
+                    cwd,
+                    env=build_scrubbed_command_env(
+                        self.project_root, self.environment_allowlist
+                    ),
+                    stream_callback=streamer,
+                    expected_cwd_identity=expected_cwd_identity,
+                )
         finally:
             streamer.finish()
+        return _preserve_command_tail(result, streamer)
 
     async def _run_pty(
         self,
@@ -896,6 +899,71 @@ def _truncate_command_output(
     )
 
 
+def _preserve_command_tail(
+    result: ToolResult, streamer: "_CommandEventStreamer"
+) -> ToolResult:
+    """Keep redacted terminal test diagnostics without expanding the text budget."""
+
+    if not result.truncated or result.outcome is ToolExecutionOutcome.UNKNOWN:
+        return result
+    recent_stdout = streamer.tail("stdout")
+    recent_stderr = streamer.tail("stderr")
+    original_output = result.output
+    original_error = result.error or ""
+    tail_stdout = recent_stdout if recent_stdout not in original_output else ""
+    tail_stderr = recent_stderr if recent_stderr not in original_error else ""
+    if not tail_stdout and not tail_stderr:
+        return result
+
+    notice = (
+        "\n[Warning: Process output capture limit reached; middle omitted; "
+        "final output follows]\n"
+    )
+    # Small capture budgets used by embedded hosts and tests must not be
+    # inflated by the retained tail or its explanation.
+    tail_budget = min(
+        MAX_COMMAND_TAIL_CHARS,
+        max(0, (MAX_COMMAND_OUTPUT_CHARS - 2 * len(notice)) // 2),
+    )
+    if tail_budget == 0:
+        return result
+    tail_stdout = tail_stdout[-tail_budget:]
+    tail_stderr = tail_stderr[-tail_budget:]
+    extra = sum(
+        len(notice) + len(tail)
+        for tail in (tail_stdout, tail_stderr)
+        if tail
+    )
+    remaining = max(0, MAX_COMMAND_OUTPUT_CHARS - extra)
+    # Favor a small early stderr excerpt while keeping the beginning of stdout
+    # (including any sandbox annotation) and the independently redacted tails.
+    initial_error = original_error[: min(len(original_error), remaining, 8_192)]
+    remaining -= len(initial_error)
+    initial_output = original_output[:remaining]
+    remaining -= len(initial_output)
+    if remaining:
+        initial_error += original_error[len(initial_error) : len(initial_error) + remaining]
+    output = initial_output + (notice + tail_stdout if tail_stdout else "")
+    error = initial_error + (notice + tail_stderr if tail_stderr else "")
+
+    recent_diagnostics = extract_diagnostics(recent_stdout, recent_stderr)
+    diagnostics = recent_diagnostics + [
+        item for item in result.diagnostics if item not in recent_diagnostics
+    ]
+    summary = dict(result.diagnostic_summary)
+    summary.update(extract_diagnostic_summary(recent_stdout, recent_stderr))
+    return ToolResult(
+        **{
+            **result.model_dump(),
+            "output": output,
+            "error": error or None,
+            "token_count": count_output_tokens(output),
+            "diagnostics": diagnostics[:MAX_DIAGNOSTIC_ITEMS],
+            "diagnostic_summary": summary,
+        }
+    )
+
+
 class _CommandEventStreamer:
     """Convert subprocess chunks into bounded, redacted typed events."""
 
@@ -903,6 +971,7 @@ class _CommandEventStreamer:
         self._emit = emit
         self._emitted_characters = 0
         self._truncated = False
+        self._tails = {"stdout": "", "stderr": ""}
         self._redactors = {
             "stdout": StreamingRedactor(),
             "stderr": StreamingRedactor(),
@@ -912,13 +981,21 @@ class _CommandEventStreamer:
         redactor = self._redactors[stream]
         delta = redactor.feed(text)
         if delta:
+            self._retain_tail(stream, delta)
             self._send(stream, delta)
 
     def finish(self) -> None:
         for stream, redactor in self._redactors.items():
             delta = redactor.finish()
             if delta:
+                self._retain_tail(stream, delta)
                 self._send(stream, delta)
+
+    def _retain_tail(self, stream: str, delta: str) -> None:
+        self._tails[stream] = (self._tails[stream] + delta)[-MAX_COMMAND_TAIL_CHARS:]
+
+    def tail(self, stream: str) -> str:
+        return self._tails[stream]
 
     def _send(self, stream: str, delta: str) -> None:
         if self._truncated:

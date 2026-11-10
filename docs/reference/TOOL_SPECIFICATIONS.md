@@ -236,6 +236,12 @@ values.
         when their output is truncated. Beyond that hard limit, Ash stops the
         managed process tree and conservatively reports an unknown outcome.
         The live output stream is separately capped at 100,000 characters.
+        When a command completes after its capture limit, the tool result
+        retains the redacted final output from stdout/stderr alongside a
+        shortened beginning, without exceeding the same 100,000-character
+        result budget. The tail can preserve final test failure summaries
+        and structured diagnostics that would otherwise be lost. Interrupted
+        commands do not present an incomplete tail as a completed result.
 
 Tool results report `success` separately from process output and include an
 `exit_code` when the process completed with a known status. Timeouts and other

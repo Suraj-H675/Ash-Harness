@@ -16,6 +16,168 @@ import pytest
 from ash.core.session import SessionStore
 
 
+def test_real_cli_replays_truncated_test_failure_tail_to_next_model_request(
+    tmp_path: Path,
+) -> None:
+    """A subsequent provider turn sees the final failure, not only initial noise."""
+
+    requests: list[dict[str, object]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+        def do_GET(self) -> None:
+            if self.path != "/api/v1/models":
+                self.send_error(404)
+                return
+            self._send_json({
+                "models": [{
+                    "key": "local-model",
+                    "type": "llm",
+                    "max_output_tokens": 512,
+                    "loaded_instances": [{"config": {"context_length": 65536}}],
+                    "capabilities": {"trained_for_tool_use": True, "vision": False},
+                }]
+            })
+
+        def _send_json(self, payload: object) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            if self.path != "/v1/chat/completions":
+                self.send_error(404)
+                return
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(request)
+            if len(requests) == 1:
+                delta: dict[str, object] = {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "verbose-test-call",
+                        "type": "function",
+                        "function": {
+                            "name": "run_command",
+                            "arguments": json.dumps({
+                                "command_line": "python3 -B verbose_suite.py",
+                                "timeout_seconds": 12,
+                            }),
+                        },
+                    }]
+                }
+                finish = "tool_calls"
+            else:
+                delta = {"content": "TAIL-CONFIRMED"}
+                finish = "stop"
+            chunks = [
+                {
+                    "id": "verbose-test",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "local-model",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                },
+                {
+                    "id": "verbose-test",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "local-model",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                },
+            ]
+            body = (
+                "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
+                + "data: [DONE]\n\n"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        workspace = tmp_path / "workspace"
+        home = tmp_path / "home"
+        workspace.mkdir()
+        home.mkdir()
+        (workspace / "verbose_suite.py").write_text(
+            "import sys\n"
+            "print('noise\\n' * 20000, end='', flush=True)\n"
+            "print('FAILED tests/test_events.py::test_null - AssertionError')\n"
+            "print('1 failed, 2 passed in 0.12s')\n"
+            "sys.exit(1)\n"
+        )
+        environment = {
+            "PATH": os.pathsep.join((str(Path(sys.executable).parent), os.defpath)),
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src"),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "NO_COLOR": "1",
+            "ASH_MODEL": "lmstudio/local-model",
+            "ASH_MAX_CONTEXT_TOKENS": "65536",
+            "LMSTUDIO_API_BASE": f"http://127.0.0.1:{server.server_port}/v1",
+            "ASH_ALLOW_UNSAFE_AUTO_APPROVE": "true",
+        }
+        _route_loopback_directly(environment)
+
+        trust = subprocess.run(
+            [sys.executable, "-m", "ash", "trust", "add", str(workspace)],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert trust.returncode == 0, trust.stderr
+        completed = subprocess.run(
+            [
+                sys.executable, "-m", "ash", "--db-directory", str(tmp_path / "db"),
+                "--mode", "auto_approve", "-p", "Run the test command.",
+                "--output-format", "json",
+            ],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        assert completed.returncode == 0, (
+            json.loads(completed.stdout.splitlines()[-1]).get("error"),
+            len(requests),
+            completed.stderr[-400:],
+        )
+        assert json.loads(completed.stdout)["response"] == "TAIL-CONFIRMED"
+        assert len(requests) == 2
+        tool_messages = [
+            item for item in requests[1]["messages"] if item.get("role") == "tool"
+        ]
+        assert len(tool_messages) == 1
+        replay = str(tool_messages[0]["content"])
+        assert "FAILED tests/test_events.py::test_null" in replay
+        assert "1 failed, 2 passed in 0.12s" in replay
+        assert "pytest_failed" in replay
+        store = SessionStore(tmp_path / "db" / "sessions.db")
+        sessions = store.list_sessions(project_path=str(workspace))
+        assert len(sessions) == 1
+        assert store.verify_audit_log(sessions[0].session_id) == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def _route_loopback_directly(environment: dict[str, str]) -> None:
     """Keep host proxy settings from intercepting the fake local provider."""
 
