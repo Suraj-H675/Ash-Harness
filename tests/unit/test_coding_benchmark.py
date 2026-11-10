@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -53,6 +54,221 @@ def _free_model_catalog() -> dict[str, object]:
             }
         ]
     }
+
+
+def _fake_chatgpt_account():
+    from ash.providers.openai_chatgpt_auth import (
+        CHATGPT_ISSUER,
+        CHATGPT_REQUIRED_PLAN_SCOPE,
+        ChatGPTAccount,
+    )
+
+    return ChatGPTAccount(
+        client_id="oaiapp_fixture",
+        subject="offline-fixture",
+        email="fixture@example.invalid",
+        issuer=CHATGPT_ISSUER,
+        ext_agent_host_id="urn:uuid:00000000-0000-4000-8000-000000000001",
+        id_token="FAKE-IDENTITY-CREDENTIAL",
+        access_token="FAKE-ACCESS-CREDENTIAL",
+        refresh_token="FAKE-REFRESH-CREDENTIAL",
+        token_type="Bearer",
+        scopes=(CHATGPT_REQUIRED_PLAN_SCOPE,),
+        expires_at=time.time() + 3_600,
+        earliest_refresh_at=0.0,
+        saved_at=time.time(),
+    )
+
+
+def test_chatgpt_access_only_staging_excludes_other_credentials(
+    tmp_path: Path,
+) -> None:
+    from ash.providers.openai_chatgpt_auth import ChatGPTCredentialStore
+
+    original = _fake_chatgpt_account()
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    _benchmark._stage_chatgpt_access_only(home, original, timeout=120)
+    staged = ChatGPTCredentialStore(directory=home / ".ash" / "openai-chatgpt").active()
+    assert staged is not None
+    assert staged.access_token == original.access_token
+    assert staged.id_token == staged.refresh_token == staged.email == ""
+    assert staged.access_usable()
+    record = (home / ".ash/openai-chatgpt/accounts.json").read_bytes()
+    assert b"FAKE-ACCESS-CREDENTIAL" in record
+    assert b"FAKE-REFRESH-CREDENTIAL" not in record
+    assert b"FAKE-IDENTITY-CREDENTIAL" not in record
+    assert b"fixture@example.invalid" not in record
+
+
+def test_chatgpt_trial_keeps_credentials_out_of_evidence_and_process_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = _fake_chatgpt_account()
+    memory_root = tmp_path / "memory-root"
+    memory_root.mkdir()
+    monkeypatch.setattr(_benchmark, "_chatgpt_tmpfs_root", lambda: memory_root)
+
+    def no_model_setup(
+        argv: list[str], *, env: dict[str, str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        assert "FAKE-ACCESS-CREDENTIAL" not in repr(argv)
+        assert "FAKE-ACCESS-CREDENTIAL" not in repr(env)
+        assert "OPENROUTER_API_KEY" not in env
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def inspect_launch(argv: list[str], **kwargs: object) -> None:
+        from ash.providers.openai_chatgpt_auth import ChatGPTCredentialStore
+
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        home = Path(env["HOME"])
+        assert home.parent == memory_root
+        assert env["ASH_MODEL"] == "openai/gpt-6-luna"
+        assert env["ASH_OPENAI_AUTH_MODE"] == "chatgpt"
+        assert env["ASH_MAX_TURN_ITERATIONS"] == str(_benchmark.CHATGPT_TURN_ITERATIONS)
+        assert not any("CREDENTIAL" in str(value) for value in env.values())
+        assert not any("CREDENTIAL" in str(value) for value in argv)
+        assert (
+            ChatGPTCredentialStore(directory=home / ".ash" / "openai-chatgpt")
+            .active()
+            .access_token
+            == account.access_token
+        )
+        raise RuntimeError("captured temporary ChatGPT model invocation")
+
+    monkeypatch.setattr(_benchmark, "command", no_model_setup)
+    monkeypatch.setattr(_benchmark.subprocess, "Popen", inspect_launch)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    with pytest.raises(RuntimeError, match="captured temporary"):
+        _benchmark.run_trial(
+            "two-file",
+            evidence,
+            "https://chatgpt.com/backend-api/codex",
+            120,
+            None,
+            chatgpt_model_id="gpt-6-luna",
+            chatgpt_account=account,
+        )
+    assert not list(memory_root.iterdir())
+    assert all(
+        b"FAKE-ACCESS-CREDENTIAL" not in file.read_bytes()
+        for file in evidence.rglob("*")
+        if file.is_file()
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra_arguments", "reason"),
+    [
+        (["--chatgpt-model", "!!"], "model ID is invalid"),
+        (
+            ["--chatgpt-model", "gpt-6-luna", "--endpoint", "http://127.0.0.1:9999"],
+            "cannot use --endpoint",
+        ),
+        (
+            [
+                "--chatgpt-model",
+                "gpt-6-luna",
+                "--openrouter-free-model",
+                "cohere/north-mini-code:free",
+            ],
+            "not both",
+        ),
+        (
+            ["--chatgpt-model", "gpt-6-luna", "--repeat", "3"],
+            "1-2 explicitly selected trials",
+        ),
+    ],
+)
+def test_chatgpt_cli_invalid_requests_fail_before_auth_or_evidence(
+    tmp_path: Path, extra_arguments: list[str], reason: str
+) -> None:
+    evidence = tmp_path / "no-evidence"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_benchmark_path),
+            "--evidence-dir",
+            str(evidence),
+            "--task",
+            "two-file",
+            *extra_arguments,
+        ],
+        cwd=_benchmark.REPO,
+        env={"PATH": os.defpath, "PYTHONPATH": str(_benchmark.REPO / "src")},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 2
+    assert reason in result.stderr
+    assert not evidence.exists()
+
+
+def test_chatgpt_cli_preflight_uses_eligible_catalog_and_auth_without_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import ash.commands.chatgpt_auth as chatgpt_commands
+
+    account = _fake_chatgpt_account()
+    evidence = tmp_path / "evidence"
+
+    class FakeStore:
+        def active(self):
+            return account
+
+    async def catalog():
+        return (("gpt-6-luna", "Luna"),)
+
+    def git_stub(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[:2] == ["git", "rev-parse"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="test-head\n")
+        if argv[:2] == ["git", "diff"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="")
+        raise AssertionError("Unexpected setup command")
+
+    def trial_stub(*args: object, **kwargs: object) -> dict[str, object]:
+        assert kwargs["chatgpt_model_id"] == "gpt-6-luna"
+        assert kwargs["chatgpt_account"] is account
+        assert kwargs["completion_tokens"] == 4_096
+        assert kwargs["remote_api_key"] is None
+        assert kwargs["remote_model_id"] is None
+        return {
+            "task": "two-file",
+            "passed": True,
+            "task_correct": True,
+            "required_tools_succeeded": True,
+            "elapsed_seconds": 0.02,
+        }
+
+    monkeypatch.setattr(_benchmark, "ChatGPTCredentialStore", FakeStore)
+    monkeypatch.setattr(
+        _benchmark, "_chatgpt_tmpfs_root", lambda: tmp_path / "fake-memory"
+    )
+    monkeypatch.setattr(chatgpt_commands, "list_chatgpt_models", catalog)
+    monkeypatch.setattr(_benchmark.shutil, "which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(_benchmark, "command", git_stub)
+    monkeypatch.setattr(_benchmark, "run_trial", trial_stub)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "coding_benchmark.py",
+            "--evidence-dir",
+            str(evidence),
+            "--chatgpt-model",
+            "gpt-6-luna",
+            "--task",
+            "two-file",
+        ],
+    )
+    assert _benchmark.main() == 0
+    result = (evidence / "summary.json").read_text()
+    assert json.loads(result)["provider_model"] == "openai/gpt-6-luna"
+    assert "FAKE-ACCESS-CREDENTIAL" not in result + capsys.readouterr().out
 
 
 def test_free_openrouter_catalog_accepts_only_an_exact_zero_cost_tool_model() -> None:

@@ -7,6 +7,7 @@ quality. Each trial receives fresh Ash state and a disposable workspace.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -18,6 +19,8 @@ import sys
 import tempfile
 import time
 import urllib.request
+from contextlib import ExitStack
+from dataclasses import replace
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -26,6 +29,7 @@ from urllib.parse import urlsplit
 
 from ash.core.activity import EDIT_TOOL_NAMES, summarize_operational_events
 from ash.core.session import SessionStore
+from ash.providers.openai_chatgpt_auth import ChatGPTAccount, ChatGPTCredentialStore
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -206,6 +210,7 @@ MAX_EVAL_CONTEXT_TOKENS = 16_384
 MAX_REMOTE_CONTEXT_TOKENS = 65_536
 MAX_REMOTE_TRIALS = 2
 REMOTE_TURN_ITERATIONS = 16
+CHATGPT_TURN_ITERATIONS = 24
 OPENROUTER_CATALOG_URL = "https://openrouter.ai/api/v1/models"
 FREE_MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*:free\Z")
 
@@ -214,6 +219,36 @@ def validate_free_openrouter_model(model_id: str) -> str:
     if not FREE_MODEL_ID.fullmatch(model_id):
         raise ValueError("OpenRouter evaluation requires an exact vendor/model:free ID")
     return model_id
+
+
+def _chatgpt_tmpfs_root() -> Path:
+    """Require an actual Linux tmpfs so trial credentials never touch disk."""
+    mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    if not any(
+        entry.split(" - ", 1)[-1].startswith("tmpfs ")
+        and entry.split(" ")[4] == "/dev/shm"
+        for entry in mountinfo.splitlines()
+        if " - " in entry and len(entry.split(" ")) > 4
+    ):
+        raise ValueError("ChatGPT benchmark requires a memory-backed /dev/shm mount")
+    root = Path("/dev/shm")
+    if not root.is_dir():
+        raise ValueError("ChatGPT benchmark requires /dev/shm")
+    return root
+
+
+def _stage_chatgpt_access_only(
+    home: Path, account: ChatGPTAccount, *, timeout: int
+) -> None:
+    """Stage a short-lived access credential, not refresh/identity tokens."""
+    if not account.access_usable(now=time.time() + timeout + 30):
+        raise ValueError(
+            "ChatGPT access token must remain valid through the trial; "
+            "refresh the source registration before running a benchmark"
+        )
+    staged = replace(account, id_token="", refresh_token="", email="")
+    (home / ".ash").mkdir(mode=0o700, exist_ok=True)
+    ChatGPTCredentialStore(directory=home / ".ash" / "openai-chatgpt").save(staged)
 
 
 def validate_free_openrouter_catalog(
@@ -553,6 +588,8 @@ def run_trial(
     remote_model_id: str | None = None,
     remote_api_key: str | None = None,
     completion_tokens: int = 384,
+    chatgpt_model_id: str | None = None,
+    chatgpt_account: ChatGPTAccount | None = None,
 ) -> dict[str, Any]:
     task = TASKS[task_name]
     trial_dir = evidence / (
@@ -568,28 +605,48 @@ def run_trial(
         "context_tokens": context_tokens,
         "completion_tokens": completion_tokens,
         "provider_model": (
-            f"openrouter/{remote_model_id}" if remote_model_id else "eval/local-model"
+            f"openai/{chatgpt_model_id}"
+            if chatgpt_model_id
+            else f"openrouter/{remote_model_id}"
+            if remote_model_id
+            else "eval/local-model"
         ),
     }
+    if chatgpt_model_id and (remote_model_id or not chatgpt_account):
+        raise ValueError("ChatGPT evaluation requires only an authorized plan account")
     if remote_model_id:
         validate_free_openrouter_model(remote_model_id)
         if not remote_api_key:
             raise ValueError("OpenRouter free evaluation requires an API key")
-    with tempfile.TemporaryDirectory(prefix="trial-", dir=trial_dir) as scratch_name:
+    with (
+        tempfile.TemporaryDirectory(prefix="trial-", dir=trial_dir) as scratch_name,
+        ExitStack() as private_home,
+    ):
         scratch = Path(scratch_name)
         workspace, home, db, tmp = [
             scratch / name for name in ("workspace", "home", "db", "tmp")
         ]
+        if chatgpt_model_id:
+            home = Path(
+                private_home.enter_context(
+                    tempfile.TemporaryDirectory(
+                        prefix="ash-chatgpt-benchmark-", dir=_chatgpt_tmpfs_root()
+                    )
+                )
+            )
         for path in (workspace, home, db, tmp):
-            path.mkdir()
+            path.mkdir(exist_ok=True)
         (workspace / "keep.txt").write_bytes(PRESERVED)
         for name, content in task.initial_files.items():
             target = workspace / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
         (home / ".ash").mkdir()
+        if chatgpt_model_id:
+            assert chatgpt_account is not None
+            _stage_chatgpt_access_only(home, chatgpt_account, timeout=timeout)
         config = 'sandbox_backend = "native"\n'
-        if not remote_model_id:
+        if not remote_model_id and not chatgpt_model_id:
             config += (
                 "[custom_providers.eval]\n"
                 f'base_url = "{endpoint}/v1"\n'
@@ -618,7 +675,9 @@ def run_trial(
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
             "ASH_MODEL": (
-                f"openrouter/{remote_model_id}"
+                f"openai/{chatgpt_model_id}"
+                if chatgpt_model_id
+                else f"openrouter/{remote_model_id}"
                 if remote_model_id
                 else "eval/local-model"
             ),
@@ -626,6 +685,9 @@ def run_trial(
             "ASH_MAX_COMPLETION_TOKENS": str(completion_tokens),
             "ASH_MAX_TURN_TOTAL_TOKENS": str(turn_token_budget),
         }
+        if chatgpt_model_id:
+            env["ASH_OPENAI_AUTH_MODE"] = "chatgpt"
+            env["ASH_MAX_TURN_ITERATIONS"] = str(CHATGPT_TURN_ITERATIONS)
         if remote_model_id:
             # A bounded fraction of the free tier's daily request quota;
             # provider retries are additional, so keep trial count low too.
@@ -831,6 +893,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--chatgpt-model",
+        metavar="MODEL",
+        help=(
+            "Explicit opt-in: evaluate a currently available ChatGPT-plan model "
+            "using access-only credentials in private tmpfs"
+        ),
+    )
+    parser.add_argument(
         "--model-file", type=Path, help="Optional local GGUF to hash as run provenance"
     )
     parser.add_argument("--timeout", type=int, default=285)
@@ -874,10 +944,11 @@ def main() -> int:
         parser.error("duplicate --task selection; use --repeat for independent trials")
     if not (20 <= args.timeout <= 300):
         parser.error("--timeout must be between 20 and 300 seconds")
+    if args.openrouter_free_model and args.chatgpt_model:
+        parser.error("select either a free OpenRouter model or ChatGPT, not both")
+    remote_route = bool(args.openrouter_free_model or args.chatgpt_model)
     maximum_context = (
-        MAX_REMOTE_CONTEXT_TOKENS
-        if args.openrouter_free_model
-        else MAX_EVAL_CONTEXT_TOKENS
+        MAX_REMOTE_CONTEXT_TOKENS if remote_route else MAX_EVAL_CONTEXT_TOKENS
     )
     if not (4_096 <= args.context_tokens <= maximum_context):
         parser.error(f"--context-tokens must be between 4096 and {maximum_context}")
@@ -890,11 +961,19 @@ def main() -> int:
     completion_tokens = (
         args.completion_tokens
         if args.completion_tokens is not None
-        else (4_096 if args.openrouter_free_model else 384)
+        else (4_096 if remote_route else 384)
     )
     if not (128 <= completion_tokens <= 16_384):
         parser.error("--completion-tokens must be between 128 and 16384")
     remote_key: str | None = None
+    chatgpt_account: ChatGPTAccount | None = None
+    if args.chatgpt_model:
+        if args.endpoint or args.model_file:
+            parser.error("ChatGPT evaluation cannot use --endpoint or --model-file")
+        if not args.task or len(args.task) * args.repeat > MAX_REMOTE_TRIALS:
+            parser.error("ChatGPT evaluation requires 1-2 explicitly selected trials")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.chatgpt_model):
+            parser.error("ChatGPT model ID is invalid")
     if args.openrouter_free_model:
         if args.endpoint or args.model_file:
             parser.error("remote free evaluation cannot use --endpoint or --model-file")
@@ -916,6 +995,30 @@ def main() -> int:
         parser.error(f"repository virtual environment missing: {PYTHON}")
     if not shutil.which("bwrap"):
         parser.error("Bubblewrap is required to safely execute model-written code")
+    if args.chatgpt_model:
+        try:
+            _chatgpt_tmpfs_root()
+            account = ChatGPTCredentialStore().active()
+            if account is None or not account.access_usable(
+                now=time.time() + args.timeout + 30
+            ):
+                raise ValueError(
+                    "active ChatGPT access token cannot cover the trial; "
+                    "renew authorization first"
+                )
+            from ash.commands.chatgpt_auth import list_chatgpt_models
+
+            available_models = {slug for slug, _ in asyncio.run(list_chatgpt_models())}
+            if args.chatgpt_model not in available_models:
+                raise ValueError("ChatGPT model is not in the authorized catalog")
+            chatgpt_account = account
+        except ValueError as exc:
+            parser.error(f"ChatGPT benchmark preflight refused: {exc}")
+        except Exception as exc:
+            # Auth and network errors must not spill credentials into CLI logs.
+            parser.error(
+                "ChatGPT benchmark preflight unavailable: " + type(exc).__name__
+            )
     if args.openrouter_free_model:
         try:
             # Public catalog check is unauthenticated. Never send the key
@@ -935,28 +1038,37 @@ def main() -> int:
         advertised_models = [args.openrouter_free_model]
     else:
         endpoint = args.endpoint or "http://127.0.0.1:18105"
-        address = urlsplit(endpoint)
-        if (
-            address.scheme != "http"
-            or address.hostname != "127.0.0.1"
-            or not address.port
-            or address.username
-            or address.password
-            or address.path
-            or address.query
-            or address.fragment
-        ):
-            parser.error("--endpoint must use a local 127.0.0.1 model server")
-        try:
-            with urllib.request.urlopen(endpoint + "/health", timeout=5) as response:
-                if response.status != 200:
-                    raise ValueError(f"model server returned {response.status}")
-            with urllib.request.urlopen(endpoint + "/v1/models", timeout=5) as response:
-                advertised_models = [
-                    str(entry.get("id", "")) for entry in json.load(response)["data"]
-                ]
-        except (OSError, ValueError) as error:
-            parser.error(f"local model server not ready: {error}")
+        if args.chatgpt_model:
+            endpoint = "https://chatgpt.com/backend-api/codex"
+            advertised_models = [args.chatgpt_model]
+        else:
+            address = urlsplit(endpoint)
+            if (
+                address.scheme != "http"
+                or address.hostname != "127.0.0.1"
+                or not address.port
+                or address.username
+                or address.password
+                or address.path
+                or address.query
+                or address.fragment
+            ):
+                parser.error("--endpoint must use a local 127.0.0.1 model server")
+            try:
+                with urllib.request.urlopen(
+                    endpoint + "/health", timeout=5
+                ) as response:
+                    if response.status != 200:
+                        raise ValueError(f"model server returned {response.status}")
+                with urllib.request.urlopen(
+                    endpoint + "/v1/models", timeout=5
+                ) as response:
+                    advertised_models = [
+                        str(entry.get("id", ""))
+                        for entry in json.load(response)["data"]
+                    ]
+            except (OSError, ValueError) as error:
+                parser.error(f"local model server not ready: {error}")
     model_hash = None
     if args.model_file:
         digest = hashlib.sha256()
@@ -995,6 +1107,14 @@ def main() -> int:
                 remote_model_id=args.openrouter_free_model,
                 remote_api_key=remote_key,
                 completion_tokens=completion_tokens,
+                **(
+                    {
+                        "chatgpt_model_id": args.chatgpt_model,
+                        "chatgpt_account": chatgpt_account,
+                    }
+                    if args.chatgpt_model
+                    else {}
+                ),
             )
             results.append(result)
             print(
@@ -1017,7 +1137,9 @@ def main() -> int:
         "python": str(PYTHON),
         "endpoint": endpoint,
         "provider_model": (
-            f"openrouter/{args.openrouter_free_model}"
+            f"openai/{args.chatgpt_model}"
+            if args.chatgpt_model
+            else f"openrouter/{args.openrouter_free_model}"
             if args.openrouter_free_model
             else "eval/local-model"
         ),

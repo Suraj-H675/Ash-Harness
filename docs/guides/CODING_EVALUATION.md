@@ -1,10 +1,10 @@
-# Coding-task evaluation (local or explicit free remote model)
+# Coding-task evaluation (local, free remote, or authorized ChatGPT plan)
 
 `devtools/coding_benchmark.py` is a small, repeatable real-model evaluation of
 Ash's **actual one-shot CLI**, not a mocked provider test. It uses a local
-loopback model by default; a separate, explicitly opted-in zero-cost OpenRouter
-model route exists for stronger-model investigations. It creates a separate
-home, Ash database, and workspace for each task, checks the resulting files with
+loopback model by default; explicitly opted-in zero-cost OpenRouter and
+authorized ChatGPT-plan routes exist for stronger-model investigations. It
+creates a separate home, Ash database, and workspace for each task, checks the resulting files with
 an independent oracle, reads the persisted tool/audit record, and removes the
 temporary workspace. Its evidence directory retains task results, model output,
 tool-call summaries, and the source revision.
@@ -39,6 +39,15 @@ before claiming an improvement in completion rate or latency.
   first and rejects unknown IDs, non-`:free` IDs, listed nonzero or conditional
   pricing, missing native-tool support, and insufficient context. Failed
   preflight means no coding inference is sent.
+- For the **opt-in ChatGPT plan path**: an already-authorized
+  `ash auth chatgpt status` registration, with an access token valid long
+  enough to cover the trial, and an available model listed by
+  `ash auth chatgpt models`. Linux `/dev/shm` must be mounted as `tmpfs`.
+  The benchmark reads the existing registration without changing it, stages
+  **only an access token** (not refresh or identity tokens) in a private,
+  memory-backed disposable Ash home, and destroys that home after the trial.
+  This avoids recording credentials in the benchmark evidence or normal Ash
+  configuration; an expired access token must be refreshed separately.
 
 For example, start a locally installed llama.cpp server on a free loopback port
 (in a separate terminal). Replace the paths with your own *authorized local*
@@ -78,15 +87,34 @@ rate limits can be stricter. Remote inference sends only synthetic benchmark
 prompts and code to the selected model provider; review its data policies.
 The runner never silently substitutes a paid model or a different free model.
 
+For an already authorized ChatGPT plan, select a model that is currently
+available in your account:
+
+```sh
+PYTHONPATH=src .venv/bin/python devtools/coding_benchmark.py \
+  --chatgpt-model gpt-6-luna --task two-file \
+  --context-tokens 32768 --turn-token-budget 120000 \
+  --timeout 210 --evidence-dir /var/tmp/ash-chatgpt-trial-001
+```
+
+This exercises Ash's ChatGPT-plan Responses provider, **not** the separate
+OpenAI API-key route. It permits up to 24 model-request cycles per trial and
+at most two selected trials per invocation. The plan provider currently
+ignores the provider-neutral per-request `max_completion_tokens` setting, so
+the recorded completion-token cap is **not enforced** on this route. Do not
+compare token budgets or model-provider timings as if this setting were
+identical across local, OpenRouter, and ChatGPT models. The trial does not
+alter the user's normal Ash trust, permissions, or session database.
+
 Use a **new evidence path** for every invocation. `--task marker`,
 `--task build-run`, `--task repair-test`, `--task multi-file`,
 `--task two-file`, or `--task event-log` can select a single case, and
 `--task` can be repeated to
 select cases. In local mode, `--repeat 3` uses three isolated Ash workspaces
 and sessions per case. Those trials **share the model server and any of its
-prompt/KV caches**; they are not independent inference environments. Remote
-mode allows at most two selected trials per invocation to reduce free-quota
-consumption. A before/after comparison should use equivalent selected models,
+prompt/KV caches**; they are not independent inference environments. Free
+remote and ChatGPT-plan modes allow at most two selected trials per invocation
+to bound model usage. A before/after comparison should use equivalent selected models,
 model-serving conditions, sampling, context, and output budgets, and balance
 task order before interpreting small latency differences.
 The benchmark deliberately limits cumulative input plus output to **40,000
@@ -116,8 +144,9 @@ workflow coverage without implying real-world or multi-language success.
 The default local mode never launches cloud inference. Opt-in free remote mode
 uses a named OpenRouter model, verified public pricing, and the key provided
 only through the isolated child environment; it does not write that key to
-configuration, command arguments, or benchmark metadata. Neither mode touches
-the user's live Ash profile or executes code in the project being developed.
+configuration, command arguments, or benchmark metadata. ChatGPT-plan mode
+uses a short-lived access-only credential in private tmpfs. None of the modes
+modify the user's live Ash profile or execute code in the project being developed.
 The code tasks execute in `auto_edit` mode with no general command approval;
 only the exact
 fixture test command is granted when needed. Ash's own command sandbox is

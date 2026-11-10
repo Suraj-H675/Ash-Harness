@@ -354,3 +354,57 @@ status in text, JSON, and streaming JSON. One-shot CLI exit status now reports
 failure for iteration exhaustion, turn-token exhaustion, and circuit-breaker
 stops, while preserving the terminal event, saved session, and audit.
 This improves **completion signaling**, not model quality or coding-task success.
+
+## First ChatGPT subscription coding baseline (2026-11-10)
+
+An explicit GPT-6 Luna subscription evaluation ran through Ash's **real
+one-shot CLI** on unchanged synthetic fixture tasks, with isolated workspace,
+permissions, database, and a private access-only credential staged in Linux
+tmpfs. The authenticated model was confirmed in the active account's catalog.
+Neither the user's regular Ash profile nor the repository under development
+was used as a trial workspace.
+
+Both trials used Ash runtime HEAD `60ace10`, a 32,768-token per-request
+context cap, a 120,000-token turn budget, and a 24-iteration maximum.
+The nominal 4,096-token completion cap is **not enforced** by the current
+ChatGPT-plan adapter, so output-budget parity is unproven.
+
+| Task | Independent score | Model/CLI behavior | Total time |
+|---|---|---|---:|
+| `two-file` | **Pass (1/1)** | Two source files changed; visible and hidden oracles passed; all 9 tool calls succeeded; audit valid; 5 model requests, 13,778 prompt and 529 completion tokens | 45.96 s |
+| `event-log` | **Fail / transport interruption** | Inspected all three modules, changed parser, then three consecutive transient provider request failures led to `turn.error`. No completion claim, visible or hidden oracle pass, or authorized test execution. Audit and protected files remained valid; 6 provider attempts, 8,172 prompt and 462 completion tokens | 65.83 s |
+
+For `two-file` the actual CLI returned exit 0, all required tools succeeded,
+the independently graded hidden oracle passed, and no out-of-scope tool calls
+were issued. For `event-log`, the terminal error was an OpenAI ChatGPT
+Responses connection failure after request timeouts (the provider retried
+before output); it is **not** evidence of the model's ability or inability to
+complete this more complex repair.
+
+Private receipts are under
+`/var/tmp/ash-chatgpt-luna-two-file-20261110/` and
+`/var/tmp/ash-chatgpt-luna-event-log-20261110/`. Both disposable credential
+homes and trial workspaces were deleted; evidence checks confirmed no
+credential file was retained. This is an initial strong-model integration
+proof, not an existing-repository benchmark, a statistically meaningful
+completion-rate estimate, or a fair baseline against Codex/Claude Code.
+
+### Independent stronger-model retry of the three-module task
+
+A separate trial used **GPT-6.1 Sol**, also verified in the authenticated
+ChatGPT-plan model catalog, on the *same* `event-log` fixture and budgets.
+It **passed** in 67.28s (65.91s CLI): all three source files changed, the
+exact authorized test command completed successfully, both visible and hidden
+oracles passed, the audit verified, and protected files stayed unchanged.
+Nine model requests consumed 38,144 prompt and 1,128 completion tokens.
+One `replace_file_content` invocation failed against stale text, then the
+model reread the file, repaired successfully, and ran the test. There were
+no out-of-scope tool calls. The disposable credentials and workspace were
+removed after grading. Private evidence:
+`/var/tmp/ash-chatgpt-sol-event-log-20261110/`.
+
+This establishes that Ash's authenticated ChatGPT route can finish this
+three-module coding journey with a stronger model. It does **not** retroactively
+convert the GPT-6 Luna transport failure into a model-quality failure,
+establish comparative model superiority, or meet the existing-repository
+competitive daily-driver acceptance gate.
