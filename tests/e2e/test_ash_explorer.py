@@ -964,8 +964,10 @@ def _replay_with_step_deadlines(
     environment: dict[str, str],
     observations: int,
     step_timeout: float = 55,
+    startup_timeout: float = 30,
+    cleanup_timeout: float = 30,
 ) -> list[dict[str, object]]:
-    """Bound progress per replay step, not all Ash subprocesses together."""
+    """Bound startup, each replay step, and cleanup independently."""
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -1001,10 +1003,13 @@ def _replay_with_step_deadlines(
             *("observation" for _ in range(observations)),
             "finished",
         ):
+            timeout = {
+                "started": startup_timeout,
+                "observation": step_timeout,
+                "finished": cleanup_timeout,
+            }[expected]
             try:
-                line = lines.get(
-                    timeout=step_timeout if expected == "observation" else 10
-                )
+                line = lines.get(timeout=timeout)
             except queue.Empty:
                 pytest.fail(
                     f"Explorer replay stalled before {expected} "
@@ -1047,6 +1052,45 @@ def test_replay_progress_deadlines_allow_multiple_slow_steps(tmp_path: Path) -> 
         "observation",
         "finished",
     ]
+
+
+def test_replay_progress_deadlines_allow_slow_startup_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    code = (
+        "import json,time\n"
+        "time.sleep(0.2)\n"
+        "print(json.dumps({'type':'started'}), flush=True)\n"
+        "print(json.dumps({'type':'observation'}), flush=True)\n"
+        "time.sleep(0.2)\n"
+        "print(json.dumps({'type':'finished'}), flush=True)\n"
+    )
+    events = _replay_with_step_deadlines(
+        [sys.executable, "-u", "-c", code],
+        cwd=tmp_path,
+        environment=os.environ.copy(),
+        observations=1,
+        step_timeout=0.1,
+        startup_timeout=0.5,
+        cleanup_timeout=0.5,
+    )
+    assert [event["type"] for event in events] == [
+        "started",
+        "observation",
+        "finished",
+    ]
+
+
+def test_replay_progress_deadlines_stop_stalled_startup(tmp_path: Path) -> None:
+    code = "import time; time.sleep(5)"
+    with pytest.raises(pytest.fail.Exception, match="stalled before started"):
+        _replay_with_step_deadlines(
+            [sys.executable, "-u", "-c", code],
+            cwd=tmp_path,
+            environment=os.environ.copy(),
+            observations=1,
+            startup_timeout=0.1,
+        )
 
 
 def test_replay_progress_deadlines_stop_stalled_child(tmp_path: Path) -> None:
