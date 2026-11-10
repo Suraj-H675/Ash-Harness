@@ -26,12 +26,17 @@ class TextArgs(BaseModel):
     text: str = Field(..., description="Database query text.")
 
 
-def test_small_context_keeps_discovery_and_verification() -> None:
+@pytest.mark.parametrize("extra_path_chars", [0, 240])
+def test_small_context_keeps_discovery_and_verification(
+    extra_path_chars: int,
+) -> None:
     # Reproduce the CI macOS provider's 501-token core-system allocation.
     workspace = Path(
         "/private/var/folders/ab/abcdefghijklmnopqrstuvwx/T/pytest-of-runner/"
         "pytest-0/test_default_runtime_discovers2"
     )
+    if extra_path_chars:
+        workspace /= "nested-" + "x" * extra_path_chars
     prompt = _default_system_prompt(workspace, native_tools=True, search_tools=True)
     fitted = ContextBudgetAllocator(
         max_context_tokens=4_096, completion_reserve=1_024
