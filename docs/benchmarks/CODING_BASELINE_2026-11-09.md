@@ -213,3 +213,41 @@ success, rather than evidence that the guidance made the model faster or worse.
 The local evidence path is
 `/var/tmp/ash-coding-eval-20261109/gpu-event-log-command-guidance-v1/`.
 The model server was stopped after evaluation.
+
+## Follow-up: complete tools, incomplete specification (2026-11-10)
+
+One additional **unmodified-current-runtime** `event-log` CLI trial ran on
+`e14495c` with the same Qwen3.5-4B Q4_K_M GGUF, llama.cpp b12223 Vulkan
+server, 80,000 cumulative turn-token budget, and 16,384-token request context.
+It completed in **58.95s**, using **10 model requests**, 72,329 estimated
+prompt tokens, and 1,915 estimated completion tokens. All six initial source
+reads succeeded with project-relative paths, and there were **zero
+out-of-scope path calls**. It changed all three required modules, preserved
+all protected files, and passed the audit-integrity check. Its first test run
+failed; after a further edit, the exact authorized
+`python3 -B test_eventlog.py` command ran successfully. The CLI turn ended
+normally with `stop_reason=completed` (not a context, token, or iteration
+limit); the final model message asserted that all three modules were fixed.
+
+**The externally graded task nevertheless failed.** The visible oracle passed,
+but the hidden oracle failed when given JSON arrays: the resulting parser used
+`if event and event.get('request_id')`, so a nonempty array raised
+`AttributeError` rather than being ignored as the README required. The task's
+explicit requirement to ignore non-object JSON was missed. A deterministic
+regression now verifies that this near-correct, visible-test-passing parser
+remains rejected by the hidden oracle. The saved evidence is private under
+`/var/tmp/ash-coding-eval-20261110/gpu-event-log-current-main/`, and the
+locally owned model server was shut down after the run.
+
+This establishes a useful distinction: **path discovery, authorized command
+execution, editing, and durable audit can all work while the model still misses
+specified edge cases**. It does not demonstrate a general coding success-rate
+improvement over earlier trials or prove a new Ash runtime defect. The
+`e14495c` directory-scoped discovery change was not actually exercised by this
+root-file-reading task, so it cannot be credited for the outcome. Ash already
+instructs the model to inspect requirements and edge cases beyond passing
+tests, and the session/activity APIs expose executed command outcomes. Do not
+raise production iteration limits, add redundant completion gates, or make the
+benchmark easier based on one 4B-model failure. A stronger-model or broader
+multi-task comparison is required to justify runtime changes aimed at this
+semantic completion gap.

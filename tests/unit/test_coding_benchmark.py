@@ -545,6 +545,24 @@ def test_event_log_oracle_rejects_partial_repairs_and_accepts_three_module_fix(
     assert grade("event-log", workspace)["correct"] is False
     parser.write_bytes(correct_parser)
 
+    # The real Qwen3.5-4B trial on 2026-11-10 fixed malformed JSON and null
+    # values, but incorrectly assumed every other JSON value was an object.
+    # Passing the visible test must not certify that near-correct repair.
+    parser.write_bytes(
+        correct_parser.replace(
+            b"if (isinstance(event, dict) and "
+            b"isinstance(event.get('request_id'), str) "
+            b"and event['request_id']):",
+            b"if event and event.get('request_id'):",
+        )
+    )
+    assert oracle_python(workspace, "test_eventlog.py").returncode == 0
+    partial = grade("event-log", workspace)
+    assert partial["visible_oracle_exit"] == 0
+    assert partial["hidden_oracle_exit"] != 0
+    assert partial["correct"] is False
+    parser.write_bytes(correct_parser)
+
     # The external hidden oracle is not a substitute for the protected-file
     # contract: changing tests must still invalidate the scored workspace.
     (workspace / "test_eventlog.py").write_bytes(b"pass\n")
