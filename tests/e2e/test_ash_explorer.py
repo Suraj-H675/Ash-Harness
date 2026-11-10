@@ -957,6 +957,111 @@ def _child_loopback_bind_error(environment: dict[str, str]) -> str | None:
     pytest.fail(f"child loopback capability probe failed: {payload!r}")
 
 
+def _replay_with_step_deadlines(
+    command: list[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    observations: int,
+    step_timeout: float = 55,
+) -> list[dict[str, object]]:
+    """Bound progress per replay step, not all Ash subprocesses together."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    lines: queue.Queue[bytes | None] = queue.Queue()
+    stderr_chunks: list[bytes] = []
+
+    def drain_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    def drain_stderr() -> None:
+        assert process.stderr is not None
+        stderr_chunks.append(process.stderr.read())
+
+    readers = [
+        threading.Thread(target=drain_stdout, daemon=True),
+        threading.Thread(target=drain_stderr, daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    events: list[dict[str, object]] = []
+    try:
+        for expected in (
+            "started",
+            *("observation" for _ in range(observations)),
+            "finished",
+        ):
+            try:
+                line = lines.get(
+                    timeout=step_timeout if expected == "observation" else 10
+                )
+            except queue.Empty:
+                pytest.fail(
+                    f"Explorer replay stalled before {expected} "
+                    f"({len(events)} completed events, exit={process.poll()}); "
+                    f"stderr={b''.join(stderr_chunks).decode('utf-8', errors='replace')[-500:]}"
+                )
+            assert line is not None, f"Explorer replay ended before {expected}"
+            event = json.loads(line)
+            assert event.get("type") == expected, event
+            events.append(event)
+        assert process.wait(timeout=10) == 0, b"".join(stderr_chunks).decode(
+            "utf-8", errors="replace"
+        )[-1000:]
+        return events
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        for reader in readers:
+            reader.join(timeout=2)
+
+
+def test_replay_progress_deadlines_allow_multiple_slow_steps(tmp_path: Path) -> None:
+    code = (
+        "import json,time\n"
+        "for kind in ['started','observation','observation','finished']:\n"
+        "    time.sleep(0.12)\n"
+        "    print(json.dumps({'type':kind}), flush=True)\n"
+    )
+    events = _replay_with_step_deadlines(
+        [sys.executable, "-u", "-c", code],
+        cwd=tmp_path,
+        environment=os.environ.copy(),
+        observations=2,
+        step_timeout=0.3,
+    )
+    assert [event["type"] for event in events] == [
+        "started",
+        "observation",
+        "observation",
+        "finished",
+    ]
+
+
+def test_replay_progress_deadlines_stop_stalled_child(tmp_path: Path) -> None:
+    code = 'import time; print(\'{"type":"started"}\', flush=True); time.sleep(5)'
+    with pytest.raises(pytest.fail.Exception, match="stalled before observation"):
+        _replay_with_step_deadlines(
+            [sys.executable, "-u", "-c", code],
+            cwd=tmp_path,
+            environment=os.environ.copy(),
+            observations=1,
+            step_timeout=0.1,
+        )
+
+
+@pytest.mark.timeout(300)
 def test_agent_directed_run_adapts_after_real_write_observation(
     tmp_path: Path,
 ) -> None:
@@ -1200,7 +1305,7 @@ def test_agent_directed_run_adapts_after_real_write_observation(
     assert not Path(manifest["scratch_path"]).exists()
 
     replay_evidence = tmp_path / "replay"
-    replay = subprocess.run(
+    replay_events = _replay_with_step_deadlines(
         [
             sys.executable,
             str(RUNNER),
@@ -1213,14 +1318,9 @@ def test_agent_directed_run_adapts_after_real_write_observation(
             "23",
         ],
         cwd=ROOT,
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=55,
-        check=False,
+        environment=environment,
+        observations=4,
     )
-    assert replay.returncode == 0, replay.stderr
-    replay_events = [json.loads(line) for line in replay.stdout.splitlines()]
     assert [
         event["classification"]
         for event in replay_events
