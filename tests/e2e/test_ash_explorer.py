@@ -8,11 +8,13 @@ import json
 import os
 import queue
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 import tomllib
+import urllib.request
 from argparse import Namespace
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
@@ -40,6 +42,28 @@ _extract_tool_outcome = explorer._extract_tool_outcome
 _read_live_line = explorer._read_live_line
 _target_path = explorer._target_path
 _tool_outcome = explorer._tool_outcome
+
+
+def test_explorer_loopback_fixture_does_not_reverse_resolve_localhost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_reverse_lookup(address: str) -> str:
+        pytest.fail(
+            f"Explorer fixture made an unnecessary reverse DNS lookup: {address}"
+        )
+
+    monkeypatch.setattr(socket, "getfqdn", unexpected_reverse_lookup)
+    fixture = explorer._FixtureServer(seed=47)
+    try:
+        assert fixture.server.server_name == "localhost"
+        assert fixture.server.server_address[0] == "127.0.0.1"
+        with urllib.request.urlopen(
+            fixture.base_url + "/models", timeout=3
+        ) as response:
+            assert response.status == 200
+            assert json.load(response)["data"][0]["id"] == "local-model"
+    finally:
+        fixture.close()
 
 
 def test_live_reader_returns_successive_jsonl_actions_without_dropping_lines() -> None:

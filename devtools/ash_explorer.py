@@ -23,6 +23,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PureWindowsPath
+from socketserver import TCPServer
 from typing import Any, BinaryIO, Literal
 from xml.sax.saxutils import unescape as xml_unescape
 
@@ -195,6 +196,18 @@ class _FixtureState:
                 "error": self.error,
                 "discovery_used": self.discovery_used,
             }
+
+
+class _LoopbackFixtureHTTPServer(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind calls socket.getfqdn on the bound address.
+        # Reverse DNS for 127.0.0.1 can stall on macOS CI, before Explorer
+        # can report startup progress. The fixture never needs a DNS name.
+        if self.server_address[0] != "127.0.0.1":
+            raise ValueError("Explorer fixture must bind only to loopback")
+        TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
 
 
 class _FixtureServer:
@@ -475,7 +488,7 @@ class _FixtureServer:
                 self._reply(200, encoded, "text/event-stream")
 
         self.state = state
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = _LoopbackFixtureHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
