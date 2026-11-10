@@ -517,23 +517,46 @@ def shared_state() -> SharedState:
 
 @pytest.mark.asyncio
 async def test_fanout_runs_all_agents_concurrently(shared_state):
-    """All agents should be launched immediately, not sequentially."""
+    """All workers must enter the runner before any is allowed to finish."""
+
+    all_started = asyncio.Event()
+    release = asyncio.Event()
+    started: set[str] = set()
+
+    async def waiting_task(ctx):
+        started.add(ctx["agent_id"])
+        if len(started) == 4:
+            all_started.set()
+        await release.wait()
+        return "done"
+
     specs = [
-        SubagentSpec(role="general", task=f"task-{i}", agent_id=f"agent-{i}")
+        SubagentSpec(
+            role="general",
+            task=f"task-{i}",
+            agent_id=f"agent-{i}",
+            runner=waiting_task,
+        )
         for i in range(4)
     ]
     orchestrator = SubagentOrchestrator(shared_state, max_concurrency=4)
 
-    start = time.monotonic()
-    result = await orchestrator.run_batch("concurrent test", specs)
-    elapsed = time.monotonic() - start
+    batch = asyncio.create_task(orchestrator.run_batch("concurrent test", specs))
+    try:
+        # A serial implementation blocks its first worker at release.wait()
+        # and cannot reach all_started. Scheduling and SQLite time do not
+        # affect this assertion as long as the CI host eventually runs tasks.
+        await asyncio.wait_for(all_started.wait(), timeout=10)
+        assert started == {f"agent-{i}" for i in range(4)}
+        assert not batch.done()
+    finally:
+        release.set()
+        # Always settle owned tasks even if an assertion or deadline fails.
+        result = await asyncio.wait_for(batch, timeout=10)
 
     assert result.sprint_id
     assert len(result.reports) == 4
     assert all(r.success for r in result.reports)
-    # With 4 agents each sleeping 0.05s, concurrent execution should be ~0.05-0.10s,
-    # not 4 * 0.05s = 0.2s (sequential). Allow up to 0.30s for loaded systems.
-    assert elapsed < 0.30, f"Agents ran in {elapsed:.3f}s — too slow for concurrent"
 
 
 @pytest.mark.asyncio
@@ -552,15 +575,20 @@ async def test_max_concurrency_is_respected(shared_state):
         return f"done at {time.monotonic() - start_time:.3f}s"
 
     specs = [
-        SubagentSpec(role="general", task=f"task-{i}", agent_id=f"agent-{i}")
+        SubagentSpec(
+            role="general",
+            task=f"task-{i}",
+            agent_id=f"agent-{i}",
+            runner=slow_task,
+        )
         for i in range(6)
     ]
     orchestrator = SubagentOrchestrator(shared_state, max_concurrency=3)
 
     await orchestrator.run_batch("concurrency test", specs)
 
-    assert max_concurrent_seen <= 3, (
-        f"Saw {max_concurrent_seen} concurrent, expected ≤3"
+    assert max_concurrent_seen == 3, (
+        f"Saw {max_concurrent_seen} concurrent, expected exactly 3"
     )
 
 
