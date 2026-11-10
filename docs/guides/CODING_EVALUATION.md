@@ -22,6 +22,11 @@ statistically meaningful agent leaderboard, general model-quality claim, or
 replacement for larger, independently authored coding tasks. Run repeated trials
 before claiming an improvement in completion rate or latency.
 
+For pinned **real upstream Git repositories** rather than synthetic fixture
+projects, see [Real-repository coding evaluation](REAL_REPOSITORY_CODING_EVALUATION.md).
+That separate runner keeps independent hidden behavioral checks and protected
+source boundaries without putting the later upstream fix in the model's checkout.
+
 ## Prerequisites
 
 - An Ash development environment (`.venv` with Python 3.12–3.14).

@@ -93,6 +93,22 @@ Local evidence is retained outside Git under
 `/var/tmp/ash-daily-driver-verify-20261110-113c849/` and
 `/var/tmp/ash-daily-driver-wheel-20261110-113c849/`.
 
+**Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
+passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
+three-module `event-log` fixture with GPT-6.1 Sol. The intervening Luna
+three-module attempt failed from transient provider transport, not an
+independently established coding defect. Separately, GPT-6.1 Sol passed
+the first two **real, pinned upstream repository** regression replays:
+`python-hyper/h11` chunk footer validation and `urllib3/urllib3` response
+header normalization, each with original-source red/reference-fix green
+preflight, a model-visible test, a model-hidden oracle, strict file protection,
+approved tool execution, and verified session audit. See
+[the real-repository baseline](../benchmarks/REAL_REPOSITORY_BASELINE_2026-11-10.md).
+These are one trial each, and both real-repo tasks edit one module. The
+multi-module and feature/task-recovery gates, statistically useful repetitions,
+head-to-head leading-CLI comparison, and current public release remain open.
+**The “Ash is done” decision stays NOT YET ACCEPTED.**
+
 Reassess these gates from **current** source, supported-host runtime, and
 independent results. Explicitly state what remains open; do not repeat
 historical “parity closed” language as a fresh daily-driver endorsement.
