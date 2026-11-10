@@ -189,3 +189,27 @@ previous passing `two-file` smoke; it does not estimate general success rates.
 The evidence stays local under
 `/var/tmp/ash-coding-eval-20261109/gpu-event-log-v1/`, and the benchmark's GPU
 model server was stopped after the trial.
+
+## Follow-up: command working-directory guidance (2026-11-10)
+
+The original event-log trial added a `cd` prefix to its otherwise authorized
+test command, which made the call fail exact-command permission matching. A
+small model-facing change now states that `run_command` already starts in the
+project root, and explicit command strings must be passed verbatim. It also
+repeats the preference for project-relative file paths. Permission matching,
+working-directory selection, and side-effect handling remain unchanged. A
+deterministic runtime regression verifies that a prefixed command is refused
+without execution while the exact command runs from the project root.
+
+One exploratory rerun with the same Qwen3.5-4B GGUF, llama.cpp Vulkan runtime,
+80k-turn/16k-request limits, and event-log task **did not complete**. It
+executed four model requests in 29.07s, refused six out-of-scope reads, then
+successfully listed the workspace and read six files. The next provider stream
+failed validation (`provider emitted an invalid stream chunk`) before any edit
+or test command. The visible and hidden oracles therefore still failed; file
+protections and session audit checks passed. This early provider failure makes
+the single replay **inconclusive** as a comparison of command-use or coding
+success, rather than evidence that the guidance made the model faster or worse.
+The local evidence path is
+`/var/tmp/ash-coding-eval-20261109/gpu-event-log-command-guidance-v1/`.
+The model server was stopped after evaluation.

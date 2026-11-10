@@ -46,7 +46,7 @@ from ash.providers.capabilities import ProviderCapabilities
 from ash.providers.failover import FailoverProvider
 from ash.providers.retry import ProviderCircuitBreaker, ProviderCircuitOpen
 from ash.repo.repomap import RepoMap
-from ash.safety.grants import PermissionRule, RuleEffect
+from ash.safety.grants import ArgumentMatcher, MatchOperator, PermissionRule, RuleEffect
 from ash.safety.guard import SafetyGuard
 from ash.safety.policy import PermissionMode, PolicyAction
 from ash.ui.terminal import TerminalUI
@@ -82,6 +82,96 @@ class MustNotRunProvider(MockProvider):
     async def stream_chat(self, messages, temperature=0.0, tools=None):
         raise AssertionError("provider must not receive an invalid message")
         yield  # pragma: no cover
+
+
+@pytest.mark.parametrize("native_tools", [True, False])
+def test_core_prompt_explains_project_relative_tools_and_exact_commands(
+    tmp_path, native_tools: bool
+) -> None:
+    prompt = loop_module._default_system_prompt(
+        tmp_path, native_tools=native_tools
+    )
+    assert str(tmp_path) in prompt
+    assert "project-relative" in prompt
+    assert "run_command" in prompt
+    assert "command_line" in prompt
+    assert "exact" in prompt
+    assert "cd" in prompt
+
+
+@pytest.mark.asyncio
+async def test_exactly_granted_command_runs_at_project_root_not_with_cd_prefix(
+    tmp_path,
+) -> None:
+    """A changed command string remains unapproved even if shell-equivalent."""
+
+    class RefuseUnexpectedApproval(EventUI):
+        def request_tool_approval(self, tool_name, arguments):
+            return False
+
+    program = tmp_path / "check.py"
+    program.write_text(
+        "from pathlib import Path\n"
+        "Path('checked.txt').write_text('done', encoding='utf-8')\n"
+        "print('TEST_OK')\n",
+        encoding="utf-8",
+    )
+    command = "python3 -B check.py"
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "exact-command-grant.db")
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        RefuseUnexpectedApproval(safety_tier="auto_edit"),
+        tmp_path,
+        tools={"run_command": RunCommandTool(guard)},
+        safety_tier="auto_edit",
+    )
+    loop.permission_policy.set_persistent_rules(
+        [
+            PermissionRule.create(
+                RuleEffect.ALLOW,
+                "run_command",
+                [ArgumentMatcher("command_line", MatchOperator.EXACT, command)],
+            )
+        ]
+    )
+    try:
+        session = await loop.start_session()
+        denied = await loop._execute_tool_calls(
+            [
+                {
+                    "call_id": "extra-cd",
+                    "name": "run_command",
+                    "arguments": {"command_line": "cd . && " + command},
+                }
+            ],
+            session,
+            persist_tool_messages=True,
+        )
+        assert denied[0]["success"] is False
+        assert not (tmp_path / "checked.txt").exists()
+        allowed = await loop._execute_tool_calls(
+            [
+                {
+                    "call_id": "exact-command",
+                    "name": "run_command",
+                    "arguments": {"command_line": command},
+                }
+            ],
+            session,
+            persist_tool_messages=True,
+        )
+        assert allowed[0]["success"] is True
+        assert "TEST_OK" in allowed[0]["output"]
+        assert (tmp_path / "checked.txt").read_text(encoding="utf-8") == "done"
+        saved = store.load_session(session.session_id)
+        assert [item.approved for item in saved.tool_calls] == [False, True]
+        assert [item.executed for item in saved.tool_calls] == [False, True]
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
 
 
 class SpyMiddleware(ToolMiddleware):

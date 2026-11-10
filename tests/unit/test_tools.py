@@ -60,6 +60,17 @@ def test_run_command_schema_rejects_oversized_command_and_cwd() -> None:
         )
 
 
+def test_run_command_model_schema_explains_workspace_cwd_and_exact_permissions(
+    guard: SafetyGuard,
+) -> None:
+    tool = RunCommandTool(guard)
+    schema = tool.json_schema()
+    assert "project" in tool.description.lower()
+    assert "project" in schema["properties"]["cwd"]["description"].lower()
+    assert "cd" in schema["properties"]["command_line"]["description"]
+    assert "exact" in schema["properties"]["command_line"]["description"]
+
+
 def test_provider_tool_schema_elides_generated_titles_but_preserves_fields(
     guard: SafetyGuard,
 ) -> None:

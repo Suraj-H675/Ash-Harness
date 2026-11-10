@@ -167,6 +167,24 @@ def test_argument_scoped_rules_match_all_conditions() -> None:
     )
 
 
+def test_exact_run_command_grant_does_not_authorize_equivalent_cd_prefix() -> None:
+    approved = "python3 -B test_eventlog.py"
+    rule = PermissionRule.create(
+        RuleEffect.ALLOW,
+        "run_command",
+        [ArgumentMatcher("command_line", MatchOperator.EXACT, approved)],
+    )
+    policy = PermissionPolicy("auto_edit", persistent_rules=[rule])
+
+    assert policy.evaluate("run_command", {"command_line": approved}).action == (
+        PolicyAction.ALLOW
+    )
+    assert (
+        policy.evaluate("run_command", {"command_line": "cd . && " + approved}).action
+        == PolicyAction.ASK
+    )
+
+
 def test_plan_mode_cannot_be_overridden_by_allow_rule() -> None:
     allow = PermissionRule.create(RuleEffect.ALLOW, "write_file")
     decision = PermissionPolicy("plan", persistent_rules=[allow]).evaluate(

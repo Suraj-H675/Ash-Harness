@@ -84,12 +84,20 @@ class RunCommandArgs(BaseModel):
     command_line: str = Field(
         ...,
         max_length=MAX_COMMAND_INPUT_CHARS,
-        description="The shell command string to execute.",
+        description=(
+            "Shell command to execute. If the user specified an exact command, "
+            "send it verbatim; do not prefix it with cd or other shell commands. "
+            "Exact command grants apply to this command_line string."
+        ),
     )
     cwd: str | None = Field(
         None,
         max_length=MAX_COMMAND_CWD_CHARS,
-        description="Directory path context to run the command in.",
+        description=(
+            "Optional directory within the project workspace. If omitted, "
+            "the command runs from the project root (Current Project Path). "
+            "Omit for a user-specified exact command unless told otherwise."
+        ),
     )
     timeout_seconds: int = Field(
         DEFAULT_TIMEOUT_SECONDS,
@@ -267,7 +275,11 @@ def extract_diagnostic_summary(output: str, error: str) -> dict[str, int]:
 
 class RunCommandTool(BaseTool):
     name = "run_command"
-    description = "Execute a shell command after safety validation."
+    description = (
+        "Execute a shell command after safety validation, starting in the "
+        "current project root by default. Command authorization is checked "
+        "against the supplied arguments before execution."
+    )
     args_schema = RunCommandArgs
 
     def __init__(

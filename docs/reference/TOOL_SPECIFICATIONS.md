@@ -189,6 +189,19 @@ Neither read nor search is attempted at the denied location.
 
 ### 2.5 `run_command`
 Executes user-approved commands in a subprocess shell.
+By default, it starts in **Current Project Path** (the workspace root), so
+`python3 -B test_example.py` needs no leading `cd`. An optional `cwd` argument
+selects a workspace-scoped directory. For a user-requested *exact* command,
+pass the string verbatim as `command_line` and leave `cwd` unset unless the
+user explicitly requests a different working directory. Adding a shell `cd`
+prefix changes the command string and does **not** match a `command_line`-exact
+permission grant. Authorization is checked before execution; Ash never
+silently strips shell prefixes or upgrades a denied command to an allowed one.
+
+An exact grant constrained only by `command_line` does not itself restrict the
+separate `cwd` argument. Policies requiring a particular working directory must
+scope that argument as well; the workspace boundary still applies to all `cwd`
+values.
 
 *   **Arguments Schema**:
     ```python
