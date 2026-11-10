@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 import pytest
 
@@ -31,6 +35,265 @@ check_workspace_artifacts = _benchmark.check_workspace_artifacts
 grade = _benchmark.grade
 oracle_python = _benchmark.oracle_python
 summarize_operational_events = _benchmark.summarize_operational_events
+
+
+def _free_model_catalog() -> dict[str, object]:
+    return {
+        "data": [
+            {
+                "id": "cohere/north-mini-code:free",
+                "pricing": {
+                    "prompt": "0",
+                    "completion": "0.000",
+                    "request": "0",
+                    "internal_reasoning": "0",
+                },
+                "supported_parameters": ["tools", "max_tokens"],
+                "context_length": 256_000,
+            }
+        ]
+    }
+
+
+def test_free_openrouter_catalog_accepts_only_an_exact_zero_cost_tool_model() -> None:
+    _benchmark.validate_free_openrouter_catalog(
+        "cohere/north-mini-code:free", _free_model_catalog(), context_tokens=32_768
+    )
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        (lambda item: item["pricing"].update(prompt="0.0001"), "zero-cost"),
+        (lambda item: item["pricing"].update(completion="0.01"), "zero-cost"),
+        (lambda item: item["pricing"].update(request="0.2"), "extra charge"),
+        (lambda item: item["pricing"].update(internal_reasoning="0.2"), "extra charge"),
+        (lambda item: item["pricing"].update(overrides=[{}]), "overrides"),
+        (lambda item: item.update(supported_parameters=[]), "tool-call"),
+        (lambda item: item.update(context_length=1000), "context window"),
+        (lambda item: item.update(pricing={}), "pricing"),
+    ],
+)
+def test_free_openrouter_catalog_rejects_unpriced_or_incompatible_variants(
+    change: Callable[[dict[str, Any]], None], error: str
+) -> None:
+    catalog = _free_model_catalog()
+    records = catalog["data"]
+    assert isinstance(records, list) and isinstance(records[0], dict)
+    change(records[0])
+    with pytest.raises(ValueError, match=error):
+        _benchmark.validate_free_openrouter_catalog(
+            "cohere/north-mini-code:free", catalog, context_tokens=16_384
+        )
+
+
+@pytest.mark.parametrize(
+    "model", ["cohere/north-mini-code", "openrouter/free", "../free:free"]
+)
+def test_free_openrouter_catalog_refuses_non_exact_model_ids(model: str) -> None:
+    with pytest.raises(ValueError, match="exact vendor/model:free"):
+        _benchmark.validate_free_openrouter_model(model)
+
+
+def test_free_openrouter_catalog_refuses_unknown_or_duplicate_free_models() -> None:
+    with pytest.raises(ValueError, match="not uniquely found"):
+        _benchmark.validate_free_openrouter_catalog(
+            "recursive/flint-v1.0:free", _free_model_catalog(), context_tokens=8192
+        )
+    catalog = _free_model_catalog()
+    records = catalog["data"]
+    assert isinstance(records, list)
+    catalog["data"] = records + records
+    with pytest.raises(ValueError, match="not uniquely found"):
+        _benchmark.validate_free_openrouter_catalog(
+            "cohere/north-mini-code:free", catalog, context_tokens=8192
+        )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (
+            ["--openrouter-free-model", "cohere/north-mini-code"],
+            "exact vendor/model:free",
+        ),
+        (
+            ["--openrouter-free-model", "cohere/north-mini-code:free"],
+            "OPENROUTER_API_KEY",
+        ),
+        (
+            ["--openrouter-free-model", "cohere/north-mini-code:free", "--repeat", "3"],
+            "1-2 explicitly selected trials",
+        ),
+        (
+            [
+                "--openrouter-free-model",
+                "cohere/north-mini-code:free",
+                "--endpoint",
+                "http://127.0.0.1:9999",
+            ],
+            "cannot use --endpoint",
+        ),
+        (
+            [
+                "--openrouter-free-model",
+                "cohere/north-mini-code:free",
+                "--completion-tokens",
+                "0",
+            ],
+            "--completion-tokens must be between",
+        ),
+    ],
+)
+def test_free_openrouter_cli_refuses_unapproved_requests_before_network_or_files(
+    tmp_path: Path, arguments: list[str], message: str
+) -> None:
+    env = os.environ.copy()
+    env.pop("OPENROUTER_API_KEY", None)
+    target = tmp_path / "never-created"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_benchmark_path),
+            "--evidence-dir",
+            str(target),
+            "--task",
+            "event-log",
+            *arguments,
+        ],
+        cwd=_benchmark.REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 2, result.stderr
+    assert message in result.stderr
+    assert not target.exists()
+
+
+def test_free_openrouter_trial_keeps_key_in_child_environment_not_config_or_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "FAKE-ONLY-DO-NOT-LOG"
+
+    def successful_setup(
+        *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        setup_env = kwargs["env"]
+        assert isinstance(setup_env, dict)
+        assert "OPENROUTER_API_KEY" not in setup_env
+        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    def inspect_launch(argv: list[str], **kwargs: object) -> None:
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        assert env["ASH_MODEL"] == "openrouter/cohere/north-mini-code:free"
+        assert env["OPENROUTER_API_KEY"] == secret
+        assert env["ASH_MAX_TURN_ITERATIONS"] == "16"
+        assert env["ASH_MAX_COMPLETION_TOKENS"] == "4096"
+        assert secret not in " ".join(argv)
+        config = (Path(env["HOME"]) / ".ash/ash.toml").read_text()
+        assert config == 'sandbox_backend = "native"\n'
+        assert secret not in config
+        raise RuntimeError("captured isolated free-model invocation")
+
+    monkeypatch.setattr(_benchmark, "command", successful_setup)
+    monkeypatch.setattr(_benchmark.subprocess, "Popen", inspect_launch)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    with pytest.raises(RuntimeError, match="captured isolated"):
+        _benchmark.run_trial(
+            "event-log",
+            evidence,
+            "https://openrouter.ai/api/v1",
+            120,
+            None,
+            remote_model_id="cohere/north-mini-code:free",
+            remote_api_key=secret,
+            completion_tokens=4096,
+        )
+    assert all(
+        secret.encode() not in path.read_bytes()
+        for path in evidence.rglob("*")
+        if path.is_file()
+    )
+
+
+def test_free_openrouter_cli_preflight_is_public_zero_cost_and_secret_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    key = "SYNTHETIC-DO-NOT-LOG-OPENROUTER-KEY"
+    evidence = tmp_path / "trial"
+    catalog_urls: list[str] = []
+
+    def public_catalog(url: str, *, timeout: int) -> io.BytesIO:
+        assert timeout == 10
+        catalog_urls.append(url)
+        return io.BytesIO(json.dumps(_free_model_catalog()).encode())
+
+    def git_stub(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[:2] == ["git", "rev-parse"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="test-head\n", stderr="")
+        if argv[:2] == ["git", "diff"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        raise AssertionError("Unexpected benchmark setup command")
+
+    def trial_stub(
+        task: str,
+        path: Path,
+        endpoint: str,
+        timeout: int,
+        model_hash: str | None,
+        *args: object,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        assert task == "event-log"
+        assert path == evidence
+        assert endpoint == "https://openrouter.ai/api/v1"
+        assert timeout == 285
+        assert model_hash is None
+        assert kwargs["remote_api_key"] == key
+        assert kwargs["remote_model_id"] == "cohere/north-mini-code:free"
+        assert kwargs["completion_tokens"] == 4_096
+        return {
+            "task": task,
+            "passed": True,
+            "task_correct": True,
+            "required_tools_succeeded": True,
+            "elapsed_seconds": 0.01,
+        }
+
+    monkeypatch.setattr(_benchmark.urllib.request, "urlopen", public_catalog)
+    monkeypatch.setattr(_benchmark, "command", git_stub)
+    monkeypatch.setattr(_benchmark, "run_trial", trial_stub)
+    monkeypatch.setattr(_benchmark.shutil, "which", lambda name: "/usr/bin/bwrap")
+    monkeypatch.setenv("OPENROUTER_API_KEY", key)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "coding_benchmark.py",
+            "--task",
+            "event-log",
+            "--openrouter-free-model",
+            "cohere/north-mini-code:free",
+            "--context-tokens",
+            "32768",
+            "--evidence-dir",
+            str(evidence),
+        ],
+    )
+    assert _benchmark.main() == 0
+    assert catalog_urls == [_benchmark.OPENROUTER_CATALOG_URL]
+    summary = (evidence / "summary.json").read_text()
+    assert (
+        json.loads(summary)["provider_model"]
+        == "openrouter/cohere/north-mini-code:free"
+    )
+    assert json.loads(summary)["context_tokens"] == 32_768
+    assert key not in summary + capsys.readouterr().out
 
 
 def test_coding_benchmark_default_and_custom_turn_budget_reach_isolated_cli(

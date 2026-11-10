@@ -1,4 +1,4 @@
-"""Run small, scored coding tasks through the real Ash CLI and a local model.
+"""Run small, scored coding tasks through Ash's real CLI and a selected model.
 
 This is an operator-run evaluation, not a unit test or a claim about model
 quality. Each trial receives fresh Ash state and a disposable workspace.
@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -18,6 +19,7 @@ import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -201,6 +203,74 @@ DEFAULT_TURN_TOKEN_BUDGET = 40_000
 MAX_EVAL_TURN_TOKEN_BUDGET = 250_000
 DEFAULT_EVAL_CONTEXT_TOKENS = 8_192
 MAX_EVAL_CONTEXT_TOKENS = 16_384
+MAX_REMOTE_CONTEXT_TOKENS = 65_536
+MAX_REMOTE_TRIALS = 2
+REMOTE_TURN_ITERATIONS = 16
+OPENROUTER_CATALOG_URL = "https://openrouter.ai/api/v1/models"
+FREE_MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*:free\Z")
+
+
+def validate_free_openrouter_model(model_id: str) -> str:
+    if not FREE_MODEL_ID.fullmatch(model_id):
+        raise ValueError("OpenRouter evaluation requires an exact vendor/model:free ID")
+    return model_id
+
+
+def validate_free_openrouter_catalog(
+    model_id: str, payload: object, *, context_tokens: int
+) -> None:
+    """Refuse unknown, billed, or tool-incompatible models before inference."""
+    validate_free_openrouter_model(model_id)
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise ValueError("OpenRouter model catalog has an invalid shape")
+    matches = [
+        item
+        for item in payload["data"]
+        if isinstance(item, dict) and item.get("id") == model_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("Requested free model was not uniquely found in the catalog")
+    item = matches[0]
+    pricing = item.get("pricing")
+    if not isinstance(pricing, dict):
+        raise ValueError("Free model pricing could not be verified")
+    for field in ("prompt", "completion"):
+        value = pricing.get(field)
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise ValueError("Free model pricing could not be verified")
+        try:
+            price = Decimal(str(value))
+        except InvalidOperation as exc:
+            raise ValueError("Free model pricing could not be verified") from exc
+        if not price.is_finite() or price != 0:
+            raise ValueError("OpenRouter model is not verified as zero-cost")
+    # Free token rates do not imply zero per-request or reasoning charges.
+    for field in (
+        "request",
+        "internal_reasoning",
+        "input_cache_read",
+        "input_cache_write",
+    ):
+        value = pricing.get(field)
+        if value is None:
+            continue
+        try:
+            if isinstance(value, bool) or Decimal(str(value)) != 0:
+                raise ValueError("OpenRouter model has an unverified extra charge")
+        except InvalidOperation as exc:
+            raise ValueError("OpenRouter model has an invalid extra price") from exc
+    if pricing.get("overrides"):
+        raise ValueError("OpenRouter conditional pricing overrides are unsupported")
+    parameters = item.get("supported_parameters")
+    if not isinstance(parameters, list) or "tools" not in parameters:
+        raise ValueError("Free model lacks verified native tool-call support")
+    window = item.get("context_length")
+    if (
+        not isinstance(window, int)
+        or isinstance(window, bool)
+        or window < context_tokens
+    ):
+        raise ValueError("Free model context window is below the requested limit")
 
 
 @dataclass(frozen=True)
@@ -480,6 +550,9 @@ def run_trial(
     trial_index: int = 1,
     turn_token_budget: int = DEFAULT_TURN_TOKEN_BUDGET,
     context_tokens: int = DEFAULT_EVAL_CONTEXT_TOKENS,
+    remote_model_id: str | None = None,
+    remote_api_key: str | None = None,
+    completion_tokens: int = 384,
 ) -> dict[str, Any]:
     task = TASKS[task_name]
     trial_dir = evidence / (
@@ -493,7 +566,15 @@ def run_trial(
         "model_sha256": model_hash,
         "turn_token_budget": turn_token_budget,
         "context_tokens": context_tokens,
+        "completion_tokens": completion_tokens,
+        "provider_model": (
+            f"openrouter/{remote_model_id}" if remote_model_id else "eval/local-model"
+        ),
     }
+    if remote_model_id:
+        validate_free_openrouter_model(remote_model_id)
+        if not remote_api_key:
+            raise ValueError("OpenRouter free evaluation requires an API key")
     with tempfile.TemporaryDirectory(prefix="trial-", dir=trial_dir) as scratch_name:
         scratch = Path(scratch_name)
         workspace, home, db, tmp = [
@@ -507,17 +588,18 @@ def run_trial(
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
         (home / ".ash").mkdir()
-        (home / ".ash/ash.toml").write_text(
-            'sandbox_backend = "native"\n'
-            "[custom_providers.eval]\n"
-            f'base_url = "{endpoint}/v1"\n'
-            'auth_mode = "none"\n'
-            '[custom_providers.eval.model_capabilities."local-model"]\n'
-            "native_tools = true\n"
-            "context_window = 16384\n"
-            "max_output_tokens = 384\n",
-            encoding="utf-8",
-        )
+        config = 'sandbox_backend = "native"\n'
+        if not remote_model_id:
+            config += (
+                "[custom_providers.eval]\n"
+                f'base_url = "{endpoint}/v1"\n'
+                'auth_mode = "none"\n'
+                '[custom_providers.eval.model_capabilities."local-model"]\n'
+                "native_tools = true\n"
+                "context_window = 16384\n"
+                f"max_output_tokens = {completion_tokens}\n"
+            )
+        (home / ".ash/ash.toml").write_text(config, encoding="utf-8")
         env = {
             "HOME": str(home),
             "USERPROFILE": str(home),
@@ -535,11 +617,19 @@ def run_trial(
             "GIT_TERMINAL_PROMPT": "0",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
-            "ASH_MODEL": "eval/local-model",
+            "ASH_MODEL": (
+                f"openrouter/{remote_model_id}"
+                if remote_model_id
+                else "eval/local-model"
+            ),
             "ASH_MAX_CONTEXT_TOKENS": str(context_tokens),
-            "ASH_MAX_COMPLETION_TOKENS": "384",
+            "ASH_MAX_COMPLETION_TOKENS": str(completion_tokens),
             "ASH_MAX_TURN_TOTAL_TOKENS": str(turn_token_budget),
         }
+        if remote_model_id:
+            # A bounded fraction of the free tier's daily request quota;
+            # provider retries are additional, so keep trial count low too.
+            env["ASH_MAX_TURN_ITERATIONS"] = str(REMOTE_TURN_ITERATIONS)
         setup_started = time.monotonic()
         setup = command(
             [str(PYTHON), "-m", "ash", "trust", "add", str(workspace)],
@@ -584,6 +674,13 @@ def run_trial(
             "--output-format",
             "json",
         ]
+        # Setup and permission commands need no inference credential. Pass it
+        # only to the model-bearing CLI child, never to config or argv.
+        cli_env = (
+            {**env, "OPENROUTER_API_KEY": remote_api_key or ""}
+            if remote_model_id
+            else env
+        )
         cli_started = time.monotonic()
         with (
             (trial_dir / "ash.stdout").open("wb") as stdout,
@@ -592,7 +689,7 @@ def run_trial(
             child = subprocess.Popen(
                 invocation,
                 cwd=workspace,
-                env=env,
+                env=cli_env,
                 stdout=stdout,
                 stderr=stderr,
                 start_new_session=True,
@@ -722,18 +819,33 @@ def main() -> int:
         required=True,
         help="New directory; never reuses prior results",
     )
-    parser.add_argument("--endpoint", default="http://127.0.0.1:18105")
+    parser.add_argument(
+        "--endpoint", help="Local 127.0.0.1 model server (default port 18105)"
+    )
+    parser.add_argument(
+        "--openrouter-free-model",
+        metavar="VENDOR/MODEL:free",
+        help=(
+            "Explicit opt-in: evaluate a verified zero-cost OpenRouter model "
+            "using OPENROUTER_API_KEY from the process environment"
+        ),
+    )
     parser.add_argument(
         "--model-file", type=Path, help="Optional local GGUF to hash as run provenance"
     )
     parser.add_argument("--timeout", type=int, default=285)
     parser.add_argument(
+        "--completion-tokens",
+        type=int,
+        help="Per-request output budget; defaults to 384 local or 4096 remote",
+    )
+    parser.add_argument(
         "--context-tokens",
         type=int,
         default=DEFAULT_EVAL_CONTEXT_TOKENS,
         help=(
-            "Maximum per-request model context for isolated trials "
-            "(default 8192, up to 16384); server must support this context"
+            "Maximum per-request model context (default 8192, "
+            "local max 16384, free remote max 65536)"
         ),
     )
     parser.add_argument(
@@ -762,44 +874,85 @@ def main() -> int:
         parser.error("duplicate --task selection; use --repeat for independent trials")
     if not (20 <= args.timeout <= 300):
         parser.error("--timeout must be between 20 and 300 seconds")
-    if not (4_096 <= args.context_tokens <= MAX_EVAL_CONTEXT_TOKENS):
-        parser.error(
-            f"--context-tokens must be between 4096 and {MAX_EVAL_CONTEXT_TOKENS}"
-        )
+    maximum_context = (
+        MAX_REMOTE_CONTEXT_TOKENS
+        if args.openrouter_free_model
+        else MAX_EVAL_CONTEXT_TOKENS
+    )
+    if not (4_096 <= args.context_tokens <= maximum_context):
+        parser.error(f"--context-tokens must be between 4096 and {maximum_context}")
     if not (2_000 <= args.turn_token_budget <= MAX_EVAL_TURN_TOKEN_BUDGET):
         parser.error(
             f"--turn-token-budget must be between 2000 and {MAX_EVAL_TURN_TOKEN_BUDGET}"
         )
     if not (1 <= args.repeat <= 5):
         parser.error("--repeat must be between 1 and 5")
-    address = urlsplit(args.endpoint)
-    if (
-        address.scheme != "http"
-        or address.hostname != "127.0.0.1"
-        or not address.port
-        or address.username
-        or address.password
-        or address.path
-        or address.query
-        or address.fragment
-    ):
-        parser.error("--endpoint must use a local 127.0.0.1 model server")
+    completion_tokens = (
+        args.completion_tokens
+        if args.completion_tokens is not None
+        else (4_096 if args.openrouter_free_model else 384)
+    )
+    if not (128 <= completion_tokens <= 16_384):
+        parser.error("--completion-tokens must be between 128 and 16384")
     if not PYTHON.is_file():
         parser.error(f"repository virtual environment missing: {PYTHON}")
     if not shutil.which("bwrap"):
         parser.error("Bubblewrap is required to safely execute model-written code")
-    try:
-        with urllib.request.urlopen(args.endpoint + "/health", timeout=5) as response:
-            if response.status != 200:
-                raise ValueError(f"model server returned {response.status}")
-        with urllib.request.urlopen(
-            args.endpoint + "/v1/models", timeout=5
-        ) as response:
-            advertised_models = [
-                str(entry.get("id", "")) for entry in json.load(response)["data"]
-            ]
-    except (OSError, ValueError) as error:
-        parser.error(f"local model server not ready: {error}")
+    remote_key: str | None = None
+    if args.openrouter_free_model:
+        if args.endpoint or args.model_file:
+            parser.error("remote free evaluation cannot use --endpoint or --model-file")
+        if not args.task or len(args.task) * args.repeat > MAX_REMOTE_TRIALS:
+            parser.error(
+                "remote free evaluation requires 1-2 explicitly selected trials"
+            )
+        try:
+            validate_free_openrouter_model(args.openrouter_free_model)
+        except ValueError as exc:
+            parser.error(str(exc))
+        remote_key = os.environ.get("OPENROUTER_API_KEY")
+        if not remote_key:
+            parser.error("OPENROUTER_API_KEY is required for free-model evaluation")
+        try:
+            # Public catalog check is unauthenticated. Never send the key
+            # here, or guess that a model is free from its name alone.
+            with urllib.request.urlopen(OPENROUTER_CATALOG_URL, timeout=10) as response:
+                data = response.read(8_000_001)
+                if len(data) > 8_000_000:
+                    raise ValueError("OpenRouter catalog exceeded 8 MB")
+            validate_free_openrouter_catalog(
+                args.openrouter_free_model,
+                json.loads(data),
+                context_tokens=args.context_tokens,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(f"OpenRouter free-model preflight refused: {exc}")
+        endpoint = "https://openrouter.ai/api/v1"
+        advertised_models = [args.openrouter_free_model]
+    else:
+        endpoint = args.endpoint or "http://127.0.0.1:18105"
+        address = urlsplit(endpoint)
+        if (
+            address.scheme != "http"
+            or address.hostname != "127.0.0.1"
+            or not address.port
+            or address.username
+            or address.password
+            or address.path
+            or address.query
+            or address.fragment
+        ):
+            parser.error("--endpoint must use a local 127.0.0.1 model server")
+        try:
+            with urllib.request.urlopen(endpoint + "/health", timeout=5) as response:
+                if response.status != 200:
+                    raise ValueError(f"model server returned {response.status}")
+            with urllib.request.urlopen(endpoint + "/v1/models", timeout=5) as response:
+                advertised_models = [
+                    str(entry.get("id", "")) for entry in json.load(response)["data"]
+                ]
+        except (OSError, ValueError) as error:
+            parser.error(f"local model server not ready: {error}")
     model_hash = None
     if args.model_file:
         digest = hashlib.sha256()
@@ -829,12 +982,15 @@ def main() -> int:
             result = run_trial(
                 task_name,
                 evidence,
-                args.endpoint,
+                endpoint,
                 args.timeout,
                 model_hash,
                 trial,
                 args.turn_token_budget,
                 args.context_tokens,
+                remote_model_id=args.openrouter_free_model,
+                remote_api_key=remote_key,
+                completion_tokens=completion_tokens,
             )
             results.append(result)
             print(
@@ -855,12 +1011,18 @@ def main() -> int:
         "runtime_diff_sha256": hashlib.sha256(runtime_diff.stdout.encode()).hexdigest(),
         "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "python": str(PYTHON),
-        "endpoint": args.endpoint,
+        "endpoint": endpoint,
+        "provider_model": (
+            f"openrouter/{args.openrouter_free_model}"
+            if args.openrouter_free_model
+            else "eval/local-model"
+        ),
         "model_sha256": model_hash,
         "advertised_model_ids": advertised_models,
         "timeout_seconds": args.timeout,
         "turn_token_budget": args.turn_token_budget,
         "context_tokens": args.context_tokens,
+        "completion_tokens": completion_tokens,
         "repeat": args.repeat,
         "tasks": [item["task"] for item in results],
         "passed": sum(bool(item["passed"]) for item in results),
