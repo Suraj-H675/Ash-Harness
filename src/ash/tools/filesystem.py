@@ -111,7 +111,10 @@ class WriteFileArgs(BaseModel):
     )
     overwrite: bool = Field(
         False,
-        description="Set to true if target file already exists and overwrite is intended.",
+        description=(
+            "Existing files are refused by default. Set true for an intentional "
+            "full-file rewrite; prefer replace_file_content for small edits."
+        ),
     )
 
 
@@ -136,7 +139,8 @@ class ReplaceFileContentArgs(BaseModel):
         ...,
         max_length=MAX_TEXT_ARGUMENT_CHARS,
         description=(
-            "Exact text of every complete line being replaced, including indentation. "
+            "OLD existing text to match, not the proposed fix: copy the exact "
+            "complete lines without read_file's line numbers, including indentation. "
             "With line bounds, it must equal the entire selected range; without "
             "bounds, it must match exactly one full-line block in the file."
         ),
@@ -145,8 +149,10 @@ class ReplaceFileContentArgs(BaseModel):
         ...,
         max_length=MAX_TEXT_ARGUMENT_CHARS,
         description=(
-            "Replacement content. LF-only separators follow the replaced range's "
-            "local style; replacements containing CR keep their supplied separators."
+            "NEW desired text to write. Normally differs from target_content; "
+            "identical no-op edits are refused. For line endings, LF-only "
+            "separators follow the replaced range's local style; replacements "
+            "containing CR keep their supplied separators."
         ),
     )
     expected_sha256: str | None = Field(
@@ -345,7 +351,10 @@ class ReadFileTool(BaseTool):
 
 class WriteFileTool(BaseTool):
     name = "write_file"
-    description = "Create or overwrite a workspace text file."
+    description = (
+        "Create a workspace text file. Replacing an existing file requires "
+        "overwrite=true; use replace_file_content for smaller edits."
+    )
     args_schema = WriteFileArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
@@ -395,7 +404,8 @@ class WriteFileTool(BaseTool):
 class ReplaceFileContentTool(BaseTool):
     name = "replace_file_content"
     description = (
-        "Replace exact complete lines in a workspace file. Give both line bounds "
+        "Replace OLD existing complete lines (target_content) with NEW desired "
+        "lines (replacement_content). Give both line bounds "
         "for a strict range edit, or omit both to replace a unique full-line block. "
         "Ambiguous matches and stale file hashes are rejected."
     )

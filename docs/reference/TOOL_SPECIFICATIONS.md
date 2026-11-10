@@ -114,13 +114,15 @@ whole-file SHA-256 digest and detected text encoding. The read is non-mutating.
 
 ### 2.2 `write_file`
 Creates a new file or overwrites an existing one.
+An existing file is **never** overwritten implicitly. A complete rewrite
+requires `overwrite=true`; use `replace_file_content` for a focused change.
 
 *   **Arguments Schema**:
     ```python
     class WriteFileArgs(BaseModel):
         file_path: str = Field(..., description="Target path for writing content.")
         content: str = Field(..., description="Complete textual content to write.")
-        overwrite: bool = Field(False, description="Set to true if target file already exists and overwrite is intended.")
+        overwrite: bool = Field(False, description="Existing files are refused by default. Set true for an intentional full-file rewrite; prefer replace_file_content for small edits.")
     ```
 *   **Security & Safety Checks**:
     1.  Validate path scope.
@@ -130,6 +132,10 @@ Creates a new file or overwrites an existing one.
 
 ### 2.3 `replace_file_content`
 Performs structured Search and Replace operations on a contiguous block of text.
+`target_content` is **old text already present in the file** (without
+`read_file`'s line-number prefixes); `replacement_content` is **new desired
+text**. Submitting the new code as both arguments usually requests a no-op and
+will be refused. An intentional newline/line-ending change is the exception.
 
 *   **Arguments Schema**:
     ```python
@@ -137,11 +143,11 @@ Performs structured Search and Replace operations on a contiguous block of text.
         file_path: str = Field(..., description="Path of target file to edit.")
         start_line: int | None = Field(None, description="Optional 1-indexed inclusive start line.")
         end_line: int | None = Field(None, description="Optional 1-indexed inclusive end line.")
-        target_content: str = Field(..., description="Exact complete lines to replace, including indentation.")
+        target_content: str = Field(..., description="OLD existing complete lines to match, including indentation and excluding read_file line numbers.")
         replacement_content: str = Field(
             ...,
             description=(
-                "Replacement content. LF-only separators follow the replaced range's "
+                "NEW desired text. LF-only separators follow the replaced range's "
                 "local style; replacements containing CR keep their supplied separators."
             ),
         )

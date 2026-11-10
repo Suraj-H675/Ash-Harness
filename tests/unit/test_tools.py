@@ -71,6 +71,27 @@ def test_run_command_model_schema_explains_workspace_cwd_and_exact_permissions(
     assert "exact" in schema["properties"]["command_line"]["description"]
 
 
+def test_edit_tool_schemas_distinguish_old_new_content_and_existing_files(
+    guard: SafetyGuard,
+) -> None:
+    """The model receives edit semantics before choosing an unsafe no-op."""
+    write_tool = WriteFileTool(guard)
+    write = write_tool.json_schema()["properties"]
+    assert "existing" in write_tool.description.lower()
+    assert "overwrite" in write_tool.description.lower()
+    assert write["overwrite"]["default"] is False
+    assert "existing" in write["overwrite"]["description"].lower()
+    assert "true" in write["overwrite"]["description"]
+
+    replace_tool = ReplaceFileContentTool(guard)
+    replace = replace_tool.json_schema()["properties"]
+    assert "old" in replace_tool.description.lower()
+    assert "new" in replace_tool.description.lower()
+    assert "old" in replace["target_content"]["description"].lower()
+    assert "new" in replace["replacement_content"]["description"].lower()
+    assert "line" in replace["replacement_content"]["description"].lower()
+
+
 def test_provider_tool_schema_elides_generated_titles_but_preserves_fields(
     guard: SafetyGuard,
 ) -> None:

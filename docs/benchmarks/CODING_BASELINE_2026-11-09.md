@@ -228,6 +228,11 @@ failed; after a further edit, the exact authorized
 `python3 -B test_eventlog.py` command ran successfully. The CLI turn ended
 normally with `stop_reason=completed` (not a context, token, or iteration
 limit); the final model message asserted that all three modules were fixed.
+Before its first successful edit, the model submitted identical old/new text to
+`replace_file_content` and then used `write_file` on an existing file without
+`overwrite=true`. Both calls were refused without rewriting the file, and the
+model recovered. Their model-visible schema descriptions have since been
+clarified; no overwrite or replacement behavior was changed.
 
 **The externally graded task nevertheless failed.** The visible oracle passed,
 but the hidden oracle failed when given JSON arrays: the resulting parser used
