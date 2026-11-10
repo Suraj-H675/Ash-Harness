@@ -288,3 +288,43 @@ OpenAI-compatible CLI integration test verifies malformed tool JSON is refused
 without leaking the model-supplied fragment, dispatching a tool, or silently
 replaying the partial stream. This **improves error guidance only**, not model
 tool-call correctness, recovery or coding-task success.
+
+## Eager patch-tool exposure: controlled local comparison (2026-11-10)
+
+The `fe2b9f4` change promoted the existing `apply_patch` tool into the initial
+native-tool catalog when the effective input budget was at least 6,144 tokens.
+The tool itself, its permissions, and its discoverability through `search_tools`
+were already present. To evaluate whether the additional eager schema helped,
+we compared the unchanged `23d93e7` runtime with `fe2b9f4` using separate
+detached Git worktrees and isolated Ash homes, databases, and task workspaces.
+
+Both revisions used the same Qwen3.5-4B Q4_K_M GGUF, llama.cpp Vulkan b12223
+on the same local server, 16,384-token request context, 80,000-token turn
+budget, 384-token completion cap, and the unchanged independent task oracles.
+Two runs per task were followed by an alternating additional `two-file` run
+against each revision. The results were:
+
+| Task | `23d93e7` (deferred patch) | `fe2b9f4` (eager patch) |
+|---|---|---|
+| `two-file` | **3/3 passed**; successful edits, test, hidden oracle, and audit | **0/3 passed**; all three aborted with `arguments:value_error` immediately after four successful source reads, before edits or tests |
+| `event-log` | **0/2 passed**; hidden/visible oracle failures | **0/2 passed**; visible test passed but hidden oracle failed |
+
+No `apply_patch` calls were issued in the five eager-tool trials. The extra
+schema did not reduce tool-discovery turns for these tasks, while the observed
+`two-file` completion rate regressed. In all malformed-response trials Ash
+refused the invalid provider output without tool dispatch or automatic replay.
+The original patch tool remains available through `search_tools`; no policy
+relaxation is needed to restore its deferred presentation.
+
+These are **small, single-model, non-randomized** trials sharing a model server
+and KV cache, not an estimate of general reliability or proof of a causal
+mechanism. The comparison is nevertheless sufficient to reject eager patch
+exposure as an *unverified default improvement* on the tested local-model
+configuration. The change was reversed pending stronger-model and broader-task
+evidence. Private receipts are retained under
+`/var/tmp/ash-eval-20261110-head23d93e7/` on the test host; the evidence tree
+and model-generated task files are not tracked.
+After restoring the deferred-tool runtime on `main`, one additional `two-file`
+CLI trial passed in 33.17s, including the authorized test command, hidden
+oracle, and audit-integrity check. This confirms the restored user path works
+in the tested environment, not that larger-model performance is established.

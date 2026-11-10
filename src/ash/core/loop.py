@@ -444,7 +444,6 @@ def _observer_event_projection(event: dict[str, Any]) -> dict[str, Any]:
 
 
 DEFAULT_MAX_TURN_ITERATIONS = 10
-MIN_EAGER_PATCH_INPUT_TOKENS = 6_144
 FILE_WRITE_TOOLS = {
     "write_file",
     "replace_file_content",
@@ -4972,20 +4971,7 @@ class AshLoop:
         search_tool = self.tools.get("search_tools")
         visible_tools = getattr(search_tool, "visible_tools", None)
         if callable(visible_tools):
-            selected = dict(visible_tools(self.tools))
-            # Multi-file patches are valuable for coding, but an additional
-            # schema can prevent small (4k) models from fitting the protected
-            # current-turn history after tool discovery. Expose the existing
-            # atomic patch tool eagerly only when effective input headroom is
-            # substantial; smaller models can still find it with search_tools.
-            budget = self._resolve_request_token_budget()
-            if (
-                budget is not None
-                and budget.input_limit >= MIN_EAGER_PATCH_INPUT_TOKENS
-                and "apply_patch" in self.tools
-            ):
-                selected.setdefault("apply_patch", self.tools["apply_patch"])
-            return selected
+            return dict(visible_tools(self.tools))
         return self.tools
 
     def _tool_schema_payload(

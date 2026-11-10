@@ -54,15 +54,6 @@ Only visible schemas count against the tools budget. Deferred tools remain in
 the runtime registry and continue through normal validation, permissions,
 hooks, audit, event, and result-persistence paths after activation.
 
-For model requests with at least 6,144 effective input tokens after the
-response reserve and provider input ceiling, Ash also exposes `apply_patch`
-alongside its core read, edit, and command tools immediately. This allows
-multi-file unified diffs without spending a request discovering patch support.
-In smaller contexts, `apply_patch` remains available through `search_tools`:
-eagerly sending its schema would otherwise crowd out protected conversation
-history during tool discovery. The existing patch validation, scope and
-approval rules are unchanged.
-
 After a request is assembled, `ContextBudgetReport.fragments` records each
 fragment's typed kind, source, trust class, token use and limit, truncation
 state, SHA-256, and non-content metadata. The report intentionally does not

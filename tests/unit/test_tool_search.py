@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import io
 import json
-import subprocess
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -370,107 +368,6 @@ class ScriptedDiscoveryProvider(ProviderABC):
 
 
 @pytest.mark.asyncio
-async def test_atomic_two_file_patch_is_eager_only_with_sufficient_input_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from ash.runtime import build_tools
-
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, timeout=10)
-    (tmp_path / "left.py").write_text("def left():\n    return 1\n")
-    (tmp_path / "right.py").write_text("def right():\n    return 1\n")
-    patch = (
-        "--- a/left.py\n+++ b/left.py\n@@ -1,2 +1,2 @@\n"
-        " def left():\n-    return 1\n+    return 2\n"
-        "--- a/right.py\n+++ b/right.py\n@@ -1,2 +1,2 @@\n"
-        " def right():\n-    return 1\n+    return 3\n"
-    )
-
-    class PatchFirstProvider(ProviderABC):
-        model_name = "patch-first"
-        _ash_declared_capabilities = ProviderCapabilities(
-            native_tools=True,
-            context_window=16_384,
-            max_input_tokens=12_288,
-            max_output_tokens=1_024,
-        )
-
-        def __init__(self) -> None:
-            self.requests = 0
-
-        def count_tokens(self, text: str) -> int:
-            return max(1, len(text) // 4)
-
-        async def stream_chat(self, messages, temperature=0.0, tools=None):
-            self.requests += 1
-            names = {tool["function"]["name"] for tool in tools}
-            assert "apply_patch" in names
-            if self.requests == 1:
-                yield StreamChunk(
-                    native_tool_calls=[
-                        {
-                            "id": "patch-two-files",
-                            "name": "apply_patch",
-                            "arguments": {"patch": patch},
-                        }
-                    ],
-                    is_done=True,
-                )
-            else:
-                assert any(message.get("role") == "tool" for message in messages)
-                yield StreamChunk(content="Both files patched", is_done=True)
-
-    config = AshConfig(
-        model="local/patch-first",
-        workspace_root=tmp_path,
-        db_directory=tmp_path / "db",
-        max_context_tokens=16_384,
-        max_completion_tokens=1_024,
-        memory_backend="off",
-        tool_search_threshold=32,
-    )
-    guard = SafetyGuard(tmp_path)
-    catalog = build_tools(guard, tmp_path, runtime_config=config)
-    provider = PatchFirstProvider()
-    store = SessionStore(tmp_path / "patch-first.db")
-    loop = AshLoop(
-        store,
-        provider,
-        guard,
-        HeadlessUI(output_format="text", stream=io.StringIO()),
-        tmp_path,
-        tools=catalog,
-        config=config,
-        safety_tier="auto_approve",
-    )
-    assert len(catalog) > 32
-    assert "apply_patch" in loop._provider_tools()
-    provider._ash_declared_capabilities = replace(
-        provider._ash_declared_capabilities, max_input_tokens=5_000
-    )
-    assert "apply_patch" not in loop._provider_tools()
-    provider._ash_declared_capabilities = replace(
-        provider._ash_declared_capabilities, max_input_tokens=12_288
-    )
-
-    session = await loop.start_session()
-    assert await loop.run_turn("Patch both modules atomically.") == "Both files patched"
-    assert provider.requests == 2  # No discovery iteration needed.
-    assert "return 2" in (tmp_path / "left.py").read_text()
-    assert "return 3" in (tmp_path / "right.py").read_text()
-    assert not catalog["search_tools"].activated_names
-    persisted = store.load_session(session.session_id)
-    assert [call.tool_name for call in persisted.tool_calls] == ["apply_patch"]
-    assert all(
-        call.approved and call.executed and call.error is None
-        for call in persisted.tool_calls
-    )
-    assert store.verify_audit_log(session.session_id) == []
-    await loop.aclose()
-
-
-@pytest.mark.asyncio
 async def test_context_provenance_reports_frozen_visible_tool_selection(
     tmp_path,
 ) -> None:
@@ -748,10 +645,7 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
     assert len(catalog) > config.tool_search_threshold
     initial_payload = loop._tool_schema_payload()
     initial_names = {item["function"]["name"] for item in initial_payload}
-    expected_names = {*ESSENTIAL_TOOL_NAMES, "search_tools"}
-    if context_window >= 8_192:
-        expected_names.add("apply_patch")
-    assert initial_names == expected_names
+    assert initial_names == {*ESSENTIAL_TOOL_NAMES, "search_tools"}
 
     await loop.start_session()
     response = await loop.run_turn(intent)
