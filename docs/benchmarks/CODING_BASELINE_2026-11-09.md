@@ -256,3 +256,35 @@ raise production iteration limits, add redundant completion gates, or make the
 benchmark easier based on one 4B-model failure. A stronger-model or broader
 multi-task comparison is required to justify runtime changes aimed at this
 semantic completion gap.
+
+## Edit-schema replay and native tool-call failure (2026-11-10)
+
+One bounded follow-up on `b75a154` evaluated `two-file` and `event-log` with
+the identical Qwen3.5-4B Q4_K_M GGUF, llama.cpp Vulkan b12223, 80k cumulative
+turn budget, and 16k request context used in the previous trial. It used
+separate disposable workspaces and retained its private evidence at
+`/var/tmp/ash-coding-eval-20261110/gpu-edit-schema-b75a154/`. The model
+server was stopped when both trials ended.
+
+| Task | Scored result | Observed boundary |
+|---|---|---|
+| `two-file` | **Fail**, 2 requests, 21.99s | Four allowed source reads succeeded, then the provider emitted `arguments:value_error` while generating the next native tool call. Ash rejected the malformed stream; zero edits or test commands ran, no forbidden paths were accessed and the audit remained valid. |
+| `event-log` | **Fail**, 10 requests, 58.71s | The model changed all three modules, used the exact allowed test command successfully, and passed the visible test, but the hidden oracle still rejected list-valued JSON because the parser called `.get()` on a non-object. Protected files and the audit remained valid. |
+
+Critically, the `event-log` model **again** first submitted an identical
+`target_content`/`replacement_content` no-op and then attempted `write_file`
+on an existing file without `overwrite=true`. Both were safely refused. The
+new edit-schema wording therefore did **not** eliminate those mistakes in
+this single replay. Results are not statistically comparable success-rate
+estimates; the two-file case failed due to a different provider-stream event
+and cannot be interpreted as evidence of an editing regression. The event-log
+case confirms the existing visible-test-versus-specification failure.
+
+The two-file failure exposed an actionable CLI diagnostic gap: the specific
+`arguments:value_error` error was classified under the generic provider remedy
+to check API keys and connectivity. Ash now reports a targeted, content-free
+native-tool-argument remedy for this exact failure. A real loopback
+OpenAI-compatible CLI integration test verifies malformed tool JSON is refused
+without leaking the model-supplied fragment, dispatching a tool, or silently
+replaying the partial stream. This **improves error guidance only**, not model
+tool-call correctness, recovery or coding-task success.

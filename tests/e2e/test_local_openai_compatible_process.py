@@ -1276,6 +1276,132 @@ def test_builtin_provider_stream_error_redacts_key_in_cli_json(
         thread.join(timeout=2)
 
 
+def test_malformed_native_tool_arguments_get_actionable_cli_error_without_replay(
+    tmp_path: Path,
+) -> None:
+    """An actual local SSE provider can fail safely without a credential hint."""
+    requests: list[dict[str, object]] = []
+    private_marker = "MODEL_OUTPUT_MUST_NOT_BE_REPEATED_123"
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+        def do_GET(self) -> None:
+            if self.path != "/v1/models":
+                self.send_error(404)
+                return
+            payload = json.dumps(
+                {"data": [{"id": "future-model", "max_model_len": 32768}]}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self) -> None:
+            if self.path != "/v1/chat/completions":
+                self.send_error(404)
+                return
+            requests.append(
+                json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            )
+
+            def chunk(delta: dict[str, object], finish: str | None) -> dict[str, object]:
+                return {
+                    "id": "malformed-tool",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "future-model",
+                    "choices": [
+                        {"index": 0, "delta": delta, "finish_reason": finish}
+                    ],
+                }
+
+            events = [
+                chunk({"content": "partial answer"}, None),
+                chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "unsafe-call",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": "{" + private_marker,
+                                },
+                            }
+                        ]
+                    },
+                    None,
+                ),
+                chunk({}, "tool_calls"),
+            ]
+            payload = (
+                "".join("data: " + json.dumps(event) + "\n\n" for event in events)
+                + "data: [DONE]\n\n"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        workspace = tmp_path / "workspace"
+        home = tmp_path / "home"
+        workspace.mkdir()
+        home.mkdir()
+        environment = _builtin_provider_environment(
+            home,
+            "vllm",
+            "VLLM_API_BASE",
+            "VLLM_API_KEY",
+            f"http://127.0.0.1:{server.server_port}/v1",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ash",
+                "--db-directory",
+                str(tmp_path / "db"),
+                "--mode",
+                "auto_edit",
+                "-p",
+                "Create audit-marker.txt with write_file.",
+                "--output-format",
+                "json",
+            ],
+            cwd=workspace,
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=35,
+            check=False,
+        )
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        error = json.loads(result.stdout)["error"]
+        assert error["category"] == "provider"
+        assert error["retriable"] is False
+        assert "arguments:value_error" in error["message"]
+        assert "native tool" in error["remedy"].lower()
+        assert "chat template" in error["remedy"].lower()
+        assert "API key" not in error["remedy"]
+        assert private_marker not in result.stdout + result.stderr
+        assert len(requests) == 1
+        assert not (workspace / "audit-marker.txt").exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_ollama_fresh_process_completes_native_file_edit_tool_turn(
     tmp_path: Path,
 ) -> None:

@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 from ash.core.redaction import redact_text
+from ash.providers.base import ProviderCompletionError
 from ash.ui.safe_text import terminal_safe_text
 
 
@@ -188,6 +189,19 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
             message,
             "Install an available sandbox backend, choose a less privileged safety mode, or configure Ash for this host.",
             retriable=True,
+        )
+
+    if type(exc) is ProviderCompletionError and lowered.startswith(
+        "provider emitted an invalid stream chunk (arguments:"
+    ):
+        return ErrorInfo(
+            ErrorCategory.PROVIDER,
+            message,
+            "The model or provider emitted malformed native tool arguments. "
+            "Check model and chat template support for native tool calling; "
+            "inspect the session before manually retrying. "
+            "Ash did not automatically replay this response.",
+            retriable=False,
         )
 
     if _is_provider_error(module, lowered):

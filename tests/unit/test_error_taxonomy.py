@@ -9,6 +9,7 @@ from ash.config import AshConfig
 from ash.core.planner import PlannerError
 from ash.core.session import SessionResolutionError, SessionStorageError
 from ash.exceptions import ErrorCategory, classify_exception, format_error
+from ash.providers.base import ProviderCompletionError
 from ash.safety.guard import SafetyViolation
 from ash.sandbox import SandboxBackendUnavailable
 from ash.ui.headless import HeadlessUI
@@ -100,6 +101,38 @@ def test_classify_provider_error_is_retriable_for_transient_failures() -> None:
     assert error.category == ErrorCategory.PROVIDER
     assert error.retriable is True
     assert "API key" in error.remedy
+
+
+def test_malformed_provider_tool_arguments_have_actionable_nonretriable_remedy() -> None:
+    error = classify_exception(
+        ProviderCompletionError(
+            "provider emitted an invalid stream chunk (arguments:value_error)"
+        )
+    )
+    assert error.category == ErrorCategory.PROVIDER
+    assert error.retriable is False
+    assert "native tool" in error.remedy.lower()
+    assert "model" in error.remedy.lower()
+    assert "chat template" in error.remedy.lower()
+    assert "manual" in error.remedy.lower()
+    assert "API key" not in error.remedy
+    assert "network" not in error.remedy
+    assert "arguments:value_error" in error.to_dict()["message"]
+
+    # Only this explicit completed-stream failure is reclassified. Other
+    # provider errors retain their established connectivity/credential advice.
+    other_field = classify_exception(
+        ProviderCompletionError(
+            "provider emitted an invalid stream chunk (reasoning:list_type)"
+        )
+    )
+    assert "API key" in other_field.remedy
+    forged_message = classify_exception(
+        _ProviderFailure(
+            "provider emitted an invalid stream chunk (arguments:value_error)"
+        )
+    )
+    assert "API key" in forged_message.remedy
 
 
 def test_classify_structured_output_failure_as_output() -> None:
