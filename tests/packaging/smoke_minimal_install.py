@@ -46,6 +46,7 @@ def run_ash(
         env=env,
         text=True,
         capture_output=True,
+        timeout=60,
         check=False,
     )
     assert result.returncode == expected, (
@@ -203,6 +204,189 @@ def verify_installed_openai_first_turn(*, workspace: Path, env: dict[str, str]) 
             ("/v1/models", "Bearer wheel-secret"),
             ("/v1/chat/completions", "Bearer wheel-secret"),
         ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+
+
+def verify_installed_coding_turn(
+    *, workspace: Path, root: Path, env: dict[str, str]
+) -> None:
+    """Prove the installed CLI can inspect, repair, test, and persist a turn."""
+    from ash.core.session import SessionStore
+
+    source = workspace / "wheel_calc.py"
+    source.write_text("def next_number(n):\n    return n - 1\n", encoding="utf-8")
+    (workspace / "test_wheel_calc.py").write_text(
+        "from wheel_calc import next_number\nassert next_number(2) == 3\n",
+        encoding="utf-8",
+    )
+    untouched = workspace / "protected.txt"
+    untouched.write_text("preserve this file\n", encoding="utf-8")
+    assert (
+        subprocess.run(
+            [sys.executable, "-B", "test_wheel_calc.py"],
+            cwd=workspace,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        ).returncode
+        != 0
+    )
+
+    actions = [
+        ("read_file", {"file_path": "wheel_calc.py"}),
+        (
+            "replace_file_content",
+            {
+                "file_path": "wheel_calc.py",
+                "target_content": "    return n - 1\n",
+                "replacement_content": "    return n + 1\n",
+            },
+        ),
+        (
+            "run_command",
+            {"command_line": "python3 -B test_wheel_calc.py", "timeout_seconds": 10},
+        ),
+    ]
+    requests: list[dict[str, object]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            if self.path != "/api/v1/models":
+                self.send_error(404)
+                return
+            model = {
+                "models": [
+                    {
+                        "key": "wheel-coder",
+                        "type": "llm",
+                        "loaded_instances": [{"config": {"context_length": 32768}}],
+                        "capabilities": {"trained_for_tool_use": True, "vision": False},
+                    }
+                ]
+            }
+            self.send_data(json.dumps(model).encode(), "application/json")
+
+        def send_data(self, data: bytes, media_type: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", media_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self) -> None:
+            if self.path != "/v1/chat/completions":
+                self.send_error(404)
+                return
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(payload)
+            index = len(requests)
+            if index <= len(actions):
+                name, arguments = actions[index - 1]
+                assert payload.get("tools"), "fixture expects native tools"
+                delta = {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": f"wheel-call-{index}",
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(arguments),
+                            },
+                        }
+                    ]
+                }
+                finish_reason = "tool_calls"
+            else:
+                assert index == len(actions) + 1
+                delta = {"content": "WHEEL-CODING-OK"}
+                finish_reason = "stop"
+            chunks = [
+                {
+                    "id": "wheel-coding",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "wheel-coder",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                },
+                {
+                    "id": "wheel-coding",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "wheel-coder",
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                    ],
+                },
+            ]
+            data = (
+                "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+                + "data: [DONE]\n\n"
+            ).encode()
+            self.send_data(data, "text/event-stream")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        configured = dict(env)
+        configured.update(
+            {
+                "ASH_MODEL": "lmstudio/wheel-coder",
+                "LMSTUDIO_API_BASE": f"http://127.0.0.1:{server.server_port}/v1",
+                # The fixture owns only disposable files; avoid a human prompt
+                # while exercising the real headless command authorization path.
+                "ASH_ALLOW_UNSAFE_AUTO_APPROVE": "true",
+            }
+        )
+        result = json.loads(
+            run_ash(
+                "--db-directory",
+                str(root / "coding-db"),
+                "--mode",
+                "auto_approve",
+                "-p",
+                "Repair wheel_calc.py and run python3 -B test_wheel_calc.py.",
+                "--output-format",
+                "json",
+                cwd=workspace,
+                env=configured,
+            ).stdout
+        )
+        assert result["response"] == "WHEEL-CODING-OK"
+        assert (
+            source.read_text(encoding="utf-8")
+            == "def next_number(n):\n    return n + 1\n"
+        )
+        assert untouched.read_text(encoding="utf-8") == "preserve this file\n"
+        assert (
+            subprocess.run(
+                [sys.executable, "-B", "test_wheel_calc.py"],
+                cwd=workspace,
+                check=False,
+                timeout=5,
+            ).returncode
+            == 0
+        )
+        assert len(requests) == len(actions) + 1
+        assert any(
+            message.get("role") == "tool" for message in requests[-1]["messages"]
+        )
+        store = SessionStore(root / "coding-db" / "sessions.db")
+        sessions = store.list_sessions(project_path=str(workspace))
+        assert len(sessions) == 1
+        calls = store.load_session(sessions[0].session_id).tool_calls
+        assert [call.tool_name for call in calls] == [name for name, _ in actions]
+        assert all(
+            call.approved and call.executed and call.error is None for call in calls
+        )
+        assert store.verify_audit_log(sessions[0].session_id) == []
     finally:
         server.shutdown()
         server.server_close()
@@ -386,6 +570,7 @@ def main() -> None:
             }
         )
         verify_installed_openai_first_turn(workspace=workspace, env=env)
+        verify_installed_coding_turn(workspace=workspace, root=root, env=env)
 
         class InstalledNativeProvider(ProviderABC):
             model_name = "installed-native-smoke"

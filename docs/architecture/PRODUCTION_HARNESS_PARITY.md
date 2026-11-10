@@ -32,6 +32,71 @@ native client coverage, or interoperability with every comparator.
 - **Missing:** no usable implementation exists.
 - A feature is not complete until install, CLI/TUI, persistence, and failure paths work.
 
+## “Ash is done” — competitive daily-driver acceptance (2026-11-10)
+
+The owner has established a stronger product-level finish line: **a developer
+who already likes Codex CLI, Claude Code, OpenCode, or a comparable coding
+agent should be able to switch to Ash and reasonably expect to like using it**.
+ChatGPT must explicitly announce **“Ash is done”** only when that recommendation
+is warranted by current, reproducible user-path evidence. This does **not**
+mean Ash development ends. The earlier M1–M5 and P0–P8 closure decisions
+established their *documented release scopes*; they cannot substitute for this
+new, experience-based acceptance decision.
+
+The decisive gates are:
+
+1. **Real coding competence:** A predeclared, independently graded set of
+   realistic tasks on existing repositories, including multi-file repair,
+   feature addition, regression testing, large-project navigation, and
+   interruption/resume, works reliably with at least one strong supported
+   model. Compare representative tasks with a current leading terminal agent
+   under as similar a model, resource budget, and permission policy as feasible.
+   Report independent test outcomes, human interventions, requests, time,
+   failures and variability; do not cherry-pick successes or conflate a weak
+   model's reasoning with a harness bug. The two toy/synthetic coding fixtures
+   alone cannot establish this gate.
+2. **Smooth first use and ongoing work:** A clean supported-host installation
+   leads predictably through trust, model setup, first editing/testing turn,
+   diff review, approvals, session resumption, switching models, and useful
+   troubleshooting. Verify both a fresh user path and a repeat user's routine
+   terminal workflow; accessible/no-color modes must not be second-class.
+3. **Safe and durable under stress:** Permission refusal, malicious workspace
+   content, filesystem boundaries, secret isolation, cancellation, long
+   processes, crashes and ambiguous side effects remain correct through real
+   CLI/runtime journeys. No unresolved material security or data-loss defect.
+4. **Operationally competitive:** On the same representative tasks, Ash's
+   responsiveness, edit reliability, context use, test feedback, diagnostics,
+   and operator burden must not exhibit a material disadvantage that would
+   make a reasonable experienced user prefer to return to their old harness.
+   Feature-count parity, green CI and self-reported model confidence do not
+   establish this.
+5. **Actually available to new users:** A verified, versioned public artifact
+   contains the accepted behavior. The supported Linux installer, upgrade,
+   clean installed-wheel coding flow, and secondary macOS CI are green for that
+   release. WSL2 remains experimental until exercised on genuine WSL2; native
+   Windows and optional nonterminal surfaces are not release blockers by
+   themselves. Do not publish a new release without its separate authorization.
+
+**Current decision: NOT YET ACCEPTED.** At `113c849` the Linux/Arch source
+checkout passed four isolated trust/setup/sessions/interactive-terminal smoke
+recipes, and an offline sdist→wheel→fresh-venv installation passed the installed
+package smoke. The newly extended smoke also proves an installed, controlled
+provider-driven read/edit/test/persist cycle in an explicitly auto-approved,
+disposable workspace. These are wiring/packaging proofs, not default approval
+UX or strong-model task-quality results. Recent Qwen3.5-4B trials failed
+both two-file and three-module tasks, with distinct malformed-provider and
+semantic-correctness causes; a proper stronger-model and cross-harness
+comparison is still missing. The latest public release is `ash-v0.5.1`
+(published 2026-10-24), while current `main` includes 117 later commits; the
+public installer therefore does **not** yet deliver the current candidate.
+Local evidence is retained outside Git under
+`/var/tmp/ash-daily-driver-verify-20261110-113c849/` and
+`/var/tmp/ash-daily-driver-wheel-20261110-113c849/`.
+
+Reassess these gates from **current** source, supported-host runtime, and
+independent results. Explicitly state what remains open; do not repeat
+historical “parity closed” language as a fresh daily-driver endorsement.
+
 ## Public Benchmarks
 
 - Claude Code official docs: <https://code.claude.com/docs/en/overview>,
