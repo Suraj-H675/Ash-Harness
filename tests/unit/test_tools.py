@@ -670,8 +670,8 @@ async def test_run_command_pty_enforces_output_capture_limit(
     assert result.truncated is True
     assert len(result.output) < 256
     assert "Process output capture limit reached" in result.output
-    assert result.outcome is ToolExecutionOutcome.UNKNOWN
-    assert result.exit_code is None
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert result.exit_code == 0
 
 
 @pytest.mark.skipif(os.name != "posix", reason="PTY execution is POSIX-only")
@@ -1922,8 +1922,58 @@ async def test_run_command_handles_output_capture_limit_without_escaping(
     assert result.success is True
     assert result.truncated is True
     assert "Process output capture limit reached" in result.output
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert result.exit_code == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pty", [False, True])
+@pytest.mark.parametrize("exit_status", [0, 1])
+async def test_run_command_finishes_finite_verbose_test_before_reporting_success(
+    project_root: Path, guard: SafetyGuard, pty: bool, exit_status: int
+) -> None:
+    script = (
+        "import pathlib,sys,time;"
+        "sys.stdout.write('x'*150000);sys.stdout.flush();"
+        "time.sleep(0.2);"
+        f"pathlib.Path('test-finished.txt').write_text('finished');sys.exit({exit_status})"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    result = await RunCommandTool(guard).run(
+        command_line=command, timeout_seconds=5, pty=pty
+    )
+
+    assert (project_root / "test-finished.txt").read_text() == "finished"
+    assert result.success is (exit_status == 0)
+    assert result.exit_code == exit_status
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert result.truncated is True
+    assert "Process output capture limit reached" in result.output
+
+
+@pytest.mark.asyncio
+async def test_run_command_kills_runaway_output_before_continuing_side_effect(
+    project_root: Path, guard: SafetyGuard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ash.tools.command as command_module
+
+    monkeypatch.setattr(command_module, "MAX_COMMAND_DRAIN_BYTES", 150_000)
+    script = (
+        "import pathlib,sys,time;"
+        "sys.stdout.write('x'*300000);sys.stdout.flush();"
+        "time.sleep(30);"
+        "pathlib.Path('should-not-run.txt').write_text('ran')"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    result = await RunCommandTool(guard).run(
+        command_line=command, timeout_seconds=5
+    )
+
+    assert result.success is False
     assert result.outcome is ToolExecutionOutcome.UNKNOWN
     assert result.exit_code is None
+    assert result.truncated is True
+    assert not (project_root / "should-not-run.txt").exists()
 
 
 @pytest.mark.asyncio

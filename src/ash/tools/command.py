@@ -57,6 +57,9 @@ MAX_COMMAND_TIMEOUT_SECONDS = 86_400
 MAX_COMMAND_INPUT_CHARS = 100_000
 MAX_COMMAND_CWD_CHARS = 4_096
 MAX_COMMAND_OUTPUT_CHARS = 100_000
+# Preserve a bounded live transcript while letting ordinary verbose test/build
+# commands finish. Truly runaway output still terminates the process tree.
+MAX_COMMAND_DRAIN_BYTES = 2_000_000
 OUTPUT_CAPTURE_LIMIT_NOTICE = "Process output capture limit reached."
 MAX_DIAGNOSTIC_ITEMS = 50
 MAX_SUMMARY_ITEMS = 8
@@ -464,6 +467,7 @@ class RunCommandTool(BaseTool):
                         master_fd,
                         stream_callback=stream_callback,
                         max_output_bytes=MAX_COMMAND_OUTPUT_CHARS,
+                        max_drain_bytes=MAX_COMMAND_DRAIN_BYTES,
                         process_tree_plan=process_tree_plan,
                     ),
                     timeout=timeout_seconds,
@@ -598,6 +602,7 @@ class RunCommandTool(BaseTool):
                 env=env,
                 passthrough_env_names=passthrough_env_names,
                 stream_callback=stream_callback,
+                max_drain_bytes=MAX_COMMAND_DRAIN_BYTES,
                 expected_cwd_identity=expected_cwd_identity,
             )
         except SandboxBackendUnavailable as exc:
@@ -702,6 +707,7 @@ class RunCommandTool(BaseTool):
                     process,
                     stream_callback=stream_callback,
                     max_output_bytes=MAX_COMMAND_OUTPUT_CHARS,
+                    max_drain_bytes=MAX_COMMAND_DRAIN_BYTES,
                     process_tree_plan=process_tree_plan,
                 ),
                 timeout=timeout_seconds,

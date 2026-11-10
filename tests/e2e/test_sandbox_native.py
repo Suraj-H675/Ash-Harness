@@ -20,6 +20,42 @@ from ash.tools.command import RunCommandTool
     os.name == "nt" or os.environ.get("ASH_RUN_NATIVE_SANDBOX_TESTS") != "1",
     reason="set ASH_RUN_NATIVE_SANDBOX_TESTS=1 on a supported native host",
 )
+def test_native_coding_command_can_finish_after_output_capture_limit(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = SandboxManager(
+        workspace_root=workspace, backend_preference="native", network=False
+    )
+    if sys.platform.startswith("linux"):
+        assert manager.backend_name == "bubblewrap"
+    script = (
+        "import pathlib,sys,time;"
+        "sys.stdout.write('x'*150000);sys.stdout.flush();"
+        "time.sleep(.2);"
+        "pathlib.Path('finished.txt').write_text('finished')"
+    )
+    result = asyncio.run(
+        RunCommandTool(
+            SafetyGuard(workspace),
+            sandbox_manager=manager,
+        ).run(
+            command_line="python3 -c " + shlex.quote(script),
+            timeout_seconds=10,
+        )
+    )
+    assert result.success is True
+    assert result.exit_code == 0
+    assert result.outcome.value == "completed"
+    assert result.truncated is True
+    assert (workspace / "finished.txt").read_text() == "finished"
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.environ.get("ASH_RUN_NATIVE_SANDBOX_TESTS") != "1",
+    reason="set ASH_RUN_NATIVE_SANDBOX_TESTS=1 on a supported native host",
+)
 def test_native_sandbox_enforces_supported_host_contract(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

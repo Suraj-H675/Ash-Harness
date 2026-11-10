@@ -784,6 +784,7 @@ class SandboxManager:
         passthrough_env_names: Sequence[str] = (),
         stream_callback: ProcessStreamCallback | None = None,
         expected_cwd_identity: tuple[int, int] | None = None,
+        max_drain_bytes: int | None = None,
     ) -> SandboxResult:
         """
         Run ``command`` (argv list) under the active sandbox.
@@ -802,6 +803,7 @@ class SandboxManager:
             passthrough_env_names=passthrough_env_names,
             stream_callback=stream_callback,
             expected_cwd_identity=expected_cwd_identity,
+            _max_drain_bytes=max_drain_bytes,
             _docker_container_name=None,
             _docker_supervised_token=None,
         )
@@ -821,6 +823,7 @@ class SandboxManager:
         _docker_supervised_token: str | None,
         _docker_supervised_state_directory: Path | None = None,
         _max_output_bytes: int = 100_000,
+        _max_drain_bytes: int | None = None,
     ) -> SandboxResult:
         if not command:
             raise ValueError("command must be a non-empty sequence")
@@ -864,6 +867,7 @@ class SandboxManager:
                     expected_cwd_identity=expected_cwd_identity,
                     expected_workspace_identity=self._workspace_identity,
                     max_output_bytes=_max_output_bytes,
+                    max_drain_bytes=_max_drain_bytes,
                 )
 
             return await _run_subprocess(
@@ -884,6 +888,7 @@ class SandboxManager:
                     else self._workspace_identity
                 ),
                 max_output_bytes=_max_output_bytes,
+                max_drain_bytes=_max_drain_bytes,
             )
 
     @contextmanager
@@ -1401,6 +1406,7 @@ async def _run_scoped(
     expected_cwd_identity: tuple[int, int] | None = None,
     expected_workspace_identity: tuple[int, int] | None = None,
     max_output_bytes: int = 100_000,
+    max_drain_bytes: int | None = None,
 ) -> SandboxResult:
     """Execute the command through the managed subprocess startup path."""
 
@@ -1450,6 +1456,7 @@ async def _run_scoped(
                 process,
                 stream_callback=stream_callback,
                 max_output_bytes=max_output_bytes,
+                max_drain_bytes=max_drain_bytes,
                 process_tree_plan=process_tree_plan,
             ),
             timeout=deadline,
@@ -1538,6 +1545,7 @@ async def _run_subprocess(
     expected_cwd_identity: tuple[int, int] | None = None,
     expected_workspace_identity: tuple[int, int] | None = None,
     max_output_bytes: int = 100_000,
+    max_drain_bytes: int | None = None,
 ) -> SandboxResult:
     """Execute a pre-wrapped argv (e.g. bwrap or docker run) directly."""
 
@@ -1587,6 +1595,7 @@ async def _run_subprocess(
                 process,
                 stream_callback=stream_callback,
                 max_output_bytes=max_output_bytes,
+                max_drain_bytes=max_drain_bytes,
                 process_tree_plan=process_tree_plan,
             ),
             timeout=deadline,

@@ -255,6 +255,7 @@ async def communicate_pty_process(
     *,
     stream_callback: ProcessStreamCallback | None = None,
     max_output_bytes: int | None = None,
+    max_drain_bytes: int | None = None,
     process_tree_plan: "ProcessTreePlan" | None = None,
     capture_output: bool = True,
 ) -> bytes:
@@ -262,6 +263,10 @@ async def communicate_pty_process(
 
     if max_output_bytes is not None and max_output_bytes < 1:
         raise ValueError("max_output_bytes must be positive")
+    if max_drain_bytes is not None and (
+        max_output_bytes is None or max_drain_bytes < max_output_bytes
+    ):
+        raise ValueError("max_drain_bytes must be at least max_output_bytes")
     captured = bytearray()
     read_total = 0
     output_limit_exceeded = False
@@ -291,11 +296,12 @@ async def communicate_pty_process(
                 pass
         if max_output_bytes is not None and read_total > max_output_bytes:
             output_limit_exceeded = True
-            try:
-                await terminate_process_tree(process, plan=process_tree_plan)
-            except ProcessTreeError as exc:
-                cleanup_error = exc
-            break
+            if max_drain_bytes is None or read_total > max_drain_bytes:
+                try:
+                    await terminate_process_tree(process, plan=process_tree_plan)
+                except ProcessTreeError as exc:
+                    cleanup_error = exc
+                break
     if stream_callback is not None and decoder is not None:
         trailing = decoder.decode(b"", final=True)
         if trailing:
@@ -303,12 +309,17 @@ async def communicate_pty_process(
                 stream_callback("stdout", trailing)
             except Exception:
                 pass
+    interrupted = max_drain_bytes is None or read_total > max_drain_bytes
     if output_limit_exceeded:
+        if not interrupted:
+            # PTY EOF can precede the child-watcher's exit notification.
+            # A drained, naturally completed process has a known exit status.
+            await process.wait()
         raise ProcessOutputLimitExceeded(
             f"subprocess output exceeded {max_output_bytes} bytes",
             stdout=bytes(captured),
             cleanup_error=cleanup_error,
-            interrupted=True,
+            interrupted=interrupted,
         )
     await process.wait()
     return bytes(captured)
@@ -1330,6 +1341,7 @@ async def communicate_process(
     input_data: bytes | None = None,
     stream_callback: ProcessStreamCallback | None = None,
     max_output_bytes: int | None = None,
+    max_drain_bytes: int | None = None,
     process_tree_plan: ProcessTreePlan | None = None,
 ) -> tuple[bytes, bytes]:
     """Drain pipes without relying on a racy subprocess waiter notification."""
@@ -1364,6 +1376,10 @@ async def communicate_process(
 
     if max_output_bytes is not None and max_output_bytes < 1:
         raise ValueError("max_output_bytes must be positive")
+    if max_drain_bytes is not None and (
+        max_output_bytes is None or max_drain_bytes < max_output_bytes
+    ):
+        raise ValueError("max_drain_bytes must be at least max_output_bytes")
     output_limit_exceeded = False
     captured_total = 0
     read_total = 0
@@ -1425,7 +1441,8 @@ async def communicate_process(
                 captured_total += min(len(chunk), remaining)
             if max_output_bytes is not None and read_total > max_output_bytes:
                 output_limit_exceeded = True
-                await terminate_after_output_limit()
+                if max_drain_bytes is None or read_total > max_drain_bytes:
+                    await terminate_after_output_limit()
             if stream_callback is not None and decoder is not None:
                 try:
                     text = decoder.decode(chunk)

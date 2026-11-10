@@ -229,7 +229,13 @@ values.
         destructive patterns such as `rm -rf /`, `mkfs`, `dd if=`,
         `chmod -R 777 /`, `chown`, `shutdown`, `reboot`, and `passwd`.
     3.  If command contains blacklisted patterns, raise `SafetyViolation` immediately.
-    4.  All commands run with standard output buffering. Max output size is limited to 100,000 characters.
+    4.  Commands retain a bounded output capture (100,000 bytes across
+        stdout/stderr for pipe execution; 100,000 bytes for PTY execution).
+        Ash continues draining up to 2,000,000 total bytes so ordinary verbose
+        test/build commands can finish and report their real exit status even
+        when their output is truncated. Beyond that hard limit, Ash stops the
+        managed process tree and conservatively reports an unknown outcome.
+        The live output stream is separately capped at 100,000 characters.
 
 Tool results report `success` separately from process output and include an
 `exit_code` when the process completed with a known status. Timeouts and other
