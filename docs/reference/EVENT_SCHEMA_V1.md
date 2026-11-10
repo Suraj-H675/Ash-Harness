@@ -96,6 +96,15 @@ normal terminal response with empty text. Automation must inspect the response,
 `stop_reason`, and relevant tool outcomes or independent verification evidence
 before claiming that the requested work is complete.
 
+For one-shot `ash -p` invocations, the process exits with code **1** when
+`stop_reason` is `iteration_limit`, `token_budget`, or `circuit_breaker`.
+The terminal `turn.completed` event and saved session are still emitted:
+the process ended normally but did **not** finish the turn. An ordinary
+`stop_reason=completed` exits with code 0 unless another error occurs.
+Neither code 0 nor `turn.completed` proves that the user's requested task
+passed independent tests or review. Interactive sessions retain their
+existing process-exit behavior.
+
 `turn.completed` preserves the legacy model-only `model` field and may also
 include `model_id`, the canonical `provider/model` identity of the provider that
 actually served the turn. Consumers that need route-aware attribution should

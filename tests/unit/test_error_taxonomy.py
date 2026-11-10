@@ -430,6 +430,7 @@ async def test_headless_cleanup_failure_replaces_success_with_one_json_error() -
     class ClosingLoop:
         active_model_id = "openai/test"
         _last_context_tokens = 0
+        _last_turn_stop_reason = "completed"
         last_turn_usage = {}
         recovery_summary = None
         recovered_turns = []

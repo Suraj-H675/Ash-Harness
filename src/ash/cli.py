@@ -5516,6 +5516,16 @@ async def _bootstrap_and_headless(
         if schema is not None:
             payload["structured_output"] = validate_structured_output(response, schema)
         result_payload = payload
+        # A one-shot CLI process must not signal success to scripts when Ash
+        # stopped before the turn could finish. The turn remains durably
+        # completed as an execution boundary, and its stop_reason stays in
+        # the existing terminal event for callers to inspect.
+        if loop._last_turn_stop_reason in {
+            "iteration_limit",
+            "token_budget",
+            "circuit_breaker",
+        }:
+            result_code = 1
     except asyncio.CancelledError as exc:
         primary_error = exc
         raise

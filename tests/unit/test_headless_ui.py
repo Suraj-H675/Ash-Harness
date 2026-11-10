@@ -1,5 +1,6 @@
 import io
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,54 @@ def test_json_result_is_single_machine_readable_event() -> None:
     assert payload["type"] == "turn.completed"
     assert payload["response"] == "done"
     assert payload["session_id"] == "s1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_reason", "expected_code"),
+    [
+        ("completed", 0),
+        ("iteration_limit", 1),
+        ("token_budget", 1),
+        ("circuit_breaker", 1),
+    ],
+)
+async def test_headless_unfinished_turn_preserves_result_and_exit_status(
+    stop_reason: str, expected_code: int
+) -> None:
+    from ash.cli import _bootstrap_and_headless
+
+    class FakeLoop:
+        provider = None
+        safety_guard = None
+        recovered_turns = 0
+        recovery_summary = None
+        active_model_id = "fixture/model"
+        _last_context_tokens = 100
+        last_turn_usage = {"prompt_tokens": 10, "completion_tokens": 3}
+        _last_turn_stop_reason = stop_reason
+
+        async def start_session(self, session_id=None):
+            assert session_id is None
+            return SimpleNamespace(session_id="fixture-session")
+
+        async def run_turn(self, prompt: str) -> str:
+            assert prompt == "Run task."
+            return "fixture-response"
+
+        async def aclose(self) -> None:
+            return None
+
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="json", stream=stream)
+    code = await _bootstrap_and_headless(
+        FakeLoop(), SimpleNamespace(), prompt="Run task.", session_id=None, ui=ui
+    )
+    assert code == expected_code
+    result = json.loads(stream.getvalue())
+    assert result["type"] == "turn.completed"
+    assert result["response"] == "fixture-response"
+    assert result["session_id"] == "fixture-session"
 
 
 def test_stream_json_emits_deltas_and_completion() -> None:

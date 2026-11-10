@@ -328,3 +328,29 @@ After restoring the deferred-tool runtime on `main`, one additional `two-file`
 CLI trial passed in 33.17s, including the authorized test command, hidden
 oracle, and audit-integrity check. This confirms the restored user path works
 in the tested environment, not that larger-model performance is established.
+
+## Free remote coding baseline and one-shot exit status (2026-11-10)
+
+With `5e878b5` checked out, Ash ran the real `event-log` coding task against
+`openrouter/cohere/north-mini-code:free`. The public OpenRouter catalog
+advertised zero prompt/completion prices, native tools, and sufficient context;
+the credential was passed only in the isolated model process environment.
+This was **one trial**, not a strong-model or cross-harness comparison.
+The run used a 32,768-token request context, 80,000-token turn budget, and
+2,048-token completion cap. It made 16 provider requests in 42.19s
+(43.48s including setup and grading), using 61,436 prompt and 3,620
+completion tokens. The model read requirements, attempted the authorized test,
+edited two of the three required modules, and stopped before repairing the
+renderer or verifying the changes. Both the visible and hidden oracles failed;
+protected files and the audit remained intact. The score was **0/1 passed**.
+Private evidence is under
+`/var/tmp/ash-openrouter-cohere-eventlog-20261110/`.
+
+This trial also exposed a separate **CLI automation defect**: the model hit
+the configured 16-iteration limit and the JSON completion event correctly
+reported `stop_reason=iteration_limit`, but the process exited with status 0.
+A deterministic real-CLI regression then reproduced the same misleading exit
+status in text, JSON, and streaming JSON. One-shot CLI exit status now reports
+failure for iteration exhaustion, turn-token exhaustion, and circuit-breaker
+stops, while preserving the terminal event, saved session, and audit.
+This improves **completion signaling**, not model quality or coding-task success.
