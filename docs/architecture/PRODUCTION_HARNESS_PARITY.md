@@ -123,6 +123,18 @@ context use or stable completion across repeated matched trials. Feature
 implementation, long-running recovery, larger navigation tasks, head-to-head
 comparison and public-release gates remain open.
 
+**Existing-repository feature addition (2026-11-10):** A separate
+`urllib3/urllib3` task predeclared the new URL authentication convenience
+properties and verified red original/green upstream reference on both
+visible and sealed behavioral oracles. GPT-6.1 Sol implemented the feature
+through Ash's real CLI at 32K request context and 120K turn budget, edited
+only `src/urllib3/util/url.py`, ran the authorized test, passed both oracles,
+and produced a valid audit (38.34s total; six model requests). See the
+[real-repository baseline](../benchmarks/REAL_REPOSITORY_BASELINE_2026-11-10.md).
+This adds evidence for **one scoped feature implementation**, not broad
+feature-design reliability or competitive coding efficiency. Acceptance
+remains **NOT YET**.
+
 Reassess these gates from **current** source, supported-host runtime, and
 independent results. Explicitly state what remains open; do not repeat
 historical “parity closed” language as a fresh daily-driver endorsement.

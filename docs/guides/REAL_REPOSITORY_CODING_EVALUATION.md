@@ -18,6 +18,7 @@ lifetime for the chosen trial. Model IDs are confirmed in the account catalog.
 | `h11-chunk-footer` | [python-hyper/h11](https://github.com/python-hyper/h11) | `31e626c64e1e28db3cd73a6aa0ac057f1b915c18` | `dff7cc397a26ed4acdedd92d1bda6c8f18a6ed9f` | `h11/_readers.py` |
 | `urllib3-header-sanitization` | [urllib3/urllib3](https://github.com/urllib3/urllib3) | `8883fd900057ee65f553586389ecd70269f05e04` | `96449eb1ac8cfca8fb9605b8bbff7a5fe0081dd2` | `src/urllib3/connection.py` |
 | `urllib3-proxy-redirect` | [urllib3/urllib3](https://github.com/urllib3/urllib3) | `e349d97f2bf234b95d5dd9e689d056a521dfc3b0` | `01cd60b539f808a65e9c5aa93db1c48292432176` | `src/urllib3/connectionpool.py` and `src/urllib3/poolmanager.py` |
+| `urllib3-url-auth-feature` | [urllib3/urllib3](https://github.com/urllib3/urllib3) | `5454903f272718f19d68d5f78789251bd5c5b443` | `5cf0247049a4baa02e830666de53431e5b575694` | `src/urllib3/util/url.py` |
 
 Each original repository is fetched at the **exact pinned Git commit**, with
 no agent access to the later reference fix. Before inference, the benchmark
@@ -36,6 +37,15 @@ pools rather than live network connections. Because urllib3 generates its
 `_version` module at installation, the evaluation scripts supply a
 noncredentialed runtime stub without changing the upstream checkout.
 The fixed oracles check behavior, not source text.
+
+The fourth task is an actual **feature implementation**: adding
+`Url.auth_decoded` and `Url.auth_decoded_joined` convenience properties to
+the existing urllib3 URL parser. Tests verify UTF-8 percent-decoding,
+missing versus empty passwords, first-colon parsing, preservation of the
+percent-encoded raw `auth` field, and Basic-auth-ready trailing-colon
+semantics. Only `src/urllib3/util/url.py` may change. The upstream feature
+commit also contained ancillary socks and documentation updates, which are
+not part of this deliberately scoped task.
 
 ## Example usage
 
@@ -71,7 +81,8 @@ edits, an executed authorized test, both external oracles passing, protected
 files unchanged, and verified session audit.
 
 Interpret each trial narrowly. This replay suite contains two real-world
-**single-module regression repairs** and one **two-module regression repair**;
-it does not yet cover feature work, language/build ecosystem diversity,
+**single-module regression repairs**, one **two-module regression repair**,
+and one **single-module feature addition**. It does not yet cover more
+substantial feature work, language/build ecosystem diversity,
 interruption/resume, repeated reliability, or a fair same-model competitor
 baseline. Those remain open acceptance work.

@@ -116,3 +116,42 @@ consumption. Do not fold the changed-budget retries into the earlier 2/2
 single-module score or claim that increased budgets improved the harness
 itself. Compare with a leading CLI under matched model, budgets, tools, and
 permissions before drawing conclusions about operational efficiency.
+
+## First existing-repository feature task: URL auth decoding (2026-11-10)
+
+The fourth curated task is **feature implementation**, not a regression fix:
+add `Url.auth_decoded` and `Url.auth_decoded_joined` convenience properties
+to an existing urllib3 URL parser. The pinned initial source is
+`5454903f272718f19d68d5f78789251bd5c5b443`; the independent historical
+reference feature is
+`5cf0247049a4baa02e830666de53431e5b575694`. The original failed the
+visible and hidden oracles; the reference passed both. The trial required
+only `src/urllib3/util/url.py` to change, and prevented edits to the test,
+packaging metadata, or any other file.
+
+GPT-6.1 Sol ran with a **32,768-token request context** and a **120,000-token
+turn budget**. Ash successfully read the URL parser and visible test, made
+two authorized source-edit calls, executed the exact
+`python3 -B qa_visible.py` command, and completed the CLI with exit 0.
+Both external oracles passed; the session audit verified and protected files
+were unchanged.
+
+| Measure | Observed |
+|---|---:|
+| Independently scored result | **Pass, 1/1** |
+| Full trial / CLI duration | 38.34s / 32.94s |
+| Model requests | 6 (all completed) |
+| Prompt / completion tokens | 41,211 / 601 |
+| Authorized tool calls | 5 / 5 succeeded |
+| Files changed | `src/urllib3/util/url.py` only |
+| Scratch and temporary access-only credential home | Deleted |
+
+Private evidence:
+`/var/tmp/ash-urllib3-auth-feature-sol-20261110/`.
+
+This demonstrates a correct, independently graded **single-production-module
+feature** through Ash's real CLI. It does not prove performance on open-ended
+feature design, multi-module feature changes, new dependencies, or large
+existing-project navigation. The earlier large two-module repair's budget
+pressure remains unresolved. Competitor-matched tests and repeated trials
+remain outstanding.

@@ -40,6 +40,11 @@ _spec.loader.exec_module(bench)
             "https://github.com/urllib3/urllib3.git",
             {"src/urllib3/connectionpool.py", "src/urllib3/poolmanager.py"},
         ),
+        (
+            "urllib3-url-auth-feature",
+            "https://github.com/urllib3/urllib3.git",
+            {"src/urllib3/util/url.py"},
+        ),
     ],
 )
 def test_upstream_tasks_are_pinned_and_oracles_sealed(

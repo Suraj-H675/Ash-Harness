@@ -272,6 +272,56 @@ assert case["Cookie"] == "id=keep"
 assert case["Host"] == "alpha.invalid"
 """
 
+URLLIB3_AUTH_FEATURE_VISIBLE = r"""import sys
+import types
+version = types.ModuleType("urllib3._version")
+version.__version__ = "0.0+repository-benchmark"
+sys.modules["urllib3._version"] = version
+sys.path.insert(0, "src")
+from urllib3.util.url import parse_url
+
+examples = [
+    ("http://someone:secret@example.invalid/", ("someone", "secret"), "someone:secret"),
+    ("http://someone@example.invalid/", ("someone", None), "someone:"),
+    ("http://someone:@example.invalid/", ("someone", ""), "someone:"),
+    ("http://user%40mail:pass%3Aword@example.invalid/", ("user@mail", "pass:word"), "user@mail:pass:word"),
+    ("http://example.invalid/", (None, None), None),
+]
+for uri, pair, joined in examples:
+    result = parse_url(uri)
+    assert result.auth_decoded == pair, (uri, result.auth_decoded)
+    assert result.auth_decoded_joined == joined, (uri, result.auth_decoded_joined)
+    assert result.auth == (uri.split("@", 1)[0].split("//", 1)[1] if "@" in uri else None)
+"""
+
+URLLIB3_AUTH_FEATURE_HIDDEN = r"""import sys
+import types
+version = types.ModuleType("urllib3._version")
+version.__version__ = "0.0+repository-benchmark"
+sys.modules["urllib3._version"] = version
+sys.path.insert(0, "src")
+from urllib3.util.url import parse_url, Url
+
+examples = [
+    ("http://name%3Awith%3Acolon:p%40ss%2Fword@example.invalid/", ("name:with:colon", "p@ss/word"), "name:with:colon:p@ss/word"),
+    ("http://%E6%BC%A2%E5%AD%97:%C3%A9@example.invalid/", ("漢字", "é"), "漢字:é"),
+    ("http://user-name:pass_word@example.invalid/", ("user-name", "pass_word"), "user-name:pass_word"),
+    ("http://x%20y@example.invalid/", ("x y", None), "x y:"),
+    ("http://user:pass:more@example.invalid/", ("user", "pass:more"), "user:pass:more"),
+    ("http://:pass@example.invalid/", ("", "pass"), ":pass"),
+    ("http://example.invalid/", (None, None), None),
+]
+for uri, pair, joined in examples:
+    result = parse_url(uri)
+    assert result.auth_decoded == pair, (uri, result.auth_decoded)
+    assert result.auth_decoded_joined == joined, (uri, result.auth_decoded_joined)
+
+raw = Url(scheme="http", auth="first%3Aname:second%3Avalue", host="example.invalid")
+assert raw.auth_decoded == ("first:name", "second:value")
+assert raw.auth_decoded_joined == "first:name:second:value"
+assert raw.auth == "first%3Aname:second%3Avalue"
+"""
+
 
 @dataclass(frozen=True)
 class RepositoryTask:
@@ -362,6 +412,34 @@ TASKS = {
             "src/urllib3/connectionpool.py and src/urllib3/poolmanager.py, "
             "then run exactly python3 -B qa_visible.py with run_command. "
             "No other commands are authorized. Preserve public APIs and tests."
+        ),
+    ),
+    "urllib3-url-auth-feature": RepositoryTask(
+        source="urllib3/urllib3",
+        upstream="https://github.com/urllib3/urllib3.git",
+        base_sha="5454903f272718f19d68d5f78789251bd5c5b443",
+        reference_fix_sha="5cf0247049a4baa02e830666de53431e5b575694",
+        editable=frozenset({"src/urllib3/util/url.py"}),
+        visible_script="qa_visible.py",
+        visible_source=URLLIB3_AUTH_FEATURE_VISIBLE,
+        hidden_source=URLLIB3_AUTH_FEATURE_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Implement a new URL authentication convenience feature in this "
+            "pinned real urllib3 repository. The Url result of parse_url() "
+            "currently stores its userinfo in percent-encoded auth. Add "
+            "read-only Url.auth_decoded returning (username, password) with "
+            "percent escapes decoded as UTF-8. Without auth return (None, None); "
+            "without a password return (username, None), distinguishing an "
+            "empty password. Add Url.auth_decoded_joined returning the decoded "
+            "userinfo as a Basic-auth-ready colon-separated string. Include "
+            "a trailing colon for a username without a password, and return "
+            "None when no auth is supplied. Partition on the first raw colon "
+            "before decoding, so encoded colons are preserved correctly. "
+            "Retain the existing raw Url.auth value and other URL behavior. "
+            "Review qa_visible.py; edit ONLY src/urllib3/util/url.py, then "
+            "execute exactly python3 -B qa_visible.py with run_command. "
+            "No other commands are authorized. Preserve other files and APIs."
         ),
     ),
 }
