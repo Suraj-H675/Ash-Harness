@@ -1522,6 +1522,99 @@ async def test_provider_eof_after_output_is_never_replayed(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalid_kind", "expected_signature"),
+    [
+        ("native_arguments", "arguments:value_error"),
+        ("reasoning_shape", "reasoning:list_type"),
+    ],
+)
+async def test_invalid_provider_chunk_reports_content_free_field_and_never_replays(
+    tmp_path, invalid_kind: str, expected_signature: str
+) -> None:
+    from ash.providers.messages import CanonicalToolCall
+
+    private_marker = "SENSITIVE_MODEL_OUTPUT_12345"
+
+    class MalformedProvider(ProviderABC):
+        model_name = "malformed-provider-chunk"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(str(text))
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            yield StreamChunk(content="partial response")
+            if invalid_kind == "native_arguments":
+                # Matches the validation path of malformed OpenAI-compatible
+                # native tool-call JSON produced by a local model.
+                yield StreamChunk(
+                    native_tool_calls=[
+                        CanonicalToolCall.model_validate(
+                            {
+                                "call_id": "bad-args",
+                                "name": "read_file",
+                                "arguments": "{" + private_marker,
+                            }
+                        )
+                    ],
+                    is_done=True,
+                )
+            else:
+                yield StreamChunk.model_validate(
+                    {"reasoning": private_marker, "is_done": True}
+                )
+
+    provider = MalformedProvider()
+    store = SessionStore(tmp_path / "malformed-stream.db")
+    loop = AshLoop(
+        store,
+        provider,
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        config=AshConfig(model="openai/test", provider_max_attempts=3),
+    )
+    try:
+        with pytest.raises(ProviderCompletionError) as caught:
+            await loop.run_turn("reject malformed output")
+        assert expected_signature in str(caught.value)
+        assert private_marker not in str(caught.value)
+        assert provider.calls == 1
+        assert loop.current_session is not None
+        saved = store.load_session(loop.current_session.session_id)
+        assert [message.role for message in saved.messages] == ["user"]
+        assert not saved.tool_calls
+        assert store.verify_audit_log(saved.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+def test_provider_validation_diagnostic_does_not_repeat_untrusted_field_names() -> None:
+    from pydantic import ValidationError
+
+    from ash.providers.messages import CanonicalToolCall
+
+    private_marker = "MODEL_SUPPLIED_PRIVATE_FIELD_12345"
+    with pytest.raises(ValidationError) as caught:
+        CanonicalToolCall.model_validate(
+            {
+                "call_id": "example",
+                "name": "read_file",
+                "arguments": {},
+                private_marker: "private data",
+            }
+        )
+    result = loop_module._provider_stream_validation_signature(caught.value)
+    assert result == "unknown:extra_forbidden"
+    assert private_marker not in result
+
+
+@pytest.mark.asyncio
 async def test_provider_output_after_terminal_chunk_is_rejected(tmp_path) -> None:
     class PostTerminalProvider(ProviderABC):
         model_name = "post-terminal"

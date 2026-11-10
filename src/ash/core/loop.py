@@ -84,6 +84,7 @@ from ash.providers.base import (
     ProviderCompletionError,
     ProviderIncompleteStreamError,
     ProviderTerminalError,
+    StreamChunk,
     TokenCounterLike,
     close_async_stream,
     completion_stop_category,
@@ -904,6 +905,34 @@ def _provider_credential_event_fields(
         "credential_profile": profile,
         "credential_pool_size": count,
     }
+
+
+def _provider_stream_validation_signature(exc: ValidationError) -> str:
+    """Name only known schema fields/error codes; never expose rejected values."""
+    allowed_fields = (
+        StreamChunk.model_fields.keys() | CanonicalToolCall.model_fields.keys()
+    )
+    for issue in exc.errors(
+        include_input=False, include_context=False, include_url=False
+    ):
+        path = issue.get("loc", ())
+        candidate = path[0] if path else None
+        field = (
+            candidate
+            if isinstance(candidate, str) and candidate in allowed_fields
+            else "unknown"
+        )
+        candidate_kind = issue.get("type")
+        kind = (
+            candidate_kind
+            if isinstance(candidate_kind, str)
+            and len(candidate_kind) <= 48
+            and candidate_kind.isascii()
+            and candidate_kind.replace("_", "").isalnum()
+            else "validation_error"
+        )
+        return f"{field}:{kind}"
+    return "unknown:validation_error"
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness for local development.
@@ -5212,7 +5241,8 @@ class AshLoop:
                                         "its text-size limit"
                                     ) from exc
                                 raise ProviderCompletionError(
-                                    "provider emitted an invalid stream chunk"
+                                    "provider emitted an invalid stream chunk "
+                                    f"({_provider_stream_validation_signature(exc)})"
                                 ) from exc
                             except asyncio.TimeoutError as exc:
                                 raise TimeoutError(
