@@ -115,7 +115,9 @@ def _skipped_generated_note(skipped: set[str]) -> str:
 
 
 class ListDirectoryArgs(BaseModel):
-    directory_path: str = "."
+    directory_path: str = Field(
+        ".", description="Project-relative directory; '.' lists the project root."
+    )
     recursive: bool = False
     max_results: int = Field(DEFAULT_MAX_RESULTS, ge=1, le=HARD_MAX_RESULTS)
 
@@ -123,7 +125,9 @@ class ListDirectoryArgs(BaseModel):
 class ListDirectoryTool(BaseTool):
     name = "list_dir"
     execution_contract = ToolExecutionContract(parallel_safe=True)
-    description = "List workspace files and directories with bounded output."
+    description = (
+        "List bounded workspace files and directories with project-relative paths."
+    )
     args_schema = ListDirectoryArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
@@ -158,7 +162,7 @@ class ListDirectoryTool(BaseTool):
                 break
             if scanned % WORKSPACE_SCAN_YIELD_INTERVAL == 0:
                 await asyncio.sleep(0)
-            relative = path.relative_to(root).as_posix()
+            relative = path.relative_to(self.safety_guard.project_root).as_posix()
             entries.append(relative + ("/" if is_directory else ""))
         entries.sort()
         output = "\n".join(entries)
@@ -175,8 +179,14 @@ class ListDirectoryTool(BaseTool):
 
 
 class GlobFilesArgs(BaseModel):
-    pattern: str = Field(..., min_length=1)
-    directory_path: str = "."
+    pattern: str = Field(
+        ...,
+        min_length=1,
+        description="Glob relative to directory_path; returned paths are project-relative.",
+    )
+    directory_path: str = Field(
+        ".", description="Project-relative search directory; '.' is the project root."
+    )
     max_results: int = Field(DEFAULT_MAX_RESULTS, ge=1, le=HARD_MAX_RESULTS)
 
 
@@ -185,7 +195,8 @@ class GlobFilesTool(BaseTool):
     execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
         "Find workspace files by glob (e.g. '**/*.py'). Broad searches skip "
-        "known generated directories; set directory_path to include one."
+        "known generated directories; set directory_path to include one. "
+        "Returned paths are project-relative."
     )
     args_schema = GlobFilesArgs
 
@@ -238,13 +249,13 @@ class GlobFilesTool(BaseTool):
             except (OSError, SafetyViolation):
                 scan_incomplete = True
                 continue
-            relative = path.relative_to(root).as_posix()
-            if not _matches_workspace_glob(relative, args.pattern):
+            relative_to_search = path.relative_to(root).as_posix()
+            if not _matches_workspace_glob(relative_to_search, args.pattern):
                 continue
             if len(matches) >= args.max_results:
                 match_truncated = True
                 break
-            matches.append(relative)
+            matches.append(path.relative_to(self.safety_guard.project_root).as_posix())
         matches.sort()
         output = "\n".join(matches)
         if match_truncated:
@@ -269,7 +280,11 @@ class GlobFilesTool(BaseTool):
 class SearchTextArgs(BaseModel):
     pattern: str = Field(..., min_length=1, max_length=4_096)
     directory_path: str = Field(
-        ".", description="Workspace directory or single regular file to search."
+        ".",
+        description=(
+            "Project-relative directory or regular file to search. "
+            "Returned file locations are project-relative."
+        ),
     )
     glob: str | None = None
     fixed_strings: bool = False
@@ -433,11 +448,12 @@ class SearchTextTool(BaseTool):
                 await asyncio.sleep(0)
             if is_directory:
                 continue
-            relative = path.relative_to(
+            relative_to_search = path.relative_to(
                 self.safety_guard.project_root if single_file else root
             ).as_posix()
-            if args.glob and not _matches_workspace_glob(relative, args.glob):
+            if args.glob and not _matches_workspace_glob(relative_to_search, args.glob):
                 continue
+            relative = path.relative_to(self.safety_guard.project_root).as_posix()
             try:
                 _, content = read_scoped_bytes(
                     path,

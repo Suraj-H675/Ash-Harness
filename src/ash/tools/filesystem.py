@@ -78,7 +78,10 @@ class TextEncodingError(ValueError):
 
 
 class ReadFileArgs(BaseModel):
-    file_path: str = Field(..., description="Workspace path.")
+    file_path: str = Field(
+        ...,
+        description="Prefer a project-relative path, e.g. 'pkg/app.py' from list_dir.",
+    )
     start_line: int = Field(1, ge=1, description="First line (1-based).")
     end_line: int | None = Field(None, ge=1, description="Last line.")
     start_column: int = Field(

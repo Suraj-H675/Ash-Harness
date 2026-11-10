@@ -9,6 +9,7 @@ import pytest
 
 from ash.safety.guard import SafetyGuard
 from ash.tools import search as search_module
+from ash.tools.filesystem import ReadFileTool
 from ash.tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
 
 
@@ -151,6 +152,47 @@ async def test_glob_files_returns_relative_matches(tmp_path) -> None:
     (tmp_path / "README.md").write_text("readme")
     result = await GlobFilesTool(SafetyGuard(tmp_path)).run(pattern="**/*.py")
     assert result.output == "src/app.py"
+
+
+@pytest.mark.asyncio
+async def test_scoped_discovery_paths_can_be_read_from_workspace_root(tmp_path) -> None:
+    package = tmp_path / "pkg"
+    (package / "sub").mkdir(parents=True)
+    (package / "app.py").write_text("needle app\n", encoding="utf-8")
+    (package / "sub" / "util.py").write_text("needle util\n", encoding="utf-8")
+    guard = SafetyGuard(tmp_path)
+    for tool, field_name in (
+        (ListDirectoryTool(guard), "directory_path"),
+        (GlobFilesTool(guard), "pattern"),
+        (SearchTextTool(guard), "directory_path"),
+        (ReadFileTool(guard), "file_path"),
+    ):
+        assert (
+            "project-relative"
+            in tool.json_schema()["properties"][field_name]["description"].lower()
+        )
+
+    listed = await ListDirectoryTool(guard).run(directory_path="pkg")
+    recursive = await ListDirectoryTool(guard).run(directory_path="pkg", recursive=True)
+    globbed = await GlobFilesTool(guard).run(pattern="**/*.py", directory_path="pkg")
+    scoped_glob = await GlobFilesTool(guard).run(pattern="app.py", directory_path="pkg")
+    searched = await SearchTextTool(guard).run(
+        pattern="needle", directory_path="pkg", fixed_strings=True
+    )
+    scoped_search = await SearchTextTool(guard).run(
+        pattern="needle", directory_path="pkg", glob="app.py", fixed_strings=True
+    )
+
+    assert listed.output == "pkg/app.py\npkg/sub/"
+    assert recursive.output == "pkg/app.py\npkg/sub/\npkg/sub/util.py"
+    assert globbed.output == "pkg/app.py\npkg/sub/util.py"
+    assert scoped_glob.output == "pkg/app.py"
+    assert searched.output == "pkg/app.py:1:needle app\npkg/sub/util.py:1:needle util"
+    assert scoped_search.output == "pkg/app.py:1:needle app"
+    for path in globbed.output.splitlines():
+        result = await ReadFileTool(guard).run(file_path=path)
+        assert result.success is True, (path, result.error)
+        assert "needle" in result.output
 
 
 @pytest.mark.asyncio

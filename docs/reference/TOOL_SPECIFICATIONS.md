@@ -168,6 +168,14 @@ Performs structured Search and Replace operations on a contiguous block of text.
 ### 2.4 `list_dir`
 Scans workspace contents.
 
+`list_dir`, `glob_files`, and `search_text` report file locations **relative to
+Current Project Path**, even when `directory_path` selects a nested directory.
+For example, listing `directory_path="pkg"` yields `pkg/app.py`, which can be
+passed unchanged to `read_file`. Glob patterns are still matched relative to
+the selected search directory: `pattern="app.py", directory_path="pkg"` finds
+`pkg/app.py`. Search matches retain `path:line:text` formatting. All paths
+remain subject to the same workspace guards; no denied path is rewritten.
+
 `list_dir`, `glob_files`, and `search_text` return a known-completed,
 unsuccessful tool result when their root path is outside the workspace instead
 of raising an exception after dispatch. The refusal preserves the attempted
