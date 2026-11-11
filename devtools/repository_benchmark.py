@@ -742,6 +742,7 @@ def run_task(
             "source": task.source,
             "base_sha": task.base_sha,
             "reference_fix_sha": task.reference_fix_sha,
+            "task_prompt_sha256": hashlib.sha256(task.prompt.encode()).hexdigest(),
             "preflight": preflight_receipt,
             "ash_head": subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=REPO, text=True

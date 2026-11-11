@@ -111,3 +111,24 @@ def test_mismatched_effort_does_not_claim_model_parity(tmp_path: Path) -> None:
     assert report["requested_model_effort_match"] is False
     assert report["requested_model"] is None
     assert report["evaluation"]["fully_controlled"] is False
+
+
+@pytest.mark.parametrize("matching", [True, False])
+def test_task_fingerprint_requires_identical_declared_objective(
+    tmp_path: Path, matching: bool
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    ash_file = ash / "result.json"
+    ash_result = json.loads(ash_file.read_text())
+    ash_result["task_prompt_sha256"] = "a" * 64
+    ash_file.write_text(json.dumps(ash_result))
+    codex_file = codex / "manifest.json"
+    codex_manifest = json.loads(codex_file.read_text())
+    codex_manifest["task_prompt_sha256"] = "a" * 64 if matching else "b" * 64
+    codex_file.write_text(json.dumps(codex_manifest))
+    if matching:
+        report = comparison.compare(ash, codex)
+        assert report["evaluation"]["same_task_objective_fingerprint_verified"] is True
+    else:
+        with pytest.raises(ValueError, match="objectives do not match"):
+            comparison.compare(ash, codex)

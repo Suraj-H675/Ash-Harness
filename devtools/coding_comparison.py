@@ -51,6 +51,20 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
         or manifest.get("reference_fix_sha") != reference
     ):
         raise ValueError("comparator upstream revisions do not match")
+    ash_task_hash = ash.get("task_prompt_sha256")
+    codex_task_hash = manifest.get("task_prompt_sha256")
+    objective_verified = (
+        isinstance(ash_task_hash, str)
+        and isinstance(codex_task_hash, str)
+        and len(ash_task_hash) == len(codex_task_hash) == 64
+        and ash_task_hash == codex_task_hash
+    )
+    if (
+        ash_task_hash is not None
+        and codex_task_hash is not None
+        and not objective_verified
+    ):
+        raise ValueError("comparator objectives do not match")
 
     ash_model = _required_str(ash, "provider_model")
     codex_model = _required_str(codex, "model_requested")
@@ -116,6 +130,7 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             # could not inspect the grader or that both oracles were identical.
             "fully_controlled": False,
             "same_upstream_revision_pins": True,
+            "same_task_objective_fingerprint_verified": objective_verified,
             "identical_oracle_provenance_verified": False,
             "model_and_effort_only_requested_not_attested": True,
             "identical_prompts_verified": False,

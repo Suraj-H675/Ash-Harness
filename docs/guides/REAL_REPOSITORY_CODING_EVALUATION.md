@@ -99,3 +99,39 @@ and one **single-module feature addition**. It does not yet cover more
 substantial feature work, language/build ecosystem diversity,
 interruption/resume, repeated reliability, or a fair same-model competitor
 baseline. Those remain open acceptance work.
+
+## Repeatable Codex + Poteto comparator
+
+The optional devtools/codex_repository_benchmark.py uses these same
+predeclared tasks, pinned historical source commits, preflight red/green
+oracles and protected-file snapshots. It runs against a fresh disposable
+checkout and grades after the model exits. A preflight-only exercise requires
+no Codex inference:
+
+~~~sh
+PYTHONPATH=src .venv/bin/python devtools/codex_repository_benchmark.py \
+  --task h11-chunk-footer --model gpt-6-luna --reasoning-effort xhigh \
+  --preflight-only --evidence-dir /var/tmp/ash-codex-h11-preflight
+~~~
+
+For an actual operator-approved, bounded model run, omit --preflight-only,
+choose a new evidence directory, and optionally set --timeout (30–300
+seconds). A zero exit means both independent oracles passed, the authorized
+source was changed, protected files stayed unchanged, the visible QA command
+was observed succeeding, and the Codex CLI emitted a completed turn. A
+timeout cannot count as a finished run even if the resulting code passes.
+Evidence directories cannot be overwritten, and private Codex JSONL/stderr
+logs are retained outside Git. Scratch source checkouts are removed after
+grading. The runner reads Codex's existing user-owned login; it does not
+copy credentials or inherit ambient API-token variables.
+
+**Comparison limitations:** Codex still uses its configured Poteto skills;
+the shell sandbox and command permissions are not identical to Ash's exact
+tool grant. Network blocking is requested through Codex configuration, not
+independently verified, and access to every host-side file has not been
+proven isolated. Its prompt starts with the mandated Poteto instruction
+and adapts Ash-only tool terminology, so the full agent prompts differ.
+Both runners now record a SHA-256 of the identical canonical task objective,
+allowing future receipt comparisons to detect objective drift without
+mistaking different system instructions for equality. Do not claim a fair
+head-to-head or competitive win from this runner alone.

@@ -73,3 +73,10 @@ boolean metadata plus a hash of the Codex prompt, not agent messages or
 source content. This is **not a Codex runner** and cannot retroactively
 verify the Codex sandbox, prompt equivalence, sealed-oracle access or actual
 inference route. Those require a controlled future execution setup.
+
+After this original hand-assembled experiment, the dedicated
+devtools/codex_repository_benchmark.py runner was added to make future
+Codex/Poteto evaluations reproducible, including a preflight-only mode that
+does not contact a model.
+This does **not** retroactively upgrade the original Codex receipt's
+trustworthiness or erase the differences in tool and sandbox policy.
