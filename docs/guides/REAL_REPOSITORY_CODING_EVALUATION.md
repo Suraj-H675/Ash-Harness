@@ -93,6 +93,17 @@ The grader requires a successful one-shot CLI completion, required source
 edits, an executed authorized test, both external oracles passing, protected
 files unchanged, and verified session audit.
 
+Ash's `replace_file_content` supports both strictly bounded replacements
+and exact, unique whole-line block matching without line bounds. The
+recommended mode for a block uniquely identifiable by its old lines,
+especially after earlier edits have shifted line positions, is the
+unbounded **unique-block** mode. This still rejects duplicates and stale
+SHA-256, does not ignore indentation, and uses the same atomic write
+guard. A bounded mismatch can offer a **non-mutating** hint for a unique
+exact block at a different location; it never silently relocates or
+fuzzily applies the edit. Use explicit current bounds when the old block
+is duplicated or location is important.
+
 Interpret each trial narrowly. This replay suite contains two real-world
 **single-module regression repairs**, one **two-module regression repair**,
 and one **single-module feature addition**. It does not yet cover more
@@ -145,8 +156,21 @@ and a fresh evidence directory, passing `--fair-prompt` to
 `devtools/repository_benchmark.py`. The two runners record the actual
 user-prompt SHA-256; `devtools/coding_comparison.py` rejects different
 user prompts or historical task-objective hashes when both are present.
+New receipts also include content-free SHA-256 fingerprints of both
+visible and hidden oracle *source*; a mismatch is rejected when both
+runners provide these fields. This proves the declared grader text
+matches, not identical grader environments or oracle inaccessibility.
 The old Poteto trials have no matched actual-user-prompt receipt and
 cannot be treated as plain-Codex comparisons.
+
+For new controlled runs, both runners **remove the preflight-only
+historical reference checkout before any model call**. Codex also
+accepts `--context-tokens 32768`, which requests
+`model_context_window=32768` from its native CLI; use the corresponding
+`--context-tokens 32768` for Ash. The comparison receipt verifies
+that both requested the same window. This does not prove that the
+providers account for system overhead identically, and Codex has no
+enforced counterpart to Ash's `--turn-token-budget`.
 
 **Comparison limitations:** The shell sandbox and command permissions are
 not identical to Ash's exact tool grants. Network blocking and host skill

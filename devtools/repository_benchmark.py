@@ -574,6 +574,16 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
     }
 
 
+def remove_reference_checkout(root: Path) -> None:
+    """Discard the historical solution after preflight, before either agent runs."""
+    reference = root / "reference"
+    if reference.is_symlink() or not reference.is_dir():
+        raise RuntimeError("preflight reference checkout missing or unsafe")
+    shutil.rmtree(reference)
+    if reference.exists() or reference.is_symlink():
+        raise RuntimeError("preflight reference checkout was not removed")
+
+
 def run_task(
     task_name: str,
     *,
@@ -598,6 +608,7 @@ def run_task(
         scratch = Path(scratch_str)
         home = Path(home_str)
         baseline, preflight_receipt = preflight(task, scratch)
+        remove_reference_checkout(scratch)
         workspace = scratch / "workspace"
         # Preserve link types instead of following upstream links into any
         # filesystem paths outside the pinned source checkout.
@@ -759,6 +770,12 @@ def run_task(
             "reference_fix_sha": task.reference_fix_sha,
             "task_prompt_sha256": hashlib.sha256(task.prompt.encode()).hexdigest(),
             "user_prompt_sha256": hashlib.sha256(user_prompt.encode()).hexdigest(),
+            "visible_oracle_sha256": hashlib.sha256(
+                task.visible_source.encode()
+            ).hexdigest(),
+            "hidden_oracle_sha256": hashlib.sha256(
+                task.hidden_source.encode()
+            ).hexdigest(),
             "fair_prompt": fair_prompt,
             "preflight": preflight_receipt,
             "ash_head": subprocess.check_output(

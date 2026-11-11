@@ -90,6 +90,9 @@ def test_edit_tool_schemas_distinguish_old_new_content_and_existing_files(
     assert "old" in replace["target_content"]["description"].lower()
     assert "new" in replace["replacement_content"]["description"].lower()
     assert "line" in replace["replacement_content"]["description"].lower()
+    assert "prefer omitting both line bounds" in replace_tool.description.lower()
+    assert "never relocate" in replace_tool.description.lower()
+    assert "previous edits shift line numbers" in replace["start_line"]["description"]
 
 
 def test_provider_tool_schema_elides_generated_titles_but_preserves_fields(
@@ -1761,7 +1764,8 @@ async def test_replace_file_content_does_not_search_outside_requested_bounds(
 
     assert result.success is False
     assert "target_content does not match" in (result.error or "")
-    assert "omit both start_line and end_line" in (result.error or "")
+    assert "multiple full-line blocks" in (result.error or "")
+    assert "use precise current line bounds" in (result.error or "")
     assert target.read_text(encoding="utf-8") == "target\nmiddle\ntarget\n"
 
 
@@ -1785,6 +1789,7 @@ async def test_replace_file_content_mismatch_explains_safe_unique_block_recovery
     assert mismatch.success is False
     assert "Read the file again" in (mismatch.error or "")
     assert "omit both start_line and end_line" in (mismatch.error or "")
+    assert "lines 2-2" in (mismatch.error or "")
     assert "--- target_content" in (mismatch.error or "")
     assert target.read_text(encoding="utf-8") == original
 
@@ -1795,6 +1800,136 @@ async def test_replace_file_content_mismatch_explains_safe_unique_block_recovery
     )
     assert recovered.success is True
     assert target.read_text(encoding="utf-8") == "header\n    replaced\nfooter\n"
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_reports_shifted_exact_match_without_relocating(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_text("header\nold\nfooter\n", encoding="utf-8")
+    tool = ReplaceFileContentTool(guard)
+    first = await tool.run(
+        file_path="doc.txt",
+        target_content="header",
+        replacement_content="header\nnew line",
+    )
+    assert first.success is True
+    new_text = "header\nnew line\nold\nfooter\n"
+    assert target.read_text(encoding="utf-8") == new_text
+    current_hash = hashlib.sha256(new_text.encode()).hexdigest()
+
+    failed = await tool.run(
+        file_path="doc.txt",
+        start_line=2,
+        end_line=2,
+        target_content="old",
+        replacement_content="updated",
+        expected_sha256=current_hash,
+    )
+    assert failed.success is False
+    assert "once at lines 3-3" in (failed.error or "")
+    assert "no edit was made" in (failed.error or "")
+    assert target.read_text(encoding="utf-8") == new_text
+
+    recovered = await tool.run(
+        file_path="doc.txt",
+        target_content="old",
+        replacement_content="updated",
+        expected_sha256=current_hash,
+    )
+    assert recovered.success is True
+    assert target.read_text(encoding="utf-8") == "header\nnew line\nupdated\nfooter\n"
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_mismatch_does_not_guess_among_duplicate_blocks(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "doc.txt"
+    source = "header\nrepeat\nseparator\nrepeat\nfooter\n"
+    target.write_text(source, encoding="utf-8")
+    tool = ReplaceFileContentTool(guard)
+    failed = await tool.run(
+        file_path="doc.txt",
+        start_line=3,
+        end_line=3,
+        target_content="repeat",
+        replacement_content="changed",
+    )
+    assert failed.success is False
+    assert "multiple full-line blocks" in (failed.error or "")
+    assert "once at lines" not in (failed.error or "")
+    assert target.read_text(encoding="utf-8") == source
+
+    unique_mode = await tool.run(
+        file_path="doc.txt",
+        target_content="repeat",
+        replacement_content="changed",
+    )
+    assert unique_mode.success is False
+    assert target.read_text(encoding="utf-8") == source
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_stale_read_prevents_shifted_match_diagnostics(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "doc.txt"
+    before = "first\nold\nlast\n"
+    target.write_text(before, encoding="utf-8")
+    stale_digest = hashlib.sha256(before.encode()).hexdigest()
+    target.write_text("inserted\n" + before, encoding="utf-8")
+    failed = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        start_line=2,
+        end_line=2,
+        target_content="old",
+        replacement_content="changed",
+        expected_sha256=stale_digest,
+    )
+    assert failed.success is False
+    assert "File changed since it was read" in (failed.error or "")
+    assert "once at lines" not in (failed.error or "")
+    assert target.read_text(encoding="utf-8") == "inserted\n" + before
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_mismatch_does_not_fuzz_indentation(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "doc.txt"
+    source = "first\n    old\nlast\n"
+    target.write_text(source, encoding="utf-8")
+    failed = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        start_line=1,
+        end_line=1,
+        target_content="old",
+        replacement_content="new",
+    )
+    assert failed.success is False
+    assert "once at lines" not in (failed.error or "")
+    assert target.read_text(encoding="utf-8") == source
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_shift_hint_refuses_unicode_line_boundary_near_match(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "doc.txt"
+    source = "header\none\u2028two\nfooter\n"
+    target.write_text(source, encoding="utf-8")
+    failed = await ReplaceFileContentTool(guard).run(
+        file_path="doc.txt",
+        start_line=1,
+        end_line=1,
+        target_content="one\u2028two",
+        replacement_content="replacement",
+    )
+    assert failed.success is False
+    assert "once at lines" not in (failed.error or "")
+    assert target.read_text(encoding="utf-8") == source
 
 
 @pytest.mark.asyncio

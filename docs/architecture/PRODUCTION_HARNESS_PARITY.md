@@ -174,6 +174,61 @@ limits and permission semantics remain different; a single pair does
 not establish a general competitive winner. See
 [the scored paired evidence](../benchmarks/COMPARATIVE_H11_2026-11-11.md).
 
+**Second matched-requested-context coding comparison (2026-11-11):**
+The real pinned urllib3 URL-authentication feature was run with
+identical user-prompt SHA-256
+`4171e7ee9ba43fdc3efd4a01660da2463a85f0661d28209846b0b0c117c36bb2`,
+requested GPT-6 Luna xhigh, requested 32,768-token context windows and
+a 170-second limit. Both independently passed visible and hidden
+oracles, edited only `src/urllib3/util/url.py`, preserved protected files,
+and terminated successfully. Ash took **82.89 seconds**, and isolated
+native Codex took **71.70 seconds**. Both runners discarded their
+preflight historical-reference checkout before model execution.
+Private receipts are under
+`/var/tmp/ash-fair2-urllib3-url-auth-luna-xhigh-20261111/` and
+`/var/tmp/ash-fair2-codex-urllib3-url-auth-luna-xhigh-20261111/`.
+This single additional pair reinforces **an efficiency investigation**,
+not a general competitive ranking: the native tool/runtime overheads,
+system prompts, turn budgets and provider token accounting differ.
+
+The successful Ash trial included one refused strict line-range edit,
+followed by recovery. Codex uses context-located patch hunks
+(see [Codex's upstream file-update implementation](https://github.com/openai/codex/blob/main/codex-rs/apply-patch/src/file_update.rs)),
+while Ash already exposes unique-content replacement and a guarded
+unified-diff patch tool. Investigate whether Ash's existing tool
+selection/guidance can reduce avoidable retries without weakening
+uniqueness, SHA checks or mutation approval. No production edit semantics
+have been changed based on these two timings.
+
+**Evidence integrity improvement:** Future comparator receipts fingerprint
+both oracle source bodies, reject mismatches and report verified equality
+separately from full grader-environment parity. The two historical paired
+receipts predate this field and must not be retroactively represented as
+independently hash-attested.
+
+**Safe edit-selection follow-up (2026-11-11):** Codex's native patch
+implementation locates context hunks and tolerates several relaxed matches,
+while Ash intentionally rejects ambiguous, stale and non-exact edits.
+Rather than port more permissive matching, Ash now prioritizes its existing
+unique full-line replacement mode in model tool guidance. A failed strict
+range edit diagnoses whether the exact old block occurs uniquely elsewhere,
+or is ambiguous; it **never relocates or applies** a mismatched range.
+Adversarial tests cover shifted lines following an earlier edit, repeated
+blocks, stale SHA-256, and indentation-only near matches.
+
+One Ash-only identical-task replay of `urllib3-url-auth-feature` with
+GPT-6 Luna xhigh, 32K requested context, and 120K turn budget passed
+both independent behavioral oracles and the audit in **74.56s** (six
+model requests, 51,615 prompt tokens, zero rejected edits), compared
+with the earlier passing Ash run's **82.89s** (seven requests, 64,747
+prompt tokens, one rejected edit). Both runs preserved protected files
+and cleaned isolated credentials. These are **one run per variant**, not
+reliability or speed significance; model decisions differ between runs.
+The comparison to native Codex remains the separate requested-model-
+matched but system/tool-policy-unmatched exploratory evidence above.
+Private replay evidence:
+`/var/tmp/ash-edit-hint-urllib3-auth-luna-xhigh-20261111/result.json`.
+
 Reassess these gates from **current** source, supported-host runtime, and
 independent results. Explicitly state what remains open; do not repeat
 historical “parity closed” language as a fresh daily-driver endorsement.

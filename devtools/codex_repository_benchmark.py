@@ -29,6 +29,7 @@ from repository_benchmark import (
     check_edits,
     check_oracles,
     preflight,
+    remove_reference_checkout,
     shared_user_prompt,
     snapshot_files,
 )
@@ -212,6 +213,7 @@ def _run_codex(
     timeout: int,
     prompt: str,
     scratch: Path,
+    context_tokens: int = 32768,
 ) -> dict[str, Any]:
     executable = _native_codex_binary()
     argv = [
@@ -231,6 +233,8 @@ def _run_codex(
         "workspace-write",
         "-c",
         f'model_reasoning_effort="{effort}"',
+        "-c",
+        f"model_context_window={context_tokens}",
         "-c",
         'approval_policy="never"',
         "-c",
@@ -271,6 +275,7 @@ def _run_codex(
         "cli_seconds": round(time.monotonic() - start, 2),
         "codex_model": model,
         "codex_reasoning_effort": effort,
+        "context_tokens_requested": context_tokens,
         "sandbox": "workspace-write",
         "approval_policy": "never",
         "network_access_requested": False,
@@ -294,6 +299,7 @@ def run_task(
     effort: str,
     timeout: int,
     preflight_only: bool = False,
+    context_tokens: int = 32768,
 ) -> dict[str, Any]:
     """Isolate source, run Codex once at most, and score outside the checkout."""
     task = TASKS[name]
@@ -301,6 +307,7 @@ def run_task(
         scratch = Path(temp)
         (scratch / "tmp").mkdir()
         baseline, preflight_receipt = preflight(task, scratch)
+        remove_reference_checkout(scratch)
         workspace = scratch / "workspace"
         shutil.copytree(baseline, workspace, symlinks=True)
         initial = snapshot_files(workspace)
@@ -320,6 +327,12 @@ def run_task(
             "task_prompt_sha256": hashlib.sha256(task.prompt.encode()).hexdigest(),
             "codex_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
             "user_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "visible_oracle_sha256": hashlib.sha256(
+                task.visible_source.encode()
+            ).hexdigest(),
+            "hidden_oracle_sha256": hashlib.sha256(
+                task.hidden_source.encode()
+            ).hexdigest(),
         }
         (evidence / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         if preflight_only:
@@ -333,6 +346,7 @@ def run_task(
             timeout=timeout,
             prompt=prompt,
             scratch=scratch,
+            context_tokens=context_tokens,
         )
         (evidence / "invocation.json").write_text(
             json.dumps(invocation, indent=2) + "\n"
@@ -369,6 +383,7 @@ def run_task(
             "runner": "plain-codex-cli",
             "model_requested": model,
             "reasoning_effort_requested": effort,
+            "context_tokens_requested": context_tokens,
             "sandbox": "workspace-write",
             "shell_command_policy_enforced": False,
             "host_skill_discovery_disabled_requested": True,
@@ -415,6 +430,7 @@ def main() -> int:
         default="xhigh",
     )
     parser.add_argument("--timeout", type=int, default=170)
+    parser.add_argument("--context-tokens", type=int, default=32768)
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
@@ -422,6 +438,8 @@ def main() -> int:
         parser.error("model must be an explicit simple model ID")
     if not 30 <= args.timeout <= 300:
         parser.error("timeout must be between 30 and 300 seconds")
+    if not 8192 <= args.context_tokens <= 65536:
+        parser.error("context window must be between 8192 and 65536 tokens")
     if not args.preflight_only:
         try:
             _native_codex_binary()
@@ -442,6 +460,7 @@ def main() -> int:
             effort=args.reasoning_effort,
             timeout=args.timeout,
             preflight_only=args.preflight_only,
+            context_tokens=args.context_tokens,
         )
     finally:
         os.umask(previous_umask)

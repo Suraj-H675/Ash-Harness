@@ -235,6 +235,7 @@ def test_codex_timeout_terminates_process_group_without_leaking_keys(
     assert "--ignore-rules" in child_args
     assert "features.skip_host_skill_discovery=true" in child_args
     assert "features.skill_search=false" in child_args
+    assert "model_context_window=32768" in child_args
     assert "workspace-write" in child_args
     assert "PRIVATE-SENTINEL" not in repr(child_env)
     assert child_env["CODEX_HOME"] == str(tmp_path / "isolated-codex-home")
@@ -266,6 +267,9 @@ def test_scoring_rejects_modified_oracle_and_cleans_scratch(
         base.mkdir()
         (base / "source.py").write_text("BROKEN")
         (base / "qa_visible.py").write_text("assert True\n")
+        reference = scratch / "reference"
+        reference.mkdir()
+        (reference / "source.py").write_text("REFERENCE-SOLUTION")
         return base, {
             "base_visible_exit": 1,
             "base_hidden_exit": 1,
@@ -274,6 +278,7 @@ def test_scoring_rejects_modified_oracle_and_cleans_scratch(
         }
 
     def run_codex(workspace: Path, evidence: Path, **_kwargs):
+        assert not (workspace.parent / "reference").exists()
         (workspace / "source.py").write_text("FIXED")
         if tamper_visible:
             (workspace / "qa_visible.py").write_text("assert 'tampered'\n")
@@ -330,6 +335,7 @@ def test_scoring_rejects_modified_oracle_and_cleans_scratch(
     assert result["protected_files_unchanged"] is not tamper_visible
     assert result["visible_test_command_executed"] is True
     assert result["scratch_removed"] is True
+    assert result["context_tokens_requested"] == 32768
     assert not scratch_roots[0].exists()
     assert (evidence / "grade.json").is_file()
     assert (evidence / "manifest.json").is_file()

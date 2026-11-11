@@ -110,6 +110,52 @@ def test_isolated_codex_receipt_is_distinguished_from_legacy_trial(
     assert report["evaluation"]["codex_ephemeral_auth_cleanup"] is True
 
 
+@pytest.mark.parametrize("window", [32768, 65536])
+def test_comparison_discloses_requested_context_window_parity(
+    tmp_path: Path, window: int
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    ash_file = ash / "result.json"
+    a = json.loads(ash_file.read_text())
+    a["context_tokens"] = 32768
+    ash_file.write_text(json.dumps(a))
+    codex_file = codex / "grade.json"
+    c = json.loads(codex_file.read_text())
+    c["context_tokens_requested"] = window
+    codex_file.write_text(json.dumps(c))
+    report = comparison.compare(ash, codex)
+    assert report["evaluation"]["same_requested_context_window"] is (window == 32768)
+    assert report["evaluation"]["matched_context_and_turn_limits"] is False
+
+
+@pytest.mark.parametrize("matching", [True, False])
+def test_comparison_rejects_different_visible_or_hidden_oracle_source(
+    tmp_path: Path, matching: bool
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    source_hashes = {
+        "visible_oracle_sha256": "a" * 64,
+        "hidden_oracle_sha256": "b" * 64,
+    }
+    ash_file = ash / "result.json"
+    a = json.loads(ash_file.read_text())
+    a.update(source_hashes)
+    ash_file.write_text(json.dumps(a))
+    codex_file = codex / "manifest.json"
+    c = json.loads(codex_file.read_text())
+    c.update(source_hashes)
+    if not matching:
+        c["hidden_oracle_sha256"] = "c" * 64
+    codex_file.write_text(json.dumps(c))
+    if matching:
+        report = comparison.compare(ash, codex)
+        assert report["evaluation"]["identical_oracle_source_verified"] is True
+        assert report["evaluation"]["identical_oracle_provenance_verified"] is False
+    else:
+        with pytest.raises(ValueError, match="oracle source fingerprints do not match"):
+            comparison.compare(ash, codex)
+
+
 @pytest.mark.parametrize("tampered", ["task", "base_sha", "reference_fix_sha"])
 def test_comparison_rejects_different_upstream_task_or_revision(
     tmp_path: Path, tampered: str

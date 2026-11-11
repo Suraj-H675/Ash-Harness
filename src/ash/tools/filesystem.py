@@ -124,8 +124,10 @@ class ReplaceFileContentArgs(BaseModel):
         None,
         ge=1,
         description=(
-            "Optional 1-indexed inclusive start line. Supply both line bounds "
-            "for an exact range edit, or neither to match a unique block of full lines."
+            "Optional 1-indexed inclusive start line. Prefer omitting both bounds "
+            "when OLD complete lines identify exactly one block (especially after "
+            "previous edits shift line numbers). Supply both bounds only when "
+            "the exact current range is known; bounded edits never relocate."
         ),
     )
     end_line: int | None = Field(
@@ -410,9 +412,10 @@ class ReplaceFileContentTool(BaseTool):
     name = "replace_file_content"
     description = (
         "Replace OLD existing complete lines (target_content) with NEW desired "
-        "lines (replacement_content). Give both line bounds "
-        "for a strict range edit, or omit both to replace a unique full-line block. "
-        "Ambiguous matches and stale file hashes are rejected."
+        "lines (replacement_content). Prefer omitting both line bounds when OLD "
+        "lines form a unique full-line block, especially after earlier edits; "
+        "use both bounds only for a verified exact range. Bounded edits never "
+        "relocate automatically. Ambiguous matches and stale hashes are rejected."
     )
     args_schema = ReplaceFileContentArgs
 
@@ -515,13 +518,15 @@ class ReplaceFileContentTool(BaseTool):
                 _normalize_line_endings(segment)
             )
             if normalized_segment != normalized_target:
+                recovery_hint = _unique_line_mismatch_hint(
+                    original_text, normalized_target, start_index, end_index
+                )
                 return ToolResult(
                     success=False,
                     output="",
                     error=(
                         _build_mismatch_error(normalized_target, normalized_segment)
-                        + " If target_content uniquely matches a full-line block, "
-                        "omit both start_line and end_line instead."
+                        + recovery_hint
                     ),
                 )
 
@@ -879,6 +884,33 @@ def _find_unique_line_span(
 
     start_index = content.count("\n", 0, matches[0])
     return (start_index, start_index + normalized_target.count("\n") + 1), None
+
+
+def _unique_line_mismatch_hint(
+    original_text: str, normalized_target: str, start_index: int, end_index: int
+) -> str:
+    """Diagnose a shifted match; never turn a bounded edit into a search/edit."""
+    span, error = _find_unique_line_span(original_text, normalized_target)
+    if span is not None and span != (start_index, end_index):
+        # Match the unique-block tool's second exact-line validation. Some
+        # Unicode line separators affect splitlines() differently than LF.
+        source_lines = original_text.splitlines(keepends=True)
+        segment = "".join(source_lines[span[0] : span[1]])
+        if _strip_trailing_newlines(_normalize_line_endings(segment)) == normalized_target:
+            return (
+                f" Exact OLD lines occur once at lines {span[0] + 1}-{span[1]} "
+                "instead; no edit was made. Verify the target and omit both "
+                "start_line and end_line to use the unique-block mode."
+            )
+    if error is not None and "multiple full-line blocks" in error:
+        return (
+            " OLD lines occur in multiple full-line blocks; no edit was made. "
+            "Read the file again and use precise current line bounds."
+        )
+    return (
+        " If target_content uniquely matches a full-line block, "
+        "omit both start_line and end_line instead."
+    )
 
 
 def _format_read_truncation_metadata(

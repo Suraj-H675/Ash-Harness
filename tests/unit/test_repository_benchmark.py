@@ -265,6 +265,29 @@ def test_preflight_requires_red_base_and_green_upstream_fix(
         bench.preflight(task, tmp_path / "linked")
 
 
+def test_reference_checkout_deleted_before_agent_access(tmp_path: Path) -> None:
+    base = tmp_path / "baseline"
+    ref = tmp_path / "reference"
+    base.mkdir()
+    ref.mkdir()
+    (ref / "historical_fix.py").write_text("SECRET REFERENCE SOLUTION")
+    bench.remove_reference_checkout(tmp_path)
+    assert base.exists()
+    assert not ref.exists()
+    with pytest.raises(RuntimeError, match="missing or unsafe"):
+        bench.remove_reference_checkout(tmp_path)
+
+
+def test_reference_checkout_symlink_refused_without_deletion(tmp_path: Path) -> None:
+    external = tmp_path / "protected"
+    external.mkdir()
+    (external / "source.py").write_text("KEEP")
+    (tmp_path / "reference").symlink_to(external, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="missing or unsafe"):
+        bench.remove_reference_checkout(tmp_path)
+    assert (external / "source.py").read_text() == "KEEP"
+
+
 @pytest.mark.parametrize(
     ("arguments", "error"),
     [

@@ -79,6 +79,21 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
         and not same_user_prompt
     ):
         raise ValueError("comparator user prompts do not match")
+    oracle_source_identical = all(
+        isinstance(ash.get(key), str)
+        and isinstance(manifest.get(key), str)
+        and len(ash[key]) == len(manifest[key]) == 64
+        and ash[key] == manifest[key]
+        for key in ("visible_oracle_sha256", "hidden_oracle_sha256")
+    )
+    if (
+        any(
+            ash.get(key) is not None and manifest.get(key) is not None
+            for key in ("visible_oracle_sha256", "hidden_oracle_sha256")
+        )
+        and not oracle_source_identical
+    ):
+        raise ValueError("comparator oracle source fingerprints do not match")
 
     ash_model = _required_str(ash, "provider_model")
     codex_model = _required_str(codex, "model_requested")
@@ -146,12 +161,18 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             "same_upstream_revision_pins": True,
             "same_task_objective_fingerprint_verified": objective_verified,
             "identical_oracle_provenance_verified": False,
+            "identical_oracle_source_verified": oracle_source_identical,
             "model_and_effort_only_requested_not_attested": True,
             "identical_user_prompts_verified": same_user_prompt,
             "identical_system_prompts_verified": False,
             "same_skill_stack": False,
             "same_tool_and_command_authorizations": False,
             "matched_context_and_turn_limits": False,
+            "same_requested_context_window": (
+                type(ash.get("context_tokens")) is int
+                and type(codex.get("context_tokens_requested")) is int
+                and ash["context_tokens"] == codex["context_tokens_requested"]
+            ),
             "codex_hidden_oracle_unreadable_to_agent_verified": False,
             "comparator_terminal_usage_available": bool(codex.get("usage")),
             "codex_ephemeral_requested": invocation.get("ephemeral") is True,
