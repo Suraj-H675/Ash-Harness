@@ -63,13 +63,25 @@ def summarize_codex_events(log: Path, exact_test: str) -> dict[str, Any]:
     successful_test_commands = 0
     terminal: list[str] = []
     last_usage: dict[str, int] = {}
+    routing_errors = 0
+    substantive_events = 0
     with log.open(encoding="utf-8") as stream:
         for line in stream:
             event = json.loads(line)
             if not isinstance(event, dict):
                 raise ValueError("Codex event was not an object")
             kind = event.get("type")
+            # A provider-routing failure before any agent action cannot be
+            # graded as a coding failure or a competitor loss. Retain only a
+            # boolean, never the backend's potentially sensitive message.
+            if kind == "error" and isinstance(event.get("message"), str):
+                message = event["message"].lower()
+                if "workspace routing discovery failed" in message or (
+                    "workspace routing discovery timed out" in message
+                ):
+                    routing_errors += 1
             if kind in _TERMINAL_EVENTS:
+                substantive_events += 1
                 terminal.append(kind)
                 usage = event.get("usage")
                 if isinstance(usage, dict):
@@ -84,6 +96,8 @@ def summarize_codex_events(log: Path, exact_test: str) -> dict[str, Any]:
             item = event.get("item")
             if kind != "item.completed" or not isinstance(item, dict):
                 continue
+            if item.get("type") != "error":
+                substantive_events += 1
             if item.get("type") != "command_execution":
                 continue
             commands += 1
@@ -98,6 +112,9 @@ def summarize_codex_events(log: Path, exact_test: str) -> dict[str, Any]:
         "visible_test_command_executed": successful_test_commands > 0,
         "terminal_events": terminal,
         "usage": last_usage,
+        "infrastructure_unavailable": bool(
+            routing_errors and not substantive_events and not commands
+        ),
     }
 
 
@@ -245,13 +262,15 @@ def _run_codex(
         "features.skill_search=false",
         "-",
     ]
-    start = time.monotonic()
     timed_out = False
     with _isolated_codex_profile() as codex_home:
         with (
             (evidence / "codex.jsonl").open("wb") as stdout,
             (evidence / "codex.stderr").open("wb") as stderr,
         ):
+            # Match the Ash CLI timer: start immediately before spawning
+            # the agent, not while preparing the isolated auth profile.
+            start = time.monotonic()
             child = subprocess.Popen(
                 argv,
                 cwd=workspace,
@@ -269,10 +288,11 @@ def _run_codex(
             except BaseException:
                 _stop_child(child)
                 raise
+            cli_seconds = round(time.monotonic() - start, 2)
     return {
         "exit_code": child.returncode,
         "timed_out": timed_out,
-        "cli_seconds": round(time.monotonic() - start, 2),
+        "cli_seconds": cli_seconds,
         "codex_model": model,
         "codex_reasoning_effort": effort,
         "context_tokens_requested": context_tokens,
@@ -404,6 +424,9 @@ def run_task(
                 if key != "oracle_stderr_tail"
             },
             "event_log_valid": event_log_valid,
+            "infrastructure_unavailable": events.get(
+                "infrastructure_unavailable", False
+            ),
             "elapsed_seconds": invocation["cli_seconds"],
             "exit_code": invocation["exit_code"],
             "timed_out": invocation["timed_out"],

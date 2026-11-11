@@ -79,7 +79,43 @@ def test_event_summary_records_only_metadata_not_model_content(tmp_path: Path) -
     assert result["shell_non_test_commands"] == 0
     assert result["terminal_events"] == ["turn.completed"]
     assert result["usage"] == {"input_tokens": 200, "output_tokens": 12}
+    assert result["infrastructure_unavailable"] is False
     assert "PRIVATE" not in repr(result)
+
+
+def test_codex_routing_outage_is_not_counted_as_coding_failure(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "codex.jsonl"
+    path.write_text("".join(json.dumps(event) + "\n" for event in [
+        {"type": "thread.started", "thread_id": "test"},
+        {"type": "turn.started"},
+        {"type": "error", "message": "workspace routing discovery timed out"},
+        {"type": "item.completed", "item": {
+            "type": "error", "text": "PRIVATE-AUTH-DATA",
+        }},
+        {"type": "error", "message": "workspace routing discovery failed"},
+    ]))
+    result = summarize_codex_events(path, "python3 -B qa_visible.py")
+    assert result["infrastructure_unavailable"] is True
+    assert result["shell_command_count"] == 0
+    assert "PRIVATE-AUTH-DATA" not in repr(result)
+
+
+def test_codex_routing_error_after_work_does_not_invalidate_trial(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "codex.jsonl"
+    path.write_text("".join(json.dumps(event) + "\n" for event in [
+        {"type": "error", "message": "workspace routing discovery failed"},
+        {"type": "item.completed", "item": {
+            "type": "command_execution", "command": "pwd", "exit_code": 0,
+            "status": "completed",
+        }},
+    ]))
+    result = summarize_codex_events(path, "python3 -B qa_visible.py")
+    assert result["infrastructure_unavailable"] is False
+    assert result["shell_command_count"] == 1
 
 
 def test_codex_env_does_not_inherit_api_credentials(

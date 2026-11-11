@@ -124,11 +124,17 @@ and a **170-second deadline**.
 | Completed CLI and both independent oracles | PASS | PASS |
 | Protected files unchanged | PASS | PASS |
 | Required source changed | `h11/_readers.py` | `h11/_readers.py` |
-| Total wall-clock elapsed | **56.57 seconds** | **46.52 seconds** |
+| CLI execution interval | **51.80 seconds** | **46.52 seconds** |
+| Original `elapsed_seconds` receipt | 56.57 seconds (includes preflight and grading) | 46.52 seconds (CLI only) |
 | CLI timeout | No | No |
 
-This single pair shows **Codex about 10 seconds faster** on this
-specific task, with both solutions correct. It does **not** establish
+**Timing correction:** the original 10.05-second gap compared Ash's
+end-to-end interval with Codex's CLI-only interval. The comparable CLI
+intervals show Codex **about 5.28 seconds faster** on this
+specific task, with both solutions correct. The Codex CLI timer on the
+historical run also included a small isolated-profile setup/cleanup span;
+future runs start/stop the timer at the process boundaries. This single
+pair does **not** establish
 an overall speed or reliability advantage. Ash's exact-command
 authorization, tool interfaces, model context budget and token
 accounting are not mirrored by Codex's native shell tools; both
@@ -138,3 +144,45 @@ turn-token limits are not independently matched.
 Private evidence:
 `/var/tmp/ash-fair-h11-luna-xhigh-20261111/result.json` and
 `/var/tmp/ash-isolated-codex-h11-luna-xhigh-20261111/grade.json`.
+
+## Second paired-task attempt: excluded, not a competitor result
+
+On 2026-11-11 a second model/effort-matched attempt used the pinned
+`urllib3-proxy-redirect` two-module task, identical user input
+(SHA-256 `6a7c43d46d7a51ccc76c311d26ec637efaf05a5ef45b6613cf828b9e81d83416`),
+the same 65,536-token *requested* context window, GPT-6 Luna xhigh, and
+180-second subprocess deadlines. The identical hidden/visible-oracle source
+fingerprints were checked by `devtools/coding_comparison.py`. Both runners
+created disposable source checkouts and retained independent receipts.
+
+| Outcome | Ash | Isolated plain Codex |
+|---|---|---|
+| Graded completion | FAIL / deadline | FAIL / deadline |
+| Source edits | Both designated modules | None |
+| Tool calls | 21 | Zero shell commands |
+| Visible test | Not executed | Not executed |
+| Model/provider state | Nine model requests; eight completed | Nine routing-retry errors; no usable model execution |
+| External oracles | Not passing | Not passing (untouched baseline) |
+| **Count as a coding contest?** | **No** | **No** |
+
+**Exclusion reason:** the private Codex JSONL contains repeated
+`workspace routing discovery failed` / `workspace routing discovery timed out`
+errors, and native Codex's model-catalog refresh timed out. Codex never got
+to interact with the repository. This is an infrastructure-unavailable trial,
+not evidence that Ash outperformed Codex. Its original `grade.json` records
+the unsuccessful run without a routing-failure classification because that
+metadata was added to the comparator afterward; historical receipts are not
+retroactively altered. The local source and events were independently read.
+
+Ash's failure remains actionable on its own: about 138,233 prompt tokens,
+5,076 completion tokens, 177.66 seconds of completed model request time and
+0.25 seconds of tool execution, with the last edit at 178.6 seconds. The
+required visible test did not run and the unchanged oracles failed. This
+suggests investigating model-request count, read/search trajectory and
+context reuse, but does not yet identify a harness-only regression or prove
+that a particular optimization is correct. Retest without changing the task
+or its oracles, then validate any improvement on held-out tasks.
+
+Private receipts:
+`/var/tmp/ash-fair-urllib3-proxy-luna-65536-20261111-b2/result.json` and
+`/var/tmp/ash-plain-codex-urllib3-proxy-luna-65536-20261111-b1/grade.json`.

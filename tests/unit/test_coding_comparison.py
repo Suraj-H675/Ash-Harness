@@ -38,6 +38,7 @@ def _evidence(root: Path) -> tuple[Path, Path]:
                 "exit_code": 0,
                 "timed_out": False,
                 "elapsed_seconds": 80,
+                "cli_seconds": 72.5,
             }
         )
     )
@@ -46,7 +47,9 @@ def _evidence(root: Path) -> tuple[Path, Path]:
             {"task": "real-bug", "base_sha": "a" * 40, "reference_fix_sha": "b" * 40}
         )
     )
-    (codex / "invocation.json").write_text(json.dumps({"ephemeral": True}))
+    (codex / "invocation.json").write_text(json.dumps({
+        "ephemeral": True, "cli_seconds": 170,
+    }))
     (codex / "grade.json").write_text(
         json.dumps(
             {
@@ -87,6 +90,46 @@ def test_comparison_separates_correct_code_from_terminal_completion(
     assert report["codex"]["prompt_sha256"] is not None
     assert "SECRET-TEST-PROMPT" not in repr(report)
     assert report["evaluation"]["codex_native_binary_direct"] is False
+    assert report["evaluation"]["excluded_provider_outage"] is False
+    assert report["evaluation"]["matching_cli_timing_available"] is True
+    assert report["ash"]["cli_seconds"] == 72.5
+    assert report["ash"]["elapsed_scope"] == "preflight_cli_and_grading"
+    assert report["codex"]["cli_seconds"] == 170
+    assert report["codex"]["elapsed_scope"] == "cli_only"
+
+
+def test_comparison_does_not_conflate_cli_and_grading_timing(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    invocation = codex / "invocation.json"
+    data = json.loads(invocation.read_text())
+    data["cli_seconds"] = 169
+    invocation.write_text(json.dumps(data))
+    report = comparison.compare(ash, codex)
+    assert report["evaluation"]["matching_cli_timing_available"] is False
+    assert report["ash"]["elapsed_seconds"] == 80
+    assert report["ash"]["cli_seconds"] == 72.5
+    assert report["codex"]["elapsed_seconds"] == 170
+    assert report["codex"]["cli_seconds"] == 169
+
+
+def test_comparison_marks_prework_codex_provider_outage_as_excluded(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    receipt = codex / "grade.json"
+    data = json.loads(receipt.read_text())
+    data.update({
+        "infrastructure_unavailable": True,
+        "required_source_changed": False,
+        "visible_test_command_executed": False,
+        "shell_non_test_commands": 0,
+    })
+    receipt.write_text(json.dumps(data))
+    report = comparison.compare(ash, codex)
+    assert report["evaluation"]["excluded_provider_outage"] is True
+    assert report["codex"]["scored_pass"] is False
 
 
 def test_isolated_codex_receipt_is_distinguished_from_legacy_trial(

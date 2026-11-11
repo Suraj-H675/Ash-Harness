@@ -1853,8 +1853,9 @@ def test_context_restart_does_not_inherit_summary_from_empty_parent(
 
 
 @pytest.mark.parametrize("checkpoint_kind", ["restart", "native"])
+@pytest.mark.parametrize("dispatched", [False, True], ids=["legacy", "current"])
 def test_context_checkpoint_rejects_completed_turn_with_unknown_tool_outcome(
-    tmp_path: Path, checkpoint_kind: str,
+    tmp_path: Path, checkpoint_kind: str, dispatched: bool,
 ) -> None:
     store = SessionStore(tmp_path / "unknown-outcome-checkpoint.db")
     parent = store.create_session(str(tmp_path), model="openai/example")
@@ -1866,7 +1867,7 @@ def test_context_checkpoint_rejects_completed_turn_with_unknown_tool_outcome(
             tool_name="run_command",
             arguments={"command_line": "touch changed-file"},
             approved=True,
-            dispatched=True,
+            dispatched=dispatched,
             executed=True,
             success=None,
             result="",
@@ -1902,6 +1903,52 @@ def test_context_checkpoint_rejects_completed_turn_with_unknown_tool_outcome(
                 }],
             )
     assert len(store.session_tree(parent.session_id)) == 1
+
+
+@pytest.mark.parametrize("checkpoint_kind", ["restart", "native"])
+@pytest.mark.parametrize("success", [False, True])
+def test_context_checkpoint_allows_confirmed_completed_tool_outcome(
+    tmp_path: Path, checkpoint_kind: str, success: bool,
+) -> None:
+    store = SessionStore(tmp_path / "known-outcome-checkpoint.db")
+    parent = store.create_session(str(tmp_path), model="openai/example")
+    store.save_tool_call(
+        parent.session_id,
+        ToolCallRecord(
+            call_id="known-outcome",
+            tool_name="run_command",
+            arguments={"command_line": "true"},
+            approved=True,
+            dispatched=True,
+            executed=True,
+            success=success,
+            result="" if success else None,
+            error=None if success else "command exited with a known failure",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    if checkpoint_kind == "restart":
+        child = store.restart_context_session(
+            parent.session_id, expected_project_path=tmp_path,
+            user_handoff="Continue from the verified outcome",
+        )
+    else:
+        child = store.install_native_context_checkpoint(
+            parent.session_id,
+            expected_project_path=tmp_path,
+            expected_parent_messages=0,
+            expected_parent_revision=store.session_history_revision(
+                parent.session_id
+            ),
+            checkpoint=[{
+                "type": "responses_compacted_input",
+                "output": [{
+                    "type": "compaction", "encrypted_content": "opaque-test-only",
+                }],
+            }],
+        )
+    assert child.parent_session_id == parent.session_id
+    assert len(store.session_tree(parent.session_id)) == 2
 
 
 def test_context_restart_refuses_inconsistent_dispatched_tool_state(

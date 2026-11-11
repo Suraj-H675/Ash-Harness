@@ -5623,8 +5623,8 @@ class SessionStore:
                         "SELECT 1 FROM tool_calls WHERE session_id = ? "
                         "AND ((approved = 1 AND executed = 0 "
                         "AND result IS NULL AND error IS NULL) "
-                        "OR (dispatched = 1 AND "
-                        "(executed = 0 OR success IS NULL))) LIMIT 1",
+                        "OR (dispatched = 1 AND executed = 0) "
+                        "OR (executed = 1 AND success IS NULL)) LIMIT 1",
                         (session_id,),
                     ).fetchone()
                     archived_ambiguous = conn.execute(

@@ -119,6 +119,18 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
         and codex.get("protected_files_unchanged") is True
         and codex.get("required_source_changed") is True
     )
+    # The Ash receipt's elapsed_seconds includes preflight and grading,
+    # whereas the Codex receipt's elapsed_seconds is only the CLI. Use the
+    # instrumented child-process intervals for any speed comparison.
+    ash_cli_seconds = _numeric(ash, "cli_seconds")
+    codex_cli_seconds = _numeric(invocation, "cli_seconds")
+    codex_elapsed = _numeric(codex, "elapsed_seconds")
+    cli_timing_compatible = bool(
+        ash_cli_seconds is not None
+        and codex_cli_seconds is not None
+        and codex_elapsed is not None
+        and abs(codex_cli_seconds - codex_elapsed) <= 0.02
+    )
 
     # Operator-only metadata: no prompts, source, shell commands, account data,
     # stderr, or model-generated text is reproduced by this report.
@@ -142,6 +154,8 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             "cli_complete": ash.get("exit_code") == 0 and ash.get("timed_out") is False,
             "scored_pass": ash.get("passed") is True,
             "elapsed_seconds": _numeric(ash, "elapsed_seconds"),
+            "cli_seconds": ash_cli_seconds,
+            "elapsed_scope": "preflight_cli_and_grading",
         },
         "codex": {
             "correct_source": codex_source_correct,
@@ -150,11 +164,19 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             and codex.get("timed_out") is False
             and "turn.completed" in codex.get("terminal_events", []),
             "scored_pass": codex.get("passed") is True,
-            "elapsed_seconds": _numeric(codex, "elapsed_seconds"),
+            "elapsed_seconds": codex_elapsed,
+            "cli_seconds": codex_cli_seconds,
+            "elapsed_scope": "cli_only",
             "non_test_shell_commands": codex.get("shell_non_test_commands"),
             "prompt_sha256": prompt_sha,
         },
         "evaluation": {
+            "matching_cli_timing_available": cli_timing_compatible,
+            # A provider outage before any Codex work is not a coding loss.
+            # Other parity gaps below still apply even to scorable trials.
+            "excluded_provider_outage": (
+                codex.get("infrastructure_unavailable") is True
+            ),
             # Shared revision pins do not attest that the Codex environment
             # could not inspect the grader or that both oracles were identical.
             "fully_controlled": False,

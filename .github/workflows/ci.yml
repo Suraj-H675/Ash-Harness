@@ -91,14 +91,34 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked --group dev --extra server --extra browser --extra acp --extra a2a --extra aws --extra azure --extra gcp --extra local-embeddings
-      - name: Full test suite (macOS Explorer tests run separately)
+      # Isolate the test phase on a hang: a single 40-minute pytest process
+      # previously left four cancelled jobs with no retrievable pytest logs.
+      # A step-level timeout retains time for GitHub to record a failed job.
+      - name: Unit test suite
+        timeout-minutes: 20
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: >-
+          uv run --locked pytest -v tests/unit
+          --timeout=120 --timeout-method=thread --durations=30 --durations-min=1 -ra
+      - name: Integration test suite
+        timeout-minutes: 12
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: >-
+          uv run --locked pytest -v tests/integration
+          --timeout=120 --timeout-method=thread --durations=30 --durations-min=1 -ra
+      - name: End-to-end test suite (macOS Explorer tests run separately)
+        timeout-minutes: 20
+        env:
+          PYTHONUNBUFFERED: "1"
         shell: bash
         run: |
           args=(--timeout=120 --timeout-method=thread --durations=30 --durations-min=1 -ra)
           if [ "$RUNNER_OS" = "macOS" ]; then
             args+=(--ignore=tests/e2e/test_ash_explorer.py --ignore=tests/e2e/test_ash_explorer_controller.py)
           fi
-          uv run --locked pytest -v "${args[@]}"
+          uv run --locked pytest -v tests/e2e tests/packaging "${args[@]}"
 
   macos-explorer-e2e:
     timeout-minutes: 35
