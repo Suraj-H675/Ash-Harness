@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import traceback
 from types import SimpleNamespace
 from typing import Any
 
@@ -345,3 +347,273 @@ def test_stream_chunk_rejects_malformed_provider_replay_state() -> None:
                 }
             ]
         )
+
+
+@pytest.mark.asyncio
+async def test_native_compaction_retains_complete_output_window_without_instructions() -> None:
+    from ash.providers.openai_responses import (
+        OpenAIResponsesProvider,
+        prepare_openai_responses_input,
+    )
+
+    class Responses:
+        kwargs: dict[str, Any]
+
+        @property
+        def with_raw_response(self) -> Responses:
+            return self
+
+        async def compact(self, **kwargs: Any) -> Any:
+            self.kwargs = kwargs
+            output = [
+                {
+                    "type": "message", "id": "msg-1", "role": "user",
+                    "status": "completed",
+                    "content": [{"type": "input_text", "text": "Original task"}],
+                },
+                {
+                    "type": "compaction", "id": "cp-1",
+                    "encrypted_content": "opaque-checkpoint",
+                },
+            ]
+            return SimpleNamespace(content=json.dumps({
+                "object": "response.compaction", "output": output
+            }).encode())
+
+    responses = Responses()
+    provider = OpenAIResponsesProvider(
+        "gpt-6-luna", "synthetic-api-key",
+        client=SimpleNamespace(responses=responses),
+    )
+    history = [
+        {"role": "system", "content": "system policy"},
+        {"role": "user", "content": "Original task"},
+        {"role": "assistant", "content": "I inspected the code"},
+    ]
+    compacted = await provider.compact_history(history)
+    assert responses.kwargs == {
+        "model": "gpt-6-luna",
+        "input": [
+            {"role": "user", "content": "Original task"},
+            {"role": "assistant", "content": "I inspected the code"},
+        ],
+        "timeout": 30,
+    }
+    assert compacted == [
+        {
+            "type": "responses_compacted_input",
+            "output": [
+                {
+                    "type": "message", "id": "msg-1", "role": "user",
+                    "status": "completed",
+                    "content": [{"type": "input_text", "text": "Original task"}],
+                },
+                {"type": "compaction", "id": "cp-1",
+                 "encrypted_content": "opaque-checkpoint"},
+            ],
+        }
+    ]
+    instructions, response_input = prepare_openai_responses_input([
+        {"role": "system", "content": "system policy"},
+        {"role": "assistant", "content": "", "provider_state": compacted},
+        {"role": "user", "content": "Continue safely"},
+    ])
+    assert instructions == "system policy"
+    assert response_input == [
+        *compacted[0]["output"], {"role": "user", "content": "Continue safely"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_compaction_uses_real_sdk_raw_http_response_without_coercion() -> None:
+    import httpx
+    import openai
+
+    from ash.providers.openai_responses import compact_openai_responses_history
+
+    output = [
+        {
+            "type": "message", "id": "msg-2", "role": "user",
+            "status": "completed",
+            "content": [{"type": "input_text", "text": "Original task"}],
+        },
+        {"type": "compaction", "id": "cp-1", "encrypted_content": "opaque"},
+    ]
+    response = {
+        "id": "resp-synthetic", "object": "response.compaction",
+        "created_at": 1764967971,
+        "output": output,
+        "usage": {
+            "input_tokens": 1, "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 2,
+        },
+    }
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return httpx.Response(200, json=response)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+        async with openai.AsyncOpenAI(
+            api_key="synthetic-only", http_client=http
+        ) as client:
+            compacted = await compact_openai_responses_history(
+                client,
+                model_name="gpt-6-luna",
+                messages=[{"role": "user", "content": "Original task"}],
+            )
+    assert requests == ["/v1/responses/compact"]
+    assert compacted == [{"type": "responses_compacted_input", "output": output}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_body", "error_pattern"),
+    [
+        (b'{"output": [', "invalid JSON"),
+        (
+            b'{"object":"response.compaction","output":[{"type":"compaction",'
+            b'"encrypted_content":"first","encrypted_content":"second"}]}',
+            "invalid JSON",
+        ),
+        (
+            b'{"object":"response","output":[{"type":"compaction",'
+            b'"encrypted_content":"opaque"}]}',
+            "unexpected object type",
+        ),
+        (
+            b'{"output":[{"type":"compaction","encrypted_content":"opaque"}]}',
+            "unexpected object type",
+        ),
+        (b'x' * (4 * 1024 * 1024 + 1), "oversized response"),
+        (
+            json.dumps({
+                "object": "response.compaction",
+                "output": [
+                    {
+                        "type": "message", "role": "user",
+                        "content": [{"type": "function_call", "name": "shell"}],
+                    },
+                    {"type": "compaction", "encrypted_content": "opaque"},
+                ],
+            }).encode(),
+            "malformed or oversized checkpoint",
+        ),
+    ],
+)
+async def test_native_compaction_rejects_unsafe_raw_http_responses(
+    raw_body: bytes, error_pattern: str
+) -> None:
+    from ash.providers.openai_responses import compact_openai_responses_history
+
+    class Responses:
+        @property
+        def with_raw_response(self) -> Responses:
+            return self
+
+        async def compact(self, **kwargs: Any) -> Any:
+            return SimpleNamespace(content=raw_body)
+
+    with pytest.raises(RuntimeError, match=error_pattern):
+        await compact_openai_responses_history(
+            SimpleNamespace(responses=Responses()),
+            model_name="gpt-6-luna",
+            messages=[{"role": "user", "content": "Synthetic request"}],
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("item", [
+    {"type": "reasoning", "id": "rs", "encrypted_content": "opaque"},
+    {"type": "compaction", "id": "cp", "encrypted_content": ""},
+    {"type": "compaction", "id": 123, "encrypted_content": "opaque"},
+    {"type": "function_call", "call_id": "oops", "name": "write_file"},
+])
+async def test_native_compaction_rejects_unsupported_or_invalid_results(
+    item: Any,
+) -> None:
+    from ash.providers.openai_responses import compact_openai_responses_history
+
+    class Responses:
+        @property
+        def with_raw_response(self) -> Responses:
+            return self
+
+        async def compact(self, **kwargs: Any) -> Any:
+            return SimpleNamespace(content=json.dumps({
+                "object": "response.compaction", "output": [item]
+            }).encode())
+
+    with pytest.raises(RuntimeError):
+        await compact_openai_responses_history(
+            SimpleNamespace(responses=Responses()),
+            model_name="gpt-6-luna",
+            messages=[{"role": "user", "content": "minimal synthetic"}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_compaction_provider_errors_redact_api_credentials() -> None:
+    from ash.providers.openai_responses import OpenAIResponsesProvider
+
+    class Responses:
+        @property
+        def with_raw_response(self) -> Responses:
+            return self
+
+        async def compact(self, **kwargs: Any) -> Any:
+            raise RuntimeError("Transport failed with synthetic-secret-key")
+
+    provider = OpenAIResponsesProvider(
+        "gpt-6-luna", "synthetic-secret-key",
+        client=SimpleNamespace(responses=Responses()),
+    )
+    with pytest.raises(RuntimeError) as error:
+        await provider.compact_history(
+            [{"role": "user", "content": "synthetic input"}]
+        )
+    assert "synthetic-secret-key" not in str(error.value)
+    assert "synthetic-secret-key" not in "".join(
+        traceback.format_exception(error.value)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_body", [
+    b'{"object":"response.compaction","output":[{"type":"compaction",'
+    b'"encrypted_content":"synthetic-sensitive-untrusted-item",'
+    b'"encrypted_content":"duplicate"}]}',
+    json.dumps({
+        "object": "response.compaction",
+        "output": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "synthetic-sensitive-untrusted-item",
+                          "untrusted_extra": "reject"}]},
+            {"type": "compaction", "encrypted_content": "synthetic-opaque"},
+        ],
+    }).encode("utf-8"),
+])
+async def test_native_compaction_rejected_raw_payload_never_leaks_into_traceback(
+    response_body: bytes,
+) -> None:
+    from ash.providers.openai_responses import compact_openai_responses_history
+
+    class Responses:
+        @property
+        def with_raw_response(self) -> Responses:
+            return self
+
+        async def compact(self, **kwargs: Any) -> Any:
+            return SimpleNamespace(content=response_body)
+
+    with pytest.raises(RuntimeError) as error:
+        await compact_openai_responses_history(
+            SimpleNamespace(responses=Responses()),
+            model_name="gpt-6-luna",
+            messages=[{"role": "user", "content": "synthetic"}],
+        )
+    assert "synthetic-sensitive-untrusted-item" not in "".join(
+        traceback.format_exception(error.value)
+    )

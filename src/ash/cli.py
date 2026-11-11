@@ -1803,6 +1803,29 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     )
                 )
                 continue
+            if command.name == "restart-context":
+                if loop.current_session is None or not arguments:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                try:
+                    restart = loop.session_store.restart_context_session(
+                        loop.current_session.session_id,
+                        expected_project_path=loop.project_root,
+                        user_handoff=" ".join(arguments),
+                    )
+                    session = await loop.start_session(restart.session_id)
+                    _sync_repl_model_config(config, loop)
+                except (ValueError, RuntimeError) as exc:
+                    _print_classified_error(exc)
+                    continue
+                loop.ui.load_session_transcript(session)
+                transition_feedback(
+                    "Started a new reasoning window. The original session "
+                    "and its tool/audit history remain unchanged. "
+                    "No previous tool actions or approvals will replay. "
+                    "Review the handoff, then send your next task."
+                )
+                continue
             if command.name == "tree":
                 if loop.current_session is None or arguments:
                     print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
@@ -2002,6 +2025,24 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 print(
                     f"Context summary {state}; estimated input {tokens} tokens.",
                     flush=True,
+                )
+                continue
+            if command.name == "compact-native":
+                if arguments or loop.current_session is None:
+                    print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
+                    continue
+                try:
+                    checkpoint = await loop.native_compact_current_context()
+                    session = await loop.start_session(checkpoint.session_id)
+                    _sync_repl_model_config(config, loop)
+                except (ValueError, RuntimeError) as exc:
+                    _print_classified_error(exc)
+                    continue
+                loop.ui.load_session_transcript(session)
+                transition_feedback(
+                    "Provider-native checkpoint installed in a new session. "
+                    "Original transcript and audit retained; no tool actions "
+                    "or approvals replayed. Continue with your next task."
                 )
                 continue
             if command.name == "capabilities":

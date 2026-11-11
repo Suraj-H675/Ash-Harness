@@ -17,7 +17,12 @@ from ash.providers.base import (
     TokenCounterLike,
     managed_async_stream,
 )
-from ash.providers.messages import CanonicalToolCall, MessageInput, normalize_messages
+from ash.providers.messages import (
+    MAX_PROVIDER_STATE_BYTES,
+    CanonicalToolCall,
+    MessageInput,
+    normalize_messages,
+)
 from ash.providers.openai import _owned_openai_http_client
 from ash.providers.readiness import (
     normalize_provider_base_url,
@@ -111,7 +116,10 @@ def prepare_openai_responses_input(
             continue
         if role == "assistant":
             for state_item in message.get("provider_state") or []:
-                items.append(dict(state_item))
+                if state_item["type"] == "responses_compacted_input":
+                    items.extend(state_item["output"])
+                else:
+                    items.append(dict(state_item))
             if content:
                 if not isinstance(content, str):
                     raise ValueError("assistant Responses replay content must be text")
@@ -293,10 +301,72 @@ async def stream_openai_responses(
         )
 
 
+async def compact_openai_responses_history(
+    client: Any,
+    *,
+    model_name: str,
+    messages: Sequence[MessageInput],
+) -> list[dict[str, Any]]:
+    """Capture the *complete* compacted Responses input without rewriting it.
+
+    This requires an API-key-backed Responses client with compaction access.
+    The session owner is responsible for installing the checkpoint atomically
+    and must not change durable history on transport/validation failure.
+    """
+    _, input_items = prepare_openai_responses_input(messages)
+    if not input_items:
+        raise ValueError("cannot compact an empty Responses conversation")
+    # The SDK currently decodes the documented retained user-message items
+    # through a response-output union intended for assistant messages.
+    # Capture the raw HTTP JSON instead: model_dump() can otherwise coerce or
+    # discard fields when the generated response schema and wire schema differ.
+    result = await client.responses.with_raw_response.compact(
+        model=model_name,
+        input=input_items,
+        timeout=30,
+    )
+    raw_bytes = result.content
+    if not isinstance(raw_bytes, bytes) or len(raw_bytes) > MAX_PROVIDER_STATE_BYTES:
+        raise RuntimeError("native compaction returned an oversized response")
+    try:
+        response_data = strict_json_loads(raw_bytes.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        # Raw provider data can include credentials or opaque reasoning. Do not
+        # chain a parsing exception that quotes untrusted input into tracebacks.
+        raise RuntimeError("native compaction returned invalid JSON") from None
+    if (
+        not isinstance(response_data, dict)
+        or response_data.get("object") != "response.compaction"
+    ):
+        raise RuntimeError("native compaction response has an unexpected object type")
+    outputs = response_data.get("output")
+    if not isinstance(outputs, list) or not outputs:
+        raise RuntimeError("native compaction returned an invalid replacement window")
+    payload: dict[str, Any] = {
+        "type": "responses_compacted_input",
+        "output": outputs,
+    }
+    from ash.providers.messages import CanonicalMessage
+
+    try:
+        CanonicalMessage.model_validate(
+            {"role": "assistant", "content": "", "provider_state": [payload]}
+        )
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "native compaction returned a malformed or oversized checkpoint"
+        ) from None
+    return [payload]
+
+
 class OpenAIResponsesProvider(ProviderABC):
     """First-party OpenAI API-key adapter for current Responses-native models."""
 
     provider_family = "openai"
+    # The complete replacement-window serializer has synthetic coverage, but
+    # the installed SDK has not passed a real API compaction response fixture.
+    # Keep the optional native action unavailable until verified end-to-end.
+    supports_native_compaction = False
 
     def __init__(
         self,
@@ -343,6 +413,27 @@ class OpenAIResponsesProvider(ProviderABC):
                 ),
             )
         return self._client
+
+    async def compact_history(
+        self, messages: Sequence[MessageInput]
+    ) -> list[dict[str, Any]]:
+        """Create a native reasoning checkpoint (API key access required)."""
+        try:
+            return await compact_openai_responses_history(
+                self._resolve_client(),
+                model_name=self._model_name,
+                messages=messages,
+            )
+        except Exception as exc:
+            if isinstance(exc, ValueError):
+                raise RuntimeError(
+                    "OpenAI native compaction failed checkpoint validation"
+                ) from None
+            detail = redact_provider_error(str(exc), self._api_key)
+            # The original SDK exception may include request headers or
+            # opaque provider output. Redacting only the wrapper message is
+            # insufficient if the original exception is still chained.
+            raise RuntimeError(f"OpenAI native compaction failed: {detail}") from None
 
     def configure_max_tokens(self, max_tokens: int) -> None:
         if max_tokens < 1:

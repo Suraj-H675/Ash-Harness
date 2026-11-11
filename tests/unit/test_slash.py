@@ -19,6 +19,12 @@ def test_parse_alias_and_quoted_argument() -> None:
 
     alias, _ = parse_slash_command("/clear")
     assert alias.name == "new"
+    command, arguments = parse_slash_command('/restart-context "Fix the two-module issue next"')
+    assert command.name == "restart-context"
+    assert arguments == ["Fix the two-module issue next"]
+    native, native_args = parse_slash_command("/compact-native")
+    assert native.name == "compact-native"
+    assert native_args == []
 
     expected_aliases = {
         "/reset": "new",
@@ -48,6 +54,8 @@ def test_help_lists_core_session_commands() -> None:
     assert "/sessions [search QUERY|prune DAYS]" in rendered
     assert "/rewind <message-count> [--files]" in rendered
     assert "/resume [session]" in rendered
+    assert "/restart-context <handoff-for-next-turn>" in rendered
+    assert "/compact-native" in rendered
     assert "/status" in rendered
     assert "/usage" in rendered
     assert "/settings" in rendered

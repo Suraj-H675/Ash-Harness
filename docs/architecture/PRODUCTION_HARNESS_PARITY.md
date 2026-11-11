@@ -229,6 +229,58 @@ matched but system/tool-policy-unmatched exploratory evidence above.
 Private replay evidence:
 `/var/tmp/ash-edit-hint-urllib3-auth-luna-xhigh-20261111/result.json`.
 
+**Reasoning-aware context finding (2026-11-11):** On the harder pinned
+`urllib3-proxy-redirect` two-module task, the fair-input Ash run
+exhausted its context before editing; longer-budget read-heavy replays
+also failed without a source edit. Local masking and deletion of old
+read-only call/result pairs passed deterministic tests but never
+activated in the live subscription-backed Responses sessions because
+assistant calls carried opaque reasoning replay state. OpenAI's
+[preserved-reasoning guidance](https://developers.openai.com/api/docs/guides/preserved-reasoning)
+warns that modifying the prefix before retained reasoning items can
+invalidate that state. The speculative active-turn masking/deletion
+experiment was therefore retired rather than shipped.
+
+The replacement guard leaves the provider-visible input unchanged if it
+contains opaque replay state and still fits the input limit. If rewriting
+would be necessary, it fails closed with an explicit explanation; it
+never silently drops reasoning or claims it performed a valid checkpoint.
+The native SDK offers `/responses/compact`, but one bounded synthetic
+probe through the existing ChatGPT-plan OAuth route returned HTTP 401
+(`hardened_oauth_rule_missing`). That result does **not** imply the
+endpoint is unavailable to API-key-backed providers.
+The conservative reasoning-state guard remains safety work, **not a
+passing fix** for the benchmark.
+
+**Explicit context checkpoints (pending live native acceptance):** The
+checkpoint implementation now serializes a bounded complete Responses
+replacement input window, including retained user items and the final
+opaque compaction item. It stores that window in one child-session
+provider-state envelope and expands its items unchanged on replay.
+Synthetic session/replay and concurrent-source tests pass, including
+model and permission-mode changes during in-flight compaction. Native
+compaction remains disabled for production providers because the installed
+OpenAI SDK has not been validated against a live compact response. Strict
+SDK model validation rejects the documented retained user input item, but
+normal SDK HTTP parsing accepts it. The prototype now captures raw SDK
+HTTP JSON instead of round-tripping through the incompatible generated
+model and verifies the complete replacement array using a mocked SDK
+transport. Duplicate JSON keys, malformed/oversized responses and
+unsupported retained content are rejected before child creation. The
+currently verified retained content contract is text-only; native
+compaction remains disabled for unverified output types. Restart and
+checkpoint children explicitly clear inherited parent context summaries,
+even when the parent has zero stored messages. Rejected remote outputs
+and transport exceptions cannot leak original provider text through
+chained formatted tracebacks.
+The local-first
+`/restart-context` path creates a new child containing a
+user-provided, redacted handoff instead of old reasoning or tool actions.
+The parent history, approvals and audit stay unchanged, and both paths
+refuse unresolved or ambiguous work. Native compaction is currently
+verified only with a synthetic Responses client, not a live API-key
+invocation. See [context checkpoint usage](../guides/CONTEXT_CHECKPOINTS.md).
+
 Reassess these gates from **current** source, supported-host runtime, and
 independent results. Explicitly state what remains open; do not repeat
 historical “parity closed” language as a fresh daily-driver endorsement.
@@ -2206,9 +2258,9 @@ truthful evidence boundaries, not open mission blockers.
 |---|---|---|
 | Token accounting | Verified locally | Provider usage and cache tokens are normalized; missing usage is estimated from the compacted prompt and streamed/native response, marked provider/estimated/mixed across TUI and structured surfaces, and estimated token/cost portions are persisted separately |
 | Context budget allocation | Verified locally | Configurable system/tool/history/repo-map/memory budgets are enforced before compaction and shown by `/context`; text, directory, and image attachments have a model-counted combined cap that defaults to 25% of usable input context and refuses overflow without silent clipping |
-| Automatic compaction | Verified locally | Threshold-based extractive summary retains recent tool call/result pairs |
-| Manual `/compact` | Verified locally | Forces compaction while preserving the durable transcript |
-| Tool-output pruning | Verified locally | Stale large results are pruned in provider context while preserving call identity and durable data |
+| Automatic compaction | Partial | Extractive summaries operate for histories without opaque provider replay state. With retained reasoning, Ash preserves the exact prefix or fails closed; a provider-compatible reasoning checkpoint is still needed |
+| Manual `/compact` | Partial | Forces compaction for compatible histories while preserving the durable transcript; opaque replay state cannot be locally rewritten |
+| Tool-output pruning | Partial | Stale large results may be pruned when no opaque reasoning replay state is retained; history containing it is preserved unchanged |
 | Prompt caching | Verified locally | First-party Anthropic/OpenAI automatic controls and retention mapping; normalized reads/writes/hit rate persist and surface through CLI, SDK, HTTP, and JSON-RPC; custom/local endpoints remain untouched ([OpenAI](https://platform.openai.com/docs/guides/prompt-caching), [Anthropic](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)) |
 | Repository map | Verified locally | Incremental Tree-sitter symbols/imports for Python, JS/JSX, TS/TSX, Go, Rust, Java, C/C++, and C#; configured/Git ignores, active-file ranking, and CLI/SDK injection |
 | Project instructions | Verified locally | Trusted hierarchical project discovery with ordered `ASH.md` → `AGENTS.md` → `CLAUDE.md` compatibility fallbacks per scope; instructions refresh between model iterations while preserving session prompt layers; successful file reads activate the applicable nested rule chains for the next model iteration, including deterministic union for parallel reads without unrelated sibling scopes; bounded `@import` expansion, diagnostics, and conservative conflict lint across user/project/imported instructions |

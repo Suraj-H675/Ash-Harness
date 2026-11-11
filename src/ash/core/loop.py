@@ -7627,6 +7627,9 @@ class AshLoop:
                         for message in result.messages
                         if message.get("role") == "tool"
                     ),
+                    "provider_replay_state_preserved": (
+                        result.provider_replay_state_preserved
+                    ),
                     "tool_message_chars": sum(
                         len(message["content"])
                         for message in result.messages
@@ -7837,6 +7840,89 @@ class AshLoop:
             },
         )
         return self._last_context_tokens, changed
+
+    async def native_compact_current_context(self) -> Session:
+        """Create an isolated native checkpoint; never rewrite the source session.
+
+        A native Responses checkpoint is installed as a new session only after
+        the remote response succeeds and the source's durable message count is
+        rechecked atomically. The caller must explicitly switch to that child.
+        """
+        source = self.current_session
+        if source is None:
+            raise RuntimeError("No active session")
+        if self._turn_running:
+            raise RuntimeError("Cannot compact during a running turn")
+        if self.provider.supports_native_compaction is not True:
+            raise RuntimeError(
+                "Native compaction is unavailable for this provider; "
+                "use /restart-context with an explicit handoff instead"
+            )
+        compact_history = getattr(self.provider, "compact_history", None)
+        if not callable(compact_history):
+            raise RuntimeError(
+                "Provider advertised native compaction without implementing it"
+            )
+        if source.resident_history_is_windowed or source.context_summary:
+            raise RuntimeError(
+                "Native compaction requires a complete, non-windowed transcript"
+            )
+        if not source.messages:
+            raise RuntimeError("There is no conversation to compact")
+        if self.session_store.recoverable_turns(source.session_id):
+            raise RuntimeError(
+                "Resolve unfinished or interrupted work before native compaction"
+            )
+        if any(
+            task["status"] in {"working", "input_required"}
+            for task in self.session_store.list_mcp_tasks(source.session_id)
+        ):
+            raise RuntimeError("Resolve active external tasks before native compaction")
+        message_count = self.session_store.durable_message_count(source.session_id)
+        durable = [item for item in source.messages if not item.is_runtime_only]
+        if len(durable) != message_count:
+            raise RuntimeError("Session history changed; reload before compaction")
+        persisted = self.session_store.load_session(source.session_id)
+        if persisted.resident_history_is_windowed or persisted.messages != durable:
+            raise RuntimeError(
+                "The resident session differs from durable history; "
+                "reload before native compaction"
+            )
+        history_revision = self.session_store.session_history_revision(
+            source.session_id
+        )
+        # The source's tool/action journals are not copied into the child.
+        # All provider-state and tool-call IDs remain in the exact input order
+        # for the provider-native compaction call.
+        history: list[dict[str, Any]] = []
+        for item in durable:
+            message: dict[str, Any] = {
+                "role": item.role,
+                "content": _canonical_message_content(item),
+            }
+            if item.role == "assistant":
+                if item.metadata.get("tool_calls"):
+                    message["tool_calls"] = self._provider_history_tool_calls(
+                        item.metadata["tool_calls"]
+                    )
+                if item.metadata.get("provider_state"):
+                    message["provider_state"] = item.metadata["provider_state"]
+            if item.role == "tool":
+                call_id = item.metadata.get("call_id")
+                if not call_id:
+                    raise RuntimeError("Cannot compact an unmatched tool result")
+                message["tool_call_id"] = call_id
+            history.append(message)
+        checkpoint = await compact_history(history)
+        return self.session_store.install_native_context_checkpoint(
+            source.session_id,
+            expected_project_path=self.project_root,
+            expected_parent_messages=message_count,
+            expected_parent_revision=history_revision,
+            expected_parent_model=source.model,
+            expected_parent_permission_mode=source.permission_mode,
+            checkpoint=checkpoint,
+        )
 
     # --- provider switching -------------------------------------------------
 

@@ -68,6 +68,7 @@ def _open_pty_cli(
     *,
     rows: int = 24,
     columns: int = 80,
+    args: tuple[str, ...] = (),
 ) -> tuple[int, subprocess.Popen[bytes]]:
     import fcntl
     import pty
@@ -80,7 +81,7 @@ def _open_pty_cli(
         struct.pack("HHHH", rows, columns, 0, 0),
     )
     process = subprocess.Popen(
-        [sys.executable, "-m", "ash"],
+        [sys.executable, "-m", "ash", *args],
         cwd=workspace,
         env=environment,
         stdin=slave,
@@ -230,6 +231,76 @@ def test_linear_help_search_matches_multiple_terms(tmp_path: Path) -> None:
         os.write(master, b"/help model switch\r")
         _read_until(master, process, captured, b"/model [provider/model]")
         assert b"No slash commands match" not in captured
+        os.write(master, b"/exit\r")
+        process.wait(timeout=10)
+        assert process.returncode == 0
+    finally:
+        _stop_pty_cli(master, process)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_restart_context_in_real_repl_preserves_parent_and_permission_mode(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime, timezone
+
+    from ash.core.session import Message, SessionStore
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    (home / "db").mkdir()
+    environment = _terminal_environment(
+        home, workspace, model="lmstudio/local-model"
+    )
+    _set_workspace_trust(workspace, environment, trusted=False)
+    store = SessionStore(home / "db" / "sessions.db")
+    parent = store.create_session(
+        str(workspace), model="lmstudio/local-model", permission_mode="plan"
+    )
+    store.save_message(
+        parent.session_id,
+        Message(
+            role="user",
+            content="Prior conversation should stay in the parent",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    parent_before = store.load_session(parent.session_id)
+    master, process = _open_pty_cli(
+        workspace, environment, columns=120,
+        args=("--session", parent.session_id),
+    )
+    captured = bytearray()
+
+    try:
+        _read_until(master, process, captured, b"> ", timeout=30)
+        os.write(master, b"/restart-context Verify the current code before edits\r")
+        _read_until(
+            master, process, captured,
+            b"Started a new reasoning window", timeout=30,
+        )
+        children = [
+            row for row in store.list_sessions(project_path=str(workspace))
+            if row.session_id != parent.session_id
+        ]
+        assert len(children) == 1
+        child = store.load_session(children[0].session_id)
+        assert child.parent_session_id == parent.session_id
+        assert child.permission_mode == "plan"
+        assert child.context_summary == ""
+        assert len(child.messages) == 1
+        assert child.messages[0].role == "user"
+        assert "Verify the current code before edits" in child.messages[0].content
+        assert "Prior conversation" not in child.messages[0].content
+        assert store.load_session(parent.session_id).messages == parent_before.messages
+
+        os.write(master, b"/status\r")
+        _read_until(
+            master, process, captured,
+            f"Session: {child.session_id}".encode(), timeout=20,
+        )
         os.write(master, b"/exit\r")
         process.wait(timeout=10)
         assert process.returncode == 0

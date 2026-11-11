@@ -33,6 +33,7 @@ from ash.context.history import ContextBudgetExceededError, RequestTokenBudget
 from ash.context.turn import TurnContext
 from ash.core.session import (
     Message,
+    SessionForkConflictError,
     SessionStore,
     SessionStorageError,
     TURN_JOURNAL_INPUT_OMITTED,
@@ -2717,6 +2718,227 @@ async def test_provider_replay_state_persists_and_returns_to_next_request(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_native_compaction_installs_replayable_child_and_preserves_source(
+    tmp_path: Path,
+) -> None:
+    from ash.providers.openai_responses import (
+        OpenAIResponsesProvider, prepare_openai_responses_input,
+    )
+
+    class SyntheticWindowProvider(OpenAIResponsesProvider):
+        supports_native_compaction = True
+
+    class Responses:
+        requests: list[dict[str, Any]]
+
+        def __init__(self) -> None:
+            self.requests = []
+
+        @property
+        def with_raw_response(self) -> Any:
+            return self
+
+        async def compact(self, **kwargs: Any) -> Any:
+            self.requests.append(kwargs)
+            output = [
+                {
+                    "type": "message", "id": "msg-one", "role": "user",
+                    "status": "completed",
+                    "content": [{"type": "input_text", "text": "Fix both modules"}],
+                },
+                {
+                    "type": "compaction", "id": "cp-one",
+                    "encrypted_content": "OPAQUE_REPLAY_CHECKPOINT",
+                },
+            ]
+            return SimpleNamespace(content=json.dumps({
+                "object": "response.compaction", "output": output
+            }).encode())
+
+    responses = Responses()
+    provider = SyntheticWindowProvider(
+        "gpt-6-luna", "synthetic-key",
+        client=SimpleNamespace(responses=responses),
+    )
+    store = SessionStore(tmp_path / "native-compaction.db")
+    loop = AshLoop(
+        store, provider, SafetyGuard(tmp_path), EventUI(), tmp_path
+    )
+    source = await loop.start_session()
+    user = Message(
+        role="user", content="Fix both modules",
+        timestamp=datetime.now(timezone.utc)
+    )
+    store.save_message(source.session_id, user)
+    source.messages.append(user)
+    original = store.load_session(source.session_id).messages
+
+    child = await loop.native_compact_current_context()
+    assert child.parent_session_id == source.session_id
+    assert len(child.messages) == 1
+    assert child.messages[0].role == "assistant"
+    assert "OPAQUE_REPLAY_CHECKPOINT" in repr(child.messages[0].metadata)
+    assert store.load_session(source.session_id).messages == original
+    assert store.verify_audit_log(source.session_id) == []
+    assert store.verify_audit_log(child.session_id) == []
+    assert responses.requests[0]["input"] == [
+        {"role": "user", "content": "Fix both modules"}
+    ]
+    assert "instructions" not in responses.requests[0]
+
+    resumed = await loop.start_session(child.session_id)
+    _, items = prepare_openai_responses_input([
+        {"role": "system", "content": "safety system"},
+        {
+            "role": "assistant", "content": "",
+            "provider_state": resumed.messages[0].metadata["provider_state"]
+        },
+        {"role": "user", "content": "Implement after verifying the workspace"}
+    ])
+    assert items == [
+        {
+            "type": "message", "id": "msg-one", "role": "user",
+            "status": "completed",
+            "content": [{"type": "input_text", "text": "Fix both modules"}],
+        },
+        {"type": "compaction", "id": "cp-one",
+         "encrypted_content": "OPAQUE_REPLAY_CHECKPOINT"},
+        {"role": "user", "content": "Implement after verifying the workspace"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_compaction_is_unsupported_on_non_api_key_providers(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "unsupported-native.db")
+    loop = AshLoop(
+        store, MockProvider(), SafetyGuard(tmp_path), EventUI(), tmp_path
+    )
+    source = await loop.start_session()
+    with pytest.raises(RuntimeError, match="unavailable for this provider"):
+        await loop.native_compact_current_context()
+    assert len(store.session_tree(source.session_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_compaction_rejects_non_replayable_output_without_creating_child(
+    tmp_path: Path,
+) -> None:
+    from ash.providers.openai_responses import OpenAIResponsesProvider
+
+    class SyntheticWindowProvider(OpenAIResponsesProvider):
+        supports_native_compaction = True
+
+    class InvalidOutput:
+        @property
+        def with_raw_response(self) -> Any:
+            return self
+
+        async def compact(self, **kwargs: Any) -> Any:
+            output = [
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "not retained user"}]},
+                {"type": "compaction", "encrypted_content": "opaque"},
+            ]
+            return SimpleNamespace(content=json.dumps({
+                "object": "response.compaction", "output": output
+            }).encode())
+
+    provider = SyntheticWindowProvider(
+        "gpt-6-luna", "synthetic-key",
+        client=SimpleNamespace(responses=InvalidOutput()),
+    )
+    store = SessionStore(tmp_path / "disabled-native.db")
+    loop = AshLoop(store, provider, SafetyGuard(tmp_path), EventUI(), tmp_path)
+    source = await loop.start_session()
+    assert provider.supports_native_compaction is True
+    source.messages.append(
+        Message(role="user", content="prompt",
+                timestamp=datetime.now(timezone.utc))
+    )
+    store.save_message(source.session_id, source.messages[-1])
+    with pytest.raises(RuntimeError, match="malformed or oversized checkpoint"):
+        await loop.native_compact_current_context()
+    assert len(store.session_tree(source.session_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_compaction_is_not_advertised_on_chatgpt_plan_route(
+    tmp_path: Path,
+) -> None:
+    from ash.providers.openai_chatgpt import OpenAIChatGPTProvider
+
+    class FakeAuth:
+        async def access_token(self) -> str:
+            raise AssertionError("OAuth must not be contacted for native compaction")
+
+    provider = OpenAIChatGPTProvider(
+        "gpt-6-luna", auth_session=FakeAuth()  # type: ignore[arg-type]
+    )
+    store = SessionStore(tmp_path / "oauth-unsupported-native.db")
+    loop = AshLoop(
+        store, provider, SafetyGuard(tmp_path), EventUI(), tmp_path
+    )
+    source = await loop.start_session()
+    assert provider.supports_native_compaction is False
+    with pytest.raises(RuntimeError, match="unavailable for this provider"):
+        await loop.native_compact_current_context()
+    assert len(store.session_tree(source.session_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_compaction_refuses_source_changed_while_network_pending(
+    tmp_path: Path,
+) -> None:
+    from ash.providers.openai_responses import OpenAIResponsesProvider
+
+    class SyntheticWindowProvider(OpenAIResponsesProvider):
+        supports_native_compaction = True
+
+    store = SessionStore(tmp_path / "compaction-race.db")
+    source_id: str | None = None
+
+    class Responses:
+        @property
+        def with_raw_response(self) -> Any:
+            return self
+
+        async def compact(self, **kwargs: Any) -> Any:
+            assert source_id is not None
+            store.save_message(
+                source_id,
+                Message(role="user", content="Concurrent new turn",
+                        timestamp=datetime.now(timezone.utc))
+            )
+            output = [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "Work"}]},
+                {"type": "compaction", "id": "cp-race",
+                 "encrypted_content": "OPAQUE_CHECKPOINT"},
+            ]
+            return SimpleNamespace(content=json.dumps({
+                "object": "response.compaction", "output": output
+            }).encode())
+
+    provider = SyntheticWindowProvider(
+        "gpt-6-luna", "synthetic-key",
+        client=SimpleNamespace(responses=Responses())
+    )
+    loop = AshLoop(
+        store, provider, SafetyGuard(tmp_path), EventUI(), tmp_path
+    )
+    source = await loop.start_session()
+    source_id = source.session_id
+    first = Message(role="user", content="Work", timestamp=datetime.now(timezone.utc))
+    store.save_message(source.session_id, first)
+    source.messages.append(first)
+    with pytest.raises(ValueError, match="source session changed"):
+        await loop.native_compact_current_context()
+    assert len(store.session_tree(source.session_id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_sealed_provider_replay_state_persists_exactly_without_plaintext(
     tmp_path,
 ) -> None:
@@ -3060,6 +3282,38 @@ async def test_fork_does_not_inherit_parent_permission_mode_override(tmp_path):
 
     assert resumed_fork.permission_mode == ""
     assert loop.permission_policy.mode is PermissionMode.INTERACTIVE
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_context_restart_preserves_permission_mode_but_clears_approvals(tmp_path):
+    store = SessionStore(tmp_path / "context-restart-policy.db")
+    ui = TerminalUI(safety_tier="interactive")
+    loop = AshLoop(
+        store, MockProvider(), SafetyGuard(tmp_path), ui, tmp_path,
+        safety_tier="interactive",
+    )
+    parent = await loop.start_session()
+    loop.set_permission_mode(PermissionMode.PLAN)
+    loop.permission_policy.add_session_rule(
+        PermissionRule.create(RuleEffect.ALLOW, "write_file")
+    )
+    ui.approve_tool_for_session("write_file")
+
+    restarted = store.restart_context_session(
+        parent.session_id,
+        expected_project_path=tmp_path,
+        user_handoff="Verify the source before any new action",
+    )
+    resumed = await loop.start_session(restarted.session_id)
+
+    assert resumed.permission_mode == "plan"
+    assert loop.permission_policy.mode is PermissionMode.PLAN
+    assert ui.safety_tier == "plan"
+    assert loop.permission_policy.session_rules == []
+    assert ui.is_tool_approved_for_session("write_file") is False
+    assert loop.permission_policy.evaluate("write_file", {}).action is PolicyAction.DENY
+    assert store.session_permission_mode(parent.session_id) == "plan"
     await loop.aclose()
 
 
@@ -10033,9 +10287,16 @@ async def test_timed_out_command_after_effect_is_durably_ambiguous(tmp_path):
     record = store.load_session(session.session_id).tool_calls[-1]
     assert record.dispatched is True
     assert record.executed is True
+    assert record.success is None
     audit = store.list_audit_logs(session.session_id)[-1]
     assert audit.result == "FAILURE"
     assert audit.details["ambiguous"] is True
+    with pytest.raises(SessionForkConflictError, match="ambiguous actions"):
+        store.restart_context_session(
+            session.session_id,
+            expected_project_path=tmp_path,
+            user_handoff="Check whether the timed-out command took effect",
+        )
 
 
 @pytest.mark.asyncio

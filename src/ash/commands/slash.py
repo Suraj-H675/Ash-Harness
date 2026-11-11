@@ -69,6 +69,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "/fork [message-count] [branch-name]",
         aliases=("branch",),
     ),
+    SlashCommand(
+        "restart-context",
+        "Start a fresh reasoning window from an explicit handoff; never replay tools",
+        "/restart-context <handoff-for-next-turn>",
+    ),
     SlashCommand("tree", "Show the current session branch tree", "/tree"),
     SlashCommand(
         "rewind",
@@ -92,6 +97,11 @@ COMMANDS: tuple[SlashCommand, ...] = (
         "Compact older conversation history",
         "/compact",
         aliases=("compress",),
+    ),
+    SlashCommand(
+        "compact-native",
+        "Provider-native checkpoint (disabled until live contract verification)",
+        "/compact-native",
     ),
     SlashCommand(
         "capabilities",

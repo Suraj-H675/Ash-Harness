@@ -197,6 +197,7 @@ class CompactionResult:
     estimated_tokens: int
     removed_messages: int = 0
     pruned_tool_outputs: int = 0
+    provider_replay_state_preserved: bool = False
 
 
 class ContextBudgetExceededError(RuntimeError):
@@ -209,12 +210,29 @@ class ContextBudgetExceededError(RuntimeError):
         *,
         protected_current_turn: bool,
         required_history_summary: bool = False,
+        provider_replay_state_preserved: bool = False,
     ) -> None:
         self.required_tokens = required_tokens
         self.limit = limit
         self.protected_current_turn = protected_current_turn
         self.required_history_summary = required_history_summary
-        if required_history_summary and protected_current_turn:
+        self.provider_replay_state_preserved = provider_replay_state_preserved
+        if provider_replay_state_preserved:
+            if required_tokens <= limit:
+                super().__init__(
+                    "opaque provider reasoning state prevents safe local "
+                    "compaction or session-summary reconstruction without "
+                    "rewriting the earlier conversation prefix; use a "
+                    "provider-native checkpoint when supported"
+                )
+                return
+            scope = "conversation with opaque provider reasoning state"
+            suffix = (
+                "; local history rewriting could invalidate reusable reasoning. "
+                "Use provider-native compaction when supported, a fresh session, "
+                "or a model with a larger input window"
+            )
+        elif required_history_summary and protected_current_turn:
             scope = "protected current turn and required session summary"
             suffix = (
                 "; shorten the current request or current-turn tool output, "
@@ -479,6 +497,34 @@ class HistoryCompactor:
             0 <= protected_from_index < len(messages)
         ):
             raise ValueError("protected_from_index is outside the message list")
+
+        # Stateless Responses (and other providers) can carry opaque reasoning
+        # replay state on assistant messages. It depends on the exact preceding
+        # request prefix. Locally changing earlier tool outputs or summarizing
+        # history can silently invalidate it. Keep that prefix intact and fail
+        # closed if it cannot fit; native compaction requires a separate
+        # provider-supported checkpoint contract.
+        if any(
+            item.get("role") == "assistant" and item.get("provider_state")
+            for item in messages
+        ):
+            unchanged_tokens = self._count(messages, count_tokens)
+            summary_required = include_previous_summary and bool(previous_summary)
+            if force or summary_required or unchanged_tokens > self.input_limit:
+                raise ContextBudgetExceededError(
+                    unchanged_tokens,
+                    self.input_limit,
+                    protected_current_turn=protected_from_index is not None,
+                    required_history_summary=summary_required,
+                    provider_replay_state_preserved=True,
+                )
+            return CompactionResult(
+                messages=list(messages),
+                summary=previous_summary,
+                compacted=False,
+                estimated_tokens=unchanged_tokens,
+                provider_replay_state_preserved=True,
+            )
 
         prepared, pruned = self._prune_tool_outputs(
             messages,

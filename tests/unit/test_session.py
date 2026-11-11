@@ -1685,6 +1685,469 @@ def test_session_forks_form_a_durable_redacted_tree(tmp_path: Path) -> None:
     assert [row["turn_id"] for row in copied] == [None, None]
 
 
+def test_context_restart_forks_new_reasoning_window_without_tool_replay(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "context-restart.db")
+    root = store.create_session(
+        str(tmp_path), model="openai/gpt-6-luna", permission_mode="plan"
+    )
+    store.start_turn(root.session_id, "turn-old", "old task")
+    store.save_message(
+        root.session_id,
+        Message(role="user", content="Investigate the issue", timestamp=datetime.now(timezone.utc)),
+    )
+    store.save_message(
+        root.session_id,
+        Message(
+            role="assistant",
+            content="",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "provider_state": [{
+                    "type": "reasoning",
+                    "id": "rs-old",
+                    "summary": [],
+                    "encrypted_content": "PRIVATE-OPAQUE",
+                }]
+            },
+        ),
+    )
+    store.complete_turn("turn-old")
+    store.append_audit_log(
+        root.session_id,
+        action_type="command_run",
+        target_resource="local-command",
+        details={"result": "completed"},
+        result="SUCCESS",
+    )
+    parent_before = store.load_session(root.session_id)
+    restart = store.restart_context_session(
+        root.session_id,
+        expected_project_path=tmp_path,
+        user_handoff="Inspect the updated code. OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
+    )
+    assert restart.parent_session_id == root.session_id
+    assert restart.fork_message_count == 0
+    assert restart.model == "openai/gpt-6-luna"
+    assert restart.permission_mode == "plan"
+    assert len(restart.messages) == 1
+    assert restart.messages[0].role == "user"
+    assert "Inspect the updated code" in restart.messages[0].content
+    assert "not imported or authorized for replay" in restart.messages[0].content.lower()
+    assert "sk-proj-" not in restart.messages[0].content
+    assert "REDACTED" in restart.messages[0].content
+    assert "PRIVATE-OPAQUE" not in repr(restart)
+    assert restart.tool_calls == []
+    assert store.started_turns(restart.session_id) == []
+    assert store.verify_audit_log(restart.session_id) == []
+    assert store.verify_audit_log(root.session_id) == []
+    assert len(store.list_audit_logs(root.session_id)) == 1
+    assert store.list_audit_logs(restart.session_id) == []
+    assert store.load_session(root.session_id).messages == parent_before.messages
+    assert store.get_session_lineage(restart.session_id).parent_session_id == root.session_id
+
+
+def test_context_restart_refuses_incomplete_parent_and_is_atomic(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "context-restart-guard.db")
+    root = store.create_session(str(tmp_path))
+    store.start_turn(root.session_id, "turn-unfinished", "unfinished side effect")
+    for state in ("started", "interrupted"):
+        if state == "interrupted":
+            store.interrupt_turn("turn-unfinished")
+        with pytest.raises(SessionForkConflictError):
+            store.restart_context_session(
+                root.session_id, expected_project_path=tmp_path,
+                user_handoff="Do not repeat the previous operation"
+            )
+        assert len(store.session_tree(root.session_id)) == 1
+
+    with pytest.raises(ValueError, match="different workspace"):
+        store.restart_context_session(
+            root.session_id, expected_project_path=tmp_path / "wrong",
+            user_handoff="Resume manually"
+        )
+    with pytest.raises(ValueError, match="bounded, printable"):
+        store.restart_context_session(
+            root.session_id, expected_project_path=tmp_path,
+            user_handoff="unsafe\x00handoff"
+        )
+    assert len(store.session_tree(root.session_id)) == 1
+
+
+def test_context_restart_rejects_live_mcp_task_even_with_completed_turn(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "context-restart-task.db")
+    source = store.create_session(str(tmp_path))
+    store.start_turn(source.session_id, "turn-task", "watch task")
+    store.complete_turn("turn-task")
+    store.save_mcp_task(
+        task_id="task-1", session_id=source.session_id, turn_id="turn-task",
+        call_id="mcp-call", server_name="test-server",
+        remote_tool_name="submit", contract_fingerprint="contract",
+        server_fingerprint="server", protocol_version="2025-11-25",
+        task={"status": "working"}, answered_inputs={},
+    )
+    with pytest.raises(SessionForkConflictError, match="external tasks"):
+        store.restart_context_session(
+            source.session_id, expected_project_path=tmp_path,
+            user_handoff="Wait for the external task"
+        )
+    assert len(store.session_tree(source.session_id)) == 1
+
+
+def test_context_restart_rejects_unconfirmed_side_effect_without_replay(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "unconfirmed-restart.db")
+    root = store.create_session(str(tmp_path))
+    store.start_turn(root.session_id, "turn-side-effect", "run a remote operation")
+    store.save_tool_call(
+        root.session_id,
+        ToolCallRecord(
+            call_id="side-effect",
+            tool_name="run_command",
+            arguments={"command_line": "true"},
+            approved=True,
+            dispatched=True,
+            executed=False,
+            result=None,
+            error=None,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="turn-side-effect",
+    )
+    store.complete_turn("turn-side-effect")
+    with pytest.raises(SessionForkConflictError, match="ambiguous actions"):
+        store.restart_context_session(
+            root.session_id,
+            expected_project_path=tmp_path,
+            user_handoff="Do not repeat any external operations",
+        )
+    assert len(store.session_tree(root.session_id)) == 1
+
+
+def test_context_restart_does_not_inherit_summary_from_empty_parent(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "restart-empty-summary.db")
+    root = store.create_session(str(tmp_path))
+    store.save_context_summary(
+        root.session_id,
+        "Parent-only private analysis and stale evidence",
+        summarized_message_count=0,
+    )
+    child = store.restart_context_session(
+        root.session_id,
+        expected_project_path=tmp_path,
+        user_handoff="Verify current files before doing any work",
+    )
+    assert child.context_summary == ""
+    assert child.context_summary_message_count == 0
+    assert len(child.messages) == 1
+    assert "Parent-only private analysis" not in repr(child)
+    assert store.load_session(root.session_id).context_summary.startswith(
+        "Parent-only private analysis"
+    )
+
+
+@pytest.mark.parametrize("checkpoint_kind", ["restart", "native"])
+def test_context_checkpoint_rejects_completed_turn_with_unknown_tool_outcome(
+    tmp_path: Path, checkpoint_kind: str,
+) -> None:
+    store = SessionStore(tmp_path / "unknown-outcome-checkpoint.db")
+    parent = store.create_session(str(tmp_path), model="openai/example")
+    store.start_turn(parent.session_id, "turn-unknown", "run command")
+    store.save_tool_call(
+        parent.session_id,
+        ToolCallRecord(
+            call_id="unknown-outcome",
+            tool_name="run_command",
+            arguments={"command_line": "touch changed-file"},
+            approved=True,
+            dispatched=True,
+            executed=True,
+            success=None,
+            result="",
+            error="command timed out after dispatch",
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="turn-unknown",
+    )
+    store.complete_turn("turn-unknown")
+    assert store.load_session(parent.session_id).tool_calls[-1].success is None
+
+    with pytest.raises(SessionForkConflictError, match="ambiguous actions"):
+        if checkpoint_kind == "restart":
+            store.restart_context_session(
+                parent.session_id,
+                expected_project_path=tmp_path,
+                user_handoff="Check whether the previous command took effect",
+            )
+        else:
+            store.install_native_context_checkpoint(
+                parent.session_id,
+                expected_project_path=tmp_path,
+                expected_parent_messages=0,
+                expected_parent_revision=store.session_history_revision(
+                    parent.session_id
+                ),
+                checkpoint=[{
+                    "type": "responses_compacted_input",
+                    "output": [{
+                        "type": "compaction",
+                        "encrypted_content": "opaque-test-only",
+                    }],
+                }],
+            )
+    assert len(store.session_tree(parent.session_id)) == 1
+
+
+def test_context_restart_refuses_inconsistent_dispatched_tool_state(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "restart-unknown-dispatch.db")
+    parent = store.create_session(str(tmp_path))
+    store.save_tool_call(
+        parent.session_id,
+        ToolCallRecord(
+            call_id="unknown-dispatch",
+            tool_name="run_command",
+            arguments={"command_line": "true"},
+            approved=False,
+            dispatched=True,
+            executed=False,
+            result=None,
+            error="dispatch status inconsistent",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    with pytest.raises(SessionForkConflictError, match="ambiguous actions"):
+        store.restart_context_session(
+            parent.session_id,
+            expected_project_path=tmp_path,
+            user_handoff="Recheck external effects before continuing",
+        )
+    assert len(store.session_tree(parent.session_id)) == 1
+
+
+def test_native_context_checkpoint_preserves_parent_without_replaying_actions(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "native-checkpoint.db")
+    root = store.create_session(
+        str(tmp_path), model="openai/gpt-6-luna", permission_mode="dry_run"
+    )
+    store.save_message(
+        root.session_id,
+        Message(role="user", content="Fix the feature", timestamp=datetime.now(timezone.utc)),
+    )
+    source_before = store.load_session(root.session_id)
+    checkpoint = [{
+        "type": "responses_compacted_input",
+        "output": [
+            {
+                "type": "message", "role": "user", "id": "msg-1",
+                "status": "completed",
+                "content": [{"type": "input_text", "text": "Fix the feature"}],
+            },
+            {"type": "compaction", "id": "cp-1",
+             "encrypted_content": "OPAQUE_CHECKPOINT"},
+        ],
+    }]
+    child = store.install_native_context_checkpoint(
+        root.session_id,
+        expected_project_path=tmp_path,
+        expected_parent_messages=1,
+        expected_parent_revision=store.session_history_revision(root.session_id),
+        checkpoint=checkpoint,
+    )
+    assert child.parent_session_id == root.session_id
+    assert child.permission_mode == "dry_run"
+    assert child.fork_message_count == 0
+    assert len(child.messages) == 1
+    assert child.messages[0].role == "assistant"
+    assert child.messages[0].content == ""
+    assert child.messages[0].metadata["provider_state"] == checkpoint
+    assert child.tool_calls == []
+    assert store.list_audit_logs(child.session_id) == []
+    assert store.verify_audit_log(child.session_id) == []
+    assert store.load_session(root.session_id).messages == source_before.messages
+
+
+def test_native_checkpoint_child_does_not_inherit_parent_summary(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "checkpoint-empty-summary.db")
+    parent = store.create_session(str(tmp_path))
+    store.save_context_summary(parent.session_id, "Old private summary")
+    checkpoint = [{
+        "type": "responses_compacted_input",
+        "output": [{"type": "compaction", "encrypted_content": "synthetic-opaque"}],
+    }]
+    child = store.install_native_context_checkpoint(
+        parent.session_id,
+        expected_project_path=tmp_path,
+        expected_parent_messages=0,
+        expected_parent_revision=store.session_history_revision(parent.session_id),
+        checkpoint=checkpoint,
+    )
+    assert child.context_summary == ""
+    assert child.context_summary_message_count == 0
+    assert len(child.messages) == 1
+    assert "Old private summary" not in repr(child)
+    assert store.load_session(parent.session_id).context_summary == "Old private summary"
+
+
+def test_native_checkpoint_refuses_malformed_or_stale_source_atomically(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "native-checkpoint-guard.db")
+    root = store.create_session(str(tmp_path))
+    original = [{
+        "type": "responses_compacted_input",
+        "output": [{"type": "compaction", "encrypted_content": "opaque"}],
+    }]
+    with pytest.raises(SessionForkConflictError, match="source session changed"):
+        store.install_native_context_checkpoint(
+            root.session_id,
+            expected_project_path=tmp_path,
+            expected_parent_messages=1,
+            expected_parent_revision=store.session_history_revision(root.session_id),
+            checkpoint=original,
+        )
+    for bad in (
+        [{"type": "reasoning", "id": "rs", "summary": [],
+          "encrypted_content": "opaque"}],
+        [{"type": "compaction", "encrypted_content": ""}],
+        [{"type": "compaction", "encrypted_content": "opaque", "unsafe": True}],
+        [{
+            "type": "responses_compacted_input",
+            "output": [
+                {"type": "function_call", "call_id": "action"},
+                {"type": "compaction", "encrypted_content": "opaque"},
+            ],
+        }],
+        [{
+            "type": "responses_compacted_input",
+            "output": [{"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "no compaction"}]}],
+        }],
+        [],
+    ):
+        with pytest.raises(ValueError):
+            store.install_native_context_checkpoint(
+                root.session_id,
+                expected_project_path=tmp_path,
+                expected_parent_messages=0,
+                expected_parent_revision=store.session_history_revision(root.session_id),
+                checkpoint=bad,
+            )
+    assert len(store.session_tree(root.session_id)) == 1
+
+
+def test_native_checkpoint_rejects_same_count_rewritten_source(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "checkpoint-revision.db")
+    root = store.create_session(str(tmp_path))
+    store.save_message(
+        root.session_id,
+        Message(role="user", content="original",
+                timestamp=datetime.now(timezone.utc)),
+    )
+    revision = store.session_history_revision(root.session_id)
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE messages SET content = ? WHERE session_id = ?",
+            ("changed concurrently", root.session_id),
+        )
+    assert store.durable_message_count(root.session_id) == 1
+    assert store.session_history_revision(root.session_id) != revision
+    with pytest.raises(SessionForkConflictError, match="source session changed"):
+        store.install_native_context_checkpoint(
+            root.session_id,
+            expected_project_path=tmp_path,
+            expected_parent_messages=1,
+            expected_parent_revision=revision,
+            checkpoint=[{
+                "type": "responses_compacted_input",
+                "output": [{"type": "compaction",
+                            "encrypted_content": "opaque"}],
+            }],
+        )
+    assert len(store.session_tree(root.session_id)) == 1
+
+
+def test_native_checkpoint_rejects_model_change_during_remote_compaction(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "checkpoint-model-race.db")
+    root = store.create_session(str(tmp_path), model="openai/gpt-6-luna")
+    store.save_message(
+        root.session_id,
+        Message(
+            role="user", content="original",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    revision = store.session_history_revision(root.session_id)
+    store.update_session_model(root.session_id, "openai/gpt-6-astra")
+    assert store.session_history_revision(root.session_id) == revision
+    with pytest.raises(
+        SessionForkConflictError, match="source session model changed"
+    ):
+        store.install_native_context_checkpoint(
+            root.session_id,
+            expected_project_path=tmp_path,
+            expected_parent_messages=1,
+            expected_parent_revision=revision,
+            expected_parent_model="openai/gpt-6-luna",
+            checkpoint=[{
+                "type": "responses_compacted_input",
+                "output": [
+                    {"type": "compaction", "encrypted_content": "synthetic"}
+                ],
+            }],
+        )
+    assert len(store.session_tree(root.session_id)) == 1
+
+
+def test_native_checkpoint_rejects_permission_change_during_remote_compaction(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "checkpoint-policy-race.db")
+    root = store.create_session(str(tmp_path), permission_mode="plan")
+    store.save_message(
+        root.session_id,
+        Message(
+            role="user", content="original",
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+    revision = store.session_history_revision(root.session_id)
+    store.update_session_permission_mode(root.session_id, "auto_approve")
+    assert store.session_history_revision(root.session_id) == revision
+    with pytest.raises(
+        SessionForkConflictError, match="permission mode changed"
+    ):
+        store.install_native_context_checkpoint(
+            root.session_id,
+            expected_project_path=tmp_path,
+            expected_parent_messages=1,
+            expected_parent_revision=revision,
+            expected_parent_permission_mode="plan",
+            checkpoint=[{
+                "type": "responses_compacted_input",
+                "output": [
+                    {"type": "compaction", "encrypted_content": "synthetic"}
+                ],
+            }],
+        )
+    assert len(store.session_tree(root.session_id)) == 1
+
+
 def test_session_fork_rejects_incomplete_tool_and_turn_boundaries(
     tmp_path: Path,
 ) -> None:

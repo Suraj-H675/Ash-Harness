@@ -362,6 +362,9 @@ class ProviderABC(ABC):
     """
 
     provider_family = "custom"
+    # Provider-owned opaque checkpoints require an explicit, verified protocol.
+    # OpenAI wire compatibility alone must never imply support.
+    supports_native_compaction = False
     _ash_declared_capabilities: ProviderCapabilities | None = None
 
     @abstractmethod

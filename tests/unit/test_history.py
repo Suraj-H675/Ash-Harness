@@ -72,6 +72,107 @@ def test_history_below_budget_is_unchanged() -> None:
     assert result.messages == messages
 
 
+def test_opaque_provider_replay_state_preserves_unmodified_prefix() -> None:
+    messages = [
+        {"role": "system", "content": "Trusted instructions"},
+        {"role": "user", "content": "Repair the source"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"call_id": "read-1", "name": "read_file", "arguments": {}}
+            ],
+            "provider_state": [
+                {"type": "reasoning", "id": "rs-1", "summary": [],
+                 "encrypted_content": "OPAQUE_STATE"}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "read-1",
+            "content": "Source evidence " * 200,
+        },
+    ]
+    original = json.dumps(messages, sort_keys=True)
+    compactor = HistoryCompactor(
+        max_context_tokens=2000,
+        completion_reserve=200,
+        threshold=0.10,
+        input_token_limit=1800,
+    )
+    result = compactor.compact(
+        messages, count_tokens=count_words, protected_from_index=1
+    )
+    assert result.provider_replay_state_preserved
+    assert not result.compacted
+    assert result.pruned_tool_outputs == 0
+    assert result.messages == messages
+    assert json.dumps(messages, sort_keys=True) == original
+
+
+def test_opaque_provider_replay_state_refuses_local_compaction_when_full() -> None:
+    messages = [
+        {"role": "system", "content": "Policy"},
+        {"role": "user", "content": "Current user task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"call_id": "read", "name": "read_file", "arguments": {}}],
+            "provider_state": [
+                {"type": "reasoning", "id": "rs", "summary": [],
+                 "encrypted_content": "OPAQUE_STATE"}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "read",
+            "content": "Source observation " * 180,
+        },
+    ]
+    snapshot = json.dumps(messages, sort_keys=True)
+    compactor = HistoryCompactor(
+        max_context_tokens=150, completion_reserve=20, input_token_limit=130
+    )
+    with pytest.raises(
+        ContextBudgetExceededError,
+        match="local history rewriting could invalidate reusable reasoning",
+    ) as exc:
+        compactor.compact(
+            messages, count_tokens=count_words, protected_from_index=1
+        )
+    assert exc.value.provider_replay_state_preserved
+    assert exc.value.required_tokens > exc.value.limit
+    assert json.dumps(messages, sort_keys=True) == snapshot
+
+
+def test_force_compaction_does_not_silently_reset_opaque_reasoning() -> None:
+    messages = [
+        {"role": "system", "content": "Policy"},
+        {"role": "user", "content": "Current task"},
+        {
+            "role": "assistant",
+            "content": "Interim result",
+            "provider_state": [
+                {"type": "reasoning", "id": "rs", "summary": [],
+                 "encrypted_content": "OPAQUE_STATE"}
+            ],
+        },
+    ]
+    compactor = HistoryCompactor(
+        max_context_tokens=1000, completion_reserve=100
+    )
+    with pytest.raises(
+        ContextBudgetExceededError,
+        match="prevents safe local compaction",
+    ) as exc:
+        compactor.compact(
+            messages, count_tokens=count_words,
+            protected_from_index=1, force=True
+        )
+    assert exc.value.provider_replay_state_preserved
+    assert messages[-1]["provider_state"][0]["encrypted_content"] == "OPAQUE_STATE"
+
+
 def test_history_compaction_preserves_recent_tool_pair() -> None:
     messages = [{"role": "system", "content": "system"}]
     for index in range(10):

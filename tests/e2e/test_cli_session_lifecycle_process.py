@@ -140,19 +140,49 @@ def test_populated_session_continue_resume_and_fork_across_cli_processes(
             root_before_fork.messages
         )
 
+        branch_before_restart = store.load_session(branch_id)
+        restarted = store.restart_context_session(
+            branch_id,
+            expected_project_path=workspace,
+            user_handoff="Carry forward only the verified fix specification",
+        )
+        restart_id = restarted.session_id
+        assert restarted.parent_session_id == branch_id
+        assert len(restarted.messages) == 1
+        sixth = completed(
+            "--resume", restart_id, "-p", "Continue after checking current files"
+        )
+        assert sixth["session_id"] == restart_id
+        assert sixth["response"] == "ANSWER-6"
+        assert store.load_session(branch_id).messages == branch_before_restart.messages
+        restarted_inputs = [
+            item.get("content")
+            for item in requests[5]["messages"]
+            if item.get("role") == "user"
+        ]
+        assert len(restarted_inputs) == 2
+        assert "verified fix specification" in restarted_inputs[0]
+        assert restarted_inputs[1] == "Continue after checking current files"
+        assert "first question" not in repr(requests[5]["messages"])
+        assert "branch question" not in repr(requests[5]["messages"])
+
         listing = cli("sessions", "list", "--json")
         assert listing.returncode == 0, listing.stderr
         assert {
             row["session_id"] for row in json.loads(listing.stdout)["sessions"]
-        } == {root_id, branch_id}
+        } == {root_id, branch_id, restart_id}
         tree = cli("sessions", "tree", "--session", branch_id, "--json")
         assert tree.returncode == 0, tree.stderr
         lineage = json.loads(tree.stdout)["sessions"]
-        assert [row["session_id"] for row in lineage] == [root_id, branch_id]
+        assert [row["session_id"] for row in lineage] == [
+            root_id, branch_id, restart_id
+        ]
         assert lineage[0]["parent_session_id"] is None
         assert lineage[1]["parent_session_id"] == root_id
         assert lineage[1]["root_session_id"] == root_id
         assert lineage[1]["fork_message_count"] == len(root_before_fork.messages)
+        assert lineage[2]["parent_session_id"] == branch_id
+        assert lineage[2]["fork_message_count"] == 0
 
         search = cli("sessions", "search", "--query", "branch question", "--json")
         assert search.returncode == 0, search.stderr
@@ -171,8 +201,8 @@ def test_populated_session_continue_resume_and_fork_across_cli_processes(
         )
         assert foreign.returncode != 0
         assert json.loads(foreign.stdout)["type"] == "error"
-        assert len(requests) == 5
-        assert authorizations == [None] * 5
+        assert len(requests) == 6
+        assert authorizations == [None] * 6
         assert any(
             message.get("content") == "follow-up question"
             for message in requests[2]["messages"]

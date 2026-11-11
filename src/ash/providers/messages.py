@@ -293,8 +293,70 @@ class CanonicalMessage(BaseModel):
 def _validate_provider_state_item(item: Any) -> None:
     if not isinstance(item, dict):
         raise ValueError("provider_state items must be objects")
+    if item.get("type") == "responses_compacted_input":
+        if set(item) != {"type", "output"}:
+            raise ValueError("native Responses checkpoint has unsupported fields")
+        output = item["output"]
+        if (
+            not isinstance(output, list)
+            or not 1 <= len(output) <= MAX_CANONICAL_MESSAGES
+            or not all(isinstance(entry, dict) for entry in output)
+        ):
+            raise ValueError("native Responses checkpoint output is invalid")
+        for retained in output[:-1]:
+            if (
+                retained.get("type") != "message"
+                or retained.get("role") != "user"
+                or not isinstance(retained.get("content"), list)
+                or not 1 <= len(retained["content"]) <= MAX_CANONICAL_CONTENT_BLOCKS
+            ):
+                raise ValueError(
+                    "native Responses checkpoint contains unsupported retained items"
+                )
+            if (
+                set(retained) - {"type", "id", "role", "status", "content"}
+                or (retained.get("id") is not None and (
+                    not isinstance(retained["id"], str)
+                    or not retained["id"]
+                    or len(retained["id"]) > 1024
+                ))
+                or retained.get("status") not in {
+                    None, "in_progress", "completed", "incomplete"
+                }
+            ):
+                raise ValueError("native Responses retained message is malformed")
+            for block in retained["content"]:
+                if (
+                    not isinstance(block, dict)
+                    or set(block) != {"type", "text"}
+                    or block.get("type") != "input_text"
+                    or not isinstance(block.get("text"), str)
+                ):
+                    raise ValueError(
+                        "native Responses retained content block is unsupported "
+                        "(only verified input_text blocks can be replayed)"
+                    )
+        if output[-1].get("type") != "compaction":
+            raise ValueError("native Responses checkpoint must end in compaction")
+        _validate_provider_state_item(output[-1])
+        return
     if item.get("type") == "reasoning":
         _validate_provider_reasoning_state(item)
+        return
+    if item.get("type") == "compaction":
+        if set(item) - {"type", "id", "encrypted_content"}:
+            raise ValueError("provider compaction item contains unsupported fields")
+        encrypted = item.get("encrypted_content")
+        item_id = item.get("id")
+        if (
+            not isinstance(encrypted, str)
+            or not encrypted
+            or len(encrypted.encode("utf-8")) > MAX_PROVIDER_STATE_BYTES
+            or (item_id is not None and (
+                not isinstance(item_id, str) or not item_id or len(item_id) > 1024
+            ))
+        ):
+            raise ValueError("provider compaction item is invalid")
         return
     if item.get("type") == "sealed_provider_state":
         _validate_sealed_provider_state(item)
