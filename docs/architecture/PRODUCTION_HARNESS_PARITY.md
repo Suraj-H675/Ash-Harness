@@ -148,6 +148,16 @@ too few to establish general reliability or a competing-harness advantage.
 See [the controlled context investigation](../benchmarks/REAL_REPOSITORY_BASELINE_2026-11-10.md).
 The broader acceptance remains **NOT YET**.
 
+**Requested-model-matched exploratory CLI comparison (2026-11-11):**
+Ash now supports a model-validated `--reasoning-effort` for one-shot turns.
+On the same pinned h11 repair and with requested GPT-6 Luna xhigh on both
+sides, Ash completed in 83.90 seconds and passed the visible and sealed
+hidden oracle, while Codex CLI + local Poteto produced correct code and
+passed both oracles but did not terminate within the same 170-second limit.
+The environments, tool affordances and workflow policies were not equivalent;
+this is **not** a head-to-head competitive acceptance. See
+[the comparison limitations and receipts](../benchmarks/COMPARATIVE_H11_2026-11-11.md).
+
 Reassess these gates from **current** source, supported-host runtime, and
 independent results. Explicitly state what remains open; do not repeat
 historical “parity closed” language as a fresh daily-driver endorsement.

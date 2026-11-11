@@ -56,6 +56,13 @@ PYTHONPATH=src .venv/bin/python devtools/repository_benchmark.py \
   --evidence-dir /var/tmp/ash-h11-replay-001
 ```
 
+For model/effort-controlled comparisons, add `--reasoning-effort xhigh`
+or another effort supported by the chosen model. This passes a one-shot,
+model-validated `ash --reasoning-effort` option; the benchmark records the
+requested effort and never changes the persistent Ash profile. Earlier
+trials that omit the option retain the model's runtime default, which must
+not be presented as the same effort setting.
+
 Select **one task per execution** and a new evidence directory each time.
 The documented example model must still be in the signed-in account's current
 catalog. A maximum of 24 model iterations and a task timeout bound the run.

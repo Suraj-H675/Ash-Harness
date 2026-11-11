@@ -1,11 +1,28 @@
 from __future__ import annotations
 
+import argparse
 import ast
 import inspect
 from pathlib import Path
 
 import ash.cli as cli_module
 import ash.cli_parser as cli_parser_module
+
+
+def test_one_shot_reasoning_effort_parser_rejects_unknown_values() -> None:
+    import pytest
+
+    parser = argparse.ArgumentParser()
+    cli_parser_module.configure_parser(parser, "test")
+    assert (
+        parser.parse_args(
+            ["--prompt", "Fix bug", "--reasoning-effort", "xhigh"]
+        ).reasoning_effort
+        == "xhigh"
+    )
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(["--prompt", "Fix bug", "--reasoning-effort", "invalid"])
+    assert error.value.code == 2
 
 
 def test_every_cli_subparser_declares_discovery_help() -> None:

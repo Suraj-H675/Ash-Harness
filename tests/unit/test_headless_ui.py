@@ -74,6 +74,62 @@ async def test_headless_unfinished_turn_preserves_result_and_exit_status(
     assert result["session_id"] == "fixture-session"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported", [True, False])
+async def test_one_shot_reasoning_effort_is_applied_before_model_request_and_cleaned_up(
+    supported: bool,
+) -> None:
+    from ash.cli import _bootstrap_and_headless
+
+    calls: list[str] = []
+
+    class FakeLoop:
+        provider = None
+        safety_guard = None
+        recovered_turns = 0
+        recovery_summary = None
+        active_model_id = "openai/gpt-6-luna"
+        _last_context_tokens = 12
+        last_turn_usage = {"prompt_tokens": 1, "completion_tokens": 1}
+        _last_turn_stop_reason = "completed"
+
+        def set_reasoning_effort(self, effort: str) -> None:
+            calls.append("effort:" + effort)
+            if not supported:
+                raise ValueError("effort unavailable for model")
+
+        async def start_session(self, session_id=None):
+            calls.append("session")
+            return SimpleNamespace(session_id="test-session")
+
+        async def run_turn(self, prompt: str) -> str:
+            calls.append("turn")
+            return "done"
+
+        async def aclose(self):
+            calls.append("close")
+
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="json", stream=stream)
+    code = await _bootstrap_and_headless(
+        FakeLoop(),
+        SimpleNamespace(),
+        prompt="Fix bug",
+        session_id=None,
+        ui=ui,
+        reasoning_effort="xhigh",
+    )
+    payload = json.loads(stream.getvalue())
+    if supported:
+        assert code == 0
+        assert calls == ["effort:xhigh", "session", "turn", "close"]
+        assert payload["type"] == "turn.completed"
+    else:
+        assert code != 0
+        assert calls == ["effort:xhigh", "close"]
+        assert payload["type"] == "error"
+
+
 def test_stream_json_emits_deltas_and_completion() -> None:
     stream = io.StringIO()
     ui = HeadlessUI(output_format="stream-json", stream=stream)

@@ -1571,6 +1571,12 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         help="Override the configured permission mode for this run.",
     )
     parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        default=None,
+        help="Set a model-supported reasoning effort for this one-shot prompt.",
+    )
+    parser.add_argument(
         "--json-schema",
         type=Path,
         default=None,

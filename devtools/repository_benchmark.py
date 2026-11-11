@@ -570,6 +570,7 @@ def run_task(
     timeout: int,
     context_tokens: int,
     turn_token_budget: int,
+    reasoning_effort: str | None = None,
 ) -> dict[str, object]:
     task = TASKS[task_name]
     started = time.monotonic()
@@ -658,6 +659,8 @@ def run_task(
             "--output-format",
             "json",
         ]
+        if reasoning_effort is not None:
+            argv.extend(["--reasoning-effort", reasoning_effort])
         cli_started = time.monotonic()
         with (
             (evidence / "ash.stdout").open("wb") as stdout,
@@ -747,6 +750,7 @@ def run_task(
             "context_tokens": context_tokens,
             "turn_token_budget": turn_token_budget,
             "iteration_limit": CHATGPT_TURN_ITERATIONS,
+            "reasoning_effort": reasoning_effort,
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "cli_seconds": cli_seconds,
             "exit_code": exit_code,
@@ -790,6 +794,12 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=210)
     parser.add_argument("--context-tokens", type=int, default=32768)
     parser.add_argument("--turn-token-budget", type=int, default=120000)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        default=None,
+        help="Explicit model-validated reasoning effort for a controlled trial",
+    )
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.chatgpt_model):
         parser.error("invalid exact ChatGPT model ID")
@@ -826,6 +836,7 @@ def main() -> int:
         timeout=args.timeout,
         context_tokens=args.context_tokens,
         turn_token_budget=args.turn_token_budget,
+        reasoning_effort=args.reasoning_effort,
     )
     print(
         json.dumps(

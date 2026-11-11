@@ -3118,6 +3118,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
             args.output_format = "stream-json"
         if args.command == "setup":
             args.non_interactive = True
+    if args.reasoning_effort is not None and (
+        args.prompt is None or args.command is not None
+    ):
+        parser.error("--reasoning-effort requires a one-shot prompt")
 
     if args.command == "crew":
         from ash.commands.crew import run_crew_command
@@ -5272,6 +5276,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     session_id=startup_session_id,
                     ui=ui,
                     json_schema_path=args.json_schema,
+                    reasoning_effort=args.reasoning_effort,
                 )
             )
         except KeyboardInterrupt:
@@ -5301,6 +5306,7 @@ async def _headless_with_sigterm_cleanup(
     session_id: str | None,
     ui: Any,
     json_schema_path: Path | None = None,
+    reasoning_effort: str | None = None,
 ) -> int:
     return await _with_sigterm_cleanup(
         lambda: _bootstrap_and_headless(
@@ -5310,6 +5316,7 @@ async def _headless_with_sigterm_cleanup(
             session_id=session_id,
             ui=ui,
             json_schema_path=json_schema_path,
+            reasoning_effort=reasoning_effort,
         )
     )
 
@@ -5414,6 +5421,7 @@ async def _bootstrap_and_headless(
     session_id: str | None,
     ui: Any,
     json_schema_path: Path | None = None,
+    reasoning_effort: str | None = None,
 ) -> int:
     from ash.exceptions import classify_exception, format_error
     from ash.commands.attachments import PreparedAttachments, prepare_file_mentions
@@ -5423,6 +5431,8 @@ async def _bootstrap_and_headless(
     result_payload: dict[str, Any] | None = None
     result_code = 0
     try:
+        if reasoning_effort is not None:
+            loop.set_reasoning_effort(reasoning_effort)
         session = await loop.start_session(session_id)
         # A turn may recheck recovery state and clear this summary. Preserve the
         # startup finding for the one-shot operator result.
