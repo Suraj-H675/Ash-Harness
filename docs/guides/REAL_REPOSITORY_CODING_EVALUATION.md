@@ -76,6 +76,12 @@ preflight red/green outcomes, exact CLI outcome, allowed tool activity, runtime
 timings/usage, visible and hidden oracle scores, audit integrity, changed file
 paths, and cleanup state. Raw CLI stdout/stderr are preserved privately for
 diagnosis. **A passing model message is never sufficient for acceptance.**
+The local benchmark additionally records **content-free** tool-result
+character counts and, for `read_file`, the numeric requested range and
+maximum-size settings (if supplied). These size fields never include the
+file path, source content, or credential text. The operational timeline
+also includes numeric `context.usage` slices, making inflated repeated file
+reads distinguishable from static system/tool-schema overhead.
 The grader requires a successful one-shot CLI completion, required source
 edits, an executed authorized test, both external oracles passing, protected
 files unchanged, and verified session audit.

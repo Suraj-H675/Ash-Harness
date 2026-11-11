@@ -312,7 +312,20 @@ class RuntimeEventObserver(Protocol):
 
 
 _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
-    "context.usage": frozenset({"current", "maximum"}),
+    "context.usage": frozenset(
+        {
+            "current",
+            "maximum",
+            "system_tokens",
+            "tool_schema_tokens",
+            "history_tokens",
+            "repo_map_tokens",
+            "memory_tokens",
+            "history_message_count",
+            "tool_message_count",
+            "tool_message_chars",
+        }
+    ),
     "model.request.started": frozenset(
         {
             "provider",
@@ -7600,6 +7613,26 @@ class AshLoop:
                     "type": "context.usage",
                     "current": self._last_context_tokens,
                     "maximum": maximum_input,
+                    # Content-free input accounting. These slices separate
+                    # repeated file/tool history from provider tool schemas
+                    # without persisting paths, prompts, or tool contents.
+                    "system_tokens": budget_usage["system"],
+                    "tool_schema_tokens": budget_usage["tools"],
+                    "history_tokens": budget_usage["history"],
+                    "repo_map_tokens": budget_usage["repo_map"],
+                    "memory_tokens": budget_usage["memory"],
+                    "history_message_count": max(0, len(result.messages) - 1),
+                    "tool_message_count": sum(
+                        1
+                        for message in result.messages
+                        if message.get("role") == "tool"
+                    ),
+                    "tool_message_chars": sum(
+                        len(message["content"])
+                        for message in result.messages
+                        if message.get("role") == "tool"
+                        and isinstance(message.get("content"), str)
+                    ),
                 }
             )
             self.ui.update_token_count(self._last_context_tokens, maximum_input)

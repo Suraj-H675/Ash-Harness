@@ -23,7 +23,7 @@ from pathlib import Path
 
 from ash.commands.chatgpt_auth import list_chatgpt_models
 from ash.core.activity import EDIT_TOOL_NAMES, summarize_operational_events
-from ash.core.session import SessionStore
+from ash.core.session import SessionStore, ToolCallRecord
 from ash.providers.openai_chatgpt_auth import ChatGPTAccount, ChatGPTCredentialStore
 
 from coding_benchmark import (
@@ -501,6 +501,20 @@ def check_edits(
     return protected, changed
 
 
+def tool_call_size_metrics(entry: ToolCallRecord) -> dict[str, int | bool]:
+    """Report a tool's size/range without copying file contents or paths."""
+    metrics: dict[str, int | bool] = {}
+    if isinstance(entry.result, str):
+        metrics["result_chars"] = len(entry.result)
+    if entry.tool_name == "read_file":
+        metrics["explicit_max_chars"] = "max_chars" in entry.arguments
+        for name in ("max_chars", "start_line", "end_line", "start_column"):
+            value = entry.arguments.get(name)
+            if type(value) is int and 0 < value <= 131_072:
+                metrics[name] = value
+    return metrics
+
+
 def check_oracles(workspace: Path, task: RepositoryTask) -> dict[str, object]:
     visible = oracle_python(workspace, task.visible_script)
     hidden = oracle_python(workspace, code=task.hidden_source)
@@ -692,6 +706,7 @@ def run_task(
                     "command": entry.arguments.get("command_line", "")
                     if entry.tool_name == "run_command"
                     else "",
+                    "size_metrics": tool_call_size_metrics(entry),
                 }
                 for entry in session.tool_calls
             ]

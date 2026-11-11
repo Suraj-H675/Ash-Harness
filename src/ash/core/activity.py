@@ -22,7 +22,18 @@ EDIT_TOOL_NAMES = frozenset(
 )
 METRIC_EVENT_FIELDS = {
     "turn.started": (),
-    "context.usage": ("current", "maximum"),
+    "context.usage": (
+        "current",
+        "maximum",
+        "system_tokens",
+        "tool_schema_tokens",
+        "history_tokens",
+        "repo_map_tokens",
+        "memory_tokens",
+        "history_message_count",
+        "tool_message_count",
+        "tool_message_chars",
+    ),
     "model.request.started": ("attempt", "message_count", "tool_count", "native_tools"),
     "model.request.first_output": ("attempt",),
     "model.request.completed": (

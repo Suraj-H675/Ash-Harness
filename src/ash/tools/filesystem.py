@@ -223,7 +223,12 @@ class WholeEditArgs(BaseModel):
 class ReadFileTool(BaseTool):
     name = "read_file"
     execution_contract = ToolExecutionContract(parallel_safe=True)
-    description = "Read numbered file lines. Truncated results include next line/column and SHA-256."
+    description = (
+        "Read numbered file lines. For large files, locate relevant symbols "
+        "with search_text, then read focused start_line/end_line ranges; avoid "
+        "large full-file reads that bloat later requests. Truncated results "
+        "include next line/column and SHA-256."
+    )
     args_schema = ReadFileArgs
 
     def json_schema(self) -> dict[str, Any]:

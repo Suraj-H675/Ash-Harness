@@ -578,6 +578,18 @@ def test_structured_redaction_only_preserves_numeric_usage_token_fields() -> Non
     assert redact_value({"credential_configured": True}) == {
         "credential_configured": True
     }
+    context_counts = {
+        "system_tokens": 300,
+        "history_tokens": 1200,
+        "repo_map_tokens": 80,
+        "memory_tokens": 40,
+        "tool_schema_tokens": 700,
+    }
+    assert redact_value(context_counts) == context_counts
+    for field in context_counts:
+        assert redact_value({field: "PRIVATE-ACCESS-TOKEN"}) == {
+            field: "[REDACTED]"
+        }
 
 
 def test_redaction_handles_nested_escaped_and_multiline_assignments() -> None:

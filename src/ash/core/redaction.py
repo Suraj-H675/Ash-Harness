@@ -767,6 +767,12 @@ _NON_SECRET_USAGE_FIELDS = frozenset(
         "max_tool_result_tokens",
         "max_attachment_tokens",
         "agent_token_budget",
+        # Exact numeric-only context accounting keys. Do not exempt string
+        # values, which may still contain credentials or untrusted text.
+        "system_tokens",
+        "history_tokens",
+        "repo_map_tokens",
+        "memory_tokens",
     }
 )
 _USAGE_TOKEN_FIELD = re.compile(

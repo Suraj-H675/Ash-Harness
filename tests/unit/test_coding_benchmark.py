@@ -650,9 +650,26 @@ def test_coding_timeline_records_request_and_tool_timings_without_content() -> N
     evidence = summarize_operational_events(
         [
             event(1, 0, "turn.started", prompt="do not retain secret"),
-            event(2, 1, "model.request.started", operation_id="r1", tool_count=10),
             event(
-                3,
+                2,
+                0,
+                "context.usage",
+                current=8000,
+                maximum=16000,
+                system_tokens=1000,
+                tool_schema_tokens=750,
+                history_tokens=6000,
+                repo_map_tokens=250,
+                memory_tokens=0,
+                history_message_count=5,
+                tool_message_count=2,
+                tool_message_chars=30000,
+                tool_result="SECRET-SOURCE-TEXT",
+                file_path="/private/sensitive-file.py",
+            ),
+            event(3, 1, "model.request.started", operation_id="r1", tool_count=10),
+            event(
+                4,
                 4,
                 "model.request.completed",
                 operation_id="r1",
@@ -661,7 +678,7 @@ def test_coding_timeline_records_request_and_tool_timings_without_content() -> N
                 output="SECRET-OUTPUT",
             ),
             event(
-                4,
+                5,
                 5,
                 "tool.completed",
                 tool="replace_file_content",
@@ -669,23 +686,23 @@ def test_coding_timeline_records_request_and_tool_timings_without_content() -> N
                 arguments={"file_path": "private.txt"},
             ),
             event(
-                5,
+                6,
                 7,
                 "tool.completed",
                 tool="run_command",
                 success=True,
                 error="PRIVATE-ERROR",
             ),
-            event(6, 8, "model.request.started", operation_id="r2", tool_count=10),
+            event(7, 8, "model.request.started", operation_id="r2", tool_count=10),
             event(
-                7,
+                8,
                 10,
                 "model.request.completed",
                 operation_id="r2",
                 prompt_tokens=4100,
                 completion_tokens=30,
             ),
-            event(8, 11, "turn.completed", stop_reason="completed", iterations=2),
+            event(9, 11, "turn.completed", stop_reason="completed", iterations=2),
         ]
     )
 
@@ -695,13 +712,27 @@ def test_coding_timeline_records_request_and_tool_timings_without_content() -> N
     assert evidence["last_successful_edit_seconds"] == 5
     assert evidence["last_successful_command_seconds"] == 7
     assert evidence["timeline_truncated"] is False
-    assert evidence["timeline"][1]["tool_count"] == 10
+    assert (
+        next(
+            item["tool_count"]
+            for item in evidence["timeline"]
+            if item["type"] == "model.request.started"
+        )
+        == 10
+    )
     assert evidence["timeline"][-1]["at_seconds"] == 11
+    context_metrics = next(
+        item for item in evidence["timeline"] if item["type"] == "context.usage"
+    )
+    assert context_metrics["history_tokens"] == 6000
+    assert context_metrics["tool_message_chars"] == 30000
     serialized = str(evidence)
     assert "SECRET-OUTPUT" not in serialized
     assert "PRIVATE-ERROR" not in serialized
     assert "private.txt" not in serialized
     assert "do not retain secret" not in serialized
+    assert "SECRET-SOURCE-TEXT" not in serialized
+    assert "/private/sensitive-file.py" not in serialized
 
 
 def test_coding_timeline_measures_only_successful_terminal_requests_and_tools() -> None:

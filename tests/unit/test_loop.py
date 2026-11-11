@@ -8529,6 +8529,17 @@ async def test_turn_usage_tracks_cache_and_configured_cost(tmp_path):
         event for event in ui.events if event["type"] == "context.usage"
     )
     assert loop._last_context_tokens == context_event["current"]
+    for source, event_key in (
+        ("system", "system_tokens"),
+        ("tools", "tool_schema_tokens"),
+        ("history", "history_tokens"),
+        ("repo_map", "repo_map_tokens"),
+        ("memory", "memory_tokens"),
+    ):
+        assert context_event[event_key] == report.slices[source].used
+    assert context_event["history_message_count"] >= 1
+    assert context_event["tool_message_count"] >= 0
+    assert context_event["tool_message_chars"] >= 0
     usage = store.get_session_usage(session.session_id)
     assert usage.prompt_tokens == 100
     assert usage.cache_read_tokens == 60

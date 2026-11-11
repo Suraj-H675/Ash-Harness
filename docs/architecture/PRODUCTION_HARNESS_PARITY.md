@@ -135,6 +135,19 @@ This adds evidence for **one scoped feature implementation**, not broad
 feature-design reliability or competitive coding efficiency. Acceptance
 remains **NOT YET**.
 
+**Context-efficiency follow-up (2026-11-10):** An instrumented same-task
+replay of the two-module urllib3 repair identified explicitly requested
+large file reads (up to 70K source characters), with ~87K characters of
+tool-result history resent on later requests. Simply halving the default
+`read_file` size did not improve the result and was reverted. A focused
+search-then-range-read description, keeping execution and trust semantics
+unchanged, completed the original **64K request / 120K turn** benchmark
+in **two separate trials** (77,491 and 85,300 prompt tokens). The original
+unguided trial failed at that budget, but the two guided passes are still
+too few to establish general reliability or a competing-harness advantage.
+See [the controlled context investigation](../benchmarks/REAL_REPOSITORY_BASELINE_2026-11-10.md).
+The broader acceptance remains **NOT YET**.
+
 Reassess these gates from **current** source, supported-host runtime, and
 independent results. Explicitly state what remains open; do not repeat
 historical “parity closed” language as a fresh daily-driver endorsement.

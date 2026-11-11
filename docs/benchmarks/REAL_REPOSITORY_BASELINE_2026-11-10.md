@@ -155,3 +155,65 @@ feature design, multi-module feature changes, new dependencies, or large
 existing-project navigation. The earlier large two-module repair's budget
 pressure remains unresolved. Competitor-matched tests and repeated trials
 remain outstanding.
+
+## Context-efficiency diagnosis and focused-read experiment (2026-11-10)
+
+On the **same pinned two-module urllib3 redirect repair**, a controlled
+investigation compared tool behavior under GPT-6.1 Sol. All trials retained
+the same independent visible/hidden graders, exact command authorization,
+protected-file checks, native sandbox, and model. The model is not fully
+deterministic, so individual trials are evidence, not guaranteed outcomes.
+
+An instrumented **unchanged read-file behavior** run at 65,536 request-context
+tokens and a 250,000-token turn budget passed again in 144.23s, consuming
+180,117 provider-reported prompt tokens and 1,507 completion tokens across
+nine requests. Its file-read tool calls explicitly supplied maximum lengths
+of **30,000, 60,000, 70,000 and 19,000** source characters. The model-visible
+tool-history content grew to roughly **87,000 characters**, retransmitted
+in later requests. Small static tool-schema overhead (~2,265 locally
+estimated tokens) was not the dominant growth source.
+
+A temporary reduction of the `read_file` **default** from 32,768 to 16,384
+characters, without altering explicit requests, did **not** improve the
+120K-budget task: its separate trial stopped at `token_budget`, changed
+only `connectionpool.py`, and consumed 103,739 prompt and 784 completion
+tokens in 72.25s. The default was restored; the model can request large
+reads explicitly, so a smaller default alone is not an effective fix.
+
+The next trial changed only the tool's provider-visible **description**, to
+recommend symbol search followed by narrow `read_file` line ranges before
+large reads. It left all read limits, tool implementations, approval policy,
+compaction semantics and model settings unchanged.
+
+| Identical 64K / 120K-budget task | Outcome | Provider prompt / completion tokens | Model requests | Total time |
+|---|---|---:|---:|---:|
+| Original unguided baseline | **Fail**: total-token budget after partial repair | 97,032 / 809 | 7 | 50.33s |
+| Smaller-default-only ablation | **Fail**: total-token budget after partial repair | 103,739 / 784 | 6 | 72.25s |
+| Focused read guidance, trial 1 | **Pass**: both modules, exact command, hidden oracle and audit | 77,491 / 1,599 | 9 | 110.35s |
+| Focused read guidance, trial 2 | **Pass**: same checks | 85,300 / 1,557 | 10 | 73.49s |
+
+The two guided trials replaced large full-module reads with search plus
+specific line ranges. Their provider-visible tool-result history remained
+around **29K characters**, versus ~87K in the instrumented large-read
+replay. Both completed with a valid `turn.completed`, exit code 0, both
+production source files changed, exactly authorized visible test executed,
+visible and hidden oracles passing, all tool calls successful, unmodified
+protected files and verified audit. Their scratch workspaces and temporary
+access-only credentials were deleted afterward.
+
+Private, untracked receipts:
+`/var/tmp/ash-urllib3-proxy-redirect-context-metrics-20261110/`,
+`/var/tmp/ash-urllib3-proxy-redirect-sol-16k-read-120k-20261110/`,
+`/var/tmp/ash-urllib3-proxy-redirect-focused-read-120k-20261110/` and
+`/var/tmp/ash-urllib3-proxy-redirect-focused-read-120k-repeat-20261110/`.
+The profiling source was a **working-tree instrumentation candidate**, so
+the recorded Git HEAD alone does not identify every source edit.
+
+This is **2/2 successful guided trials, 0/1 original baseline and 0/1
+default-size ablation** on this one task, not a statistically meaningful
+success-rate comparison. The evidence supports improved tool *selection*
+and reduced repeated source-history overhead; it does not prove shorter
+wall-clock runtime, general model superiority, or competitive parity with
+Codex/Claude Code. Numeric context-section and tool-size telemetry has been
+added for future apples-to-apples investigations without retaining source
+contents or credential-bearing arguments.

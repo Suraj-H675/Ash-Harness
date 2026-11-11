@@ -6,9 +6,11 @@ import importlib.util
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from ash.core.session import ToolCallRecord
 
 
 _devtools = Path(__file__).resolve().parents[2] / "devtools"
@@ -20,6 +22,38 @@ assert _spec is not None and _spec.loader is not None
 bench = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = bench
 _spec.loader.exec_module(bench)
+
+
+def test_size_telemetry_excludes_tool_payload_and_private_file_path() -> None:
+    record = ToolCallRecord(
+        call_id="read-1",
+        tool_name="read_file",
+        arguments={
+            "file_path": "/private/SECRET-SOURCE-PATH",
+            "start_line": 40,
+            "max_chars": 32768,
+            "expected_sha256": "PRIVATE-HASH",
+        },
+        approved=True,
+        executed=True,
+        dispatched=True,
+        result="SECRET-FILE-CONTENT" * 150,
+        timestamp=datetime.now(timezone.utc),
+    )
+    metrics = bench.tool_call_size_metrics(record)
+    assert metrics == {
+        "result_chars": len(record.result),
+        "explicit_max_chars": True,
+        "max_chars": 32768,
+        "start_line": 40,
+    }
+    assert "SECRET" not in repr(metrics)
+    assert "PRIVATE" not in repr(metrics)
+    assert not bench.tool_call_size_metrics(
+        record.model_copy(
+            update={"arguments": {"file_path": "SECRET", "max_chars": "SECRET"}}
+        )
+    ).get("max_chars")
 
 
 @pytest.mark.parametrize(

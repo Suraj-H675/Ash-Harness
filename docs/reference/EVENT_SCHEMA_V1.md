@@ -88,6 +88,22 @@ stable lifecycle contract.
 These events make retry/failover behavior observable without requiring
 consumers to infer provider attempts from assistant deltas.
 
+## Provider input budget telemetry
+
+`context.usage` retains `current` (the locally estimated token count for
+the next provider input) and `maximum` (the effective input-token ceiling).
+It also includes optional content-free accounting fields:
+`system_tokens`, `tool_schema_tokens`, `history_tokens`,
+`repo_map_tokens`, `memory_tokens`, `history_message_count`,
+`tool_message_count`, and `tool_message_chars`.
+
+These measurements describe **locally assembled input**, not provider-billed
+tokens or a task's completion quality. Tool-message character counts include
+the model-visible serialized results, not file paths or source snippets.
+Actual `model.request.completed.prompt_tokens` remains the authoritative
+provider-reported number when available. Consumers must not sum overlapping
+per-request input values and label them a single context-window size.
+
 ## Turn completion identity
 
 `turn.completed` means the Ash turn reached its terminal boundary, not that
