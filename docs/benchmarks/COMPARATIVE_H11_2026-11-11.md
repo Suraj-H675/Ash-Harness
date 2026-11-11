@@ -55,3 +55,21 @@ policy as far as each CLI permits, control skill/plugin activation and
 subagents explicitly, use identical prompt wording, and run multiple fixed
 tasks with repeated trials. Keep scored coding correctness separate from
 terminal completion and provider usage.
+
+## Reusable comparison check
+
+Run the local read-only receipt comparison without starting either model:
+
+```sh
+PYTHONPATH=src .venv/bin/python devtools/coding_comparison.py \
+  --ash-evidence /var/tmp/ash-h11-luna-xhigh-comparator-20261111 \
+  --codex-evidence /var/tmp/ash-codex-h11-comparator-20261111
+```
+
+The checker refuses mismatched task identifiers or upstream revision pins,
+separates source correctness from CLI completion and requested model settings,
+and makes unresolved parity conditions explicit. It prints only numeric and
+boolean metadata plus a hash of the Codex prompt, not agent messages or
+source content. This is **not a Codex runner** and cannot retroactively
+verify the Codex sandbox, prompt equivalence, sealed-oracle access or actual
+inference route. Those require a controlled future execution setup.
