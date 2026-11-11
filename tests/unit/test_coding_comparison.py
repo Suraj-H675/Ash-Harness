@@ -86,6 +86,28 @@ def test_comparison_separates_correct_code_from_terminal_completion(
     assert report["evaluation"]["same_tool_and_command_authorizations"] is False
     assert report["codex"]["prompt_sha256"] is not None
     assert "SECRET-TEST-PROMPT" not in repr(report)
+    assert report["evaluation"]["codex_native_binary_direct"] is False
+
+
+def test_isolated_codex_receipt_is_distinguished_from_legacy_trial(
+    tmp_path: Path,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    receipt = codex / "grade.json"
+    data = json.loads(receipt.read_text())
+    data.update(
+        {
+            "native_binary_direct": True,
+            "isolated_codex_home": True,
+            "isolated_home_xdg": True,
+            "memory_backed_auth_copy_cleaned": True,
+        }
+    )
+    receipt.write_text(json.dumps(data))
+    report = comparison.compare(ash, codex)
+    assert report["evaluation"]["codex_native_binary_direct"] is True
+    assert report["evaluation"]["codex_private_home_and_xdg"] is True
+    assert report["evaluation"]["codex_ephemeral_auth_cleanup"] is True
 
 
 @pytest.mark.parametrize("tampered", ["task", "base_sha", "reference_fix_sha"])
@@ -131,4 +153,25 @@ def test_task_fingerprint_requires_identical_declared_objective(
         assert report["evaluation"]["same_task_objective_fingerprint_verified"] is True
     else:
         with pytest.raises(ValueError, match="objectives do not match"):
+            comparison.compare(ash, codex)
+
+
+@pytest.mark.parametrize("matching", [True, False])
+def test_comparison_requires_byte_identical_user_prompts_when_recorded(
+    tmp_path: Path, matching: bool
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    ash_file = ash / "result.json"
+    ash_receipt = json.loads(ash_file.read_text())
+    ash_receipt["user_prompt_sha256"] = "a" * 64
+    ash_file.write_text(json.dumps(ash_receipt))
+    codex_file = codex / "manifest.json"
+    codex_receipt = json.loads(codex_file.read_text())
+    codex_receipt["user_prompt_sha256"] = "a" * 64 if matching else "b" * 64
+    codex_file.write_text(json.dumps(codex_receipt))
+    if matching:
+        result = comparison.compare(ash, codex)
+        assert result["evaluation"]["identical_user_prompts_verified"] is True
+    else:
+        with pytest.raises(ValueError, match="user prompts do not match"):
             comparison.compare(ash, codex)

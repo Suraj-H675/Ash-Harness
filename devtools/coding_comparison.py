@@ -65,6 +65,20 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
         and not objective_verified
     ):
         raise ValueError("comparator objectives do not match")
+    ash_user_hash = ash.get("user_prompt_sha256")
+    codex_user_hash = manifest.get("user_prompt_sha256")
+    same_user_prompt = (
+        isinstance(ash_user_hash, str)
+        and isinstance(codex_user_hash, str)
+        and len(ash_user_hash) == len(codex_user_hash) == 64
+        and ash_user_hash == codex_user_hash
+    )
+    if (
+        ash_user_hash is not None
+        and codex_user_hash is not None
+        and not same_user_prompt
+    ):
+        raise ValueError("comparator user prompts do not match")
 
     ash_model = _required_str(ash, "provider_model")
     codex_model = _required_str(codex, "model_requested")
@@ -133,13 +147,22 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             "same_task_objective_fingerprint_verified": objective_verified,
             "identical_oracle_provenance_verified": False,
             "model_and_effort_only_requested_not_attested": True,
-            "identical_prompts_verified": False,
+            "identical_user_prompts_verified": same_user_prompt,
+            "identical_system_prompts_verified": False,
             "same_skill_stack": False,
             "same_tool_and_command_authorizations": False,
             "matched_context_and_turn_limits": False,
             "codex_hidden_oracle_unreadable_to_agent_verified": False,
             "comparator_terminal_usage_available": bool(codex.get("usage")),
             "codex_ephemeral_requested": invocation.get("ephemeral") is True,
+            "codex_native_binary_direct": codex.get("native_binary_direct") is True,
+            "codex_private_home_and_xdg": (
+                codex.get("isolated_codex_home") is True
+                and codex.get("isolated_home_xdg") is True
+            ),
+            "codex_ephemeral_auth_cleanup": (
+                codex.get("memory_backed_auth_copy_cleaned") is True
+            ),
         },
     }
 

@@ -1,6 +1,6 @@
-"""Run a pinned real-repository task through Codex CLI; independently score it.
+"""Run a pinned real-repository task through plain Codex CLI; score it.
 
-Operator-initiated only. This is a Codex+Poteto comparison, NOT a claim that
+Operator-initiated only. This is a plain-Codex comparison, NOT a claim that
 Codex's shell policy, sandbox or context window matches the Ash runner.
 The fixed reference and hidden tests are never copied into the agent checkout.
 """
@@ -8,6 +8,7 @@ The fixed reference and hidden tests are never copied into the agent checkout.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -15,46 +16,28 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from repository_benchmark import (
     TASKS,
     check_edits,
     check_oracles,
     preflight,
+    shared_user_prompt,
     snapshot_files,
 )
+from coding_benchmark import _chatgpt_tmpfs_root
 
 
 MAX_EVENT_BYTES = 32 * 1024 * 1024
 _TERMINAL_EVENTS = {"turn.completed", "turn.failed", "turn.cancelled"}
 _SHELLS = frozenset({"bash", "zsh", "sh"})
-
-
-def codex_prompt(task_name: str) -> str:
-    """Preserve the declared task while adapting Ash-only tool vocabulary."""
-    task = TASKS[task_name]
-    objective = task.prompt
-    objective = objective.replace("using run_command", "in the shell")
-    objective = objective.replace("with run_command", "in the shell")
-    objective = objective.replace(
-        "No other commands are authorized.",
-        "Read-only source inspection commands are allowed; no other test "
-        "or mutating shell commands are authorized.",
-    )
-    return (
-        "Use poteto-mode to "
-        + objective[0].lower()
-        + objective[1:]
-        + " Do not access the network, install dependencies, or modify files "
-        "outside the authorized sources. The grader will verify the file "
-        "tree and execute independent tests after the agent finishes.\n"
-    )
 
 
 def _exact_test_command(command: str, expected: str) -> bool:
@@ -117,34 +100,90 @@ def summarize_codex_events(log: Path, exact_test: str) -> dict[str, Any]:
     }
 
 
-def _codex_env(scratch: Path) -> dict[str, str]:
-    """Only ambient operational paths, never inherited API keys or secrets."""
-    allowed = {
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "SHELL",
-        "LANG",
-        "LC_ALL",
-        "XDG_RUNTIME_DIR",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_CACHE_HOME",
-        "CODEX_HOME",
+def _native_codex_binary() -> Path:
+    """Bypass account overlays; do not silently route into user Codex settings."""
+    candidate = shutil.which("codex-real") or shutil.which("codex")
+    if candidate is None:
+        raise RuntimeError(
+            "A native Codex CLI executable is required for isolated trials"
+        )
+    binary = Path(candidate).resolve(strict=True)
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise RuntimeError("Native Codex executable is unavailable")
+    with binary.open("rb") as source:
+        header = source.read(4)
+    if header not in {
+        b"\x7fELF",  # Linux
+        b"\xcf\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf",  # macOS
+    }:
+        raise RuntimeError("Codex binary is not a native executable")
+    return binary
+
+
+@contextlib.contextmanager
+def _isolated_codex_profile(
+    auth_source: Path | None = None, *, memory_root: Path | None = None
+) -> Iterator[Path]:
+    """Copy only auth, never plugins/config, into private, ephemeral RAM."""
+    origin = auth_source or (Path.home() / ".codex" / "auth.json")
+    fd = os.open(origin, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ValueError("Codex authentication source must be a user-owned file")
+        if info.st_size > 64 * 1024:
+            raise ValueError("Codex authentication source exceeds the bounded limit")
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            raw = source.read(64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            raise ValueError("Codex authentication source exceeds the bounded limit")
+        parsed = json.loads(raw)
+        if (
+            not isinstance(parsed, dict)
+            or parsed.get("auth_mode") != "chatgpt"
+            or not isinstance(parsed.get("tokens"), dict)
+            or not all(
+                isinstance(parsed["tokens"].get(key), str)
+                for key in ("access_token", "refresh_token", "account_id")
+            )
+        ):
+            raise ValueError("An existing ChatGPT-based Codex login is required")
+    finally:
+        os.close(fd)
+    with tempfile.TemporaryDirectory(
+        prefix="ash-codex-credential-", dir=memory_root or _chatgpt_tmpfs_root()
+    ) as private:
+        codex_home = Path(private) / "codex"
+        codex_home.mkdir(mode=0o700)
+        target = codex_home / "auth.json"
+        output_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(output_fd, "wb") as output:
+            output.write(raw)
+        yield codex_home
+
+
+def _codex_env(scratch: Path, codex_home: Path) -> dict[str, str]:
+    """Fully separate HOME/XDG paths and block inherited overlay/plugins."""
+    for name in ("home", "xdg-config", "xdg-data", "xdg-cache", "runtime"):
+        (scratch / name).mkdir(mode=0o700, exist_ok=True)
+    return {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": str(scratch / "home"),
+        "CODEX_HOME": str(codex_home),
+        "USER": os.environ.get("USER", "user"),
+        "LANG": "C.UTF-8",
+        "NO_COLOR": "1",
+        "XDG_CONFIG_HOME": str(scratch / "xdg-config"),
+        "XDG_DATA_HOME": str(scratch / "xdg-data"),
+        "XDG_CACHE_HOME": str(scratch / "xdg-cache"),
+        "XDG_RUNTIME_DIR": str(scratch / "runtime"),
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": str(scratch / "tmp"),
     }
-    env = {key: value for key, value in os.environ.items() if key in allowed}
-    env.update(
-        {
-            "NO_COLOR": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "TMPDIR": str(scratch / "tmp"),
-        }
-    )
-    return env
 
 
 def _stop_child(child: subprocess.Popen[bytes]) -> None:
@@ -174,12 +213,12 @@ def _run_codex(
     prompt: str,
     scratch: Path,
 ) -> dict[str, Any]:
-    executable = shutil.which("codex")
-    if executable is None:
-        raise RuntimeError("Codex executable unavailable")
+    executable = _native_codex_binary()
     argv = [
-        executable,
+        str(executable),
         "exec",
+        "--ignore-user-config",
+        "--ignore-rules",
         "--ephemeral",
         "--json",
         "--color",
@@ -196,31 +235,36 @@ def _run_codex(
         'approval_policy="never"',
         "-c",
         "sandbox_workspace_write.network_access=false",
+        "-c",
+        "features.skip_host_skill_discovery=true",
+        "-c",
+        "features.skill_search=false",
         "-",
     ]
     start = time.monotonic()
     timed_out = False
-    with (
-        (evidence / "codex.jsonl").open("wb") as stdout,
-        (evidence / "codex.stderr").open("wb") as stderr,
-    ):
-        child = subprocess.Popen(
-            argv,
-            cwd=workspace,
-            env=_codex_env(scratch),
-            stdin=subprocess.PIPE,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
-        )
-        try:
-            child.communicate(input=prompt.encode("utf-8"), timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _stop_child(child)
-        except BaseException:
-            _stop_child(child)
-            raise
+    with _isolated_codex_profile() as codex_home:
+        with (
+            (evidence / "codex.jsonl").open("wb") as stdout,
+            (evidence / "codex.stderr").open("wb") as stderr,
+        ):
+            child = subprocess.Popen(
+                argv,
+                cwd=workspace,
+                env=_codex_env(scratch, codex_home),
+                stdin=subprocess.PIPE,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
+            )
+            try:
+                child.communicate(input=prompt.encode("utf-8"), timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _stop_child(child)
+            except BaseException:
+                _stop_child(child)
+                raise
     return {
         "exit_code": child.returncode,
         "timed_out": timed_out,
@@ -231,7 +275,14 @@ def _run_codex(
         "approval_policy": "never",
         "network_access_requested": False,
         "ephemeral": True,
-        "workflow": "poteto",
+        "workflow": "plain-codex",
+        "user_config_ignored": True,
+        "user_rules_ignored": True,
+        "host_skill_discovery_disabled_requested": True,
+        "native_binary_direct": True,
+        "isolated_codex_home": True,
+        "isolated_home_xdg": True,
+        "memory_backed_auth_copy_cleaned": True,
     }
 
 
@@ -256,7 +307,7 @@ def run_task(
         if any(path not in initial for path in task.editable):
             raise RuntimeError("required source file missing in pinned baseline")
 
-        prompt = codex_prompt(name)
+        prompt = shared_user_prompt(task)
         (evidence / "prompt.txt").write_text(prompt, encoding="utf-8")
         manifest = {
             "task": name,
@@ -268,6 +319,7 @@ def run_task(
             "visible_test": task.command_grant,
             "task_prompt_sha256": hashlib.sha256(task.prompt.encode()).hexdigest(),
             "codex_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "user_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         }
         (evidence / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         if preflight_only:
@@ -314,12 +366,19 @@ def run_task(
         )
         result = {
             "task": name,
-            "runner": "codex-cli-with-poteto",
+            "runner": "plain-codex-cli",
             "model_requested": model,
             "reasoning_effort_requested": effort,
             "sandbox": "workspace-write",
             "shell_command_policy_enforced": False,
-            "skill_stack_isolated": False,
+            "host_skill_discovery_disabled_requested": True,
+            "skill_stack_isolated_verified": False,
+            "native_binary_direct": invocation["native_binary_direct"],
+            "isolated_codex_home": invocation["isolated_codex_home"],
+            "isolated_home_xdg": invocation["isolated_home_xdg"],
+            "memory_backed_auth_copy_cleaned": invocation[
+                "memory_backed_auth_copy_cleaned"
+            ],
             "network_block_independently_verified": False,
             "passed": passed,
             "protected_files_unchanged": protected,
@@ -363,8 +422,12 @@ def main() -> int:
         parser.error("model must be an explicit simple model ID")
     if not 30 <= args.timeout <= 300:
         parser.error("timeout must be between 30 and 300 seconds")
-    if not args.preflight_only and not shutil.which("codex"):
-        parser.error("Codex is not installed")
+    if not args.preflight_only:
+        try:
+            _native_codex_binary()
+            _chatgpt_tmpfs_root()
+        except (OSError, ValueError, RuntimeError):
+            parser.error("Native Codex and memory-backed authentication are required")
     if not shutil.which("git") or not shutil.which("bwrap"):
         parser.error("Git and Bubblewrap are required")
     if args.evidence_dir.exists():

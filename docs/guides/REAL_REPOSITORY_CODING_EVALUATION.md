@@ -100,13 +100,27 @@ substantial feature work, language/build ecosystem diversity,
 interruption/resume, repeated reliability, or a fair same-model competitor
 baseline. Those remain open acceptance work.
 
-## Repeatable Codex + Poteto comparator
+## Repeatable plain-Codex comparator
 
 The optional devtools/codex_repository_benchmark.py uses these same
 predeclared tasks, pinned historical source commits, preflight red/green
 oracles and protected-file snapshots. It runs against a fresh disposable
-checkout and grades after the model exits. A preflight-only exercise requires
-no Codex inference:
+checkout and grades after the model exits. Unlike earlier exploratory
+Codex + Poteto runs, the current comparator does not invoke Poteto:
+the user task is supplied verbatim from the same model-neutral prompt
+builder used by Ash when `--fair-prompt` is selected. Codex runs with
+`--ignore-user-config` and `--ignore-rules`, and requests disabling host
+skill discovery. The runner bypasses account-overlay launchers by resolving
+a native Codex executable (`codex-real` when available, otherwise native
+`codex`), rejecting script wrappers. It creates a private memory-backed
+`CODEX_HOME`, copies only the existing user-owned `auth.json` into it,
+and sets separate temporary HOME/XDG runtime and configuration paths.
+Installed personal skills, plugins, MCP configurations, Codex rules and
+other user profile files are not copied. The authentication copy is
+removed when the subprocess terminates; the original file is only read,
+not changed. These isolated credentials are deliberately never logged or
+stored in the Git repository.
+A preflight-only exercise requires no Codex inference:
 
 ~~~sh
 PYTHONPATH=src .venv/bin/python devtools/codex_repository_benchmark.py \
@@ -122,16 +136,25 @@ was observed succeeding, and the Codex CLI emitted a completed turn. A
 timeout cannot count as a finished run even if the resulting code passes.
 Evidence directories cannot be overwritten, and private Codex JSONL/stderr
 logs are retained outside Git. Scratch source checkouts are removed after
-grading. The runner reads Codex's existing user-owned login; it does not
-copy credentials or inherit ambient API-token variables.
+grading. The runner copies a temporary authenticated profile into RAM,
+but never inherits ambient API-token environment variables and never
+mutates the existing personal Codex installation.
 
-**Comparison limitations:** Codex still uses its configured Poteto skills;
-the shell sandbox and command permissions are not identical to Ash's exact
-tool grant. Network blocking is requested through Codex configuration, not
-independently verified, and access to every host-side file has not been
-proven isolated. Its prompt starts with the mandated Poteto instruction
-and adapts Ash-only tool terminology, so the full agent prompts differ.
-Both runners now record a SHA-256 of the identical canonical task objective,
-allowing future receipt comparisons to detect objective drift without
-mistaking different system instructions for equality. Do not claim a fair
-head-to-head or competitive win from this runner alone.
+For the paired Ash run, use the same task, model, effort, time limit
+and a fresh evidence directory, passing `--fair-prompt` to
+`devtools/repository_benchmark.py`. The two runners record the actual
+user-prompt SHA-256; `devtools/coding_comparison.py` rejects different
+user prompts or historical task-objective hashes when both are present.
+The old Poteto trials have no matched actual-user-prompt receipt and
+cannot be treated as plain-Codex comparisons.
+
+**Comparison limitations:** The shell sandbox and command permissions are
+not identical to Ash's exact tool grants. Network blocking and host skill
+discovery disabling are requested through Codex configuration, not
+independently proven in all cases; access to every host-side file has not
+been audited. Only the agent's personal profile is isolated, not every
+possible host read path. Both receive identical user-input bytes, but their
+product/system instructions, native tools, provider internals and resource
+accounting differ. The prompt fingerprint checks user intent equality,
+not system-prompt equality. Do not claim a fully controlled head-to-head or
+general competitive win from one paired trial.

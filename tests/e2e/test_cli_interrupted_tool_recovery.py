@@ -10,10 +10,15 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+
 from ash.core.session import SessionStore
 
 
-def test_cli_restart_preserves_completed_write_without_replay(tmp_path: Path) -> None:
+@pytest.mark.parametrize("termination", ("SIGKILL", "SIGTERM"))
+def test_cli_restart_preserves_completed_write_without_replay(
+    tmp_path: Path, termination: str
+) -> None:
     workspace = tmp_path / "project"
     home = tmp_path / "home"
     db_dir = tmp_path / "db"
@@ -133,10 +138,15 @@ def test_cli_restart_preserves_completed_write_without_replay(tmp_path: Path) ->
         )
         assert (workspace / "kept.txt").read_bytes() == b"written-before-crash\n"
 
-        # Model an abrupt process death, not the graceful SIGTERM shutdown.
-        process.kill()
+        # Exercise both abrupt failure and the CLI's cooperative shutdown.
+        if termination == "SIGKILL":
+            process.kill()
+        else:
+            process.terminate()
         process.communicate(timeout=5)
         assert process.returncode is not None and process.returncode != 0
+        if termination == "SIGTERM":
+            assert process.returncode == 143
         release_second.set()
 
         store = SessionStore(db_dir / "sessions.db")
@@ -144,7 +154,8 @@ def test_cli_restart_preserves_completed_write_without_replay(tmp_path: Path) ->
         assert len(sessions) == 1
         session_id = sessions[0].session_id
         assert len([call for call in store.load_session(session_id).tool_calls if call.tool_name == "write_file"]) == 1
-        assert len(store.started_turns(session_id)) == 1
+        if termination == "SIGKILL":
+            assert len(store.started_turns(session_id)) == 1
 
         resumed = cli(
             "--session", session_id, "--mode", "auto_edit", "-p", "resume safely",

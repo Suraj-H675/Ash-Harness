@@ -445,6 +445,19 @@ TASKS = {
 }
 
 
+def shared_user_prompt(task: RepositoryTask) -> str:
+    """Model-neutral task input for paired Ash/plain-Codex evaluations."""
+    return (
+        task.prompt.replace("using run_command", "using the available command tool")
+        .replace("with run_command", "using the available command tool")
+        .replace(
+            "No other commands are authorized.",
+            "Read-only source inspection commands are allowed. "
+            "Do not run other tests or shell commands that modify files.",
+        )
+    )
+
+
 def fetch_pinned(destination: Path, task: RepositoryTask, sha: str) -> None:
     """Clone a constant, exact-commit public source; never infer HEAD from a branch."""
     destination.mkdir()
@@ -571,8 +584,10 @@ def run_task(
     context_tokens: int,
     turn_token_budget: int,
     reasoning_effort: str | None = None,
+    fair_prompt: bool = False,
 ) -> dict[str, object]:
     task = TASKS[task_name]
+    user_prompt = shared_user_prompt(task) if fair_prompt else task.prompt
     started = time.monotonic()
     with (
         tempfile.TemporaryDirectory(prefix="ash-repository-eval-") as scratch_str,
@@ -655,7 +670,7 @@ def run_task(
             "--mode",
             "auto_edit",
             "-p",
-            task.prompt,
+            user_prompt,
             "--output-format",
             "json",
         ]
@@ -743,6 +758,8 @@ def run_task(
             "base_sha": task.base_sha,
             "reference_fix_sha": task.reference_fix_sha,
             "task_prompt_sha256": hashlib.sha256(task.prompt.encode()).hexdigest(),
+            "user_prompt_sha256": hashlib.sha256(user_prompt.encode()).hexdigest(),
+            "fair_prompt": fair_prompt,
             "preflight": preflight_receipt,
             "ash_head": subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=REPO, text=True
@@ -801,6 +818,11 @@ def main() -> int:
         default=None,
         help="Explicit model-validated reasoning effort for a controlled trial",
     )
+    parser.add_argument(
+        "--fair-prompt",
+        action="store_true",
+        help="Use the exact model-neutral user task shared with plain Codex",
+    )
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.chatgpt_model):
         parser.error("invalid exact ChatGPT model ID")
@@ -838,6 +860,7 @@ def main() -> int:
         context_tokens=args.context_tokens,
         turn_token_budget=args.turn_token_budget,
         reasoning_effort=args.reasoning_effort,
+        fair_prompt=args.fair_prompt,
     )
     print(
         json.dumps(

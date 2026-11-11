@@ -76,7 +76,65 @@ inference route. Those require a controlled future execution setup.
 
 After this original hand-assembled experiment, the dedicated
 devtools/codex_repository_benchmark.py runner was added to make future
-Codex/Poteto evaluations reproducible, including a preflight-only mode that
-does not contact a model.
+Codex evaluations reproducible, including a preflight-only mode that
+does not contact a model. It now defaults to plain Codex.
 This does **not** retroactively upgrade the original Codex receipt's
 trustworthiness or erase the differences in tool and sandbox policy.
+
+**Updated comparison protocol:** Following the owner's explicit fairness
+requirement, new trials use plain Codex without Poteto, ignore Codex
+user configuration/rules, request suppression of host skill discovery,
+and send the exact same user task bytes as an Ash run with `--fair-prompt`.
+Both retain their native runtime/system instructions and tool safety
+boundaries; the comparison receipt verifies actual user-prompt fingerprints.
+All earlier Poteto results remain historical exploratory evidence only.
+
+**First plain-Codex h11 trial (2026-11-11):** The pinned h11 fixture
+passed red-original/green-reference preflight and was repaired by
+plain Codex CLI using requested GPT-6 Luna xhigh, a 170-second deadline,
+ignored user config and exec rules, and requested host-skill discovery
+suppression. The full user-input SHA-256 was
+`5567c1b06b83aa604c1b38bbaa6e60d32c1f0f05c8b3bc27e7b6554c92bf592e`.
+It exited **0 in 56.61 seconds**, passed both external oracles, changed
+only `h11/_readers.py`, executed the visible test successfully, and
+cleaned the temporary source checkout. The JSONL included four completed
+shell calls, two of which were not the exact test command; no Poteto
+commands were observed. At that checkpoint a matching Ash run with
+`--fair-prompt` had not yet been performed, so the 56.61-second
+outcome must not be
+compared as a controlled speed result against the older Ash 83.90-second
+trial using different user input. Private evidence:
+`/var/tmp/ash-plain-codex-h11-luna-xhigh-20261111/grade.json`.
+
+**First paired identical-user-input run (2026-11-11):** A stricter
+plain-Codex evaluation used the **native binary directly** and an
+isolated, disposable HOME/XDG/CODEX_HOME with only an authentication
+copy staged on Linux tmpfs. The installed account overlay, personal
+plugins, skills, MCP configuration, rules and user-home instructions
+were excluded. The source authentication file was not changed, and
+the temporary private credential directory was deleted. Ash was run
+in its existing isolated benchmark home with the exact same user
+input (SHA-256
+`5567c1b06b83aa604c1b38bbaa6e60d32c1f0f05c8b3bc27e7b6554c92bf592e`),
+the same pinned h11 revision, GPT-6 Luna xhigh requested on both,
+and a **170-second deadline**.
+
+| Scored outcome | Ash | Isolated plain Codex |
+|---|---|---|
+| Completed CLI and both independent oracles | PASS | PASS |
+| Protected files unchanged | PASS | PASS |
+| Required source changed | `h11/_readers.py` | `h11/_readers.py` |
+| Total wall-clock elapsed | **56.57 seconds** | **46.52 seconds** |
+| CLI timeout | No | No |
+
+This single pair shows **Codex about 10 seconds faster** on this
+specific task, with both solutions correct. It does **not** establish
+an overall speed or reliability advantage. Ash's exact-command
+authorization, tool interfaces, model context budget and token
+accounting are not mirrored by Codex's native shell tools; both
+products retain their own system prompts. The request-context and
+turn-token limits are not independently matched.
+
+Private evidence:
+`/var/tmp/ash-fair-h11-luna-xhigh-20261111/result.json` and
+`/var/tmp/ash-isolated-codex-h11-luna-xhigh-20261111/grade.json`.

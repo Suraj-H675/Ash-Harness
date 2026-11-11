@@ -158,6 +158,22 @@ The environments, tool affordances and workflow policies were not equivalent;
 this is **not** a head-to-head competitive acceptance. See
 [the comparison limitations and receipts](../benchmarks/COMPARATIVE_H11_2026-11-11.md).
 
+**Fairness correction (2026-11-11):** The prior Codex result invoked the
+owner's Poteto skill workflow and cannot represent plain Codex. A new
+plain-Codex h11 trial, with user configuration/rules ignored, host skill
+discovery suppression requested, and a model-neutral user task, completed
+successfully in 56.61 seconds with both independent oracles green. The
+updated protocol subsequently bypassed the account overlay and used
+an isolated native Codex binary with a memory-backed private
+authentication copy, no personal plugin/skill/profile files and a
+separate temporary HOME/XDG profile. On a **paired identical-user-input**
+h11 run, Ash passed both independent oracles in **56.57 seconds** and
+isolated plain Codex passed in **46.52 seconds**, with 170-second
+limits and requested GPT-6 Luna xhigh. System prompts, tools, context
+limits and permission semantics remain different; a single pair does
+not establish a general competitive winner. See
+[the scored paired evidence](../benchmarks/COMPARATIVE_H11_2026-11-11.md).
+
 Reassess these gates from **current** source, supported-host runtime, and
 independent results. Explicitly state what remains open; do not repeat
 historical “parity closed” language as a fresh daily-driver endorsement.

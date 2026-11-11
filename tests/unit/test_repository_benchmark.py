@@ -99,6 +99,19 @@ def test_upstream_tasks_are_pinned_and_oracles_sealed(
     compile(task.hidden_source, "<sealed-oracle>", "exec")
 
 
+@pytest.mark.parametrize("task_id", tuple(bench.TASKS))
+def test_fair_user_prompt_is_model_neutral_and_preserves_core_scope(
+    task_id: str,
+) -> None:
+    task = bench.TASKS[task_id]
+    prompt = bench.shared_user_prompt(task)
+    assert "run_command" not in prompt
+    assert "Use poteto-mode" not in prompt
+    assert task.command_grant in prompt
+    for path in task.editable:
+        assert path in prompt
+
+
 def test_repository_snapshot_and_protected_edits_refuse_unexpected_changes(
     tmp_path: Path,
 ) -> None:
