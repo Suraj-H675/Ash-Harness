@@ -115,9 +115,14 @@ lines around each match without a separate read request. Adjacent windows are
 merged, and the match count still controls `max_results`. Matching lines keep
 `path:line:text` locations; neighboring lines use `path-line-text` so callers
 can distinguish context. Context previews are limited to 512 characters per
-line and contextual searches have a 24,576-byte output capture limit. The
-default `context_lines=0` preserves existing match-only output. These bounded
-previews can save an inspection round trip; they do not replace explicit
+line. Ordinary search now defaults to a **16,384-byte output capture** to avoid
+unexpectedly retaining enormous search results in reasoning-replay history;
+models can explicitly request `max_output_bytes` up to 2,000,000 for a larger
+search. Contextual searches remain capped at 24,576 bytes regardless of that
+request. Long matched lines return a bounded excerpt and, when the excerpt
+starts after the beginning of the line, the starting column. The default
+`context_lines=0` preserves match-only formatting. These bounded previews
+can save an inspection round trip; they do not replace explicit
 `read_file` slices for editing or prove a live coding-performance improvement.
 The `read_files` tool remains discoverable through `search_tools` at every
 context size rather than adding another default tool schema. It groups up to

@@ -34,6 +34,7 @@ from ash.tools.base import (
 DEFAULT_MAX_RESULTS = 200
 HARD_MAX_RESULTS = 2_000
 MAX_SEARCH_CAPTURE_BYTES = 2_000_000
+DEFAULT_SEARCH_CAPTURE_BYTES = 16_384
 MAX_SEARCH_LINE_CHARS = 64 * 1024
 MAX_SEARCH_CONTEXT_PREVIEW_CHARS = 512
 MAX_SEARCH_CONTEXT_CAPTURE_BYTES = 24_576
@@ -284,26 +285,32 @@ class SearchTextArgs(BaseModel):
     pattern: str = Field(..., min_length=1, max_length=4_096)
     directory_path: str = Field(
         ".",
-        description=(
-            "Project-relative directory or regular file to search. "
-            "Returned file locations are project-relative."
-        ),
+        description="Project-relative directory/file; output paths are project-relative.",
     )
     glob: str | None = None
     fixed_strings: bool = False
     case_sensitive: bool = True
     max_results: int = Field(DEFAULT_MAX_RESULTS, ge=1, le=HARD_MAX_RESULTS)
     context_lines: int = Field(0, ge=0, le=3)
+    max_output_bytes: int = Field(
+        DEFAULT_SEARCH_CAPTURE_BYTES, ge=1_024, le=MAX_SEARCH_CAPTURE_BYTES
+    )
 
 
 class SearchTextTool(BaseTool):
     name = "search_text"
     execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
-        "Search workspace text with file:line matches. Scope with directory_path; "
-        "use context_lines for nearby lines."
+        "Search text with file:line matches. Scope with directory_path; "
+        "context_lines adds nearby lines."
     )
     args_schema = SearchTextArgs
+
+    def json_schema(self) -> dict[str, Any]:
+        schema = super().json_schema()
+        for name in ("context_lines", "max_output_bytes"):
+            schema["properties"][name].pop("default", None)
+        return schema
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SearchTextArgs(**kwargs)
@@ -350,12 +357,19 @@ class SearchTextTool(BaseTool):
                 ),
             )
 
+        capture_limit = (
+            min(args.max_output_bytes, MAX_SEARCH_CONTEXT_CAPTURE_BYTES)
+            if args.context_lines
+            else min(args.max_output_bytes, MAX_SEARCH_CAPTURE_BYTES)
+        )
+        match_preview_limit = min(MAX_SEARCH_LINE_CHARS, max(256, capture_limit // 2))
+
         regex_time_remaining = MAX_SEARCH_REGEX_TOTAL_SECONDS
         regex_incomplete = False
 
         def bounded_lines(
             handle: TextIO,
-        ) -> Iterator[tuple[int, str, bool, bool]]:
+        ) -> Iterator[tuple[int, str, bool, bool, int]]:
             nonlocal regex_time_remaining, regex_incomplete
             line_number = 0
             file_bytes = 0
@@ -380,14 +394,12 @@ class SearchTextTool(BaseTool):
                 line_number += 1
                 scanned_line = "".join(line_chunks)
                 line = scanned_line.rstrip("\r\n")
-                clipped = len(line) > MAX_SEARCH_LINE_CHARS
-                preview = line[:MAX_SEARCH_LINE_CHARS]
                 if regex_time_remaining <= 0:
                     regex_incomplete = True
                     return
                 started_at = monotonic()
                 try:
-                    matched = regex.search(
+                    match = regex.search(
                         scanned_line,
                         timeout=min(
                             MAX_SEARCH_REGEX_MATCH_SECONDS,
@@ -402,11 +414,23 @@ class SearchTextTool(BaseTool):
                         0.0,
                         regex_time_remaining - (monotonic() - started_at),
                     )
+                preview_start = 0
+                if match is not None and match.start() > 0:
+                    # A match late in a long line should be visible even when
+                    # the search-result budget only permits an excerpt.
+                    prefix_bytes = len(line[: match.start()].encode("utf-8"))
+                    if prefix_bytes >= match_preview_limit - 80:
+                        preview_start = max(0, match.start() - 80)
+                preview = line[preview_start : preview_start + MAX_SEARCH_LINE_CHARS]
+                clipped = preview_start > 0 or (
+                    preview_start + len(preview) < len(line)
+                )
                 yield (
                     line_number,
                     preview,
-                    bool(matched),
+                    match is not None,
                     clipped,
+                    preview_start,
                 )
                 if not complete:
                     return
@@ -426,11 +450,6 @@ class SearchTextTool(BaseTool):
             nonlocal output_bytes, output_limited
             rendered_bytes = len(rendered.encode("utf-8"))
             separator_bytes = 1 if matches else 0
-            capture_limit = (
-                MAX_SEARCH_CONTEXT_CAPTURE_BYTES
-                if args.context_lines
-                else MAX_SEARCH_CAPTURE_BYTES
-            )
             if output_bytes + separator_bytes + rendered_bytes > capture_limit:
                 output_limited = True
                 return False
@@ -445,6 +464,19 @@ class SearchTextTool(BaseTool):
                 preview_truncated = True
                 clipped += " [context preview truncated]"
             return clipped
+
+        def match_preview(text: str, line_truncated: bool) -> str:
+            nonlocal preview_truncated
+            # One pathological source line must not consume the entire search
+            # budget and hide even the first match location.
+            encoded = text.encode("utf-8")
+            if len(encoded) > match_preview_limit:
+                text = encoded[:match_preview_limit].decode("utf-8", errors="ignore")
+                line_truncated = True
+            if line_truncated:
+                preview_truncated = True
+                text += " [line preview truncated]"
+            return text
 
         def mark_scan_incomplete() -> None:
             nonlocal scan_incomplete
@@ -498,9 +530,9 @@ class SearchTextTool(BaseTool):
                     )
                     trailing_until = 0
                     last_rendered_line = 0
-                    for line_number, text, matched, line_truncated in bounded_lines(
-                        handle
-                    ):
+                    for (
+                        line_number, text, matched, line_truncated, preview_start
+                    ) in bounded_lines(handle):
                         if matched:
                             if match_count >= args.max_results:
                                 match_limited = True
@@ -516,10 +548,15 @@ class SearchTextTool(BaseTool):
                                 last_rendered_line = previous_line
                             if output_limited:
                                 break
-                            if line_truncated:
-                                preview_truncated = True
-                                text += " [line preview truncated]"
-                            if not append_result(f"{relative}:{line_number}:{text}"):
+                            preview = match_preview(text, line_truncated)
+                            column_label = (
+                                f"[column {preview_start + 1}] "
+                                if preview_start
+                                else ""
+                            )
+                            if not append_result(
+                                f"{relative}:{line_number}:{column_label}{preview}"
+                            ):
                                 break
                             match_count += 1
                             last_rendered_line = line_number
@@ -548,7 +585,7 @@ class SearchTextTool(BaseTool):
         elif output_limited:
             output += (
                 f"{separator}[search output capture truncated after "
-                f"{MAX_SEARCH_CONTEXT_CAPTURE_BYTES if args.context_lines else MAX_SEARCH_CAPTURE_BYTES} bytes]"
+                f"{capture_limit} bytes]"
             )
         elif match_limited:
             output += f"{separator}[truncated after {args.max_results} matches]"

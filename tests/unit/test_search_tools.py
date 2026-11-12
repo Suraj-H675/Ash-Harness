@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -377,6 +378,76 @@ async def test_search_text_context_caps_total_output_without_changing_default(
 
 
 @pytest.mark.asyncio
+async def test_search_text_defaults_to_bounded_capture_with_explicit_larger_output(
+    tmp_path,
+) -> None:
+    (tmp_path / "large.py").write_text(
+        "".join(f"needle_{index:03d} " + "x" * 300 + "\n" for index in range(200))
+    )
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+
+    bounded = await tool.run(pattern="needle", fixed_strings=True)
+    assert bounded.truncated is True
+    assert "[search output capture truncated after 16384 bytes]" in bounded.output
+    assert "large.py:1:needle_000" in bounded.output
+    assert "large.py:200:needle_199" not in bounded.output
+    assert len(bounded.output.encode("utf-8")) < 17_000
+
+    explicit = await tool.run(
+        pattern="needle", fixed_strings=True, max_output_bytes=100_000
+    )
+    assert explicit.truncated is False
+    assert "large.py:200:needle_199" in explicit.output
+    assert len(explicit.output) > 60_000
+
+
+@pytest.mark.asyncio
+async def test_search_text_long_unicode_match_still_exposes_location_with_budget(
+    tmp_path,
+) -> None:
+    (tmp_path / "wide.py").write_text("needle " + "🪐" * 20_000 + "\n")
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle", fixed_strings=True
+    )
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output.startswith("wide.py:1:needle ")
+    assert "[line preview truncated]" in result.output
+    assert len(result.output.encode("utf-8")) < 10_000
+
+
+@pytest.mark.asyncio
+async def test_context_search_hard_cap_still_applies_to_explicit_large_budget(
+    tmp_path,
+) -> None:
+    (tmp_path / "many.py").write_text(
+        "".join(f"needle {index}: " + "x" * 300 + "\n" for index in range(200))
+    )
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle", fixed_strings=True,
+        context_lines=1, max_output_bytes=100_000,
+    )
+    assert result.success is True
+    assert result.truncated is True
+    assert "[search output capture truncated after 24576 bytes]" in result.output
+    assert len(result.output.encode("utf-8")) < 25_000
+
+
+@pytest.mark.asyncio
+async def test_search_text_late_match_keeps_relevant_excerpt_and_column(tmp_path) -> None:
+    (tmp_path / "minified.js").write_text("x" * 30_000 + "NEEDLE" + "y" * 5_000)
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="NEEDLE", fixed_strings=True
+    )
+    assert result.success is True
+    assert result.truncated is True
+    assert result.output.startswith("minified.js:1:[column 29921] ")
+    assert "NEEDLE" in result.output
+    assert "[line preview truncated]" in result.output
+    assert len(result.output.encode("utf-8")) < 10_000
+
+
+@pytest.mark.asyncio
 async def test_search_text_accepts_a_single_file_path(tmp_path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "app.py").write_text("first\nneedle here\n")
@@ -514,7 +585,7 @@ async def test_search_text_reports_per_match_timeout_without_losing_earlier_resu
         def search(self, line: str, *, timeout: float):
             if line.startswith("slow"):
                 raise TimeoutError
-            return True
+            return re.search("needle", line)
 
     monkeypatch.setattr(search_module.regex_engine, "compile", lambda *_: TimedMatcher())
     result = await SearchTextTool(SafetyGuard(tmp_path)).run(pattern="needle")
@@ -810,7 +881,8 @@ async def test_search_text_fallback_bounds_long_line(tmp_path, monkeypatch) -> N
 
     assert result.success is True
     assert result.truncated is True
-    assert "search output capture truncated" in result.output
+    assert result.output.startswith("large.txt:1:needle")
+    assert "[line preview truncated]" in result.output
     assert len(result.output) < 10_000
 
 
@@ -844,7 +916,7 @@ async def test_search_text_matches_regex_across_long_logical_line(tmp_path) -> N
     assert result.success is True
     assert result.truncated is True
     assert result.output.startswith(
-        "long.txt:1:" + line[: search_module.MAX_SEARCH_LINE_CHARS]
+        "long.txt:1:" + line[: search_module.DEFAULT_SEARCH_CAPTURE_BYTES // 2]
     )
     assert "[line preview truncated]" in result.output
 
