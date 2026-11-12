@@ -16,7 +16,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R1 | `h11-chunk-footer` | Pinned real repo | One-file parser bug; incremental tests | Historical matched Ash/Codex pair passed; retain as control |
 | R2 | `urllib3-header-sanitization` | Pinned real repo | One-file security-oriented normalization | Historical paired pilot passed; retain as control |
 | R3 | `urllib3-proxy-redirect` | Pinned real repo | Coordinated two-file redirect/security fix | **Scenario 04: PARKED, unresolved**; prior matched pair: Ash fail / Codex pass (one sample) |
-| R4 | `urllib3-url-auth-feature` | Pinned real repo | New public API / URL parsing edge cases | **Unmeasured on a new matched pair**; first candidate |
+| R4 | `urllib3-url-auth-feature` | Pinned real repo | New public API / URL parsing edge cases | **Initial paired pass for both engines**; one sample, no reliability claim |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -37,9 +37,11 @@ diversity beyond shared urllib3 history.
 **Evidence checkpoint:** Before this workflow change, the locally retained
 paired receipts showed **R1 and R2 passing for both engines** in a concurrent
 pilot and **R3 failing for Ash but passing for Codex** in one matched pair.
-These are historical observations, not a current portfolio pass rate. The
-fourth pinned real-repository task has no matched-pair receipt in this
-checkpoint. No provider call was required to assemble this inventory.
+An initial **sequential** R4 pair subsequently passed both independent
+oracles and completed CLI for both engines (Ash **77.14s**, plain Codex
+**79.15s**). The paired runner verified the comparison receipt. These are
+single observations, not a stable portfolio pass rate or a 2-second speed
+advantage. Their task difficulty, order and runtime conditions differ.
 
 ## Evaluation and prioritization contract
 
@@ -81,11 +83,11 @@ checkpoint. No provider call was required to assemble this inventory.
 
 ## Next portfolio slice
 
-**Now:** no new Scenario 04 run. Validate the portfolio's task metadata and
-existing baseline receipts offline, then establish a fresh matched-pair result
-for **R4 (`urllib3-url-auth-feature`)** when provider access and the bounded
-run budget are appropriate. Add one genuinely different real repository before
-using a tiny all-urllib3 sample to decide another architecture change.
+**Now:** no new Scenario 04 run and no immediate R4 retry. The initial R4
+matched pair is complete. **Next, add one genuinely different real repository**
+with independent behavioral oracles, and then run it once under a frozen
+matched pair before choosing another architecture change. Use repetitions
+only for a predeclared variance question, not to reverse a disappointing result.
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate
