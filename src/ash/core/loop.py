@@ -974,6 +974,18 @@ SYSTEM_PROMPT_TEMPLATE = """You are Ash, a terminal-native AI coding harness for
 4. PRESERVE: Keep existing code, documentation style and comments unless asked.
 """
 
+# Only use this guidance when the provider's effective input window has room
+# for the additional tool declarations. The compact 4K prompt is unchanged.
+LARGE_CONTEXT_CODING_GUIDANCE = (
+    "### Coding workflow\n"
+    "Prefer focused symbol searches and bounded source reads over repeatedly "
+    "reading unchanged regions. For changes spanning modules, inspect the "
+    "relevant definitions and callers, make consistent edits across affected "
+    "files, and run the explicitly authorized focused test before reporting "
+    "completion. Review changes using the dedicated git_diff tool rather "
+    "than an unapproved shell command. Do not bypass policy or claim unrun tests."
+)
+
 NATIVE_TOOL_PROTOCOL = """### Tool Call Format
 Use only the provider's native tool-calling interface for tool invocations. Do not
 write XML tool-call or response wrappers. Return ordinary assistant text directly
@@ -4984,7 +4996,20 @@ class AshLoop:
         search_tool = self.tools.get("search_tools")
         visible_tools = getattr(search_tool, "visible_tools", None)
         if callable(visible_tools):
-            return dict(visible_tools(self.tools))
+            visible = dict(visible_tools(self.tools))
+            if len(visible) < len(self.tools):
+                # Keep the compact essential catalog for small local models.
+                # Larger effective input windows can afford the dedicated,
+                # read-only Git diff tool without making the model execute a
+                # shell command to inspect its edits. Leave apply_patch
+                # deferred: eager exposure previously regressed local-model
+                # multi-file coding and produced malformed patches in a
+                # higher-context coding trial.
+                request_budget = self._resolve_request_token_budget()
+                if request_budget is not None and request_budget.input_limit >= 24_576:
+                    if "git_diff" in self.tools:
+                        visible["git_diff"] = self.tools["git_diff"]
+            return visible
         return self.tools
 
     def _tool_schema_payload(
@@ -7410,6 +7435,13 @@ class AshLoop:
                 core_system_content = system_content
                 persistent_instructions = ""
                 injected_system_content = ""
+            if (
+                self._generated_system_prompt
+                and self.system_prompt.startswith(self._base_system_prompt)
+                and request_budget.input_limit >= 24_576
+                and "git_diff" in provider_tools
+            ):
+                core_system_content += "\n\n" + LARGE_CONTEXT_CODING_GUIDANCE
             supplemental_system_content = "\n\n".join(
                 part
                 for part in (injected_system_content, skill_content)

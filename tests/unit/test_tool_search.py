@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from ash.cli import _render_context_provenance
 from ash.config import AshConfig
 from ash.context.history import ContextBudgetAllocator, ContextFragmentKind
-from ash.core.loop import AshLoop, _default_system_prompt
+from ash.core.loop import AshLoop, LARGE_CONTEXT_CODING_GUIDANCE, _default_system_prompt
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
@@ -365,6 +365,98 @@ class ScriptedDiscoveryProvider(ProviderABC):
             if self.expected_tool is not None:
                 assert self.expected_tool in names
             yield StreamChunk(content="discovery complete", is_done=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "configured_window, provider_window, promoted",
+    [(4_096, 4_096, False), (65_536, 4_096, False), (65_536, 65_536, True)],
+)
+async def test_large_context_coding_tools_fit_effective_provider_window(
+    tmp_path, configured_window: int, provider_window: int, promoted: bool,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=12)
+    catalog[search.name] = search
+    for name in ESSENTIAL_TOOL_NAMES:
+        catalog[name] = DummyTool(guard, name, f"Essential {name} tool")
+    for name in ("git_diff", "apply_patch"):
+        catalog[name] = DummyTool(guard, name, f"Review or edit with {name}")
+    for index in range(32):
+        name = f"optional_tool_{index}"
+        catalog[name] = DummyTool(guard, name, "Optional integration")
+
+    config = AshConfig(
+        model="local/intent-discovery", workspace_root=tmp_path,
+        db_directory=tmp_path / "db", max_context_tokens=configured_window,
+        max_completion_tokens=1_024, memory_backend="off",
+        tool_search_threshold=12,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "coding-budget.db"),
+        ScriptedDiscoveryProvider("git diff", None, provider_window),
+        guard, HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path, tools=catalog, config=config,
+    )
+    names = set(loop._provider_tools())
+    expected = {*ESSENTIAL_TOOL_NAMES, "search_tools"}
+    if promoted:
+        expected.add("git_diff")
+    assert names == expected
+    session = await loop.start_session()
+    messages = loop._build_messages(session)
+    assert ("Prefer focused symbol searches" in messages[0]["content"]) is promoted
+    if promoted:
+        assert "git_diff" in messages[0]["content"]
+        assert LARGE_CONTEXT_CODING_GUIDANCE in messages[0]["content"]
+    assert loop._last_context_tokens <= loop._resolve_request_token_budget().input_limit
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_real_git_review_tool_is_available_with_large_effective_context(
+    tmp_path, monkeypatch,
+) -> None:
+    """Check real Git/patch schemas rather than only synthetic tool names."""
+    from ash.runtime import build_tools
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    config = AshConfig(
+        model="local/intent-discovery", workspace_root=tmp_path,
+        db_directory=tmp_path / "db", max_context_tokens=65_536,
+        max_completion_tokens=1_024, memory_backend="off",
+        tool_search_threshold=32,
+    )
+    guard = SafetyGuard(tmp_path)
+    tools = build_tools(
+        guard, tmp_path, runtime_config=config,
+        provider_factory=lambda *_args, **_kwargs: None,
+        agent_db_path=tmp_path / "agents.db",
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "large-tools.db"),
+        ScriptedDiscoveryProvider("review changes", None, 65_536),
+        guard, HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path, tools=tools, config=config,
+    )
+    assert len(tools) > config.tool_search_threshold
+    visible = loop._provider_tools()
+    assert {"git_diff", "search_tools"} <= visible.keys()
+    assert "apply_patch" not in visible
+    schema = loop._tool_schema_payload(visible)
+    schemas = {item["function"]["name"]: item for item in schema}
+    assert schemas["git_diff"]["function"]["parameters"] == tools[
+        "git_diff"
+    ].json_schema()
+    session = await loop.start_session()
+    messages = loop._build_messages(
+        session, provider_tools=visible, tool_schema_payload=schema,
+    )
+    assert "run the explicitly authorized focused test" in messages[0]["content"]
+    assert loop._last_context_tokens <= loop._resolve_request_token_budget().input_limit
+    await loop.aclose()
 
 
 @pytest.mark.asyncio

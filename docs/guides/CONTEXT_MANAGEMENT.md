@@ -54,6 +54,17 @@ Only visible schemas count against the tools budget. Deferred tools remain in
 the runtime registry and continue through normal validation, permissions,
 hooks, audit, event, and result-persistence paths after activation.
 
+When the **effective** provider input limit is at least 24,576 tokens and
+deferred discovery is active, Ash also exposes the existing read-only
+`git_diff` schema directly. The generated system prompt includes concise
+coding guidance for focused inspection, coordinated edits and authorized
+testing. This does not grant shell access or alter any tool permissions.
+`apply_patch` remains deferred, including on large models; making its schema
+eager previously harmed local-model multi-file trials, and its usefulness as
+a general default has not been established. Models with smaller *actual*
+input limits keep the original compact catalog and prompt, even if the user
+configured a larger nominal context window.
+
 After a request is assembled, `ContextBudgetReport.fragments` records each
 fragment's typed kind, source, trust class, token use and limit, truncation
 state, SHA-256, and non-content metadata. The report intentionally does not
