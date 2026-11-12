@@ -322,6 +322,116 @@ assert raw.auth_decoded_joined == "first:name:second:value"
 assert raw.auth == "first%3Aname:second%3Avalue"
 """
 
+CLICK_RESOURCE_VISIBLE = r"""import sys
+sys.path.insert(0, "src")
+import click
+
+class RollbackRequested(Exception):
+    pass
+
+class ManagedTransaction:
+    def __init__(self, suppress=False):
+        self.suppress = suppress
+        self.seen = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.seen.append((exc_type, exc_value, traceback is not None))
+        return self.suppress if exc_type is not None else False
+
+# Ordinary successful cleanup stays unchanged.
+ctx = click.Context(click.Command("transaction"))
+success = ManagedTransaction()
+with ctx:
+    assert ctx.with_resource(success) is success
+assert success.seen == [(None, None, False)]
+
+# Unhandled exceptions must reach managed resources, not commit as success.
+failure = ManagedTransaction()
+reason = RollbackRequested("rollback the operation")
+try:
+    with ctx:
+        ctx.with_resource(failure)
+        raise reason
+except RollbackRequested as actual:
+    assert actual is reason
+else:
+    raise AssertionError("exception unexpectedly swallowed")
+assert failure.seen == [(RollbackRequested, reason, True)]
+
+# A resource which explicitly handles an exception may suppress it.
+handled = ManagedTransaction(suppress=True)
+with ctx:
+    ctx.with_resource(handled)
+    raise RollbackRequested("handled inside the resource")
+assert handled.seen[0][0] is RollbackRequested
+assert handled.seen[0][2] is True
+"""
+
+CLICK_RESOURCE_HIDDEN = r"""import sys
+sys.path.insert(0, "src")
+import click
+
+class AbortTransaction(Exception):
+    pass
+
+events = []
+
+class Resource:
+    def __init__(self, label, swallow=False):
+        self.label = label
+        self.swallow = swallow
+
+    def __enter__(self):
+        events.append((self.label, "entered"))
+        return self
+
+    def __exit__(self, typ, value, traceback):
+        events.append((self.label, typ, value, traceback))
+        return bool(typ is not None and self.swallow)
+
+ctx = click.Context(click.Command("audit"))
+
+# ExitStack unwinds LIFO; a swallowed error must not reach outer resources.
+reason = AbortTransaction("inner handled the error")
+with ctx.scope():
+    ctx.with_resource(Resource("outer"))
+    ctx.with_resource(Resource("inner", swallow=True))
+    raise reason
+assert events[0:2] == [("outer", "entered"), ("inner", "entered")]
+assert events[2][0] == "inner" and events[2][1] is AbortTransaction
+assert events[2][2] is reason and events[2][3] is not None
+assert events[3] == ("outer", None, None, None), events
+
+# With no suppressor, all resources receive the same live exception.
+events.clear()
+reason = AbortTransaction("propagate through both")
+try:
+    with ctx.scope():
+        ctx.with_resource(Resource("outer"))
+        ctx.with_resource(Resource("inner"))
+        raise reason
+except AbortTransaction as actual:
+    assert actual is reason
+else:
+    raise AssertionError("resource incorrectly swallowed exception")
+assert [entry[0] for entry in events] == ["outer", "inner", "inner", "outer"]
+for entry in events[2:]:
+    assert entry[1] is AbortTransaction and entry[2] is reason
+    assert entry[3] is not None
+
+# Reusing the context resets its cleanup stack, without stale callbacks.
+events.clear()
+with ctx:
+    ctx.with_resource(Resource("first"))
+with ctx:
+    ctx.with_resource(Resource("second"))
+assert [event[0] for event in events] == ["first", "first", "second", "second"]
+assert all(entry[1:] == (None, None, None) for entry in (events[1], events[3]))
+"""
+
 
 @dataclass(frozen=True)
 class RepositoryTask:
@@ -338,6 +448,30 @@ class RepositoryTask:
 
 
 TASKS = {
+    "click-resource-exception": RepositoryTask(
+        source="pallets/click",
+        upstream="https://github.com/pallets/click.git",
+        base_sha="16fe802a3f96c4c8fa3cd382f1a7577fda0c5321",
+        reference_fix_sha="555fa9bb37770a6845a98be60b0c84876775552e",
+        editable=frozenset({"src/click/core.py"}),
+        visible_script="qa_visible.py",
+        visible_source=CLICK_RESOURCE_VISIBLE,
+        hidden_source=CLICK_RESOURCE_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Repair a historical lifecycle bug in this pinned Click CLI framework. "
+            "Context.with_resource() registers context managers for cleanup, "
+            "but when a command's context exits with an exception, managed "
+            "resources are currently exited as if the operation succeeded. "
+            "Forward the real exception type, value, and traceback through "
+            "resource cleanup. Respect context managers that suppress an "
+            "exception, preserve LIFO resource order, ordinary successful "
+            "cleanup, reusable contexts, and the public Context interface. "
+            "Inspect the code and qa_visible.py, edit ONLY src/click/core.py, "
+            "then execute exactly python3 -B qa_visible.py with run_command. "
+            "No other commands are authorized. Do not modify tests or metadata."
+        ),
+    ),
     "h11-chunk-footer": RepositoryTask(
         source="python-hyper/h11",
         upstream="https://github.com/python-hyper/h11.git",

@@ -162,6 +162,11 @@ def test_size_telemetry_excludes_tool_payload_and_private_file_path() -> None:
     ("task_id", "upstream", "editable"),
     [
         (
+            "click-resource-exception",
+            "https://github.com/pallets/click.git",
+            {"src/click/core.py"},
+        ),
+        (
             "h11-chunk-footer",
             "https://github.com/python-hyper/h11.git",
             {"h11/_readers.py"},

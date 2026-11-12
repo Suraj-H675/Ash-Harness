@@ -7,8 +7,8 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These ten fixtures already have runnable code and grading logic. They **do not
-constitute ten independent real repositories**; synthetic and real-repository
+These eleven fixtures already have runnable code and grading logic. They **do not
+constitute eleven independent real repositories**; synthetic and real-repository
 lanes must remain separate. Do not pool their scores into a single win rate.
 
 | ID | Existing task | Lane | What it exercises | Latest evidence / next action |
@@ -17,6 +17,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R2 | `urllib3-header-sanitization` | Pinned real repo | One-file security-oriented normalization | Historical paired pilot passed; retain as control |
 | R3 | `urllib3-proxy-redirect` | Pinned real repo | Coordinated two-file redirect/security fix | **Scenario 04: PARKED, unresolved**; prior matched pair: Ash fail / Codex pass (one sample) |
 | R4 | `urllib3-url-auth-feature` | Pinned real repo | New public API / URL parsing edge cases | **Initial paired pass for both engines**; one sample, no reliability claim |
+| R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Oracle-verified**, original fails and upstream fix passes; no agent result yet |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -24,13 +25,13 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | S5 | `two-file` | Synthetic repair | Both billing modules must change | Exists; current strong-model baseline pending |
 | S6 | `event-log` | Synthetic integration | Three-module parser, aggregation and rendering | Exists; current strong-model baseline pending |
 
-**Current gaps (not runnable tasks):** add approximately four independently
+**Current gaps (not runnable tasks):** add approximately three independently
 scoped, pinned real-repository cases before interpreting broad coding quality:
 one unfamiliar codebase with debugging/test triage; one multi-file refactor
 with stable public behavior; one dependency/interface compatibility change;
 and one larger repository requiring targeted discovery. Choose repositories,
 base/fix pins and independent visible/hidden oracles only after provenance and
-red-original/green-reference verification. This will give a **14-case initial
+red-original/green-reference verification. This would give a **14-case initial
 inventory**, though reliability claims will still require repetitions and
 diversity beyond shared urllib3 history.
 
@@ -42,6 +43,14 @@ oracles and completed CLI for both engines (Ash **77.14s**, plain Codex
 **79.15s**). The paired runner verified the comparison receipt. These are
 single observations, not a stable portfolio pass rate or a 2-second speed
 advantage. Their task difficulty, order and runtime conditions differ.
+
+**R5 provenance:** The Click task uses original `pallets/click` commit
+`16fe802a3f96c4c8fa3cd382f1a7577fda0c5321` and the upstream
+`Context.__exit__` fix `555fa9bb37770a6845a98be60b0c84876775552e`
+([PR #3058](https://github.com/pallets/click/pull/3058)). Independently
+authored, stdlib-only visible and hidden checks both failed on the original
+and passed on the fixed commit. Only `src/click/core.py` is editable. This
+establishes a **real runnable evaluation**, not a coding-agent success claim.
 
 ## Evaluation and prioritization contract
 
@@ -84,10 +93,10 @@ advantage. Their task difficulty, order and runtime conditions differ.
 ## Next portfolio slice
 
 **Now:** no new Scenario 04 run and no immediate R4 retry. The initial R4
-matched pair is complete. **Next, add one genuinely different real repository**
-with independent behavioral oracles, and then run it once under a frozen
-matched pair before choosing another architecture change. Use repetitions
-only for a predeclared variance question, not to reverse a disappointing result.
+matched pair is complete. **R5 Click** adds a third upstream repository with
+an independent resource-lifecycle bug. Grade it through one frozen sequential
+Ash/plain-Codex pair, then rotate to a different case. Use repetitions only
+for a predeclared variance question, not to reverse a disappointing result.
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate
