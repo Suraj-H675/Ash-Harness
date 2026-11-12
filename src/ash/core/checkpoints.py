@@ -177,13 +177,16 @@ def recover_interrupted_turns(
     session_id: str,
     *,
     deferred_call_ids: set[str] | None = None,
+    include_quiescent_interrupted: bool = False,
 ) -> RecoverySummary:
     """Compensate provably interrupted direct edits and flag unknown effects."""
 
     # Idle sessions have no file state to inspect or restore. Their callers
     # hold a session lease, so unrelated coworkers must not compete for the
     # global write lock merely to establish that recovery is unnecessary.
-    if not store.recoverable_turns(session_id):
+    if not store.recoverable_turns(
+        session_id, include_quiescent_interrupted=include_quiescent_interrupted
+    ):
         return RecoverySummary()
     with workspace_mutation_lock():
         return _recover_interrupted_turns_locked(
@@ -191,6 +194,7 @@ def recover_interrupted_turns(
             guard,
             session_id,
             deferred_call_ids=deferred_call_ids,
+            include_quiescent_interrupted=include_quiescent_interrupted,
         )
 
 
@@ -200,11 +204,14 @@ def _recover_interrupted_turns_locked(
     session_id: str,
     *,
     deferred_call_ids: set[str] | None = None,
+    include_quiescent_interrupted: bool = False,
 ) -> RecoverySummary:
     """Run interrupted-turn recovery while the mutation lease is held."""
 
     deferred_call_ids = deferred_call_ids or set()
-    turns = store.recoverable_turns(session_id)
+    turns = store.recoverable_turns(
+        session_id, include_quiescent_interrupted=include_quiescent_interrupted
+    )
     compensated_calls: list[str] = []
     compensated_files: list[Path] = []
     unknown_calls: list[str] = []

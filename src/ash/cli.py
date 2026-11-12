@@ -1808,11 +1808,35 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                     print(f"Usage: {command.usage}", file=sys.stderr, flush=True)
                     continue
                 try:
-                    restart = loop.session_store.restart_context_session(
-                        loop.current_session.session_id,
-                        expected_project_path=loop.project_root,
-                        user_handoff=" ".join(arguments),
+                    # Recovery and handoff must share the parent session
+                    # lease. A completed recovery never grants permission to
+                    # replay uncertain tools; the atomic fork checks the
+                    # durable tool, checkpoint and external-task journals.
+                    parent_id = loop.current_session.session_id
+                    lease = loop.session_store.acquire_session_runtime_lease(
+                        parent_id
                     )
+                    try:
+                        await loop._recover_current_session_before_turn()
+                        from ash.core.checkpoints import recover_interrupted_turns
+
+                        # Ordinary startup intentionally skips idle
+                        # interrupted turns. Explicit restart requires a
+                        # durable recovery receipt even when no tool is
+                        # pending; this is never an automatic continuation.
+                        recover_interrupted_turns(
+                            loop.session_store,
+                            loop.safety_guard,
+                            parent_id,
+                            include_quiescent_interrupted=True,
+                        )
+                        restart = loop.session_store.restart_context_session(
+                            parent_id,
+                            expected_project_path=loop.project_root,
+                            user_handoff=" ".join(arguments),
+                        )
+                    finally:
+                        lease.close()
                     session = await loop.start_session(restart.session_id)
                     _sync_repl_model_config(config, loop)
                 except (ValueError, RuntimeError) as exc:

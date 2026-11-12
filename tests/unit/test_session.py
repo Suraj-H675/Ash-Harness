@@ -1775,6 +1775,161 @@ def test_context_restart_refuses_incomplete_parent_and_is_atomic(tmp_path: Path)
     assert len(store.session_tree(root.session_id)) == 1
 
 
+def test_context_restart_accepts_only_reconciled_interrupted_turn(
+    tmp_path: Path,
+) -> None:
+    """A failed coding turn can be handed off only after real recovery."""
+    from ash.core.checkpoints import recover_interrupted_turns
+    from ash.safety.guard import SafetyGuard
+
+    store = SessionStore(tmp_path / "interrupted-context-restart.db")
+    source = store.create_session(
+        str(tmp_path), model="openai/gpt-6-luna", permission_mode="plan"
+    )
+    store.start_turn(source.session_id, "turn-overflow", "fix two modules")
+    store.save_message(source.session_id, Message(
+        role="assistant", content="In progress",
+        timestamp=datetime.now(timezone.utc),
+        metadata={"provider_state": [{
+            "type": "reasoning", "id": "old-state", "summary": [],
+            "encrypted_content": "SENSITIVE-OPAQUE-STATE",
+        }]},
+    ))
+    store.interrupt_turn("turn-overflow")
+    with pytest.raises(SessionForkConflictError, match="quiescent"):
+        store.restart_context_session(
+            source.session_id, expected_project_path=tmp_path,
+            user_handoff="Inspect existing changes before continuing",
+        )
+
+    recovery = recover_interrupted_turns(
+        store, SafetyGuard(project_root=tmp_path), source.session_id,
+        include_quiescent_interrupted=True,
+    )
+    assert recovery.interrupted_turns == 1
+    assert not recovery.needs_attention
+    before = store.load_session(source.session_id)
+    child = store.restart_context_session(
+        source.session_id, expected_project_path=tmp_path,
+        user_handoff="Inspect existing changes before continuing",
+    )
+    assert child.parent_session_id == source.session_id
+    assert child.model == "openai/gpt-6-luna"
+    assert child.permission_mode == "plan"
+    assert child.fork_message_count == 0
+    assert child.tool_calls == []
+    assert len(child.messages) == 1
+    assert "Inspect existing changes" in child.messages[0].content
+    assert "not imported or authorized for replay" in child.messages[0].content.lower()
+    assert "SENSITIVE-OPAQUE-STATE" not in repr(child)
+    assert before.messages == store.load_session(source.session_id).messages
+    assert store.interrupted_recovery_reports(source.session_id)[0]["status"] == "interrupted"
+
+
+def test_context_restart_rejects_recovered_ambiguous_external_action(
+    tmp_path: Path,
+) -> None:
+    from ash.core.checkpoints import recover_interrupted_turns
+    from ash.safety.guard import SafetyGuard
+
+    store = SessionStore(tmp_path / "ambiguous-interrupted.db")
+    source = store.create_session(str(tmp_path))
+    store.start_turn(source.session_id, "turn-ambiguous", "send external notification")
+    store.save_tool_call(source.session_id, ToolCallRecord(
+        call_id="unknown-side-effect", tool_name="run_command",
+        arguments={"command_line": "example"}, approved=True,
+        dispatched=True, executed=False, result=None, error=None,
+        timestamp=datetime.now(timezone.utc),
+    ), turn_id="turn-ambiguous")
+    store.interrupt_turn("turn-ambiguous")
+    recovery = recover_interrupted_turns(
+        store, SafetyGuard(project_root=tmp_path), source.session_id
+    )
+    assert recovery.needs_attention
+    assert recovery.unknown_calls
+    report = store.interrupted_recovery_reports(source.session_id)[0]
+    assert report["status"] == "needs_attention"
+    with pytest.raises(SessionForkConflictError, match="quiescent"):
+        store.restart_context_session(
+            source.session_id, expected_project_path=tmp_path,
+            user_handoff="Do not replay unknown work",
+        )
+    assert len(store.session_tree(source.session_id)) == 1
+
+
+def test_context_restart_preserves_known_completed_action_and_native_gate(
+    tmp_path: Path,
+) -> None:
+    from ash.core.checkpoints import recover_interrupted_turns
+    from ash.safety.guard import SafetyGuard
+
+    store = SessionStore(tmp_path / "known-interrupted-tool.db")
+    source = store.create_session(str(tmp_path), model="openai/gpt-6-luna")
+    store.start_turn(source.session_id, "turn-known", "fix source")
+    store.save_tool_call(source.session_id, ToolCallRecord(
+        call_id="known-edit", tool_name="replace_file_content",
+        arguments={"file_path": "module.py"}, approved=True,
+        dispatched=True, executed=True, success=True,
+        result="edit completed", error=None,
+        timestamp=datetime.now(timezone.utc),
+    ), turn_id="turn-known")
+    store.interrupt_turn("turn-known")
+    report = recover_interrupted_turns(
+        store, SafetyGuard(project_root=tmp_path), source.session_id,
+        include_quiescent_interrupted=True,
+    )
+    assert report.interrupted_turns == 1
+    assert report.unknown_calls == ()
+    # A provider-native checkpoint is not the same as an explicit user
+    # handoff, and must still reject an interrupted source conversation.
+    with pytest.raises(SessionForkConflictError, match="quiescent"):
+        store.install_native_context_checkpoint(
+            source.session_id,
+            expected_project_path=tmp_path,
+            expected_parent_messages=0,
+            expected_parent_revision=store.session_history_revision(source.session_id),
+            checkpoint=[{
+                "type": "responses_compacted_input",
+                "output": [{"type": "compaction", "encrypted_content": "opaque"}],
+            }],
+        )
+    child = store.restart_context_session(
+        source.session_id, expected_project_path=tmp_path,
+        user_handoff="Inspect the known edit; do not repeat it",
+    )
+    assert child.tool_calls == []
+    assert [record.call_id for record in store.load_session(source.session_id).tool_calls] == [
+        "known-edit"
+    ]
+    assert store.load_session(source.session_id).tool_calls[0].success is True
+
+
+@pytest.mark.parametrize("invalid_recovery", [
+    "{}", "garbled", '{"status":"interrupted"}',
+    '{"status":"interrupted","unknown_calls":[],"unresolved_files":[],"recovered_calls":[{"ambiguous":true}]}',
+    '{"status":"interrupted","unknown_calls":[{"call_id":"bad"}],"unresolved_files":[],"recovered_calls":[]}',
+])
+def test_context_restart_refuses_unverified_interruption_receipt(
+    tmp_path: Path, invalid_recovery: str,
+) -> None:
+    store = SessionStore(tmp_path / "tampered-interrupted.db")
+    source = store.create_session(str(tmp_path))
+    store.start_turn(source.session_id, "turn-old", "old request")
+    store.interrupt_turn("turn-old")
+    with get_db_connection(store.db_path) as conn:
+        conn.execute(
+            "UPDATE turn_journal SET recovery_json=? WHERE turn_id=?",
+            (invalid_recovery, "turn-old"),
+        )
+        conn.commit()
+    with pytest.raises(SessionForkConflictError, match="quiescent"):
+        store.restart_context_session(
+            source.session_id, expected_project_path=tmp_path,
+            user_handoff="Recheck all work",
+        )
+    assert len(store.session_tree(source.session_id)) == 1
+
+
 def test_context_restart_rejects_live_mcp_task_even_with_completed_turn(
     tmp_path: Path,
 ) -> None:

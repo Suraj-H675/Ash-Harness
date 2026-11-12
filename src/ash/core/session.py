@@ -4485,8 +4485,10 @@ class SessionStore:
                 (session_id,),
             ).fetchall()
 
-    def recoverable_turns(self, session_id: str) -> list[sqlite3.Row]:
-        """Return turns that still require crash-consistency recovery."""
+    def recoverable_turns(
+        self, session_id: str, *, include_quiescent_interrupted: bool = False
+    ) -> list[sqlite3.Row]:
+        """Find pending recovery; explicit restarts can also seal idle failures."""
 
         with closing(self._connect()) as conn:
             rows = conn.execute(
@@ -4496,6 +4498,11 @@ class SessionStore:
                 "ORDER BY started_at DESC, turn_id DESC",
                 (session_id,),
             ).fetchall()
+            if include_quiescent_interrupted:
+                # Only explicit reasoning-window restarts need a durable
+                # no-ambiguity receipt for interrupted turns without pending
+                # tools. Ordinary resume remains lock-free for that case.
+                return rows
             recoverable: list[sqlite3.Row] = []
             for row in rows:
                 if str(row["status"]) == "started":
@@ -5520,6 +5527,36 @@ class SessionStore:
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise _invalid_stored_data_error(self.db_path) from exc
 
+    @staticmethod
+    def _reconciled_interrupted_turn_is_safe(recovery_json: str) -> bool:
+        """Permit explicit reasoning restart only after ambiguity-free recovery.
+
+        An interrupted turn is never considered complete. Its recorded
+        side effects stay in the parent and cannot be inherited or replayed.
+        """
+        try:
+            report = json.loads(recovery_json)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(report, dict) or report.get("status") not in {
+            "interrupted", "compensated"
+        }:
+            return False
+        unknown = report.get("unknown_calls")
+        unresolved = report.get("unresolved_files")
+        recovered = report.get("recovered_calls")
+        return (
+            isinstance(unknown, list)
+            and not unknown
+            and isinstance(unresolved, list)
+            and not unresolved
+            and isinstance(recovered, list)
+            and all(
+                isinstance(call, dict) and call.get("ambiguous") is False
+                for call in recovered
+            )
+        )
+
     def fork_session(
         self,
         session_id: str,
@@ -5609,11 +5646,25 @@ class SessionStore:
                         "before forking"
                     )
                 if handoff_content is not None or checkpoint_metadata is not None:
-                    unresolved = conn.execute(
-                        "SELECT 1 FROM turn_journal WHERE session_id = ? "
-                        "AND status != 'completed' LIMIT 1",
+                    nonterminal = conn.execute(
+                        "SELECT turn_id, status, recovery_json FROM turn_journal "
+                        "WHERE session_id = ? AND status != 'completed'",
                         (session_id,),
-                    ).fetchone()
+                    ).fetchall()
+                    # Native checkpoints continue requiring completed turns.
+                    # Only an explicit user handoff may leave a recovered,
+                    # interrupted parent behind in a separate reasoning window.
+                    unresolved = any(
+                        handoff_content is None
+                        or row["status"] != "interrupted"
+                        or not self._reconciled_interrupted_turn_is_safe(
+                            row["recovery_json"]
+                        )
+                        or bool(self._assistant_tool_calls_missing_results_in_connection(
+                            conn, session_id, str(row["turn_id"])
+                        ))
+                        for row in nonterminal
+                    )
                     active_task = conn.execute(
                         "SELECT 1 FROM mcp_tasks WHERE session_id = ? "
                         "AND status IN ('working', 'input_required') LIMIT 1",
@@ -5631,11 +5682,15 @@ class SessionStore:
                         "SELECT 1 FROM mcp_task_handles WHERE session_id = ? LIMIT 1",
                         (session_id,),
                     ).fetchone()
-                    if any(
-                        item is not None
-                        for item in (
-                            unresolved, active_task, unconfirmed_action,
-                            archived_ambiguous,
+                    incomplete_file_edit = conn.execute(
+                        "SELECT 1 FROM file_checkpoints WHERE session_id = ? "
+                        "AND restored = 0 AND after_sha256 IS NULL LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if unresolved or any(
+                        item is not None for item in (
+                            active_task, unconfirmed_action, archived_ambiguous,
+                            incomplete_file_edit,
                         )
                     ):
                         raise SessionForkConflictError(

@@ -88,3 +88,26 @@ The current summary is deterministic and extractive. Ash does not claim a
 model-assisted compactor yet. A future model-assisted path must be optional,
 bounded, provenance-tagged, failure-isolated, and fall back to this algorithm
 without recursively exhausting the same context window.
+
+## Explicit restart after a context failure
+
+Some reasoning-capable providers return opaque state that must be replayed
+without modifying earlier input. If that protected input cannot fit within
+the provider limit, Ash stops with a context error rather than silently
+discarding state, rewriting tool results, or repeating actions. This can
+happen partway through a multi-file coding task.
+
+After inspecting the workspace and any recovery warnings, an interactive
+user may run `/restart-context <explicit handoff>` to open a **new reasoning
+window**. The old session, action history and audit log remain available for
+review. Ash reconciles the interrupted journal under the session lease before
+the fork. Only completed, known tool outcomes (or safely compensated edits)
+permit this explicit restart. Pending turns, ambiguous external actions,
+unresolved file checkpoints and active external tasks still block it. The
+child inherits neither previous tool approvals nor opaque reasoning items;
+no actions are automatically replayed. The handoff is user-supplied, not
+a model-generated completion claim, and the user must verify partial edits.
+
+This is **manual recovery**, not transparent automatic continuation or a
+substitute for long-task context management. `/compact-native` remains
+unavailable on the ChatGPT-plan route until the native contract is verified.

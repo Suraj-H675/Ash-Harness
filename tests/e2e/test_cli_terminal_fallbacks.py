@@ -309,6 +309,113 @@ def test_restart_context_in_real_repl_preserves_parent_and_permission_mode(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_restart_context_in_real_repl_reconciles_failed_turn_without_replay(
+    tmp_path: Path,
+) -> None:
+    """Real CLI handoff from a context-failed turn requires recovered journal."""
+    from ash.core.session import SessionStore
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    (home / "db").mkdir()
+    environment = _terminal_environment(
+        home, workspace, model="lmstudio/local-model"
+    )
+    _set_workspace_trust(workspace, environment, trusted=False)
+    store = SessionStore(home / "db" / "sessions.db")
+    parent = store.create_session(
+        str(workspace), model="lmstudio/local-model", permission_mode="plan"
+    )
+    store.start_turn(parent.session_id, "turn-context-error", "fix two modules")
+    store.interrupt_turn("turn-context-error")
+    assert store.interrupted_recovery_reports(parent.session_id) == []
+
+    master, process = _open_pty_cli(
+        workspace, environment, columns=120,
+        args=("--session", parent.session_id),
+    )
+    captured = bytearray()
+    try:
+        _read_until(master, process, captured, b"> ", timeout=30)
+        os.write(master, b"/restart-context Inspect the two modules before editing\r")
+        _read_until(
+            master, process, captured,
+            b"Started a new reasoning window", timeout=30,
+        )
+        children = [
+            row for row in store.list_sessions(project_path=str(workspace))
+            if row.session_id != parent.session_id
+        ]
+        assert len(children) == 1
+        child = store.load_session(children[0].session_id)
+        assert child.parent_session_id == parent.session_id
+        assert child.permission_mode == "plan"
+        assert child.tool_calls == []
+        assert child.fork_message_count == 0
+        assert len(child.messages) == 1
+        assert "Inspect the two modules" in child.messages[0].content
+        assert store.interrupted_recovery_reports(parent.session_id)[0][
+            "status"
+        ] == "interrupted"
+        assert store.load_session(parent.session_id).tool_calls == []
+        os.write(master, b"/exit\r")
+        process.wait(timeout=10)
+        assert process.returncode == 0
+    finally:
+        _stop_pty_cli(master, process)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_restart_context_real_repl_refuses_unknown_dispatched_action(
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime, timezone
+
+    from ash.core.session import SessionStore, ToolCallRecord
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    (home / "db").mkdir()
+    environment = _terminal_environment(
+        home, workspace, model="lmstudio/local-model"
+    )
+    _set_workspace_trust(workspace, environment, trusted=False)
+    store = SessionStore(home / "db" / "sessions.db")
+    parent = store.create_session(str(workspace), model="lmstudio/local-model")
+    store.start_turn(parent.session_id, "turn-unknown", "run outside command")
+    store.save_tool_call(parent.session_id, ToolCallRecord(
+        call_id="uncertain-external", tool_name="run_command",
+        arguments={"command_line": "external-effect"}, approved=True,
+        dispatched=True, executed=False, result=None, error=None,
+        timestamp=datetime.now(timezone.utc),
+    ), turn_id="turn-unknown")
+    store.interrupt_turn("turn-unknown")
+
+    master, process = _open_pty_cli(
+        workspace, environment, columns=120,
+        args=("--session", parent.session_id),
+    )
+    captured = bytearray()
+    try:
+        _read_until(master, process, captured, b"> ", timeout=30)
+        os.write(master, b"/restart-context Recheck external state safely\r")
+        _read_until(master, process, captured, b"quiescent", timeout=30)
+        assert b"Started a new reasoning window" not in captured
+        assert len(store.list_sessions(project_path=str(workspace))) == 1
+        reports = store.interrupted_recovery_reports(parent.session_id)
+        assert reports[0]["status"] == "needs_attention"
+        os.write(master, b"/exit\r")
+        process.wait(timeout=10)
+        assert process.returncode == 0
+    finally:
+        _stop_pty_cli(master, process)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
 def test_config_diagnostic_escapes_controls_from_workspace_path(
     tmp_path: Path,
 ) -> None:
