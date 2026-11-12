@@ -7,8 +7,8 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These eleven fixtures already have runnable code and grading logic. They **do not
-constitute eleven independent real repositories**; synthetic and real-repository
+These twelve fixtures already have runnable code and grading logic. They **do not
+constitute twelve independent real repositories**; synthetic and real-repository
 lanes must remain separate. Do not pool their scores into a single win rate.
 
 | ID | Existing task | Lane | What it exercises | Latest evidence / next action |
@@ -18,6 +18,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R3 | `urllib3-proxy-redirect` | Pinned real repo | Coordinated two-file redirect/security fix | **Scenario 04: PARKED, unresolved**; prior matched pair: Ash fail / Codex pass (one sample) |
 | R4 | `urllib3-url-auth-feature` | Pinned real repo | New public API / URL parsing edge cases | **Initial paired pass for both engines**; one sample, no reliability claim |
 | R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Initial pair: Ash fail / Codex pass**; Ash stopped at safe context limit after an incomplete edit |
+| R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Oracle-verified** on both pins; paired agent outcome pending |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -25,7 +26,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | S5 | `two-file` | Synthetic repair | Both billing modules must change | Exists; current strong-model baseline pending |
 | S6 | `event-log` | Synthetic integration | Three-module parser, aggregation and rendering | Exists; current strong-model baseline pending |
 
-**Current gaps (not runnable tasks):** add approximately three independently
+**Current gaps (not runnable tasks):** add approximately two independently
 scoped, pinned real-repository cases before interpreting broad coding quality:
 one unfamiliar codebase with debugging/test triage; one multi-file refactor
 with stable public behavior; one dependency/interface compatibility change;
@@ -58,6 +59,17 @@ completed in 55.92s. Comparison receipt validated both task inputs and
 source pins. This **single observation** is a failure classification, not a
 reliability estimate or a timed ranking. The two engines retain different
 command/permission enforcement and system-prompt behavior.
+
+**R6 provenance:** The python-dateutil case uses original
+`6e1864c7c309f4d905e8b337864ca8b5d3ff9d34` and upstream fix
+`6f1362220007b9d868638630043636e0f3285a3f`, which changes
+`src/dateutil/parser/isoparser.py` and `src/dateutil/tz/tz.py` (plus upstream
+tests/metadata, which the agent cannot modify). Independently authored
+public-API checks reject non-digit, partial and signed ISO fields and
+invalid `tzical` offsets, while preserving legitimate dates and timezones.
+Both visible and hidden tests were **red on the original and green on the
+fix**. Both source modules are required to change. This is an oracle-valid
+evaluation, not a coding-agent success claim.
 
 ## Evaluation and prioritization contract
 
@@ -99,14 +111,12 @@ command/permission enforcement and system-prompt behavior.
 
 ## Next portfolio slice
 
-**Now:** no new Scenario 04 run or immediate R4/R5 retry. R5 Click has been
-independently graded, adding a third repository and a second example of Ash
-encountering protected opaque-context exhaustion in a coding task. Record
-the incomplete edit and missing verification as separate errors; investigate
-context economy only if further held-out tasks corroborate it. **Next, add a
-different real-repository task**, preferably a genuine multi-module refactor
-or dependency/API migration. Use repetitions only for a predeclared variance
-question, not to reverse a disappointing result.
+**Now:** no Scenario 04 rerun and no immediate R4/R5 retry. R6 adds a fourth
+upstream repository and an independent **two-module** validation bug. Run one
+frozen sequential Ash/plain-Codex pair, classify the result without an
+immediate fixture-specific change, and then rotate to the next portfolio
+slice. Use repetitions only for a predeclared variance question, not to
+reverse a disappointing result.
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate

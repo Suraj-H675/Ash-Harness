@@ -432,6 +432,107 @@ assert [event[0] for event in events] == ["first", "first", "second", "second"]
 assert all(entry[1:] == (None, None, None) for entry in (events[1], events[3]))
 """
 
+DATEUTIL_NUMERIC_VISIBLE = r"""import sys
+from io import StringIO
+from datetime import datetime, timedelta
+sys.path.insert(0, "src")
+from dateutil.parser import isoparse
+from dateutil.tz import tzical
+
+valid = isoparse("2020-02-29T23:45:10+05:30")
+assert valid == datetime(2020, 2, 29, 23, 45, 10, tzinfo=valid.tzinfo)
+assert valid.utcoffset() == timedelta(hours=5, minutes=30)
+assert isoparse("2024-W01-1").date().isoformat() == "2024-01-01"
+
+# Fixed-width ISO date/time fields must not accept int()-compatible garbage.
+for malformed in (
+    "2_14-04-21",
+    "2014- 4-21",
+    "2014-04-21T14:3",
+    "2014-04-21T14:30+-1:00",
+    "20200728121240",
+):
+    try:
+        isoparse(malformed)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("malformed ISO field accepted: " + repr(malformed))
+
+def zone(offset):
+    source = (
+        "BEGIN:VCALENDAR\nBEGIN:VTIMEZONE\nTZID:Example\n"
+        "BEGIN:STANDARD\nDTSTART:19700101T000000\nTZOFFSETFROM:+0000\n"
+        "TZOFFSETTO:" + offset + "\nTZNAME:Example\n"
+        "END:STANDARD\nEND:VTIMEZONE\nEND:VCALENDAR\n"
+    )
+    return tzical(StringIO(source)).get()
+
+assert zone("-0500") is not None
+assert zone("-053000") is not None
+for malformed in ("+-500", "+ 500"):
+    try:
+        zone(malformed)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("malformed TZOFFSETTO accepted: " + repr(malformed))
+"""
+
+DATEUTIL_NUMERIC_HIDDEN = r"""import sys
+from io import StringIO
+from datetime import datetime, timedelta
+sys.path.insert(0, "src")
+from dateutil.parser import isoparse, isoparser
+from dateutil.tz import tzical
+
+# Exercise other numeric fields than the visible oracle, including offset
+# minutes, ordinal/week forms, and a truncated final component.
+for malformed in (
+    "2014-W1 -1",
+    "2014-04-21T14:30:1",
+    "2014-04-21T14:30+01:-5",
+    "2014-04-21T14:30+01000",
+    "2014-04-21T12: 5",
+    "2014-04-21T14:30+01:0",
+):
+    try:
+        isoparse(malformed)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("non-digit or truncated ISO field accepted: " + repr(malformed))
+
+assert isoparser().parse_isodate("2024-366").isoformat() == "2024-12-31"
+assert isoparser().parse_isotime("14:30:25").isoformat() == "14:30:25"
+parsed = isoparse("2020-01-02T10:30:15-04:00")
+assert parsed == datetime(2020, 1, 2, 10, 30, 15, tzinfo=parsed.tzinfo)
+assert parsed.utcoffset() == -timedelta(hours=4)
+
+def zone(from_offset, to_offset):
+    source = (
+        "BEGIN:VCALENDAR\nBEGIN:VTIMEZONE\nTZID:Independent\n"
+        "BEGIN:STANDARD\nDTSTART:19700101T000000\n"
+        "TZOFFSETFROM:" + from_offset + "\n"
+        "TZOFFSETTO:" + to_offset + "\nTZNAME:Independent\n"
+        "END:STANDARD\nEND:VTIMEZONE\nEND:VCALENDAR\n"
+    )
+    return tzical(StringIO(source)).get()
+
+assert zone("+0000", "-0500") is not None
+for malformed_from, malformed_to in (
+    ("--500", "-0500"),
+    ("+0000", "-05 0"),
+    ("+٠٥٠٠", "-0500"),
+):
+    try:
+        zone(malformed_from, malformed_to)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid calendar timezone offset accepted")
+"""
+
 
 @dataclass(frozen=True)
 class RepositoryTask:
@@ -448,6 +549,35 @@ class RepositoryTask:
 
 
 TASKS = {
+    "dateutil-strict-numeric-fields": RepositoryTask(
+        source="dateutil/dateutil",
+        upstream="https://github.com/dateutil/dateutil.git",
+        base_sha="6e1864c7c309f4d905e8b337864ca8b5d3ff9d34",
+        reference_fix_sha="6f1362220007b9d868638630043636e0f3285a3f",
+        editable=frozenset({
+            "src/dateutil/parser/isoparser.py",
+            "src/dateutil/tz/tz.py",
+        }),
+        visible_script="qa_visible.py",
+        visible_source=DATEUTIL_NUMERIC_VISIBLE,
+        hidden_source=DATEUTIL_NUMERIC_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Repair a historical strict-numeric-input bug in this pinned "
+            "python-dateutil repository. ISO-8601 date/time parsing uses "
+            "int() on fixed-width fields, which incorrectly accepts signs, "
+            "underscores, whitespace and truncated ASCII digit fields. "
+            "The calendar tzical parser similarly permits malformed "
+            "TZOFFSETFROM/TZOFFSETTO values, including non-ASCII digits. "
+            "Require exact-width ASCII decimal digits where applicable "
+            "without changing valid ISO week/ordinal dates, valid date-time "
+            "offsets, valid calendar timezone values or public APIs. "
+            "Inspect qa_visible.py and both implicated modules; edit ONLY "
+            "src/dateutil/parser/isoparser.py and src/dateutil/tz/tz.py, "
+            "then run exactly python3 -B qa_visible.py with run_command. "
+            "No other commands are authorized. Do not edit tests or metadata."
+        ),
+    ),
     "click-resource-exception": RepositoryTask(
         source="pallets/click",
         upstream="https://github.com/pallets/click.git",

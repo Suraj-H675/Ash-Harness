@@ -162,6 +162,11 @@ def test_size_telemetry_excludes_tool_payload_and_private_file_path() -> None:
     ("task_id", "upstream", "editable"),
     [
         (
+            "dateutil-strict-numeric-fields",
+            "https://github.com/dateutil/dateutil.git",
+            {"src/dateutil/parser/isoparser.py", "src/dateutil/tz/tz.py"},
+        ),
+        (
             "click-resource-exception",
             "https://github.com/pallets/click.git",
             {"src/click/core.py"},
