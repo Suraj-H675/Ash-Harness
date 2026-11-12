@@ -1,5 +1,9 @@
 # Coding-task evaluation (local, free remote, or authorized ChatGPT plan)
 
+For the cross-scenario decision process, existing-task inventory and the
+separation between synthetic smoke tasks and pinned real-repository tasks,
+see [Coding evaluation portfolio](../benchmarks/CODING_PORTFOLIO.md).
+
 `devtools/coding_benchmark.py` is a small, repeatable real-model evaluation of
 Ash's **actual one-shot CLI**, not a mocked provider test. It uses a local
 loopback model by default; explicitly opted-in zero-cost OpenRouter and

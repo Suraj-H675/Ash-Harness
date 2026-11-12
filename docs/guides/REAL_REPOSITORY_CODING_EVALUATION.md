@@ -1,5 +1,8 @@
 # Real-repository coding evaluation
 
+For the current cross-scenario inventory, stopping rules, and evaluation
+priorities, see [Coding evaluation portfolio](../benchmarks/CODING_PORTFOLIO.md).
+
 This is a **curated historical-regression replay** on publicly available,
 pre-existing source repositories, not a synthetic project and not yet a
 SWE-bench or Codex/Claude Code head-to-head comparison. It exercises Ash's
