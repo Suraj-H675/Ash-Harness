@@ -153,6 +153,14 @@ MAX_RECOVERY_TOOL_OUTPUT_PREVIEW_BYTES = 2 * 1024 * 1024
 MAX_RECOVERY_TOOL_ERROR_PREVIEW_BYTES = 256 * 1024
 MAX_RECOVERY_AUDIT_OUTPUT_PREVIEW_BYTES = 64 * 1024
 MAX_RECOVERY_ARGUMENT_PREVIEW_BYTES = 64 * 1024
+# An automatic context handoff may repeat the original *coding objective*,
+# never known external commands or opaque plugin effects. Direct workspace
+# edits remain under the existing file, policy, checkpoint and audit guards.
+AUTOMATIC_CONTEXT_HANDOFF_TOOLS = frozenset({
+    "read_file", "search_text", "list_dir", "glob_files", "git_status", "git_diff",
+    "write_file", "replace_file_content", "replace_file_edits", "whole_edit",
+    "apply_patch",
+})
 
 
 class SessionStorageError(RuntimeError):
@@ -5567,6 +5575,7 @@ class SessionStore:
         branch_summary: str = "",
         _child_session_id: str | None = None,
         _restart_handoff: str | None = None,
+        _automatic_context_handoff: bool = False,
         _native_checkpoint: list[dict[str, Any]] | None = None,
         _expected_parent_messages: int | None = None,
         _expected_parent_revision: str | None = None,
@@ -5579,6 +5588,8 @@ class SessionStore:
         checkpoint_metadata: str | None = None
         if _restart_handoff is not None and _native_checkpoint is not None:
             raise ValueError("a restart cannot combine native and local checkpoints")
+        if _automatic_context_handoff and _restart_handoff is None:
+            raise ValueError("automatic context handoff requires a restart handoff")
         if _native_checkpoint is not None:
             from ash.providers.messages import CanonicalMessage
 
@@ -5698,6 +5709,32 @@ class SessionStore:
                             "resolve interrupted turns, ambiguous actions and "
                             "external tasks before starting a fresh reasoning window"
                         )
+                    if _automatic_context_handoff:
+                        # Conservative scope: only one interrupted coding
+                        # turn in this fresh session, with no external or
+                        # unknown tool dispatch. Any command execution (even
+                        # a successful one) requires explicit human handoff.
+                        turn_rows = conn.execute(
+                            "SELECT status FROM turn_journal WHERE session_id = ?",
+                            (session_id,),
+                        ).fetchall()
+                        unsafe_call = conn.execute(
+                            "SELECT 1 FROM tool_calls WHERE session_id = ? "
+                            "AND (tool_name NOT IN ("
+                            + ",".join("?" for _ in AUTOMATIC_CONTEXT_HANDOFF_TOOLS)
+                            + ") OR success IS NOT 1) LIMIT 1",
+                            (session_id, *sorted(AUTOMATIC_CONTEXT_HANDOFF_TOOLS)),
+                        ).fetchone()
+                        if (
+                            len(turn_rows) != 1
+                            or turn_rows[0]["status"] != "interrupted"
+                            or unsafe_call is not None
+                        ):
+                            raise SessionForkConflictError(
+                                "automatic context handoff requires one "
+                                "reconciled coding turn without external "
+                                "actions or unknown tool outcomes"
+                            )
                 total_count, retained, removed = _message_boundary_rows(
                     conn,
                     session_id,
@@ -5865,6 +5902,7 @@ class SessionStore:
         *,
         expected_project_path: str | Path,
         user_handoff: str,
+        automatic: bool = False,
     ) -> Session:
         """Explicit fresh reasoning window with ancestry, without tool replay.
 
@@ -5879,6 +5917,7 @@ class SessionStore:
             branch_name="Context restart",
             branch_summary="Fresh reasoning window; original session preserved",
             _restart_handoff=user_handoff,
+            _automatic_context_handoff=automatic,
         )
 
     def install_native_context_checkpoint(

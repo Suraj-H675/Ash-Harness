@@ -3138,6 +3138,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         parser.error(f"unrecognized arguments: {' '.join(unknown_args)}")
     if args.json_schema is not None and args.prompt is None:
         parser.error("--json-schema requires --prompt")
+    if args.context_continuations and args.prompt is None:
+        parser.error("--context-continuations requires a one-shot prompt")
+    if args.context_continuations and args.json_schema is not None:
+        parser.error("--context-continuations cannot be used with --json-schema")
     early_event_output = (
         args.prompt is not None
         and args.output_format in {"json", "stream-json"}
@@ -5299,6 +5303,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if startup_selection.cancelled:
             return 0
         startup_session_id = startup_selection.session_id
+    if args.context_continuations and startup_session_id is not None:
+        parser.error("--context-continuations requires a new one-shot session")
     if args.prompt is not None:
         from ash.ui.headless import HeadlessUI
 
@@ -5342,6 +5348,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     ui=ui,
                     json_schema_path=args.json_schema,
                     reasoning_effort=args.reasoning_effort,
+                    context_continuations=args.context_continuations,
                 )
             )
         except KeyboardInterrupt:
@@ -5372,6 +5379,7 @@ async def _headless_with_sigterm_cleanup(
     ui: Any,
     json_schema_path: Path | None = None,
     reasoning_effort: str | None = None,
+    context_continuations: int = 0,
 ) -> int:
     return await _with_sigterm_cleanup(
         lambda: _bootstrap_and_headless(
@@ -5382,6 +5390,7 @@ async def _headless_with_sigterm_cleanup(
             ui=ui,
             json_schema_path=json_schema_path,
             reasoning_effort=reasoning_effort,
+            context_continuations=context_continuations,
         )
     )
 
@@ -5487,6 +5496,7 @@ async def _bootstrap_and_headless(
     ui: Any,
     json_schema_path: Path | None = None,
     reasoning_effort: str | None = None,
+    context_continuations: int = 0,
 ) -> int:
     from ash.exceptions import classify_exception, format_error
     from ash.commands.attachments import PreparedAttachments, prepare_file_mentions
@@ -5498,6 +5508,8 @@ async def _bootstrap_and_headless(
     try:
         if reasoning_effort is not None:
             loop.set_reasoning_effort(reasoning_effort)
+        if context_continuations and session_id is not None:
+            raise ValueError("automatic context continuation requires a new session")
         session = await loop.start_session(session_id)
         # A turn may recheck recovery state and clear this summary. Preserve the
         # startup finding for the one-shot operator result.
@@ -5546,6 +5558,7 @@ async def _bootstrap_and_headless(
             ui.emit_event({"type": "session.recovery.attention", **recovery_attention})
         safety_guard = getattr(loop, "safety_guard", None)
         provider = getattr(loop, "provider", None)
+        original_user_prompt = prompt
         prepared = (
             prepare_file_mentions(
                 prompt,
@@ -5569,18 +5582,41 @@ async def _bootstrap_and_headless(
                 f"{json.dumps(schema, ensure_ascii=False)}"
             )
         user_metadata = prepared.message_metadata()
-        response = (
-            await loop.run_turn(prompt)
-            if user_metadata is None
-            else await loop.run_turn(prompt, user_metadata=user_metadata)
-        )
+        completed_restarts = 0
+        final_session_id = session.session_id
+        if context_continuations:
+            if (
+                json_schema_path is not None
+                or user_metadata is not None
+                or prompt != original_user_prompt
+            ):
+                raise ValueError(
+                    "automatic context continuation does not support "
+                    "attachments or structured output"
+                )
+            from ash.core.context_continuation import run_with_context_continuation
+
+            continued = await run_with_context_continuation(
+                loop, prompt, max_continuations=context_continuations
+            )
+            response = continued.response
+            completed_restarts = continued.context_continuations
+            final_session_id = continued.session_id
+        else:
+            response = (
+                await loop.run_turn(prompt)
+                if user_metadata is None
+                else await loop.run_turn(prompt, user_metadata=user_metadata)
+            )
         payload = {
             "response": response,
-            "session_id": session.session_id,
+            "session_id": final_session_id,
             "model": loop.active_model_id,
             "context_tokens": loop._last_context_tokens,
             "usage": loop.last_turn_usage,
         }
+        if context_continuations:
+            payload["context_continuations"] = completed_restarts
         recovery = startup_recovery or (
             loop.recovery_summary if loop.recovered_turns else None
         )

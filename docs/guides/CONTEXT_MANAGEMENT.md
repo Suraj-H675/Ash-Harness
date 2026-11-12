@@ -111,3 +111,30 @@ a model-generated completion claim, and the user must verify partial edits.
 This is **manual recovery**, not transparent automatic continuation or a
 substitute for long-task context management. `/compact-native` remains
 unavailable on the ChatGPT-plan route until the native contract is verified.
+
+### Opt-in one-shot continuation
+
+For a **new** non-interactive coding session, `ash -p "..." \
+--context-continuations 1` authorizes at most one extra reasoning window
+after an opaque reasoning-state context overflow. `2` allows two; the default
+is **0 (disabled)**. This is not enabled for resumed sessions, attachments,
+or structured JSON-schema outputs.
+
+The original user task is preserved verbatim in a bounded handoff. Ash first
+closes and reconciles the interrupted turn, verifies its durable recovery
+record, and forks a fresh context without importing any reasoning items,
+tool results, approvals or tool dispatches. Automatic continuation is
+**refused** if the previous turn dispatched any shell command or other
+external tool, even when its result is known, or if it has ambiguous actions,
+unfinished edits or unverified external tasks. Only known-successful local
+read/search and direct workspace edit tools may precede an automatic handoff.
+The new turn is instructed to inspect the actual workspace state and verify
+the task before reporting completion; any tool execution in the new turn
+still passes normal permissions, sandbox and audit checks.
+
+This option does not resolve context limits automatically in every case. It
+does not extend the outer process deadline, retries neither provider outages
+nor failed tests, and stops after the configured number of restarts. A
+failure can leave partial edits in the workspace; always inspect the
+recorded session lineage and working tree. It must not be interpreted as an
+exactly-once guarantee for arbitrary external actions.

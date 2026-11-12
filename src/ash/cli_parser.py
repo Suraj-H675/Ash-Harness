@@ -1577,6 +1577,17 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         help="Set a model-supported reasoning effort for this one-shot prompt.",
     )
     parser.add_argument(
+        "--context-continuations",
+        type=int,
+        choices=[0, 1, 2],
+        default=0,
+        help=(
+            "For a fresh one-shot coding task, allow up to N safe reasoning-window "
+            "restarts after opaque context overflow (default 0). Refuses prior "
+            "external actions, ambiguous effects and attachments."
+        ),
+    )
+    parser.add_argument(
         "--json-schema",
         type=Path,
         default=None,

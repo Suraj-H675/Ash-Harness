@@ -600,6 +600,65 @@ def _stop_evaluation_child(child: subprocess.Popen[bytes]) -> int:
     return child.wait(timeout=5)
 
 
+def collect_coding_session_receipts(
+    store: SessionStore, workspace: Path,
+) -> dict[str, object]:
+    """Aggregate each fresh task's parent and context-restart child safely."""
+    sessions = sorted(
+        store.list_sessions(project_path=str(workspace)),
+        key=lambda item: (item.created_at, item.session_id),
+    )
+    calls: list[dict[str, object]] = []
+    usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    events = []
+    terminals: list[str] = []
+    audit_ok = bool(sessions)
+    lineage_ok = bool(sessions)
+    previous_session_id: str | None = None
+    for summary in sessions:
+        session = store.load_session(summary.session_id)
+        if previous_session_id is None:
+            lineage_ok = lineage_ok and session.parent_session_id is None
+        else:
+            lineage_ok = (
+                lineage_ok and session.parent_session_id == previous_session_id
+                and session.fork_message_count == 0
+            )
+        previous_session_id = session.session_id
+        calls.extend({
+            "tool": entry.tool_name,
+            "success": entry.success is True,
+            "executed": entry.executed,
+            "approved": entry.approved,
+            "error": (entry.error or "")[:180],
+            "command": entry.arguments.get("command_line", "")
+            if entry.tool_name == "run_command"
+            else "",
+            "size_metrics": tool_call_size_metrics(entry),
+        } for entry in session.tool_calls)
+        audit_ok = audit_ok and not store.verify_audit_log(session.session_id)
+        used = store.get_session_usage(session.session_id)
+        usage["prompt_tokens"] += used.prompt_tokens
+        usage["completion_tokens"] += used.completion_tokens
+        events.extend(store.list_runtime_events(session.session_id, limit=10_000))
+    events.sort(key=lambda entry: entry.sequence)
+    terminals = [
+        str(row.event.get("type"))
+        for row in events
+        if row.event.get("type") in {"turn.completed", "turn.cancelled", "turn.error"}
+    ]
+    return {
+        "calls": calls,
+        "audit_ok": audit_ok,
+        "lineage_ok": lineage_ok,
+        "session_count": len(sessions),
+        "context_continuations": max(0, len(sessions) - 1),
+        "usage": usage,
+        "events": summarize_operational_events(events),
+        "terminals": terminals,
+    }
+
+
 def run_task(
     task_name: str,
     *,
@@ -611,6 +670,7 @@ def run_task(
     turn_token_budget: int,
     reasoning_effort: str | None = None,
     fair_prompt: bool = False,
+    context_continuations: int = 0,
 ) -> dict[str, object]:
     task = TASKS[task_name]
     user_prompt = shared_user_prompt(task) if fair_prompt else task.prompt
@@ -703,6 +763,8 @@ def run_task(
         ]
         if reasoning_effort is not None:
             argv.extend(["--reasoning-effort", reasoning_effort])
+        if context_continuations:
+            argv.extend(["--context-continuations", str(context_continuations)])
         cli_started = time.monotonic()
         with (
             (evidence / "ash.stdout").open("wb") as stdout,
@@ -731,42 +793,12 @@ def run_task(
         protected, changed = check_edits(original, updated, task.editable)
         oracle = check_oracles(workspace, task)
         store = SessionStore(db / "sessions.db")
-        sessions = store.list_sessions(project_path=str(workspace))
-        calls: list[dict[str, object]] = []
-        audit_ok = False
-        event_stats = summarize_operational_events([])
-        usage: dict[str, int] = {}
-        terminals: list[str] = []
-        if sessions:
-            session = store.load_session(sessions[0].session_id)
-            calls = [
-                {
-                    "tool": entry.tool_name,
-                    "success": entry.error is None,
-                    "executed": entry.executed,
-                    "approved": entry.approved,
-                    "error": (entry.error or "")[:180],
-                    "command": entry.arguments.get("command_line", "")
-                    if entry.tool_name == "run_command"
-                    else "",
-                    "size_metrics": tool_call_size_metrics(entry),
-                }
-                for entry in session.tool_calls
-            ]
-            audit_ok = not store.verify_audit_log(session.session_id)
-            used = store.get_session_usage(session.session_id)
-            usage = {
-                "prompt_tokens": used.prompt_tokens,
-                "completion_tokens": used.completion_tokens,
-            }
-            events = store.list_runtime_events(session.session_id, limit=10_000)
-            event_stats = summarize_operational_events(events)
-            terminals = [
-                str(row.event.get("type"))
-                for row in events
-                if row.event.get("type")
-                in {"turn.completed", "turn.cancelled", "turn.error"}
-            ]
+        aggregated = collect_coding_session_receipts(store, workspace)
+        calls = aggregated["calls"]
+        audit_ok = aggregated["audit_ok"] and aggregated["lineage_ok"]
+        event_stats = aggregated["events"]
+        usage = aggregated["usage"]
+        terminals = aggregated["terminals"]
         required = any(
             call["tool"] in EDIT_TOOL_NAMES and call["success"] and call["executed"]
             for call in calls
@@ -800,6 +832,9 @@ def run_task(
             "turn_token_budget": turn_token_budget,
             "iteration_limit": CHATGPT_TURN_ITERATIONS,
             "reasoning_effort": reasoning_effort,
+            "requested_context_continuations": context_continuations,
+            "context_continuations": aggregated["context_continuations"],
+            "session_count": aggregated["session_count"],
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "cli_seconds": cli_seconds,
             "exit_code": exit_code,
@@ -863,6 +898,10 @@ def main() -> int:
         action="store_true",
         help="Use the exact model-neutral user task shared with plain Codex",
     )
+    parser.add_argument(
+        "--context-continuations", type=int, default=0, choices=(0, 1, 2),
+        help="Opt in to bounded safe Ash reasoning-window restart on overflow",
+    )
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.chatgpt_model):
         parser.error("invalid exact ChatGPT model ID")
@@ -901,6 +940,7 @@ def main() -> int:
         turn_token_budget=args.turn_token_budget,
         reasoning_effort=args.reasoning_effort,
         fair_prompt=args.fair_prompt,
+        context_continuations=args.context_continuations,
     )
     print(
         json.dumps(

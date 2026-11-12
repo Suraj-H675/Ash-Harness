@@ -66,6 +66,66 @@ def test_finished_repository_child_is_never_signalled(
     assert bench._stop_evaluation_child(Finished()) == 0
 
 
+def test_coding_receipt_aggregates_verified_restarted_session_lineage(
+    tmp_path: Path,
+) -> None:
+    from ash.core.checkpoints import recover_interrupted_turns
+    from ash.core.session import SessionStore
+    from ash.safety.guard import SafetyGuard
+
+    store = SessionStore(tmp_path / "paired.db")
+    parent = store.create_session(str(tmp_path), model="openai/gpt-6-luna")
+    store.start_turn(parent.session_id, "original", "fix two modules")
+    store.save_tool_call(
+        parent.session_id,
+        ToolCallRecord(
+            call_id="edited", tool_name="replace_file_content",
+            arguments={"file_path": "module.py"}, approved=True,
+            dispatched=True, executed=True, success=True,
+            result="edited", error=None,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="original",
+    )
+    store.save_turn_usage_snapshot(
+        "original", {"prompt_tokens": 100, "completion_tokens": 10}
+    )
+    store.interrupt_turn("original")
+    recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), parent.session_id,
+        include_quiescent_interrupted=True,
+    )
+    child = store.restart_context_session(
+        parent.session_id, expected_project_path=tmp_path,
+        user_handoff="Continue the two-file repair", automatic=True,
+    )
+    store.start_turn(child.session_id, "continuation", "verify existing edit")
+    store.save_tool_call(
+        child.session_id,
+        ToolCallRecord(
+            call_id="tested", tool_name="run_command",
+            arguments={"command_line": "python qa_visible.py"}, approved=True,
+            dispatched=True, executed=True, success=True,
+            result="passed", error=None,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="continuation",
+    )
+    store.save_turn_usage_snapshot(
+        "continuation", {"prompt_tokens": 60, "completion_tokens": 15}
+    )
+    store.complete_turn("continuation")
+    summary = bench.collect_coding_session_receipts(store, tmp_path)
+    assert summary["audit_ok"] is True
+    assert summary["lineage_ok"] is True
+    assert summary["context_continuations"] == 1
+    assert summary["session_count"] == 2
+    assert [entry["tool"] for entry in summary["calls"]] == [
+        "replace_file_content", "run_command"
+    ]
+    assert summary["usage"] == {"prompt_tokens": 160, "completion_tokens": 25}
+
+
 def test_size_telemetry_excludes_tool_payload_and_private_file_path() -> None:
     record = ToolCallRecord(
         call_id="read-1",
