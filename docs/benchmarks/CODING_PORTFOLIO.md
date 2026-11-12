@@ -18,7 +18,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R3 | `urllib3-proxy-redirect` | Pinned real repo | Coordinated two-file redirect/security fix | **Scenario 04: PARKED, unresolved**; prior matched pair: Ash fail / Codex pass (one sample) |
 | R4 | `urllib3-url-auth-feature` | Pinned real repo | New public API / URL parsing edge cases | **Initial paired pass for both engines**; one sample, no reliability claim |
 | R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Initial pair: Ash fail / Codex pass**; Ash stopped at safe context limit after an incomplete edit |
-| R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Oracle-verified** on both pins; paired agent outcome pending |
+| R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Initial pair: Ash timeout / Codex pass**; no Ash source edit or verification |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -68,8 +68,23 @@ tests/metadata, which the agent cannot modify). Independently authored
 public-API checks reject non-digit, partial and signed ISO fields and
 invalid `tzical` offsets, while preserving legitimate dates and timezones.
 Both visible and hidden tests were **red on the original and green on the
-fix**. Both source modules are required to change. This is an oracle-valid
-evaluation, not a coding-agent success claim.
+fix**. Both source modules are required to change. A single frozen sequential
+pair at GPT-6 Luna xhigh with 32,768 requested context and 170s per engine
+yielded **Ash fail** (170.22s, no edits, no required command, cancelled during
+a model request) and **plain Codex pass** (151.24s, both modules changed,
+required test executed, visible and hidden oracles passed). The paired
+comparison receipt validated common pins and task/oracle hashes. Ash used
+approximately 151.5s in an unsuccessful final model request, rather than
+producing a patch. This is one observation; it does not establish that the
+cause was an upstream outage or reliably distinguish model generation latency
+from upstream transport latency.
+
+**Emerging patterns, not yet causal conclusions:** R3 exposed difficulty
+completing a coordinated two-file repair despite some correct graded code;
+R5 ended with a partial repair and a protected opaque-context limit; R6
+spent its deadline waiting for a model request before editing. These are
+different failure mechanisms. Do not treat them as interchangeable evidence
+for a single prompt/tool change, or average them into a stable success rate.
 
 ## Evaluation and prioritization contract
 
@@ -111,12 +126,14 @@ evaluation, not a coding-agent success claim.
 
 ## Next portfolio slice
 
-**Now:** no Scenario 04 rerun and no immediate R4/R5 retry. R6 adds a fourth
-upstream repository and an independent **two-module** validation bug. Run one
-frozen sequential Ash/plain-Codex pair, classify the result without an
-immediate fixture-specific change, and then rotate to the next portfolio
-slice. Use repetitions only for a predeclared variance question, not to
-reverse a disappointing result.
+**Now:** no Scenario 04 rerun and no immediate R4/R5/R6 retry. R6 adds a
+fourth upstream repository and an independently graded **two-module**
+validation bug. **Next, use existing receipts to separate provider/model
+latency, context exhaustion, and editing/verification failures**, and add a
+different real-repository case with an independently verified oracle before
+making another broad harness change. Prefer a genuinely different developer
+workflow such as API compatibility or refactoring. Use repetitions only for
+a predeclared variance question, not to reverse a disappointing result.
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate
