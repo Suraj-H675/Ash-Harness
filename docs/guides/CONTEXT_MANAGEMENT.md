@@ -102,6 +102,14 @@ deferred discovery is active, Ash also exposes the existing read-only
 `git_diff` schema directly. The generated system prompt includes concise
 coding guidance for focused inspection, coordinated edits and authorized
 testing. This does not grant shell access or alter any tool permissions.
+Ordinary `read_file` calls now default to **8,192 source characters** instead
+of 32,768. This reduces the amount of source content retained in subsequent
+model requests, particularly when opaque provider reasoning state prevents
+history compaction. The result still includes numbered lines, file SHA-256,
+encoding and exact line/column continuation. Models and users may explicitly
+request larger `max_chars` values (up to the existing hard limit) when a
+fuller inspection is actually necessary. This is a context-economy default,
+not a proven increase in independent coding benchmark pass rates.
 The `read_files` tool remains discoverable through `search_tools` at every
 context size rather than adding another default tool schema. It groups up to
 four focused file ranges into

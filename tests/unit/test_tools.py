@@ -24,6 +24,7 @@ from ash.tools.command import (
 from ash.tools.base import BaseTool, ToolExecutionOutcome, ToolResult
 from ash.tools.filesystem import (
     BINARY_FILE_ERROR,
+    DEFAULT_MAX_READ_CHARS,
     EXISTS_ERROR,
     ReadFileTool,
     ReadFilesTool,
@@ -320,6 +321,41 @@ async def test_read_file_returns_numbered_line_slice(
 
 
 @pytest.mark.asyncio
+async def test_default_read_budget_is_small_but_full_file_access_remains_explicit(
+    project_root: Path, guard: SafetyGuard,
+) -> None:
+    # Large source reads are especially costly when an opaque provider state
+    # prevents history compaction. Keep the normal inspection bounded without
+    # removing the ability to inspect an exact larger range on demand.
+    assert DEFAULT_MAX_READ_CHARS == 8_192
+    content = "# " + "x" * 20_000
+    path = project_root / "module.py"
+    path.write_text(content + "\n")
+    reader = ReadFileTool(guard)
+
+    first = await reader.run(file_path="module.py")
+    assert first.success and first.truncated
+    assert "source_chars_limit=8192" in first.output
+    assert "next_start_line=1; next_start_column=8193" in first.output
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert f"sha256={digest}" in first.output
+
+    # An explicit larger read is not silently reduced to the new default.
+    explicit = await reader.run(file_path="module.py", max_chars=32_768)
+    assert explicit.success and not explicit.truncated
+    assert f"1: {content}" in explicit.output
+    assert f"sha256={digest}" in explicit.output
+
+    # Exact cursor pagination reconstructs content without losing characters.
+    second = await reader.run(
+        file_path="module.py", start_line=1, end_line=1,
+        start_column=8_193, max_chars=32_768, expected_sha256=digest,
+    )
+    assert second.success and not second.truncated
+    assert content[8_192:] in second.output
+
+
+@pytest.mark.asyncio
 async def test_read_file_policy_denial_is_a_completed_refusal(
     project_root: Path, guard: SafetyGuard
 ) -> None:
@@ -454,9 +490,9 @@ async def test_read_file_paginates_a_single_long_code_line_without_losing_text(
 
     first = await reader.run(file_path="bundle.js")
     assert first.success and first.truncated
-    assert len(first.output) < 35_000
-    assert "next_start_line=1; next_start_column=" in first.output
-    assert first.token_count > 8_000
+    assert len(first.output) < 10_000
+    assert "next_start_line=1; next_start_column=8193" in first.output
+    assert 1_500 < first.token_count < 5_000
 
     parts: list[str] = []
     column = 1

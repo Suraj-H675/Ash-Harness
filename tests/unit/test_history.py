@@ -110,6 +110,61 @@ def test_opaque_provider_replay_state_preserves_unmodified_prefix() -> None:
     assert json.dumps(messages, sort_keys=True) == original
 
 
+@pytest.mark.asyncio
+async def test_focused_default_reads_preserve_an_opaque_replay_history_budget(
+    tmp_path,
+) -> None:
+    """Reduce replay-prefix growth *before* a compactor would be forbidden."""
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.filesystem import ReadFileTool
+
+    reader = ReadFileTool(SafetyGuard(tmp_path))
+    for name in ("module_a.py", "module_b.py"):
+        (tmp_path / name).write_text("# " + "x" * 20_000 + "\n")
+
+    async def history(explicit_large: bool) -> list[dict]:
+        messages = [
+            {"role": "system", "content": "Trusted instructions"},
+            {"role": "user", "content": "Inspect the relevant source"},
+        ]
+        for index, name in enumerate(("module_a.py", "module_b.py"), 1):
+            result = await reader.run(
+                file_path=name,
+                **({"max_chars": 32_768} if explicit_large else {}),
+            )
+            assert result.success
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "provider_state": [{"type": "reasoning", "id": f"rs-{index}",
+                                        "encrypted_content": "OPAQUE_STATE"}],
+                },
+                {"role": "tool", "tool_call_id": f"read-{index}",
+                 "content": result.output},
+            ])
+        return messages
+
+    compact = HistoryCompactor(
+        max_context_tokens=8_000, completion_reserve=500,
+        input_token_limit=6_500,
+    )
+    def count_chars(text: str) -> int:
+        return max(1, len(text) // 4)
+    large = await history(explicit_large=True)
+    with pytest.raises(ContextBudgetExceededError) as failure:
+        compact.compact(large, count_tokens=count_chars, protected_from_index=1)
+    assert failure.value.provider_replay_state_preserved
+
+    focused = await history(explicit_large=False)
+    result = compact.compact(
+        focused, count_tokens=count_chars, protected_from_index=1
+    )
+    assert result.provider_replay_state_preserved
+    assert result.messages == focused
+    assert result.estimated_tokens <= compact.input_limit
+
+
 def test_opaque_provider_replay_state_refuses_local_compaction_when_full() -> None:
     messages = [
         {"role": "system", "content": "Policy"},
