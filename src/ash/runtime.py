@@ -150,6 +150,7 @@ def build_tools(
     from ash.tools.delegate import DelegateAgentsTool
     from ash.tools.filesystem import (
         ReadFileTool,
+        ReadFilesTool,
         ReplaceFileContentTool,
         ReplaceFileEditsTool,
         WholeEditTool,
@@ -201,6 +202,7 @@ def build_tools(
     )
     tools: list[BaseTool] = [
         ReadFileTool(safety_guard),
+        ReadFilesTool(safety_guard),
         WriteFileTool(safety_guard),
         ReplaceFileContentTool(safety_guard),
         ReplaceFileEditsTool(safety_guard),

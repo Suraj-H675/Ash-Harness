@@ -157,7 +157,7 @@ MAX_RECOVERY_ARGUMENT_PREVIEW_BYTES = 64 * 1024
 # never known external commands or opaque plugin effects. Direct workspace
 # edits remain under the existing file, policy, checkpoint and audit guards.
 AUTOMATIC_CONTEXT_HANDOFF_TOOLS = frozenset({
-    "read_file", "search_text", "list_dir", "glob_files", "git_status", "git_diff",
+    "read_file", "read_files", "search_text", "list_dir", "glob_files", "git_status", "git_diff",
     "write_file", "replace_file_content", "replace_file_edits", "whole_edit",
     "apply_patch",
 })

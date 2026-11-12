@@ -195,6 +195,51 @@ def test_plan_mode_cannot_be_overridden_by_allow_rule() -> None:
     assert decision.reason == "plan mode is read-only"
 
 
+def test_bounded_batch_read_keeps_read_only_policy_and_explicit_denials() -> None:
+    arguments = {"files": [{"file_path": "src/a.py"}, {"file_path": "src/b.py"}]}
+    assert PermissionPolicy("plan").evaluate("read_files", arguments).action == (
+        PolicyAction.ALLOW
+    )
+    deny = PermissionRule.create(RuleEffect.DENY, "read_files")
+    assert PermissionPolicy(
+        "auto_edit", persistent_rules=[deny]
+    ).evaluate("read_files", arguments).action == PolicyAction.DENY
+    assert PermissionPolicy("dry_run").evaluate(
+        "read_files", arguments
+    ).action == PolicyAction.DENY
+
+
+def test_batch_read_inherits_per_file_scoped_deny_and_ask_rules() -> None:
+    arguments = {"files": [
+        {"file_path": "src/public.py"},
+        {"file_path": "secrets/private.py"},
+    ]}
+    ask_public = PermissionRule.create(
+        RuleEffect.ASK, "read_file",
+        [ArgumentMatcher("file_path", MatchOperator.EXACT, "src/public.py")],
+    )
+    deny_private = PermissionRule.create(
+        RuleEffect.DENY, "read_file",
+        [ArgumentMatcher("file_path", MatchOperator.PREFIX, "secrets/")],
+    )
+    decision = PermissionPolicy(
+        "auto_edit", persistent_rules=[ask_public, deny_private]
+    ).evaluate("read_files", arguments)
+    assert decision.action == PolicyAction.DENY
+    assert decision.rule_id == deny_private.rule_id
+
+    only_ask = PermissionPolicy(
+        "plan", managed_rules=[ask_public]
+    ).evaluate("read_files", arguments)
+    assert only_ask.action == PolicyAction.ASK
+    assert only_ask.rule_id == ask_public.rule_id
+
+    unscoped = PermissionRule.create(RuleEffect.DENY, "read_file")
+    assert PermissionPolicy(
+        "auto_approve", persistent_rules=[unscoped]
+    ).evaluate("read_files", arguments).action == PolicyAction.DENY
+
+
 def test_managed_deny_and_ask_override_lower_rules() -> None:
     managed_deny = PermissionRule.create(RuleEffect.DENY, "run_command")
     managed_ask = PermissionRule.create(RuleEffect.ASK, "read_file")

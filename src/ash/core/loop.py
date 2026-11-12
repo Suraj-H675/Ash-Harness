@@ -5001,10 +5001,10 @@ class AshLoop:
                 # Keep the compact essential catalog for small local models.
                 # Larger effective input windows can afford the dedicated,
                 # read-only Git diff tool without making the model execute a
-                # shell command to inspect its edits. Leave apply_patch
-                # deferred: eager exposure previously regressed local-model
-                # multi-file coding and produced malformed patches in a
-                # higher-context coding trial.
+                # shell command to inspect its edits. Leave apply_patch and
+                # read_files deferred rather than expanding every prompt:
+                # eager patches regressed local-model coding, while initial
+                # batch-read trials did not establish an end-to-end gain.
                 request_budget = self._resolve_request_token_budget()
                 if request_budget is not None and request_budget.input_limit >= 24_576:
                     if "git_diff" in self.tools:
@@ -6853,6 +6853,16 @@ class AshLoop:
                     directory_targets = True
             elif tool_name == "read_file" or tool_name in FILE_WRITE_TOOLS:
                 candidate_paths = self._tool_paths(tool_name, arguments)
+            elif tool_name == "read_files":
+                ranges = arguments.get("files", [])
+                if isinstance(ranges, list):
+                    candidate_paths = {
+                        entry["file_path"]
+                        for entry in ranges
+                        if isinstance(entry, dict)
+                        and isinstance(entry.get("file_path"), str)
+                        and entry["file_path"]
+                    }
             else:
                 continue
             for path in candidate_paths:

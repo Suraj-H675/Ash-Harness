@@ -26,12 +26,139 @@ from ash.tools.filesystem import (
     BINARY_FILE_ERROR,
     EXISTS_ERROR,
     ReadFileTool,
+    ReadFilesTool,
     ReplaceFileContentTool,
     ReplaceFileEditsTool,
     WholeEditTool,
     WriteFileTool,
 )
 from ash.tools.base import count_output_tokens
+
+
+@pytest.mark.asyncio
+async def test_batch_read_preserves_numbered_ranges_and_file_hashes(
+    guard: SafetyGuard, project_root: Path,
+) -> None:
+    (project_root / "left.py").write_text("alpha\nbeta\ngamma\n")
+    (project_root / "right.py").write_text("one\ntwo\nthree\n")
+    tool = ReadFilesTool(guard)
+    result = await tool.run(files=[
+        {"file_path": "left.py", "start_line": 2, "end_line": 3},
+        {"file_path": "right.py", "start_line": 1, "end_line": 2},
+    ])
+    assert result.success and not result.truncated
+    assert "[1/2] left.py" in result.output
+    assert "2: beta" in result.output
+    assert "3: gamma" in result.output
+    assert "[2/2] right.py" in result.output
+    assert "1: one" in result.output
+    assert "2: two" in result.output
+    assert result.output.count("SHA-256") == 2 or result.output.count("sha256") == 2
+    assert tool.execution_contract.parallel_safe
+
+
+@pytest.mark.asyncio
+async def test_batch_read_keeps_normal_per_file_limits_and_truncation(
+    guard: SafetyGuard, project_root: Path,
+) -> None:
+    (project_root / "first.py").write_text("abcdefghij\nmore\n")
+    (project_root / "second.py").write_text("tail\n")
+    result = await ReadFilesTool(guard).run(files=[
+        {"file_path": "first.py", "max_chars": 3},
+        {"file_path": "second.py", "max_chars": 10},
+    ])
+    assert result.success
+    assert result.truncated
+    assert "next_start_line" in result.output
+    assert "[2/2] second.py" in result.output
+    assert "1: tail" in result.output
+
+
+@pytest.mark.asyncio
+async def test_batch_read_isolated_failure_never_leaks_out_of_workspace(
+    guard: SafetyGuard, project_root: Path,
+) -> None:
+    outside = project_root.parent / "outside-private-token.txt"
+    outside.write_text("UNSAFE_SECRET_DO_NOT_DISCLOSE")
+    (project_root / "safe.py").write_text("safe = True\n")
+    (project_root / "alias.py").symlink_to(outside)
+    result = await ReadFilesTool(guard).run(files=[
+        {"file_path": "safe.py"},
+        {"file_path": "alias.py"},
+        {"file_path": "../outside-private-token.txt"},
+    ])
+    assert not result.success
+    assert "1: safe = True" in result.output
+    assert "2 of 3 reads failed" in result.error
+    assert "UNSAFE_SECRET_DO_NOT_DISCLOSE" not in result.output
+    assert "UNSAFE_SECRET_DO_NOT_DISCLOSE" not in result.error
+
+
+@pytest.mark.asyncio
+async def test_batch_read_rejects_stale_hash_without_suppressing_other_reads(
+    guard: SafetyGuard, project_root: Path,
+) -> None:
+    (project_root / "stale.py").write_text("changed\n")
+    (project_root / "current.py").write_text("current\n")
+    result = await ReadFilesTool(guard).run(files=[
+        {"file_path": "stale.py", "expected_sha256": "0" * 64},
+        {"file_path": "current.py"},
+    ])
+    assert not result.success
+    assert "1 of 2 reads failed" in result.error
+    assert "[2/2] current.py" in result.output
+    assert "1: current" in result.output
+
+
+@pytest.mark.asyncio
+async def test_batch_read_rejects_overlarge_sum_without_reading_files(
+    guard: SafetyGuard, project_root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = ReadFilesTool(guard)
+
+    async def unexpected_read(**_kwargs: object) -> ToolResult:
+        raise AssertionError("over-budget batches must not read any files")
+
+    monkeypatch.setattr(tool._reader, "run", unexpected_read)
+    result = await tool.run(files=[
+        {"file_path": f"missing-{index}.py", "max_chars": 8_192}
+        for index in range(3)
+    ])
+    assert not result.success
+    assert "exceed 16384" in result.error
+
+
+@pytest.mark.asyncio
+async def test_batch_read_count_and_per_entry_limits_are_schema_enforced(
+    guard: SafetyGuard,
+) -> None:
+    from pydantic import ValidationError
+
+    tool = ReadFilesTool(guard)
+    with pytest.raises(ValidationError):
+        await tool.run(files=[{"file_path": "x"}] * 5)
+    with pytest.raises(ValidationError):
+        await tool.run(files=[{"file_path": "x", "max_chars": 8_193}])
+    with pytest.raises(ValidationError):
+        await tool.run(files=[])
+
+
+@pytest.mark.asyncio
+async def test_batch_read_output_overrun_fails_closed(
+    guard: SafetyGuard, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = ReadFilesTool(guard)
+
+    async def unexpectedly_large_read(**_kwargs: object) -> ToolResult:
+        return ToolResult(success=True, output="x" * 30_000)
+
+    monkeypatch.setattr(tool._reader, "run", unexpectedly_large_read)
+    result = await tool.run(files=[{"file_path": "foo.py"}])
+    assert not result.success
+    assert result.truncated
+    assert len(result.output) < 1_000
+    assert "omitted" in result.output
+    assert "render limit" in result.error
 
 
 @pytest.fixture

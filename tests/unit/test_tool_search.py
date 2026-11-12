@@ -444,7 +444,15 @@ async def test_real_git_review_tool_is_available_with_large_effective_context(
     assert len(tools) > config.tool_search_threshold
     visible = loop._provider_tools()
     assert {"git_diff", "search_tools"} <= visible.keys()
+    assert "read_files" not in visible
     assert "apply_patch" not in visible
+    discovery = await tools["search_tools"].run(query="read several source files together")
+    assert discovery.success
+    assert any(
+        tool["name"] == "read_files"
+        for tool in json.loads(discovery.output)["tools"]
+    )
+    assert "read_files" in loop._provider_tools()
     schema = loop._tool_schema_payload(visible)
     schemas = {item["function"]["name"]: item for item in schema}
     assert schemas["git_diff"]["function"]["parameters"] == tools[

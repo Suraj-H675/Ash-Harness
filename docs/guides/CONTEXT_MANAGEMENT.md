@@ -59,6 +59,18 @@ deferred discovery is active, Ash also exposes the existing read-only
 `git_diff` schema directly. The generated system prompt includes concise
 coding guidance for focused inspection, coordinated edits and authorized
 testing. This does not grant shell access or alter any tool permissions.
+The `read_files` tool remains discoverable through `search_tools` at every
+context size rather than adding another default tool schema. It groups up to
+four focused file ranges into
+one request, with a 16,384-character combined source cap and the same path,
+binary, SHA-256, encoding and truncation checks as `read_file`. This is a
+convenience for model round trips, not a replacement for focused searching or
+permissioned test execution. An initial large-context multi-file coding trial
+used this tool but did not complete the independent task; eager promotion is
+therefore not treated as a demonstrated coding improvement.
+Batch requests inherit the managed, session and persistent `read_file`
+permission rules for **each** requested path; a path-scoped deny blocks the
+entire batch, and a required approval cannot be bypassed by grouping reads.
 `apply_patch` remains deferred, including on large models; making its schema
 eager previously harmed local-model multi-file trials, and its usefulness as
 a general default has not been established. Models with smaller *actual*

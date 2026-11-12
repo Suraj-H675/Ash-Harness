@@ -29,6 +29,7 @@ class PermissionMode(str, Enum):
 READ_ONLY_TOOLS = frozenset(
     {
         "read_file",
+        "read_files",
         "list_dir",
         "glob_files",
         "search_text",
@@ -185,6 +186,24 @@ class PermissionPolicy:
                 "matched deny rule",
                 deny_rule.rule_id,
             )
+        if tool_name == "read_files":
+            # A grouped read must not bypass the existing user/managed
+            # read_file rules, including path-scoped denials and asks.
+            # Validate the actual individual file requests separately;
+            # malformed batches are rejected by the tool schema downstream.
+            file_requests = arguments.get("files")
+            pending_ask: PolicyDecision | None = None
+            if isinstance(file_requests, list):
+                for item in file_requests:
+                    if not isinstance(item, dict):
+                        continue
+                    decision = self.evaluate("read_file", item)
+                    if decision.action == PolicyAction.DENY:
+                        return decision
+                    if decision.action == PolicyAction.ASK:
+                        pending_ask = decision
+                if pending_ask is not None:
+                    return pending_ask
         if self.mode == PermissionMode.PLAN and not read_only:
             return PolicyDecision(PolicyAction.DENY, "plan mode is read-only")
         ask_rule = self._matching_rule(RuleEffect.ASK, tool_name, arguments)

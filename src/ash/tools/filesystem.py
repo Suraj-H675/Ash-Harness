@@ -32,6 +32,10 @@ BINARY_DETECTION_BYTES = 8192
 DEFAULT_MAX_READ_LINES = 800
 DEFAULT_MAX_READ_CHARS = 32_768
 HARD_MAX_READ_CHARS = 131_072
+MAX_BATCH_READ_FILES = 4
+MAX_BATCH_READ_SOURCE_CHARS = 16_384
+MAX_BATCH_READ_ENTRY_CHARS = 8_192
+MAX_BATCH_READ_RENDER_CHARS = 24_576
 MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024
 MAX_TEXT_ARGUMENT_CHARS = 8 * 1024 * 1024
 BINARY_FILE_ERROR = (
@@ -99,6 +103,33 @@ class ReadFileArgs(BaseModel):
         None,
         pattern=r"^[a-fA-F0-9]{64}$",
         description="Reject changed SHA-256.",
+    )
+
+
+class ReadFilesEntry(BaseModel):
+    file_path: str = Field(..., description="Workspace-relative source path.")
+    start_line: int = Field(1, ge=1, description="First line, 1-based.")
+    end_line: int | None = Field(None, ge=1, description="Last line, inclusive.")
+    start_column: int = Field(1, ge=1, description="First-line column, 1-based.")
+    max_chars: int = Field(
+        4_096,
+        ge=1,
+        le=MAX_BATCH_READ_ENTRY_CHARS,
+        description="Maximum source characters for this range.",
+    )
+    expected_sha256: str | None = Field(
+        None,
+        pattern=r"^[a-fA-F0-9]{64}$",
+        description="Optional source SHA-256; reject a stale read.",
+    )
+
+
+class ReadFilesArgs(BaseModel):
+    files: list[ReadFilesEntry] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_BATCH_READ_FILES,
+        description="Up to four exact file ranges; total max_chars at most 16384.",
     )
 
 
@@ -353,6 +384,74 @@ class ReadFileTool(BaseTool):
             output=output,
             token_count=count_output_tokens(output),
             truncated=truncated,
+        )
+
+
+class ReadFilesTool(BaseTool):
+    """Read a handful of independent source ranges in one model round trip.
+
+    All access is delegated to ReadFileTool so the normal anchored-file,
+    stale-hash, encoding, binary and truncation protections remain authoritative.
+    """
+
+    name = "read_files"
+    execution_contract = ToolExecutionContract(parallel_safe=True)
+    description = (
+        "Read up to 4 focused source ranges together, with numbered lines, "
+        "SHA-256 and truncation markers per file. Search for symbols first; "
+        "keep the combined source budget at or below 16384 characters. "
+        "Each read retains normal workspace and stale-file checks."
+    )
+    args_schema = ReadFilesArgs
+
+    def __init__(self, safety_guard: SafetyGuard) -> None:
+        super().__init__(safety_guard)
+        self._reader = ReadFileTool(safety_guard)
+
+    async def run(self, **kwargs: Any) -> ToolResult:
+        args = ReadFilesArgs(**kwargs)
+        if sum(item.max_chars for item in args.files) > MAX_BATCH_READ_SOURCE_CHARS:
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "Combined source-character limits exceed 16384; "
+                    "request shorter ranges or split the batch."
+                ),
+            )
+        outputs: list[str] = []
+        failures = 0
+        truncated = False
+        output_chars = 0
+        omitted = False
+        for index, item in enumerate(args.files, 1):
+            result = await self._reader.run(**item.model_dump())
+            label = f"[{index}/{len(args.files)}] {item.file_path}"
+            content = result.output if result.success else (result.error or "Read failed")
+            rendered = f"{label}\n{content}"
+            if output_chars + len(rendered) + 2 > MAX_BATCH_READ_RENDER_CHARS:
+                outputs.append(
+                    f"[{index}/{len(args.files)}] Remaining batch output omitted; "
+                    "request smaller ranges."
+                )
+                omitted = True
+                break
+            outputs.append(rendered)
+            output_chars += len(rendered) + 2
+            truncated = truncated or result.truncated
+            failures += not result.success
+        output = "\n\n".join(outputs)
+        error = None
+        if failures:
+            error = f"{failures} of {len(args.files)} reads failed."
+        elif omitted:
+            error = "Batch render limit reached; request smaller ranges."
+        return ToolResult(
+            success=failures == 0 and not omitted,
+            output=output,
+            error=error,
+            truncated=truncated or omitted,
+            token_count=count_output_tokens(output),
         )
 
 
