@@ -17,7 +17,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R2 | `urllib3-header-sanitization` | Pinned real repo | One-file security-oriented normalization | Historical paired pilot passed; retain as control |
 | R3 | `urllib3-proxy-redirect` | Pinned real repo | Coordinated two-file redirect/security fix | **Scenario 04: PARKED, unresolved**; prior matched pair: Ash fail / Codex pass (one sample) |
 | R4 | `urllib3-url-auth-feature` | Pinned real repo | New public API / URL parsing edge cases | **Initial paired pass for both engines**; one sample, no reliability claim |
-| R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Oracle-verified**, original fails and upstream fix passes; no agent result yet |
+| R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Initial pair: Ash fail / Codex pass**; Ash stopped at safe context limit after an incomplete edit |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -49,8 +49,15 @@ advantage. Their task difficulty, order and runtime conditions differ.
 `Context.__exit__` fix `555fa9bb37770a6845a98be60b0c84876775552e`
 ([PR #3058](https://github.com/pallets/click/pull/3058)). Independently
 authored, stdlib-only visible and hidden checks both failed on the original
-and passed on the fixed commit. Only `src/click/core.py` is editable. This
-establishes a **real runnable evaluation**, not a coding-agent success claim.
+and passed on the fixed commit. Only `src/click/core.py` is editable. In one
+frozen **sequential** pair at GPT-6 Luna xhigh and 32,768 requested context,
+Ash failed both independent oracles and CLI completion after 59.75s; it made
+one permitted edit but never executed the test, then hit the safe opaque
+context limit. Plain Codex passed both oracles, executed the visible test and
+completed in 55.92s. Comparison receipt validated both task inputs and
+source pins. This **single observation** is a failure classification, not a
+reliability estimate or a timed ranking. The two engines retain different
+command/permission enforcement and system-prompt behavior.
 
 ## Evaluation and prioritization contract
 
@@ -92,11 +99,14 @@ establishes a **real runnable evaluation**, not a coding-agent success claim.
 
 ## Next portfolio slice
 
-**Now:** no new Scenario 04 run and no immediate R4 retry. The initial R4
-matched pair is complete. **R5 Click** adds a third upstream repository with
-an independent resource-lifecycle bug. Grade it through one frozen sequential
-Ash/plain-Codex pair, then rotate to a different case. Use repetitions only
-for a predeclared variance question, not to reverse a disappointing result.
+**Now:** no new Scenario 04 run or immediate R4/R5 retry. R5 Click has been
+independently graded, adding a third repository and a second example of Ash
+encountering protected opaque-context exhaustion in a coding task. Record
+the incomplete edit and missing verification as separate errors; investigate
+context economy only if further held-out tasks corroborate it. **Next, add a
+different real-repository task**, preferably a genuine multi-module refactor
+or dependency/API migration. Use repetitions only for a predeclared variance
+question, not to reverse a disappointing result.
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate
