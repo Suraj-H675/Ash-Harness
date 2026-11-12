@@ -3196,6 +3196,19 @@ def _main_impl(argv: list[str] | None = None) -> int:
             parser.error("--turn-time-budget requires a one-shot prompt")
         if not 30 <= args.turn_time_budget <= 3600:
             parser.error("--turn-time-budget must be between 30 and 3600 seconds")
+    if args.report_after_command is not None:
+        if (
+            args.prompt is None
+            or args.command is not None
+            or args.session is not None
+            or args.continue_session
+            or args.resume is not None
+        ):
+            parser.error("--report-after-command requires a fresh one-shot prompt")
+        if args.json_schema is not None:
+            parser.error("--report-after-command cannot be combined with --json-schema")
+        if not args.report_after_command.strip() or len(args.report_after_command) > 4096:
+            parser.error("--report-after-command must be 1–4096 characters")
 
     if args.command == "crew":
         from ash.commands.crew import run_crew_command
@@ -5310,6 +5323,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         startup_session_id = startup_selection.session_id
     if args.context_continuations and startup_session_id is not None:
         parser.error("--context-continuations requires a new one-shot session")
+    if args.report_after_command is not None and startup_session_id is not None:
+        parser.error("--report-after-command requires a fresh one-shot session")
     if args.prompt is not None:
         from ash.ui.headless import HeadlessUI
 
@@ -5355,6 +5370,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     reasoning_effort=args.reasoning_effort,
                     context_continuations=args.context_continuations,
                     turn_time_budget=args.turn_time_budget,
+                    report_after_command=args.report_after_command,
                 )
             )
         except KeyboardInterrupt:
@@ -5387,6 +5403,7 @@ async def _headless_with_sigterm_cleanup(
     reasoning_effort: str | None = None,
     context_continuations: int = 0,
     turn_time_budget: int | None = None,
+    report_after_command: str | None = None,
 ) -> int:
     return await _with_sigterm_cleanup(
         lambda: _bootstrap_and_headless(
@@ -5399,6 +5416,7 @@ async def _headless_with_sigterm_cleanup(
             reasoning_effort=reasoning_effort,
             context_continuations=context_continuations,
             turn_time_budget=turn_time_budget,
+            report_after_command=report_after_command,
         )
     )
 
@@ -5506,6 +5524,7 @@ async def _bootstrap_and_headless(
     reasoning_effort: str | None = None,
     context_continuations: int = 0,
     turn_time_budget: int | None = None,
+    report_after_command: str | None = None,
 ) -> int:
     from ash.exceptions import classify_exception, format_error
     from ash.commands.attachments import PreparedAttachments, prepare_file_mentions
@@ -5600,38 +5619,42 @@ async def _bootstrap_and_headless(
             if turn_time_budget is not None
             else nullcontext()
         )
-        async with budget_scope:
-            if context_continuations:
-                if (
-                    json_schema_path is not None
-                    or user_metadata is not None
-                    or prompt != original_user_prompt
-                ):
-                    raise ValueError(
-                        "automatic context continuation does not support "
-                        "attachments or structured output"
-                    )
-                from ash.core.context_continuation import run_with_context_continuation
+        loop._owner_report_after_command = report_after_command
+        try:
+            async with budget_scope:
+                if context_continuations:
+                    if (
+                        json_schema_path is not None
+                        or user_metadata is not None
+                        or prompt != original_user_prompt
+                    ):
+                        raise ValueError(
+                            "automatic context continuation does not support "
+                            "attachments or structured output"
+                        )
+                    from ash.core.context_continuation import run_with_context_continuation
 
-                loop._safe_edit_preflight = True
-                try:
-                    continued = await run_with_context_continuation(
-                        loop,
-                        prompt,
-                        max_continuations=context_continuations,
-                        allow_tool_free_finalization=True,
+                    loop._safe_edit_preflight = True
+                    try:
+                        continued = await run_with_context_continuation(
+                            loop,
+                            prompt,
+                            max_continuations=context_continuations,
+                            allow_tool_free_finalization=True,
+                        )
+                    finally:
+                        loop._safe_edit_preflight = False
+                    response = continued.response
+                    completed_restarts = continued.context_continuations
+                    final_session_id = continued.session_id
+                else:
+                    response = (
+                        await loop.run_turn(prompt)
+                        if user_metadata is None
+                        else await loop.run_turn(prompt, user_metadata=user_metadata)
                     )
-                finally:
-                    loop._safe_edit_preflight = False
-                response = continued.response
-                completed_restarts = continued.context_continuations
-                final_session_id = continued.session_id
-            else:
-                response = (
-                    await loop.run_turn(prompt)
-                    if user_metadata is None
-                    else await loop.run_turn(prompt, user_metadata=user_metadata)
-                )
+        finally:
+            loop._owner_report_after_command = None
         payload = {
             "response": response,
             "session_id": final_session_id,
@@ -5648,6 +5671,10 @@ async def _bootstrap_and_headless(
                 )
         if turn_time_budget is not None:
             payload["turn_time_budget_seconds"] = turn_time_budget
+        if report_after_command is not None:
+            payload["owner_command_checkpoint"] = bool(
+                loop._last_turn_owner_checkpoint
+            )
         recovery = startup_recovery or (
             loop.recovery_summary if loop.recovered_turns else None
         )

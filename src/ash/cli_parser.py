@@ -1599,6 +1599,17 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         ),
     )
     parser.add_argument(
+        "--report-after-command",
+        type=str,
+        default=None,
+        metavar="EXACT_COMMAND",
+        help=(
+            "For a fresh one-shot coding turn, finish with an evidence-only "
+            "report immediately after the exact owner-selected command "
+            "succeeds following recorded edits. Never runs the command for you."
+        ),
+    )
+    parser.add_argument(
         "--json-schema",
         type=Path,
         default=None,

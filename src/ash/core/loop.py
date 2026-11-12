@@ -1622,6 +1622,10 @@ class AshLoop:
         )
         self._last_turn_non_goal_tool_calls = 0
         self._safe_edit_preflight = False
+        # CLI-owned, optional verification boundary. Never inferred from
+        # model text, repository files, or a successful arbitrary command.
+        self._owner_report_after_command: str | None = None
+        self._last_turn_owner_checkpoint = False
         self._default_session_permission_mode = PermissionMode(safety_tier)
         self._permission_mode_validator = permission_mode_validator
         self.safety_tier = safety_tier
@@ -2474,6 +2478,7 @@ class AshLoop:
         self._last_estimated_cost_usd = 0.0
         self._last_cost_known = True
         self._last_turn_stop_reason = "completed"
+        self._last_turn_owner_checkpoint = False
         self._last_turn_iterations = 0
         self._last_turn_iteration_limit = self.max_turn_iterations
         self._last_turn_token_budget = int(
@@ -4541,6 +4546,60 @@ class AshLoop:
                 1 for call in tool_calls if call.get("name") != "update_goal"
             )
             self._record_instruction_scope_activity(tool_calls, results)
+
+            # One-shot owners may explicitly designate a command as the
+            # reporting boundary. All tool calls in this *active turn* must
+            # have known successful outcomes, with the exact owner-selected
+            # command executed after the last edit. No further model call or
+            # implicit command replay is necessary at that boundary.
+            checkpoint_command = self._owner_report_after_command
+            if (
+                checkpoint_command
+                and not self.auto_commit
+                and not self.continuous_mode
+                and self.current_goal is None
+                and not self._steering_messages
+                and self.turn_context is not None
+                and not self.session_store.verify_audit_log(session.session_id)
+            ):
+                owner_checkpoint_receipt = self.session_store.owner_command_checkpoint_evidence(
+                    session.session_id,
+                    self.turn_context.turn_id,
+                    expected_project_path=self.project_root,
+                    command_line=checkpoint_command,
+                )
+                if owner_checkpoint_receipt is not None:
+                    edit_count = owner_checkpoint_receipt
+                    final_text = (
+                        "Owner-selected verification checkpoint reached.\n\n"
+                        f"Recorded successful workspace edit calls: {edit_count}.\n"
+                        "The exact owner-selected command was recorded as "
+                        "successfully executed from the project root after those edits.\n\n"
+                        "This is a completion checkpoint selected by the operator, "
+                        "not a claim that all other requirements or hidden checks pass. "
+                        "No additional model request or command was run to produce this report."
+                    )
+                    report_message = Message(
+                        role="assistant",
+                        content=final_text,
+                        timestamp=_utc_now(),
+                        metadata={"owner_command_checkpoint": True},
+                    )
+                    self.session_store.save_message(
+                        session.session_id,
+                        report_message,
+                        turn_id=self.turn_context.turn_id,
+                    )
+                    session.messages.append(report_message)
+                    self._last_turn_owner_checkpoint = True
+                    self._last_turn_stop_reason = "owner_command_checkpoint"
+                    self._emit_event({
+                        "type": "turn.owner_command_checkpoint",
+                        "turn_id": self.turn_context.turn_id,
+                        "successful_edit_calls": edit_count,
+                        "command_executed": True,
+                    })
+                    break
 
             if self._steering_messages and iteration >= iteration_budget:
                 iteration_budget = min(

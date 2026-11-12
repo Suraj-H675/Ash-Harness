@@ -29,6 +29,36 @@ refuses to guess the outcome of ambiguous external effects. A timed-out run
 exits nonzero; inspect its recorded tool outcomes and current files before
 resuming. This is an **execution control**, not a verified coding-speed gain.
 
+### Owner-selected post-verification checkpoint
+
+For a **fresh one-shot** coding task, an operator may explicitly select the
+command that should end the turn once the model has executed it successfully:
+
+```shell
+ash -p "Repair the issue and run the requested test" \
+  --report-after-command "python3 -B qa_visible.py"
+```
+
+The flag **does not execute or approve the command**. The model must still
+request `run_command` normally and all regular permission, sandbox, audit,
+and recovery safeguards apply. The command string must match the recorded,
+successfully dispatched command run from the project root. The checkpoint
+requires at least one known-successful local workspace edit in the same fresh
+session and turn, no failed, unknown or unrecognized tool actions, and no
+unresolved external tasks or edits. The owner-selected check must be the
+latest recorded tool action, and the audit chain must be intact.
+
+At that explicit boundary Ash returns a **deterministic, evidence-limited
+report** without another model request or command replay. The one-shot output
+contains `owner_command_checkpoint=true`, and the recorded stop reason is
+`owner_command_checkpoint`. The turn is completed with its tool records
+intact. This is an **operator-defined stop condition**, not proof that hidden
+tests or unrelated requirements pass. If the check fails, doesn't match, or
+any prerequisite is missing, Ash continues the normal reasoning loop. The
+feature is disabled by default; it cannot be used with resumed sessions or
+JSON-schema output. It may be combined with bounded wall time and opt-in safe
+context continuation.
+
 An adapter that does not accept a response ceiling can only use the reserve for
 input admission; the ChatGPT-plan preview route currently does not transmit a
 maximum response value.

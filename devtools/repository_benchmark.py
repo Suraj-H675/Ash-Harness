@@ -672,6 +672,7 @@ def run_task(
     fair_prompt: bool = False,
     context_continuations: int = 0,
     turn_time_budget: int | None = None,
+    report_after_visible_check: bool = False,
 ) -> dict[str, object]:
     task = TASKS[task_name]
     user_prompt = shared_user_prompt(task) if fair_prompt else task.prompt
@@ -768,6 +769,8 @@ def run_task(
             argv.extend(["--context-continuations", str(context_continuations)])
         if turn_time_budget is not None:
             argv.extend(["--turn-time-budget", str(turn_time_budget)])
+        if report_after_visible_check:
+            argv.extend(["--report-after-command", task.command_grant])
         cli_started = time.monotonic()
         with (
             (evidence / "ash.stdout").open("wb") as stdout,
@@ -837,6 +840,7 @@ def run_task(
             "reasoning_effort": reasoning_effort,
             "requested_context_continuations": context_continuations,
             "requested_turn_time_budget": turn_time_budget,
+            "requested_report_after_visible_check": report_after_visible_check,
             "context_continuations": aggregated["context_continuations"],
             "session_count": aggregated["session_count"],
             "elapsed_seconds": round(time.monotonic() - started, 2),
@@ -910,6 +914,10 @@ def main() -> int:
         "--turn-time-budget", type=int, default=None,
         help="Optional Ash one-shot wall-time budget (30..3600s), independent of external timeout",
     )
+    parser.add_argument(
+        "--report-after-visible-check", action="store_true",
+        help="Explicit operator checkpoint: finish with a bounded report when the already-granted visible command succeeds after edits",
+    )
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.chatgpt_model):
         parser.error("invalid exact ChatGPT model ID")
@@ -952,6 +960,7 @@ def main() -> int:
         fair_prompt=args.fair_prompt,
         context_continuations=args.context_continuations,
         turn_time_budget=args.turn_time_budget,
+        report_after_visible_check=args.report_after_visible_check,
     )
     print(
         json.dumps(

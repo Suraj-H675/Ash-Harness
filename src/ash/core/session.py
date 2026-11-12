@@ -6014,6 +6014,93 @@ class SessionStore:
                 return None
             return turn_id, actions
 
+    def owner_command_checkpoint_evidence(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        expected_project_path: str | Path,
+        command_line: str,
+    ) -> int | None:
+        """Accept a user-selected completion boundary, never a model hint.
+
+        Only an exact, successfully executed command *after* successful local
+        edits in the same active one-shot turn qualifies. The caller holds
+        its session lease. The command is never invoked by this method.
+        """
+        if not command_line or len(command_line) > 4096:
+            return None
+        allowed = AUTOMATIC_CONTEXT_HANDOFF_TOOLS | {"run_command", "search_tools"}
+        editing = {
+            "write_file", "replace_file_content", "replace_file_edits",
+            "whole_edit", "apply_patch",
+        }
+        with closing(self._connect()) as conn:
+            source = conn.execute(
+                "SELECT project_key FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if source is None or source["project_key"] != normalize_project_path(
+                expected_project_path
+            ):
+                return None
+            turns = conn.execute(
+                "SELECT turn_id, status FROM turn_journal WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            if len(turns) != 1 or turns[0]["turn_id"] != turn_id or turns[0]["status"] != "started":
+                return None
+            if self._assistant_tool_calls_missing_results_in_connection(
+                conn, session_id, turn_id
+            ):
+                return None
+            for table, predicate in (
+                ("mcp_tasks", "status IN ('working', 'input_required')"),
+                ("mcp_task_handles", "1 = 1"),
+                ("file_checkpoints", "restored = 0 AND after_sha256 IS NULL"),
+            ):
+                if conn.execute(
+                    f"SELECT 1 FROM {table} WHERE session_id = ? AND {predicate} LIMIT 1",
+                    (session_id,),
+                ).fetchone():
+                    return None
+            calls = conn.execute(
+                "SELECT tool_name, arguments_json, approved, dispatched, "
+                "executed, success, error FROM tool_calls "
+                "WHERE session_id = ? AND turn_id = ? ORDER BY rowid",
+                (session_id, turn_id),
+            ).fetchall()
+            if len(calls) < 2 or len(calls) > 128:
+                return None
+            edited = 0
+            for index, row in enumerate(calls):
+                name = str(row["tool_name"])
+                if (
+                    name not in allowed
+                    or not bool(row["approved"])
+                    or not bool(row["dispatched"])
+                    or not bool(row["executed"])
+                    or row["success"] != 1
+                    or row["error"] is not None
+                ):
+                    return None
+                if name in editing:
+                    edited += 1
+                if index == len(calls) - 1:
+                    if name != "run_command" or edited == 0:
+                        return None
+                    try:
+                        args = json.loads(row["arguments_json"])
+                    except (TypeError, ValueError):
+                        return None
+                    if (
+                        not isinstance(args, dict)
+                        or args.get("command_line") != command_line
+                        or args.get("cwd") not in (None, "", ".")
+                    ):
+                        return None
+            return edited
+
     def install_native_context_checkpoint(
         self,
         session_id: str,
