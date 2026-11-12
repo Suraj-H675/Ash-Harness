@@ -1588,6 +1588,17 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         ),
     )
     parser.add_argument(
+        "--turn-time-budget",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Opt in to a 30..3600 second wall-clock limit for a one-shot "
+            "turn, with bounded model-visible time notices. Cancellation "
+            "retains the interrupted-turn recovery safeguards."
+        ),
+    )
+    parser.add_argument(
         "--json-schema",
         type=Path,
         default=None,

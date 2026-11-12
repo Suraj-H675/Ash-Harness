@@ -91,6 +91,21 @@ class AshConfigError(AshError):
     exit_code = 2
 
 
+class TurnWallBudgetExceededError(AshError):
+    """An explicitly requested wall-clock limit interrupted the operation."""
+
+    category = ErrorCategory.CONTEXT
+    remedy = (
+        "Inspect the workspace, the interrupted session's recorded tool "
+        "outcomes, and any unresolved external actions before continuing. "
+        "Increase --turn-time-budget if the task needs more time. "
+        "Do not blindly replay uncertain side effects."
+    )
+
+    def __init__(self, seconds: float) -> None:
+        super().__init__(f"turn wall-time budget of {seconds:g} seconds exceeded")
+
+
 def classify_exception(exc: BaseException) -> ErrorInfo:
     """Classify arbitrary runtime exceptions into stable Ash error groups."""
 

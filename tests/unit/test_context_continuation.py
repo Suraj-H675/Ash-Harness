@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import asynccontextmanager
 import io
 import json
 from datetime import datetime, timezone
@@ -45,6 +46,12 @@ class FailingThenSuccessfulCodingLoop:
         self._fail_count = fail_count
         self.inputs: list[str] = []
         self.recovered_calls = 0
+        self.observed_wall_budget: float | None = None
+
+    @asynccontextmanager
+    async def wall_time_budget(self, seconds: float):
+        self.observed_wall_budget = seconds
+        yield
 
     async def start_session(self, session_id: str | None = None):
         if session_id is not None:
@@ -229,6 +236,43 @@ def test_cli_context_continuation_disabled_by_default() -> None:
     assert parser.parse_args(["-p", "hello"]).context_continuations == 0
     with pytest.raises(SystemExit):
         parser.parse_args(["-p", "hello", "--context-continuations", "3"])
+
+
+def test_cli_wall_budget_is_opt_in() -> None:
+    parser = argparse.ArgumentParser()
+    configure_parser(parser, "test")
+    assert parser.parse_args(["-p", "hello"]).turn_time_budget is None
+    assert parser.parse_args([
+        "-p", "hello", "--turn-time-budget", "300"
+    ]).turn_time_budget == 300
+
+
+@pytest.mark.parametrize("value", ["0", "29", "3601"])
+def test_cli_rejects_wall_budget_outside_allowed_range(value: str) -> None:
+    from ash.cli import main
+
+    with pytest.raises(SystemExit) as error:
+        main(["-p", "hello", "--turn-time-budget", value])
+    assert error.value.code == 2
+
+
+@pytest.mark.asyncio
+async def test_headless_wall_budget_wraps_one_shot_and_reports_opt_in(
+    tmp_path: Path,
+) -> None:
+    loop = FailingThenSuccessfulCodingLoop(tmp_path, fail_count=0)
+    output = io.StringIO()
+    ui = HeadlessUI(output_format="json", stream=output)
+    result = await _bootstrap_and_headless(
+        loop, SimpleNamespace(attachment_token_budget=1024),
+        prompt="Complete a bounded coding task", session_id=None,
+        ui=ui, turn_time_budget=300,
+    )
+    assert result == 0
+    assert loop.observed_wall_budget == 300
+    event = json.loads(output.getvalue().splitlines()[0])
+    assert event["type"] == "turn.completed"
+    assert event["turn_time_budget_seconds"] == 300
 
 
 @pytest.mark.asyncio

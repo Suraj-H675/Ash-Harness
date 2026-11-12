@@ -671,6 +671,7 @@ def run_task(
     reasoning_effort: str | None = None,
     fair_prompt: bool = False,
     context_continuations: int = 0,
+    turn_time_budget: int | None = None,
 ) -> dict[str, object]:
     task = TASKS[task_name]
     user_prompt = shared_user_prompt(task) if fair_prompt else task.prompt
@@ -765,6 +766,8 @@ def run_task(
             argv.extend(["--reasoning-effort", reasoning_effort])
         if context_continuations:
             argv.extend(["--context-continuations", str(context_continuations)])
+        if turn_time_budget is not None:
+            argv.extend(["--turn-time-budget", str(turn_time_budget)])
         cli_started = time.monotonic()
         with (
             (evidence / "ash.stdout").open("wb") as stdout,
@@ -833,6 +836,7 @@ def run_task(
             "iteration_limit": CHATGPT_TURN_ITERATIONS,
             "reasoning_effort": reasoning_effort,
             "requested_context_continuations": context_continuations,
+            "requested_turn_time_budget": turn_time_budget,
             "context_continuations": aggregated["context_continuations"],
             "session_count": aggregated["session_count"],
             "elapsed_seconds": round(time.monotonic() - started, 2),
@@ -902,6 +906,10 @@ def main() -> int:
         "--context-continuations", type=int, default=0, choices=(0, 1, 2),
         help="Opt in to bounded safe Ash reasoning-window restart on overflow",
     )
+    parser.add_argument(
+        "--turn-time-budget", type=int, default=None,
+        help="Optional Ash one-shot wall-time budget (30..3600s), independent of external timeout",
+    )
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", args.chatgpt_model):
         parser.error("invalid exact ChatGPT model ID")
@@ -911,6 +919,8 @@ def main() -> int:
         parser.error("context budget must be between 8192 and 65536")
     if args.turn_token_budget != 0 and not 2000 <= args.turn_token_budget <= 250000:
         parser.error("turn budget must be 0 or between 2000 and 250000")
+    if args.turn_time_budget is not None and not 30 <= args.turn_time_budget <= args.timeout:
+        parser.error("turn-time-budget must be between 30 seconds and the external timeout")
     if not PYTHON.is_file() or not shutil.which("bwrap") or not shutil.which("git"):
         parser.error("repository benchmark requires Ash venv, Git, and Bubblewrap")
     try:
@@ -941,6 +951,7 @@ def main() -> int:
         reasoning_effort=args.reasoning_effort,
         fair_prompt=args.fair_prompt,
         context_continuations=args.context_continuations,
+        turn_time_budget=args.turn_time_budget,
     )
     print(
         json.dumps(

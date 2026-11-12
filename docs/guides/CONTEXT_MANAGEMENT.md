@@ -16,6 +16,19 @@ queued steering messages. A configured `max_turn_total_tokens` also limits the
 combined prompt and completion tokens for a turn; `0` disables that token
 limit.
 
+For new or resumed **one-shot** work, `ash -p "..." --turn-time-budget 270`
+provides an optional 30–3600 second wall-clock budget (disabled by default).
+Ash gives the model a short trusted budget notice, then at most two further
+notices as the remaining time decreases. These notices are not stored in the
+durable conversation. The budget covers all model requests, tools and opted-in
+context restarts in that one-shot operation; it does not reduce reasoning
+effort, grant permissions, execute verification commands automatically, or
+extend an external supervisor's deadline. On expiry Ash cancels through the
+normal interrupted-turn recovery path, preserves known completed work and
+refuses to guess the outcome of ambiguous external effects. A timed-out run
+exits nonzero; inspect its recorded tool outcomes and current files before
+resuming. This is an **execution control**, not a verified coding-speed gain.
+
 An adapter that does not accept a response ceiling can only use the reserve for
 input admission; the ChatGPT-plan preview route currently does not transmit a
 maximum response value.

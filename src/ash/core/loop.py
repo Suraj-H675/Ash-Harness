@@ -18,15 +18,16 @@ emits new tool calls. A :class:`CircuitBreaker` halts the loop after
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import stat
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -1606,6 +1607,11 @@ class AshLoop:
         self._last_turn_token_budget = int(
             getattr(config, "max_turn_total_tokens", 0)
         )
+        self._turn_wall_deadline: float | None = None
+        self._turn_wall_budget_seconds: float | None = None
+        self._turn_wall_notice_phase = -1
+        self._turn_wall_notice_session_id: str | None = None
+        self._turn_wall_notices: list[tuple[Session, Message]] = []
         self.skill_nudge_interval = skill_nudge_interval
         self._iterations_since_skill_use = 0
         self.continuous_mode = continuous_mode
@@ -3647,6 +3653,86 @@ class AshLoop:
         )
         self._last_turn_budget_exhausted = any(budget_exhausted)
 
+    @asynccontextmanager
+    async def wall_time_budget(self, seconds: float) -> AsyncIterator[None]:
+        """Bound an explicitly opted-in operation, including context restarts.
+
+        Cancellation follows the normal durable interrupted-turn path. This
+        never dispatches verification or compensates ambiguous tool effects.
+        """
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("turn wall-time budget must be positive and finite")
+        if self._turn_wall_deadline is not None:
+            raise RuntimeError("a turn wall-time budget is already active")
+        clock = asyncio.get_running_loop()
+        deadline = clock.time() + seconds
+        timeout = asyncio.timeout_at(deadline)
+        self._turn_wall_deadline = deadline
+        self._turn_wall_budget_seconds = seconds
+        self._turn_wall_notice_phase = -1
+        self._turn_wall_notice_session_id = None
+        try:
+            try:
+                async with timeout:
+                    yield
+            except TimeoutError as exc:
+                if not timeout.expired():
+                    raise
+                from ash.exceptions import TurnWallBudgetExceededError
+
+                raise TurnWallBudgetExceededError(seconds) from exc
+        finally:
+            for session, notice in self._turn_wall_notices:
+                session.messages[:] = [
+                    message for message in session.messages if message is not notice
+                ]
+            self._turn_wall_notices.clear()
+            self._turn_wall_deadline = None
+            self._turn_wall_budget_seconds = None
+            self._turn_wall_notice_phase = -1
+            self._turn_wall_notice_session_id = None
+
+    def _notify_turn_wall_budget(self, session: Session) -> None:
+        """Give a bounded, trusted time reminder without rewriting history."""
+        deadline = self._turn_wall_deadline
+        duration = self._turn_wall_budget_seconds
+        if deadline is None or duration is None:
+            return
+        if session.session_id != self._turn_wall_notice_session_id:
+            self._turn_wall_notice_session_id = session.session_id
+            self._turn_wall_notice_phase = -1
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        fraction = remaining / duration
+        phase = 2 if fraction <= 0.15 else 1 if fraction <= 0.35 else 0
+        if phase <= self._turn_wall_notice_phase:
+            return
+        self._turn_wall_notice_phase = phase
+        if phase == 0:
+            content = (
+                f"Trusted execution budget: {duration:g} seconds total; "
+                f"approximately {int(remaining)} seconds remain. "
+                "Batch independent inspections, make coherent "
+                "edits, and run only explicitly authorized checks before "
+                "claiming completion. The deadline does not grant permissions."
+            )
+        else:
+            content = (
+                f"Trusted execution budget: approximately {int(remaining)} "
+                "seconds remain. Prioritize the unfinished user objective "
+                "and explicitly authorized verification. If unable to finish "
+                "safely, report incomplete work rather than bypass approvals "
+                "or claim tests ran."
+            )
+        message = Message(role="system", content=content, timestamp=_utc_now())
+        message.mark_runtime_only()
+        session.messages.append(message)
+        self._turn_wall_notices.append((session, message))
+        self._emit_event({
+            "type": "turn.wall_budget.notice",
+            "phase": phase,
+            "remaining_seconds": int(remaining),
+        })
+
     async def run_turn(
         self,
         user_input: str,
@@ -4081,6 +4167,7 @@ class AshLoop:
         continue_follow_up = False
         while iteration < iteration_budget:
             iteration += 1
+            self._notify_turn_wall_budget(session)
             self._drain_steering_messages(session)
             self._drain_background_agent_reports(session)
             self._pending_plan_context = ""
