@@ -2536,6 +2536,62 @@ class EventUI(TerminalUI):
 
 
 @pytest.mark.asyncio
+async def test_provider_transport_error_event_preserves_only_failure_phase(tmp_path):
+    import httpx
+
+    class BrokenProvider(ProviderABC):
+        model_name = "broken-connection"
+
+        def count_tokens(self, text):
+            return max(1, len(text) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            try:
+                raise httpx.ConnectTimeout("PRIVATE_HOST_AND_TOKEN")
+            except httpx.ConnectTimeout as cause:
+                raise RuntimeError("sanitized provider error") from cause
+            yield StreamChunk(is_done=True)  # pragma: no cover
+
+    class Observer:
+        def __init__(self):
+            self.events = []
+
+        def on_event(self, event):
+            self.events.append(event)
+
+        def close(self):
+            pass
+
+    observer = Observer()
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "transport.db"),
+        BrokenProvider(),
+        SafetyGuard(tmp_path),
+        ui,
+        tmp_path,
+        event_observer=observer,
+        config=AshConfig(model="local/broken-connection", provider_max_attempts=1),
+    )
+    try:
+        session = await loop.start_session()
+        with pytest.raises(RuntimeError, match="sanitized provider error"):
+            await loop._stream_one_completion(
+                [{"role": "user", "content": "ping"}],
+                provider_tools={},
+                provider_tool_schema=[],
+                session_id=session.session_id,
+            )
+        errors = [event for event in observer.events if event["type"] == "model.request.error"]
+        assert len(errors) == 1
+        assert errors[0]["transport_phase"] == "connect_timeout"
+        assert errors[0]["error_type"] == "RuntimeError"
+        assert "PRIVATE_HOST_AND_TOKEN" not in repr(observer.events)
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_runtime_event_observer_receives_content_free_projection(tmp_path):
     class Observer:
         def __init__(self):

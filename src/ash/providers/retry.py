@@ -214,6 +214,31 @@ def classify_provider_failure(error: BaseException) -> ProviderFailure:
     )
 
 
+def provider_transport_phase(error: BaseException) -> str | None:
+    """Report an SDK's low-level transport failure without logging its text.
+
+    SDKs frequently wrap httpx failures in APIConnectionError/APITimeoutError,
+    and Ash may wrap those again for redaction. Inspect only concrete type
+    names in the bounded cause chain; never expose request URLs, exceptions,
+    headers, credentials or network addresses in operational telemetry.
+    """
+    phases = {
+        "ConnectTimeout": "connect_timeout",
+        "ReadTimeout": "read_timeout",
+        "WriteTimeout": "write_timeout",
+        "PoolTimeout": "pool_timeout",
+        "ConnectError": "connect_error",
+        "ReadError": "read_error",
+        "WriteError": "write_error",
+        "CloseError": "close_error",
+    }
+    for item in _exception_chain(error):
+        phase = phases.get(type(item).__name__)
+        if phase is not None:
+            return phase
+    return None
+
+
 def retry_delay(
     failure: ProviderFailure,
     retry_number: int,

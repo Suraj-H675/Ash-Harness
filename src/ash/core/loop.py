@@ -108,6 +108,7 @@ from ash.providers.messages import (
 from ash.providers.retry import (
     ProviderCircuitBreaker,
     classify_provider_failure,
+    provider_transport_phase,
     retry_delay,
 )
 from ash.repo.repomap import RepoMap
@@ -365,6 +366,7 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "failure_category",
             "emitted_output",
             "error_type",
+            "transport_phase",
             "credential_profile",
             "credential_pool_size",
         }
@@ -5654,6 +5656,7 @@ class AshLoop:
                                 "failure_category": failure.category.value,
                                 "emitted_output": emitted_output,
                                 "error_type": type(exc).__name__,
+                                "transport_phase": provider_transport_phase(exc),
                                 **_provider_credential_event_fields(self.provider),
                             }
                         )
@@ -5858,6 +5861,7 @@ class AshLoop:
                         "failure_category": failure.category.value,
                         "emitted_output": False,
                         "error_type": type(exc).__name__,
+                        "transport_phase": provider_transport_phase(exc),
                         **_provider_credential_event_fields(self.provider),
                     }
                 )

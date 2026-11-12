@@ -64,6 +64,11 @@ class OpenAIChatGPTProvider(ProviderABC):
         self._auth_session = auth_session or ChatGPTAuthSession()
         self._token_counter = token_counter or OpenAITokenCounter(model_name)
         self._client_factory = client_factory
+        # An Ash provider is long-lived across a coding turn's many model
+        # requests. Keep one transport/connection pool, but construct a fresh
+        # SDK wrapper with the current OAuth bearer for *every* request.
+        self._http_client: Any | None = None
+        self._closed = False
 
     @property
     def model_name(self) -> str:
@@ -90,14 +95,28 @@ class OpenAIChatGPTProvider(ProviderABC):
             raise ValueError("prompt cache retention must be memory or extended")
 
     def _new_client(self, access_token: str) -> Any:
+        if self._closed:
+            raise RuntimeError("ChatGPT provider has been closed")
         if self._client_factory is not None:
             return self._client_factory(access_token)
+        if self._http_client is None:
+            self._http_client = _owned_openai_http_client(cookie_free=True)
         return openai.AsyncOpenAI(
             api_key=access_token,
             base_url=CHATGPT_RESOURCE,
             max_retries=0,
-            http_client=_owned_openai_http_client(),
+            http_client=self._http_client,
         )
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        if self._http_client is not None:
+            # If close fails, retain ownership so the caller can retry
+            # shutdown (including Ash's retired-provider cleanup).
+            await self._http_client.aclose()
+            self._http_client = None
+        self._closed = True
 
     async def stream_chat(
         self,
@@ -106,33 +125,23 @@ class OpenAIChatGPTProvider(ProviderABC):
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         del temperature
+        if self._closed:
+            raise RuntimeError("ChatGPT provider has been closed")
         access_token = await self._auth_session.access_token()
         client = self._new_client(access_token)
-        owns_client = self._client_factory is None
         request_options: dict[str, Any] = {}
         if self.configured_reasoning_effort is not None:
             request_options["reasoning"] = {
                 "effort": self.configured_reasoning_effort
             }
-        try:
-            async for chunk in stream_openai_responses(
-                client,
-                model_name=self._model_name,
-                messages=messages,
-                tools=tools,
-                request_options=request_options,
-                error_label="OpenAI ChatGPT Responses",
-                error_secrets=(access_token,),
-                terminal_error_factory=ChatGPTResponsesTerminalError,
-            ):
-                yield chunk
-        finally:
-            if owns_client:
-                close = getattr(client, "close", None)
-                aclose = getattr(client, "aclose", None)
-                if callable(aclose):
-                    await aclose()
-                elif callable(close):
-                    result = close()
-                    if hasattr(result, "__await__"):
-                        await result
+        async for chunk in stream_openai_responses(
+            client,
+            model_name=self._model_name,
+            messages=messages,
+            tools=tools,
+            request_options=request_options,
+            error_label="OpenAI ChatGPT Responses",
+            error_secrets=(access_token,),
+            terminal_error_factory=ChatGPTResponsesTerminalError,
+        ):
+            yield chunk

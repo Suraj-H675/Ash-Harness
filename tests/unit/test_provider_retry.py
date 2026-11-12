@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import httpx
 
 from ash.providers.base import ProviderTerminalError
 from ash.providers.retry import (
@@ -11,6 +12,7 @@ from ash.providers.retry import (
     ProviderFailure,
     ProviderFailureCategory,
     classify_provider_failure,
+    provider_transport_phase,
     retry_delay,
 )
 
@@ -92,6 +94,24 @@ def test_wrapped_connection_and_status_errors_are_classified() -> None:
     failure = classify_provider_failure(wrapper)
     assert failure.status_code == 503
     assert failure.retry_after == 1.25
+
+
+@pytest.mark.parametrize("cause,phase", [
+    (httpx.ConnectTimeout("private-host-and-secret"), "connect_timeout"),
+    (httpx.ReadTimeout("private-host-and-secret"), "read_timeout"),
+    (httpx.PoolTimeout("private-host-and-secret"), "pool_timeout"),
+    (httpx.ConnectError("private-host-and-secret"), "connect_error"),
+    (RuntimeError("generic provider error"), None),
+])
+def test_transport_phase_is_fixed_vocabulary_without_private_details(
+    cause: BaseException, phase: str | None,
+) -> None:
+    sdk_wrapper = RuntimeError("SDK wrapper")
+    sdk_wrapper.__cause__ = cause
+    ash_wrapper = RuntimeError("Ash sanitized provider failure")
+    ash_wrapper.__cause__ = sdk_wrapper
+    assert provider_transport_phase(ash_wrapper) == phase
+    assert "private-host-and-secret" not in str(provider_transport_phase(ash_wrapper))
 
 
 @pytest.mark.parametrize("reason", ["rate_limit", "timeout"])

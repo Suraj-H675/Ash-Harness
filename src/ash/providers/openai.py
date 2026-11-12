@@ -101,8 +101,14 @@ async def _strip_authorization_header(request: httpx.Request) -> None:
     request.headers.pop("Authorization", None)
 
 
+async def _strip_cookie_header(request: httpx.Request) -> None:
+    """Prevent a persistent transport from sharing cookies across identities."""
+
+    request.headers.pop("Cookie", None)
+
+
 def _owned_openai_http_client(
-    *, anonymous: bool = False, trust_env: bool = True
+    *, anonymous: bool = False, trust_env: bool = True, cookie_free: bool = False
 ) -> Any:
     """Build an Ash-owned SDK transport that never follows redirects."""
 
@@ -110,8 +116,13 @@ def _owned_openai_http_client(
         "follow_redirects": False,
         "trust_env": trust_env,
     }
+    request_hooks = []
     if anonymous:
-        options["event_hooks"] = {"request": [_strip_authorization_header]}
+        request_hooks.append(_strip_authorization_header)
+    if cookie_free:
+        request_hooks.append(_strip_cookie_header)
+    if request_hooks:
+        options["event_hooks"] = {"request": request_hooks}
     return openai.DefaultAsyncHttpxClient(**options)
 
 

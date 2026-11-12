@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import httpx
 
 from ash.providers.base import ProviderIncompleteStreamError, ProviderTerminalError
 from ash.providers.openai_chatgpt import (
@@ -13,6 +14,7 @@ from ash.providers.openai_chatgpt import (
     OpenAIChatGPTProvider,
     prepare_chatgpt_responses_input,
 )
+from ash.providers.retry import provider_transport_phase
 
 
 class _AuthSession:
@@ -330,6 +332,224 @@ def test_chatgpt_response_failure_retry_classification_is_conservative() -> None
 
     assert temporary.retriable is True
     assert exhausted.retriable is False
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_provider_reuses_one_http_pool_with_fresh_bearer_per_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Many coding turns must not reconnect, or retain expired bearer headers."""
+    requests: list[str] = []
+    pools: list[httpx.AsyncClient] = []
+    completions = (
+        b'data: {"type":"response.completed","response":{"usage":'
+        b'{"input_tokens":1,"output_tokens":1}}}\n\n'
+    )
+
+    def on_request(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith('/responses')
+        requests.append(request.headers["authorization"])
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=completions,
+        )
+
+    def transport_factory(**kwargs: Any) -> httpx.AsyncClient:
+        assert kwargs == {"cookie_free": True}
+        pool = httpx.AsyncClient(
+            transport=httpx.MockTransport(on_request), follow_redirects=False,
+        )
+        pools.append(pool)
+        return pool
+
+    monkeypatch.setattr(
+        "ash.providers.openai_chatgpt._owned_openai_http_client",
+        transport_factory,
+    )
+
+    class RotatingAuth:
+        count = 0
+
+        async def access_token(self) -> str:
+            self.count += 1
+            return f"synthetic-access-token-{self.count}"
+
+    provider = OpenAIChatGPTProvider(
+        "gpt-test", auth_session=RotatingAuth(),  # type: ignore[arg-type]
+    )
+    try:
+        for _ in range(3):
+            chunks = [
+                chunk async for chunk in provider.stream_chat(
+                    [{"role": "user", "content": "ping"}]
+                )
+            ]
+            assert chunks[-1].is_done
+        assert requests == [
+            "Bearer synthetic-access-token-1",
+            "Bearer synthetic-access-token-2",
+            "Bearer synthetic-access-token-3",
+        ]
+        assert len(pools) == 1
+        assert pools[0].is_closed is False
+    finally:
+        await provider.aclose()
+    assert len(pools) == 1
+    assert pools[0].is_closed
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = [
+            chunk async for chunk in provider.stream_chat(
+                [{"role": "user", "content": "cannot reuse closed provider"}]
+            )
+        ]
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_provider_close_is_idempotent_without_an_active_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocated: list[httpx.AsyncClient] = []
+
+    def transport_factory(**kwargs: Any) -> httpx.AsyncClient:
+        assert kwargs == {"cookie_free": True}
+        pool = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(500)))
+        allocated.append(pool)
+        return pool
+
+    monkeypatch.setattr(
+        "ash.providers.openai_chatgpt._owned_openai_http_client", transport_factory
+    )
+    provider = OpenAIChatGPTProvider("gpt-test", auth_session=_AuthSession())  # type: ignore[arg-type]
+    await provider.aclose()
+    await provider.aclose()
+    assert allocated == []  # Nothing allocated until first real request.
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_provider_recovers_after_one_failed_connection_without_new_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[str] = []
+    pools: list[httpx.AsyncClient] = []
+
+    def on_request(request: httpx.Request) -> httpx.Response:
+        requests.append(request.headers["authorization"])
+        if len(requests) == 1:
+            raise httpx.ConnectTimeout("synthetic connectivity failure")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'data: {"type":"response.completed","response":{"usage":'
+                b'{"input_tokens":1,"output_tokens":1}}}\n\n'
+            ),
+        )
+
+    def transport_factory(**kwargs: Any) -> httpx.AsyncClient:
+        assert kwargs == {"cookie_free": True}
+        pool = httpx.AsyncClient(transport=httpx.MockTransport(on_request))
+        pools.append(pool)
+        return pool
+
+    monkeypatch.setattr(
+        "ash.providers.openai_chatgpt._owned_openai_http_client", transport_factory
+    )
+
+    class RotatingAuth:
+        count = 0
+
+        async def access_token(self) -> str:
+            self.count += 1
+            return f"synthetic-oauth-{self.count}"
+
+    provider = OpenAIChatGPTProvider(
+        "gpt-test", auth_session=RotatingAuth(),  # type: ignore[arg-type]
+    )
+    try:
+        with pytest.raises(RuntimeError, match="OpenAI ChatGPT Responses error") as failure:
+            _ = [
+                chunk async for chunk in provider.stream_chat(
+                    [{"role": "user", "content": "first"}]
+                )
+            ]
+        assert provider_transport_phase(failure.value) == "connect_timeout"
+        chunks = [
+            chunk async for chunk in provider.stream_chat(
+                [{"role": "user", "content": "second"}]
+            )
+        ]
+        assert chunks[-1].is_done
+        assert len(pools) == 1
+        assert requests == ["Bearer synthetic-oauth-1", "Bearer synthetic-oauth-2"]
+    finally:
+        await provider.aclose()
+    assert pools[0].is_closed
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_shared_pool_never_sends_cookies_from_another_oauth_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only per-request bearer authentication may cross a reused connection."""
+    cookies_sent: list[str | None] = []
+    bearers_sent: list[str] = []
+    pools: list[httpx.AsyncClient] = []
+
+    def on_request(request: httpx.Request) -> httpx.Response:
+        cookies_sent.append(request.headers.get("cookie"))
+        bearers_sent.append(request.headers["authorization"])
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "set-cookie": "session=first-account-private; Path=/; HttpOnly",
+            },
+            content=(
+                b'data: {"type":"response.completed","response":{"usage":'
+                b'{"input_tokens":1,"output_tokens":1}}}\n\n'
+            ),
+        )
+
+    def actual_helper_transport(**options: Any) -> httpx.AsyncClient:
+        pool = httpx.AsyncClient(
+            transport=httpx.MockTransport(on_request), **options
+        )
+        pools.append(pool)
+        return pool
+
+    # Exercise the real cookie-free helper, not a replacement of the helper.
+    monkeypatch.setattr(
+        "ash.providers.openai.openai.DefaultAsyncHttpxClient",
+        actual_helper_transport,
+    )
+
+    class DifferentTokens:
+        n = 0
+
+        async def access_token(self) -> str:
+            self.n += 1
+            return f"synthetic-account-{self.n}"
+
+    provider = OpenAIChatGPTProvider(
+        "gpt-test", auth_session=DifferentTokens(),  # type: ignore[arg-type]
+    )
+    try:
+        for _ in range(2):
+            chunks = [
+                chunk async for chunk in provider.stream_chat(
+                    [{"role": "user", "content": "cookie isolation"}]
+                )
+            ]
+            assert chunks[-1].is_done
+        assert len(pools) == 1
+        assert cookies_sent == [None, None]
+        assert bearers_sent == [
+            "Bearer synthetic-account-1", "Bearer synthetic-account-2"
+        ]
+    finally:
+        await provider.aclose()
+    assert pools[0].is_closed
 
 
 def test_stream_chunk_rejects_malformed_provider_replay_state() -> None:
