@@ -48,6 +48,7 @@ def _emit_receipt(task_name: str, evidence: Path, *, outage: bool = False) -> No
         (evidence / "result.json").write_text(json.dumps({
             **base, **hashes, "provider_model": "openai/gpt-6-luna",
             "reasoning_effort": "xhigh", "context_tokens": 32768,
+            "turn_token_budget": 0,
             "passed": True, "oracle": {"correct": True},
             "protected_files_unchanged": True, "required_sources_changed": True,
             "required_tools_succeeded": True, "exit_code": 0,
@@ -85,6 +86,7 @@ def test_engine_commands_select_plain_codex_with_identical_model_limits(
     assert ash[1] == str(ROOT / "devtools/repository_benchmark.py")
     assert codex[1] == str(ROOT / "devtools/codex_repository_benchmark.py")
     assert "--fair-prompt" in ash
+    assert ash[ash.index("--turn-token-budget") + 1] == "0"
     for argv in (ash, codex):
         assert "gpt-6-luna" in argv
         assert "xhigh" in argv

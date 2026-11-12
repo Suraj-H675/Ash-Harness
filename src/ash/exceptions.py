@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from ash.context.history import ContextBudgetExceededError
 from ash.core.redaction import redact_text
 from ash.providers.base import ProviderCompletionError
 from ash.ui.safe_text import terminal_safe_text
@@ -222,6 +223,22 @@ def classify_exception(exc: BaseException) -> ErrorInfo:
         )
 
     if module.startswith("ash.context.") or "context" in lowered or "token" in lowered:
+        if (
+            isinstance(exc, ContextBudgetExceededError)
+            and exc.provider_replay_state_preserved
+        ):
+            return ErrorInfo(
+                ErrorCategory.CONTEXT,
+                message,
+                "Opaque provider reasoning cannot be shortened safely within "
+                "the current turn. Inspect the workspace and recorded tool "
+                "outcomes before continuing in a fresh session. When the "
+                "source session is quiescent, /restart-context with an "
+                "explicit handoff can start a new reasoning window without "
+                "replaying earlier actions. Otherwise use a larger supported "
+                "input window or verified provider-native compaction. "
+                "Do not automatically repeat uncertain side effects.",
+            )
         return ErrorInfo(
             ErrorCategory.CONTEXT,
             message,

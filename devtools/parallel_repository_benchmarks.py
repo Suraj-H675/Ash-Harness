@@ -56,7 +56,10 @@ def commands(
             "--chatgpt-model", "gpt-6-luna",
             "--reasoning-effort", "xhigh",
             "--context-tokens", str(context),
-            "--turn-token-budget", "120000",
+            # Plain Codex has no corresponding cumulative turn-token cap.
+            # Use Ash's normal uncapped default, retaining matched context,
+            # model effort, task inputs, and bounded subprocess deadlines.
+            "--turn-token-budget", "0",
             "--timeout", str(timeout),
             "--fair-prompt",
             "--evidence-dir", str(evidence),
@@ -125,6 +128,7 @@ def run_pair(
                 "identical_user_prompts_verified",
                 "identical_oracle_source_verified",
                 "same_requested_context_window",
+                "ash_unbounded_turn_configured",
                 "codex_native_binary_direct",
                 "codex_private_home_and_xdg",
                 "codex_ephemeral_auth_cleanup",

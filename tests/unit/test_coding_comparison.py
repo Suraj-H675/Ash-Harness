@@ -30,6 +30,7 @@ def _evidence(root: Path) -> tuple[Path, Path]:
                 "reference_fix_sha": "b" * 40,
                 "provider_model": "openai/gpt-6-luna",
                 "reasoning_effort": "xhigh",
+                "turn_token_budget": 0,
                 "passed": True,
                 "oracle": {"correct": True},
                 "protected_files_unchanged": True,
@@ -92,10 +93,34 @@ def test_comparison_separates_correct_code_from_terminal_completion(
     assert report["evaluation"]["codex_native_binary_direct"] is False
     assert report["evaluation"]["excluded_provider_outage"] is False
     assert report["evaluation"]["matching_cli_timing_available"] is True
+    assert report["evaluation"]["ash_unbounded_turn_configured"] is True
+    assert report["evaluation"]["asymmetric_ash_turn_token_cap"] is False
     assert report["ash"]["cli_seconds"] == 72.5
     assert report["ash"]["elapsed_scope"] == "preflight_cli_and_grading"
     assert report["codex"]["cli_seconds"] == 170
     assert report["codex"]["elapsed_scope"] == "cli_only"
+
+
+@pytest.mark.parametrize("budget,unbounded,asymmetric", [
+    (0, True, False), (120000, False, True), (None, False, False),
+])
+def test_comparison_discloses_unmatched_ash_turn_token_cap(
+    tmp_path: Path, budget: int | None, unbounded: bool, asymmetric: bool,
+) -> None:
+    ash, codex = _evidence(tmp_path)
+    path = ash / "result.json"
+    data = json.loads(path.read_text())
+    if budget is None:
+        data.pop("turn_token_budget", None)
+    else:
+        data["turn_token_budget"] = budget
+    path.write_text(json.dumps(data))
+    report = comparison.compare(ash, codex)
+    evaluation = report["evaluation"]
+    assert evaluation["ash_turn_token_budget"] == budget
+    assert evaluation["ash_unbounded_turn_configured"] is unbounded
+    assert evaluation["asymmetric_ash_turn_token_cap"] is asymmetric
+    assert evaluation["matched_context_and_turn_limits"] is False
 
 
 def test_comparison_does_not_conflate_cli_and_grading_timing(

@@ -842,7 +842,16 @@ def main() -> int:
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=210)
     parser.add_argument("--context-tokens", type=int, default=32768)
-    parser.add_argument("--turn-token-budget", type=int, default=120000)
+    parser.add_argument(
+        "--turn-token-budget",
+        type=int,
+        default=0,
+        help=(
+            "Cumulative prompt and completion tokens per Ash turn; "
+            "0 uses Ash's production default (no cumulative cap). "
+            "Per-request context, iteration and wall-time bounds still apply."
+        ),
+    )
     parser.add_argument(
         "--reasoning-effort",
         choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
@@ -861,8 +870,8 @@ def main() -> int:
         parser.error("timeout must be between 30 and 300 seconds")
     if not 8192 <= args.context_tokens <= 65536:
         parser.error("context budget must be between 8192 and 65536")
-    if not 2000 <= args.turn_token_budget <= 250000:
-        parser.error("turn budget must be between 2000 and 250000")
+    if args.turn_token_budget != 0 and not 2000 <= args.turn_token_budget <= 250000:
+        parser.error("turn budget must be 0 or between 2000 and 250000")
     if not PYTHON.is_file() or not shutil.which("bwrap") or not shutil.which("git"):
         parser.error("repository benchmark requires Ash venv, Git, and Bubblewrap")
     try:

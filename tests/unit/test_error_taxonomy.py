@@ -6,6 +6,7 @@ import pytest
 
 from ash.cli import _bootstrap_and_headless, _bootstrap_and_repl, validate_structured_output
 from ash.config import AshConfig
+from ash.context.history import ContextBudgetExceededError
 from ash.core.planner import PlannerError
 from ash.core.session import SessionResolutionError, SessionStorageError
 from ash.exceptions import ErrorCategory, classify_exception, format_error
@@ -37,6 +38,36 @@ def test_classify_policy_storage_sandbox_and_context_errors() -> None:
     assert (
         classify_exception(SafetyViolation("blocked")).category == ErrorCategory.POLICY
     )
+
+
+def test_opaque_reasoning_context_error_has_safe_actionable_remedy() -> None:
+    error = classify_exception(
+        ContextBudgetExceededError(
+            72904, 59141,
+            protected_current_turn=True,
+            provider_replay_state_preserved=True,
+        )
+    )
+    assert error.category is ErrorCategory.CONTEXT
+    assert error.exit_code == 1
+    assert error.retriable is False
+    assert "opaque provider reasoning" in error.message
+    assert "/restart-context" in error.remedy
+    assert "quiescent" in error.remedy
+    assert "Inspect the workspace" in error.remedy
+    assert "Do not automatically repeat uncertain side effects" in error.remedy
+    assert "compact the session" not in error.remedy
+
+
+def test_plain_context_error_keeps_generic_remedy() -> None:
+    error = classify_exception(
+        ContextBudgetExceededError(
+            900, 400,
+            protected_current_turn=True,
+            provider_replay_state_preserved=False,
+        )
+    )
+    assert "Reduce the prompt" in error.remedy
     assert (
         classify_exception(SessionStorageError("database corrupt")).category
         == ErrorCategory.STORAGE

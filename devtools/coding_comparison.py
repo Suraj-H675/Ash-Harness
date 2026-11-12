@@ -190,6 +190,23 @@ def compare(ash_dir: Path, codex_dir: Path) -> dict[str, Any]:
             "same_skill_stack": False,
             "same_tool_and_command_authorizations": False,
             "matched_context_and_turn_limits": False,
+            # Native plain Codex exposes no corresponding per-turn cumulative
+            # token cap to this runner. A positive cap on Ash can stop a
+            # multi-file task before its deadline, independently of model
+            # quality; do not certify such pairs as equally budgeted.
+            "ash_turn_token_budget": (
+                ash["turn_token_budget"]
+                if type(ash.get("turn_token_budget")) is int
+                else None
+            ),
+            "ash_unbounded_turn_configured": (
+                type(ash.get("turn_token_budget")) is int
+                and ash["turn_token_budget"] == 0
+            ),
+            "asymmetric_ash_turn_token_cap": (
+                type(ash.get("turn_token_budget")) is int
+                and ash["turn_token_budget"] > 0
+            ),
             "same_requested_context_window": (
                 type(ash.get("context_tokens")) is int
                 and type(codex.get("context_tokens_requested")) is int

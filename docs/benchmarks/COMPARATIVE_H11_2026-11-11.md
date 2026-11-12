@@ -230,3 +230,79 @@ Private pilot evidence:
 `/tmp/ash-paired-batch-9d62499f9fb0fad094d5/batch.json`.
 No credentials, source fixtures, or raw model transcripts are part of the
 tracked report. The benchmark remains optional and local-first.
+
+## 2026-11-12: two-file proxy-redirect diagnosis (not yet accepted)
+
+The earlier 180-second proxy-redirect comparison was unusable as a paired
+coding result because plain Codex failed provider routing before making any
+repository edits. A new **sequential**, same-user-prompt, same-oracle,
+GPT-6 Luna xhigh attempt gave both agents a 240-second child deadline and
+requested 65,536 context tokens. The independent plain Codex runner now
+completed correctly, while Ash did not:
+
+| Metric | Ash, old 120K cumulative cap | Plain Codex |
+|---|---:|---:|
+| CLI interval | 154.72s | 147.74s |
+| Visible and hidden oracles | Fail | Pass |
+| Required visible test run | No | Yes |
+| Timed out | No | No |
+| Terminal | Nonzero, `token_budget` | Completed, exit zero |
+
+The Ash turn used 73,953 cumulative tokens and could not admit the next
+estimated 54,607-token input within its benchmark-only 120K limit. Native
+plain Codex had no corresponding configured cumulative turn cap. The two
+task inputs and both oracle-source fingerprints matched; execution policies
+and cumulative limits did not. Do **not** claim a fair capability ranking
+from this pair. The receipt comparison now discloses the asymmetric Ash cap,
+and the parallel coordinator refuses to certify a capped pair as comparable.
+
+**Corrected runner configuration:** The Ash repository benchmark and
+paired-scenario coordinator now use `max_turn_total_tokens = 0`, matching
+Ash's normal product default, rather than imposing an artificial 120K cap.
+They still enforce per-request input and output bounds, model iteration
+limits, exact permitted tool grants, sandbox and process isolation, and
+the 240-second deadline. Explicit finite turn budgets remain available for
+users deliberately measuring resource-constrained tasks.
+
+An Ash-only retest with the **unchanged proxy task, identical prompt and
+oracle source, 65,536 requested context, GPT-6 Luna xhigh and the same
+240-second deadline**, but with the cumulative cap disabled, still failed:
+
+| Metric | Ash, 120K capped | Ash, uncapped retest | Plain Codex, prior pair |
+|---|---:|---:|---:|
+| CLI interval | 154.72s | 202.12s | 147.74s |
+| Visible/hidden independent oracles | Fail/Fail | Fail/Fail | Pass/Pass |
+| Required test executed | No | No | Yes |
+| Context/terminal blocker | Cumulative turn cap | Opaque reasoning input overflow | None |
+
+The second Ash attempt made seven model requests, performed 15 tool calls
+(14 reads/searches and one completed edit), and hit a fail-closed
+`ContextBudgetExceededError` after the edit: the next protected provider
+history required approximately **72,904 input tokens** versus an effective
+**59,141-token** input limit. The independent grader observed a missing
+`_is_same_host` helper in the partially modified source. That is an
+incomplete repair, not a successful solution, and not a deadline expiry.
+
+This reveals a real harness capability gap: long multi-file tasks may
+require a new reasoning window before finishing a turn. On the ChatGPT-plan
+route, opaque reasoning replay cannot be rewritten or locally compacted
+without losing required provider state. The existing `/restart-context`
+correctly refuses unfinished turns and ambiguous side effects, and native
+Responses compaction is not supported on this route. Silently discarding
+provider state or auto-replaying actions would weaken fundamental safety
+guarantees. As an immediate user-facing correction, context-error guidance
+now explains safe workspace inspection, quiescent explicit handoff and
+provider-native/larger-context alternatives, rather than recommending
+unsafe generic compaction. **Automatic safe mid-task continuation remains
+unimplemented and unverified**; no throughput or quality win is claimed.
+
+The next engineering task is to design and test an explicit, bounded
+continuation checkpoint for unfinished *coding* turns that preserves
+pending/unknown side-effect guards, audit and approval boundaries, user
+objective, verified workspace facts, and session lineage without replaying
+opaque reasoning data. Evaluate alternatives against real Codex behavior,
+then retest this same frozen proxy task and held-out multi-file tasks.
+
+Private evidence: original pair
+`/tmp/ash-paired-batch-a0020a4ba87c22d54c6b/` and corrected Ash attempt
+`/var/tmp/ash-urllib3-proxy-uncapped-20261112-r1/result.json`.
