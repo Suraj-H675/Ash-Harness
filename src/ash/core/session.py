@@ -5722,7 +5722,10 @@ class SessionStore:
                             "SELECT 1 FROM tool_calls WHERE session_id = ? "
                             "AND (tool_name NOT IN ("
                             + ",".join("?" for _ in AUTOMATIC_CONTEXT_HANDOFF_TOOLS)
-                            + ") OR success IS NOT 1) LIMIT 1",
+                            + ") OR NOT (success IS 1 OR ("
+                            "tool_name = 'replace_file_content' "
+                            "AND approved = 1 AND dispatched = 0 "
+                            "AND executed = 0 AND success IS 0))) LIMIT 1",
                             (session_id, *sorted(AUTOMATIC_CONTEXT_HANDOFF_TOOLS)),
                         ).fetchone()
                         if (

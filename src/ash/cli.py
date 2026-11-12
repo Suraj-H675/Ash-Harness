@@ -5613,9 +5613,13 @@ async def _bootstrap_and_headless(
                     )
                 from ash.core.context_continuation import run_with_context_continuation
 
-                continued = await run_with_context_continuation(
-                    loop, prompt, max_continuations=context_continuations
-                )
+                loop._safe_edit_preflight = True
+                try:
+                    continued = await run_with_context_continuation(
+                        loop, prompt, max_continuations=context_continuations
+                    )
+                finally:
+                    loop._safe_edit_preflight = False
                 response = continued.response
                 completed_restarts = continued.context_continuations
                 final_session_id = continued.session_id

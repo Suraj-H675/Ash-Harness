@@ -519,6 +519,19 @@ class ReplaceFileContentTool(BaseTool):
     args_schema = ReplaceFileContentArgs
 
     async def run(self, **kwargs: Any) -> ToolResult:
+        result = await self._replace(check_only=False, **kwargs)
+        assert result is not None
+        return result
+
+    async def preflight(self, **kwargs: Any) -> ToolResult | None:
+        """Return a proven pre-write rejection, or None if execution is possible.
+
+        Callers must still run the ordinary tool after a successful check:
+        file contents and permissions can change before the actual edit.
+        """
+        return await self._replace(check_only=True, **kwargs)
+
+    async def _replace(self, *, check_only: bool, **kwargs: Any) -> ToolResult | None:
         args = ReplaceFileContentArgs(**kwargs)
         if (args.start_line is None) != (args.end_line is None):
             return ToolResult(
@@ -643,6 +656,9 @@ class ReplaceFileContentTool(BaseTool):
                     else NO_OP_EDIT_ERROR
                 ),
             )
+
+        if check_only:
+            return None
 
         try:
             atomic_write_scoped_bytes(

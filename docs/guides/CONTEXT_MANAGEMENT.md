@@ -164,6 +164,16 @@ tool results, approvals or tool dispatches. Automatic continuation is
 external tool, even when its result is known, or if it has ambiguous actions,
 unfinished edits or unverified external tasks. Only known-successful local
 read/search and direct workspace edit tools may precede an automatic handoff.
+While this option is active, the built-in `replace_file_content` tool also
+preflights an approved edit **before** tool dispatch, tool hooks or middleware.
+If the exact replacement is already invalid, Ash records a rejection without
+executing it. An accepted preflight still goes through the usual tool path,
+which rechecks the file before writing. Such a rejection permits automatic
+handoff only if the durable call was approved but never dispatched or executed,
+and no registered hooks or custom approval callbacks could have caused external
+effects. Failed dispatched
+edits, denied approvals and unknown outcomes remain blocked. This neither
+automatically retries an edit nor bypasses filesystem safeguards.
 The new turn is instructed to inspect the actual workspace state and verify
 the task before reporting completion; any tool execution in the new turn
 still passes normal permissions, sandbox and audit checks.

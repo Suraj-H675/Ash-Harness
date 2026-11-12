@@ -1621,6 +1621,7 @@ class AshLoop:
             max_goal_continuations
         )
         self._last_turn_non_goal_tool_calls = 0
+        self._safe_edit_preflight = False
         self._default_session_permission_mode = PermissionMode(safety_tier)
         self._permission_mode_validator = permission_mode_validator
         self.safety_tier = safety_tier
@@ -6460,6 +6461,98 @@ class AshLoop:
 
             # Persist approved intent before execution so a fresh process can
             # distinguish an interrupted tool from an unstarted request.
+            if self._safe_edit_preflight:
+                from ash.tools.filesystem import ReplaceFileContentTool
+
+                # Only the exact built-in implementation may reject an edit
+                # before dispatch. A successful check is never an execution:
+                # the normal tool still runs with hooks, checkpoints, and
+                # fresh file validation (including race checks).
+                if type(tool) is ReplaceFileContentTool:
+                    refusal = await tool.preflight(**deepcopy(arguments))
+                    if refusal is not None:
+                        from ash.hooks.registry import HookRegistry
+
+                        hooks = self._active_hooks()
+                        no_effect_hooks = hooks is None or (
+                            type(hooks) is HookRegistry
+                            and not hooks.has_registered_hooks
+                        )
+                        no_effect_callbacks = (
+                            self.on_tool_approval is None
+                            and not self.ui.has_approval_callback
+                        )
+                        record.error = _bounded_durable_tool_error(
+                            refusal.error or "Edit preflight refused the request",
+                            fallback="Edit preflight refused the request",
+                        )
+                        # Durable proof: approved, never dispatched/executed,
+                        # and rejected by the trusted built-in before hooks
+                        # or middleware. External hooks may cause effects and
+                        # therefore never receive this safe-rejection mark.
+                        record.success = (
+                            False if no_effect_hooks and no_effect_callbacks else None
+                        )
+                        if not defer_terminal_persistence:
+                            self.session_store.save_tool_call(
+                                session.session_id,
+                                record,
+                                turn_id=(
+                                    self.turn_context.turn_id
+                                    if self.turn_context else None
+                                ),
+                            )
+                        self._append_tool_audit(
+                            session,
+                            action_type="file_write",
+                            target_resource=tool_name,
+                            details={
+                                "call_id": record.call_id,
+                                "arguments": record.arguments,
+                                "error": record.error,
+                                "preflight_rejected": True,
+                                "dispatched": False,
+                            },
+                            result="FAILURE",
+                        )
+                        self._emit_event({
+                            "type": "tool.error",
+                            **event_base,
+                            "error": record.error,
+                            "preflight_rejected": True,
+                            "dispatched": False,
+                        })
+                        result_payload = self._tool_result_payload(
+                            {
+                                "success": False,
+                                "output": refusal.output,
+                                "error": record.error,
+                            },
+                            record,
+                            defer_terminal_persistence=defer_terminal_persistence,
+                        )
+                        if persist_tool_messages:
+                            self._persist_deferred_tool_result(
+                                session=session,
+                                call=call,
+                                result=result_payload,
+                            )
+                        results.append(result_payload)
+                        # An attested no-dispatch refusal must not invoke an
+                        # extension callback that was registered after the
+                        # no-hook check. Unattested failures still notify
+                        # installed tool-error hooks through the normal path.
+                        if record.success is not False:
+                            await self._fire_tool_error_hook(
+                                session,
+                                call_id=record.call_id,
+                                tool_name=tool_name,
+                                arguments=record.arguments,
+                                error=record.error,
+                            )
+                        record_breaker_outcome(tool_name, False)
+                        continue
+
             self.session_store.save_tool_call(
                 session.session_id,
                 record,

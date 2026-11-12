@@ -169,6 +169,16 @@ class HookRegistry:
     def diagnostics(self) -> tuple[HookDiagnostic, ...]:
         return tuple(self._diagnostics)
 
+    @property
+    def has_registered_hooks(self) -> bool:
+        """Conservatively report callbacks that may have external effects."""
+        return bool(
+            self._pre_tool
+            or self._post_tool
+            or self._session_start
+            or any(self._lifecycle.values())
+        )
+
     def _record_failure(self, event: str, source: str, exc: BaseException) -> None:
         safe_error = redact_text(str(exc))[:4096]
         diagnostic = HookDiagnostic(
