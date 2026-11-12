@@ -110,6 +110,15 @@ encoding and exact line/column continuation. Models and users may explicitly
 request larger `max_chars` values (up to the existing hard limit) when a
 fuller inspection is actually necessary. This is a context-economy default,
 not a proven increase in independent coding benchmark pass rates.
+`search_text` also supports optional `context_lines=1..3` for nearby source
+lines around each match without a separate read request. Adjacent windows are
+merged, and the match count still controls `max_results`. Matching lines keep
+`path:line:text` locations; neighboring lines use `path-line-text` so callers
+can distinguish context. Context previews are limited to 512 characters per
+line and contextual searches have a 24,576-byte output capture limit. The
+default `context_lines=0` preserves existing match-only output. These bounded
+previews can save an inspection round trip; they do not replace explicit
+`read_file` slices for editing or prove a live coding-performance improvement.
 The `read_files` tool remains discoverable through `search_tools` at every
 context size rather than adding another default tool schema. It groups up to
 four focused file ranges into

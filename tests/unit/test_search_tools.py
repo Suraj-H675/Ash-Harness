@@ -309,6 +309,74 @@ async def test_search_text_returns_file_and_line(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_text_opt_in_context_merges_adjacent_match_windows(tmp_path) -> None:
+    (tmp_path / "app.py").write_text(
+        "header\nbefore\nneedle first\nbetween\nneedle second\nafter\ntail\n"
+    )
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+    result = await tool.run(pattern="needle", fixed_strings=True, context_lines=1)
+
+    assert result.success is True
+    assert result.truncated is False
+    assert result.output.splitlines() == [
+        "app.py-2-before",
+        "app.py:3:needle first",
+        "app.py-4-between",
+        "app.py:5:needle second",
+        "app.py-6-after",
+    ]
+    # Context rows never consume the match count or change default results.
+    limited = await tool.run(
+        pattern="needle", fixed_strings=True, context_lines=1, max_results=1
+    )
+    assert limited.output.splitlines() == [
+        "app.py-2-before",
+        "app.py:3:needle first",
+        "app.py-4-between",
+        "[truncated after 1 matches]",
+    ]
+    assert limited.truncated is True
+    default = await tool.run(pattern="needle", fixed_strings=True)
+    assert default.output == "app.py:3:needle first\napp.py:5:needle second"
+
+
+@pytest.mark.asyncio
+async def test_search_text_context_previews_are_bounded_and_reported(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(search_module, "MAX_SEARCH_CONTEXT_PREVIEW_CHARS", 12)
+    (tmp_path / "app.py").write_text(
+        "a" * 300 + "\nneedle\n" + "b" * 300 + "\n"
+    )
+    result = await SearchTextTool(SafetyGuard(tmp_path)).run(
+        pattern="needle", fixed_strings=True, context_lines=1
+    )
+    assert result.output.splitlines() == [
+        "app.py-1-" + "a" * 12 + " [context preview truncated]",
+        "app.py:2:needle",
+        "app.py-3-" + "b" * 12 + " [context preview truncated]",
+    ]
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
+async def test_search_text_context_caps_total_output_without_changing_default(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(search_module, "MAX_SEARCH_CONTEXT_CAPTURE_BYTES", 48)
+    (tmp_path / "app.py").write_text("before\nneedle\nafter\nneedle\n")
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+
+    contextual = await tool.run(pattern="needle", context_lines=1)
+    assert contextual.truncated is True
+    assert "[search output capture truncated after 48 bytes]" in contextual.output
+    assert "app.py:4:needle" not in contextual.output
+    ordinary = await tool.run(pattern="needle")
+    assert ordinary.truncated is False
+    assert ordinary.output == "app.py:2:needle\napp.py:4:needle"
+
+
+@pytest.mark.asyncio
 async def test_search_text_accepts_a_single_file_path(tmp_path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "app.py").write_text("first\nneedle here\n")
@@ -334,9 +402,10 @@ async def test_search_text_accepts_a_single_file_path(tmp_path) -> None:
     assert excluded.output == ""
 
 
+@pytest.mark.parametrize("context_lines", [0, 2])
 @pytest.mark.asyncio
 async def test_search_text_single_file_preserves_scoped_read_protection(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path, monkeypatch: pytest.MonkeyPatch, context_lines: int
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -357,7 +426,8 @@ async def test_search_text_single_file_preserves_scoped_read_protection(
 
     monkeypatch.setattr(search_module, "read_scoped_bytes", replace_with_symlink)
     result = await SearchTextTool(SafetyGuard(workspace)).run(
-        pattern="PRIVATE_NEEDLE", directory_path="app.py", fixed_strings=True
+        pattern="PRIVATE_NEEDLE", directory_path="app.py",
+        fixed_strings=True, context_lines=context_lines,
     )
 
     assert result.success is True

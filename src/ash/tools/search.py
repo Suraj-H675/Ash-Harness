@@ -6,6 +6,7 @@ import asyncio
 import fnmatch
 import io
 import stat
+from collections import deque
 from time import monotonic
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -34,6 +35,8 @@ DEFAULT_MAX_RESULTS = 200
 HARD_MAX_RESULTS = 2_000
 MAX_SEARCH_CAPTURE_BYTES = 2_000_000
 MAX_SEARCH_LINE_CHARS = 64 * 1024
+MAX_SEARCH_CONTEXT_PREVIEW_CHARS = 512
+MAX_SEARCH_CONTEXT_CAPTURE_BYTES = 24_576
 MAX_LIST_DIRECTORY_DEPTH = 4
 MAX_GLOB_SCAN_ENTRIES = 100_000
 MAX_GLOB_DEPTH = 32
@@ -290,14 +293,15 @@ class SearchTextArgs(BaseModel):
     fixed_strings: bool = False
     case_sensitive: bool = True
     max_results: int = Field(DEFAULT_MAX_RESULTS, ge=1, le=HARD_MAX_RESULTS)
+    context_lines: int = Field(0, ge=0, le=3)
 
 
 class SearchTextTool(BaseTool):
     name = "search_text"
     execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
-        "Search bounded workspace text with line locations; skip known generated "
-        "directories in broad searches, or set directory_path to search one."
+        "Search workspace text with file:line matches. Scope with directory_path; "
+        "use context_lines for nearby lines."
     )
     args_schema = SearchTextArgs
 
@@ -408,6 +412,7 @@ class SearchTextTool(BaseTool):
                     return
 
         matches: list[str] = []
+        match_count = 0
         output_bytes = 0
         output_limited = False
         match_limited = False
@@ -416,6 +421,30 @@ class SearchTextTool(BaseTool):
         skipped_file = False
         preview_truncated = False
         skipped_generated: set[str] = set()
+
+        def append_result(rendered: str) -> bool:
+            nonlocal output_bytes, output_limited
+            rendered_bytes = len(rendered.encode("utf-8"))
+            separator_bytes = 1 if matches else 0
+            capture_limit = (
+                MAX_SEARCH_CONTEXT_CAPTURE_BYTES
+                if args.context_lines
+                else MAX_SEARCH_CAPTURE_BYTES
+            )
+            if output_bytes + separator_bytes + rendered_bytes > capture_limit:
+                output_limited = True
+                return False
+            matches.append(rendered)
+            output_bytes += separator_bytes + rendered_bytes
+            return True
+
+        def context_preview(text: str, line_truncated: bool) -> str:
+            nonlocal preview_truncated
+            clipped = text[:MAX_SEARCH_CONTEXT_PREVIEW_CHARS]
+            if len(text) > len(clipped) or line_truncated:
+                preview_truncated = True
+                clipped += " [context preview truncated]"
+            return clipped
 
         def mark_scan_incomplete() -> None:
             nonlocal scan_incomplete
@@ -464,28 +493,44 @@ class SearchTextTool(BaseTool):
                     io.BytesIO(content),
                     encoding="utf-8",
                 ) as handle:
+                    preceding: deque[tuple[int, str, bool]] = deque(
+                        maxlen=args.context_lines
+                    )
+                    trailing_until = 0
+                    last_rendered_line = 0
                     for line_number, text, matched, line_truncated in bounded_lines(
                         handle
                     ):
-                        if not matched:
-                            continue
-                        if line_truncated:
-                            preview_truncated = True
-                            text += " [line preview truncated]"
-                        rendered = f"{relative}:{line_number}:{text}"
-                        rendered_bytes = len(rendered.encode("utf-8"))
-                        separator_bytes = 1 if matches else 0
-                        if (
-                            output_bytes + separator_bytes + rendered_bytes
-                            > MAX_SEARCH_CAPTURE_BYTES
-                        ):
-                            output_limited = True
-                            break
-                        if len(matches) >= args.max_results:
-                            match_limited = True
-                            break
-                        matches.append(rendered)
-                        output_bytes += separator_bytes + rendered_bytes
+                        if matched:
+                            if match_count >= args.max_results:
+                                match_limited = True
+                                break
+                            for previous_line, previous_text, previous_clipped in preceding:
+                                if previous_line <= last_rendered_line:
+                                    continue
+                                preview = context_preview(previous_text, previous_clipped)
+                                if not append_result(
+                                    f"{relative}-{previous_line}-{preview}"
+                                ):
+                                    break
+                                last_rendered_line = previous_line
+                            if output_limited:
+                                break
+                            if line_truncated:
+                                preview_truncated = True
+                                text += " [line preview truncated]"
+                            if not append_result(f"{relative}:{line_number}:{text}"):
+                                break
+                            match_count += 1
+                            last_rendered_line = line_number
+                            trailing_until = line_number + args.context_lines
+                        elif args.context_lines and line_number <= trailing_until:
+                            preview = context_preview(text, line_truncated)
+                            if not append_result(f"{relative}-{line_number}-{preview}"):
+                                break
+                            last_rendered_line = line_number
+                        if args.context_lines:
+                            preceding.append((line_number, text, line_truncated))
             except (OSError, UnicodeError, SafetyViolation):
                 skipped_file = True
                 continue
@@ -503,7 +548,7 @@ class SearchTextTool(BaseTool):
         elif output_limited:
             output += (
                 f"{separator}[search output capture truncated after "
-                f"{MAX_SEARCH_CAPTURE_BYTES} bytes]"
+                f"{MAX_SEARCH_CONTEXT_CAPTURE_BYTES if args.context_lines else MAX_SEARCH_CAPTURE_BYTES} bytes]"
             )
         elif match_limited:
             output += f"{separator}[truncated after {args.max_results} matches]"
