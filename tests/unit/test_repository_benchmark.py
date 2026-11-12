@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -22,6 +23,47 @@ assert _spec is not None and _spec.loader is not None
 bench = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = bench
 _spec.loader.exec_module(bench)
+
+
+def test_interrupted_repository_trial_reaps_isolated_child_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals: list[int] = []
+
+    class FakeChild:
+        pid = 32111
+        returncode = -9
+        waits = 0
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, *, timeout: int) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("ash", timeout)
+            return -9
+
+    child = FakeChild()
+    monkeypatch.setattr(bench.os, "killpg", lambda pid, sig: signals.append(sig))
+    assert bench._stop_evaluation_child(child) == -9
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_finished_repository_child_is_never_signalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Finished:
+        returncode = 0
+
+        def poll(self) -> int:
+            return 0
+
+    def unexpected_signal(pid: int, signum: int) -> None:
+        pytest.fail("completed trial must not receive process-group signals")
+
+    monkeypatch.setattr(bench.os, "killpg", unexpected_signal)
+    assert bench._stop_evaluation_child(Finished()) == 0
 
 
 def test_size_telemetry_excludes_tool_payload_and_private_file_path() -> None:

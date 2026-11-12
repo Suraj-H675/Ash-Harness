@@ -186,3 +186,47 @@ or its oracles, then validate any improvement on held-out tasks.
 Private receipts:
 `/var/tmp/ash-fair-urllib3-proxy-luna-65536-20261111-b2/result.json` and
 `/var/tmp/ash-plain-codex-urllib3-proxy-luna-65536-20261111-b1/grade.json`.
+
+## 2026-11-12: bounded parallel-scenario proof
+
+The new `devtools/parallel_repository_benchmarks.py` coordinates **at most
+two independent pairs** of the existing, independently graded runners. Each
+pair executes Ash and native *plain Codex* sequentially in independently
+provisioned source and authentication directories; pairs may overlap. It does
+not use a supervisory Codex model, Poteto, model-generated grading, shared
+worktrees, or unscored task prose. It preserves protected-path checks and
+verifies shared task, prompt, and visible/hidden oracle fingerprints. It
+alternates engine starting order across tasks and repeat indices.
+
+The initial pilot ran before the task-order alternation improvement. Both
+Ash runners started first, each followed by its own Codex runner. Both
+requested GPT-6 Luna xhigh, a 32,768-token context window, and a
+160-second child deadline. All four attempts passed their independent
+visible and hidden oracles, and both pairs passed receipt consistency checks:
+
+| Real-repo scenario | Ash CLI | Plain Codex CLI | Both independently pass? |
+|---|---:|---:|---|
+| `h11-chunk-footer` | 64.54s | 49.60s | Yes |
+| `urllib3-header-sanitization` | 54.87s | 42.22s | Yes |
+
+**Do not use these durations to rank engines.** Concurrent provider load
+is uncontrolled, as is the difference in each runner's system instructions,
+command tools, sandbox implementation, and model token accounting. Pair
+execution order was not balanced in this first pilot. The result demonstrates
+correctness, reproducible graded evidence, bounded concurrency, and working
+isolation, not a controlled performance winner. For latency comparisons use
+`--parallel 1`, repeat and alternate the order, and disclose the remaining
+model-routing and tool-parity limitations.
+
+Example, explicitly opt-in only (not a CI job or a background service):
+
+```sh
+PYTHONPATH=src .venv/bin/python devtools/parallel_repository_benchmarks.py \
+  --task h11-chunk-footer --task urllib3-header-sanitization \
+  --parallel 2 --repetitions 1 --timeout 160 --context-tokens 32768
+```
+
+Private pilot evidence:
+`/tmp/ash-paired-batch-9d62499f9fb0fad094d5/batch.json`.
+No credentials, source fixtures, or raw model transcripts are part of the
+tracked report. The benchmark remains optional and local-first.

@@ -584,6 +584,22 @@ def remove_reference_checkout(root: Path) -> None:
         raise RuntimeError("preflight reference checkout was not removed")
 
 
+def _stop_evaluation_child(child: subprocess.Popen[bytes]) -> int:
+    """Reap the isolated Ash subprocess after timeout or interruption."""
+    if child.poll() is not None:
+        return child.returncode
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, signum)
+        except ProcessLookupError:
+            pass
+        try:
+            return child.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            continue
+    return child.wait(timeout=5)
+
+
 def run_task(
     task_name: str,
     *,
@@ -705,12 +721,10 @@ def run_task(
                 exit_code = child.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                os.killpg(child.pid, signal.SIGTERM)
-                try:
-                    exit_code = child.wait(timeout=4)
-                except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    exit_code = child.wait(timeout=5)
+                exit_code = _stop_evaluation_child(child)
+            except BaseException:
+                _stop_evaluation_child(child)
+                raise
         cli_seconds = round(time.monotonic() - cli_started, 2)
 
         updated = snapshot_files(workspace)
