@@ -5923,6 +5923,97 @@ class SessionStore:
             _automatic_context_handoff=automatic,
         )
 
+    def tool_free_finalization_evidence(
+        self, session_id: str, *, expected_project_path: str | Path
+    ) -> tuple[str, list[dict[str, Any]]] | None:
+        """Return a single fully reconciled coding turn for *reporting only*.
+
+        This is deliberately not a context fork or permission to execute. It
+        admits known completed commands for a tool-free report, but never
+        allows such commands to be replayed by an automatic coding agent.
+        Call with the source session's runtime lease held.
+        """
+        allowed = AUTOMATIC_CONTEXT_HANDOFF_TOOLS | {"run_command", "search_tools"}
+        with closing(self._connect()) as conn:
+            source = conn.execute(
+                "SELECT project_key FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if source is None or source["project_key"] != normalize_project_path(
+                expected_project_path
+            ):
+                return None
+            turns = conn.execute(
+                "SELECT turn_id, status, recovery_json FROM turn_journal "
+                "WHERE session_id = ?", (session_id,)
+            ).fetchall()
+            if (
+                len(turns) != 1
+                or turns[0]["status"] != "interrupted"
+                or not self._reconciled_interrupted_turn_is_safe(
+                    turns[0]["recovery_json"]
+                )
+            ):
+                return None
+            turn_id = str(turns[0]["turn_id"])
+            if self._assistant_tool_calls_missing_results_in_connection(
+                conn, session_id, turn_id
+            ):
+                return None
+            for table, predicate in (
+                ("mcp_tasks", "status IN ('working', 'input_required')"),
+                ("mcp_task_handles", "1 = 1"),
+                ("file_checkpoints", "restored = 0 AND after_sha256 IS NULL"),
+            ):
+                if conn.execute(
+                    f"SELECT 1 FROM {table} WHERE session_id = ? AND {predicate} LIMIT 1",
+                    (session_id,),
+                ).fetchone():
+                    return None
+            rows = conn.execute(
+                "SELECT tool_name, arguments_json, result, error, approved, "
+                "dispatched, executed, success FROM tool_calls "
+                "WHERE session_id = ? AND turn_id = ? ORDER BY rowid",
+                (session_id, turn_id),
+            ).fetchall()
+            if not rows or len(rows) > 128:
+                return None
+            actions: list[dict[str, Any]] = []
+            last_edit_index = -1
+            last_command_index = -1
+            for index, row in enumerate(rows):
+                name = str(row["tool_name"])
+                if (
+                    name not in allowed
+                    or not bool(row["approved"])
+                    or not bool(row["dispatched"])
+                    or not bool(row["executed"])
+                    or row["success"] != 1
+                    or row["error"] is not None
+                ):
+                    return None
+                try:
+                    arguments = json.loads(row["arguments_json"])
+                except (TypeError, ValueError):
+                    return None
+                if not isinstance(arguments, dict):
+                    return None
+                if name in {
+                    "write_file", "replace_file_content", "replace_file_edits",
+                    "whole_edit", "apply_patch",
+                }:
+                    last_edit_index = index
+                if name == "run_command":
+                    last_command_index = index
+                actions.append({
+                    "tool": name,
+                    "arguments": arguments,
+                    "result": str(row["result"] or ""),
+                })
+            if last_edit_index < 0 or last_command_index <= last_edit_index:
+                return None
+            return turn_id, actions
+
     def install_native_context_checkpoint(
         self,
         session_id: str,

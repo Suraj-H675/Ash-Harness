@@ -5616,7 +5616,10 @@ async def _bootstrap_and_headless(
                 loop._safe_edit_preflight = True
                 try:
                     continued = await run_with_context_continuation(
-                        loop, prompt, max_continuations=context_continuations
+                        loop,
+                        prompt,
+                        max_continuations=context_continuations,
+                        allow_tool_free_finalization=True,
                     )
                 finally:
                     loop._safe_edit_preflight = False
@@ -5638,6 +5641,11 @@ async def _bootstrap_and_headless(
         }
         if context_continuations:
             payload["context_continuations"] = completed_restarts
+            payload["tool_free_finalized"] = bool(continued.tool_free_finalized)
+            if continued.tool_free_finalization_usage is not None:
+                payload["tool_free_finalization_usage"] = (
+                    continued.tool_free_finalization_usage
+                )
         if turn_time_budget is not None:
             payload["turn_time_budget_seconds"] = turn_time_budget
         recovery = startup_recovery or (

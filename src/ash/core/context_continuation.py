@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from ash.context.history import ContextBudgetExceededError
 from ash.core.checkpoints import recover_interrupted_turns
+from ash.core.session import SessionForkConflictError
 
 if TYPE_CHECKING:
     from ash.core.loop import AshLoop
@@ -35,6 +36,8 @@ class ContinuationResult:
     response: str
     session_id: str
     context_continuations: int
+    tool_free_finalized: bool = False
+    tool_free_finalization_usage: dict[str, int] | None = None
 
 
 async def run_with_context_continuation(
@@ -42,6 +45,7 @@ async def run_with_context_continuation(
     original_task: str,
     *,
     max_continuations: int,
+    allow_tool_free_finalization: bool = False,
 ) -> ContinuationResult:
     """Run once, then restart only on safe, opaque-state context overflow.
 
@@ -98,12 +102,37 @@ async def run_with_context_continuation(
                     "continuing; no prior tool calls or approvals are "
                     "authorized for replay."
                 )
-                child = loop.session_store.restart_context_session(
-                    parent.session_id,
-                    expected_project_path=loop.project_root,
-                    user_handoff=handoff,
-                    automatic=True,
-                )
+                try:
+                    child = loop.session_store.restart_context_session(
+                        parent.session_id,
+                        expected_project_path=loop.project_root,
+                        user_handoff=handoff,
+                        automatic=True,
+                    )
+                except SessionForkConflictError:
+                    if not allow_tool_free_finalization:
+                        raise
+                    evidence = loop.session_store.tool_free_finalization_evidence(
+                        parent.session_id, expected_project_path=loop.project_root
+                    )
+                    if (
+                        evidence is None
+                        or loop.session_store.verify_audit_log(parent.session_id)
+                    ):
+                        raise
+                    from ash.core.tool_free_finalization import finalize_tool_free
+
+                    source_turn_id, actions = evidence
+                    report = await finalize_tool_free(
+                        loop, original_task, source_turn_id, actions
+                    )
+                    return ContinuationResult(
+                        response=report.response,
+                        session_id=parent.session_id,
+                        context_continuations=completed_restarts,
+                        tool_free_finalized=True,
+                        tool_free_finalization_usage=report.usage,
+                    )
             finally:
                 lease.close()
             await loop.start_session(child.session_id)

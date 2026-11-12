@@ -296,5 +296,6 @@ async def test_headless_json_reports_child_session_after_safe_context_restart(
     assert rows[0]["type"] == "turn.completed"
     assert rows[0]["session_id"] != loop.original_session_id
     assert rows[0]["context_continuations"] == 1
+    assert rows[0]["tool_free_finalized"] is False
     assert rows[0]["response"] == "Completed after verifying actual workspace"
     assert loop._safe_edit_preflight is False

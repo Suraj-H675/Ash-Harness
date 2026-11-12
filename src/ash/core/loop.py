@@ -5204,6 +5204,7 @@ class AshLoop:
         provider_tools: dict[str, BaseTool] | None = None,
         provider_tool_schema: list[dict[str, Any]] | None = None,
         session_id: str | None = None,
+        allow_tool_calls: bool = True,
     ) -> CompletionOutcome:
         """Stream one completion with normalized token and cache usage."""
 
@@ -5376,6 +5377,12 @@ class AshLoop:
                                     f"{request_timeout:g} seconds"
                                 ) from exc
                             stream_chunk_count += 1
+                            if not allow_tool_calls and (
+                                chunk.tool_call_delta or chunk.native_tool_calls
+                            ):
+                                raise ProviderCompletionError(
+                                    "tool-free model completion attempted a tool call"
+                                )
                             if stream_chunk_count > MAX_PROVIDER_STREAM_CHUNKS:
                                 raise ProviderCompletionError(
                                     "provider stream exceeded "
@@ -5807,6 +5814,10 @@ class AshLoop:
             tool_calls = [
                 _normalize_native_tool_call(call) for call in native_tool_calls_from_api
             ]
+        if not allow_tool_calls and tool_calls:
+            raise ProviderCompletionError(
+                "tool-free model completion attempted a tool call"
+            )
 
         return CompletionOutcome(
             text="".join(text_chunks),

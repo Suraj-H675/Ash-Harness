@@ -184,3 +184,23 @@ nor failed tests, and stops after the configured number of restarts. A
 failure can leave partial edits in the workspace; always inspect the
 recorded session lineage and working tree. It must not be interpreted as an
 exactly-once guarantee for arbitrary external actions.
+
+If a new one-shot coding turn with this option enabled already made **known
+successful local edits and a known successful authorized shell command**, but
+exhausts opaque context before producing its final response, the ordinary
+automatic coding-context fork remains forbidden: commands must never be
+silently repeated. When its one interrupted turn is fully reconciled, all
+action outcomes are known and successful, no external plugin/task or file
+checkpoint remains uncertain, and its audit chain is intact, Ash may use the
+remaining context-continuation allowance for **one tool-free final report**.
+This is a fresh, bounded model request containing only the original task and
+compact redacted durable evidence. No tool schemas, previous opaque reasoning,
+shell privileges or approval grants are supplied. The old coding turn stays
+interrupted in the journal; its tool actions are neither imported nor replayed.
+Ash records a separate completed reporting turn with explicit provenance and
+sets `tool_free_finalized=true` in one-shot JSON output. The report must
+distinguish a successful recorded command from proof that every user
+requirement was met. Missing, failed, ambiguous or unrecognized actions,
+failed provider finalization, and explicitly configured cumulative turn-token
+caps still fail closed. This does not certify the correctness of arbitrary
+code or make finalization a replacement for testing.
