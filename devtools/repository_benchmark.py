@@ -663,6 +663,72 @@ assert ordinary.number == 9
 """
 
 
+PACKAGING_PICKLE_VISIBLE = r"""import pickle
+import sys
+sys.path.insert(0, 'src')
+from packaging.metadata import InvalidMetadata
+from packaging.dependency_groups import CyclicDependencyGroup
+
+metadata_error = InvalidMetadata('version', 'invalid version field')
+metadata_copy = pickle.loads(pickle.dumps(metadata_error))
+assert isinstance(metadata_copy, InvalidMetadata)
+assert metadata_copy.field == 'version'
+assert str(metadata_copy) == 'invalid version field'
+assert metadata_copy.args == metadata_error.args
+
+cycle_error = CyclicDependencyGroup('main', 'docs', 'main')
+cycle_copy = pickle.loads(pickle.dumps(cycle_error))
+assert isinstance(cycle_copy, CyclicDependencyGroup)
+assert (
+    cycle_copy.requested_group,
+    cycle_copy.group,
+    cycle_copy.include_group,
+) == ('main', 'docs', 'main')
+assert str(cycle_copy) == str(cycle_error)
+"""
+
+
+PACKAGING_PICKLE_HIDDEN = r"""import copy
+import pickle
+import sys
+sys.path.insert(0, 'src')
+from packaging.metadata import InvalidMetadata
+from packaging.dependency_groups import CyclicDependencyGroup
+
+examples = [
+    InvalidMetadata('name', 'invalid metadata: café'),
+    InvalidMetadata('requires_python', ''),
+    CyclicDependencyGroup('root', 'root', 'root'),
+    CyclicDependencyGroup('alpha', 'bravo', 'charlie'),
+]
+for original in examples:
+    for protocol in (0, 1, 2, pickle.HIGHEST_PROTOCOL):
+        clone = pickle.loads(pickle.dumps(original, protocol=protocol))
+        assert type(clone) is type(original)
+        assert str(clone) == str(original)
+        assert clone.args == original.args
+        if isinstance(original, InvalidMetadata):
+            assert clone.field == original.field
+        else:
+            assert (
+                clone.requested_group, clone.group, clone.include_group
+            ) == (
+                original.requested_group, original.group, original.include_group
+            )
+    for cloner in (copy.copy, copy.deepcopy):
+        clone = cloner(original)
+        assert type(clone) is type(original)
+        assert str(clone) == str(original)
+        if isinstance(original, InvalidMetadata):
+            assert clone.field == original.field
+        else:
+            assert clone.include_group == original.include_group
+
+assert str(InvalidMetadata('version', 'bad')) == 'bad'
+assert 'self' in str(CyclicDependencyGroup('self', 'self', 'self'))
+"""
+
+
 @dataclass(frozen=True)
 class RepositoryTask:
     source: str
@@ -678,6 +744,36 @@ class RepositoryTask:
 
 
 TASKS = {
+    "packaging-exception-pickle": RepositoryTask(
+        source="pypa/packaging",
+        upstream="https://github.com/pypa/packaging.git",
+        base_sha="458b0ae53e5a4261df851657d147e590b4546eb2",
+        reference_fix_sha="1a9c4cb6b6aac7fb6137fcdc4f440af912d8d87f",
+        editable=frozenset({
+            "src/packaging/metadata.py",
+            "src/packaging/dependency_groups.py",
+        }),
+        visible_script="qa_visible.py",
+        visible_source=PACKAGING_PICKLE_VISIBLE,
+        hidden_source=PACKAGING_PICKLE_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Fix an exception serialization compatibility defect in this "
+            "pinned Python packaging repository. Two public ValueError "
+            "subclasses, InvalidMetadata and CyclicDependencyGroup, store "
+            "constructor fields but pass only a formatted error message to "
+            "ValueError. As a result, Python pickle and copy round trips "
+            "cannot reconstruct them from .args. Make both exceptions "
+            "round-trip safely, preserving each class, all constructor "
+            "fields, human-readable message, and ordinary exception behavior. "
+            "Review qa_visible.py and the existing class definitions; edit "
+            "ONLY src/packaging/metadata.py and "
+            "src/packaging/dependency_groups.py. Execute exactly "
+            "python3 -B qa_visible.py with run_command afterward. "
+            "No other commands are authorized. Do not change tests, metadata, "
+            "or other public APIs."
+        ),
+    ),
     "attrs-generator-setattr-hooks": RepositoryTask(
         source="python-attrs/attrs",
         upstream="https://github.com/python-attrs/attrs.git",
@@ -1344,8 +1440,10 @@ def main() -> int:
         parser.error("invalid exact ChatGPT model ID")
     if not 30 <= args.timeout <= 300:
         parser.error("timeout must be between 30 and 300 seconds")
-    if not 8192 <= args.context_tokens <= 65536:
-        parser.error("context budget must be between 8192 and 65536")
+    # The production default is 128K. The evaluation runner must be able to
+    # exercise it without lifting provider, approval, or resource boundaries.
+    if not 8192 <= args.context_tokens <= 131072:
+        parser.error("context budget must be between 8192 and 131072")
     if args.turn_token_budget != 0 and not 2000 <= args.turn_token_budget <= 250000:
         parser.error("turn budget must be 0 or between 2000 and 250000")
     if args.turn_time_budget is not None and not 30 <= args.turn_time_budget <= args.timeout:

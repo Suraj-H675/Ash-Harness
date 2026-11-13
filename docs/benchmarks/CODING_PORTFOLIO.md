@@ -7,8 +7,8 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These thirteen fixtures already have runnable code and grading logic. They **do not
-constitute thirteen independent real repositories**; synthetic and real-repository
+These fourteen fixtures already have runnable code and grading logic. They **do not
+constitute fourteen independent real repositories**; synthetic and real-repository
 lanes must remain separate. Do not pool their scores into a single win rate.
 
 | ID | Existing task | Lane | What it exercises | Latest evidence / next action |
@@ -20,6 +20,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Initial pair: Ash fail / Codex pass**; Ash stopped at safe context limit after an incomplete edit |
 | R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Initial pair: Ash timeout / Codex pass**; no Ash source edit or verification |
 | R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Initial pair: both fail**; Ash 32K protected-context overflow after one edit, Codex visible pass but hidden fail; Ash 64K ablation reaches 120K total-turn cap. Park fixture-specific remediation. |
+| R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | Independently red/green proven; production-default Ash evaluation pending |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -33,7 +34,7 @@ refactor with stable public behavior, dependency/interface compatibility, and
 larger-codebase navigation. R7 now contributes a new codebase and a two-module
 feature, but does not fill all these gaps. Choose each base/fix pin and sealed
 oracle only after provenance and red-original/green-reference verification.
-The present **13-case inventory** is not a stable reliability benchmark;
+The present **14-case inventory** is not a stable reliability benchmark;
 repetitions and broader workflow diversity remain necessary.
 
 **Evidence checkpoint:** Before this workflow change, the locally retained
@@ -121,6 +122,21 @@ provider context. No production harness change or repeated retry is warranted
 from this one task. Detailed receipts and the ablation decision are in the
 private, Git-excluded scenario journal.
 
+**R8 provenance / production-budget question (2026-11-13):** The independent
+`pypa/packaging` repository (sixth upstream project) provides a genuine
+two-module compatibility fix in commit
+`1a9c4cb6b6aac7fb6137fcdc4f440af912d8d87f`, relative to original
+`458b0ae53e5a4261df851657d147e590b4546eb2`. Separately authored,
+standard-library-only visible/hidden checks test pickling and copying
+`InvalidMetadata` and `CyclicDependencyGroup`. Both oracles are **red on the
+original and green on the reference** in the existing isolated networkless
+harness. Only `src/packaging/metadata.py` and
+`src/packaging/dependency_groups.py` are editable. The real-repository runner
+now permits up to **131,072** requested context tokens to evaluate Ash at its
+normal **128,000** configured request context and **zero cumulative turn cap**
+under a separate bounded external time limit. This is evaluation tooling,
+not a change to Ash production context policy.
+
 ## Evaluation and prioritization contract
 
 1. **Freeze the task** before a run: objective, task inputs, source revision,
@@ -171,6 +187,9 @@ tool history / early editing decisions across genuinely different tasks.
 Prioritize product-correctness, recovery safety, and resource economy over
 another case-specific attempt to get a green benchmark. Repetitions require
 a predeclared variance or causal question, not a desired score.
+
+R8 is the next distinct pinned task for a production-budget Ash trial,
+without reopening R7 or changing its grade.
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate

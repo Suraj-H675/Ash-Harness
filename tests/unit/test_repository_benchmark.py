@@ -196,6 +196,11 @@ def test_size_telemetry_excludes_tool_payload_and_private_file_path() -> None:
             "https://github.com/python-attrs/attrs.git",
             {"src/attr/_compat.py", "src/attr/_make.py"},
         ),
+        (
+            "packaging-exception-pickle",
+            "https://github.com/pypa/packaging.git",
+            {"src/packaging/metadata.py", "src/packaging/dependency_groups.py"},
+        ),
     ],
 )
 def test_upstream_tasks_are_pinned_and_oracles_sealed(
@@ -411,6 +416,7 @@ def test_reference_checkout_symlink_refused_without_deletion(tmp_path: Path) -> 
         (["--chatgpt-model", "!invalid"], "invalid exact ChatGPT model ID"),
         (["--chatgpt-model", "gpt-6-luna", "--timeout", "500"], "timeout must"),
         (["--chatgpt-model", "gpt-6-luna", "--context-tokens", "5"], "context budget"),
+        (["--chatgpt-model", "gpt-6-luna", "--context-tokens", "131073"], "context budget"),
     ],
 )
 def test_real_repo_cli_rejects_invalid_options_without_evidence(
