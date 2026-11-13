@@ -144,6 +144,17 @@ Neither code 0 nor `turn.completed` proves that the user's requested task
 passed independent tests or review. Interactive sessions retain their
 existing process-exit behavior.
 
+For a fresh one-shot `ash -p --require-check-command EXACT_COMMAND`, Ash also
+includes `required_check_satisfied` in the final JSON/stream-JSON result.
+Only confirmed successful execution of the exact operator-selected command
+after the last recorded edit, with complete safe tool history, sets this to
+`true`; otherwise it is `false`, the result carries a review warning, and
+the CLI exits with code **1** even if the model claimed success. Streaming
+completion is withheld until this evidence check finishes. The ordinary
+runtime `turn.completed` event retains its execution-boundary meaning and
+there is no automatic test execution or replay. This flag does not establish
+correctness beyond the selected command and does not change ACP/A2A behavior.
+
 Protocol adapters must not confuse this terminal boundary with task success.
 On ACP, `token_budget` maps to the standard `max_tokens` stop reason and
 `iteration_limit` maps to `max_turn_requests`. Circuit-breaker stops and a

@@ -6182,7 +6182,7 @@ class SessionStore:
                     return None
             calls = conn.execute(
                 "SELECT tool_name, arguments_json, approved, dispatched, "
-                "executed, success, error FROM tool_calls "
+                "executed, success, exit_code, error FROM tool_calls "
                 "WHERE session_id = ? AND turn_id = ? ORDER BY rowid",
                 (session_id, turn_id),
             ).fetchall()
@@ -6203,7 +6203,10 @@ class SessionStore:
                 if name in editing:
                     edited += 1
                 if index == len(calls) - 1:
-                    if name != "run_command" or edited == 0:
+                    if (
+                        name != "run_command" or edited == 0
+                        or row["exit_code"] != 0
+                    ):
                         return None
                     try:
                         args = json.loads(row["arguments_json"])
@@ -6216,6 +6219,110 @@ class SessionStore:
                     ):
                         return None
             return edited
+
+    def required_check_command_succeeded(
+        self,
+        session_id: str,
+        *,
+        expected_project_path: str | Path,
+        command_line: str,
+    ) -> bool:
+        """Verify a required owner-selected check from completed turn evidence.
+
+        Unlike the optional early-report checkpoint, a failed check followed
+        by a successful repair and exact recheck is acceptable. Never execute
+        the command or infer success from model text, a stale pre-edit check,
+        a result without an exit status, or an ambiguous side effect.
+        """
+        if not command_line or len(command_line) > 4096:
+            return False
+        editing = {
+            "write_file", "replace_file_content", "replace_file_edits",
+            "whole_edit", "apply_patch",
+        }
+        allowed = AUTOMATIC_CONTEXT_HANDOFF_TOOLS | {"run_command", "search_tools"}
+        with closing(self._connect()) as conn:
+            session = conn.execute(
+                "SELECT project_key FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None or session["project_key"] != normalize_project_path(
+                expected_project_path
+            ):
+                return False
+            turns = conn.execute(
+                "SELECT turn_id, status FROM turn_journal WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            if len(turns) != 1 or turns[0]["status"] != "completed":
+                return False
+            turn_id = str(turns[0]["turn_id"])
+            if self._assistant_tool_calls_missing_results_in_connection(
+                conn, session_id, turn_id
+            ):
+                return False
+            for table, predicate in (
+                ("mcp_tasks", "status IN ('working', 'input_required')"),
+                ("mcp_task_handles", "1 = 1"),
+                ("file_checkpoints", "restored = 0 AND after_sha256 IS NULL"),
+            ):
+                if conn.execute(
+                    f"SELECT 1 FROM {table} WHERE session_id = ? AND {predicate} LIMIT 1",
+                    (session_id,),
+                ).fetchone():
+                    return False
+            calls = conn.execute(
+                "SELECT tool_name, arguments_json, approved, dispatched, "
+                "executed, success, exit_code, error FROM tool_calls "
+                "WHERE session_id = ? AND turn_id = ? ORDER BY rowid LIMIT 257",
+                (session_id, turn_id),
+            ).fetchall()
+        if len(calls) < 2 or len(calls) > 256:
+            return False
+        edited = False
+        checked = False
+        for row in calls:
+            name = str(row["tool_name"])
+            if name not in allowed:
+                return False
+            if (
+                not row["approved"] or not row["dispatched"]
+                or not row["executed"] or row["success"] is None
+            ):
+                return False
+            if name in editing:
+                if row["success"] != 1 or row["error"] is not None:
+                    return False
+                edited = True
+                checked = False
+            elif name == "run_command":
+                # A shell command can mutate files independently of Ash's
+                # file tools. Every shell invocation invalidates prior proof.
+                checked = False
+                # No exit status means an ambiguous execution outcome, even
+                # if another command later reports a passing test. A known
+                # failure must carry a nonzero exit code, not an unconfirmed
+                # process result or a contradictory tool success flag.
+                exit_code = row["exit_code"]
+                if exit_code is None or bool(row["success"]) != (exit_code == 0):
+                    return False
+                if row["error"] is not None and row["success"] == 1:
+                    return False
+                if row["success"] == 1 and edited:
+                    try:
+                        args = json.loads(row["arguments_json"])
+                    except (TypeError, ValueError):
+                        return False
+                    checked = (
+                        isinstance(args, dict)
+                        and args.get("command_line") == command_line
+                        and args.get("cwd") in (None, "", ".")
+                    )
+            elif row["success"] != 1 or row["error"] is not None:
+                return False
+        return edited and checked and self.auto_commit_verification_blocker(
+            session_id, turn_id
+        ) is None
 
     def install_native_context_checkpoint(
         self,

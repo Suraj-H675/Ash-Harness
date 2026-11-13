@@ -1610,6 +1610,17 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         ),
     )
     parser.add_argument(
+        "--require-check-command",
+        type=str,
+        default=None,
+        metavar="EXACT_COMMAND",
+        help=(
+            "For a fresh one-shot coding task, return a nonzero exit status "
+            "unless this exact owner-selected check executes successfully "
+            "after the final recorded edit. Never executes or approves a command."
+        ),
+    )
+    parser.add_argument(
         "--json-schema",
         type=Path,
         default=None,

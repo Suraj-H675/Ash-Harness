@@ -3209,6 +3209,27 @@ def _main_impl(argv: list[str] | None = None) -> int:
             parser.error("--report-after-command cannot be combined with --json-schema")
         if not args.report_after_command.strip() or len(args.report_after_command) > 4096:
             parser.error("--report-after-command must be 1–4096 characters")
+    if args.require_check_command is not None:
+        if (
+            args.prompt is None or args.command is not None
+            or args.session is not None or args.continue_session
+            or args.resume is not None
+        ):
+            parser.error("--require-check-command requires a fresh one-shot prompt")
+        if (
+            args.report_after_command is not None
+            or args.json_schema is not None
+            or args.context_continuations
+        ):
+            parser.error(
+                "--require-check-command cannot be combined with checkpoint, "
+                "JSON-schema or context-continuation options"
+            )
+        if (
+            not args.require_check_command.strip()
+            or len(args.require_check_command) > 4096
+        ):
+            parser.error("--require-check-command must be 1–4096 characters")
 
     if args.command == "crew":
         from ash.commands.crew import run_crew_command
@@ -5325,6 +5346,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         parser.error("--context-continuations requires a new one-shot session")
     if args.report_after_command is not None and startup_session_id is not None:
         parser.error("--report-after-command requires a fresh one-shot session")
+    if args.require_check_command is not None and startup_session_id is not None:
+        parser.error("--require-check-command requires a fresh one-shot session")
     if args.prompt is not None:
         from ash.ui.headless import HeadlessUI
 
@@ -5371,6 +5394,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                     context_continuations=args.context_continuations,
                     turn_time_budget=args.turn_time_budget,
                     report_after_command=args.report_after_command,
+                    require_check_command=args.require_check_command,
                 )
             )
         except KeyboardInterrupt:
@@ -5404,6 +5428,7 @@ async def _headless_with_sigterm_cleanup(
     context_continuations: int = 0,
     turn_time_budget: int | None = None,
     report_after_command: str | None = None,
+    require_check_command: str | None = None,
 ) -> int:
     return await _with_sigterm_cleanup(
         lambda: _bootstrap_and_headless(
@@ -5417,6 +5442,7 @@ async def _headless_with_sigterm_cleanup(
             context_continuations=context_continuations,
             turn_time_budget=turn_time_budget,
             report_after_command=report_after_command,
+            require_check_command=require_check_command,
         )
     )
 
@@ -5525,6 +5551,7 @@ async def _bootstrap_and_headless(
     context_continuations: int = 0,
     turn_time_budget: int | None = None,
     report_after_command: str | None = None,
+    require_check_command: str | None = None,
 ) -> int:
     from ash.exceptions import classify_exception, format_error
     from ash.commands.attachments import PreparedAttachments, prepare_file_mentions
@@ -5609,6 +5636,10 @@ async def _bootstrap_and_headless(
                 f"{prompt}\n\nReturn only JSON matching this schema:\n"
                 f"{json.dumps(schema, ensure_ascii=False)}"
             )
+        if require_check_command is not None:
+            defer_completion = getattr(ui, "set_defer_runtime_completion", None)
+            if callable(defer_completion):
+                defer_completion(True)
         user_metadata = prepared.message_metadata()
         completed_restarts = 0
         final_session_id = session.session_id
@@ -5619,7 +5650,11 @@ async def _bootstrap_and_headless(
             if turn_time_budget is not None
             else nullcontext()
         )
+        # The required check is evaluated after the model's final answer.
+        # Stopping at an early passing test could skip subsequently planned
+        # edits, so only the explicitly early-reporting mode uses that gate.
         loop._owner_report_after_command = report_after_command
+        loop._owner_required_check_command = require_check_command
         try:
             async with budget_scope:
                 if context_continuations:
@@ -5655,6 +5690,7 @@ async def _bootstrap_and_headless(
                     )
         finally:
             loop._owner_report_after_command = None
+            loop._owner_required_check_command = None
         payload = {
             "response": response,
             "session_id": final_session_id,
@@ -5675,6 +5711,26 @@ async def _bootstrap_and_headless(
             payload["owner_command_checkpoint"] = bool(
                 loop._last_turn_owner_checkpoint
             )
+        if require_check_command is not None:
+            required_satisfied = (
+                loop._last_turn_stop_reason == "completed"
+                and loop.session_store.required_check_command_succeeded(
+                    final_session_id,
+                    expected_project_path=loop.project_root,
+                    command_line=require_check_command,
+                )
+                and not loop.session_store.verify_audit_log(final_session_id)
+            )
+            payload["required_check_satisfied"] = bool(required_satisfied)
+            if not required_satisfied:
+                payload["response"] = (
+                    f"{response}\n\n"
+                    "[Required verification not established. The exact operator-"
+                    "selected check did not have a confirmed passing result after "
+                    "the final edit, or the turn stopped unfinished. Review edits "
+                    "and test evidence before trusting this result.]"
+                ).strip()
+                result_code = 1
         recovery = startup_recovery or (
             loop.recovery_summary if loop.recovered_turns else None
         )

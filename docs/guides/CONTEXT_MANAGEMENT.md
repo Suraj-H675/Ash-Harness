@@ -75,6 +75,42 @@ An adapter that does not accept a response ceiling can only use the reserve for
 input admission; the ChatGPT-plan preview route currently does not transmit a
 maximum response value.
 
+### Required coding verification (opt-in, separate from early reporting)
+
+For a fresh one-shot coding task, an operator who wants **a failed process
+status unless a specific check passed after the final edit** can use:
+
+```shell
+ash -p "Fix both modules and verify the change" \
+  --require-check-command "python3 -B qa_visible.py"
+```
+
+Unlike `--report-after-command`, this mode **does not stop after the first
+passing check**. The agent can finish other intended edits and its final
+report. Ash then independently checks its durable, audited tool record: known
+successful workspace edits, an exact authorized `run_command` invocation from
+the project root with exit code 0 after the last edit, no later shell commands
+or edits, and no ambiguous or unresolved tool effects. Earlier failed commands
+must be corrected and successfully rechecked; a passing result from before a
+later edit cannot certify the later state. The check is read-only against
+recorded evidence: Ash does **not** execute the command, retry tests, grant
+permissions, or silently resume a session. It always obeys the existing user
+approval, sandbox and command policy.
+
+The one-shot process returns **exit 1** when this contract is not established,
+even if the model says it passed, and includes `required_check_satisfied=false`
+and a review warning in its structured result. A verified check returns exit
+0 and `required_check_satisfied=true`. Streaming JSON defers the terminal
+completion envelope until this evidence is evaluated, avoiding a premature
+success signal. Neither value proves that all other behavior or hidden tests
+pass; it certifies only the operator's selected command outcome after recorded
+edits. The flag is not interchangeable with the optional early-report mode,
+and cannot be combined with session resumption, automatic context
+continuations, JSON-schema output or `--report-after-command`.
+If `auto_commit` is enabled, Ash leaves these edits uncommitted instead of
+committing before the required check evidence is finalized. The operator can
+review and commit after the successful one-shot result.
+
 ## Budget buckets
 
 The default allocation is:

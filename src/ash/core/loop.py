@@ -1629,6 +1629,7 @@ class AshLoop:
         # CLI-owned, optional verification boundary. Never inferred from
         # model text, repository files, or a successful arbitrary command.
         self._owner_report_after_command: str | None = None
+        self._owner_required_check_command: str | None = None
         self._last_turn_owner_checkpoint = False
         self._default_session_permission_mode = PermissionMode(safety_tier)
         self._permission_mode_validator = permission_mode_validator
@@ -3809,6 +3810,27 @@ class AshLoop:
                 )
                 continuity_notice.mark_runtime_only()
                 self.current_session.messages.append(continuity_notice)
+            required_check = self._owner_required_check_command
+            if required_check:
+                # Only the operator can select this exact verification
+                # contract. Remind the model, but do not run or approve it.
+                check_notice = Message(
+                    role="system",
+                    content=(
+                        "Ash owner-required verification: this fresh coding turn "
+                        "cannot be reported as verified unless the exact "
+                        "operator-selected command is executed successfully "
+                        "through the normally authorized run_command tool "
+                        "after the final source edit. The required command is "
+                        f"{required_check!r}. "
+                        "This instruction grants no command permission. If "
+                        "the command fails, repair the code and request a "
+                        "fresh check; do not claim verification otherwise."
+                    ),
+                    timestamp=_utc_now(),
+                )
+                check_notice.mark_runtime_only()
+                self.current_session.messages.append(check_notice)
             initial_goal = self.current_goal
             goal_chain = initial_goal is not None and initial_goal.can_auto_continue
             usage_steps: list[dict[str, int | float | str | bool]] = []
@@ -4702,6 +4724,13 @@ class AshLoop:
 
         if self.auto_commit:
             commit_paths = sorted(self._turn_modified_paths)
+            if commit_paths and self._owner_required_check_command:
+                self.ui.console.print(
+                    "auto_commit skipped: owner-required verification is "
+                    "evaluated after turn finalization; edits were left "
+                    "uncommitted for review."
+                )
+                commit_paths = []
             if commit_paths and self._last_turn_stop_reason != "completed":
                 self.ui.console.print(
                     "auto_commit skipped: turn did not finish normally; "

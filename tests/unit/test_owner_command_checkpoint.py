@@ -172,6 +172,102 @@ async def test_one_shot_cli_emits_structured_owner_checkpoint(tmp_path: Path) ->
     assert "hidden checks" in report["response"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case,expect_success", [
+    ("unverified", False),
+    ("passed", True),
+    ("wrong_command", False),
+    ("failed_check", False),
+    ("passed_then_edit", False),
+    ("failed_then_repaired_and_passed", True),
+])
+async def test_owner_required_check_exposes_durable_verified_success_not_model_claim(
+    tmp_path: Path, case: str, expect_success: bool,
+) -> None:
+    """A normal model final is not proof the requested command passed."""
+
+    class RequiredCheckProvider(ProviderABC):
+        model_name = "required-check-provider"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                assert any(
+                    "Ash owner-required verification:" in str(message.get("content", ""))
+                    and COMMAND in str(message.get("content", ""))
+                    for message in messages
+                )
+            steps: list[tuple[str, str]] = [("edit", "")]
+            if case == "unverified":
+                steps = [("edit", "")]
+            elif case == "failed_then_repaired_and_passed":
+                steps = [("edit", ""), ("check", COMMAND), ("edit", ""), ("check", COMMAND)]
+            elif case == "passed_then_edit":
+                steps = [("edit", ""), ("check", COMMAND), ("edit", "")]
+            else:
+                steps.append(("check", "python3 wrong.py" if case == "wrong_command" else COMMAND))
+            if self.calls > len(steps):
+                yield StreamChunk(content="Everything passed", is_done=True)
+                return
+            step, command = steps[self.calls - 1]
+            if step == "edit":
+                tool = "replace_file_content"
+                arguments: dict[str, object] = {
+                    "file_path": "module.py",
+                    "target_content": "before = 0" if self.calls == 1 else "after = 1",
+                    "replacement_content": "after = 1" if self.calls == 1 else "after = 2",
+                }
+            else:
+                tool = "run_command"
+                arguments = {"command_line": command}
+            yield StreamChunk(is_done=True, native_tool_calls=[{
+                "id": f"required-{self.calls}", "name": tool, "arguments": arguments,
+            }])
+
+    provider = RequiredCheckProvider()
+    loop, check = make_loop(tmp_path, provider=provider, passes=case != "failed_check")
+    if case == "failed_then_repaired_and_passed":
+        original_run = check.run
+
+        async def fail_once(**kwargs):
+            check.passes = check.executions > 0
+            return await original_run(**kwargs)
+
+        check.run = fail_once  # type: ignore[method-assign]
+    stream = io.StringIO()
+    loop.ui = HeadlessUI(output_format="json", stream=stream)
+    code = await _bootstrap_and_headless(
+        loop, SimpleNamespace(attachment_token_budget=1024),
+        prompt="Fix and verify this module", session_id=None,
+        ui=loop.ui, require_check_command=COMMAND,
+    )
+    assert code == (0 if expect_success else 1)
+    response = json.loads(stream.getvalue())
+    assert response["required_check_satisfied"] is expect_success
+    assert response["type"] == "turn.completed"
+    if not expect_success:
+        assert "Required verification" in response["response"]
+    # The model's own text is never accepted as verification evidence.
+    assert "Everything passed" in response["response"] or expect_success
+    if case == "passed":
+        assert provider.calls == 3  # Final model completes the whole task.
+    if case == "failed_then_repaired_and_passed":
+        assert provider.calls == 5  # Earlier failure requires a real recheck.
+    saved = loop.session_store.load_session(response["session_id"])
+    assert all(
+        "Ash owner-required verification:" not in message.content
+        for message in saved.messages
+    )
+
+
+
 def test_cli_owner_checkpoint_is_explicit_and_rejects_resume_modes() -> None:
     import argparse
 
@@ -193,6 +289,209 @@ def test_cli_owner_checkpoint_is_explicit_and_rejects_resume_modes() -> None:
         with pytest.raises(SystemExit) as exc:
             main(invalid)
         assert exc.value.code == 2
+
+
+def test_cli_required_check_is_explicit_and_rejects_ambiguous_modes() -> None:
+    import argparse
+    from ash.cli import main
+    from ash.cli_parser import configure_parser
+
+    parser = argparse.ArgumentParser()
+    configure_parser(parser, "test")
+    assert parser.parse_args(["-p", "fix code"]).require_check_command is None
+    assert parser.parse_args([
+        "-p", "fix code", "--require-check-command", COMMAND
+    ]).require_check_command == COMMAND
+    for invalid in (
+        ["--require-check-command", COMMAND],
+        ["-p", "fix", "--session", "prior", "--require-check-command", COMMAND],
+        ["-p", "fix", "--require-check-command", ""],
+        ["-p", "fix", "--require-check-command", "a" * 4097],
+        ["-p", "fix", "--require-check-command", COMMAND, "--json-schema", "/tmp/a.json"],
+        ["-p", "fix", "--require-check-command", COMMAND, "--context-continuations", "1"],
+        ["-p", "fix", "--require-check-command", COMMAND, "--report-after-command", COMMAND],
+    ):
+        with pytest.raises(SystemExit) as error:
+            main(invalid)
+        assert error.value.code == 2
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("pass", True),
+    ("wrong_command", False),
+    ("wrong_cwd", False),
+    ("wrong_project", False),
+    ("failed", False),
+    ("no_exit_status", False),
+    ("denied", False),
+    ("unapproved", False),
+    ("unknown_effect", False),
+    ("edit_after_check", False),
+    ("shell_after_check", False),
+    ("failed_then_passed", True),
+    ("unknown_then_passed", False),
+    ("false_success_flag", False),
+    ("read_after_check", True),
+    ("earlier_unrelated_command", True),
+])
+def test_required_check_durable_evidence_rejects_unsafe_or_stale_proof(
+    tmp_path: Path, case: str, expected: bool,
+) -> None:
+    store = SessionStore(tmp_path / "required-evidence.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "only-turn", "Fix and verify")
+    calls: list[tuple[str, dict[str, object], bool, int | None]] = [
+        ("replace_file_content", {"file_path": "module.py"}, True, None),
+        ("run_command", {"command_line": COMMAND}, True, 0),
+    ]
+    if case == "wrong_command":
+        calls[-1] = ("run_command", {"command_line": "python3 other.py"}, True, 0)
+    if case == "wrong_cwd":
+        calls[-1] = ("run_command", {"command_line": COMMAND, "cwd": "elsewhere"}, True, 0)
+    if case == "failed":
+        calls[-1] = ("run_command", {"command_line": COMMAND}, False, 1)
+    if case == "no_exit_status":
+        calls[-1] = ("run_command", {"command_line": COMMAND}, True, None)
+    if case == "unknown_effect":
+        calls.append(("mcp__other__action", {}, True, None))
+    if case == "edit_after_check":
+        calls.append(("write_file", {"file_path": "module.py"}, True, None))
+    if case == "shell_after_check":
+        calls.append(("run_command", {"command_line": "echo later"}, True, 0))
+    if case == "failed_then_passed":
+        calls.insert(1, ("run_command", {"command_line": COMMAND}, False, 1))
+    if case == "unknown_then_passed":
+        calls.insert(1, ("run_command", {"command_line": COMMAND}, False, None))
+    if case == "false_success_flag":
+        calls.insert(1, ("run_command", {"command_line": COMMAND}, False, 0))
+    if case == "read_after_check":
+        calls.append(("git_diff", {}, True, None))
+    if case == "earlier_unrelated_command":
+        calls.insert(1, ("run_command", {"command_line": "true"}, True, 0))
+    for index, (name, arguments, success, exit_code) in enumerate(calls):
+        store.save_tool_call(
+            session.session_id,
+            ToolCallRecord(
+                call_id=f"record-{index}", tool_name=name, arguments=arguments,
+                approved=case != "unapproved" or index != 1,
+                dispatched=case != "denied" or index != 1,
+                executed=case != "denied" or index != 1,
+                success=success, exit_code=exit_code,
+                timestamp=datetime.now(timezone.utc),
+            ),
+            turn_id="only-turn",
+        )
+    store.complete_turn("only-turn")
+    assert store.required_check_command_succeeded(
+        session.session_id,
+        expected_project_path=(
+            tmp_path / "elsewhere" if case == "wrong_project" else tmp_path
+        ),
+        command_line=COMMAND,
+    ) is expected
+
+
+@pytest.mark.parametrize("exit_code,accepted", [(0, True), (1, False), (None, False)])
+def test_optional_owner_checkpoint_requires_confirmed_zero_exit_status(
+    tmp_path: Path, exit_code: int | None, accepted: bool,
+) -> None:
+    store = SessionStore(tmp_path / "legacy-checkpoint-exit.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "active", "Fix and test")
+    for index, (name, args) in enumerate((
+        ("replace_file_content", {"file_path": "module.py"}),
+        ("run_command", {"command_line": COMMAND}),
+    )):
+        store.save_tool_call(
+            session.session_id,
+            ToolCallRecord(
+                call_id=f"checkpoint-{index}", tool_name=name,
+                arguments=args, approved=True, dispatched=True, executed=True,
+                success=True, exit_code=exit_code if index == 1 else None,
+                timestamp=datetime.now(timezone.utc),
+            ),
+            turn_id="active",
+        )
+    evidence = store.owner_command_checkpoint_evidence(
+        session.session_id,
+        "active",
+        expected_project_path=tmp_path,
+        command_line=COMMAND,
+    )
+    assert (evidence == 1) is accepted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passes", [True, False])
+async def test_required_check_real_workspace_command_is_run_once(
+    tmp_path: Path, passes: bool,
+) -> None:
+    from ash.tools.command import RunCommandTool
+
+    expected_source = "after = 1\n" if passes else "after = 2\n"
+    (tmp_path / "qa_visible.py").write_text(
+        "from pathlib import Path\n"
+        f"assert Path('module.py').read_text() == {expected_source!r}\n",
+        encoding="utf-8",
+    )
+    loop, _ = make_loop(tmp_path)
+    loop.tools["run_command"] = RunCommandTool(loop.safety_guard)
+    output = io.StringIO()
+    loop.ui = HeadlessUI(output_format="stream-json", stream=output)
+    loop.ui.set_event_enricher(loop._envelope_event)
+    code = await _bootstrap_and_headless(
+        loop,
+        SimpleNamespace(attachment_token_budget=1024),
+        prompt="Fix the source and verify with the owner command",
+        session_id=None,
+        ui=loop.ui,
+        require_check_command=COMMAND,
+    )
+    assert code == (0 if passes else 1)
+    records = [json.loads(line) for line in output.getvalue().splitlines() if line]
+    completed = [item for item in records if item["type"] == "turn.completed"]
+    assert len(completed) == 1
+    assert completed[0]["required_check_satisfied"] is passes
+    if not passes:
+        assert "Required verification not established" in completed[0]["response"]
+    assert loop.session_store.verify_audit_log(completed[0]["session_id"]) == []
+    assert (tmp_path / "module.py").read_text() == "after = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_required_check_does_not_auto_commit_before_evidence_is_final(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    for key, value in (("user.name", "Ash Test"), ("user.email", "ash@example.invalid")):
+        subprocess.run(["git", "config", key, value], cwd=tmp_path, check=True)
+    loop, command = make_loop(tmp_path)
+    subprocess.run(["git", "add", "--", "module.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=tmp_path, check=True)
+    loop.auto_commit = True
+    stream = io.StringIO()
+    loop.ui = HeadlessUI(output_format="json", stream=stream)
+    result = await _bootstrap_and_headless(
+        loop,
+        SimpleNamespace(attachment_token_budget=1024),
+        prompt="Make the change and run the operator's required test",
+        session_id=None, ui=loop.ui, require_check_command=COMMAND,
+    )
+    assert result == 0
+    assert json.loads(stream.getvalue())["required_check_satisfied"] is True
+    assert command.executions == 1
+    commits = subprocess.run(
+        ["git", "rev-list", "--count", "HEAD"], cwd=tmp_path,
+        check=True, capture_output=True, text=True,
+    )
+    assert commits.stdout.strip() == "1"
+    diff = subprocess.run(
+        ["git", "diff", "--", "module.py"], cwd=tmp_path,
+        check=True, capture_output=True, text=True,
+    )
+    assert "+after = 1" in diff.stdout
 
 
 @pytest.mark.asyncio
