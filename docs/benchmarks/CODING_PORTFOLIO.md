@@ -19,7 +19,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R4 | `urllib3-url-auth-feature` | Pinned real repo | New public API / URL parsing edge cases | **Initial paired pass for both engines**; one sample, no reliability claim |
 | R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Initial pair: Ash fail / Codex pass**; Ash stopped at safe context limit after an incomplete edit |
 | R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Initial pair: Ash timeout / Codex pass**; no Ash source edit or verification |
-| R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Red/green independently verified**; initial matched trial pending |
+| R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Initial pair: both fail**; Ash 32K protected-context overflow after one edit, Codex visible pass but hidden fail; Ash 64K ablation reaches 120K total-turn cap. Park fixture-specific remediation. |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -98,6 +98,29 @@ dependency-free codebase and a class-construction/API compatibility task,
 not another attempt at the parked R3/R5/R6 repairs. No agent result is implied
 by the oracle preflight alone.
 
+**R7 initial paired outcome and bounded context ablation (2026-11-13):**
+The first requested GPT-6 Luna xhigh, 32K-context, 170-second paired
+evaluation used identical frozen user prompts and graded oracles. Ash took
+**70.88s** including preflight/grading (**65.48s** CLI), completed three model
+requests, edited only `_compat.py`, never ran the visible test, and stopped
+with a protected opaque-reasoning context error after eight tool calls.
+Plain Codex completed in **129.15s**, changed both required modules and ran a
+passing visible test, but **failed the hidden oracle**. Neither was an overall
+coding pass. A single unchanged-task Ash **64K** request-context ablation
+also failed (**76.98s**): it avoided the 32K opaque-context overflow, made
+six model requests and eleven tool calls, edited one module, ran no test,
+and stopped before exceeding the separately configured 120K cumulative
+turn-token budget. This provides evidence that two different resource limits
+can truncate this constrained task; it does **not** demonstrate inability at
+Ash's normal 128K request-context default and uncapped turn-total default.
+Both attempts preserved protected files and cleaned isolated scratch/auth
+state. The paired receipt checker verified the common prompt, revision pins,
+and oracle source hashes, while flagging unmatched tool/sandbox policies,
+an asymmetric cumulative-turn cap and unverified equivalence of effective
+provider context. No production harness change or repeated retry is warranted
+from this one task. Detailed receipts and the ablation decision are in the
+private, Git-excluded scenario journal.
+
 ## Evaluation and prioritization contract
 
 1. **Freeze the task** before a run: objective, task inputs, source revision,
@@ -138,13 +161,16 @@ by the oracle preflight alone.
 
 ## Next portfolio slice
 
-**Now:** no Scenario 04 rerun and no immediate R4/R5/R6 retry. R7 adds a fifth
-upstream repository and an independently graded two-module class-generation
-feature. Run its first frozen model trial without tuning Ash for this fixture,
-then use the outcome together with existing receipts to separate
-provider/model latency, context exhaustion, and editing/verification failures.
-Use repetitions only for a predeclared variance question, not to reverse a
-disappointing result.
+**Now:** no Scenario 04 or parked R5/R6/R7 repeat. R7 adds a fifth upstream
+repository and shows a second cross-repository **32K protected-context**
+failure, plus a distinct **64K/120K cumulative-budget** stop; plain Codex's
+hidden failure prevents any overall correctness-win claim. Before changing
+Ash's context architecture, study how its real production-default window and
+unbounded total-turn budget behave in independent user journeys, and compare
+tool history / early editing decisions across genuinely different tasks.
+Prioritize product-correctness, recovery safety, and resource economy over
+another case-specific attempt to get a green benchmark. Repetitions require
+a predeclared variance or causal question, not a desired score.
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate
