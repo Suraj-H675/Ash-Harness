@@ -21,7 +21,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Initial pair: Ash timeout / Codex pass**; no Ash source edit or verification |
 | R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Initial pair: both fail**; Ash 32K protected-context overflow after one edit, Codex visible pass but hidden fail; Ash 64K ablation reaches 120K total-turn cap. Park fixture-specific remediation. |
 | R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Latest sequential 65K pair: both pass**; earlier Ash-only normal-128K trial also passed. Exact independent oracle and scope checks verified; no speed/reliability ranking |
-| R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **Preflight verified: visible + hidden red on original, green on reference fix**; first paired model evaluation pending |
+| R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **First sequential 65K pair: both pass**; Ash 106.68s / 14 requests, Codex 78.74s / 5 shell commands; one sample, Codex policy-parity caveat |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -228,8 +228,27 @@ ASCII controls, standalone multiline LF/CRLF versus bare CR, single-line item
 and array comments, valid tabs/Unicode, TOML round trips, and unchanged document
 state after rejected mutations. Both visible and hidden oracles are **red on
 the original and green on the reference fix** in the existing isolated,
-networkless preflight. This is provenance and task validation only; no model
-has attempted R9 yet.
+networkless preflight.
+
+**R9 first sequential paired outcome (2026-11-13, one sample):** At matched
+GPT-6 Luna xhigh, 65,536 requested context, 170-second per-engine deadline,
+and uncapped Ash turn-total budget, **both Ash and plain Codex passed** the
+same pinned task, visible command and independent hidden oracle. Both changed
+exactly the three required modules, preserved protected files and completed
+with exit 0. Ash took **106.68s CLI**, completed **14 model requests / 22 tool
+calls**, had **zero failed tool calls**, and passed audit verification. Plain
+Codex took **78.74s**, used **five shell commands** (four non-test commands),
+and its event log, isolated private HOME/XDG, temporary auth cleanup and
+scratch cleanup verified. The comparison receipt verified common task
+objective, user prompt, source pins, oracle hashes, requested model/effort/
+context, direct native Codex binary, and ephemeral auth cleanup. It did **not**
+verify actual sandbox/policy equivalence: Codex's network blocking was not
+independently verified and its exact shell-command policy was not enforced by
+the comparator. Codex was 27.94s faster in this single observation; this is
+not a stable latency ranking or throughput claim. Ash's prompt-token and
+Codex's cached-input accounting are not directly comparable. No production
+Ash change is justified by this pass; R9 establishes a positive result on a
+new codebase, not a repeatability estimate.
 
 **Parity caveat for both new pairs:** The checker accepted requested model,
 effort, context, prompts, pins and independent grading, **not** actual
@@ -280,14 +299,15 @@ a throughput gain or motivates a production-code adjustment.
 ## Next portfolio slice
 
 **Now:** The paired R5 and R8 follow-ups both pass at matched 65K and uncapped
-Ash turn-total settings, but neither isolates a source change's impact. Avoid
-more reruns of R5/R8 merely to improve the score; R3 remains parked, R6's
-prior provider stall is unresolved as a causal coding result, and R7's hidden
-Codex failure and Ash's budget-limited runs remain distinct findings. New
-real-repository coding tests should be chosen for a previously unmeasured
-user workflow or explicitly causal hypothesis, not score accumulation. Focus
-on real owner coding usage, tool-level correctness, recovery safety, and
-unfamiliar-repository workflow diversity; commit implementation only for
+Ash turn-total settings, and the first R9 pair passes on a new codebase; none
+isolates a source change's impact. Avoid more reruns merely to improve scores;
+R3 remains parked, R6's prior provider stall is unresolved as a causal coding
+result, and R7's hidden Codex failure and Ash's budget-limited runs remain
+distinct findings. The next real-repository task should specifically target
+a **larger codebase and a multi-file refactor with stable public behavior** or
+dependency/interface compatibility, not another small API-validation fix.
+Focus on real owner coding usage, tool-level correctness, recovery safety,
+and unfamiliar-repository workflow diversity; commit implementation only for
 independently demonstrated gaps. **Ash Crew v1 is complete and merged into
 `main`; there are no remaining Crew acceptance gates in the active portfolio.**
 
