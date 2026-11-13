@@ -7,8 +7,8 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These twelve fixtures already have runnable code and grading logic. They **do not
-constitute twelve independent real repositories**; synthetic and real-repository
+These thirteen fixtures already have runnable code and grading logic. They **do not
+constitute thirteen independent real repositories**; synthetic and real-repository
 lanes must remain separate. Do not pool their scores into a single win rate.
 
 | ID | Existing task | Lane | What it exercises | Latest evidence / next action |
@@ -19,6 +19,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R4 | `urllib3-url-auth-feature` | Pinned real repo | New public API / URL parsing edge cases | **Initial paired pass for both engines**; one sample, no reliability claim |
 | R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Initial pair: Ash fail / Codex pass**; Ash stopped at safe context limit after an incomplete edit |
 | R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Initial pair: Ash timeout / Codex pass**; no Ash source edit or verification |
+| R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Red/green independently verified**; initial matched trial pending |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -26,15 +27,14 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | S5 | `two-file` | Synthetic repair | Both billing modules must change | Exists; current strong-model baseline pending |
 | S6 | `event-log` | Synthetic integration | Three-module parser, aggregation and rendering | Exists; current strong-model baseline pending |
 
-**Current gaps (not runnable tasks):** add approximately two independently
-scoped, pinned real-repository cases before interpreting broad coding quality:
-one unfamiliar codebase with debugging/test triage; one multi-file refactor
-with stable public behavior; one dependency/interface compatibility change;
-and one larger repository requiring targeted discovery. Choose repositories,
-base/fix pins and independent visible/hidden oracles only after provenance and
-red-original/green-reference verification. This would give a **14-case initial
-inventory**, though reliability claims will still require repetitions and
-diversity beyond shared urllib3 history.
+**Current gaps (not runnable tasks):** Further independent source projects
+should exercise unfamiliar-repository debugging and test triage, a multi-file
+refactor with stable public behavior, dependency/interface compatibility, and
+larger-codebase navigation. R7 now contributes a new codebase and a two-module
+feature, but does not fill all these gaps. Choose each base/fix pin and sealed
+oracle only after provenance and red-original/green-reference verification.
+The present **13-case inventory** is not a stable reliability benchmark;
+repetitions and broader workflow diversity remain necessary.
 
 **Evidence checkpoint:** Before this workflow change, the locally retained
 paired receipts showed **R1 and R2 passing for both engines** in a concurrent
@@ -86,6 +86,18 @@ spent its deadline waiting for a model request before editing. These are
 different failure mechanisms. Do not treat them as interchangeable evidence
 for a single prompt/tool change, or average them into a stable success rate.
 
+**R7 provenance (2026-11-13):** The attrs case uses original
+`python-attrs/attrs` commit `d3a98cf05ab15769003dcca3eae91cdd6504b83b`
+and upstream implementation `4b5b295bb815bf845fa3570bf63781a88212db40`
+(PR #1592). Two independently authored standard-library visible/hidden oracles
+both **fail on the original and pass on the reference fix** using the existing
+networkless benchmark sandbox. The only permitted source edits are
+`src/attr/_compat.py` and `src/attr/_make.py`; upstream's documentation and
+typing edits are not part of the permitted change. This is a separate,
+dependency-free codebase and a class-construction/API compatibility task,
+not another attempt at the parked R3/R5/R6 repairs. No agent result is implied
+by the oracle preflight alone.
+
 ## Evaluation and prioritization contract
 
 1. **Freeze the task** before a run: objective, task inputs, source revision,
@@ -126,14 +138,13 @@ for a single prompt/tool change, or average them into a stable success rate.
 
 ## Next portfolio slice
 
-**Now:** no Scenario 04 rerun and no immediate R4/R5/R6 retry. R6 adds a
-fourth upstream repository and an independently graded **two-module**
-validation bug. **Next, use existing receipts to separate provider/model
-latency, context exhaustion, and editing/verification failures**, and add a
-different real-repository case with an independently verified oracle before
-making another broad harness change. Prefer a genuinely different developer
-workflow such as API compatibility or refactoring. Use repetitions only for
-a predeclared variance question, not to reverse a disappointing result.
+**Now:** no Scenario 04 rerun and no immediate R4/R5/R6 retry. R7 adds a fifth
+upstream repository and an independently graded two-module class-generation
+feature. Run its first frozen model trial without tuning Ash for this fixture,
+then use the outcome together with existing receipts to separate
+provider/model latency, context exhaustion, and editing/verification failures.
+Use repetitions only for a predeclared variance question, not to reverse a
+disappointing result.
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate

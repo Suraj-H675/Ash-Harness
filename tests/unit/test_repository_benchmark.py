@@ -191,6 +191,11 @@ def test_size_telemetry_excludes_tool_payload_and_private_file_path() -> None:
             "https://github.com/urllib3/urllib3.git",
             {"src/urllib3/util/url.py"},
         ),
+        (
+            "attrs-generator-setattr-hooks",
+            "https://github.com/python-attrs/attrs.git",
+            {"src/attr/_compat.py", "src/attr/_make.py"},
+        ),
     ],
 )
 def test_upstream_tasks_are_pinned_and_oracles_sealed(

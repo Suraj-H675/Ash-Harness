@@ -534,6 +534,135 @@ for malformed_from, malformed_to in (
 """
 
 
+ATTRS_GENERATOR_VISIBLE = r"""import sys
+sys.path.insert(0, 'src')
+import attr
+import attrs
+
+events = []
+
+def before_after(obj, attribute, value):
+    events.append(('before', attribute.name, getattr(obj, attribute.name), value))
+    yield value * 2
+    events.append(('after', attribute.name, getattr(obj, attribute.name)))
+
+@attrs.define(on_setattr=before_after)
+class Counter:
+    amount: int = 3
+
+counter = Counter()
+events.clear()
+counter.amount = 5
+assert counter.amount == 10
+assert events == [('before', 'amount', 3, 5), ('after', 'amount', 10)]
+counter.amount = 7
+assert counter.amount == 14
+
+def add_three(obj, attribute, value):
+    return value + 3
+
+@attrs.define(on_setattr=add_three)
+class Hybrid:
+    plain: int = 1
+    hooked: int = attrs.field(default=2, on_setattr=before_after)
+
+hybrid = Hybrid()
+hybrid.plain = 4
+assert hybrid.plain == 7
+hybrid.hooked = 6
+assert hybrid.hooked == 12
+
+@attr.s(auto_attribs=True, on_setattr=before_after)
+class Legacy:
+    amount: int = 2
+
+legacy = Legacy()
+legacy.amount = 8
+assert legacy.amount == 16
+"""
+
+
+ATTRS_GENERATOR_HIDDEN = r"""import sys
+sys.path.insert(0, 'src')
+import attrs
+from attrs import setters
+
+trace = []
+
+def hook(obj, attribute, value):
+    trace.append(('enter', attribute.name, value))
+    try:
+        yield value + 10
+        trace.append(('exit', getattr(obj, attribute.name)))
+    finally:
+        trace.append(('closed', attribute.name))
+
+@attrs.define(on_setattr=hook)
+class Item:
+    value: int = 1
+    untouched: int = attrs.field(default=2, on_setattr=setters.NO_OP)
+
+item = Item()
+trace.clear()
+item.value = 3
+assert item.value == 13
+assert trace == [('enter', 'value', 3), ('exit', 13), ('closed', 'value')]
+item.untouched = 5
+assert item.untouched == 5
+assert len(trace) == 3
+
+def empty_generator(obj, attribute, value):
+    if False:
+        yield value
+
+@attrs.define(on_setattr=empty_generator)
+class Empty:
+    value: int = 2
+
+empty = Empty()
+try:
+    empty.value = 9
+except StopIteration:
+    pass
+else:
+    raise AssertionError('zero-yield generator hook unexpectedly accepted')
+assert empty.value == 2
+
+closed = []
+def too_many(obj, attribute, value):
+    try:
+        yield value * 3
+        yield value * 4
+    finally:
+        closed.append(True)
+
+@attrs.define(on_setattr=too_many)
+class Extra:
+    value: int = 2
+
+extra = Extra()
+try:
+    extra.value = 4
+except RuntimeError as exc:
+    assert 'yielded more than once' in str(exc)
+else:
+    raise AssertionError('multiple-yield hook unexpectedly accepted')
+assert extra.value == 12
+assert closed == [True]
+
+def usual(obj, attribute, value):
+    return value - 1
+
+@attrs.define(on_setattr=usual)
+class Ordinary:
+    number: int = 4
+
+ordinary = Ordinary()
+ordinary.number = 10
+assert ordinary.number == 9
+"""
+
+
 @dataclass(frozen=True)
 class RepositoryTask:
     source: str
@@ -549,6 +678,34 @@ class RepositoryTask:
 
 
 TASKS = {
+    "attrs-generator-setattr-hooks": RepositoryTask(
+        source="python-attrs/attrs",
+        upstream="https://github.com/python-attrs/attrs.git",
+        base_sha="d3a98cf05ab15769003dcca3eae91cdd6504b83b",
+        reference_fix_sha="4b5b295bb815bf845fa3570bf63781a88212db40",
+        editable=frozenset({"src/attr/_compat.py", "src/attr/_make.py"}),
+        visible_script="qa_visible.py",
+        visible_source=ATTRS_GENERATOR_VISIBLE,
+        hidden_source=ATTRS_GENERATOR_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Implement generator-based attribute-setter hooks in this pinned attrs "
+            "repository. Currently on_setattr hooks can return a transformed "
+            "value but cannot be generator functions. Support an on_setattr "
+            "generator that yields exactly one replacement value: execute it "
+            "up to the yield, assign the yielded value, then resume it so its "
+            "post-assignment cleanup can run. Propagate zero-yield failures, "
+            "reject hooks that yield twice, and close such generators. Preserve "
+            "ordinary callable setters, attributes exempted with NO_OP, class "
+            "and field hooks, and both attrs.define and attr.s callers. "
+            "Put the reusable, lazily cached generator-function classifier in "
+            "src/attr/_compat.py and connect it to generated attribute writes "
+            "in src/attr/_make.py. Review qa_visible.py, edit ONLY those two "
+            "source files, then run exactly python3 -B qa_visible.py with "
+            "run_command. No other commands are authorized. Preserve all "
+            "public signatures and other files."
+        ),
+    ),
     "dateutil-strict-numeric-fields": RepositoryTask(
         source="dateutil/dateutil",
         upstream="https://github.com/dateutil/dateutil.git",
