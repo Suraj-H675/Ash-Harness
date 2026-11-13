@@ -332,6 +332,7 @@ def test_cli_required_check_is_explicit_and_rejects_ambiguous_modes() -> None:
     ("unknown_then_passed", False),
     ("false_success_flag", False),
     ("read_after_check", True),
+    ("workspace_diff_before_check", True),
     ("earlier_unrelated_command", True),
 ])
 def test_required_check_durable_evidence_rejects_unsafe_or_stale_proof(
@@ -366,6 +367,8 @@ def test_required_check_durable_evidence_rejects_unsafe_or_stale_proof(
         calls.insert(1, ("run_command", {"command_line": COMMAND}, False, 0))
     if case == "read_after_check":
         calls.append(("git_diff", {}, True, None))
+    if case == "workspace_diff_before_check":
+        calls.insert(1, ("workspace_diff", {}, True, None))
     if case == "earlier_unrelated_command":
         calls.insert(1, ("run_command", {"command_line": "true"}, True, 0))
     for index, (name, arguments, success, exit_code) in enumerate(calls):

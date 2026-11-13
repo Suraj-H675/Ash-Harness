@@ -468,6 +468,45 @@ async def test_real_git_review_tool_is_available_with_large_effective_context(
 
 
 @pytest.mark.asyncio
+async def test_large_context_prefers_checkpoint_review_without_git_and_git_with_marker(
+    tmp_path: Path,
+) -> None:
+    """A non-Git coding project should not advertise a doomed Git diff."""
+
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=12)
+    catalog[search.name] = search
+    for name in ESSENTIAL_TOOL_NAMES:
+        catalog[name] = DummyTool(guard, name, f"Essential {name}")
+    for name in ("git_diff", "workspace_diff", "apply_patch"):
+        catalog[name] = DummyTool(guard, name, f"Review via {name}")
+    for index in range(25):
+        name = f"optional_{index}"
+        catalog[name] = DummyTool(guard, name, "Deferred integration")
+    config = AshConfig(
+        model="local/intent-discovery", workspace_root=tmp_path,
+        db_directory=tmp_path / "db", max_context_tokens=65_536,
+        max_completion_tokens=1_024, memory_backend="off",
+        tool_search_threshold=12,
+    )
+    loop = AshLoop(
+        SessionStore(tmp_path / "review-selection.db"),
+        ScriptedDiscoveryProvider("review edits", None, 65_536),
+        guard, HeadlessUI(output_format="text", stream=io.StringIO()),
+        tmp_path, tools=catalog, config=config,
+    )
+    try:
+        assert "workspace_diff" in loop._provider_tools()
+        assert "git_diff" not in loop._provider_tools()
+        (tmp_path / ".git").mkdir()
+        assert "git_diff" in loop._provider_tools()
+        assert "workspace_diff" not in loop._provider_tools()
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_context_provenance_reports_frozen_visible_tool_selection(
     tmp_path,
 ) -> None:

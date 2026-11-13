@@ -25,8 +25,8 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
 | S4 | `multi-file` | Synthetic navigation | Inspect multiple modules but edit one | Exists; do not mislabel as coordinated multi-edit |
-| S5 | `two-file` | Synthetic repair | Both billing modules must change | Exists; current strong-model baseline pending |
-| S6 | `event-log` | Synthetic integration | Three-module parser, aggregation and rendering | Exists; current strong-model baseline pending |
+| S5 | `two-file` | Synthetic repair | Both billing modules must change | **Ash passed** visible + hidden oracles in one pre-change and two post-change GPT-6 Luna trials; post-policy review tool succeeded without Git. No Codex control |
+| S6 | `event-log` | Synthetic integration | Three-module parser, aggregation and rendering | **Ash passed** visible + hidden oracles in one baseline GPT-6 Luna trial; post-change trial had provider timeouts before any model response, so no post-change semantic grade. No Codex control |
 
 **Current gaps (not runnable tasks):** Further independent source projects
 should exercise unfamiliar-repository debugging and test triage, a multi-file
@@ -45,6 +45,33 @@ oracles and completed CLI for both engines (Ash **77.14s**, plain Codex
 **79.15s**). The paired runner verified the comparison receipt. These are
 single observations, not a stable portfolio pass rate or a 2-second speed
 advantage. Their task difficulty, order and runtime conditions differ.
+
+**Synthetic S5/S6 checkpoint (2026-11-13, not a real-repository comparison):**
+Using `gpt-6-luna`, 65,536 request-context tokens, 240,000 cumulative turn
+tokens, 4,096 completion tokens, 205s deadline, and the exact permitted test
+command, current Ash initially passed both S5 (two edited modules; 29.926s
+CLI, six model requests) and S6 (three edited modules; 39.266s CLI, six model
+requests). Visible/hidden independent oracles, protected-file scope and audit
+checks passed. S5 then attempted `git_diff` inside a disposable non-Git
+workspace and received a failed Git usage message despite successful code.
+
+To expose Ash's existing checkpoint diff as a read-only model tool,
+`workspace_diff` was added to the full runtime with bounded, per-turn, no-Git
+source review. The first post-change S5 run kept code correct but was denied
+the tool under `auto_edit`; this revealed missing read-only permission policy
+classification. After correcting that policy (verified red-first), a second
+post-change S5 completed both oracles with **zero failed tools** and one
+successful `workspace_diff` call: 32.465s CLI and seven model requests, versus
+29.926s and six requests pre-change. This is **tool workflow correctness, not a
+speed win**. The sole attempted post-change S6 trial produced no model output,
+no edits and no tool calls; upstream provider requests timed out repeatedly,
+so no inference about semantic task correctness after the change is warranted.
+Evidence: `/var/tmp/ash-semantic-s5-current-20261113-v1`,
+`/var/tmp/ash-semantic-s6-current-20261113-v1`,
+`/var/tmp/ash-semantic-workspace-diff-after-20261113-v1`, and
+`/var/tmp/ash-semantic-workspace-diff-policy-green-20261113-v1`.
+These are single trials, with no paired plain-Codex control, under synthetic
+rather than pinned real-repository tasks; they must not be pooled with R1–R8.
 
 **R5 provenance:** The Click task uses original `pallets/click` commit
 `16fe802a3f96c4c8fa3cd382f1a7577fda0c5321` and the upstream

@@ -857,6 +857,20 @@ def build_runtime(
         goal_tool.set_event_sink(loop._emit_event)
         loop.tools[goal_tool.name] = goal_tool
         tools[goal_tool.name] = goal_tool
+        # The model can review Ash's own checkpointed edits in a workspace
+        # without Git. The turn identity comes from the owning live loop, not
+        # model arguments or untrusted repository content.
+        from ash.tools.workspace_diff import WorkspaceDiffTool
+
+        def active_diff_turn() -> tuple[str, str] | None:
+            if loop.current_session is None or loop.turn_context is None:
+                return None
+            return loop.current_session.session_id, loop.turn_context.turn_id
+
+        workspace_diff = WorkspaceDiffTool(guard, store, active_diff_turn)
+        workspace_diff.set_event_sink(loop._emit_event)
+        loop.tools[workspace_diff.name] = workspace_diff
+        tools[workspace_diff.name] = workspace_diff
     except BaseException as primary_error:
         _rollback_startup_owners(startup_rollback, primary_error)
         raise

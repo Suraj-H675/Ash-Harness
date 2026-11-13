@@ -24,6 +24,20 @@ def test_plan_mode_allows_reads() -> None:
     assert decision.action == PolicyAction.ALLOW
 
 
+@pytest.mark.parametrize("mode", ["interactive", "auto_edit", "plan"])
+def test_workspace_diff_is_read_only_but_respects_explicit_denials(mode: str) -> None:
+    assert PermissionPolicy(mode).evaluate("workspace_diff", {}).action == (
+        PolicyAction.ALLOW
+    )
+    deny = PermissionRule.create(RuleEffect.DENY, "workspace_diff")
+    assert PermissionPolicy(
+        mode, managed_rules=[deny]
+    ).evaluate("workspace_diff", {}).action == PolicyAction.DENY
+    assert PermissionPolicy("dry_run").evaluate(
+        "workspace_diff", {}
+    ).action == PolicyAction.DENY
+
+
 def test_goal_bookkeeping_is_safe_but_still_obeys_fail_closed_policy() -> None:
     arguments = {"action": "progress", "evidence": "targeted tests pass"}
     assert (

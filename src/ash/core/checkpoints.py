@@ -35,6 +35,8 @@ EDIT_TOOLS = {
 }
 MAX_CHECKPOINT_BYTES = 20 * 1024 * 1024
 MAX_CHECKPOINT_DIFF_LINES = 400
+MAX_AGENT_CHECKPOINT_DIFF_ROWS = 24
+MAX_AGENT_CHECKPOINT_DIFF_CONTENT_BYTES = 2 * 1024 * 1024
 OVERSIZED_DIGEST = "<checkpoint-file-too-large>"
 
 
@@ -934,8 +936,51 @@ def diff_latest_checkpoint(
     rows = store.latest_file_checkpoints(session_id)
     if not rows:
         return "No checkpointed file changes for this session."
+    return _render_checkpoint_diff(rows, guard, max_lines=max_lines)
+
+
+def diff_turn_checkpoint(
+    store: SessionStore,
+    guard: SafetyGuard,
+    session_id: str,
+    turn_id: str,
+    *,
+    max_lines: int = MAX_CHECKPOINT_DIFF_LINES,
+) -> str:
+    """Review only this active turn's edits, without Git or tool replay."""
+
+    rows = store.file_checkpoints_for_turns(
+        session_id,
+        [turn_id],
+        limit=MAX_AGENT_CHECKPOINT_DIFF_ROWS + 1,
+        max_total_before_bytes=MAX_AGENT_CHECKPOINT_DIFF_CONTENT_BYTES,
+    )
+    if len(rows) > MAX_AGENT_CHECKPOINT_DIFF_ROWS:
+        raise RuntimeError("Workspace diff exceeds the safe checkpoint review limit")
+    if not rows:
+        return "No checkpointed file changes in this turn."
+    return _render_checkpoint_diff(
+        rows,
+        guard,
+        max_lines=max_lines,
+        max_file_bytes=MAX_AGENT_CHECKPOINT_DIFF_CONTENT_BYTES,
+    )
+
+
+def _render_checkpoint_diff(
+    rows: list[Any],
+    guard: SafetyGuard,
+    *,
+    max_lines: int,
+    max_file_bytes: int | None = None,
+) -> str:
+    """Inspect a recorded checkpoint chain only while current files match."""
+
+    max_file_bytes = MAX_CHECKPOINT_BYTES if max_file_bytes is None else max_file_bytes
     paths = [guard.validate_mutation_path(row["path"]) for row in rows]
-    conflicts = _checkpoint_chain_conflicts(rows, paths, guard)
+    conflicts = _checkpoint_chain_conflicts(
+        rows, paths, guard, max_file_bytes=max_file_bytes
+    )
     if conflicts:
         raise RuntimeError(
             "Checkpoint diff refused because files changed after Ash's edit: "
@@ -951,12 +996,27 @@ def diff_latest_checkpoint(
         earliest_by_path[path] = row
     for path, row in earliest_by_path.items():
         before = _checkpoint_content(row) if bool(row["existed"]) else b""
-        _, snapshot = _checkpoint_snapshot(path, guard)
+        _, snapshot = _checkpoint_snapshot(path, guard, max_bytes=max_file_bytes)
+        # The first conflict check and this scoped snapshot are separate
+        # reads. Recheck the *actual bytes being rendered* against the last
+        # recorded post-edit state so a concurrent edit cannot appear as
+        # Ash's own work between those two operations.
+        latest = latest_by_path[path]
+        latest_mode = latest["after_mode"]
+        if not _checkpoint_state_matches(
+            snapshot.sha256,
+            snapshot.mode,
+            str(latest["after_sha256"]),
+            int(latest_mode) if latest_mode is not None else None,
+        ):
+            raise RuntimeError(
+                "Checkpoint diff refused because files changed after Ash's edit: "
+                + str(path)
+            )
         after = snapshot.content if snapshot.exists else b""
         before_mode = (
             int(row["before_mode"]) if row["before_mode"] is not None else None
         )
-        latest_mode = latest_by_path[path]["after_mode"]
         after_mode = int(latest_mode) if latest_mode is not None else None
         relative = _relative_display(path, guard.project_root)
         if (
@@ -999,14 +1059,21 @@ def diff_latest_checkpoint(
 
 
 def _checkpoint_chain_conflicts(
-    rows: list[Any], paths: list[Path], guard: SafetyGuard
+    rows: list[Any],
+    paths: list[Path],
+    guard: SafetyGuard,
+    *,
+    max_file_bytes: int | None = None,
 ) -> list[str]:
+    max_file_bytes = MAX_CHECKPOINT_BYTES if max_file_bytes is None else max_file_bytes
     simulated: dict[Path, tuple[str, int | None]] = {}
     conflicts: list[str] = []
     for row, path in zip(rows, paths, strict=True):
         current = simulated.get(path)
         if current is None:
-            current = _digest_and_mode(path, guard)
+            current = _digest_and_mode(path, guard, max_bytes=max_file_bytes)
+            if current[0] == OVERSIZED_DIGEST and max_file_bytes < MAX_CHECKPOINT_BYTES:
+                raise RuntimeError("Workspace diff file exceeds safe review size")
         expected_mode = (
             int(row["after_mode"]) if row["after_mode"] is not None else None
         )
@@ -1025,18 +1092,19 @@ def _checkpoint_chain_conflicts(
 
 
 def _checkpoint_snapshot(
-    path: Path, guard: SafetyGuard
+    path: Path, guard: SafetyGuard, *, max_bytes: int | None = None
 ) -> tuple[Path, ScopedFileSnapshot]:
+    max_bytes = MAX_CHECKPOINT_BYTES if max_bytes is None else max_bytes
     try:
         return snapshot_scoped_file(
             path,
             guard,
-            max_bytes=MAX_CHECKPOINT_BYTES,
+            max_bytes=max_bytes,
         )
     except ScopedIOError as exc:
         if str(exc).startswith("file exceeds "):
             raise ValueError(
-                f"Refusing uncheckpointed edit over {MAX_CHECKPOINT_BYTES} bytes: "
+                f"Refusing uncheckpointed edit over {max_bytes} bytes: "
                 f"{path}"
             ) from exc
         raise
@@ -1046,12 +1114,15 @@ def _digest(path: Path, guard: SafetyGuard) -> str:
     return _digest_and_mode(path, guard)[0]
 
 
-def _digest_and_mode(path: Path, guard: SafetyGuard) -> tuple[str, int | None]:
+def _digest_and_mode(
+    path: Path, guard: SafetyGuard, *, max_bytes: int | None = None
+) -> tuple[str, int | None]:
+    max_bytes = MAX_CHECKPOINT_BYTES if max_bytes is None else max_bytes
     try:
         _, snapshot = snapshot_scoped_file(
             path,
             guard,
-            max_bytes=MAX_CHECKPOINT_BYTES,
+            max_bytes=max_bytes,
         )
     except ScopedIOError as exc:
         if str(exc).startswith("file exceeds "):

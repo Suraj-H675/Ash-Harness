@@ -40,6 +40,36 @@ class RuntimeProvider(ProviderABC):
             yield
 
 
+@pytest.mark.asyncio
+async def test_default_runtime_registers_checkpoint_diff_for_gitless_projects(
+    tmp_path: Path,
+) -> None:
+    """Git-independent review must exist in the real default runtime catalog."""
+
+    config = AshConfig(
+        model="local/runtime-model", workspace_root=tmp_path,
+        db_directory=tmp_path / "db", memory_backend="off",
+        repo_map_enabled=False, automation_enabled=False, lsp_enabled=False,
+    )
+    runtime = build_runtime(
+        config,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        provider=RuntimeProvider(), workspace_trusted=False,
+        run_maintenance=False,
+    )
+    try:
+        assert "workspace_diff" in runtime.loop.tools
+        tool = runtime.loop.tools["workspace_diff"]
+        assert tool.args_schema is not None
+        assert (await tool.run()).success is False
+        assert any(
+            middleware.__class__.__name__ == "FileCheckpointMiddleware"
+            for middleware in runtime.loop.tool_middlewares
+        )
+    finally:
+        await runtime.loop.aclose()
+
+
 def test_build_repo_map_defers_expensive_initial_index(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -271,6 +271,28 @@ completed command result.
 ### 2.6 `git_status` / `git_diff` / `git_log` / `auto_commit`
 
 The read-only Git tools expose bounded status, diff, and recent-log inspection.
+Ash also provides **`workspace_diff`** for reviewing changes in projects that
+do not use Git. It compares only the current coding turn's checkpointed Ash file
+edits against the actual files; it does not run Git, start a process, or make
+changes. A file changed outside Ash after its recorded edit causes a known
+failure rather than a stale diff, including when it changes between the initial
+conflict check and the final file snapshot. Existing tool-scoped permission and audit
+handling still applies. This tool does **not** capture edits made by shell
+commands, unrecorded processes, or unrelated worktree files.
+
+`workspace_diff` accepts optional `max_lines` (1–400, default 200) and
+`max_output_bytes` (256–16,384, default 8,192). It limits review to 24
+checkpoint rows, 2 MiB of stored before-content total, and 2 MiB per current
+file; it refuses oversized reviews and redacts secrets before returning.
+Output truncation is explicit. The standard full runtime registers the tool with the owning active
+session/turn; it cannot be directed at another session by the model. With
+large enough effective model context, Ash presents `workspace_diff` by default
+for a workspace with no root `.git` marker; a Git-root workspace still presents
+`git_diff`. The other review tool is discoverable through `search_tools` when
+needed. This choice is based on a root-marker heuristic, not a claim that nested
+checkouts cannot use Git. Short-context and user-defined tool registries retain
+their existing discovery behavior.
+
 `auto_commit` is the only commit tool and requires an explicit workspace-relative
 path list; it refuses an empty scope so unrelated user work cannot be staged by
 default. Commit messages and path counts are bounded, staged content is scanned

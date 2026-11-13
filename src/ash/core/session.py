@@ -158,6 +158,7 @@ MAX_RECOVERY_ARGUMENT_PREVIEW_BYTES = 64 * 1024
 # edits remain under the existing file, policy, checkpoint and audit guards.
 AUTOMATIC_CONTEXT_HANDOFF_TOOLS = frozenset({
     "read_file", "read_files", "search_text", "list_dir", "glob_files", "git_status", "git_diff",
+    "workspace_diff",
     "write_file", "replace_file_content", "replace_file_edits", "whole_edit",
     "apply_patch",
 })
@@ -5179,19 +5180,39 @@ class SessionStore:
         return self.load_session(session_id)
 
     def file_checkpoints_for_turns(
-        self, session_id: str, turn_ids: list[str]
+        self,
+        session_id: str,
+        turn_ids: list[str],
+        *,
+        limit: int | None = None,
+        max_total_before_bytes: int | None = None,
     ) -> list[sqlite3.Row]:
         """Return unrestored checkpoints newest-first for selected turns."""
 
         if not turn_ids:
             return []
+        if limit is not None and limit < 1:
+            raise ValueError("checkpoint row limit must be positive")
+        if max_total_before_bytes is not None and max_total_before_bytes < 0:
+            raise ValueError("checkpoint byte limit cannot be negative")
         placeholders = ",".join("?" for _ in turn_ids)
         with closing(self._connect()) as conn:
+            if max_total_before_bytes is not None:
+                total = conn.execute(
+                    "SELECT COALESCE(SUM(length(before_content)), 0) "
+                    "FROM file_checkpoints WHERE session_id = ? "
+                    f"AND turn_id IN ({placeholders}) AND restored = 0",
+                    (session_id, *turn_ids),
+                ).fetchone()
+                if total is None or int(total[0]) > max_total_before_bytes:
+                    raise ValueError("Checkpoint review exceeds safe saved-content size")
             return conn.execute(
                 "SELECT * FROM file_checkpoints WHERE session_id = ? "
                 f"AND turn_id IN ({placeholders}) AND restored = 0 "
-                "ORDER BY checkpoint_id DESC",
-                (session_id, *turn_ids),
+                "ORDER BY checkpoint_id DESC"
+                + (" LIMIT ?" if limit is not None else ""),
+                (session_id, *turn_ids)
+                + ((limit,) if limit is not None else ()),
             ).fetchall()
 
     def save_file_checkpoint(

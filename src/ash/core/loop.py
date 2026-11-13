@@ -987,8 +987,9 @@ LARGE_CONTEXT_CODING_GUIDANCE = (
     "reading unchanged regions. For changes spanning modules, inspect the "
     "relevant definitions and callers, make consistent edits across affected "
     "files, and run the explicitly authorized focused test before reporting "
-    "completion. Review changes using the dedicated git_diff tool rather "
-    "than an unapproved shell command. Do not bypass policy or claim unrun tests."
+    "completion. Review edits with the available workspace_diff (Ash-edited "
+    "files, no Git required) or git_diff (Git worktree) tool rather than an "
+    "unapproved shell command. Do not bypass policy or claim unrun tests."
 )
 
 NATIVE_TOOL_PROTOCOL = """### Tool Call Format
@@ -5234,16 +5235,31 @@ class AshLoop:
             visible = dict(visible_tools(self.tools))
             if len(visible) < len(self.tools):
                 # Keep the compact essential catalog for small local models.
-                # Larger effective input windows can afford the dedicated,
-                # read-only Git diff tool without making the model execute a
-                # shell command to inspect its edits. Leave apply_patch and
-                # read_files deferred rather than expanding every prompt:
+                # Larger effective windows can afford one read-only review
+                # tool. In workspaces without a root Git marker prefer the
+                # Ash-owned checkpoint diff over a Git call that will fail.
+                # Git remains discoverable for nested checkouts. Leave
+                # apply_patch and read_files deferred rather than expanding
+                # every prompt:
                 # eager patches regressed local-model coding, while initial
                 # batch-read trials did not establish an end-to-end gain.
                 request_budget = self._resolve_request_token_budget()
                 if request_budget is not None and request_budget.input_limit >= 24_576:
-                    if "git_diff" in self.tools:
-                        visible["git_diff"] = self.tools["git_diff"]
+                    git_marker = self.project_root / ".git"
+                    try:
+                        marker_mode = git_marker.lstat().st_mode
+                        has_root_git = stat.S_ISDIR(marker_mode) or stat.S_ISREG(
+                            marker_mode
+                        )
+                    except OSError:
+                        has_root_git = False
+                    review_name = (
+                        "git_diff"
+                        if has_root_git or "workspace_diff" not in self.tools
+                        else "workspace_diff"
+                    )
+                    if review_name in self.tools:
+                        visible[review_name] = self.tools[review_name]
             return visible
         return self.tools
 
@@ -7835,7 +7851,7 @@ class AshLoop:
                 self._generated_system_prompt
                 and self.system_prompt.startswith(self._base_system_prompt)
                 and request_budget.input_limit >= 24_576
-                and "git_diff" in provider_tools
+                and ("git_diff" in provider_tools or "workspace_diff" in provider_tools)
             ):
                 core_system_content += "\n\n" + LARGE_CONTEXT_CODING_GUIDANCE
             supplemental_system_content = "\n\n".join(

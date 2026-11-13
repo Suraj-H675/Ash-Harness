@@ -38,6 +38,7 @@ READ_ONLY_TOOLS = frozenset(
         "lsp",
         "git_status",
         "git_diff",
+        "workspace_diff",
         "git_log",
         "list_skills",
         "activate_skill",
