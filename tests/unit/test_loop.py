@@ -6910,6 +6910,128 @@ async def test_turn_token_budget_blocks_next_provider_request(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_budgeted_edit_restart_informs_next_model_without_replaying_edit(
+    tmp_path: Path,
+) -> None:
+    """A continuation after restart should know partial work was not verified."""
+    from ash.tools.filesystem import ReplaceFileContentTool
+
+    source = tmp_path / "worker.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+
+    class BudgetedEditor(ProviderABC):
+        model_name = "budgeted-editor"
+        capabilities = ProviderCapabilities(native_tools=True, context_window=2_000)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(str(text).split())
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            assert self.calls == 1, "no second model request after the budget"
+            yield StreamChunk(
+                is_done=True,
+                stop_reason="tool_calls",
+                native_tool_calls=[{
+                    "id": "edit-once", "name": "replace_file_content",
+                    "arguments": {
+                        "file_path": "worker.py",
+                        "target_content": "value = 1",
+                        "replacement_content": "value = 2",
+                    },
+                }],
+                prompt_tokens=396,
+                completion_tokens=2,
+            )
+
+    class ContinuingEditor(BudgetedEditor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: list[dict[str, Any]] = []
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            self.seen = messages
+            yield StreamChunk(content="I need to verify the partial edit.", is_done=True)
+
+    store = SessionStore(tmp_path / "coding-continuity.db")
+    guard = SafetyGuard(tmp_path)
+    config = AshConfig(
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        model="openai/budgeted-editor",
+        memory_backend="off",
+        max_context_tokens=2_000,
+        max_completion_tokens=8,
+        max_turn_total_tokens=400,
+    )
+
+    async def approve(_name: str, _args: dict[str, Any]) -> bool:
+        return True
+
+    first = AshLoop(
+        store, BudgetedEditor(), guard, EventUI(), tmp_path,
+        tools={"replace_file_content": ReplaceFileContentTool(guard)},
+        config=config, system_prompt="Edit safely.", on_tool_approval=approve,
+    )
+    session = await first.start_session()
+    try:
+        await first.run_turn("Update worker.py and verify it")
+        assert first._last_turn_stop_reason == "token_budget"
+        assert source.read_text(encoding="utf-8") == "value = 2\n"
+        assert len(store.load_session(session.session_id).tool_calls) == 1
+    finally:
+        await first.aclose()
+
+    provider = ContinuingEditor()
+    resumed = AshLoop(
+        store, provider, guard, EventUI(), tmp_path,
+        config=config.model_copy(update={"max_turn_total_tokens": 0}),
+        system_prompt="Edit safely.", tools={},
+    )
+    try:
+        await resumed.start_session(session.session_id)
+        assert await resumed.run_turn("Continue and assess the changes") == (
+            "I need to verify the partial edit."
+        )
+        first_continuation = [
+            str(message.get("content", "")) for message in provider.seen
+        ]
+        assert sum(
+            "Ash runtime continuity:" in message
+            and "stop_reason=token_budget" in message
+            for message in first_continuation
+        ) == 1
+        # The advisory is not durable and does not carry into an unrelated
+        # task after a normally completed turn.
+        durable = store.load_session(session.session_id)
+        assert all(
+            "Ash runtime continuity:" not in message.content
+            for message in durable.messages
+        )
+        await resumed.run_turn("Start an unrelated task")
+        assert all(
+            "Ash runtime continuity:" not in str(message.get("content", ""))
+            for message in provider.seen
+        )
+    finally:
+        await resumed.aclose()
+
+    messages = first_continuation
+    assert any(
+        "previous" in message.casefold()
+        and "token_budget" in message
+        and "verify" in message.casefold()
+        for message in messages
+    )
+    assert source.read_text(encoding="utf-8") == "value = 2\n"
+    assert len(store.load_session(session.session_id).tool_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_provider_output_limit_is_used_for_context_and_request(tmp_path):
     class LimitedProvider(ProviderABC):
         model_name = "limited-context-provider"

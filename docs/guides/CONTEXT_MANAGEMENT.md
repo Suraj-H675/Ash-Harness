@@ -16,6 +16,18 @@ queued steering messages. A configured `max_turn_total_tokens` also limits the
 combined prompt and completion tokens for a turn; `0` disables that token
 limit.
 
+After a turn reaches `token_budget`, `iteration_limit`, or `circuit_breaker`,
+the user may explicitly start another turn in the same saved session. On the
+next turn, Ash reads only the latest completed turn's persisted terminal event
+and provides the model with a brief **runtime-only** reminder that the previous
+work may be unfinished. This reminder survives a process restart through the
+normal session event history, is not written into the conversation transcript,
+and does not repeat after a subsequent normal turn. It never restarts work,
+executes a command, restores a file, or authorizes/replays a tool call. The
+model must inspect current workspace state and verification evidence; a
+prior edit's success does not prove the task was finished. A missing or
+unrecognized terminal event does not provide a speculative continuity claim.
+
 For new or resumed **one-shot** work, `ash -p "..." --turn-time-budget 270`
 provides an optional 30–3600 second wall-clock budget (disabled by default).
 Ash gives the model a short trusted budget notice, then at most two further

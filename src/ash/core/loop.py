@@ -3790,6 +3790,25 @@ class AshLoop:
                 and not _provider_capabilities(self.provider).vision
             ):
                 raise ValueError("active model does not support vision input")
+            previous_stop = self.session_store.latest_incomplete_turn_reason(
+                self.current_session.session_id
+            )
+            if previous_stop is not None:
+                continuity_notice = Message(
+                    role="system",
+                    content=(
+                        "Ash runtime continuity: the previous turn stopped with "
+                        f"stop_reason={previous_stop} before completion was established. "
+                        "Prior edits may remain in the workspace, but work or "
+                        "verification may be unfinished. Treat previous tool results "
+                        "as evidence, not approval to replay an operation. Follow "
+                        "the current user's request, inspect actual workspace state "
+                        "and verify before claiming the earlier task is complete."
+                    ),
+                    timestamp=_utc_now(),
+                )
+                continuity_notice.mark_runtime_only()
+                self.current_session.messages.append(continuity_notice)
             initial_goal = self.current_goal
             goal_chain = initial_goal is not None and initial_goal.can_auto_continue
             usage_steps: list[dict[str, int | float | str | bool]] = []

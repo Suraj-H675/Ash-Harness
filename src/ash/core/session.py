@@ -4352,6 +4352,40 @@ class SessionStore:
                 (_serialize_datetime(_utc_now()), turn_id),
             )
 
+    def latest_incomplete_turn_reason(self, session_id: str) -> str | None:
+        """Read a bounded, trusted stop category from the last durable turn.
+
+        A terminal runtime event marks the execution boundary; it does not
+        imply the task was finished. Never infer an unfinished turn from an
+        older event when a newer turn exists, or from arbitrary event text.
+        """
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT event.event_json FROM ("
+                "SELECT turn_id, status FROM turn_journal WHERE session_id = ? "
+                "ORDER BY started_at DESC, rowid DESC LIMIT 1"
+                ") AS latest JOIN runtime_events AS event "
+                "ON event.session_id = ? AND event.turn_id = latest.turn_id "
+                "WHERE latest.status = 'completed' "
+                "AND event.event_type = 'turn.completed' "
+                "ORDER BY event.sequence DESC LIMIT 1",
+                (session_id, session_id),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            event = json.loads(str(row["event_json"]))
+        except (TypeError, ValueError):
+            return None
+        reason = event.get("stop_reason") if isinstance(event, dict) else None
+        return (
+            reason
+            if isinstance(reason, str)
+            and reason in {"token_budget", "iteration_limit", "circuit_breaker"}
+            else None
+        )
+
     def save_turn_usage(self, turn_id: str, usage: dict[str, Any]) -> None:
         """Persist normalized usage so rewinding can adjust session totals."""
 

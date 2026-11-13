@@ -29,6 +29,50 @@ from ash.sqlite_utils import preferred_sqlite_journal_mode
 
 
 @pytest.mark.parametrize(
+    "stop_reason", ["token_budget", "iteration_limit", "circuit_breaker"]
+)
+def test_latest_incomplete_turn_reason_is_from_last_durable_terminal_event(
+    tmp_path: Path, stop_reason: str,
+) -> None:
+    store = SessionStore(tmp_path / "continuity.db")
+    session = store.create_session(str(tmp_path))
+    store.start_turn(session.session_id, "turn-1", "first request")
+    store.complete_turn("turn-1")
+    store.save_runtime_events([{
+        "type": "turn.completed",
+        "session_id": session.session_id,
+        "turn_id": "turn-1",
+        "stop_reason": stop_reason,
+    }])
+    assert store.latest_incomplete_turn_reason(session.session_id) == stop_reason
+
+    # Never reach past a more recent started or completed turn.
+    store.start_turn(session.session_id, "turn-2", "new task")
+    assert store.latest_incomplete_turn_reason(session.session_id) is None
+    store.complete_turn("turn-2")
+    store.save_runtime_events([{
+        "type": "turn.completed",
+        "session_id": session.session_id,
+        "turn_id": "turn-2",
+        "stop_reason": "completed",
+    }])
+    assert store.latest_incomplete_turn_reason(session.session_id) is None
+
+    store.start_turn(session.session_id, "turn-3", "third request")
+    store.complete_turn("turn-3")
+    # An absent or unknown terminal event must never revive turn-1's notice.
+    assert store.latest_incomplete_turn_reason(session.session_id) is None
+    store.save_runtime_events([{
+        "type": "turn.completed",
+        "session_id": session.session_id,
+        "turn_id": "turn-3",
+        "stop_reason": "untrusted_unknown_reason",
+    }])
+    assert store.latest_incomplete_turn_reason(session.session_id) is None
+
+
+
+@pytest.mark.parametrize(
     ("steps", "blocked"),
     [
         ([("edit", True, ""), ("check", False, "test")], True),
