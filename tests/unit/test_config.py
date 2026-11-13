@@ -309,6 +309,7 @@ def test_config_rejects_negative_model_pricing() -> None:
         "tool_search_threshold",
         "provider_max_attempts",
         "provider_request_timeout_seconds",
+        "provider_first_output_timeout_seconds",
         "provider_retry_base_delay",
         "max_concurrent_agents",
         "agent_token_budget",
@@ -504,6 +505,7 @@ def test_provider_retry_preferences_are_validated() -> None:
     config = AshConfig(
         provider_max_attempts=5,
         provider_request_timeout_seconds=900,
+        provider_first_output_timeout_seconds=75,
         provider_retry_base_delay=0.25,
         provider_retry_max_delay=12.0,
         provider_circuit_failure_threshold=4,
@@ -511,12 +513,40 @@ def test_provider_retry_preferences_are_validated() -> None:
     )
     assert config.provider_max_attempts == 5
     assert config.provider_request_timeout_seconds == 900
+    assert config.provider_first_output_timeout_seconds == 75
+    assert AshConfig().provider_first_output_timeout_seconds == 0
+    with pytest.raises(ValueError, match="provider_first_output_timeout_seconds"):
+        AshConfig(provider_first_output_timeout_seconds=-1)
     assert config.provider_retry_base_delay == 0.25
     assert config.provider_retry_max_delay == 12.0
     assert config.provider_circuit_failure_threshold == 4
     assert config.provider_circuit_cooldown_seconds == 45
     with pytest.raises(ValueError, match="provider_retry_max_delay"):
         AshConfig(provider_retry_base_delay=2.0, provider_retry_max_delay=1.0)
+
+
+def test_first_output_timeout_is_owner_owned_not_project_controlled(
+    tmp_path: Path,
+) -> None:
+    from ash.config import _filter_project_config
+
+    diagnostics: list[str] = []
+    filtered = _filter_project_config(
+        AshConfig,
+        tmp_path / ".ash" / "config.toml",
+        {"provider_first_output_timeout_seconds": 0.001},
+        diagnostics,
+    )
+    assert filtered == {}
+    assert len(diagnostics) == 1
+    assert "ignored user-owned project config key" in diagnostics[0]
+
+
+def test_first_output_timeout_can_be_set_by_user_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ASH_PROVIDER_FIRST_OUTPUT_TIMEOUT_SECONDS", "90")
+    assert AshConfig().provider_first_output_timeout_seconds == 90.0
 
 
 def test_allowed_web_domains_are_normalized_and_validated() -> None:

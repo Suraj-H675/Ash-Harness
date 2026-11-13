@@ -262,6 +262,23 @@ Ash's normal provider retry path only when the attempt produced no retained
 model output/state; once text, tool output, reasoning, reasoning blocks, or
 provider replay state has started, the request is never replayed automatically.
 
+For interactive jobs where prolonged silence is worse than retrying a request,
+the user can additionally set `provider_first_output_timeout_seconds` in
+`~/.ash/ash.toml` (or `ASH_PROVIDER_FIRST_OUTPUT_TIMEOUT_SECONDS`). For example,
+`provider_first_output_timeout_seconds = 90` caps **only the wait for the first
+meaningful output** of each attempt. Its default is `0` (off), and values up to
+24 hours are accepted. Empty transport/heartbeat chunks do not extend this
+deadline. Once any text, tool delta, reasoning or provider-owned replay state
+arrives, only the normal whole-request timeout remains in force. The shorter
+of the two deadlines applies while waiting for first output. On timeout Ash
+closes the provider stream and uses the existing bounded retry/circuit rules
+only if nothing meaningful was emitted; it never automatically retries tools.
+Repository-controlled `.ash/config.toml` cannot set this operator-owned limit.
+This is a controllable latency/recovery trade-off: slow but healthy local or
+high-effort models may need a larger limit or the default disabled setting.
+It does not make inference faster or guarantee that a timed-out request was
+actually unhealthy.
+
 The core loop also bounds retained provider output independently of adapter
 behavior: one completion may retain at most 16 MiB across text, XML tool-call
 deltas, native tool calls, and reasoning payloads, at most 4096 reasoning

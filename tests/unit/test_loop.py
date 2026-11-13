@@ -1920,6 +1920,130 @@ async def test_provider_request_timeout_retries_only_before_output(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_first_output_deadline_retries_empty_heartbeat_stream_without_replay(
+    tmp_path,
+) -> None:
+    """Heartbeat traffic must not extend the time allotted for first output."""
+
+    class HeartbeatThenSuccess(ProviderABC):
+        model_name = "heartbeat-then-success"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.closed_stalled_stream = False
+
+        def count_tokens(self, text):
+            return len(str(text))
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                try:
+                    while True:
+                        yield StreamChunk()
+                        await asyncio.sleep(0.004)
+                finally:
+                    self.closed_stalled_stream = True
+            else:
+                yield StreamChunk(content="recovered", is_done=True, stop_reason="stop")
+
+    provider = HeartbeatThenSuccess()
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "first-output-heartbeats.db"), provider,
+        SafetyGuard(project_root=tmp_path), ui, tmp_path,
+    )
+    loop._config = SimpleNamespace(
+        provider_request_timeout_seconds=1.0,
+        provider_first_output_timeout_seconds=0.025,
+        provider_max_attempts=2,
+        provider_retry_base_delay=0.0,
+        provider_retry_max_delay=0.0,
+    )
+
+    result = await asyncio.wait_for(loop._stream_one_completion([{
+        "role": "user", "content": "repair a module"
+    }]), timeout=0.5)
+
+    assert result.text == "recovered"
+    assert provider.calls == 2
+    assert provider.closed_stalled_stream
+    assert any(
+        event["type"] == "model.request.error"
+        and event["failure_category"] == "transient"
+        and event["emitted_output"] is False
+        for event in ui.events
+    )
+    assert any(event["type"] == "provider.retrying" for event in ui.events)
+
+
+@pytest.mark.asyncio
+async def test_first_output_deadline_does_not_interrupt_started_reasoning(
+    tmp_path,
+) -> None:
+    class SlowAfterFirstOutput(ProviderABC):
+        model_name = "slow-after-first-output"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return len(str(text))
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            await asyncio.sleep(0.008)
+            # Provider-owned reasoning is meaningful first output even when
+            # the user-visible answer has not started yet.
+            yield StreamChunk(reasoning=[{
+                "type": "thinking", "thinking": "starting",
+            }])
+            await asyncio.sleep(0.06)
+            yield StreamChunk(content="complete", is_done=True, stop_reason="stop")
+
+    provider = SlowAfterFirstOutput()
+    loop = AshLoop(
+        SessionStore(tmp_path / "first-output-progress.db"), provider,
+        SafetyGuard(project_root=tmp_path), EventUI(), tmp_path,
+    )
+    loop._config = SimpleNamespace(
+        provider_request_timeout_seconds=1.0,
+        provider_first_output_timeout_seconds=0.025,
+        provider_max_attempts=2,
+    )
+
+    result = await loop._stream_one_completion([{"role": "user", "content": "work"}])
+
+    assert result.text == "complete"
+    assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_first_output_deadline_disabled_keeps_legacy_long_wait(tmp_path) -> None:
+    class SlowProvider(ProviderABC):
+        model_name = "slow-legacy-first-output"
+
+        def count_tokens(self, text):
+            return len(str(text))
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            await asyncio.sleep(0.06)
+            yield StreamChunk(content="valid", is_done=True, stop_reason="stop")
+
+    loop = AshLoop(
+        SessionStore(tmp_path / "first-output-disabled.db"), SlowProvider(),
+        SafetyGuard(project_root=tmp_path), EventUI(), tmp_path,
+    )
+    loop._config = SimpleNamespace(
+        provider_request_timeout_seconds=1.0,
+        provider_first_output_timeout_seconds=0.0,
+        provider_max_attempts=1,
+    )
+
+    assert (await loop._stream_one_completion([])).text == "valid"
+
+
+@pytest.mark.asyncio
 async def test_provider_request_timeout_does_not_retry_after_output(tmp_path) -> None:
     class PartialThenStalledProvider(ProviderABC):
         model_name = "partial-then-stalled"
@@ -1946,6 +2070,7 @@ async def test_provider_request_timeout_does_not_retry_after_output(tmp_path) ->
     )
     loop._config = SimpleNamespace(
         provider_request_timeout_seconds=0.01,
+        provider_first_output_timeout_seconds=0.005,
         provider_max_attempts=3,
         provider_retry_base_delay=0.0,
         provider_retry_max_delay=0.0,

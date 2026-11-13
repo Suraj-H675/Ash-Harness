@@ -620,6 +620,16 @@ class AshConfig(BaseSettings):
         le=86_400.0,
         description="Maximum wall-clock seconds for one provider request attempt.",
     )
+    provider_first_output_timeout_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        le=86_400.0,
+        description=(
+            "Optional wall-clock deadline for the first meaningful provider output "
+            "in each attempt; 0 disables it. The request timeout still applies "
+            "after output begins."
+        ),
+    )
     provider_retry_base_delay: float = Field(
         0.5,
         ge=0.0,

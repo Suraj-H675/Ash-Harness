@@ -5364,6 +5364,9 @@ class AshLoop:
         request_timeout = float(
             getattr(self._config, "provider_request_timeout_seconds", 1800.0)
         )
+        first_output_timeout = float(
+            getattr(self._config, "provider_first_output_timeout_seconds", 0.0)
+        )
         active_request_id: str | None = None
         active_request_attempt = 0
         active_provider_stream: Any | None = None
@@ -5422,19 +5425,38 @@ class AshLoop:
                         report_slow_first_output,
                     )
                     try:
-                        deadline = asyncio.get_running_loop().time() + request_timeout
+                        attempt_started = asyncio.get_running_loop().time()
+                        deadline = attempt_started + request_timeout
+                        first_output_deadline = (
+                            attempt_started + first_output_timeout
+                            if first_output_timeout > 0
+                            else None
+                        )
                         active_provider_stream = self.provider.stream_chat(
                             canonical_messages,
                             tools=openai_tools,
                         )
                         stream = active_provider_stream
                         while True:
-                            remaining = deadline - asyncio.get_running_loop().time()
+                            now = asyncio.get_running_loop().time()
+                            remaining = deadline - now
+                            timeout_message = (
+                                "provider request timed out after "
+                                f"{request_timeout:g} seconds"
+                            )
+                            # Empty transport chunks are not first output: use
+                            # the original per-attempt deadline until a chunk
+                            # commits content, tools, reasoning or replay state.
+                            if first_output_deadline is not None and not emitted_output:
+                                first_remaining = first_output_deadline - now
+                                if first_remaining <= remaining:
+                                    remaining = first_remaining
+                                    timeout_message = (
+                                        "provider first output timed out after "
+                                        f"{first_output_timeout:g} seconds"
+                                    )
                             if remaining <= 0:
-                                raise TimeoutError(
-                                    "provider request timed out after "
-                                    f"{request_timeout:g} seconds"
-                                )
+                                raise TimeoutError(timeout_message)
                             try:
                                 chunk = await asyncio.wait_for(
                                     anext(stream),
@@ -5513,10 +5535,7 @@ class AshLoop:
                                     f"({_provider_stream_validation_signature(exc)})"
                                 ) from exc
                             except asyncio.TimeoutError as exc:
-                                raise TimeoutError(
-                                    "provider request timed out after "
-                                    f"{request_timeout:g} seconds"
-                                ) from exc
+                                raise TimeoutError(timeout_message) from exc
                             stream_chunk_count += 1
                             if not allow_tool_calls and (
                                 chunk.tool_call_delta or chunk.native_tool_calls
