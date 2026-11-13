@@ -587,6 +587,30 @@ class TerminalUI:
             self._reasoning_tail = ""
         elif event_type == "provider.retrying":
             self._model_activity = (None, "Retrying")
+        elif event_type == "model.request.waiting":
+            operation_id = payload.get("operation_id")
+            elapsed = payload.get("elapsed_seconds")
+            if (
+                self._model_activity is not None
+                and self._model_activity[0] is not None
+                and operation_id == self._model_activity[0]
+                and self._model_activity[1] == "Thinking"
+                and isinstance(elapsed, (int, float))
+                and not isinstance(elapsed, bool)
+                and math.isfinite(elapsed)
+                and 1 <= elapsed <= 3600
+            ):
+                self._model_activity = (
+                    self._model_activity[0],
+                    f"Waiting for model output ({int(elapsed)}s+)",
+                )
+        elif event_type == "model.request.first_output":
+            if (
+                self._model_activity is not None
+                and payload.get("operation_id") == self._model_activity[0]
+                and self._model_activity[1].startswith("Waiting for model output")
+            ):
+                self._model_activity = (self._model_activity[0], "Thinking")
         elif event_type in _MODEL_REQUEST_TERMINAL_EVENTS:
             operation_id = payload.get("operation_id")
             current_id = self._model_activity[0] if self._model_activity else None

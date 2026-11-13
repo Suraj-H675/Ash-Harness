@@ -2197,6 +2197,160 @@ async def test_first_provider_output_event_is_once_correlated_and_content_free(
 
 
 @pytest.mark.asyncio
+async def test_slow_first_output_emits_one_correlated_content_free_wait_notice(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(loop_module, "MODEL_FIRST_OUTPUT_NOTICE_SECONDS", 0.01)
+
+    class SlowFirstOutputProvider(ProviderABC):
+        model_name = "slow-first-output"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk()  # Empty transport chunk is not model output.
+            await asyncio.sleep(0.04)
+            yield StreamChunk(content="done", is_done=True, stop_reason="stop")
+
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "slow-first-output.db"),
+        SlowFirstOutputProvider(),
+        SafetyGuard(project_root=tmp_path), ui, tmp_path,
+    )
+
+    outcome = await loop._stream_one_completion([])
+    assert outcome.text == "done"
+    request_events = [
+        item for item in ui.events if item["type"].startswith("model.request.")
+    ]
+    assert [item["type"] for item in request_events] == [
+        "model.request.started", "model.request.waiting",
+        "model.request.first_output", "model.request.completed",
+    ]
+    assert len({item["operation_id"] for item in request_events}) == 1
+    assert request_events[1]["elapsed_seconds"] == 0.01
+    assert request_events[1]["attempt"] == 1
+    assert "done" not in str(request_events[1])
+
+
+@pytest.mark.asyncio
+async def test_first_output_wait_notice_cancels_on_fast_completion_and_cancellation(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(loop_module, "MODEL_FIRST_OUTPUT_NOTICE_SECONDS", 0.05)
+
+    class FastProvider(ProviderABC):
+        model_name = "fast"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(content="ok", is_done=True, stop_reason="stop")
+
+    class BlockingProvider(FastProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            await asyncio.Event().wait()
+            yield StreamChunk(content="never", is_done=True, stop_reason="stop")
+
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "fast-first-output.db"), FastProvider(),
+        SafetyGuard(project_root=tmp_path), ui, tmp_path,
+    )
+    assert (await loop._stream_one_completion([])).text == "ok"
+
+    blocked_ui = EventUI()
+    blocked_loop = AshLoop(
+        SessionStore(tmp_path / "cancelled-first-output.db"), BlockingProvider(),
+        SafetyGuard(project_root=tmp_path), blocked_ui, tmp_path,
+    )
+    task = asyncio.create_task(blocked_loop._stream_one_completion([]))
+    await asyncio.sleep(0)
+    assert any(event["type"] == "model.request.started" for event in blocked_ui.events)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.06)
+
+    assert not any(event["type"] == "model.request.waiting" for event in ui.events)
+    assert not any(
+        event["type"] == "model.request.waiting" for event in blocked_ui.events
+    )
+    assert any(
+        event["type"] == "model.request.cancelled" for event in blocked_ui.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_first_output_wait_notice_is_scoped_to_each_retry_attempt(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(loop_module, "MODEL_FIRST_OUTPUT_NOTICE_SECONDS", 0.01)
+    monkeypatch.setattr(loop_module, "retry_delay", lambda *_args, **_kwargs: 0.0)
+
+    class RetryThenSlowProvider(ProviderABC):
+        model_name = "retry-then-slow"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self):
+            self.attempts = 0
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ConnectionError("temporary")
+            await asyncio.sleep(0.035)
+            yield StreamChunk(content="ok", is_done=True, stop_reason="stop")
+
+    provider = RetryThenSlowProvider()
+    ui = EventUI()
+    loop = AshLoop(
+        SessionStore(tmp_path / "slow-retry.db"), provider,
+        SafetyGuard(project_root=tmp_path), ui, tmp_path,
+    )
+
+    outcome = await loop._stream_one_completion([])
+    assert outcome.text == "ok"
+    assert provider.attempts == 2
+    started = [
+        event for event in ui.events if event["type"] == "model.request.started"
+    ]
+    waiting = [
+        event for event in ui.events if event["type"] == "model.request.waiting"
+    ]
+    assert len(started) == 2 and len(waiting) == 1
+    assert started[0]["operation_id"] != started[1]["operation_id"]
+    assert waiting[0]["operation_id"] == started[1]["operation_id"]
+    assert waiting[0]["attempt"] == 2
+
+
+def test_first_output_wait_observer_projection_never_includes_payload_content() -> None:
+    event = loop_module._observer_event_projection(
+        {
+            "type": "model.request.waiting",
+            "operation_id": "request-1",
+            "attempt": 1,
+            "elapsed_seconds": 30.0,
+            "messages": "PRIVATE_PROMPT",
+            "response": "PRIVATE_OUTPUT",
+            "error": "PRIVATE_ERROR",
+        }
+    )
+    assert event["operation_id"] == "request-1"
+    assert event["attempt"] == 1
+    assert event["elapsed_seconds"] == 30.0
+    assert "PRIVATE_" not in repr(event)
+
+
+@pytest.mark.asyncio
 async def test_terminal_usage_only_does_not_count_as_first_provider_output(
     tmp_path,
 ) -> None:

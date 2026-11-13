@@ -79,6 +79,17 @@ Every provider completion attempt emits:
 - exactly one of `model.request.completed`, `model.request.error`, or
   `model.request.cancelled` for that request operation ID.
 
+Ash also emits a content-free `model.request.first_output` when the first
+retained provider output arrives. When a request remains without retained
+output for 30 seconds, it emits at most one `model.request.waiting` event for
+that attempt with `elapsed_seconds` and `attempt`, correlated to the same
+operation ID. Empty stream/transport chunks are not counted as output. The
+interactive terminal shows a non-error waiting status that clears on the
+first output, a retry, cancellation, or completion; screen-reader mode gets
+the same semantic update. The notice neither cancels nor retries a request,
+and cannot determine whether the delay is provider inference, queueing, or
+transport. The default request timeout and reasoning effort are unaffected.
+
 Completed events include provider-reported or estimated token/cache usage and
 the normalized stop category. Error events include bounded operational
 classification such as HTTP status, retryability, whether output was already

@@ -732,6 +732,51 @@ def test_reduced_motion_keeps_semantic_activity_invalidation() -> None:
     assert ui.prompt_dock_view().activity == "Thinking"
 
 
+def test_terminal_reports_first_output_wait_without_claiming_timeout() -> None:
+    ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
+    ui.emit_event({"type": "turn.started"})
+    ui.emit_event({"type": "model.request.started", "operation_id": "request-1"})
+
+    ui.emit_event({
+        "type": "model.request.waiting", "operation_id": "stale-request",
+        "elapsed_seconds": 30,
+    })
+    assert ui.prompt_dock_view().activity == "Thinking"
+
+    ui.emit_event({
+        "type": "model.request.waiting", "operation_id": "request-1",
+        "elapsed_seconds": 30,
+    })
+    assert ui.prompt_dock_view().activity == "Waiting for model output (30s+)"
+
+    ui.emit_event({"type": "model.request.first_output", "operation_id": "request-1"})
+    assert ui.prompt_dock_view().activity == "Thinking"
+    ui.emit_event({"type": "assistant.delta", "text": "answer"})
+    assert ui.prompt_dock_view().activity == "Responding"
+    ui.emit_event({"type": "model.request.completed", "operation_id": "request-1"})
+    assert ui.prompt_dock_view().activity is None
+
+
+def test_screen_reader_announces_slow_model_wait_once() -> None:
+    output = StringIO()
+    ui = TerminalUI(
+        console=Console(file=output, force_terminal=False),
+        screen_reader_mode=True,
+    )
+    ui.emit_event({"type": "turn.started"})
+    ui.emit_event({"type": "model.request.started", "operation_id": "r1"})
+    notice = {
+        "type": "model.request.waiting", "operation_id": "r1",
+        "elapsed_seconds": 30,
+    }
+    ui.emit_event(notice)
+    ui.emit_event(notice)
+    ui.emit_event({"type": "model.request.cancelled", "operation_id": "r1"})
+
+    assert output.getvalue().count("Status: Waiting for model output (30s+)") == 1
+    assert ui.prompt_dock_view().activity is None
+
+
 def test_multiple_tools_keep_only_terminal_lifecycle_rows() -> None:
     ui = TerminalUI(console=Console(file=StringIO(), force_terminal=False))
 

@@ -148,6 +148,7 @@ MAX_PROVIDER_COMPLETION_BYTES = 16 * 1024 * 1024
 MAX_PROVIDER_TOOL_SCHEMA_BYTES = 16 * 1024 * 1024
 MAX_PROVIDER_REASONING_BLOCKS = 4096
 MAX_PROVIDER_STREAM_CHUNKS = 100_000
+MODEL_FIRST_OUTPUT_NOTICE_SECONDS = 30.0
 MAX_TURN_INPUT_BYTES = 1_000_000
 MAX_TURN_METADATA_BYTES = 1_000_000
 MAX_PENDING_STEERING_BYTES = 1_000_000
@@ -356,6 +357,7 @@ _OBSERVER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "credential_pool_size",
         }
     ),
+    "model.request.waiting": frozenset({"attempt", "elapsed_seconds"}),
     "model.request.error": frozenset(
         {
             "provider",
@@ -5341,6 +5343,29 @@ class AshLoop:
                             **_provider_credential_event_fields(self.provider),
                         }
                     )
+                    notice_operation_id = active_request_id
+
+                    def report_slow_first_output(
+                        operation_id: str = notice_operation_id,
+                        request_attempt: int = attempt,
+                    ) -> None:
+                        if (
+                            active_request_id == operation_id
+                            and not emitted_output
+                        ):
+                            self._emit_event(
+                                {
+                                    "type": "model.request.waiting",
+                                    "operation_id": operation_id,
+                                    "attempt": request_attempt,
+                                    "elapsed_seconds": MODEL_FIRST_OUTPUT_NOTICE_SECONDS,
+                                }
+                            )
+
+                    notice_handle = asyncio.get_running_loop().call_later(
+                        MODEL_FIRST_OUTPUT_NOTICE_SECONDS,
+                        report_slow_first_output,
+                    )
                     try:
                         deadline = asyncio.get_running_loop().time() + request_timeout
                         active_provider_stream = self.provider.stream_chat(
@@ -5508,6 +5533,7 @@ class AshLoop:
                                     "provider emitted output after its terminal chunk"
                                 )
                             if chunk_has_output and not emitted_output:
+                                notice_handle.cancel()
                                 # Request latency alone cannot distinguish
                                 # waiting for the first provider output from
                                 # subsequent generation. Never persist output.
@@ -5635,6 +5661,7 @@ class AshLoop:
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001
+                        notice_handle.cancel()
                         stream_to_close = active_provider_stream
                         active_provider_stream = None
                         if stream_to_close is not None:
@@ -5727,6 +5754,8 @@ class AshLoop:
                         retained_completion_bytes = 0
                         stream_chunk_count = 0
                         attempt += 1
+                    finally:
+                        notice_handle.cancel()
                 stop_category = completion_stop_category(terminal_stop_reason)
                 if stop_category != CompletionStopCategory.COMPLETE:
                     detail = terminal_stop_reason or stop_category.value
