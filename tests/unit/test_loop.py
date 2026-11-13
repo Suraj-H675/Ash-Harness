@@ -5080,6 +5080,141 @@ async def test_oversized_current_request_fails_before_provider_dispatch(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_interrupted_coding_turn_reports_successfully_edited_file_count(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ash.tools.filesystem import ReplaceFileContentTool
+
+    source = tmp_path / "worker.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+
+    class EditThenStop(ProviderABC):
+        model_name = "edit-then-stop"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return max(1, len(text) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            yield StreamChunk(
+                is_done=True,
+                stop_reason="tool_calls",
+                native_tool_calls=[{
+                    "call_id": "write-1",
+                    "name": "replace_file_content",
+                    "arguments": {
+                        "file_path": "worker.py",
+                        "target_content": "value = 1",
+                        "replacement_content": "value = 2",
+                    },
+                }],
+            )
+
+    async def approve(_tool: str, _args: dict[str, Any]) -> bool:
+        return True
+
+    ui = EventUI()
+    guard = SafetyGuard(tmp_path)
+    loop = AshLoop(
+        SessionStore(tmp_path / "partial-edit.db"), EditThenStop(), guard, ui,
+        tmp_path, tools={"replace_file_content": ReplaceFileContentTool(guard)},
+        on_tool_approval=approve,
+    )
+    session = await loop.start_session()
+    build_original = loop._build_messages
+
+    def exhaust_after_edit(*args, **kwargs):
+        if loop._turn_modified_paths:
+            raise ContextBudgetExceededError(
+                32000, 28000, protected_current_turn=True,
+                provider_replay_state_preserved=True,
+            )
+        return build_original(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_build_messages", exhaust_after_edit)
+
+    with pytest.raises(ContextBudgetExceededError):
+        await loop.run_turn("Change the value and verify it")
+
+    assert source.read_text() == "value = 2\n"
+    assert loop._last_interrupted_edit_files == 1
+    errors = [event for event in ui.events if event["type"] == "turn.error"]
+    assert len(errors) == 1
+    assert errors[0]["edited_files"] == 1
+    assert "worker.py" not in str(errors[0])
+    assert "value = 2" not in str(errors[0])
+    assert loop.session_store.load_session(session.session_id).tool_calls[-1].success
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_coding_turn_preserves_completed_edit_and_reports_it(
+    tmp_path,
+) -> None:
+    from ash.tools.filesystem import ReplaceFileContentTool
+
+    source = tmp_path / "worker.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+
+    class EditThenWait(ProviderABC):
+        model_name = "edit-then-wait"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self):
+            self.calls = 0
+            self.waiting = asyncio.Event()
+
+        def count_tokens(self, text):
+            return max(1, len(text) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                yield StreamChunk(
+                    is_done=True,
+                    stop_reason="tool_calls",
+                    native_tool_calls=[{
+                        "call_id": "write-1", "name": "replace_file_content",
+                        "arguments": {
+                            "file_path": "worker.py",
+                            "target_content": "value = 1",
+                            "replacement_content": "value = 2",
+                        },
+                    }],
+                )
+            else:
+                self.waiting.set()
+                await asyncio.Event().wait()
+
+    async def approve(_tool: str, _args: dict[str, Any]) -> bool:
+        return True
+
+    provider = EditThenWait()
+    ui = EventUI()
+    guard = SafetyGuard(tmp_path)
+    loop = AshLoop(
+        SessionStore(tmp_path / "cancel-partial-edit.db"), provider, guard, ui,
+        tmp_path, tools={"replace_file_content": ReplaceFileContentTool(guard)},
+        on_tool_approval=approve,
+    )
+
+    task = asyncio.create_task(loop.run_turn("Repair then verify"))
+    await asyncio.wait_for(provider.waiting.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert source.read_text() == "value = 2\n"
+    assert provider.calls == 2
+    assert loop._last_interrupted_edit_files == 1
+    cancelled = [event for event in ui.events if event["type"] == "turn.cancelled"]
+    assert len(cancelled) == 1
+    assert cancelled[0]["edited_files"] == 1
+    assert "worker.py" not in str(cancelled[0])
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_oversized_current_image_fails_before_provider_dispatch(tmp_path) -> None:
     class NeverCalledVisionProvider(ProviderABC):
         model_name = "context-image-test"

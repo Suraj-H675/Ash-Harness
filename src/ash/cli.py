@@ -5701,12 +5701,28 @@ async def _bootstrap_and_headless(
     except Exception as exc:  # noqa: BLE001
         primary_error = exc
         error = classify_exception(exc)
+        error_payload = error.to_dict()
+        interrupted_edit_files = getattr(loop, "_last_interrupted_edit_files", 0)
+        if isinstance(interrupted_edit_files, int) and interrupted_edit_files > 0:
+            error_payload["edited_files"] = interrupted_edit_files
+            error_payload["remedy"] += (
+                f" The interrupted turn edited {interrupted_edit_files} file(s). "
+                "Review the workspace diff and run relevant tests before "
+                "relying on changes; do not blindly replay tool calls."
+            )
         if hasattr(ui, "emit_error"):
-            ui.emit_error(error.to_dict())
+            ui.emit_error(error_payload)
         elif ui.output_format in {"json", "stream-json"}:
-            print(json.dumps({"type": "error", "error": error.to_dict()}), flush=True)
+            print(json.dumps({"type": "error", "error": error_payload}), flush=True)
         else:
             print(format_error(error), file=sys.stderr)
+            if interrupted_edit_files:
+                print(
+                    f"Warning: the interrupted turn edited "
+                    f"{interrupted_edit_files} file(s); review the workspace "
+                    "diff and run relevant tests before relying on changes.",
+                    file=sys.stderr,
+                )
         result_code = error.exit_code
     finally:
         try:

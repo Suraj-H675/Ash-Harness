@@ -1224,6 +1224,21 @@ class TerminalUI:
                     usage_text = "0 tokens reported."
                 self.write_status(f"Turn cancelled after {iterations} {step_label}; {usage_text}")
 
+        if event_type in {"turn.error", "turn.cancelled"}:
+            edited_files = payload.get("edited_files")
+            if (
+                isinstance(edited_files, int)
+                and not isinstance(edited_files, bool)
+                and 0 < edited_files <= 10_000
+            ):
+                plural = "file" if edited_files == 1 else "files"
+                self.write_status(
+                    f"Turn stopped after editing {edited_files} {plural}. "
+                    "Work may be incomplete; review the diff and run relevant "
+                    "tests before relying on these changes.",
+                    error=True,
+                )
+
         if event_type not in {
             "tool.started",
             "tool.output",

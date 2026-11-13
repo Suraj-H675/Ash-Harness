@@ -397,6 +397,47 @@ def test_json_error_is_structured_machine_readable_event() -> None:
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edited_files", [0, 2])
+async def test_headless_context_error_reports_partial_edits_only_when_known(
+    edited_files: int,
+) -> None:
+    from ash.cli import _bootstrap_and_headless
+    from ash.context.history import ContextBudgetExceededError
+
+    class InterruptedLoop:
+        provider = None
+        safety_guard = None
+        recovered_turns = 0
+        recovery_summary = None
+        _last_interrupted_edit_files = edited_files
+
+        async def start_session(self, session_id=None):
+            return SimpleNamespace(session_id="session-a")
+
+        async def run_turn(self, prompt):
+            raise ContextBudgetExceededError(40000, 28000, protected_current_turn=True)
+
+        async def aclose(self):
+            pass
+
+    stream = io.StringIO()
+    ui = HeadlessUI(output_format="json", stream=stream)
+    result_code = await _bootstrap_and_headless(
+        InterruptedLoop(), SimpleNamespace(),
+        prompt="Repair module", session_id=None, ui=ui,
+    )
+    assert result_code != 0
+    error = json.loads(stream.getvalue())["error"]
+    assert error["category"] == "context"
+    if edited_files:
+        assert error["edited_files"] == edited_files
+        assert "Review the workspace diff" in error["remedy"]
+    else:
+        assert "edited_files" not in error
+        assert "Review the workspace diff" not in error["remedy"]
+
+
 def test_headless_approval_fails_closed() -> None:
     ui = HeadlessUI(output_format="text", stream=io.StringIO())
     assert ui.request_tool_approval("run_command", {"command": "x"}) is False

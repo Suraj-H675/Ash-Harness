@@ -2470,6 +2470,7 @@ class AshLoop:
         self.recovery_summary = None
 
     def _reset_last_turn_state(self) -> None:
+        self._last_interrupted_edit_files = 0
         self._last_turn_prompt_tokens = 0
         self._last_turn_completion_tokens = 0
         self._last_turn_budget_exhausted = False
@@ -3850,6 +3851,11 @@ class AshLoop:
         except asyncio.CancelledError:
             self._pause_goal_nonfatal()
             current_turn_id = self.turn_context.turn_id if self.turn_context else None
+            self._last_interrupted_edit_files = (
+                len(self._turn_modified_paths)
+                if current_turn_id is not None and current_turn_id != previous_turn_id
+                else 0
+            )
             self._recover_cancelled_turn(current_turn_id, previous_turn_id)
             discarded = len(self._steering_messages)
             self._steering_messages.clear()
@@ -3861,6 +3867,7 @@ class AshLoop:
                     "iterations": self._last_turn_iterations,
                     "iteration_limit": self._last_turn_iteration_limit,
                     "token_budget": self._last_turn_token_budget,
+                    "edited_files": self._last_interrupted_edit_files,
                 }
             )
             await self._fire_hook_lifecycle(
@@ -3880,8 +3887,15 @@ class AshLoop:
             self._pause_goal_nonfatal()
             current_turn_id = self.turn_context.turn_id if self.turn_context else None
             if current_turn_id is not None and current_turn_id != previous_turn_id:
+                self._last_interrupted_edit_files = len(self._turn_modified_paths)
                 self.session_store.interrupt_turn(current_turn_id)
-                self._emit_event({"type": "turn.error", "error": redact_text(str(exc))})
+                self._emit_event(
+                    {
+                        "type": "turn.error",
+                        "error": redact_text(str(exc)),
+                        "edited_files": self._last_interrupted_edit_files,
+                    }
+                )
             payload = {
                 "session_id": (
                     self.current_session.session_id

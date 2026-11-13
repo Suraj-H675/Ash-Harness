@@ -117,6 +117,18 @@ per-request input values and label them a single context-window size.
 
 ## Turn completion identity
 
+When a turn fails or is cancelled after a successful Ash file-edit operation,
+`turn.error` and `turn.cancelled` include `edited_files`: the count of distinct
+file paths whose completed edits Ash could inspect after writing. The count is
+content-free: it contains no paths, source code, or command output. It is not a
+claim that the task was verified or that the diff still contains those edits;
+it does not count changes made by arbitrary shell commands or uncertain tool
+outcomes. A zero count cannot prove the workspace is unchanged. Interactive
+and one-shot CLI users receive an actionable review-and-test warning when the
+count is positive, and JSON errors expose the same count and remedy. Recovery
+continues to preserve known completed work and never blindly replay uncertain
+effects.
+
 `turn.completed` means the Ash turn reached its terminal boundary, not that
 the user's task passed verification. In particular, a provider may produce a
 normal terminal response with empty text. Automation must inspect the response,

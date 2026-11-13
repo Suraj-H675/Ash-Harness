@@ -757,6 +757,21 @@ def test_terminal_reports_first_output_wait_without_claiming_timeout() -> None:
     assert ui.prompt_dock_view().activity is None
 
 
+@pytest.mark.parametrize("terminal_event", ["turn.error", "turn.cancelled"])
+def test_interrupted_coding_edits_have_actionable_terminal_warning(terminal_event: str) -> None:
+    output = StringIO()
+    ui = TerminalUI(console=Console(file=output, force_terminal=False))
+    ui.emit_event({"type": "turn.started"})
+    ui.emit_event({"type": terminal_event, "edited_files": 2})
+    assert "editing 2 files" in output.getvalue()
+    assert "review the diff" in output.getvalue().lower()
+
+    clean_output = StringIO()
+    clean = TerminalUI(console=Console(file=clean_output, force_terminal=False))
+    clean.emit_event({"type": terminal_event, "edited_files": 0})
+    assert "review the diff" not in clean_output.getvalue().lower()
+
+
 def test_screen_reader_announces_slow_model_wait_once() -> None:
     output = StringIO()
     ui = TerminalUI(
