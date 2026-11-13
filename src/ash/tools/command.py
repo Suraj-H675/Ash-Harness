@@ -82,6 +82,26 @@ _MYPY_SUMMARY = re.compile(
 )
 _RUFF_ERROR_SUMMARY = re.compile(r"^Found\s+(\d+)\s+errors?\.$", re.I)
 _RUFF_FIXABLE = re.compile(r"\b(\d+)\s+fixable\s+with\s+the\s+[`']?--fix", re.I)
+_PYTEST_FAILURE_HEADER = re.compile(r"^={3,}\s+(?:FAILURES|ERRORS)\s+={3,}$")
+_PYTEST_SECTION_END = re.compile(r"^={3,}\s+short test summary info\s+={3,}$", re.I)
+_PYTEST_TRACE_LOCATION = re.compile(
+    r"^(?P<path>[^\s:]+\.py):(?P<line>\d+):\s+in\s+(?P<symbol>\S+)\s*$"
+)
+_PYTEST_EXCEPTION_LOCATION = re.compile(
+    r"^(?P<path>[^\s:]+\.py):(?P<line>\d+):\s+"
+    r"(?P<exception>[\w.]+(?:Error|Exception|Failed))"
+    r"(?::\s*(?P<message>.*))?$"
+)
+_PYTEST_ERROR_DETAIL = re.compile(r"^E\s+(?P<message>[^\n]+)$")
+_PYTHON_TRACEBACK_FRAME = re.compile(
+    r'^\s+File "(?P<path>[^"\n]+\.py)", line (?P<line>\d+)'
+    r'(?:, in (?P<symbol>[^\n]+))?$'
+)
+_PYTHON_TRACEBACK_EXCEPTION = re.compile(
+    r"^(?P<exception>(?:[A-Za-z_]\w*\.)*"
+    r"[A-Za-z_]\w*(?:Error|Exception|Exit|Interrupt))"
+    r"(?::\s*(?P<message>[^\n]*))?$"
+)
 
 
 class RunCommandArgs(BaseModel):
@@ -146,7 +166,8 @@ def _diagnostic_from_line(line: str, *, severity: str) -> dict[str, Any] | None:
             r"(?P<message>.+)$"
         ),
         re.compile(
-            r"^FAILED\s+(?P<path>tests/[^\s:]+)::(?P<symbol>[^\s]+)"
+            r"^(?P<pytest_kind>FAILED|ERROR)\s+"
+            r"(?P<path>[^\s:]+\.py)(?:::(?P<symbol>[^\s]+))?"
             r"(?:\s+-\s+(?P<message>.+))?$"
         ),
     )
@@ -161,6 +182,7 @@ def _diagnostic_from_line(line: str, *, severity: str) -> dict[str, Any] | None:
         elif (
             values.get("code")
             or values.get("symbol")
+            or values.get("pytest_kind")
             or (values.get("column") and values["path"].endswith(".go"))
         ):
             item_severity = "error"
@@ -208,12 +230,147 @@ def _diagnostic_from_compiler_pair(header: str, location: str) -> dict[str, Any]
     }
 
 
+def _pytest_failure_locations(output: str) -> list[dict[str, Any]]:
+    """Extract bounded pytest traceback sites only inside failure sections.
+
+    Pytest's short tracebacks use `path.py:line: in test_name` followed by
+    `E   assert ...`, not the `path:line: error:` shape that ordinary compiler
+    parsers recognize. Never classify arbitrary passing command logs this way.
+    """
+
+    locations: list[dict[str, Any]] = []
+    in_failure = False
+    pending: dict[str, Any] | None = None
+
+    def retain_pending() -> None:
+        nonlocal pending
+        if pending is not None and len(locations) < MAX_DIAGNOSTIC_ITEMS:
+            pending["source_text"] = (
+                f"{pending['path']}:{pending['line']}: {pending['message']}"
+            )[:500]
+            locations.append(pending)
+        pending = None
+
+    for line in output.splitlines():
+        if len(locations) >= MAX_DIAGNOSTIC_ITEMS:
+            break
+        stripped = line.strip()
+        if _PYTEST_FAILURE_HEADER.fullmatch(stripped):
+            retain_pending()
+            in_failure = True
+            continue
+        if _PYTEST_SECTION_END.fullmatch(stripped):
+            retain_pending()
+            in_failure = False
+        if not in_failure or len(stripped) > 1000:
+            continue
+        location = _PYTEST_TRACE_LOCATION.fullmatch(stripped)
+        if location is not None:
+            retain_pending()
+            pending = {
+                "path": location["path"],
+                "line": int(location["line"]),
+                "column": None,
+                "symbol": location["symbol"],
+                "code": None,
+                "message": "pytest traceback location",
+                "severity": "error",
+            }
+            continue
+        exception = _PYTEST_EXCEPTION_LOCATION.fullmatch(stripped)
+        if exception is not None:
+            retain_pending()
+            message = exception["message"] or exception["exception"]
+            pending = {
+                "path": exception["path"],
+                "line": int(exception["line"]),
+                "column": None,
+                "symbol": None,
+                "code": exception["exception"],
+                "message": message[:500],
+                "severity": "error",
+            }
+            continue
+        detail = _PYTEST_ERROR_DETAIL.fullmatch(stripped)
+        if detail is not None and pending is not None and (
+            pending["message"] == "pytest traceback location"
+        ):
+            message = detail["message"]
+            if not message.startswith("+"):
+                pending["message"] = message[:500]
+                exception_type = _PYTHON_TRACEBACK_EXCEPTION.fullmatch(message)
+                pending["code"] = (
+                    "AssertionError"
+                    if message.startswith("assert ")
+                    else exception_type["exception"] if exception_type else None
+                )
+    retain_pending()
+    return locations
+
+
+def _python_traceback_locations(output: str) -> list[dict[str, Any]]:
+    """Find the innermost Python exception frame from real traceback blocks.
+
+    A frame-shaped line alone is insufficient: require a traceback header and
+    a subsequent terminal exception type. No file is opened or executed.
+    """
+
+    locations: list[dict[str, Any]] = []
+    traceback_active = False
+    last_frame: re.Match[str] | None = None
+    for line in output.splitlines():
+        if len(locations) >= MAX_DIAGNOSTIC_ITEMS:
+            break
+        stripped = line.strip()
+        if stripped == "Traceback (most recent call last):":
+            traceback_active = True
+            last_frame = None
+            continue
+        if not traceback_active or len(stripped) > 1000:
+            continue
+        frame = _PYTHON_TRACEBACK_FRAME.fullmatch(line)
+        if frame is not None:
+            last_frame = frame
+            continue
+        exception = _PYTHON_TRACEBACK_EXCEPTION.fullmatch(stripped)
+        if exception is None or last_frame is None:
+            continue
+        path = last_frame["path"]
+        line_number = int(last_frame["line"])
+        exception_type = exception["exception"]
+        message = (exception["message"] or exception_type)[:500]
+        locations.append({
+            "path": path,
+            "line": line_number,
+            "column": None,
+            "symbol": last_frame["symbol"],
+            "code": exception_type,
+            "message": message,
+            "severity": "error",
+            "source_text": f"{path}:{line_number}: {exception_type}: {message}"[:500],
+        })
+        traceback_active = False
+        last_frame = None
+    return locations
+
+
 def extract_diagnostics(output: str, error: str) -> list[dict[str, Any]]:
     """Bound structured diagnostics to the most actionable stream lines."""
 
     diagnostics: list[dict[str, Any]] = []
     seen: set[str] = set()
     for source, severity in ((error, "error"), (output, "warning")):
+        for structured in (
+            *_pytest_failure_locations(source),
+            *_python_traceback_locations(source),
+        ):
+            key = structured["source_text"]
+            if key in seen:
+                continue
+            seen.add(key)
+            diagnostics.append(structured)
+            if len(diagnostics) >= MAX_DIAGNOSTIC_ITEMS:
+                return diagnostics
         previous_line = ""
         for line in source.splitlines():
             diagnostic = _diagnostic_from_line(line, severity=severity)

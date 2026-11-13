@@ -894,6 +894,226 @@ def test_command_diagnostics_recognize_coding_tool_output(
     ] == expected
 
 
+def test_pytest_short_traceback_retains_failing_location_and_assertion() -> None:
+    output = (
+        "F                                                                        [100%]\n"
+        "=================================== FAILURES ===================================\n"
+        "________________________________ test_discount _________________________________\n"
+        "test_invoice.py:5: in test_discount\n"
+        "    assert compute_total() == 9\n"
+        "E   assert 10 == 9\n"
+        "E    +  where 10 = compute_total()\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED test_invoice.py::test_discount - assert 10 == 9\n"
+        "1 failed in 0.09s\n"
+    )
+
+    diagnostics = extract_diagnostics(output, "")
+
+    assert any(
+        item["path"] == "test_invoice.py"
+        and item["line"] == 5
+        and item["symbol"] == "test_discount"
+        and item["severity"] == "error"
+        and "assert 10 == 9" in item["message"]
+        for item in diagnostics
+    )
+    assert any(
+        item["path"] == "test_invoice.py"
+        and item["symbol"] == "test_discount"
+        for item in diagnostics
+    )
+    assert extract_diagnostic_summary(output, "") == {"pytest_failed": 1}
+
+
+def test_pytest_traceback_exposes_related_source_and_collect_error_locations() -> None:
+    output = (
+        "============================= ERRORS =============================\n"
+        "________________ ERROR collecting tests/test_shipping.py ________________\n"
+        "tests/test_shipping.py:2: in <module>\n"
+        "    from package.shipping import compute\n"
+        "src/package/shipping.py:17: in <module>\n"
+        "    raise ValueError('invalid configuration')\n"
+        "E   ValueError: invalid configuration\n"
+        "=========================== short test summary info ============================\n"
+        "ERROR tests/test_shipping.py - ValueError: invalid configuration\n"
+        "1 error in 0.12s\n"
+    )
+
+    diagnostics = extract_diagnostics(output, "")
+
+    assert any(
+        item["path"] == "src/package/shipping.py"
+        and item["line"] == 17
+        and item["severity"] == "error"
+        and item["code"] == "ValueError"
+        and "ValueError" in item["message"]
+        for item in diagnostics
+    )
+    assert any(
+        item["path"] == "tests/test_shipping.py" and item["line"] == 2
+        for item in diagnostics
+    )
+    assert any(
+        item["path"] == "tests/test_shipping.py"
+        and item["severity"] == "error"
+        and "ValueError: invalid configuration" in item["message"]
+        for item in diagnostics
+    )
+
+
+def test_pytest_traceback_parser_does_not_invent_failure_from_plain_file_log() -> None:
+    output = (
+        "test_invoice.py:5: in test_discount\n"
+        "E   assert 10 == 9\n"
+        "src/billing.py:12: ValueError: example only\n"
+        "1 passed in 0.03s\n"
+    )
+    assert extract_diagnostics(output, "") == []
+
+
+def test_python_traceback_diagnostic_points_to_innermost_failing_source() -> None:
+    traceback_output = (
+        "Traceback (most recent call last):\n"
+        '  File "entry.py", line 4, in <module>\n'
+        "    run()\n"
+        '  File "src/billing.py", line 17, in run\n'
+        "    return total / 0\n"
+        "ZeroDivisionError: division by zero\n"
+    )
+
+    diagnostics = extract_diagnostics("", traceback_output)
+
+    assert any(
+        item["path"] == "src/billing.py"
+        and item["line"] == 17
+        and item["code"] == "ZeroDivisionError"
+        and item["severity"] == "error"
+        and "division by zero" in item["message"]
+        for item in diagnostics
+    )
+
+
+def test_python_traceback_diagnostics_require_real_traceback_header() -> None:
+    output = (
+        'File "src/billing.py", line 17, in run\n'
+        "ZeroDivisionError: division by zero\n"
+        "1 passed in 0.04s\n"
+    )
+    assert extract_diagnostics(output, "") == []
+
+
+def test_pytest_traceback_diagnostics_keep_the_existing_fifty_item_limit() -> None:
+    output = (
+        "============================ FAILURES ============================\n"
+        + "".join(
+            f"tests/test_case_{i}.py:{i + 1}: in test_case_{i}\n"
+            f"E   assert {i} == -1\n"
+            for i in range(100)
+        )
+        + "===================== short test summary info =====================\n"
+    )
+    diagnostics = extract_diagnostics(output, "")
+    assert len(diagnostics) == 50
+    assert diagnostics[0]["line"] == 1
+    assert diagnostics[-1]["line"] == 50
+
+
+@pytest.mark.asyncio
+async def test_pytest_failure_locations_remain_redacted_in_full_tool_result(
+    guard: SafetyGuard,
+) -> None:
+    from ash.sandbox import SANDBOX_TIER_BWRAP
+    from ash.sandbox.manager import SandboxResult
+
+    class FailedPytestSandbox:
+        tier = SANDBOX_TIER_BWRAP
+
+        async def run(self, *_args, **_kwargs) -> SandboxResult:
+            return SandboxResult(
+                exit_code=1,
+                stdout=(
+                    "================== FAILURES ==================\n"
+                    "tests/test_config.py:8: in test_key\n"
+                    "E   AssertionError: token=supersecretvalue\n"
+                    "================== short test summary info ==================\n"
+                    "FAILED tests/test_config.py::test_key - AssertionError\n"
+                    "1 failed in 0.02s\n"
+                ),
+                stderr="",
+                tier=SANDBOX_TIER_BWRAP,
+                backend_name="fixture",
+            )
+
+    result = await RunCommandTool(
+        guard, sandbox_manager=FailedPytestSandbox()
+    ).run(command_line="echo test")
+
+    assert result.success is False
+    assert any(item["line"] == 8 for item in result.diagnostics)
+    assert "supersecretvalue" not in result.model_dump_json()
+    assert "[REDACTED]" in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_real_python_command_failure_exposes_source_traceback(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "billing.py").write_text(
+        "def quote():\n    return 9 / 0\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "entry.py").write_text(
+        "from billing import quote\nquote()\n", encoding="utf-8"
+    )
+
+    result = await RunCommandTool(SafetyGuard(tmp_path)).run(
+        command_line=f"{shlex.quote(sys.executable)} -B entry.py",
+        timeout_seconds=20,
+    )
+
+    assert result.success is False
+    assert result.exit_code == 1
+    assert any(
+        item["path"].endswith("billing.py")
+        and item["line"] == 2
+        and item["code"] == "ZeroDivisionError"
+        for item in result.diagnostics
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_command_exposes_real_pytest_failure_line_to_coding_agent(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "test_invoice.py"
+    source.write_text(
+        "def compute_total():\n"
+        "    return 10\n\n"
+        "def test_discount():\n"
+        "    assert compute_total() == 9\n",
+        encoding="utf-8",
+    )
+
+    result = await RunCommandTool(SafetyGuard(tmp_path)).run(
+        command_line=(
+            f"{shlex.quote(sys.executable)} -m pytest -q --no-header "
+            "--tb=short test_invoice.py"
+        ),
+        timeout_seconds=20,
+    )
+
+    assert result.success is False
+    assert result.exit_code == 1
+    assert result.diagnostic_summary["pytest_failed"] == 1
+    assert any(
+        diagnostic["path"] == "test_invoice.py"
+        and diagnostic["line"] == 5
+        and "assert 10 == 9" in diagnostic["message"]
+        for diagnostic in result.diagnostics
+    )
+
+
 def test_ruff_summary_does_not_invent_pytest_or_mypy_failures() -> None:
     output = (
         "F401 [*] `os` imported but unused\n"

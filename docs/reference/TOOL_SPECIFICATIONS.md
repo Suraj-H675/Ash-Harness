@@ -268,6 +268,19 @@ Tool results report `success` separately from process output and include an
 unknown outcomes omit the code so a termination status is not presented as a
 completed command result.
 
+**Coding-failure diagnostics:** For Python tests and scripts, `run_command`
+also extracts bounded, structured source locations from real pytest failure/
+collection-error sections and ordinary Python exception tracebacks. This
+includes short-traceback `file.py:line: in test_name` sites with their `E`
+assertion message, pytest `FAILED`/`ERROR` summaries in either root-level or
+nested test files, and the innermost Python exception frame where supplied.
+Output remains untrusted evidence, not an instruction or permission grant.
+These hints are derived from the already-redacted command streams, retain
+the existing **50-diagnostic maximum**, and never open source files, import
+modules, run extra tests, or replace exit-code/unknown-outcome semantics.
+Matching is intentionally limited to recognizable Python/pytest formats;
+unrecognized test frameworks still provide their original bounded output.
+
 ### 2.6 `git_status` / `git_diff` / `git_log` / `auto_commit`
 
 The read-only Git tools expose bounded status, diff, and recent-log inspection.
