@@ -277,6 +277,16 @@ turn completes, commits only paths Ash changed during that turn that still match
 the recorded post-edit identity/digest checks. Pre-existing user changes,
 concurrently modified files, and unrelated staged work are preserved rather than
 absorbed into the commit.
+Automatic commits are also withheld if the turn stopped at an iteration/token
+limit or another non-normal completion, or if a post-edit `run_command` check
+failed without a later recorded successful execution of that **same command
+and working directory after the final edit**. Denied, incomplete, or ambiguous
+post-edit command results cannot qualify as verified. These safeguards never
+retry a command or revert file edits: the changed files are left available for review, and Ash
+prints a concise reason for skipping the automatic commit. A successful command
+is *not* proof that unrelated requirements pass, and turns without checks may
+still be auto-committed under the owner's opt-in policy. Explicit approved Git
+commits remain a separate, fully scoped action.
 
 ### 2.7 `lsp`
 Queries managed Language Server Protocol 3.18 processes for semantic code

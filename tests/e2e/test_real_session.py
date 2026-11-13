@@ -28,7 +28,12 @@ from ash.providers.base import StreamChunk
 from ash.safety.guard import SafetyGuard
 from ash.sandbox import SANDBOX_TIER_SCOPED, SandboxManager
 from ash.tools.command import RunCommandTool
-from ash.tools.filesystem import ReadFileTool, ReplaceFileContentTool, WriteFileTool
+from ash.tools.filesystem import (
+    DEFAULT_MAX_READ_CHARS,
+    ReadFileTool,
+    ReplaceFileContentTool,
+    WriteFileTool,
+)
 from ash.ui.terminal import TerminalUI
 
 
@@ -249,7 +254,7 @@ def test_e2e_agent_pages_large_source_then_repairs_and_verifies(tmp_path: Path) 
                 '<call_tool name="read_file">',
                 '<arg name="file_path">calc.py</arg>',
                 '<arg name="start_line">1</arg>',
-                '<arg name="start_column">32769</arg>',
+                f'<arg name="start_column">{DEFAULT_MAX_READ_CHARS + 1}</arg>',
                 '<arg name="max_chars">2000</arg>',
                 "</call_tool>",
             ],
@@ -300,8 +305,11 @@ def test_e2e_agent_pages_large_source_then_repairs_and_verifies(tmp_path: Path) 
     assert all(
         record.approved and record.executed and not record.error for record in records
     )
-    assert "next_start_line=1; next_start_column=32769" in (records[0].result or "")
-    assert "1 [column 32769]" in (records[1].result or "")
+    assert (
+        f"next_start_line=1; next_start_column={DEFAULT_MAX_READ_CHARS + 1}"
+        in (records[0].result or "")
+    )
+    assert f"1 [column {DEFAULT_MAX_READ_CHARS + 1}]" in (records[1].result or "")
     assert "PASS" in (records[3].result or "")
 
 
@@ -358,6 +366,101 @@ def test_e2e_session_auto_commits_each_turn(tmp_path: Path) -> None:
         text=True,
     )
     assert "?? unrelated.txt" in status.stdout
+
+
+@pytest.mark.parametrize("repair_and_reverify", [False, True])
+def test_e2e_auto_commit_does_not_commit_known_failed_verification(
+    tmp_path: Path, repair_and_reverify: bool,
+) -> None:
+    """A failing post-edit test cannot silently become an automatic commit."""
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    _git_init(workspace)
+    db_path = tmp_path / "s.db"
+    verify = [
+        '<call_tool name="run_command">',
+        '<arg name="command_line">grep -qx good answer.txt</arg>',
+        "</call_tool>",
+    ]
+    scripts = [
+        [
+            '<call_tool name="write_file">',
+            '<arg name="file_path">answer.txt</arg>',
+            '<arg name="content">bad\n</arg>',
+            "</call_tool>",
+        ],
+        verify,
+    ]
+    if repair_and_reverify:
+        scripts.extend([
+            [
+                '<call_tool name="replace_file_content">',
+                '<arg name="file_path">answer.txt</arg>',
+                '<arg name="target_content">bad</arg>',
+                '<arg name="replacement_content">good</arg>',
+                "</call_tool>",
+            ],
+            verify,
+        ])
+    scripts.append(["<response>Task is complete.</response>"])
+
+    ui = _make_ui()
+
+    async def driver() -> str:
+        loop = _make_loop(
+            workspace, db_path, SessionProvider(scripts), auto_commit=True, ui=ui
+        )
+        await loop.start_session()
+        try:
+            return await loop.run_turn("Write answer.txt and check it")
+        finally:
+            await loop.aclose()
+
+    response = asyncio.run(driver())
+    assert "Task is complete" in response
+    records = SessionStore(db_path).load_session(_latest_session_id(db_path)).tool_calls
+    assert [r.success for r in records if r.tool_name == "run_command"] == (
+        [False, True] if repair_and_reverify else [False]
+    )
+    assert (workspace / "answer.txt").read_text() == (
+        "good\n" if repair_and_reverify else "bad\n"
+    )
+    assert len(_git_log(workspace)) == (2 if repair_and_reverify else 1)
+    if not repair_and_reverify:
+        assert "auto_commit skipped" in ui.console.file.getvalue()
+
+
+def test_e2e_auto_commit_skips_iteration_limited_partial_edit(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    _git_init(workspace)
+    provider = SessionProvider(scripts=[[
+        '<call_tool name="write_file">',
+        '<arg name="file_path">partial.txt</arg>',
+        '<arg name="content">incomplete\n</arg>',
+        "</call_tool>",
+    ]])
+    ui = _make_ui()
+
+    async def driver() -> tuple[str, str]:
+        loop = _make_loop(
+            workspace, tmp_path / "s.db", provider, auto_commit=True, ui=ui
+        )
+        loop.max_turn_iterations = 1
+        await loop.start_session()
+        try:
+            response = await loop.run_turn("Begin a multi-step repair")
+            return response, loop._last_turn_stop_reason
+        finally:
+            await loop.aclose()
+
+    response, stop_reason = asyncio.run(driver())
+    assert stop_reason == "iteration_limit"
+    assert "max iterations" in response
+    assert (workspace / "partial.txt").read_text() == "incomplete\n"
+    assert len(_git_log(workspace)) == 1
+    assert "auto_commit skipped" in ui.console.file.getvalue()
 
 
 def test_e2e_session_respects_safety_tier_dry_run(tmp_path: Path) -> None:

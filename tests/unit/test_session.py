@@ -28,6 +28,91 @@ from ash.core.session import (
 from ash.sqlite_utils import preferred_sqlite_journal_mode
 
 
+@pytest.mark.parametrize(
+    ("steps", "blocked"),
+    [
+        ([("edit", True, ""), ("check", False, "test")], True),
+        ([("edit", True, ""), ("check", False, "test"),
+          ("check", True, "test")], False),
+        ([("edit", True, ""), ("check", False, "test"),
+          ("check", True, "test"), ("edit", True, "")], True),
+        ([("edit", True, ""), ("check", False, "test"),
+          ("check", True, "unrelated")], True),
+        ([("check", False, "test"), ("edit", True, "")], False),
+        ([("edit", True, ""), ("check", None, "test")], True),
+        ([("edit", True, ""), ("check", True, "test")], False),
+    ],
+)
+def test_auto_commit_verification_evidence_is_turn_scoped_and_exact(
+    tmp_path: Path,
+    steps: list[tuple[str, bool | None, str]],
+    blocked: bool,
+) -> None:
+    store = SessionStore(tmp_path / "auto-commit-evidence.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "verification-turn"
+    store.start_turn(session.session_id, turn_id, "fix and verify")
+    for index, (operation, success, command) in enumerate(steps):
+        is_check = operation == "check"
+        store.save_tool_call(
+            session.session_id,
+            ToolCallRecord(
+                call_id=f"call-{index}",
+                tool_name="run_command" if is_check else "write_file",
+                arguments=(
+                    {"command_line": command} if is_check
+                    else {"file_path": "worker.py"}
+                ),
+                approved=True,
+                dispatched=True,
+                executed=True,
+                success=success,
+                exit_code=(0 if success else 1) if is_check and success is not None else None,
+                error=None,
+                timestamp=datetime.now(timezone.utc),
+            ),
+            turn_id=turn_id,
+        )
+
+    reason = store.auto_commit_verification_blocker(session.session_id, turn_id)
+    assert (reason is not None) is blocked
+    assert "missing" in (
+        store.auto_commit_verification_blocker(session.session_id, "other-turn") or ""
+    )
+
+
+def test_auto_commit_verification_unknown_outcome_cannot_be_cleared_by_retry(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "unknown-command.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "unknown-command-turn"
+    store.start_turn(session.session_id, turn_id, "edit and verify")
+    for index, (tool, success) in enumerate((
+        ("write_file", True),
+        ("run_command", None),
+        ("run_command", True),
+    )):
+        store.save_tool_call(
+            session.session_id,
+            ToolCallRecord(
+                call_id=f"call-{index}", tool_name=tool,
+                arguments=(
+                    {"command_line": "python3 -m pytest"}
+                    if tool == "run_command" else {"file_path": "worker.py"}
+                ),
+                approved=True, dispatched=True, executed=True,
+                success=success,
+                exit_code=0 if success and tool == "run_command" else None,
+                timestamp=datetime.now(timezone.utc),
+            ),
+            turn_id=turn_id,
+        )
+    assert "uncertain" in (
+        store.auto_commit_verification_blocker(session.session_id, turn_id) or ""
+    )
+
+
 def test_terminal_tool_persistence_retry_is_idempotent_and_conflicts_are_rejected(
     tmp_path: Path,
 ) -> None:

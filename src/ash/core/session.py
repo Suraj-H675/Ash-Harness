@@ -6014,6 +6014,88 @@ class SessionStore:
                 return None
             return turn_id, actions
 
+    def auto_commit_verification_blocker(
+        self, session_id: str, turn_id: str,
+    ) -> str | None:
+        """Fail closed on unresolved command checks after a successful edit.
+
+        This is not a test-pass certificate: it only prevents automatic commits
+        when Ash *knows* a post-edit command failed or has uncertain execution.
+        Retrying a failed command is never performed here; a later recorded
+        success with the same invocation can clear its failure.
+        """
+
+        edit_tools = {
+            "write_file", "replace_file_content", "replace_file_edits",
+            "whole_edit", "apply_patch",
+        }
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT tool_name, "
+                "CASE WHEN tool_name = 'run_command' THEN arguments_json "
+                "ELSE NULL END AS arguments_json, approved, dispatched, "
+                "executed, success, exit_code, error FROM tool_calls "
+                "WHERE session_id = ? AND turn_id = ? ORDER BY rowid LIMIT 1025",
+                (session_id, turn_id),
+            ).fetchall()
+        if not rows or len(rows) > 1024:
+            return "verification history is missing or exceeds the safe review limit"
+
+        edited = False
+        unresolved: set[tuple[str, str | None]] = set()
+        previously_failed: set[tuple[str, str | None]] = set()
+        for row in rows:
+            name = str(row["tool_name"])
+            if (
+                name in edit_tools
+                and row["approved"]
+                and row["dispatched"]
+                and row["executed"]
+                and row["success"] == 1
+                and row["error"] is None
+            ):
+                edited = True
+                # A later edit can invalidate a previously passing recheck.
+                # Every command that failed on an edited version must be
+                # successful again after the final recorded edit.
+                unresolved.update(previously_failed)
+            if name != "run_command" or not edited:
+                continue
+            if (
+                not row["approved"]
+                or not row["dispatched"]
+                or not row["executed"]
+                or row["success"] is None
+            ):
+                return "a post-edit command has an uncertain or denied outcome"
+            try:
+                arguments = json.loads(row["arguments_json"])
+            except (TypeError, ValueError):
+                return "a post-edit command has incomplete evidence"
+            if not isinstance(arguments, dict):
+                return "a post-edit command has incomplete evidence"
+            command = arguments.get("command_line")
+            cwd = arguments.get("cwd")
+            if (
+                not isinstance(command, str)
+                or not command
+                or (cwd is not None and not isinstance(cwd, str))
+            ):
+                return "a post-edit command has incomplete evidence"
+            identity = (command, cwd)
+            if (
+                row["success"] != 1
+                or row["error"] is not None
+                or row["exit_code"] != 0
+            ):
+                previously_failed.add(identity)
+                unresolved.add(identity)
+            else:
+                unresolved.discard(identity)
+        if unresolved:
+            return "a post-edit command failed without a successful exact recheck"
+        return None
+
     def owner_command_checkpoint_evidence(
         self,
         session_id: str,

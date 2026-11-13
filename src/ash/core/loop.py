@@ -4683,6 +4683,28 @@ class AshLoop:
 
         if self.auto_commit:
             commit_paths = sorted(self._turn_modified_paths)
+            if commit_paths and self._last_turn_stop_reason != "completed":
+                self.ui.console.print(
+                    "auto_commit skipped: turn did not finish normally; "
+                    "edits were left uncommitted for review."
+                )
+                commit_paths = []
+            if commit_paths:
+                if self.turn_context is None:
+                    blocker = "verification history could not be checked"
+                else:
+                    try:
+                        blocker = self.session_store.auto_commit_verification_blocker(
+                            session.session_id, self.turn_context.turn_id
+                        )
+                    except Exception:  # noqa: BLE001 - evidence failure must not commit
+                        blocker = "verification history could not be checked"
+                if blocker:
+                    self.ui.console.print(
+                        f"auto_commit skipped: {blocker}; "
+                        "edits were left uncommitted for review."
+                    )
+                    commit_paths = []
             if self.auto_commit_paths:
                 scopes = [
                     path if path.is_absolute() else self.project_root / path
