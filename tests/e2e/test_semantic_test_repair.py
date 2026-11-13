@@ -20,8 +20,9 @@ from ash.ui.headless import HeadlessUI
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("omit_initial_indentation", [False, True])
 async def test_real_pytest_failures_guide_two_module_repair_and_recheck(
-    tmp_path: Path,
+    tmp_path: Path, omit_initial_indentation: bool,
 ) -> None:
     """Exercise native model->command->structured errors->edits->recheck."""
 
@@ -64,29 +65,49 @@ async def test_real_pytest_failures_guide_two_module_repair_and_recheck(
                     "id": "check-initial", "name": "run_command",
                     "arguments": {"command_line": command},
                 }]
-            elif self.requests == 2:
+            elif self.requests == 2 or (
+                omit_initial_indentation and self.requests == 3
+            ):
                 history = repr(messages)
-                assert '"pytest_failed": 2' in history
-                assert '"line": 5' in history
-                assert '"line": 8' in history
-                assert '"path": "test_checkout.py"' in history
-                assert '"code": "AssertionError"' in history
+                if self.requests == 2:
+                    assert '"pytest_failed": 2' in history
+                    assert '"line": 5' in history
+                    assert '"line": 8' in history
+                    assert '"path": "test_checkout.py"' in history
+                    assert '"code": "AssertionError"' in history
+                else:
+                    assert "Possible leading indentation mismatch at line 2" in history
+                    assert "no edit was made" in history
+                    assert (tmp_path / "pricing.py").read_text().endswith(
+                        "    return price - 5\n"
+                    )
+                    assert (tmp_path / "taxes.py").read_text().endswith(
+                        "    return subtotal + 11\n"
+                    )
+                omit_indent = omit_initial_indentation and self.requests == 2
                 tool_calls = [{
-                    "id": "fix-pricing", "name": "replace_file_content",
+                    "id": f"fix-pricing-{self.requests}",
+                    "name": "replace_file_content",
                     "arguments": {
                         "file_path": "pricing.py",
-                        "target_content": "    return price - 5",
+                        "target_content": (
+                            "return price - 5" if omit_indent else "    return price - 5"
+                        ),
                         "replacement_content": "    return price - 10",
                     },
                 }, {
-                    "id": "fix-taxes", "name": "replace_file_content",
+                    "id": f"fix-taxes-{self.requests}",
+                    "name": "replace_file_content",
                     "arguments": {
                         "file_path": "taxes.py",
-                        "target_content": "    return subtotal + 11",
+                        "target_content": (
+                            "return subtotal + 11"
+                            if omit_indent else "    return subtotal + 11"
+                        ),
                         "replacement_content": "    return subtotal + 9",
                     },
                 }]
-            elif self.requests == 3:
+            elif self.requests == (4 if omit_initial_indentation else 3):
                 tool_calls = [{
                     "id": "recheck", "name": "run_command",
                     "arguments": {"command_line": command},
@@ -124,15 +145,21 @@ async def test_real_pytest_failures_guide_two_module_repair_and_recheck(
             "Correct pricing and taxes, then run the authorized pytest check."
         )
         assert response == "Both modules repaired and the checks passed."
-        assert provider.requests == 4
+        assert provider.requests == (5 if omit_initial_indentation else 4)
         assert "return price - 10" in (tmp_path / "pricing.py").read_text()
         assert "return subtotal + 9" in (tmp_path / "taxes.py").read_text()
         calls = store.load_session(session.session_id).tool_calls
-        assert [call.tool_name for call in calls] == [
+        expected_tools = [
             "run_command", "replace_file_content", "replace_file_content",
-            "run_command",
         ]
-        assert [call.success for call in calls] == [False, True, True, True]
+        expected_success = [False, not omit_initial_indentation, not omit_initial_indentation]
+        if omit_initial_indentation:
+            expected_tools.extend(("replace_file_content", "replace_file_content"))
+            expected_success.extend((True, True))
+        expected_tools.append("run_command")
+        expected_success.append(True)
+        assert [call.tool_name for call in calls] == expected_tools
+        assert [call.success for call in calls] == expected_success
         assert [calls[0].exit_code, calls[-1].exit_code] == [1, 0]
         assert store.verify_audit_log(session.session_id) == []
     finally:

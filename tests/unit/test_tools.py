@@ -2478,6 +2478,106 @@ async def test_replace_file_content_mismatch_does_not_fuzz_indentation(
 
 
 @pytest.mark.asyncio
+async def test_replace_file_content_identifies_unique_indent_only_mismatch(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "invoice.py"
+    source = "def subtotal():\n    return price - 5\n"
+    target.write_text(source, encoding="utf-8")
+    tool = ReplaceFileContentTool(guard)
+
+    result = await tool.run(
+        file_path="invoice.py",
+        target_content="return price - 5",
+        replacement_content="return price - 10",
+    )
+
+    assert result.success is False
+    assert "does not match a complete block of lines" in (result.error or "")
+    assert "line 2" in (result.error or "")
+    assert "leading indentation" in (result.error or "")
+    assert "no edit was made" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == source
+    assert (await tool.preflight(
+        file_path="invoice.py",
+        target_content="return price - 5",
+        replacement_content="return price - 10",
+    )).error == result.error
+
+
+@pytest.mark.asyncio
+async def test_replace_file_content_ambiguous_indentation_refuses_to_guess(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "invoice.py"
+    source = "def first():\n    return price - 5\ndef second():\n\treturn price - 5\n"
+    target.write_text(source, encoding="utf-8")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="invoice.py",
+        target_content="return price - 5",
+        replacement_content="return price - 10",
+    )
+
+    assert result.success is False
+    assert "ambiguous" in (result.error or "")
+    assert "no edit was made" in (result.error or "")
+    assert "line 2" not in (result.error or "")
+    assert target.read_text(encoding="utf-8") == source
+
+
+@pytest.mark.asyncio
+async def test_indent_hint_rejects_arbitrary_substrings_and_stale_hashes(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "invoice.py"
+    old_text = "def subtotal():\n    return price - 5\n"
+    target.write_text(old_text, encoding="utf-8")
+    tool = ReplaceFileContentTool(guard)
+
+    partial = await tool.run(
+        file_path="invoice.py",
+        target_content="price - 5",
+        replacement_content="price - 10",
+    )
+    assert not partial.success
+    assert "Possible leading indentation mismatch" not in (partial.error or "")
+    assert target.read_text(encoding="utf-8") == old_text
+
+    stale = await tool.run(
+        file_path="invoice.py",
+        target_content="return price - 5",
+        replacement_content="return price - 10",
+        expected_sha256="0" * 64,
+    )
+    assert not stale.success
+    assert "File changed since it was read" in (stale.error or "")
+    assert "Possible leading indentation mismatch" not in (stale.error or "")
+    assert target.read_text(encoding="utf-8") == old_text
+
+
+@pytest.mark.asyncio
+async def test_indent_only_hint_does_not_expose_existing_source_text(
+    project_root: Path, guard: SafetyGuard
+) -> None:
+    target = project_root / "config.py"
+    target.write_text(
+        "def config():\n    return 'OPENAI_API_KEY=private-test-marker'\n",
+        encoding="utf-8",
+    )
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="config.py",
+        target_content="return 'OPENAI_API_KEY=private-test-marker'",
+        replacement_content="return 'safe'",
+    )
+
+    assert not result.success
+    assert "Possible leading indentation mismatch at line 2" in (result.error or "")
+    assert "private-test-marker" not in (result.error or "")
+
+
+@pytest.mark.asyncio
 async def test_replace_file_content_shift_hint_refuses_unicode_line_boundary_near_match(
     project_root: Path, guard: SafetyGuard
 ) -> None:

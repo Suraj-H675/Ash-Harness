@@ -671,7 +671,12 @@ class ReplaceFileContentTool(BaseTool):
                         output="",
                         error=IDENTICAL_EDIT_ERROR,
                     )
-                return ToolResult(success=False, output="", error=match_error)
+                hint = (
+                    _indentation_only_mismatch_hint(original_text, normalized_target)
+                    if "does not match a complete block of lines" in match_error
+                    else ""
+                )
+                return ToolResult(success=False, output="", error=match_error + hint)
             assert span is not None
             start_index, end_index = span
             segment = "".join(lines[start_index:end_index])
@@ -1085,6 +1090,47 @@ def _find_unique_line_span(
 
     start_index = content.count("\n", 0, matches[0])
     return (start_index, start_index + normalized_target.count("\n") + 1), None
+
+
+def _indentation_only_mismatch_hint(
+    original_text: str, normalized_target: str
+) -> str:
+    """Explain a missing leading-indent match without guessing or editing.
+
+    Only the one-line, exact-body case qualifies. No file contents are echoed,
+    and an ambiguous candidate never exposes a location or auto-selects one.
+    """
+
+    if not normalized_target or "\n" in normalized_target or len(normalized_target) > 4096:
+        return ""
+    stripped_target = normalized_target.lstrip(" \t")
+    if not stripped_target:
+        return ""
+    candidate_line = 0
+    indent_chars = 0
+    for line_number, line in enumerate(
+        _normalize_line_endings(original_text).split("\n"), start=1
+    ):
+        if len(line) > 8192 or line == normalized_target:
+            continue
+        if line.lstrip(" \t") != stripped_target:
+            continue
+        if candidate_line:
+            return (
+                " The requested text has ambiguous leading indentation in "
+                "multiple lines; no edit was made. Re-read the exact block and "
+                "use verified bounds only if necessary."
+            )
+        candidate_line = line_number
+        indent_chars = len(line) - len(line.lstrip(" \t"))
+    if not candidate_line:
+        return ""
+    return (
+        f" Possible leading indentation mismatch at line {candidate_line} "
+        f"(current leading whitespace: {indent_chars} characters); no edit was "
+        "made. Re-read that line and copy its complete OLD and NEW lines "
+        "including exact spaces or tabs."
+    )
 
 
 def _unique_line_mismatch_hint(
