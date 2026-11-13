@@ -1900,14 +1900,19 @@ def _valid_search_text_schema(schema: object) -> bool:
     if not isinstance(schema, dict) or schema.get("type") != "object":
         return False
     properties = schema.get("properties")
-    if not isinstance(properties, dict) or set(properties) != {
+    legacy_fields = {
         "pattern",
         "directory_path",
         "glob",
         "fixed_strings",
         "case_sensitive",
         "max_results",
-    }:
+    }
+    bounded_fields = {"context_lines", "max_output_bytes"}
+    if not isinstance(properties, dict) or set(properties) not in (
+        legacy_fields,
+        legacy_fields | bounded_fields,
+    ):
         return False
     expected_types = {
         "pattern": "string",
@@ -1916,10 +1921,24 @@ def _valid_search_text_schema(schema: object) -> bool:
         "case_sensitive": "boolean",
         "max_results": "integer",
     }
+    if bounded_fields.issubset(properties):
+        expected_types.update({"context_lines": "integer", "max_output_bytes": "integer"})
     for name, expected_type in expected_types.items():
         value = properties.get(name)
         if not isinstance(value, dict) or value.get("type") != expected_type:
             return False
+    if bounded_fields.issubset(properties):
+        for name, lower, upper, default in (
+            ("context_lines", 0, 3, 0),
+            ("max_output_bytes", 1_024, 2_000_000, 16_384),
+        ):
+            definition = properties[name]
+            if (
+                definition.get("minimum") != lower
+                or definition.get("maximum") != upper
+                or ("default" in definition and definition["default"] != default)
+            ):
+                return False
     glob_schema = properties.get("glob")
     if not isinstance(glob_schema, dict):
         return False

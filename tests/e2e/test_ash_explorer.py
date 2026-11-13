@@ -249,10 +249,15 @@ def test_search_fixture_xml_expansion_has_a_bounded_allowance() -> None:
     assert outcome["output"] == output
 
 
-def test_search_discovery_requires_successfully_offered_exact_schema() -> None:
-    from ash.tools.search import SearchTextArgs
+def test_search_discovery_requires_successfully_offered_exact_schema(
+    tmp_path: Path,
+) -> None:
+    from ash.safety.guard import SafetyGuard
+    from ash.tools.search import SearchTextTool
 
-    schema = SearchTextArgs.model_json_schema()
+    # Compare with the schema Ash actually offers (including intentional
+    # compact defaults), not Pydantic's unmodified argument-model schema.
+    schema = SearchTextTool(SafetyGuard(tmp_path)).json_schema()
     request = {
         "tools": [
             {
@@ -294,6 +299,26 @@ def test_search_discovery_requires_successfully_offered_exact_schema() -> None:
     assert not explorer._search_discovery_matches_offered_schema(
         discovery, changed_offer
     )
+    # A model cannot legitimize widened or partially advertised limits merely
+    # by repeating its forged schema in both the offer and discovery result.
+    for tamper in ("widen", "drop"):
+        forged = json.loads(json.dumps(schema))
+        if tamper == "widen":
+            forged["properties"]["max_output_bytes"]["maximum"] = 20_000_000
+        else:
+            del forged["properties"]["context_lines"]
+        forged_request = {
+            "tools": [{"function": {"name": "search_text", "parameters": forged}}]
+        }
+        forged_discovery = json.dumps({
+            "tools": [{
+                "name": "search_text", "input_schema": forged,
+                "schema_truncated": False,
+            }]
+        })
+        assert not explorer._search_discovery_matches_offered_schema(
+            forged_discovery, forged_request
+        )
 
 
 def test_read_action_rejects_unlisted_tools_and_arguments() -> None:
