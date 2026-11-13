@@ -729,6 +729,136 @@ assert 'self' in str(CyclicDependencyGroup('self', 'self', 'self'))
 """
 
 
+TOMLKIT_COMMENT_VISIBLE = r"""import tomlkit
+
+
+def rejects(call):
+    try:
+        call()
+    except ValueError as exc:
+        assert "Comment cannot contain" in str(exc), str(exc)
+    else:
+        raise AssertionError("forbidden comment accepted")
+
+
+for character in ("\x00", "\x1b", "\x7f"):
+    doc = tomlkit.document()
+    before = doc.as_string()
+    rejects(lambda: doc.add(tomlkit.comment("before" + character + "after")))
+    assert doc.as_string() == before
+
+    doc = tomlkit.parse("value = 1 # original\n")
+    before = doc.as_string()
+    rejects(lambda: doc["value"].comment("before" + character + "after"))
+    assert doc.as_string() == before
+
+    doc = tomlkit.parse("values = [1]\n")
+    before = doc.as_string()
+    rejects(
+        lambda: doc["values"].add_line(2, comment="before" + character + "after")
+    )
+    assert doc.as_string() == before
+
+for text in ("first\nsecond", "first\rsecond"):
+    doc = tomlkit.parse("value = 1\n")
+    before = doc.as_string()
+    rejects(lambda: doc["value"].comment(text))
+    assert doc.as_string() == before
+
+    doc = tomlkit.parse("values = [1]\n")
+    before = doc.as_string()
+    rejects(lambda: doc["values"].add_line(2, comment=text))
+    assert doc.as_string() == before
+
+rejects(lambda: tomlkit.comment("first\rafter"))
+
+for text in ("first\nsecond\n", "first\r\nsecond\r\n"):
+    doc = tomlkit.document()
+    doc.add(tomlkit.comment(text))
+    rendered = doc.as_string()
+    assert "first" in rendered and "second" in rendered
+    assert tomlkit.parse(rendered).as_string() == rendered
+
+valid = "tab\tunicode \u00e9 \u0085 \u2028"
+doc = tomlkit.document()
+doc.add(tomlkit.comment(valid))
+assert valid in doc.as_string()
+assert tomlkit.parse(doc.as_string()).as_string() == doc.as_string()
+
+doc = tomlkit.parse("value = 1\n")
+doc["value"].comment(valid)
+assert valid in doc.as_string()
+assert tomlkit.parse(doc.as_string()).as_string() == doc.as_string()
+
+doc = tomlkit.parse("values = [1]\n")
+doc["values"].add_line(2, comment=valid)
+assert valid in doc.as_string()
+assert tomlkit.parse(doc.as_string()).as_string() == doc.as_string()
+"""
+
+
+TOMLKIT_COMMENT_HIDDEN = r"""import tomllib
+
+import tomlkit
+
+FORBIDDEN = [chr(code) for code in range(32) if code not in (9, 10, 13)] + [chr(127)]
+
+
+def rejected(call):
+    try:
+        call()
+    except ValueError as exc:
+        assert "Comment cannot contain" in str(exc), repr(exc)
+    else:
+        raise AssertionError("comment containing a forbidden control was accepted")
+
+
+for character in FORBIDDEN:
+    payload = "left" + character + "right"
+
+    doc = tomlkit.document()
+    before = doc.as_string()
+    rejected(lambda: doc.add(tomlkit.comment(payload)))
+    assert doc.as_string() == before
+
+    doc = tomlkit.parse("value = 1 # keep\n")
+    before = doc.as_string()
+    rejected(lambda: doc["value"].comment(payload))
+    assert doc.as_string() == before
+
+    doc = tomlkit.parse("values = [1]\n")
+    before = doc.as_string()
+    rejected(lambda: doc["values"].add_line(2, comment=payload))
+    assert doc.as_string() == before
+
+for payload in ("a\rb", "a\r\rb", "a\r\nb\rc", "a\r\r\nb"):
+    rejected(lambda payload=payload: tomlkit.comment(payload))
+
+for payload in ("a\nb", "a\r\nb"):
+    doc = tomlkit.document()
+    doc.add(tomlkit.comment(payload))
+    rendered = doc.as_string()
+    assert tomlkit.parse(rendered).as_string() == rendered
+    assert tomllib.loads(rendered) == {}
+
+valid = "tab\tUnicode é \u0085 \u2028 supplementary \U0001f642"
+for entry in ("standalone", "item", "array"):
+    doc = tomlkit.document()
+    if entry == "standalone":
+        doc.add(tomlkit.comment(valid))
+    elif entry == "item":
+        doc.add("value", 1)
+        doc["value"].comment(valid)
+    else:
+        doc.add("values", [1])
+        doc["values"].add_line(2, comment=valid)
+    rendered = doc.as_string()
+    assert valid in rendered
+    assert tomlkit.parse(rendered).as_string() == rendered
+    tomllib.loads(rendered)
+"""
+
+
 @dataclass(frozen=True)
 class RepositoryTask:
     source: str
@@ -800,6 +930,40 @@ TASKS = {
             "source files, then run exactly python3 -B qa_visible.py with "
             "run_command. No other commands are authorized. Preserve all "
             "public signatures and other files."
+        ),
+    ),
+    "tomlkit-comment-control-validation": RepositoryTask(
+        source="python-poetry/tomlkit",
+        upstream="https://github.com/python-poetry/tomlkit.git",
+        base_sha="55d07680cabf023885d511d2bf2000963e4e3dc7",
+        reference_fix_sha="7e0016217ea2dbc369fc721acfd8ace52a899a99",
+        editable=frozenset(
+            {
+                "tomlkit/_utils.py",
+                "tomlkit/api.py",
+                "tomlkit/items.py",
+            }
+        ),
+        visible_script="qa_visible.py",
+        visible_source=TOMLKIT_COMMENT_VISIBLE,
+        hidden_source=TOMLKIT_COMMENT_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Fix invalid TOML comment generation in this pinned python-poetry/tomlkit "
+            "repository. The public comment-writing APIs currently allow forbidden "
+            "ASCII control characters into serialized TOML, so the output can no "
+            "longer be parsed. Centralize character validation in "
+            "tomlkit/_utils.py and apply it consistently to tomlkit.comment(), "
+            "Item.comment(), and Array.add_line(comment=...). Reject control "
+            "characters U+0000–U+001F except TAB and permitted line endings, plus "
+            "DEL U+007F. Standalone comments support LF and CRLF line endings but "
+            "must reject bare CR; attached comments are single-line and must "
+            "reject LF and CR. Preserve valid tabs and Unicode, preserve existing "
+            "document content when a comment is rejected, and retain all other "
+            "formatting behavior. Edit ONLY tomlkit/_utils.py, tomlkit/api.py, "
+            "and tomlkit/items.py. Review qa_visible.py and run exactly "
+            "python3 -B qa_visible.py with run_command afterward. No other "
+            "commands are authorized."
         ),
     ),
     "dateutil-strict-numeric-fields": RepositoryTask(

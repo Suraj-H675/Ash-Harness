@@ -7,7 +7,7 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These fourteen fixtures already have runnable code and grading logic. They **do not
+These fifteen fixtures already have runnable code and grading logic. They **do not
 constitute fourteen independent real repositories**; synthetic and real-repository
 lanes must remain separate. Do not pool their scores into a single win rate.
 
@@ -21,6 +21,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Initial pair: Ash timeout / Codex pass**; no Ash source edit or verification |
 | R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Initial pair: both fail**; Ash 32K protected-context overflow after one edit, Codex visible pass but hidden fail; Ash 64K ablation reaches 120K total-turn cap. Park fixture-specific remediation. |
 | R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Latest sequential 65K pair: both pass**; earlier Ash-only normal-128K trial also passed. Exact independent oracle and scope checks verified; no speed/reliability ranking |
+| R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **Preflight verified: visible + hidden red on original, green on reference fix**; first paired model evaluation pending |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -31,10 +32,10 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 **Current gaps (not runnable tasks):** Further independent source projects
 should exercise unfamiliar-repository debugging and test triage, a multi-file
 refactor with stable public behavior, dependency/interface compatibility, and
-larger-codebase navigation. R7 now contributes a new codebase and a two-module
-feature, but does not fill all these gaps. Choose each base/fix pin and sealed
+larger-codebase navigation. R7 and R9 add distinct codebases and multi-module
+workflows, but do not fill all these gaps. Choose each base/fix pin and sealed
 oracle only after provenance and red-original/green-reference verification.
-The present **14-case inventory** is not a stable reliability benchmark;
+The present **15-case inventory** is not a stable reliability benchmark;
 repetitions and broader workflow diversity remain necessary.
 
 **Evidence checkpoint:** Before this workflow change, the locally retained
@@ -215,6 +216,21 @@ noise at single-sample scale, not a speed advantage. The earlier Ash-only
 requested contexts, but no repeatability distribution. Private receipts:
 `/var/tmp/ash-r8-paired-post-repair-20261113-r01`.
 
+**R9 provenance and oracle preflight (2026-11-13):** The new
+`python-poetry/tomlkit` case uses original commit
+`55d07680cabf023885d511d2bf2000963e4e3dc7` and the upstream fix commit
+`7e0016217ea2dbc369fc721acfd8ace52a899a99` (PR #705, “Reject forbidden
+control characters in generated comments;
+[PR #705](https://github.com/python-poetry/tomlkit/pull/705)). Three source modules are editable:
+`tomlkit/_utils.py`, `tomlkit/api.py`, and `tomlkit/items.py`. Independently
+authored, standard-library-only visible and hidden checks cover all forbidden
+ASCII controls, standalone multiline LF/CRLF versus bare CR, single-line item
+and array comments, valid tabs/Unicode, TOML round trips, and unchanged document
+state after rejected mutations. Both visible and hidden oracles are **red on
+the original and green on the reference fix** in the existing isolated,
+networkless preflight. This is provenance and task validation only; no model
+has attempted R9 yet.
+
 **Parity caveat for both new pairs:** The checker accepted requested model,
 effort, context, prompts, pins and independent grading, **not** actual
 tool/permission/sandbox equivalence. Codex's receipt does not independently
@@ -270,9 +286,10 @@ prior provider stall is unresolved as a causal coding result, and R7's hidden
 Codex failure and Ash's budget-limited runs remain distinct findings. New
 real-repository coding tests should be chosen for a previously unmeasured
 user workflow or explicitly causal hypothesis, not score accumulation. Focus
-on real owner coding usage, Crew's remaining accepted production v1 gates
-when authorized, tool-level correctness, and recovery safety; commit
-implementation only for independently demonstrated gaps.
+on real owner coding usage, tool-level correctness, recovery safety, and
+unfamiliar-repository workflow diversity; commit implementation only for
+independently demonstrated gaps. **Ash Crew v1 is complete and merged into
+`main`; there are no remaining Crew acceptance gates in the active portfolio.**
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate
