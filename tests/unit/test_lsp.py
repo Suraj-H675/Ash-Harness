@@ -1410,6 +1410,169 @@ async def test_post_edit_diagnostics_are_advisory(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_edit_lsp_preview_prioritizes_errors_and_bounds_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ash.lsp.middleware import MAX_POST_EDIT_DIAGNOSTIC_OUTPUT_BYTES
+
+    (tmp_path / "large.py").write_text("value = 1\n", encoding="utf-8")
+    manager = LanguageServerManager(tmp_path, {})
+    diagnostics = [
+        {
+            "range": {
+                "start": {"line": index, "character": 0},
+                "end": {"line": index, "character": 3},
+            },
+            "severity": 2 if index < 99 else 1,
+            "message": f"issue-{index} " + "x" * 3800,
+            "source": "pyright",
+            "code": "error" if index == 99 else "warning",
+        }
+        for index in range(100)
+    ]
+    monkeypatch.setattr(manager, "diagnostics_for", AsyncMock(return_value=diagnostics))
+    middleware = LSPDiagnosticsMiddleware(manager, SafetyGuard(tmp_path))
+    result = ToolResult(success=True, output="File written.")
+
+    await middleware.after_tool("write_file", {"file_path": "large.py"}, result)
+
+    assert result.success is True
+    assert result.output.startswith("File written.\nLSP diagnostics after edit:")
+    assert "issue-99" in result.output  # Fatal diagnostic was last in LSP list.
+    assert "issue-98" not in result.output
+    assert "omitted" in result.output
+    assert result.truncated is True
+    assert len(result.output.encode("utf-8")) <= MAX_POST_EDIT_DIAGNOSTIC_OUTPUT_BYTES + 256
+    assert result.token_count > 0
+    assert not any("x" * 500 in line for line in result.output.splitlines())
+    preview_json = result.output.split("LSP diagnostics after edit:\n", 1)[1]
+    preview_json = preview_json.split("\n[LSP diagnostics omitted:", 1)[0]
+    parsed = json.loads(preview_json)
+    assert len(parsed["large.py"]) <= 6
+    assert parsed["large.py"][0]["code"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_post_edit_lsp_preview_preserves_small_diagnostics_and_redacts_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "example.py").write_text("value = 1\n", encoding="utf-8")
+    manager = LanguageServerManager(tmp_path, {})
+    token = "sk-" + "a" * 55
+    monkeypatch.setattr(manager, "diagnostics_for", AsyncMock(return_value=[{
+        "range": {
+            "start": {"line": 1, "character": 2},
+            "end": {"line": 1, "character": 4},
+        },
+        "severity": 1,
+        "message": "Bad import at line 2; " + token,
+        "source": "pyright",
+    }]))
+    result = ToolResult(success=True, output="Saved.")
+
+    await LSPDiagnosticsMiddleware(manager, SafetyGuard(tmp_path)).after_tool(
+        "replace_file_content", {"file_path": "example.py"}, result
+    )
+
+    assert result.success is True
+    assert result.truncated is False
+    assert '"severity": 1' in result.output
+    assert "Bad import at line 2" in result.output
+    assert token not in result.output
+    assert "[REDACTED]" in result.output
+
+
+@pytest.mark.asyncio
+async def test_post_edit_preview_from_real_lsp_subprocess(tmp_path: Path) -> None:
+    (tmp_path / "example.py").write_text("problem\n", encoding="utf-8")
+    manager = LanguageServerManager(
+        tmp_path, {"fake": fake_config(tmp_path / "lsp-post-edit.jsonl")}
+    )
+    result = ToolResult(success=True, output="File written.")
+    try:
+        await LSPDiagnosticsMiddleware(manager, SafetyGuard(tmp_path)).after_tool(
+            "write_file", {"file_path": "example.py"}, result
+        )
+        assert result.success
+        assert "fake problem" in result.output
+        assert "fake-lsp" in result.output
+        assert result.truncated is False
+        assert json.loads(result.output.split("LSP diagnostics after edit:\n", 1)[1])[
+            "example.py"
+        ]
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_post_edit_lsp_feedback_reaches_next_provider_request(
+    tmp_path: Path,
+) -> None:
+    import io
+
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.providers.base import ProviderABC, StreamChunk
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.tools.filesystem import WriteFileTool
+    from ash.ui.headless import HeadlessUI
+
+    class EditThenInspectProvider(ProviderABC):
+        model_name = "mock-lsp-feedback"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                yield StreamChunk(
+                    is_done=True,
+                    native_tool_calls=[{
+                        "call_id": "edit-1",
+                        "name": "write_file",
+                        "arguments": {"file_path": "example.py", "content": "problem\n"},
+                    }],
+                )
+                return
+            assert "LSP diagnostics after edit" in repr(messages)
+            assert "fake problem" in repr(messages)
+            yield StreamChunk(content="Review received", is_done=True)
+
+    async def allow_edit(_name, _arguments):
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    manager = LanguageServerManager(
+        tmp_path, {"fake": fake_config(tmp_path / "lsp-loop.jsonl")}
+    )
+    provider = EditThenInspectProvider()
+    loop = AshLoop(
+        SessionStore(tmp_path / "session.db"), provider, guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path,
+        tools={"write_file": WriteFileTool(guard)},
+        tool_middlewares=[LSPDiagnosticsMiddleware(manager, guard)],
+        on_tool_approval=allow_edit,
+    )
+    try:
+        session = await loop.start_session()
+        assert await loop.run_turn("Create a file and inspect the LSP result") == (
+            "Review received"
+        )
+        assert provider.calls == 2
+        assert (tmp_path / "example.py").read_text() == "problem\n"
+        assert loop.session_store.load_session(session.session_id).tool_calls[-1].success
+    finally:
+        await loop.aclose()
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
 async def test_read_message_rejects_duplicate_content_length() -> None:
     reader = asyncio.StreamReader()
     reader.feed_data(b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}")

@@ -6,6 +6,7 @@ import asyncio
 import json
 from typing import Any
 
+from ash.core.redaction import redact_text
 from ash.lsp.manager import LanguageServerManager
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.tools.base import BaseTool, ToolMiddleware, ToolResult, count_output_tokens
@@ -21,6 +22,69 @@ EDIT_TOOLS = {
 }
 MAX_POST_EDIT_FILES = 20
 POST_EDIT_TIMEOUT_SECONDS = 3.0
+MAX_POST_EDIT_DIAGNOSTIC_OUTPUT_BYTES = 16 * 1024
+MAX_POST_EDIT_DIAGNOSTICS = 24
+MAX_POST_EDIT_DIAGNOSTICS_PER_FILE = 6
+MAX_POST_EDIT_MESSAGE_CHARS = 240
+
+
+def _bounded_diagnostic_preview(
+    diagnostics: dict[str, list[dict[str, Any]]],
+) -> tuple[str, int]:
+    """Prioritize errors in a small model-facing preview, not a full LSP dump.
+
+    The separate explicit ``lsp`` tool retains full bounded diagnostic queries.
+    Workspace diagnostics are untrusted and can be very large or contain
+    secrets; never echo original message bodies or cut serialized JSON midway.
+    """
+
+    rows = [
+        (item.get("severity") if isinstance(item.get("severity"), int) else 5,
+         path, index, item)
+        for path, items in diagnostics.items()
+        for index, item in enumerate(items)
+        if isinstance(item, dict)
+    ]
+    rows.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
+    selected: dict[str, list[dict[str, Any]]] = {}
+    shown = 0
+    heading = "\nLSP diagnostics after edit:\n"
+    # Reserve space for the omitted-diagnostic notice, regardless of the
+    # number of candidate messages or the length of a workspace-relative path.
+    json_limit = MAX_POST_EDIT_DIAGNOSTIC_OUTPUT_BYTES - len(heading) - 256
+    for _, path, _, item in rows:
+        if shown >= MAX_POST_EDIT_DIAGNOSTICS:
+            break
+        chosen = selected.setdefault(path, [])
+        if len(chosen) >= MAX_POST_EDIT_DIAGNOSTICS_PER_FILE:
+            continue
+        preview = {
+            "range": item.get("range"),
+            "severity": item.get("severity"),
+            "message": redact_text(str(item.get("message", "")))
+            [:MAX_POST_EDIT_MESSAGE_CHARS],
+            "source": redact_text(str(item.get("source", "")))[:128],
+        }
+        if "code" in item:
+            preview["code"] = redact_text(str(item["code"]))[:80]
+        chosen.append(preview)
+        rendered = json.dumps(selected, ensure_ascii=True, indent=2)
+        if len(rendered.encode("utf-8")) > json_limit:
+            chosen.pop()
+            if not chosen:
+                selected.pop(path)
+            continue
+        shown += 1
+
+    rendered = json.dumps(selected, ensure_ascii=True, indent=2)
+    omitted = max(0, sum(map(len, diagnostics.values())) - shown)
+    output = heading + rendered
+    if omitted:
+        output += (
+            f"\n[LSP diagnostics omitted: {omitted}; use the lsp diagnostics "
+            "tool for full results]"
+        )
+    return output, omitted
 
 
 class LSPDiagnosticsMiddleware(ToolMiddleware):
@@ -92,11 +156,8 @@ class LSPDiagnosticsMiddleware(ToolMiddleware):
             )
             result.truncated = True
         if diagnostics:
-            rendered = "\nLSP diagnostics after edit:\n" + json.dumps(
-                diagnostics, ensure_ascii=True, indent=2
-            )
-            if len(rendered) > 256 * 1024:
-                rendered = rendered[: 256 * 1024] + "\n[LSP diagnostics truncated]"
+            rendered, omitted = _bounded_diagnostic_preview(diagnostics)
+            if omitted:
                 result.truncated = True
             result.output += rendered
         if diagnostics or skipped:

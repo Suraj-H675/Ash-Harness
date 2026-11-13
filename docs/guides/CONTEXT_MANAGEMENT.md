@@ -133,6 +133,14 @@ convenience for model round trips, not a replacement for focused searching or
 permissioned test execution. An initial large-context multi-file coding trial
 used this tool but did not complete the independent task; eager promotion is
 therefore not treated as a demonstrated coding improvement.
+In trusted workspaces with language servers configured, successful file edits
+may also carry advisory post-edit LSP diagnostics. The automatic preview now
+prioritizes errors and is capped at 16 KiB of additional tool output, with at
+most 24 diagnostics and six per edited file. Messages are shortened and
+redacted; omitted counts are explicit. The existing `lsp` diagnostics query
+remains available when the model needs more detail. A successful edit plus
+LSP feedback does **not** establish that code is correct or verified, and the
+preview never runs tests or grants additional execution permissions.
 Batch requests inherit the managed, session and persistent `read_file`
 permission rules for **each** requested path; a path-scoped deny blocks the
 entire batch, and a required approval cannot be bypassed by grouping reads.
