@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import signal
 import subprocess
@@ -157,6 +158,49 @@ def test_size_telemetry_excludes_tool_payload_and_private_file_path() -> None:
             update={"arguments": {"file_path": "SECRET", "max_chars": "SECRET"}}
         )
     ).get("max_chars")
+
+
+def test_headless_error_category_uses_only_stable_values_without_error_payload(
+    tmp_path: Path,
+) -> None:
+    stdout = tmp_path / "ash.stdout"
+    stdout.write_text(
+        json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "category": "context",
+                    "message": "PRIVATE-REASONING-DATA",
+                    "edited_files": ["PRIVATE-SOURCE-PATH"],
+                },
+            }
+        )
+        + "\n"
+    )
+    result = bench.headless_error_category(stdout)
+    assert result == "context"
+    assert "PRIVATE" not in repr(result)
+    stdout.write_text(json.dumps({"type": "turn.completed"}) + "\n")
+    assert bench.headless_error_category(stdout) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"type":"error","error":{"category":"PRIVATE-SECRET"}}\n',
+        '{"type":"error","error":{"category":123}}\n',
+        '{"type":"error","error":{"category":"tool"}}\nnot json\n',
+        '{"type":"error","error":null}\n',
+        "[1,2,3]\n",
+        "x" * (256 * 1024 + 1),
+    ],
+)
+def test_headless_error_category_refuses_untrusted_or_large_output(
+    tmp_path: Path, payload: str
+) -> None:
+    stdout = tmp_path / "ash.stdout"
+    stdout.write_text(payload)
+    assert bench.headless_error_category(stdout) is None
 
 
 @pytest.mark.parametrize(

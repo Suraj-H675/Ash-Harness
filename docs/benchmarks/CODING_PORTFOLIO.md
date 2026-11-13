@@ -23,7 +23,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Initial pair: both fail**; Ash 32K protected-context overflow after one edit, Codex visible pass but hidden fail; Ash 64K ablation reaches 120K total-turn cap. Park fixture-specific remediation. |
 | R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Latest sequential 65K pair: both pass**; earlier Ash-only normal-128K trial also passed. Exact independent oracle and scope checks verified; no speed/reliability ranking |
 | R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **First sequential 65K pair: both pass**; Ash 106.68s / 14 requests, Codex 78.74s / 5 shell commands; one sample, Codex policy-parity caveat |
-| R10 | `pluggy-role-module-split` | Pinned real repo | Seven-module role-based refactor; old import shims and public plugin behavior, wrappers, firstresult, historic replay and subset callers | **Preflight verified: visible + hidden red on original, green on reference**; five new modules and two compatibility shims; paired model evaluation pending |
+| R10 | `pluggy-role-module-split` | Pinned real repo | Seven-module role-based refactor; old import shims and public plugin behavior, wrappers, firstresult, historic replay and subset callers | **Park after two matched pairs**; at 170s both timed out/incomplete; at 300s Ash stopped on protected opaque-context exhaustion after 4/7 files, Codex changed all seven and passed both oracles but timed out without executing the visible test. Neither a complete coding pass |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -276,8 +276,61 @@ old-style wrappers, firstresult, historic replay and subset callers. The
 existing networkless preflight independently confirms visible and hidden
 **failure on the original and pass on the reference**, with exactly five
 reference-added modules and two modified shims. This is a structural refactor
-and compatibility task, not a new behavior feature. The paired Ash/Codex
-model evaluation has **not yet run**.
+and compatibility task, not a new behavior feature. At the time of preflight,
+the paired Ash/Codex model evaluation had **not yet run**.
+
+**R10 first sequential paired outcome (2026-11-13, one sample):** At matched
+GPT-6 Luna xhigh, 65,536 requested context and 170-second per-engine CLI
+deadlines, **both engines timed out** before completing the seven-module
+refactor. Ash used 170.47s, seven completed model requests and 11 successful
+tool calls (zero failed); it changed `_config.py`, `_decorators.py` and
+`_impl.py`, but did not finish `_caller.py`, `_execution.py` or either
+compatibility shim. Plain Codex used 170.06s and six shell commands; it changed
+only `_config.py` and `_decorators.py`. Neither executed the visible test;
+both visible and hidden oracles failed because the required module split was
+incomplete. Both preserved protected files. The comparison receipt verified
+the common task, pins, prompt, oracle hashes and requested settings, but not
+actual Codex/Ash sandbox or command-policy equivalence. This is an incomplete
+task result, not a pass or a speed ranking. One controlled resource ablation
+with a 300-second deadline is planned to test whether the 170-second cap was
+the binding constraint; all other task and model settings remain frozen.
+
+**R10 300s deadline-only ablation (2026-11-13, second and final pair):** Task,
+source pins, shared prompt, oracles, requested model GPT-6 Luna xhigh and 65,536
+context remained frozen. Only the separate CLI deadline changed to 300s. Ash
+stopped after **188.00s without timing out** because the context allocator
+correctly refused to rewrite the opaque provider reasoning prefix when its
+estimated 59,840 input tokens exceeded the 59,024 limit. It completed eight
+model requests and 14 successful tool calls, changed four of seven required
+files (`_config.py`, `_decorators.py`, `_execution.py`, `_impl.py`), and emitted
+a structured `context` failure. The 65K requested context is a **deliberate
+paired-test constraint**, not Ash's normal 128K setting. Ash's audit, protected
+file scope and recovery-safe failure behavior were intact; both oracles still
+failed on the incomplete work and no visible command ran. Plain Codex used
+**300.03s and timed out**, but changed all seven modules; **both independent
+oracles passed when the evaluator inspected its resulting files**, while its
+authorized visible command never ran and the turn never completed. This
+counts as code correctness **without** full workflow completion, not a Codex
+pass. The comparison receipt verified the common objective, inputs and
+requested limits, **not** identical actual tool/sandbox policies or provider
+context behavior. Under the stated two-cycle limit, **park R10**. The two
+attempts do not establish that simply extending the deadline makes Ash pass.
+Ash already has a separately tested, explicit `--context-continuations` safe
+reasoning-window restart path, which was not enabled for these frozen pairs;
+it must not be assumed effective without a separate causal test. No production
+context safety rule was weakened to score this scenario.
+
+**Diagnostic repair:** The repository evaluator now extracts only a stable,
+allowlisted failure *category* from bounded headless JSON output into the
+private machine-readable receipt (`terminal_error_category`). It never copies
+error messages, workspace paths or raw model output into this field. The
+focused regression suites verify malformed, oversized and sensitive output
+handling and now pass **80 tests**. This improves distinction between a
+context-safety stop and a provider outage without reclassifying failures as
+successes. The combined benchmark, context-continuation, history and error
+classification suites additionally pass **161 focused tests**. No provider
+trial was rerun to validate this diagnostic extractor: its actual-category
+smoke check used the existing R10 stdout receipts.
 
 **R10 evaluator support:** The repository and plain-Codex graders previously
 required every editable path to exist in the original checkout and rejected
@@ -331,18 +384,19 @@ separately before any R10 model trial.
 ## Next portfolio slice
 
 **Now:** R5, R8 and R9 have positive paired outcomes, each a single observation;
-none isolates a source change's impact. R10 has passed independent original /
-reference preflight and its evaluator changes have 72 focused unit tests
-passing. Next: run one sequential R10 Ash/Codex pair at matched 65K settings,
-then reassess whether dependency/interface compatibility in a larger
-multi-package codebase is the next missing workflow. Avoid reruns merely to
-improve scores; R3 remains parked, R6's prior provider stall is unresolved as
-a causal coding result, and R7's hidden Codex failure and Ash's budget-limited
-runs remain distinct findings. Focus on real owner coding usage, tool-level
-correctness, recovery safety, and unfamiliar-repository workflow diversity;
-commit implementation only for independently demonstrated gaps. **Ash Crew
-v1 is complete and merged into `main`; there are no remaining Crew acceptance
-gates in the active portfolio.**
+none isolates a source change's impact. R10 exposed a genuine complexity and
+context-pressure limit in a seven-module refactor, but both the 170s and 300s
+pairs are complete; **park it instead of chasing a green result**. A safe
+opaque-state stop is expected behavior, not permission to discard provider
+reasoning or replay tool actions. Future evaluation may deliberately test the
+existing opt-in safe context-restart path on a separate frozen scenario with
+its own time and cost budget. R3 remains parked, R6's prior provider stall is
+unresolved as a causal coding result, and R7's resource-limited runs remain
+distinct findings. Next select a genuinely new owner-facing coding workflow
+or an independently demonstrated production defect, with attention to
+larger-codebase navigation, dependency compatibility, safe recovery and
+verification. **Ash Crew v1 is complete and merged into `main`; there are no
+remaining Crew acceptance gates in the active portfolio.**
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate

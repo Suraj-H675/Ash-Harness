@@ -24,6 +24,7 @@ from pathlib import Path
 from ash.commands.chatgpt_auth import list_chatgpt_models
 from ash.core.activity import EDIT_TOOL_NAMES, summarize_operational_events
 from ash.core.session import SessionStore, ToolCallRecord
+from ash.exceptions import ErrorCategory
 from ash.providers.openai_chatgpt_auth import ChatGPTAccount, ChatGPTCredentialStore
 
 from coding_benchmark import (
@@ -1536,6 +1537,35 @@ def tool_call_size_metrics(entry: ToolCallRecord) -> dict[str, int | bool]:
     return metrics
 
 
+def headless_error_category(stdout_path: Path) -> str | None:
+    """Classify a headless failure without copying private CLI output to receipts."""
+    try:
+        # The JSON envelope may contain model content or tool data; never store
+        # or echo it. Oversized or malformed output is not a trusted category.
+        if stdout_path.stat().st_size > 256 * 1024:
+            return None
+        events = stdout_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    valid_categories = {category.value for category in ErrorCategory}
+    category: str | None = None
+    for line in events:
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(event, dict):
+            return None
+        if event.get("type") == "error":
+            error = event.get("error")
+            candidate = error.get("category") if isinstance(error, dict) else None
+            if isinstance(candidate, str) and candidate in valid_categories:
+                category = candidate
+            else:
+                return None
+    return category
+
+
 def check_oracles(workspace: Path, task: RepositoryTask) -> dict[str, object]:
     visible = oracle_python(workspace, task.visible_script)
     hidden = oracle_python(workspace, code=task.hidden_source)
@@ -1871,6 +1901,7 @@ def run_task(
             "cli_seconds": cli_seconds,
             "exit_code": exit_code,
             "timed_out": timed_out,
+            "terminal_error_category": headless_error_category(evidence / "ash.stdout"),
             "oracle": oracle,
             "protected_files_unchanged": protected,
             "required_sources_changed": changed,
