@@ -32,6 +32,7 @@ from repository_benchmark import (
     remove_reference_checkout,
     shared_user_prompt,
     snapshot_files,
+    validate_editable_paths,
 )
 from coding_benchmark import _chatgpt_tmpfs_root
 
@@ -331,8 +332,7 @@ def run_task(
         workspace = scratch / "workspace"
         shutil.copytree(baseline, workspace, symlinks=True)
         initial = snapshot_files(workspace)
-        if any(path not in initial for path in task.editable):
-            raise RuntimeError("required source file missing in pinned baseline")
+        validate_editable_paths(initial, task.editable, preflight_receipt)
 
         prompt = shared_user_prompt(task)
         (evidence / "prompt.txt").write_text(prompt, encoding="utf-8")

@@ -859,6 +859,266 @@ for entry in ("standalone", "item", "array"):
 """
 
 
+PLUGGY_MODULE_SPLIT_VISIBLE = r"""import sys
+
+sys.path.insert(0, "src")
+
+import pluggy
+import pluggy._callers as legacy_callers
+import pluggy._hooks as legacy_hooks
+from pluggy._caller import (
+    HookCaller,
+    HookRelay,
+    _HookCaller,
+    _HookExec,
+    _HookRelay,
+    _SubsetHookCaller,
+)
+from pluggy._config import HookimplOpts, HookspecOpts, normalize_hookimpl_opts
+from pluggy._decorators import (
+    HookimplMarker,
+    HookSpec,
+    HookspecMarker,
+    _Namespace,
+    varnames,
+)
+from pluggy._execution import (
+    Teardown,
+    _multicall,
+    _raise_wrapfail,
+    _warn_teardown_exception,
+    run_old_style_hookwrapper,
+)
+from pluggy._impl import HookImpl, _HookImplFunction, _Plugin
+
+assert legacy_hooks.HookCaller is HookCaller
+assert legacy_hooks.HookRelay is HookRelay
+assert legacy_hooks.HookImpl is HookImpl
+assert legacy_hooks.HookSpec is HookSpec
+assert legacy_hooks.HookimplMarker is HookimplMarker
+assert legacy_hooks.HookspecMarker is HookspecMarker
+assert legacy_hooks.HookimplOpts is HookimplOpts
+assert legacy_hooks.HookspecOpts is HookspecOpts
+assert legacy_hooks.normalize_hookimpl_opts is normalize_hookimpl_opts
+assert legacy_hooks.varnames is varnames
+for name, value in {
+    "_HookCaller": _HookCaller,
+    "_HookExec": _HookExec,
+    "_HookRelay": _HookRelay,
+    "_SubsetHookCaller": _SubsetHookCaller,
+    "_Namespace": _Namespace,
+    "_Plugin": _Plugin,
+    "_HookImplFunction": _HookImplFunction,
+}.items():
+    assert getattr(legacy_hooks, name) is value
+
+assert legacy_callers._multicall is _multicall
+assert legacy_callers._raise_wrapfail is _raise_wrapfail
+assert legacy_callers._warn_teardown_exception is _warn_teardown_exception
+assert legacy_callers.run_old_style_hookwrapper is run_old_style_hookwrapper
+assert legacy_callers.Teardown is Teardown
+assert set(legacy_hooks.__all__) == {
+    "HookCaller", "HookImpl", "HookRelay", "HookSpec", "HookimplMarker",
+    "HookimplOpts", "HookspecMarker", "HookspecOpts", "_HookCaller",
+    "_HookExec", "_HookImplFunction", "_HookRelay", "_Namespace", "_Plugin",
+    "_SubsetHookCaller", "normalize_hookimpl_opts", "varnames",
+}
+assert set(legacy_callers.__all__) == {
+    "Teardown", "_multicall", "_raise_wrapfail", "_warn_teardown_exception",
+    "run_old_style_hookwrapper",
+}
+
+hookspec = HookspecMarker("r10-visible")
+hookimpl = HookimplMarker("r10-visible")
+
+
+class Spec:
+    @hookspec
+    def transform(self, value): ...
+
+
+class Plugin:
+    @hookimpl
+    def transform(self, value):
+        return value * 2
+
+
+pm = pluggy.PluginManager("r10-visible")
+pm.add_hookspecs(Spec)
+plugin = Plugin()
+pm.register(plugin)
+assert pm.hook.transform(value=6) == [12]
+assert isinstance(pm.hook, HookRelay)
+assert isinstance(pm.hook.transform, HookCaller)
+assert isinstance(pm.hook.transform._hookimpls[0], HookImpl)
+assert pluggy.HookCaller is HookCaller
+assert pluggy.HookImpl is HookImpl
+assert pluggy.HookRelay is HookRelay
+assert pluggy.HookspecMarker is HookspecMarker
+assert pluggy.HookimplMarker is HookimplMarker
+"""
+
+
+PLUGGY_MODULE_SPLIT_HIDDEN = r"""import sys
+
+sys.path.insert(0, "src")
+
+import pluggy
+from pluggy._caller import HookCaller, HookRelay, _SubsetHookCaller
+from pluggy._config import HookimplOpts, HookspecOpts, normalize_hookimpl_opts
+from pluggy._decorators import HookimplMarker, HookSpec, HookspecMarker, varnames
+from pluggy._execution import _multicall, _raise_wrapfail, _warn_teardown_exception
+from pluggy._hooks import HookImpl as LegacyHookImpl
+from pluggy._hooks import HookCaller as LegacyHookCaller
+from pluggy._hooks import HookRelay as LegacyHookRelay
+from pluggy._callers import _multicall as legacy_multicall
+
+assert legacy_multicall is _multicall
+assert LegacyHookCaller is HookCaller
+assert LegacyHookRelay is HookRelay
+assert LegacyHookImpl.__module__ == "pluggy._impl"
+assert HookCaller.__module__ == "pluggy._caller"
+assert HookRelay.__module__ == "pluggy._caller"
+assert HookSpec.__module__ == "pluggy._decorators"
+assert HookimplMarker.__module__ == "pluggy._decorators"
+assert HookspecMarker.__module__ == "pluggy._decorators"
+assert varnames.__module__ == "pluggy._decorators"
+assert HookspecOpts.__module__ == "pluggy._config"
+assert HookimplOpts.__module__ == "pluggy._config"
+assert normalize_hookimpl_opts.__module__ == "pluggy._config"
+assert _multicall.__module__ == "pluggy._execution"
+assert _raise_wrapfail.__module__ == "pluggy._execution"
+assert _warn_teardown_exception.__module__ == "pluggy._execution"
+
+
+def wrapper_case(old_style):
+    spec = HookspecMarker("r10-wrapper")
+    impl = HookimplMarker("r10-wrapper")
+    events = []
+
+    class Specs:
+        @spec
+        def calculate(self, value): ...
+
+    class Worker:
+        @impl
+        def calculate(self, value):
+            events.append("worker")
+            return value + 1
+
+    if old_style:
+        class Wrapper:
+            @impl(hookwrapper=True)
+            def calculate(self, value):
+                events.append("before")
+                outcome = yield
+                assert outcome.get_result() == [value + 1]
+                events.append("after")
+    else:
+        class Wrapper:
+            @impl(wrapper=True)
+            def calculate(self, value):
+                events.append("before")
+                result = yield
+                events.append("after")
+                return result
+
+    pm = pluggy.PluginManager("r10-wrapper")
+    pm.add_hookspecs(Specs)
+    pm.register(Worker())
+    pm.register(Wrapper())
+    assert pm.hook.calculate(value=4) == [5]
+    assert events == ["before", "worker", "after"]
+    assert isinstance(pm.hook.calculate, HookCaller)
+
+
+wrapper_case(False)
+wrapper_case(True)
+
+spec = HookspecMarker("r10-first")
+impl = HookimplMarker("r10-first")
+
+
+class FirstSpec:
+    @spec(firstresult=True)
+    def choose(self): ...
+
+
+class Empty:
+    @impl(tryfirst=True)
+    def choose(self):
+        return None
+
+
+class Selected:
+    @impl
+    def choose(self):
+        return "selected"
+
+
+pm = pluggy.PluginManager("r10-first")
+pm.add_hookspecs(FirstSpec)
+pm.register(Empty())
+pm.register(Selected())
+assert pm.hook.choose() == "selected"
+
+spec = HookspecMarker("r10-historic")
+impl = HookimplMarker("r10-historic")
+
+
+class HistoricSpec:
+    @spec(historic=True)
+    def announce(self, value): ...
+
+
+seen = []
+
+
+class LatePlugin:
+    @impl
+    def announce(self, value):
+        seen.append(value)
+
+
+pm = pluggy.PluginManager("r10-historic")
+pm.add_hookspecs(HistoricSpec)
+pm.hook.announce.call_historic(kwargs={"value": 17})
+pm.register(LatePlugin())
+assert seen == [17]
+
+spec = HookspecMarker("r10-subset")
+impl = HookimplMarker("r10-subset")
+
+
+class SubsetSpec:
+    @spec
+    def collect(self): ...
+
+
+class A:
+    @impl
+    def collect(self):
+        return "a"
+
+
+class B:
+    @impl
+    def collect(self):
+        return "b"
+
+
+a, b = A(), B()
+pm = pluggy.PluginManager("r10-subset")
+pm.add_hookspecs(SubsetSpec)
+pm.register(a)
+pm.register(b)
+subset = pm.subset_hook_caller("collect", remove_plugins=[a])
+assert isinstance(subset, HookCaller)
+assert isinstance(subset, _SubsetHookCaller)
+assert subset() == ["b"]
+"""
+
+
 @dataclass(frozen=True)
 class RepositoryTask:
     source: str
@@ -964,6 +1224,50 @@ TASKS = {
             "and tomlkit/items.py. Review qa_visible.py and run exactly "
             "python3 -B qa_visible.py with run_command afterward. No other "
             "commands are authorized."
+        ),
+    ),
+    "pluggy-role-module-split": RepositoryTask(
+        source="pytest-dev/pluggy",
+        upstream="https://github.com/pytest-dev/pluggy.git",
+        base_sha="d70fe1840d01c78b7d85f693cfef01ccdf2f80a6",
+        reference_fix_sha="17d4ee957ffe86e5e65f892fef8898bb2a386d6e",
+        editable=frozenset(
+            {
+                "src/pluggy/_caller.py",
+                "src/pluggy/_callers.py",
+                "src/pluggy/_config.py",
+                "src/pluggy/_decorators.py",
+                "src/pluggy/_execution.py",
+                "src/pluggy/_hooks.py",
+                "src/pluggy/_impl.py",
+            }
+        ),
+        visible_script="qa_visible.py",
+        visible_source=PLUGGY_MODULE_SPLIT_VISIBLE,
+        hidden_source=PLUGGY_MODULE_SPLIT_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Refactor the internal hook implementation in this pinned "
+            "pytest-dev/pluggy repository by splitting the monolithic "
+            "pluggy._hooks and pluggy._callers modules into role-specific "
+            "modules, without changing runtime behavior. Move hook callers "
+            "and relay types into src/pluggy/_caller.py; option TypedDicts "
+            "and normalization into src/pluggy/_config.py; marker decorators, "
+            "HookSpec and varnames into src/pluggy/_decorators.py; multicall "
+            "and wrapper/teardown execution into src/pluggy/_execution.py; "
+            "and HookImpl plus its type aliases into src/pluggy/_impl.py. "
+            "Keep src/pluggy/_hooks.py and src/pluggy/_callers.py as "
+            "backward-compatible re-export shims for every existing public "
+            "and private import, preserving object identity rather than "
+            "creating duplicate implementations. Preserve top-level pluggy "
+            "exports, hook ordering, firstresult, historic replay, subset "
+            "callers, old-style hookwrappers and new-style wrappers. This is "
+            "a code-organization refactor, not a feature change. Edit ONLY "
+            "src/pluggy/_caller.py, _callers.py, _config.py, _decorators.py, "
+            "_execution.py, _hooks.py, and _impl.py. Review qa_visible.py "
+            "and run exactly python3 -B qa_visible.py with run_command "
+            "afterward. No other commands are authorized. Do not change "
+            "tests, changelog, packaging metadata, or any other files."
         ),
     ),
     "dateutil-strict-numeric-fields": RepositoryTask(
@@ -1182,17 +1486,40 @@ def snapshot_files(root: Path) -> dict[str, str]:
 def check_edits(
     original: dict[str, str], updated: dict[str, str], editable: frozenset[str]
 ) -> tuple[bool, bool]:
-    if set(original) != set(updated) or "SYMLINK" in updated.values():
+    if "SYMLINK" in original.values() or "SYMLINK" in updated.values():
         return False, False
-    protected = all(
-        updated[path] == digest
-        for path, digest in original.items()
-        if path not in editable
-    )
-    changed = bool(editable) and all(
-        path in original and updated.get(path) != original[path] for path in editable
-    )
+    changed_paths = {
+        path
+        for path in original.keys() | updated.keys()
+        if original.get(path) != updated.get(path)
+    }
+    unexpected_path_changes = (original.keys() ^ updated.keys()) - editable
+    if unexpected_path_changes:
+        return False, False
+    # Editable paths may be new or intentionally removed by a refactor.
+    # Every other addition, deletion, or content change remains protected.
+    protected = changed_paths.issubset(editable)
+    changed = bool(editable) and editable.issubset(changed_paths)
     return protected, changed
+
+
+def validate_editable_paths(
+    original: dict[str, str],
+    editable: frozenset[str],
+    preflight_receipt: dict[str, object],
+) -> None:
+    """Require absent baseline paths to be proven additions in the pinned fix."""
+    missing = editable.difference(original)
+    raw_added = preflight_receipt.get("reference_added_paths", [])
+    if not isinstance(raw_added, list) or any(
+        not isinstance(path, str) for path in raw_added
+    ):
+        raise RuntimeError("preflight reference-addition proof is invalid")
+    reference_added = set(raw_added)
+    if not missing.issubset(reference_added):
+        raise RuntimeError("required source path is absent from both pinned revisions")
+    if not reference_added.issubset(editable):
+        raise RuntimeError("preflight added a path outside the editable allowlist")
 
 
 def tool_call_size_metrics(entry: ToolCallRecord) -> dict[str, int | bool]:
@@ -1242,16 +1569,35 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
         raise RuntimeError(
             "upstream historical regression is not independently reproducible"
         )
-    if any(
-        (baseline / path).read_bytes() == (reference / path).read_bytes()
-        for path in task.editable
-    ):
+    base_files = snapshot_files(baseline)
+    reference_files = snapshot_files(reference)
+    if any(base_files.get(path) == reference_files.get(path) for path in task.editable):
         raise RuntimeError("reference fix does not modify all required source files")
+    added = sorted(
+        path
+        for path in task.editable
+        if path not in base_files and path in reference_files
+    )
+    removed = sorted(
+        path
+        for path in task.editable
+        if path in base_files and path not in reference_files
+    )
+    modified = sorted(
+        path
+        for path in task.editable
+        if path in base_files
+        and path in reference_files
+        and base_files[path] != reference_files[path]
+    )
     return baseline, {
         "base_visible_exit": base_score["visible_oracle_exit"],
         "base_hidden_exit": base_score["hidden_oracle_exit"],
         "reference_visible_exit": reference_score["visible_oracle_exit"],
         "reference_hidden_exit": reference_score["hidden_oracle_exit"],
+        "reference_added_paths": added,
+        "reference_removed_paths": removed,
+        "reference_modified_paths": modified,
     }
 
 
@@ -1373,10 +1719,7 @@ def run_task(
         # filesystem paths outside the pinned source checkout.
         shutil.copytree(baseline, workspace, symlinks=True)
         original = snapshot_files(workspace)
-        if any(path not in original for path in task.editable):
-            raise RuntimeError(
-                "pinned upstream source does not contain required modules"
-            )
+        validate_editable_paths(original, task.editable, preflight_receipt)
         _stage_chatgpt_access_only(home, account, timeout=timeout)
         (home / ".ash" / "ash.toml").write_text('sandbox_backend = "native"\n')
         db = scratch / "db"

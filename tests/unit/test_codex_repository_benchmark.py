@@ -378,3 +378,101 @@ def test_scoring_rejects_modified_oracle_and_cleans_scratch(
     assert (evidence / "prompt.txt").read_text() == shared_user_prompt(task)
     assert result["runner"] == "plain-codex-cli"
     assert result["host_skill_discovery_disabled_requested"] is True
+
+
+def test_codex_scoring_accepts_new_editable_source_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = RepositoryTask(
+        source="local-refactor-fixture",
+        upstream="https://example.invalid/refactor.git",
+        base_sha="c" * 40,
+        reference_fix_sha="d" * 40,
+        editable=frozenset({"src/pkg/_hooks.py", "src/pkg/_caller.py"}),
+        visible_script="qa_visible.py",
+        visible_source="assert True\n",
+        hidden_source="assert True\n",
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Split hook roles into src/pkg/_caller.py while preserving "
+            "src/pkg/_hooks.py; run exactly python3 -B qa_visible.py with run_command."
+        ),
+    )
+    monkeypatch.setitem(runner.TASKS, "new-module-fixture", task)
+
+    def preflight(_task: RepositoryTask, scratch: Path):
+        base = scratch / "baseline"
+        base.mkdir()
+        (scratch / "reference").mkdir()
+        package = base / "src/pkg"
+        package.mkdir(parents=True)
+        (package / "_hooks.py").write_text("old combined module")
+        (base / "qa_visible.py").write_text(task.visible_source)
+        return base, {
+            "base_visible_exit": 1,
+            "base_hidden_exit": 1,
+            "reference_visible_exit": 0,
+            "reference_hidden_exit": 0,
+            "reference_added_paths": ["src/pkg/_caller.py"],
+            "reference_removed_paths": [],
+            "reference_modified_paths": ["src/pkg/_hooks.py"],
+        }
+
+    def run_codex(workspace: Path, evidence: Path, **_kwargs):
+        assert not (workspace.parent / "reference").exists()
+        (workspace / "src/pkg/_hooks.py").write_text("compatibility shim")
+        (workspace / "src/pkg/_caller.py").write_text("new caller module")
+        events = [
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "/usr/bin/zsh -lc 'python3 -B qa_visible.py'",
+                    "status": "completed",
+                    "exit_code": 0,
+                },
+            },
+            {"type": "turn.completed", "usage": {"input_tokens": 80}},
+        ]
+        (evidence / "codex.jsonl").write_text(
+            "".join(json.dumps(item) + "\n" for item in events)
+        )
+        return {
+            "exit_code": 0,
+            "timed_out": False,
+            "cli_seconds": 8.0,
+            "codex_model": "gpt-6-luna",
+            "codex_reasoning_effort": "xhigh",
+            "sandbox": "workspace-write",
+            "ephemeral": True,
+            "native_binary_direct": True,
+            "isolated_codex_home": True,
+            "isolated_home_xdg": True,
+            "memory_backed_auth_copy_cleaned": True,
+        }
+
+    monkeypatch.setattr(runner, "preflight", preflight)
+    monkeypatch.setattr(runner, "_run_codex", run_codex)
+    monkeypatch.setattr(
+        runner,
+        "check_oracles",
+        lambda *_args: {
+            "correct": True,
+            "visible_oracle_exit": 0,
+            "hidden_oracle_exit": 0,
+        },
+    )
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    result = run_task(
+        "new-module-fixture",
+        evidence=evidence,
+        model="gpt-6-luna",
+        effort="xhigh",
+        timeout=170,
+    )
+    assert result["passed"] is True
+    assert result["protected_files_unchanged"] is True
+    assert result["required_source_changed"] is True
+    assert result["changed_paths"] == ["src/pkg/_caller.py", "src/pkg/_hooks.py"]
+    assert result["visible_test_command_executed"] is True

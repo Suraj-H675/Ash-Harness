@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -201,6 +202,24 @@ def test_size_telemetry_excludes_tool_payload_and_private_file_path() -> None:
             "https://github.com/pypa/packaging.git",
             {"src/packaging/metadata.py", "src/packaging/dependency_groups.py"},
         ),
+        (
+            "tomlkit-comment-control-validation",
+            "https://github.com/python-poetry/tomlkit.git",
+            {"tomlkit/_utils.py", "tomlkit/api.py", "tomlkit/items.py"},
+        ),
+        (
+            "pluggy-role-module-split",
+            "https://github.com/pytest-dev/pluggy.git",
+            {
+                "src/pluggy/_caller.py",
+                "src/pluggy/_callers.py",
+                "src/pluggy/_config.py",
+                "src/pluggy/_decorators.py",
+                "src/pluggy/_execution.py",
+                "src/pluggy/_hooks.py",
+                "src/pluggy/_impl.py",
+            },
+        ),
     ],
 )
 def test_upstream_tasks_are_pinned_and_oracles_sealed(
@@ -272,6 +291,65 @@ def test_repository_snapshot_and_protected_edits_refuse_unexpected_changes(
     assert bench.check_edits(
         baseline, bench.snapshot_files(tmp_path), frozenset({"h11/_readers.py"})
     ) == (False, False)
+
+
+def test_repository_scoring_accepts_added_and_removed_editable_modules() -> None:
+    original = {
+        "src/pluggy/_hooks.py": "old-shim-source",
+        "src/pluggy/_callers.py": "old-caller-source",
+        "src/pluggy/_legacy.py": "to-be-removed",
+        "qa_visible.py": "sealed-visible-test",
+    }
+    updated = {
+        "src/pluggy/_hooks.py": "compatibility-shim",
+        "src/pluggy/_callers.py": "compatibility-shim",
+        "src/pluggy/_caller.py": "new-caller-module",
+        "src/pluggy/_config.py": "new-config-module",
+        "qa_visible.py": "sealed-visible-test",
+    }
+    editable = frozenset(
+        {
+            "src/pluggy/_hooks.py",
+            "src/pluggy/_callers.py",
+            "src/pluggy/_caller.py",
+            "src/pluggy/_config.py",
+            "src/pluggy/_legacy.py",
+        }
+    )
+    assert bench.check_edits(original, updated, editable) == (True, True)
+
+    protected_deletion = {**updated}
+    protected_deletion.pop("qa_visible.py")
+    assert bench.check_edits(original, protected_deletion, editable) == (False, False)
+
+
+def test_editable_path_validation_requires_reference_proof_for_new_modules() -> None:
+    original = {"src/pkg/_hooks.py": "sha-old"}
+    editable = frozenset({"src/pkg/_hooks.py", "src/pkg/_caller.py"})
+    bench.validate_editable_paths(
+        original,
+        editable,
+        {"reference_added_paths": ["src/pkg/_caller.py"]},
+    )
+    with pytest.raises(RuntimeError, match="absent from both pinned revisions"):
+        bench.validate_editable_paths(original, editable, {"reference_added_paths": []})
+    with pytest.raises(RuntimeError, match="absent from both pinned revisions"):
+        bench.validate_editable_paths(
+            original,
+            editable,
+            {"reference_added_paths": ["src/pkg/_other.py"]},
+        )
+    with pytest.raises(RuntimeError, match="outside the editable allowlist"):
+        bench.validate_editable_paths(
+            original,
+            editable,
+            {
+                "reference_added_paths": [
+                    "src/pkg/_caller.py",
+                    "src/pkg/_unapproved.py",
+                ]
+            },
+        )
 
 
 def test_two_module_scoring_rejects_partial_repair_and_modified_qa() -> None:
@@ -367,6 +445,9 @@ def test_preflight_requires_red_base_and_green_upstream_fix(
         "base_hidden_exit": 1,
         "reference_visible_exit": 0,
         "reference_hidden_exit": 0,
+        "reference_added_paths": [],
+        "reference_removed_paths": [],
+        "reference_modified_paths": ["h11/_readers.py"],
     }
 
     def broken_grade(workspace: Path, _: object) -> dict[str, object]:
@@ -385,6 +466,48 @@ def test_preflight_requires_red_base_and_green_upstream_fix(
     (tmp_path / "linked").mkdir()
     with pytest.raises(RuntimeError, match="contains a symlink"):
         bench.preflight(task, tmp_path / "linked")
+
+
+def test_preflight_accepts_reference_added_source_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = replace(
+        bench.TASKS["h11-chunk-footer"],
+        editable=frozenset(
+            {"h11/_readers.py", "h11/_new_reader.py", "h11/_legacy.py"}
+        ),
+    )
+
+    def fake_fetch(destination: Path, _: object, sha: str) -> None:
+        destination.mkdir()
+        package = destination / "h11"
+        package.mkdir()
+        (package / "_readers.py").write_text(sha)
+        if sha == task.reference_fix_sha:
+            (package / "_new_reader.py").write_text("new role-specific module")
+        else:
+            (package / "_legacy.py").write_text("old module removed by refactor")
+
+    def fake_grade(workspace: Path, _: object) -> dict[str, object]:
+        good = workspace.name == "reference"
+        return {
+            "correct": good,
+            "visible_oracle_exit": 0 if good else 1,
+            "hidden_oracle_exit": 0 if good else 1,
+        }
+
+    monkeypatch.setattr(bench, "fetch_pinned", fake_fetch)
+    monkeypatch.setattr(bench, "check_oracles", fake_grade)
+    _, proof = bench.preflight(task, tmp_path)
+    assert proof == {
+        "base_visible_exit": 1,
+        "base_hidden_exit": 1,
+        "reference_visible_exit": 0,
+        "reference_hidden_exit": 0,
+        "reference_added_paths": ["h11/_new_reader.py"],
+        "reference_removed_paths": ["h11/_legacy.py"],
+        "reference_modified_paths": ["h11/_readers.py"],
+    }
 
 
 def test_reference_checkout_deleted_before_agent_access(tmp_path: Path) -> None:

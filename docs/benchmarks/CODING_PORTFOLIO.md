@@ -7,9 +7,10 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These fifteen fixtures already have runnable code and grading logic. They **do not
-constitute fourteen independent real repositories**; synthetic and real-repository
-lanes must remain separate. Do not pool their scores into a single win rate.
+These sixteen fixtures already have runnable code and grading logic. They do
+not represent sixteen independent real repositories: R1–R10 are pinned
+repository tasks (some share an upstream project), while S1–S6 are synthetic.
+Keep the lanes separate and do not pool their scores into a single win rate.
 
 | ID | Existing task | Lane | What it exercises | Latest evidence / next action |
 |---|---|---|---|---|
@@ -22,6 +23,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Initial pair: both fail**; Ash 32K protected-context overflow after one edit, Codex visible pass but hidden fail; Ash 64K ablation reaches 120K total-turn cap. Park fixture-specific remediation. |
 | R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Latest sequential 65K pair: both pass**; earlier Ash-only normal-128K trial also passed. Exact independent oracle and scope checks verified; no speed/reliability ranking |
 | R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **First sequential 65K pair: both pass**; Ash 106.68s / 14 requests, Codex 78.74s / 5 shell commands; one sample, Codex policy-parity caveat |
+| R10 | `pluggy-role-module-split` | Pinned real repo | Seven-module role-based refactor; old import shims and public plugin behavior, wrappers, firstresult, historic replay and subset callers | **Preflight verified: visible + hidden red on original, green on reference**; five new modules and two compatibility shims; paired model evaluation pending |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -30,12 +32,13 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | S6 | `event-log` | Synthetic integration | Three-module parser, aggregation and rendering | **Ash passed** visible + hidden oracles in one baseline GPT-6 Luna trial; post-change trial had provider timeouts before any model response, so no post-change semantic grade. No Codex control |
 
 **Current gaps (not runnable tasks):** Further independent source projects
-should exercise unfamiliar-repository debugging and test triage, a multi-file
-refactor with stable public behavior, dependency/interface compatibility, and
-larger-codebase navigation. R7 and R9 add distinct codebases and multi-module
-workflows, but do not fill all these gaps. Choose each base/fix pin and sealed
-oracle only after provenance and red-original/green-reference verification.
-The present **15-case inventory** is not a stable reliability benchmark;
+should exercise unfamiliar-repository debugging and test triage, dependency/
+interface compatibility, and larger-codebase navigation. R7, R9 and R10 add
+distinct codebases and multi-module workflows, with R10 covering a seven-module
+refactor behind compatibility shims; they do not fill all these gaps. Every
+additional task still needs pinned base/fix provenance and independently
+authored sealed oracles with red-original/green-reference preflight.
+The present **16-case inventory** is not a stable reliability benchmark;
 repetitions and broader workflow diversity remain necessary.
 
 **Evidence checkpoint:** Before this workflow change, the locally retained
@@ -219,9 +222,9 @@ requested contexts, but no repeatability distribution. Private receipts:
 **R9 provenance and oracle preflight (2026-11-13):** The new
 `python-poetry/tomlkit` case uses original commit
 `55d07680cabf023885d511d2bf2000963e4e3dc7` and the upstream fix commit
-`7e0016217ea2dbc369fc721acfd8ace52a899a99` (PR #705, “Reject forbidden
-control characters in generated comments;
-[PR #705](https://github.com/python-poetry/tomlkit/pull/705)). Three source modules are editable:
+`7e0016217ea2dbc369fc721acfd8ace52a899a99` (“Reject forbidden control
+characters in generated comments”, [PR #705](https://github.com/python-poetry/tomlkit/pull/705)).
+Three source modules are editable:
 `tomlkit/_utils.py`, `tomlkit/api.py`, and `tomlkit/items.py`. Independently
 authored, standard-library-only visible and hidden checks cover all forbidden
 ASCII controls, standalone multiline LF/CRLF versus bare CR, single-line item
@@ -257,6 +260,35 @@ verify the same network blocking or enforce the same exact shell-command
 policy as Ash. Codex input-token counts include cached input and cannot be
 directly compared to Ash's prompt-token accounting. Neither new pair proves
 a throughput gain or motivates a production-code adjustment.
+
+**R10 provenance and preflight (2026-11-13):** The new
+`pytest-dev/pluggy` case uses original commit
+`d70fe1840d01c78b7d85f693cfef01ccdf2f80a6` and the exact parent commit from
+upstream PR #703, `17d4ee957ffe86e5e65f892fef8898bb2a386d6e`
+([role-specific hook module split](https://github.com/pytest-dev/pluggy/pull/703)).
+The seven editable modules are `_caller.py`, `_callers.py`, `_config.py`,
+`_decorators.py`, `_execution.py`, `_hooks.py`, and `_impl.py`. The upstream
+change creates five role-specific modules and retains `_hooks.py` and
+`_callers.py` as compatibility re-export shims. Independent visible and hidden
+oracles verify legacy import names and `__all__`, object identity across old
+and new module paths, top-level exports, actual PluginManager calls, new- and
+old-style wrappers, firstresult, historic replay and subset callers. The
+existing networkless preflight independently confirms visible and hidden
+**failure on the original and pass on the reference**, with exactly five
+reference-added modules and two modified shims. This is a structural refactor
+and compatibility task, not a new behavior feature. The paired Ash/Codex
+model evaluation has **not yet run**.
+
+**R10 evaluator support:** The repository and plain-Codex graders previously
+required every editable path to exist in the original checkout and rejected
+all added/deleted files. They now accept additions/removals only for explicitly
+editable paths proven by the pinned reference diff, while still rejecting
+unapproved path additions/deletions, any symlinks, modified protected files,
+or incomplete required-module changes. This is necessary for genuine module
+splits, not a general relaxation of file-scope protection. The focused
+repository/Codex/parallel benchmark unit suites pass **73 tests** after this
+change; Ruff and `git diff --check` pass. This harness repair is committed
+separately before any R10 model trial.
 
 ## Evaluation and prioritization contract
 
@@ -298,18 +330,19 @@ a throughput gain or motivates a production-code adjustment.
 
 ## Next portfolio slice
 
-**Now:** The paired R5 and R8 follow-ups both pass at matched 65K and uncapped
-Ash turn-total settings, and the first R9 pair passes on a new codebase; none
-isolates a source change's impact. Avoid more reruns merely to improve scores;
-R3 remains parked, R6's prior provider stall is unresolved as a causal coding
-result, and R7's hidden Codex failure and Ash's budget-limited runs remain
-distinct findings. The next real-repository task should specifically target
-a **larger codebase and a multi-file refactor with stable public behavior** or
-dependency/interface compatibility, not another small API-validation fix.
-Focus on real owner coding usage, tool-level correctness, recovery safety,
-and unfamiliar-repository workflow diversity; commit implementation only for
-independently demonstrated gaps. **Ash Crew v1 is complete and merged into
-`main`; there are no remaining Crew acceptance gates in the active portfolio.**
+**Now:** R5, R8 and R9 have positive paired outcomes, each a single observation;
+none isolates a source change's impact. R10 has passed independent original /
+reference preflight and its evaluator changes have 72 focused unit tests
+passing. Next: run one sequential R10 Ash/Codex pair at matched 65K settings,
+then reassess whether dependency/interface compatibility in a larger
+multi-package codebase is the next missing workflow. Avoid reruns merely to
+improve scores; R3 remains parked, R6's prior provider stall is unresolved as
+a causal coding result, and R7's hidden Codex failure and Ash's budget-limited
+runs remain distinct findings. Focus on real owner coding usage, tool-level
+correctness, recovery safety, and unfamiliar-repository workflow diversity;
+commit implementation only for independently demonstrated gaps. **Ash Crew
+v1 is complete and merged into `main`; there are no remaining Crew acceptance
+gates in the active portfolio.**
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate
