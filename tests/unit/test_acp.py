@@ -240,6 +240,49 @@ def _events() -> list[AshEvent]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_reason", "expected"),
+    [
+        ("completed", "end_turn"),
+        ("token_budget", "max_tokens"),
+        ("iteration_limit", "max_turn_requests"),
+        ("circuit_breaker", "error"),
+        (None, "error"),
+    ],
+)
+async def test_acp_preserves_incomplete_turn_reason_for_editor(
+    tmp_path: Path, stop_reason: str | None, expected: str,
+) -> None:
+    async def factory(
+        workspace: Path, session_id: str | None,
+        mcp_configs: dict[str, Any], approval_callback: Any,
+    ) -> FakeAshClient:
+        terminal = (
+            [AshEvent("turn.completed", {
+                "response": "Incomplete work",
+                "stop_reason": stop_reason,
+            })]
+            if stop_reason is not None else []
+        )
+        return FakeAshClient(session_id or "unfinished", terminal, approval_callback)
+
+    agent = AshACPAgent(client_factory=factory)  # type: ignore[arg-type]
+    agent.on_connect(FakeACPConnection())  # type: ignore[arg-type]
+    session = await agent.new_session(str(tmp_path))
+    try:
+        if expected == "error":
+            with pytest.raises(acp.RequestError, match="Ash turn"):
+                await agent.prompt(session.session_id, [text_block("Repair code")])
+        else:
+            response = await agent.prompt(
+                session.session_id, [text_block("Repair code")]
+            )
+            assert response.stop_reason == expected
+    finally:
+        await agent.aclose()
+
+
+@pytest.mark.asyncio
 async def test_acp_maps_mcp_prompts_events_and_editor_permissions(
     tmp_path: Path,
 ) -> None:

@@ -1791,6 +1791,88 @@ async def test_remote_delegate_redacts_exact_bearer_token_from_success_output(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stop_reason", ["token_budget", "iteration_limit", "circuit_breaker", None]
+)
+async def test_a2a_never_marks_resource_limited_or_unterminated_turn_as_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_reason: str | None,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AshConfig(
+        model="ollama/test", workspace_root=workspace,
+        db_directory=tmp_path / "db", memory_backend="off",
+    )
+
+    class IncompleteClient:
+        loop = SimpleNamespace(
+            current_session=SimpleNamespace(session_id="incomplete-ash-session")
+        )
+
+        async def stream_prompt(self, *args: Any, **kwargs: Any) -> AsyncIterator[AshEvent]:
+            yield AshEvent("assistant.delta", {"text": "Partial work only"})
+            if stop_reason is not None:
+                yield AshEvent(
+                    "turn.completed",
+                    {"response": "Partial work only", "stop_reason": stop_reason},
+                )
+
+        async def close(self) -> None:
+            return None
+
+    async def create_client(**kwargs: Any) -> IncompleteClient:
+        return IncompleteClient()
+
+    monkeypatch.setattr("ash.server.a2a.AshClient.create", create_client)
+    app = create_a2a_app(
+        config, public_url="https://testserver",
+        bearer_token="0123456789abcdef",
+        requests_per_minute=100,
+        task_store=InMemoryTaskStore(),
+    )
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="https://testserver",
+            headers={"Authorization": "Bearer 0123456789abcdef"},
+        ) as http:
+            client = await ClientFactory(
+                ClientConfig(
+                    httpx_client=http, streaming=True,
+                    supported_protocol_bindings=[TransportProtocol.JSONRPC],
+                    accepted_output_modes=["text/plain"],
+                )
+            ).create_from_url("https://testserver")
+            events = [
+                event async for event in client.send_message(
+                    SendMessageRequest(
+                        message=Message(
+                            message_id="incomplete-message", role=Role.ROLE_USER,
+                            parts=[Part(text="Make changes and verify")],
+                        )
+                    )
+                )
+            ]
+            final = [
+                event.status_update
+                for event in events if event.HasField("status_update")
+            ][-1]
+            assert final.status.state == TaskState.TASK_STATE_FAILED
+            text = " ".join(part.text for part in final.status.message.parts)
+            assert "incomplete" in text.lower() or "not complete" in text.lower()
+            assert "Partial work only" not in text
+            artifacts = "".join(
+                part.text
+                for event in events if event.HasField("artifact_update")
+                for part in event.artifact_update.artifact.parts
+            )
+            assert artifacts == "Partial work only"
+            stored = await client.get_task(GetTaskRequest(id=final.task_id))
+            assert stored.status.state == TaskState.TASK_STATE_FAILED
+            await client.close()
+
+
+@pytest.mark.asyncio
 async def test_a2a_server_redacts_signed_url_from_failed_task_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

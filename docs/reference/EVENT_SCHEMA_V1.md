@@ -144,6 +144,16 @@ Neither code 0 nor `turn.completed` proves that the user's requested task
 passed independent tests or review. Interactive sessions retain their
 existing process-exit behavior.
 
+Protocol adapters must not confuse this terminal boundary with task success.
+On ACP, `token_budget` maps to the standard `max_tokens` stop reason and
+`iteration_limit` maps to `max_turn_requests`. Circuit-breaker stops and a
+stream that ends without a terminal turn result are reported as errors.
+On A2A, all three unfinished stop reasons (`token_budget`, `iteration_limit`,
+`circuit_breaker`) and a missing terminal event produce a **failed** task
+status, not `TASK_STATE_COMPLETED`; partial response artifacts remain
+available to review. Normal successful and legacy terminal turns retain
+their existing completion behavior. Neither adapter retries tool effects.
+
 `turn.completed` preserves the legacy model-only `model` field and may also
 include `model_id`, the canonical `provider/model` identity of the provider that
 actually served the turn. Consumers that need route-aware attribution should

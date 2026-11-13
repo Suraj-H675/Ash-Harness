@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -365,6 +365,10 @@ class AshACPAgent:
         sent_text = False
         failure = ""
         cancelled = False
+        completed_event_seen = False
+        terminal_reason: Literal[
+            "end_turn", "max_tokens", "max_turn_requests"
+        ] = "end_turn"
         try:
             events = (
                 state.client.stream_prompt(text, user_metadata=user_metadata)
@@ -378,6 +382,15 @@ class AshACPAgent:
                     failure = redact_text(str(event.data.get("error", "turn failed")))
                 if event.type == "turn.cancelled":
                     cancelled = True
+                if event.type == "turn.completed":
+                    completed_event_seen = True
+                    reason = event.data.get("stop_reason")
+                    if reason == "token_budget":
+                        terminal_reason = "max_tokens"
+                    elif reason == "iteration_limit":
+                        terminal_reason = "max_turn_requests"
+                    elif reason == "circuit_breaker":
+                        failure = "Ash turn stopped before completing: circuit_breaker"
                 await self._send_event(session_id, event)
                 if event.type == "turn.completed" and not sent_text:
                     response = str(event.data.get("response", ""))
@@ -393,9 +406,11 @@ class AshACPAgent:
                     state.prompt_task = None
         if cancelled:
             return PromptResponse(stop_reason="cancelled")
+        if not completed_event_seen and not failure:
+            failure = "Ash stream ended without a terminal result"
         if failure:
             raise RequestError(-32001, "Ash turn failed", {"message": failure})
-        return PromptResponse(stop_reason="end_turn")
+        return PromptResponse(stop_reason=terminal_reason)
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         state = await self._session(session_id)

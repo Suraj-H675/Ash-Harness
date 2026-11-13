@@ -562,6 +562,7 @@ class AshA2AExecutor(AgentExecutor):
             fallback = ""
             failure = ""
             cancelled = False
+            completed_event_seen = False
             async for event in client.stream_prompt(
                 prompt,
                 user_metadata={"source": "a2a", "a2a_task_id": task_id},
@@ -580,13 +581,27 @@ class AshA2AExecutor(AgentExecutor):
                             emitted = True
                         pending = text
                 elif event.type == "turn.completed":
+                    completed_event_seen = True
                     fallback = str(event.data.get("response", ""))
+                    stop_reason = event.data.get("stop_reason")
+                    if isinstance(stop_reason, str) and stop_reason in {
+                        "iteration_limit", "token_budget", "circuit_breaker"
+                    }:
+                        failure = (
+                            f"Ash turn incomplete ({stop_reason}). "
+                            "Review preserved edits and verification before continuing."
+                        )
                 elif event.type == "turn.error":
                     failure = redact_urls_in_text(
                         str(event.data.get("error", "turn failed"))
                     )
                 elif event.type == "turn.cancelled":
                     cancelled = True
+            if not completed_event_seen and not failure and not cancelled:
+                failure = (
+                    "Ash stream ended without a terminal result; "
+                    "the task is incomplete."
+                )
             if not pending and not emitted:
                 pending = fallback
             if pending:
