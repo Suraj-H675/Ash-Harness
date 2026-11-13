@@ -17,10 +17,10 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R2 | `urllib3-header-sanitization` | Pinned real repo | One-file security-oriented normalization | Historical paired pilot passed; retain as control |
 | R3 | `urllib3-proxy-redirect` | Pinned real repo | Coordinated two-file redirect/security fix | **Scenario 04: PARKED, unresolved**; prior matched pair: Ash fail / Codex pass (one sample) |
 | R4 | `urllib3-url-auth-feature` | Pinned real repo | New public API / URL parsing edge cases | **Initial paired pass for both engines**; one sample, no reliability claim |
-| R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Initial pair: Ash fail / Codex pass**; Ash stopped at safe context limit after an incomplete edit |
+| R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Latest sequential 65K pair: both pass**; Ash also passed hidden oracle and verified test after its earlier 32K protected-context failure. One paired trial, not a controlled change attribution |
 | R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Initial pair: Ash timeout / Codex pass**; no Ash source edit or verification |
 | R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Initial pair: both fail**; Ash 32K protected-context overflow after one edit, Codex visible pass but hidden fail; Ash 64K ablation reaches 120K total-turn cap. Park fixture-specific remediation. |
-| R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Ash pass (single trial)** at normal 128K context and uncapped turn total: both source edits, visible and hidden oracle passes, terminal completion, scope and audit valid |
+| R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Latest sequential 65K pair: both pass**; earlier Ash-only normal-128K trial also passed. Exact independent oracle and scope checks verified; no speed/reliability ranking |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -87,6 +87,25 @@ completed in 55.92s. Comparison receipt validated both task inputs and
 source pins. This **single observation** is a failure classification, not a
 reliability estimate or a timed ranking. The two engines retain different
 command/permission enforcement and system-prompt behavior.
+
+**R5 causal context follow-up (2026-11-13, one new pair):** After the
+red-first diagnostic and edit-recovery changes in `main` at `c13be3d`, the
+frozen Click task was run **once** under an explicit 65,536-token request
+context and **uncapped** Ash cumulative turn budget, both engines using
+GPT-6 Luna xhigh, the same requested context and 170s deadlines. The
+sequential, verified comparison found **Ash pass** (83.89s CLI, eight completed
+model requests, nine tool calls) and **plain Codex pass** (78.77s CLI,
+seven shell commands). Both completed a successful authorized visible check,
+passed sealed hidden and visible oracles and preserved protected files. Ash
+completed with exit 0, a valid session audit and cleaned scratch/access-only
+credential state. Codex's event receipt and private-home/auth cleanup also
+verified. The prior Ash 32K outcome was **fail after partial edit and protected
+context exhaustion**; the new result establishes that Ash can complete the
+same task at 65K/uncapped in this run. It does **not** isolate larger context
+from other changed source/model/transport conditions or demonstrate a
+reproducible reliability gain. No further R5 attempt is warranted without a
+new independent causal question. Private receipts:
+`/var/tmp/ash-r5-64k-paired-20261113-r01`.
 
 **R6 provenance:** The python-dateutil case uses original
 `6e1864c7c309f4d905e8b337864ca8b5d3ff9d34` and upstream fix
@@ -181,6 +200,29 @@ comparator or a repeatability estimate. It does not show that a larger
 context would fix R7. No Ash production code changed for this pass. Private
 receipt: `/var/tmp/ash-portfolio-r8-packaging-20261113-r01/ash/result.json`.
 
+**R8 independent Codex comparator (2026-11-13, one pair):** On untouched
+`packaging-exception-pickle` pins, with GPT-6 Luna xhigh and matching 65,536
+request-context tokens, 170-second separate CLI deadlines, and no Ash
+cumulative-turn cap, the sequential receipt checker verified the shared
+task objective and user prompt, source pins, visible/hidden oracle hashes,
+requested settings, temporary isolation and credential cleanup. **Ash passed**
+(71.53s CLI, nine completed model requests, 14 tool calls) and **plain Codex
+passed** (71.27s CLI, three shell commands). Both required source modules
+were changed, the visible command ran, and visible and hidden oracles passed;
+Ash audit and scoped-file checks also passed. The 0.26s timing difference is
+noise at single-sample scale, not a speed advantage. The earlier Ash-only
+128K trial also passed, so R8 has two positive Ash observations at distinct
+requested contexts, but no repeatability distribution. Private receipts:
+`/var/tmp/ash-r8-paired-post-repair-20261113-r01`.
+
+**Parity caveat for both new pairs:** The checker accepted requested model,
+effort, context, prompts, pins and independent grading, **not** actual
+tool/permission/sandbox equivalence. Codex's receipt does not independently
+verify the same network blocking or enforce the same exact shell-command
+policy as Ash. Codex input-token counts include cached input and cannot be
+directly compared to Ash's prompt-token accounting. Neither new pair proves
+a throughput gain or motivates a production-code adjustment.
+
 ## Evaluation and prioritization contract
 
 1. **Freeze the task** before a run: objective, task inputs, source revision,
@@ -221,21 +263,16 @@ receipt: `/var/tmp/ash-portfolio-r8-packaging-20261113-r01/ash/result.json`.
 
 ## Next portfolio slice
 
-**Now:** no Scenario 04 or parked R5/R6/R7 repeat. R7 adds a fifth upstream
-repository and shows a second cross-repository **32K protected-context**
-failure, plus a distinct **64K/120K cumulative-budget** stop; plain Codex's
-hidden failure prevents any overall correctness-win claim. Before changing
-Ash's context architecture, study how its real production-default window and
-unbounded total-turn budget behave in independent user journeys, and compare
-tool history / early editing decisions across genuinely different tasks.
-Prioritize product-correctness, recovery safety, and resource economy over
-another case-specific attempt to get a green benchmark. Repetitions require
-a predeclared variance or causal question, not a desired score.
-
-R8's distinct production-budget trial has completed successfully. Do not
-rerun it merely to improve its score. Prioritize real owner coding work and
-new reliability findings from actual user workflows, not more case-specific
-benchmark tuning.
+**Now:** The paired R5 and R8 follow-ups both pass at matched 65K and uncapped
+Ash turn-total settings, but neither isolates a source change's impact. Avoid
+more reruns of R5/R8 merely to improve the score; R3 remains parked, R6's
+prior provider stall is unresolved as a causal coding result, and R7's hidden
+Codex failure and Ash's budget-limited runs remain distinct findings. New
+real-repository coding tests should be chosen for a previously unmeasured
+user workflow or explicitly causal hypothesis, not score accumulation. Focus
+on real owner coding usage, Crew's remaining accepted production v1 gates
+when authorized, tool-level correctness, and recovery safety; commit
+implementation only for independently demonstrated gaps.
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate
