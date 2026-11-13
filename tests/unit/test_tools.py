@@ -26,6 +26,7 @@ from ash.tools.filesystem import (
     BINARY_FILE_ERROR,
     DEFAULT_MAX_READ_CHARS,
     EXISTS_ERROR,
+    MAX_PYTHON_SYNTAX_CHECK_BYTES,
     ReadFileTool,
     ReadFilesTool,
     ReplaceFileContentTool,
@@ -34,6 +35,186 @@ from ash.tools.filesystem import (
     WriteFileTool,
 )
 from ash.tools.base import count_output_tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edit_tool", ["write", "replace", "batch", "whole"])
+async def test_python_edits_report_nonexecuting_syntax_diagnostic(
+    tmp_path: Path, edit_tool: str,
+) -> None:
+    source = tmp_path / "module.py"
+    source.write_text("def answer():\n    return 1\n", encoding="utf-8")
+    guard = SafetyGuard(tmp_path)
+    bad_line = "    return ("
+    if edit_tool == "write":
+        result = await WriteFileTool(guard).run(
+            file_path="module.py", content=f"def answer():\n{bad_line}\n",
+            overwrite=True,
+        )
+    elif edit_tool == "replace":
+        result = await ReplaceFileContentTool(guard).run(
+            file_path="module.py", target_content="    return 1",
+            replacement_content=bad_line,
+        )
+    elif edit_tool == "batch":
+        result = await ReplaceFileEditsTool(guard).run(
+            file_path="module.py",
+            edits=[{
+                "start_line": 2, "end_line": 2,
+                "target_content": "    return 1",
+                "replacement_content": bad_line,
+            }],
+        )
+    else:
+        result = await WholeEditTool(guard).run(
+            file_path="module.py", content=f"def answer():\n{bad_line}\n",
+        )
+
+    assert result.success is True
+    assert source.read_text(encoding="utf-8") == f"def answer():\n{bad_line}\n"
+    assert result.diagnostic_summary == {"python_syntax_errors": 1}
+    assert len(result.diagnostics) == 1
+    diagnostic = result.diagnostics[0]
+    assert diagnostic["path"] == "module.py"
+    assert diagnostic["line"] == 2
+    assert diagnostic["column"] > 0
+    assert diagnostic["severity"] == "error"
+    assert diagnostic["code"] == "SyntaxError"
+    assert "syntax" in result.output.lower()
+    assert "saved" in result.output.lower()
+
+
+@pytest.mark.asyncio
+async def test_valid_and_nonpython_edits_do_not_add_syntax_feedback(tmp_path: Path) -> None:
+    guard = SafetyGuard(tmp_path)
+    valid = await WriteFileTool(guard).run(
+        file_path="valid.py", content="value = 1\n",
+    )
+    nonpython = await WriteFileTool(guard).run(
+        file_path="data.txt", content="def broken(:\n",
+    )
+    assert valid.success and not valid.diagnostics and not valid.diagnostic_summary
+    assert nonpython.success and not nonpython.diagnostics
+    assert "syntax check" not in valid.output.lower()
+    assert "syntax check" not in nonpython.output.lower()
+
+
+@pytest.mark.asyncio
+async def test_python_advisory_catches_invalid_scope_without_executing_code(
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    guard = SafetyGuard(tmp_path)
+    result = await WriteFileTool(guard).run(
+        file_path="scope.py",
+        content="import sys\nsys.exit(37)\nreturn 1\n",
+    )
+    assert result.success
+    assert result.diagnostic_summary == {"python_syntax_errors": 1}
+    assert result.diagnostics[0]["line"] == 3
+    assert "sys.exit" not in result.output
+    assert sys.version_info.major == 3  # Running compile never executes sys.exit.
+
+
+@pytest.mark.asyncio
+async def test_python_syntax_advisory_bounds_input_and_does_not_echo_source(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    secret = "synthetic-private-marker-not-for-tool-result"
+    bad = await WriteFileTool(guard).run(
+        file_path="private.py", content=f"data = {secret!r}\ndef broken(:\n",
+    )
+    assert bad.success and bad.diagnostic_summary == {"python_syntax_errors": 1}
+    assert secret not in bad.output
+    assert secret not in repr(bad.diagnostics)
+    large = await WriteFileTool(guard).run(
+        file_path="large.py",
+        content=("#" + "x" * MAX_PYTHON_SYNTAX_CHECK_BYTES + "\n" + "def broken(:\n"),
+    )
+    assert large.success and large.diagnostics == []
+    assert large.diagnostic_summary == {}
+
+
+@pytest.mark.asyncio
+async def test_coding_loop_can_correct_edit_using_immediate_syntax_feedback(
+    tmp_path: Path,
+) -> None:
+    """The diagnostic is present in the next provider request, not only ToolResult."""
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.providers.base import ProviderABC, StreamChunk
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.ui.headless import HeadlessUI
+    import io
+
+    (tmp_path / "module.py").write_text(
+        "def answer():\n    return 1\n", encoding="utf-8"
+    )
+
+    class CorrectOnSyntaxFeedback(ProviderABC):
+        model_name = "synthetic-feedback"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.saw_diagnostic = False
+
+        def count_tokens(self, text):
+            return max(1, len(text) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls == 2:
+                self.saw_diagnostic = (
+                    "python_syntax_errors" in repr(messages)
+                    and "SyntaxError" in repr(messages)
+                )
+                assert self.saw_diagnostic
+            if self.calls <= 2:
+                yield StreamChunk(
+                    is_done=True,
+                    native_tool_calls=[{
+                        "call_id": f"edit-{self.calls}",
+                        "name": "replace_file_content",
+                        "arguments": {
+                            "file_path": "module.py",
+                            "target_content": (
+                                "    return 1" if self.calls == 1 else "    return ("
+                            ),
+                            "replacement_content": (
+                                "    return (" if self.calls == 1 else "    return 2"
+                            ),
+                        },
+                    }],
+                )
+            else:
+                yield StreamChunk(content="Edits complete", is_done=True)
+
+    async def allow_edit(_name, _arguments):
+        return True
+
+    provider = CorrectOnSyntaxFeedback()
+    guard = SafetyGuard(tmp_path)
+    ui = HeadlessUI(output_format="stream-json", stream=io.StringIO())
+    loop = AshLoop(
+        SessionStore(tmp_path / "session.db"), provider, guard, ui,
+        tmp_path, tools={"replace_file_content": ReplaceFileContentTool(guard)},
+        on_tool_approval=allow_edit,
+    )
+    try:
+        session = await loop.start_session()
+        assert await loop.run_turn("Edit and correct the Python function") == "Edits complete"
+        assert provider.calls == 3 and provider.saw_diagnostic
+        assert (tmp_path / "module.py").read_text() == (
+            "def answer():\n    return 2\n"
+        )
+        assert [call.success for call in loop.session_store.load_session(
+            session.session_id
+        ).tool_calls] == [True, True]
+    finally:
+        await loop.aclose()
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import difflib
 import hashlib
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ash.core.redaction import redact_text
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import (
     ScopedFileChanged,
@@ -41,6 +43,9 @@ MAX_BATCH_READ_ENTRY_CHARS = 8_192
 MAX_BATCH_READ_RENDER_CHARS = 24_576
 MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024
 MAX_TEXT_ARGUMENT_CHARS = 8 * 1024 * 1024
+# Compiling the changed source without execution is useful for Python modules,
+# but should never add unbounded CPU/memory work to an approved file write.
+MAX_PYTHON_SYNTAX_CHECK_BYTES = 128 * 1024
 BINARY_FILE_ERROR = (
     "Error: Binary file detected. Use specialized image/binary viewer tools instead."
 )
@@ -82,6 +87,64 @@ class BinaryContentError(ValueError):
 
 class TextEncodingError(ValueError):
     pass
+
+
+def _python_syntax_advisory(
+    result: ToolResult,
+    *,
+    resolved_path: Path,
+    root: Path,
+    new_text: str,
+) -> ToolResult:
+    """Give immediate, non-executing parser feedback after a successful edit.
+
+    The edit has already happened and remains successful; syntax checking never
+    authorizes commands, blocks intentional intermediate states, or asserts that
+    a module works at runtime. Skip large files rather than stalling the loop.
+    """
+
+    if resolved_path.suffix.casefold() not in {".py", ".pyi"}:
+        return result
+    try:
+        if len(new_text.encode("utf-8")) > MAX_PYTHON_SYNTAX_CHECK_BYTES:
+            return result
+        relative_path = resolved_path.relative_to(root).as_posix()
+    except (UnicodeEncodeError, ValueError):
+        return result
+    try:
+        # Compiling does not execute module code or write bytecode. Unlike
+        # ast.parse(), it also catches invalid scope-level statements such as
+        # a top-level return/break before the model attempts a test run.
+        compile(new_text, "<edited Python source>", "exec", dont_inherit=True)
+        return result
+    except SyntaxError as exc:
+        line = max(1, exc.lineno or 1)
+        column = max(1, exc.offset or 1)
+        message = " ".join(redact_text(exc.msg).split())[:160]
+        code = "SyntaxError"
+    except (RecursionError, ValueError):
+        line = 1
+        column = 1
+        message = "Python parser could not validate the edited source"
+        code = "SyntaxError"
+
+    result.output += (
+        "\n[File saved, but local Python "
+        f"{sys.version_info.major}.{sys.version_info.minor} syntax check found "
+        f"an error at line {line}, column {column}: {message}. "
+        "This is an advisory, not a test result; fix or verify with the "
+        "target Python version.]"
+    )
+    result.diagnostics = [{
+        "path": relative_path,
+        "line": line,
+        "column": column,
+        "code": code,
+        "message": message,
+        "severity": "error",
+    }]
+    result.diagnostic_summary = {"python_syntax_errors": 1}
+    return result
 
 
 class ReadFileArgs(BaseModel):
@@ -503,9 +566,14 @@ class WriteFileTool(BaseTool):
             )
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
-        return ToolResult(
-            success=True,
-            output=f"Wrote {len(args.content)} characters to {resolved_path}.",
+        return _python_syntax_advisory(
+            ToolResult(
+                success=True,
+                output=f"Wrote {len(args.content)} characters to {resolved_path}.",
+            ),
+            resolved_path=resolved_path,
+            root=self.safety_guard.project_root,
+            new_text=args.content,
         )
 
 
@@ -678,11 +746,16 @@ class ReplaceFileContentTool(BaseTool):
             )
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
-        return ToolResult(
-            success=True,
-            output=(
-                f"Replaced lines {start_index + 1}-{end_index} in {resolved_path}."
+        return _python_syntax_advisory(
+            ToolResult(
+                success=True,
+                output=(
+                    f"Replaced lines {start_index + 1}-{end_index} in {resolved_path}."
+                ),
             ),
+            resolved_path=resolved_path,
+            root=self.safety_guard.project_root,
+            new_text=new_text,
         )
 
 
@@ -764,10 +837,11 @@ class ReplaceFileEditsTool(BaseTool):
             new_lines[start_index:end_index] = _replacement_lines_for_span(
                 lines, start_index, end_index, edit.replacement_content
             )
+        new_text = "".join(new_lines)
         try:
             atomic_write_scoped_bytes(
                 resolved_path,
-                _encode_text_bytes("".join(new_lines), encoding),
+                _encode_text_bytes(new_text, encoding),
                 self.safety_guard,
                 overwrite=True,
                 expected_sha256=actual_sha256,
@@ -780,9 +854,14 @@ class ReplaceFileEditsTool(BaseTool):
             )
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
-        return ToolResult(
-            success=True,
-            output=f"Applied {len(args.edits)} edits to {resolved_path}.",
+        return _python_syntax_advisory(
+            ToolResult(
+                success=True,
+                output=f"Applied {len(args.edits)} edits to {resolved_path}.",
+            ),
+            resolved_path=resolved_path,
+            root=self.safety_guard.project_root,
+            new_text=new_text,
         )
 
 
@@ -827,9 +906,14 @@ class WholeEditTool(BaseTool):
             )
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
-        return ToolResult(
-            success=True,
-            output=f"Whole-edit applied to {resolved_path} ({len(args.content)} chars).",
+        return _python_syntax_advisory(
+            ToolResult(
+                success=True,
+                output=f"Whole-edit applied to {resolved_path} ({len(args.content)} chars).",
+            ),
+            resolved_path=resolved_path,
+            root=self.safety_guard.project_root,
+            new_text=args.content,
         )
 
 
