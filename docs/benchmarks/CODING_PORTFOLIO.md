@@ -20,7 +20,7 @@ lanes must remain separate. Do not pool their scores into a single win rate.
 | R5 | `click-resource-exception` | Pinned real repo | CLI resource lifecycle, exception propagation and suppression | **Initial pair: Ash fail / Codex pass**; Ash stopped at safe context limit after an incomplete edit |
 | R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Initial pair: Ash timeout / Codex pass**; no Ash source edit or verification |
 | R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Initial pair: both fail**; Ash 32K protected-context overflow after one edit, Codex visible pass but hidden fail; Ash 64K ablation reaches 120K total-turn cap. Park fixture-specific remediation. |
-| R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | Independently red/green proven; production-default Ash evaluation pending |
+| R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Ash pass (single trial)** at normal 128K context and uncapped turn total: both source edits, visible and hidden oracle passes, terminal completion, scope and audit valid |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -137,6 +137,23 @@ normal **128,000** configured request context and **zero cumulative turn cap**
 under a separate bounded external time limit. This is evaluation tooling,
 not a change to Ash production context policy.
 
+**R8 first production-budget outcome:** A single GPT-6 Luna xhigh Ash trial
+used 128,000 requested context tokens, **no cumulative turn-token cap**,
+and a separate 170s external deadline. The end-to-end evaluator (including
+checkout preflight and hidden grading) took **69.54s**, of which the real
+Ash CLI took **64.22s**. Both required source files changed, the exact
+`python3 -B qa_visible.py` test command executed successfully, and
+independent visible and hidden oracles passed on the repaired code.
+The CLI completed (`exit_code=0`), scoped files and audit were intact, and
+isolated scratch and access-only credentials were removed. Seven completed
+model requests used 39,728 prompt and 2,091 completion tokens. One invalid
+`search_text(context_lines=5)` request was rejected by the existing maximum
+of three lines, and the model recovered; the invalid operation was not
+dispatched. This is a **single Ash-only result**, without a fresh Codex
+comparator or a repeatability estimate. It does not show that a larger
+context would fix R7. No Ash production code changed for this pass. Private
+receipt: `/var/tmp/ash-portfolio-r8-packaging-20261113-r01/ash/result.json`.
+
 ## Evaluation and prioritization contract
 
 1. **Freeze the task** before a run: objective, task inputs, source revision,
@@ -188,8 +205,10 @@ Prioritize product-correctness, recovery safety, and resource economy over
 another case-specific attempt to get a green benchmark. Repetitions require
 a predeclared variance or causal question, not a desired score.
 
-R8 is the next distinct pinned task for a production-budget Ash trial,
-without reopening R7 or changing its grade.
+R8's distinct production-budget trial has completed successfully. Do not
+rerun it merely to improve its score. Prioritize real owner coding work and
+new reliability findings from actual user workflows, not more case-specific
+benchmark tuning.
 
 **Don't conflate:** passing filesystem/provider regression tests proves those
 subsystem contracts; it does not prove that Ash's overall coding success rate
