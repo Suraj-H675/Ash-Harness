@@ -12,7 +12,11 @@ from pydantic import BaseModel, Field
 
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.safety.guard import SafetyGuard, SafetyViolation
-from ash.safety.scoped_io import ScopedIOError, workspace_mutation_lock
+from ash.safety.scoped_io import (
+    ScopedIOError,
+    read_scoped_bytes,
+    workspace_mutation_lock,
+)
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
     ProcessTreeUnavailable,
@@ -24,6 +28,13 @@ from ash.sandbox.process_utils import (
     terminate_process_tree_after_timeout,
 )
 from ash.tools.base import BaseTool, ToolExecutionOutcome, ToolResult
+from ash.tools.filesystem import (
+    MAX_PYTHON_SYNTAX_CHECK_BYTES,
+    BinaryContentError,
+    TextEncodingError,
+    _decode_text_bytes,
+    _python_syntax_advisory,
+)
 
 
 class ApplyPatchArgs(BaseModel):
@@ -43,6 +54,7 @@ class ApplyPatchArgs(BaseModel):
 MAX_PATCH_BYTES = 8 * 1024 * 1024
 MAX_PATCH_OUTPUT_BYTES = 100_000
 PATCH_OUTPUT_LIMIT_EXIT = -2
+MAX_PATCH_PYTHON_SYNTAX_FILES = 12
 
 
 class ApplyPatchTool(BaseTool):
@@ -146,10 +158,60 @@ class ApplyPatchTool(BaseTool):
                 output=applied[1],
                 error=f"Patch apply failed: {applied[2].strip()}",
             )
-        return ToolResult(
+        result = ToolResult(
             success=True,
             output="Applied patch to: " + ", ".join(sorted(paths)),
         )
+        return _post_patch_python_syntax_advisories(
+            result, paths=paths, guard=self.safety_guard
+        )
+
+
+def _post_patch_python_syntax_advisories(
+    result: ToolResult, *, paths: set[str], guard: SafetyGuard
+) -> ToolResult:
+    """Report bounded, non-executing syntax feedback for bulk Python edits.
+
+    The patch already succeeded. The check is advisory and must not turn a
+    known successful edit into a failed or ambiguously executed operation.
+    Post-patch reads use the same no-follow scoped IO as normal file tools.
+    """
+
+    python_paths = sorted(
+        path for path in paths if Path(path).suffix.casefold() in {".py", ".pyi"}
+    )
+    for relative in python_paths[:MAX_PATCH_PYTHON_SYNTAX_FILES]:
+        path = guard.project_root / relative
+        try:
+            _, content = read_scoped_bytes(
+                path, guard, max_bytes=MAX_PYTHON_SYNTAX_CHECK_BYTES
+            )
+            source, _ = _decode_text_bytes(content)
+        except (OSError, SafetyViolation, BinaryContentError, TextEncodingError):
+            # Deletions, oversized/non-text files and races are not syntax
+            # failures. The separate patch outcome remains authoritative.
+            continue
+        feedback = _python_syntax_advisory(
+            ToolResult(success=True, output=""),
+            resolved_path=path,
+            root=guard.project_root,
+            new_text=source,
+        )
+        if feedback.diagnostics:
+            result.diagnostics.extend(feedback.diagnostics)
+            result.output += f"\n{relative}: {feedback.output.strip()}"
+    if result.diagnostics:
+        result.diagnostic_summary = {
+            "python_syntax_errors": len(result.diagnostics)
+        }
+    omitted = len(python_paths) - MAX_PATCH_PYTHON_SYNTAX_FILES
+    if omitted > 0:
+        result.output += (
+            f"\n[Syntax advisory limited to {MAX_PATCH_PYTHON_SYNTAX_FILES} "
+            f"Python paths; {omitted} further path(s) not checked.]"
+        )
+        result.truncated = True
+    return result
 
 
 def _patch_timeout_result(

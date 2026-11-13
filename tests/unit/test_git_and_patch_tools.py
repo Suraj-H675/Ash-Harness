@@ -96,6 +96,189 @@ async def test_git_inspection_and_patch(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_multi_file_apply_patch_reports_python_syntax_without_undoing_edit(
+    tmp_path: Path,
+) -> None:
+    """Bulk edits deserve the same advisory feedback as direct file edits."""
+    await _init_repo(tmp_path)
+    valid = tmp_path / "valid.py"
+    invalid = tmp_path / "invalid.py"
+    valid.write_text("def answer():\n    return 1\n", encoding="utf-8")
+    invalid.write_text("def other():\n    return 1\n", encoding="utf-8")
+    patch = """diff --git a/valid.py b/valid.py
+--- a/valid.py
++++ b/valid.py
+@@ -1,2 +1,2 @@
+ def answer():
+-    return 1
++    return 2
+diff --git a/invalid.py b/invalid.py
+--- a/invalid.py
++++ b/invalid.py
+@@ -1,2 +1,2 @@
+ def other():
+-    return 1
++    return (
+"""
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(patch=patch)
+    assert result.success is True
+    assert valid.read_text(encoding="utf-8") == "def answer():\n    return 2\n"
+    assert invalid.read_text(encoding="utf-8") == "def other():\n    return (\n"
+    assert result.diagnostic_summary == {"python_syntax_errors": 1}
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0]["path"] == "invalid.py"
+    assert result.diagnostics[0]["line"] == 2
+    assert result.diagnostics[0]["code"] == "SyntaxError"
+    assert "syntax check" in result.output.lower()
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_syntax_feedback_is_not_emitted_on_dry_run(
+    tmp_path: Path,
+) -> None:
+    await _init_repo(tmp_path)
+    target = tmp_path / "script.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    patch = """--- a/script.py
++++ b/script.py
+@@ -1 +1 @@
+-value = 1
++def invalid(:
+"""
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
+        patch=patch, dry_run=True
+    )
+    assert result.success is True
+    assert not result.diagnostics
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_multi_file_patch_syntax_advisories_bound_number_of_python_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.patch as patch_module
+
+    await _init_repo(tmp_path)
+    monkeypatch.setattr(patch_module, "MAX_PATCH_PYTHON_SYNTAX_FILES", 1)
+    patch = ""
+    for name in ("first.py", "second.py"):
+        (tmp_path / name).write_text("value = 1\n", encoding="utf-8")
+        patch += (
+            f"--- a/{name}\n+++ b/{name}\n"
+            "@@ -1 +1 @@\n-value = 1\n+def invalid(:\n"
+        )
+
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(patch=patch)
+
+    assert result.success
+    assert result.diagnostic_summary == {"python_syntax_errors": 1}
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0]["path"] == "first.py"
+    assert result.truncated
+    assert "1 further path(s) not checked" in result.output
+    for name in ("first.py", "second.py"):
+        assert (tmp_path / name).read_text(encoding="utf-8") == "def invalid(:\n"
+
+
+@pytest.mark.asyncio
+async def test_coding_loop_repairs_syntax_after_multi_file_patch(
+    tmp_path: Path,
+) -> None:
+    import io
+
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.providers.base import ProviderABC, StreamChunk
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.tools.filesystem import ReplaceFileContentTool
+    from ash.ui.headless import HeadlessUI
+
+    await _init_repo(tmp_path)
+    (tmp_path / "first.py").write_text("value = 1\n", encoding="utf-8")
+    (tmp_path / "second.py").write_text("value = 1\n", encoding="utf-8")
+    patch = """--- a/first.py
++++ b/first.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+--- a/second.py
++++ b/second.py
+@@ -1 +1 @@
+-value = 1
++def broken(:
+"""
+
+    class RepairFromPatchFeedback(ProviderABC):
+        model_name = "patch-feedback"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text):
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                tool_call = {
+                    "call_id": "patch-two-files",
+                    "name": "apply_patch", "arguments": {"patch": patch},
+                }
+            elif self.calls == 2:
+                assert "python_syntax_errors" in repr(messages)
+                assert "second.py" in repr(messages)
+                assert "SyntaxError" in repr(messages)
+                tool_call = {
+                    "call_id": "repair-second-file",
+                    "name": "replace_file_content",
+                    "arguments": {
+                        "file_path": "second.py",
+                        "target_content": "def broken(:",
+                        "replacement_content": "value = 3",
+                    },
+                }
+            else:
+                yield StreamChunk(content="Both modules corrected", is_done=True)
+                return
+            yield StreamChunk(is_done=True, native_tool_calls=[tool_call])
+
+    async def approve(_name: str, _arguments: dict[str, object]) -> bool:
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "coding-loop.db")
+    provider = RepairFromPatchFeedback()
+    loop = AshLoop(
+        store, provider, guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path,
+        tools={
+            "apply_patch": ApplyPatchTool(guard),
+            "replace_file_content": ReplaceFileContentTool(guard),
+        },
+        on_tool_approval=approve,
+    )
+    try:
+        session = await loop.start_session()
+        assert await loop.run_turn("Update both modules and correct errors") == (
+            "Both modules corrected"
+        )
+        calls = store.load_session(session.session_id).tool_calls
+        assert [call.tool_name for call in calls] == [
+            "apply_patch", "replace_file_content"
+        ]
+        assert all(call.success is True for call in calls)
+        assert provider.calls == 3
+        assert (tmp_path / "first.py").read_text(encoding="utf-8") == "value = 2\n"
+        assert (tmp_path / "second.py").read_text(encoding="utf-8") == "value = 3\n"
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_apply_patch_explains_unsupported_codex_format(tmp_path: Path) -> None:
     target = tmp_path / "hello.txt"
     target.write_text("old\n")
