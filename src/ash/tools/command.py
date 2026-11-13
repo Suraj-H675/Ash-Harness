@@ -64,6 +64,8 @@ MAX_COMMAND_DRAIN_BYTES = 2_000_000
 OUTPUT_CAPTURE_LIMIT_NOTICE = "Process output capture limit reached."
 MAX_DIAGNOSTIC_ITEMS = 50
 MAX_SUMMARY_ITEMS = 8
+MAX_SUMMARY_SCAN_LINES = 2_000
+MAX_SUMMARY_HEAD_LINES = 64
 _RUFF_CODE = r"[A-Z]{1,4}\d{3,4}"
 _RUFF_HEADING = re.compile(rf"^(?P<code>{_RUFF_CODE})(?:\s+\[\*\])?\s+(?P<message>.+)$")
 _RUST_HEADING = re.compile(
@@ -359,7 +361,10 @@ def extract_diagnostics(output: str, error: str) -> list[dict[str, Any]]:
 
     diagnostics: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for source, severity in ((error, "error"), (output, "warning")):
+    sources = ((error, "error"), (output, "warning"))
+    # Structured terminal traceback evidence must not disappear simply
+    # because stderr contains fifty earlier generic compiler warnings.
+    for source, _ in sources:
         for structured in (
             *_pytest_failure_locations(source),
             *_python_traceback_locations(source),
@@ -371,6 +376,7 @@ def extract_diagnostics(output: str, error: str) -> list[dict[str, Any]]:
             diagnostics.append(structured)
             if len(diagnostics) >= MAX_DIAGNOSTIC_ITEMS:
                 return diagnostics
+    for source, severity in sources:
         previous_line = ""
         for line in source.splitlines():
             diagnostic = _diagnostic_from_line(line, severity=severity)
@@ -389,12 +395,28 @@ def extract_diagnostics(output: str, error: str) -> list[dict[str, Any]]:
     return diagnostics
 
 
+def _bounded_summary_lines(stream: str) -> list[str]:
+    """Preserve terminal summaries from verbose stdout and stderr separately.
+
+    Output has already been captured and redacted under command-tool limits.
+    Retain a small header window for formatter identification (e.g. Ruff)
+    and the final result window; never scan only the first N log lines.
+    """
+
+    lines = stream.splitlines()
+    if len(lines) <= MAX_SUMMARY_SCAN_LINES:
+        return lines
+    tail_lines = MAX_SUMMARY_SCAN_LINES - MAX_SUMMARY_HEAD_LINES
+    return lines[:MAX_SUMMARY_HEAD_LINES] + lines[-tail_lines:]
+
+
 def extract_diagnostic_summary(output: str, error: str) -> dict[str, int]:
     """Aggregate common framework result counts from concise summary lines."""
 
-    combined = "\n".join((error, output))
     counts: dict[str, int] = {}
-    lines = combined.splitlines()[:2000]
+    # Both streams may contain thousands of lines. A large stderr prelude
+    # cannot hide a final pytest result on stdout, or vice versa.
+    lines = _bounded_summary_lines(error) + _bounded_summary_lines(output)
     has_ruff_codes = any(
         _RUFF_HEADING.fullmatch(line.strip())
         or re.match(rf"^[^:\n]+:\d+:\d+:\s+{_RUFF_CODE}\s+", line)

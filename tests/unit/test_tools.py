@@ -1127,6 +1127,128 @@ def test_ruff_summary_does_not_invent_pytest_or_mypy_failures() -> None:
     }
 
 
+def test_framework_summary_survives_thousands_of_noisy_lines() -> None:
+    """Actionable final test results must not be lost after the first 2K lines."""
+
+    output = (
+        "initial warning\n" * 2400
+        + "FAILED tests/test_invoice.py::test_discount - AssertionError\n"
+        + "======== 1 failed, 3 passed in 0.43s ========\n"
+        + "Found 2 errors in 2 files (checked 17 source files)\n"
+    )
+    assert extract_diagnostic_summary(output, "") == {
+        "pytest_failed": 1,
+        "pytest_passed": 3,
+        "mypy_error_count": 2,
+    }
+
+
+def test_framework_summary_survives_noisy_stderr_with_stdout_test_result() -> None:
+    stderr = "warning: unrelated tool output\n" * 2400
+    stdout = "======== 2 failed, 5 passed in 0.38s ========\n"
+    assert extract_diagnostic_summary(stdout, stderr) == {
+        "pytest_failed": 2,
+        "pytest_passed": 5,
+    }
+
+
+def test_ruff_summary_retains_header_evidence_and_terminal_count_after_noise() -> None:
+    output = (
+        "F401 [*] `os` imported but unused\n"
+        " --> src/example.py:1:8\n"
+        + "other non-diagnostic output\n" * 2400
+        + "Found 3 errors.\n"
+        + "1 fixable with the --fix option.\n"
+    )
+    assert extract_diagnostic_summary(output, "") == {
+        "ruff_error_count": 3,
+        "ruff_fixable": 1,
+    }
+
+
+def test_python_test_failure_sites_take_priority_over_unrelated_stderr_errors() -> None:
+    stderr = "".join(
+        f"src/vendor/noise_{i}.py:{i + 1}: error: unrelated previous output\n"
+        for i in range(60)
+    )
+    stdout = (
+        "================== FAILURES ==================\n"
+        "tests/test_invoice.py:8: in test_discount\n"
+        "E   assert 20 == 19\n"
+        "================= short test summary info =================\n"
+        "FAILED tests/test_invoice.py::test_discount - AssertionError\n"
+        "1 failed in 0.04s\n"
+    )
+    diagnostics = extract_diagnostics(stdout, stderr)
+    assert len(diagnostics) <= 50
+    assert any(
+        item["path"] == "tests/test_invoice.py"
+        and item["line"] == 8
+        and "assert 20 == 19" in item["message"]
+        for item in diagnostics
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_verbose_pytest_failure_keeps_structured_summary_and_location(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "test_checkout.py").write_text(
+        "def test_total():\n    assert 10 == 9\n", encoding="utf-8"
+    )
+    (tmp_path / "noisy_runner.py").write_text(
+        "import subprocess, sys\n"
+        "sys.stderr.write('previous warning\\n' * 2400)\n"
+        "result = subprocess.run([sys.executable, '-m', 'pytest', '-q', "
+        "'--no-header', '--tb=short', 'test_checkout.py'], "
+        "capture_output=True, text=True, check=False)\n"
+        "sys.stdout.write(result.stdout)\n"
+        "sys.stderr.write(result.stderr)\n"
+        "sys.exit(result.returncode)\n",
+        encoding="utf-8",
+    )
+    result = await RunCommandTool(SafetyGuard(tmp_path)).run(
+        command_line=f"{shlex.quote(sys.executable)} -B noisy_runner.py",
+        timeout_seconds=20,
+    )
+    assert not result.success and result.exit_code == 1
+    assert result.diagnostic_summary["pytest_failed"] == 1
+    assert any(
+        item["path"] == "test_checkout.py"
+        and item["line"] == 2
+        and "assert 10 == 9" in item["message"]
+        for item in result.diagnostics
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pty", [False, True])
+async def test_command_tail_preserves_pytest_counts_after_many_short_lines(
+    guard: SafetyGuard, pty: bool,
+) -> None:
+    """A 12K-character tail can hold >2K lines; inspect its actual end."""
+
+    script = (
+        "import sys;"
+        "sys.stdout.write('x\\n'*60000);sys.stdout.flush();"
+        "sys.stdout.write('FAILED tests/test_module.py::test_case - AssertionError\\n'"
+        "+'1 failed, 2 passed in 0.12s\\n');sys.stdout.flush();"
+        "sys.exit(1)"
+    )
+    result = await RunCommandTool(guard).run(
+        command_line=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+        timeout_seconds=20,
+        pty=pty,
+    )
+    assert not result.success and result.exit_code == 1
+    assert result.truncated
+    assert "1 failed, 2 passed in 0.12s" in result.output
+    assert result.diagnostic_summary == {
+        "pytest_failed": 1,
+        "pytest_passed": 2,
+    }
+
+
 @pytest.mark.parametrize(
     ("stream", "truncated"),
     [("stderr", True), ("stderr", False), ("stdout", False)],

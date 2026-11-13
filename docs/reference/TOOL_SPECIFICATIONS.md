@@ -279,6 +279,14 @@ Output remains untrusted evidence, not an instruction or permission grant.
 These hints are derived from the already-redacted command streams, retain
 the existing **50-diagnostic maximum**, and never open source files, import
 modules, run extra tests, or replace exit-code/unknown-outcome semantics.
+Long, noisy test/build commands also retain terminal framework counts: Ash
+examines a bounded header and the last result lines of **each** stdout/stderr
+stream, rather than only the first 2,000 combined lines. Pytest and Python
+traceback locations take priority over generic compiler messages so an
+unrelated stream cannot exhaust all 50 diagnostic slots before an actionable
+failure. The terminal output and process status remain authoritative; these
+summaries are best-effort evidence and do not prove semantic correctness or
+convert a failed/ambiguous command into success.
 Matching is intentionally limited to recognizable Python/pytest formats;
 unrecognized test frameworks still provide their original bounded output.
 

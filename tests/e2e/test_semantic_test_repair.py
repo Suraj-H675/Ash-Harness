@@ -21,8 +21,9 @@ from ash.ui.headless import HeadlessUI
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("omit_initial_indentation", [False, True])
+@pytest.mark.parametrize("noisy_command_output", [False, True])
 async def test_real_pytest_failures_guide_two_module_repair_and_recheck(
-    tmp_path: Path, omit_initial_indentation: bool,
+    tmp_path: Path, omit_initial_indentation: bool, noisy_command_output: bool,
 ) -> None:
     """Exercise native model->command->structured errors->edits->recheck."""
 
@@ -47,6 +48,22 @@ async def test_real_pytest_failures_guide_two_module_repair_and_recheck(
         f"{shlex.quote(sys.executable)} -m pytest -q --no-header "
         "--tb=short test_checkout.py"
     )
+    if noisy_command_output:
+        # A real subprocess produces the pytest evidence after thousands of
+        # unrelated stderr lines. This must survive model-visible extraction.
+        (tmp_path / "noisy_runner.py").write_text(
+            "import subprocess, sys\n"
+            "sys.stderr.write('unrelated warning\\n' * 2400)\n"
+            "sys.stderr.write('token=supersecretvalue\\n')\n"
+            "result = subprocess.run([sys.executable, '-m', 'pytest', '-q', "
+            "'--no-header', '--tb=short', 'test_checkout.py'], "
+            "capture_output=True, text=True, check=False)\n"
+            "sys.stdout.write(result.stdout)\n"
+            "sys.stderr.write(result.stderr)\n"
+            "sys.exit(result.returncode)\n",
+            encoding="utf-8",
+        )
+        command = f"{shlex.quote(sys.executable)} -B noisy_runner.py"
 
     class TestRepairProvider(ProviderABC):
         model_name = "semantic-repair-scripted"
@@ -75,6 +92,9 @@ async def test_real_pytest_failures_guide_two_module_repair_and_recheck(
                     assert '"line": 8' in history
                     assert '"path": "test_checkout.py"' in history
                     assert '"code": "AssertionError"' in history
+                    if noisy_command_output:
+                        assert "supersecretvalue" not in history
+                        assert "[REDACTED]" in history
                 else:
                     assert "Possible leading indentation mismatch at line 2" in history
                     assert "no edit was made" in history
