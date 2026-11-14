@@ -97,6 +97,7 @@ whole-file SHA-256 digest and detected text encoding. The read is non-mutating.
     3.  If `expected_sha256` is provided, reject a changed file rather than returning a mismatched continuation page.
     4.  Return at most 800 numbered lines **and** at most `max_chars` source characters per call. `max_chars` does not include metadata or line-number labels and is a character, not an exact provider-token, limit.
     5.  On truncation, return an explicit next-page cursor. For a long line, use both `start_line=next_start_line` and `start_column=next_start_column`. Supply the first page's `sha256` as `expected_sha256` when reading further pages of the same snapshot.
+    6.  A starting line beyond the current file length is an explicit failed read with the actual line count, not an apparently successful empty source range. An empty file remains readable from line 1, column 1; an invalid continuation column is rejected. If edits shifted locations, search or re-read rather than guessing stale line numbers.
 *   **Response Format (Success)**:
     ```
     [read_file metadata: path=/workspace/example.py; sha256=...; encoding=utf-8; total_file_lines=3]

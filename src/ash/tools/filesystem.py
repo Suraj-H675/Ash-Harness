@@ -382,6 +382,22 @@ class ReadFileTool(BaseTool):
             return ToolResult(
                 success=False, output="", error="Error: end_line must be >= start_line."
             )
+        if args.start_line > max(1, len(lines)):
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Error: start_line {args.start_line} is beyond the file's "
+                    f"{len(lines)} lines. Search for the current location or "
+                    "read from the beginning; no source lines were returned."
+                ),
+            )
+        if not lines and args.start_column != 1:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Error: start_column must be 1 for an empty file.",
+            )
 
         start_index = args.start_line - 1
         end_index = args.end_line if args.end_line is not None else len(lines)

@@ -502,6 +502,56 @@ async def test_read_file_returns_numbered_line_slice(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("start_line", [4, 100])
+async def test_read_file_rejects_stale_start_line_after_end_of_file(
+    project_root: Path, guard: SafetyGuard, start_line: int,
+) -> None:
+    (project_root / "short.py").write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+    result = await ReadFileTool(guard).run(
+        file_path="short.py", start_line=start_line,
+    )
+
+    assert not result.success
+    assert not result.output
+    assert f"start_line {start_line}" in (result.error or "")
+    assert "3 lines" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_read_file_empty_source_stays_readable_but_invalid_column_refused(
+    project_root: Path, guard: SafetyGuard,
+) -> None:
+    (project_root / "empty.py").write_bytes(b"")
+    tool = ReadFileTool(guard)
+
+    empty = await tool.run(file_path="empty.py")
+    bad_line = await tool.run(file_path="empty.py", start_line=2)
+    bad_column = await tool.run(file_path="empty.py", start_column=2)
+
+    assert empty.success and "total_file_lines=0" in empty.output
+    assert not bad_line.success and "start_line 2" in (bad_line.error or "")
+    assert not bad_column.success and "start_column" in (bad_column.error or "")
+
+
+@pytest.mark.asyncio
+async def test_batch_read_reports_stale_range_without_hiding_other_source(
+    project_root: Path, guard: SafetyGuard,
+) -> None:
+    (project_root / "old.py").write_text("one\n")
+    (project_root / "current.py").write_text("current\n")
+    result = await ReadFilesTool(guard).run(files=[
+        {"file_path": "old.py", "start_line": 9},
+        {"file_path": "current.py"},
+    ])
+
+    assert not result.success and "1 of 2 reads failed" in (result.error or "")
+    assert "start_line 9" in result.output
+    assert "[2/2] current.py" in result.output
+    assert "1: current" in result.output
+
+
+@pytest.mark.asyncio
 async def test_default_read_budget_is_small_but_full_file_access_remains_explicit(
     project_root: Path, guard: SafetyGuard,
 ) -> None:
