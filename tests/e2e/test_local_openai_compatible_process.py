@@ -495,13 +495,19 @@ def test_local_openai_compatible_route_runs_through_fresh_cli_process(
         ("vllm", "VLLM_API_BASE", False),
     ],
 )
+@pytest.mark.parametrize(
+    ("multifile_required_check", "final_check"),
+    [(False, True), (True, True), (True, False)],
+)
 def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
     tmp_path: Path,
     provider: str,
     base_env: str,
     native_tools: bool,
+    multifile_required_check: bool,
+    final_check: bool,
 ) -> None:
-    """Exercise failing test feedback, repair, and verification through a real CLI."""
+    """Exercise repair and required-check evidence through real provider CLIs."""
     requests: list[dict[str, object]] = []
     actions: list[tuple[str, dict[str, object]]] = [
         (
@@ -529,6 +535,44 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
             },
         ),
     ]
+    if multifile_required_check:
+        actions = [
+            (
+                "replace_file_content",
+                {
+                    "file_path": "module_a.py",
+                    "target_content": "    return 1",
+                    "replacement_content": "    return 40",
+                },
+            ),
+            (
+                "replace_file_content",
+                {
+                    "file_path": "module_b.py",
+                    "target_content": "    return value() + 1",
+                    "replacement_content": "    return value() + 2",
+                },
+            ),
+            (
+                "run_command",
+                {"command_line": "python3 -B qa_visible.py", "timeout_seconds": 10},
+            ),
+            (
+                "replace_file_content",
+                {
+                    "file_path": "module_a.py",
+                    "target_content": "    return 40",
+                    "replacement_content": "    return 41",
+                },
+            ),
+            (
+                "run_command",
+                {"command_line": "python3 -B qa_visible.py", "timeout_seconds": 10},
+            ),
+        ]
+        if not final_check:
+            # The source is repaired, but the owner-selected check is stale.
+            actions.pop()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -708,6 +752,14 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
             "from pathlib import Path\n"
             "assert Path('local_agent.txt').read_text() == 'LOCAL_AGENT_OK\\n'\n"
         )
+        if multifile_required_check:
+            (workspace / "module_a.py").write_text("def value():\n    return 1\n")
+            (workspace / "module_b.py").write_text(
+                "from module_a import value\n\ndef result():\n    return value() + 1\n"
+            )
+            (workspace / "qa_visible.py").write_text(
+                "from module_b import result\nassert result() == 43\n"
+            )
         (workspace / "unrelated.txt").write_text("preserve unrelated work\n")
         port = int(server.server_address[1])
         environment = os.environ.copy()
@@ -736,20 +788,27 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
         )
         assert trust.returncode == 0, trust.stderr
 
+        command = [
+            sys.executable,
+            "-m",
+            "ash",
+            "--db-directory",
+            str(tmp_path / "db"),
+            "--mode",
+            "auto_approve",
+            "-p",
+            (
+                "Repair module_a.py and module_b.py, run qa_visible.py, and verify."
+                if multifile_required_check
+                else "Create local_agent.txt, run its test, repair the failure, and verify."
+            ),
+            "--output-format",
+            "json",
+        ]
+        if multifile_required_check:
+            command += ["--require-check-command", "python3 -B qa_visible.py"]
         result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "ash",
-                "--db-directory",
-                str(tmp_path / "db"),
-                "--mode",
-                "auto_approve",
-                "-p",
-                "Create local_agent.txt, run its test, repair the failure, and verify.",
-                "--output-format",
-                "json",
-            ],
+            command,
             cwd=workspace,
             env=environment,
             text=True,
@@ -758,17 +817,38 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
             check=False,
         )
 
-        assert result.returncode == 0, result.stderr
+        assert result.returncode == (0 if final_check else 1), result.stderr
         payload = json.loads(result.stdout)
-        assert payload["response"] == "LOCAL-CODING-OK"
+        if final_check:
+            assert payload["response"] == "LOCAL-CODING-OK"
+        else:
+            assert payload["response"].startswith("LOCAL-CODING-OK")
+            assert "Required verification not established" in payload["response"]
         assert payload["model"] == f"{provider}/local-model"
-        assert (workspace / "local_agent.txt").read_text(encoding="utf-8") == (
-            "LOCAL_AGENT_OK\n"
-        )
+        if multifile_required_check:
+            assert payload["required_check_satisfied"] is final_check
+            assert (workspace / "module_a.py").read_text() == (
+                "def value():\n    return 41\n"
+            )
+            assert (workspace / "module_b.py").read_text() == (
+                "from module_a import value\n\ndef result():\n    return value() + 2\n"
+            )
+        else:
+            assert (workspace / "local_agent.txt").read_text(encoding="utf-8") == (
+                "LOCAL_AGENT_OK\n"
+            )
         assert (workspace / "unrelated.txt").read_text() == "preserve unrelated work\n"
         assert (
             subprocess.run(
-                [sys.executable, "-B", "test_local_agent.py"],
+                [
+                    sys.executable,
+                    "-B",
+                    (
+                        "qa_visible.py"
+                        if multifile_required_check
+                        else "test_local_agent.py"
+                    ),
+                ],
                 cwd=workspace,
                 check=False,
                 timeout=5,
@@ -776,7 +856,9 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
             == 0
         )
         assert len(requests) == len(actions) + 1
-        messages_after_failure = json.dumps(requests[2]["messages"])
+        messages_after_failure = json.dumps(
+            requests[3 if multifile_required_check else 2]["messages"]
+        )
         assert "AssertionError" in messages_after_failure
         tool_messages = [
             message for message in requests[-1]["messages"]
@@ -791,8 +873,15 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
         calls = store.load_session(sessions[0].session_id).tool_calls
         assert [call.tool_name for call in calls] == [name for name, _ in actions]
         assert all(call.executed and call.approved for call in calls)
-        assert calls[1].error is not None and "AssertionError" in calls[1].error
-        assert calls[3].error is None
+        failed_check_index = 2 if multifile_required_check else 1
+        assert calls[failed_check_index].error is not None
+        assert "AssertionError" in calls[failed_check_index].error
+        assert calls[-1].error is None
+        if multifile_required_check:
+            actual_exit_codes = [
+                call.exit_code for call in calls if call.tool_name == "run_command"
+            ]
+            assert actual_exit_codes == ([1, 0] if final_check else [1])
         assert store.verify_audit_log(sessions[0].session_id) == []
     finally:
         server.shutdown()
