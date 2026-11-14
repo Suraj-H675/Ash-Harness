@@ -7,8 +7,8 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These sixteen fixtures already have runnable code and grading logic. They do
-not represent sixteen independent real repositories: R1–R10 are pinned
+These seventeen fixtures already have runnable code and grading logic. They do
+not represent seventeen independent real repositories: R1–R11 are pinned
 repository tasks (some share an upstream project), while S1–S6 are synthetic.
 Keep the lanes separate and do not pool their scores into a single win rate.
 
@@ -24,6 +24,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Latest sequential 65K pair: both pass**; earlier Ash-only normal-128K trial also passed. Exact independent oracle and scope checks verified; no speed/reliability ranking |
 | R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **First sequential 65K pair: both pass**; Ash 106.68s / 14 requests, Codex 78.74s / 5 shell commands; one sample, Codex policy-parity caveat |
 | R10 | `pluggy-role-module-split` | Pinned real repo | Seven-module role-based refactor; old import shims and public plugin behavior, wrappers, firstresult, historic replay and subset callers | **Park after two matched pairs**; at 170s both timed out/incomplete; at 300s Ash stopped on protected opaque-context exhaustion after 4/7 files, Codex changed all seven and passed both oracles but timed out without executing the visible test. Neither a complete coding pass |
+| R11 | `boltons-bulk-ordered-collections` | Pinned real repo | Two-module ordered-container repair: multi-list index boundaries, insertion and tail handling, and linear-time ordered-set bulk removal | **Preflight confirmed:** original visible/hidden fail, reference visible/hidden pass. One ordinary vs one opt-in context-restart Ash trial planned at the same constrained context and deadline |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -342,6 +343,38 @@ splits, not a general relaxation of file-scope protection. The focused
 repository/Codex/parallel benchmark unit suites pass **73 tests** after this
 change; Ruff and `git diff --check` pass. This harness repair is committed
 separately before any R10 model trial.
+
+**R11 independent repository and restart experiment (2026-11-14):** The
+`mahmoud/boltons` source is pinned to original
+`e66cade323f5c11cebb4bd0f099e634b245adccd` and upstream PR #440's
+pre-merge fix `a82b55af744fec5ac38b9f6b8ae24bb937b22666`
+([upstream PR](https://github.com/mahmoud/boltons/pull/440)). The exact fix
+changes two source modules: `boltons/listutils.py` and `boltons/setutils.py`.
+Independently authored standard-library-only visible and hidden checks
+exercise a multi-sublist `BarrelList`'s index bounds, out-of-range inserts,
+drained-tail pop, and an `IndexedSet`'s order, index and compaction behavior
+after large and small removal batches. Both sealed checks are **red on the
+original and green on the upstream fix** in the existing networkless,
+read-only evaluator. Neither pinned tree contains symlinks. The authorized
+visible command is `python3 -B qa_visible.py`.
+
+**Frozen study design:** Run exactly one ordinary Ash turn and one turn
+with `--context-continuations 1` at GPT-6 Luna xhigh, requested 24,576-token
+context, zero cumulative turn cap, identical task, tools, sealed oracles and
+240-second external deadline. The constrained context tests one plausible
+history-pressure situation, not Ash's normal 128K production budget.
+Report only actual elapsed time, model/tool calls, changes, safety and oracle
+results. An actual continuation benefit requires an observed opaque-context
+error, successful safe parent-to-child handoff, and completion after verifying
+the remaining work; if neither trial restarts, there is no continuation
+effect to measure. Even if the two trials differ, one sample per condition is
+not a reliable success-rate estimate or a comparison with plain Codex.
+
+**Excluded candidate:** A preliminary `python-dotenv` task for escaping
+backslashes passed its own red-original/green-reference oracles, but the
+upstream pinned checkout contained symlinks. The repository evaluator
+correctly rejected it before any model request; no checkout safety rule was
+relaxed and that non-runnable task was not added to the tracked portfolio.
 
 ## Evaluation and prioritization contract
 

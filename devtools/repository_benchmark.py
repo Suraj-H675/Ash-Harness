@@ -1120,6 +1120,125 @@ assert subset() == ["b"]
 """
 
 
+BOLTONS_BULK_VISIBLE = r"""import sys
+
+sys.path.insert(0, ".")
+from boltons.listutils import BarrelList
+from boltons.setutils import IndexedSet
+
+
+def spread_list():
+    result = BarrelList(range(30000))
+    assert result.pop(0) == 0
+    result.insert(0, 0)
+    assert len(result.lists) > 1
+    return result
+
+
+items = spread_list()
+reference = list(range(30000))
+try:
+    items[len(items)]
+except IndexError:
+    pass
+else:
+    raise AssertionError("index beyond end was accepted")
+
+items.insert(len(items), "last")
+reference.insert(len(reference), "last")
+items.insert(1_000_000, "later")
+reference.insert(1_000_000, "later")
+items.insert(-1_000_000, "first")
+reference.insert(-1_000_000, "first")
+assert list(items) == reference
+
+ordered = IndexedSet(range(5000))
+before_compactions = ordered._compactions
+ordered.difference_update(set(range(0, 5000, 2)))
+assert list(ordered) == list(range(1, 5000, 2))
+assert ordered._compactions - before_compactions <= 1
+assert ordered.index(2501) == 1250
+ordered.add(0)
+assert ordered[-1] == 0
+
+other = IndexedSet(range(5000))
+before_compactions = other._compactions
+other.intersection_update(set(range(2500, 9000)))
+assert list(other) == list(range(2500, 5000))
+assert other._compactions - before_compactions <= 1
+"""
+
+
+BOLTONS_BULK_HIDDEN = r"""import sys
+
+sys.path.insert(0, ".")
+from boltons.listutils import BarrelList
+from boltons.setutils import IndexedSet
+
+
+def split_barrel(size):
+    result = BarrelList(range(size))
+    assert result.pop(0) == 0
+    result.insert(0, 0)
+    assert len(result.lists) > 1
+    return result
+
+
+# Boundaries must behave like list for multi-sublist storage, including drains.
+barrel = split_barrel(28000)
+expected = list(range(28000))
+for offset in (0, 1, 5, 500):
+    try:
+        barrel[len(barrel) + offset]
+    except IndexError:
+        pass
+    else:
+        raise AssertionError("out-of-bounds indexed access did not fail")
+for index, item in ((len(expected), -101), (len(expected) + 999, -102), (-len(expected) - 9, -103)):
+    barrel.insert(index, item)
+    expected.insert(index, item)
+assert list(barrel) == expected
+
+tail = split_barrel(30000)
+tail_reference = list(range(30000))
+tail_length = len(tail.lists[-1])
+for _ in range(tail_length):
+    assert tail.pop(len(tail) - 1) == tail_reference.pop()
+assert tail_reference
+assert tail.pop() == tail_reference.pop()
+assert list(tail) == tail_reference
+
+# Bulk updates must preserve iteration order, uniqueness, indexes, and a
+# bounded number of full compactions, even across later mutations.
+for kind in ("difference", "intersection"):
+    values = IndexedSet(range(8000))
+    initial_compactions = values._compactions
+    if kind == "difference":
+        excluded = set(range(0, 8000, 2))
+        values.difference_update(excluded)
+        expected_values = list(range(1, 8000, 2))
+    else:
+        allowed = set(range(2000, 6500))
+        values.intersection_update(allowed)
+        expected_values = list(range(2000, 6500))
+    assert list(values) == expected_values
+    assert values._compactions - initial_compactions <= 1
+    assert len(values) == len(expected_values)
+    assert values[0] == expected_values[0] and values[-1] == expected_values[-1]
+    assert values.index(expected_values[len(expected_values) // 2]) == len(expected_values) // 2
+    values.add(-7)
+    assert values[-1] == -7
+    values.discard(-7)
+    assert list(values) == expected_values
+
+small = IndexedSet(range(25))
+small.difference_update({1, 5, 11})
+assert list(small) == [i for i in range(25) if i not in (1, 5, 11)]
+small.intersection_update({0, 3, 12, 22, 99})
+assert list(small) == [0, 3, 12, 22]
+"""
+
+
 @dataclass(frozen=True)
 class RepositoryTask:
     source: str
@@ -1135,6 +1254,36 @@ class RepositoryTask:
 
 
 TASKS = {
+    "boltons-bulk-ordered-collections": RepositoryTask(
+        source="mahmoud/boltons",
+        upstream="https://github.com/mahmoud/boltons.git",
+        base_sha="e66cade323f5c11cebb4bd0f099e634b245adccd",
+        reference_fix_sha="a82b55af744fec5ac38b9f6b8ae24bb937b22666",
+        editable=frozenset({"boltons/listutils.py", "boltons/setutils.py"}),
+        visible_script="qa_visible.py",
+        visible_source=BOLTONS_BULK_VISIBLE,
+        hidden_source=BOLTONS_BULK_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Repair the ordered-collection behavior in this pinned boltons "
+            "repository while preserving public APIs. Two modules are involved. "
+            "In boltons/listutils.py, multi-sublists BarrelList should raise "
+            "IndexError for out-of-range reads, clamp insert indexes just as "
+            "Python list does at both positive and negative extremes, and "
+            "allow ordinary pop() after its tail sublist is drained by "
+            "indexed pops. In boltons/setutils.py, IndexedSet bulk "
+            "difference_update and intersection_update must preserve "
+            "insertion order, member lookup and index consistency without "
+            "repeated O(n) compaction on thousands of scattered removals. "
+            "A single linear-time rebuild for large changes is acceptable, "
+            "with existing incremental behavior for smaller updates. "
+            "Inspect qa_visible.py and the two implementation files. Edit "
+            "ONLY boltons/listutils.py and boltons/setutils.py, and run "
+            "exactly python3 -B qa_visible.py with run_command afterward. "
+            "No other commands are authorized. Do not modify tests, "
+            "documentation, metadata or unrelated files."
+        ),
+    ),
     "packaging-exception-pickle": RepositoryTask(
         source="pypa/packaging",
         upstream="https://github.com/pypa/packaging.git",

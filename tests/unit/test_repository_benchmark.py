@@ -264,6 +264,11 @@ def test_headless_error_category_refuses_untrusted_or_large_output(
                 "src/pluggy/_impl.py",
             },
         ),
+        (
+            "boltons-bulk-ordered-collections",
+            "https://github.com/mahmoud/boltons.git",
+            {"boltons/listutils.py", "boltons/setutils.py"},
+        ),
     ],
 )
 def test_upstream_tasks_are_pinned_and_oracles_sealed(
