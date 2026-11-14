@@ -926,3 +926,20 @@ def test_repomap_symbol_queries_support_path_globs_and_case_folding(
     assert [(Path(item.file_path).name, item.language) for item in matches] == [
         ("Main.java", "java")
     ]
+
+
+def test_repomap_symbol_globs_respect_directory_boundaries(tmp_path: Path) -> None:
+    (tmp_path / "src" / "nested").mkdir(parents=True)
+    for relative in ("root.py", "src/direct.py", "src/nested/deep.py"):
+        (tmp_path / relative).write_text("def shared():\n    pass\n")
+    repo_map = RepoMap(tmp_path)
+
+    def paths(pattern: str) -> set[str]:
+        return {
+            Path(symbol.file_path).relative_to(tmp_path).as_posix()
+            for symbol in repo_map.find_definitions("shared", path_glob=pattern)
+        }
+
+    assert paths("*.py") == {"root.py"}
+    assert paths("src/*.py") == {"src/direct.py"}
+    assert paths("src/**/*.py") == {"src/direct.py", "src/nested/deep.py"}

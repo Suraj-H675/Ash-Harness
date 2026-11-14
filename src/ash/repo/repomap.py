@@ -32,6 +32,7 @@ from ash.safety.git import (
     read_only_git_untrusted_config_keys,
 )
 from ash.repo.ignore import DEFAULT_IGNORED_DIRS
+from ash.repo.path_glob import matches_relative_glob
 from ash.repo.parser import (
     MAX_SOURCE_FILE_BYTES,
     SOURCE_SUFFIXES,
@@ -787,10 +788,7 @@ class RepoMap:
         except ValueError:
             return False
         normalized = pattern.replace("\\", "/")
-        return fnmatch.fnmatchcase(relative, normalized) or (
-            normalized.startswith("**/")
-            and fnmatch.fnmatchcase(relative, normalized[3:])
-        )
+        return matches_relative_glob(relative, normalized)
 
     def _explicit_unindexed_path(self, pattern: str | None) -> Path | None:
         """Resolve one literal source path without changing the bounded map."""

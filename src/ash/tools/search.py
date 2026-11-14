@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import io
 import stat
 from collections import deque
@@ -16,6 +15,7 @@ import regex as regex_engine
 from pydantic import BaseModel, Field
 
 from ash.repo.ignore import DEFAULT_IGNORED_DIRS
+from ash.repo.path_glob import matches_relative_glob
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import (
     list_scoped_directory,
@@ -102,10 +102,7 @@ def _is_scoped_directory(path: Path, guard: SafetyGuard) -> bool:
 
 
 def _matches_workspace_glob(relative_path: str, pattern: str) -> bool:
-    return fnmatch.fnmatchcase(relative_path, pattern) or (
-        pattern.startswith("**/")
-        and fnmatch.fnmatchcase(relative_path, pattern[3:])
-    )
+    return matches_relative_glob(relative_path, pattern)
 
 
 def _skipped_generated_note(skipped: set[str]) -> str:
@@ -512,7 +509,10 @@ class SearchTextTool(BaseTool):
             relative_to_search = path.relative_to(
                 self.safety_guard.project_root if single_file else root
             ).as_posix()
-            if args.glob and not _matches_workspace_glob(relative_to_search, args.glob):
+            if args.glob and not (
+                _matches_workspace_glob(relative_to_search, args.glob)
+                or (single_file and _matches_workspace_glob(path.name, args.glob))
+            ):
                 continue
             relative = path.relative_to(self.safety_guard.project_root).as_posix()
             try:

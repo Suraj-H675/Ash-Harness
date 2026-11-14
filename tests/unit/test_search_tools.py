@@ -218,6 +218,31 @@ async def test_double_star_glob_includes_top_level_and_nested_files(tmp_path) ->
 
 
 @pytest.mark.asyncio
+async def test_workspace_globs_respect_directory_segments_and_recursive_zero_depth(
+    tmp_path,
+) -> None:
+    (tmp_path / "src" / "nested").mkdir(parents=True)
+    for relative in ("top.py", "src/direct.py", "src/nested/deep.py"):
+        target = tmp_path / relative
+        target.write_text("needle\n", encoding="utf-8")
+    guard = SafetyGuard(tmp_path)
+    glob_tool = GlobFilesTool(guard)
+    search_tool = SearchTextTool(guard)
+
+    direct = await glob_tool.run(pattern="src/*.py")
+    recursive = await glob_tool.run(pattern="src/**/*.py")
+    top = await glob_tool.run(pattern="*.py")
+    scoped = await glob_tool.run(pattern="*.py", directory_path="src")
+    searched = await search_tool.run(pattern="needle", glob="src/**/*.py")
+
+    assert direct.output == "src/direct.py"
+    assert recursive.output == "src/direct.py\nsrc/nested/deep.py"
+    assert top.output == "top.py"
+    assert scoped.output == "src/direct.py"
+    assert searched.output == ("src/direct.py:1:needle\nsrc/nested/deep.py:1:needle")
+
+
+@pytest.mark.asyncio
 async def test_glob_files_reports_depth_limit_incomplete(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -492,10 +517,18 @@ async def test_search_text_accepts_a_single_file_path(tmp_path) -> None:
     matching = await tool.run(
         pattern="needle", directory_path="src/app.py", glob="**/*.py"
     )
+    basename = await tool.run(
+        pattern="needle", directory_path="src/app.py", glob="*.py"
+    )
+    project_relative = await tool.run(
+        pattern="needle", directory_path="src/app.py", glob="src/*.py"
+    )
     excluded = await tool.run(
         pattern="needle", directory_path="src/app.py", glob="**/*.md"
     )
     assert matching.output == result.output
+    assert basename.output == result.output
+    assert project_relative.output == result.output
     assert excluded.success is True
     assert excluded.output == ""
 

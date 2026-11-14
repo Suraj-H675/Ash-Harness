@@ -203,6 +203,15 @@ the selected search directory: `pattern="app.py", directory_path="pkg"` finds
 `pkg/app.py`. Search matches retain `path:line:text` formatting. All paths
 remain subject to the same workspace guards; no denied path is rewritten.
 
+File-discovery globs match complete path segments: `*.py` selects immediate
+files only, while `**/*.py` includes files at the search root and below.
+Likewise, `src/**/*.py` includes both `src/app.py` and deeper descendants.
+`search_text(glob=...)` follows the same rules; indexed symbol queries apply
+`path_glob` relative to the project root. Matching does not override existing
+workspace scope, generated-directory exclusions, or search limits.
+When `search_text` targets one explicit file, its glob accepts either that
+file's basename or its project-relative path.
+
 `list_dir`, `glob_files`, and `search_text` return a known-completed,
 unsuccessful tool result when their root path is outside the workspace instead
 of raising an exception after dispatch. The refusal preserves the attempted
