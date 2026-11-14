@@ -96,6 +96,75 @@ async def test_git_inspection_and_patch(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("staged", [False, True])
+async def test_git_diff_discloses_untracked_source_omitted_from_review(
+    tmp_path: Path, staged: bool,
+) -> None:
+    await _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+    (tmp_path / "tracked.py").write_text("old = 1\n", encoding="utf-8")
+    await _git(tmp_path, "add", "tracked.py", ".gitignore")
+    await _git(tmp_path, "commit", "-qm", "initial")
+    (tmp_path / "new_source.py").write_text("new = 2\n", encoding="utf-8")
+    guard = SafetyGuard(tmp_path)
+
+    untracked_only = await GitDiffTool(guard).run(staged=staged)
+    scoped = await GitDiffTool(guard).run(path="new_source.py", staged=staged)
+
+    for result in (untracked_only, scoped):
+        assert result.success and not result.truncated
+        assert "untracked" in result.output.lower()
+        assert "git_status" in result.output
+        assert "workspace_diff" in result.output
+        assert "new = 2" not in result.output
+
+    tracked_only = await GitDiffTool(guard).run(path="tracked.py", staged=staged)
+    assert tracked_only.success
+    assert "untracked" not in tracked_only.output.lower()
+
+    (tmp_path / "tracked.py").write_text("old = 3\n", encoding="utf-8")
+    if staged:
+        await _git(tmp_path, "add", "tracked.py")
+    mixed = await GitDiffTool(guard).run(staged=staged)
+    assert "+old = 3" in mixed.output
+    assert "-old = 1" in mixed.output
+    assert "untracked" in mixed.output.lower()
+
+    (tmp_path / "new_source.py").unlink()
+    (tmp_path / "ignored.tmp").write_text("private build output\n", encoding="utf-8")
+    tracked_diff = await GitDiffTool(guard).run(staged=staged)
+    assert "+old = 3" in tracked_diff.output
+    assert "untracked" not in tracked_diff.output.lower()
+
+
+@pytest.mark.asyncio
+async def test_git_diff_bounds_warning_when_review_nears_output_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ash.tools.git as git_tools
+    from ash.tools.base import ToolResult
+
+    async def long_diff(*args, **kwargs):
+        del args, kwargs
+        return ToolResult(success=True, output="a" * 390)
+
+    async def untracked_status(*args, **kwargs):
+        del args, kwargs
+        return 0, "?? new.py\0", ""
+
+    monkeypatch.setattr(git_tools, "DEFAULT_GIT_OUTPUT_LIMIT", 400)
+    monkeypatch.setattr(git_tools, "_git_result", long_diff)
+    monkeypatch.setattr(git_tools, "_run_git", untracked_status)
+
+    result = await GitDiffTool(SafetyGuard(tmp_path)).run()
+    assert result.success and result.truncated
+    assert len(result.output) <= 400
+    assert "output truncated" in result.output
+    assert "untracked" in result.output
+    assert "new.py" not in result.output
+
+
+@pytest.mark.asyncio
 async def test_multi_file_apply_patch_reports_python_syntax_without_undoing_edit(
     tmp_path: Path,
 ) -> None:

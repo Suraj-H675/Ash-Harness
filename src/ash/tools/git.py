@@ -127,13 +127,51 @@ class GitDiffTool(BaseTool):
         if args.staged:
             command.append("--cached")
         command.extend(["--no-ext-diff", "--"])
+        scoped_path = ""
         if args.path:
             path = self.safety_guard.validate_path(args.path)
-            command.append(str(path.relative_to(self.safety_guard.project_root)))
-        return await _git_result(
+            scoped_path = str(path.relative_to(self.safety_guard.project_root))
+            command.append(scoped_path)
+        result = await _git_result(
             self.safety_guard.project_root,
             command,
             read_only=True,
+        )
+        if not result.success or result.truncated:
+            return result
+
+        # Git diff ignores untracked files, including brand-new files written
+        # by Ash. A blank diff must not be presented as a complete review.
+        status_args = ["status", "--porcelain=v1", "-z", "--untracked-files=normal", "--"]
+        if scoped_path:
+            status_args.append(scoped_path)
+        code, status, _ = await _run_git(
+            self.safety_guard.project_root, status_args, read_only=True
+        )
+        if code == 0 and not any(
+            record.startswith("?? ") for record in status.split("\0")
+        ):
+            return result
+        note = (
+            "[Git diff excludes untracked files in this scope. Use git_status "
+            "to locate them and workspace_diff to review Ash-owned new files.]"
+            if code == 0
+            else "[Git diff could not check untracked-file coverage; use git_status.]"
+        )
+        separator = "\n" if result.output else ""
+        capacity = DEFAULT_GIT_OUTPUT_LIMIT - len(separator) - len(note)
+        truncated = len(result.output) > capacity
+        if truncated:
+            omitted = "\n[Git diff output truncated to retain untracked-file notice]"
+            output = result.output[: max(0, capacity - len(omitted))] + omitted
+        else:
+            output = result.output
+        output += separator + note
+        return ToolResult(
+            success=True,
+            output=output,
+            truncated=truncated or code != 0,
+            token_count=count_output_tokens(output),
         )
 
 

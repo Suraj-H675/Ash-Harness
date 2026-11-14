@@ -318,6 +318,12 @@ unrecognized test frameworks still provide their original bounded output.
 ### 2.6 `git_status` / `git_diff` / `git_log` / `auto_commit`
 
 The read-only Git tools expose bounded status, diff, and recent-log inspection.
+`git_diff` reviews tracked staged or unstaged changes, following Git's own
+behavior: it does **not** include untracked new files. For a successful,
+nontruncated review, Ash checks untracked-file presence within the selected
+path scope and adds a content-free warning if the diff omits new files. Use
+`git_status` to locate them or `workspace_diff` to inspect Ash-owned edits
+without staging them. Ignored files remain excluded from this warning.
 Ash also provides **`workspace_diff`** for reviewing changes in projects that
 do not use Git. It compares only the current coding turn's checkpointed Ash file
 edits against the actual files; it does not run Git, start a process, or make
