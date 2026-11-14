@@ -27,7 +27,7 @@ def _incomplete_index_note(incomplete: bool) -> str:
     if not incomplete:
         return ""
     return (
-        "\n[Repository index incomplete: additional source files were not indexed. "
+        "\n[Repository index incomplete: some source files may not have been indexed. "
         "Use search_text or glob_files to search beyond the index.]"
     )
 

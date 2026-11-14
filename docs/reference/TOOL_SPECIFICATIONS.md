@@ -212,6 +212,14 @@ workspace scope, generated-directory exclusions, or search limits.
 When `search_text` targets one explicit file, its glob accepts either that
 file's basename or its project-relative path.
 
+`find_symbol` and `find_references` use a bounded repository index. If
+discovery stops at its entry/depth limit, a directory cannot be enumerated,
+or the index omits eligible sources, broad queries report that the index is
+incomplete. A negative result then means only that no match was found in the
+indexed files. Narrow `path_glob` to an exact source path or use
+`search_text`/`glob_files` to check beyond the index. Known generated and
+explicitly ignored directories stay excluded by design.
+
 `list_dir`, `glob_files`, and `search_text` return a known-completed,
 unsuccessful tool result when their root path is outside the workspace instead
 of raising an exception after dispatch. The refusal preserves the attempted

@@ -475,6 +475,49 @@ def test_repomap_bounds_discovery_entries(tmp_path: Path, monkeypatch) -> None:
 
     assert len(repo_map.files) == 2
     assert {node.path.name for node in repo_map.files} <= {"a.py", "b.py", "c.py"}
+    assert repo_map.index_incomplete is True
+    assert repo_map.query_incomplete("*.py") is True
+
+    (tmp_path / "c.py").unlink()
+    repo_map.refresh()
+    assert repo_map.index_incomplete is False
+
+
+def test_repomap_detects_entry_limit_across_directories(tmp_path: Path, monkeypatch) -> None:
+    for directory in ("a", "b"):
+        (tmp_path / directory).mkdir()
+        (tmp_path / directory / "module.py").write_text("def visible(): pass\n")
+    monkeypatch.setattr(repomap_module, "MAX_REPO_DISCOVERY_ENTRIES", 3)
+
+    repo_map = RepoMap(tmp_path)
+
+    assert len(repo_map.files) == 1
+    assert repo_map.index_incomplete is True
+
+
+def test_repomap_marks_unreadable_subdirectory_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "missed.py").write_text("def missed(): pass\n")
+    (tmp_path / "visible.py").write_text("def visible(): pass\n")
+    original = repomap_module.list_scoped_directory
+
+    def blocked(path, guard):
+        if path == nested:
+            raise PermissionError("unreadable directory")
+        return original(path, guard)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(repomap_module, "list_scoped_directory", blocked)
+        repo_map = RepoMap(tmp_path)
+        assert [node.path.name for node in repo_map.files] == ["visible.py"]
+        assert repo_map.index_incomplete is True
+
+    repo_map.refresh()
+    assert repo_map.index_incomplete is False
+    assert {node.path.name for node in repo_map.files} == {"missed.py", "visible.py"}
 
 
 def test_repomap_bounds_discovery_depth(tmp_path: Path, monkeypatch) -> None:
@@ -487,6 +530,8 @@ def test_repomap_bounds_discovery_depth(tmp_path: Path, monkeypatch) -> None:
     repo_map = RepoMap(tmp_path)
 
     assert [node.path.name for node in repo_map.files] == ["visible.py"]
+    assert repo_map.index_incomplete is True
+    assert repo_map.query_incomplete("*.py") is True
 
 
 def test_repomap_excludes_node_modules(tmp_path: Path) -> None:

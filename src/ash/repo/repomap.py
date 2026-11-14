@@ -22,7 +22,7 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from ash.safety.environment import resolve_host_executable
 from ash.safety.git import (
@@ -109,6 +109,7 @@ def _discover_source_files(
     ignored_dirs: frozenset[str] = DEFAULT_IGNORED_DIRS,
     exclude_patterns: Iterable[str] = (),
     guard: SafetyGuard | None = None,
+    on_incomplete: Callable[[], None] | None = None,
 ) -> list[Path]:
     guard = guard or SafetyGuard(project_root)
     patterns = tuple(exclude_patterns)
@@ -116,18 +117,26 @@ def _discover_source_files(
 
     entries_seen = 0
 
+    def mark_incomplete() -> None:
+        if on_incomplete is not None:
+            on_incomplete()
+
     def walk(directory: Path, local_patterns: tuple[str, ...], depth: int) -> bool:
         nonlocal entries_seen
         try:
             _, listed = list_scoped_directory(directory, guard)
         except (OSError, SafetyViolation):
+            mark_incomplete()
             return False
+        if len(listed) > MAX_REPO_DISCOVERY_ENTRIES:
+            mark_incomplete()
         entries = sorted(listed, key=lambda item: item[0])[
             :MAX_REPO_DISCOVERY_ENTRIES
         ]
         for name, is_directory in entries:
             entries_seen += 1
             if entries_seen > MAX_REPO_DISCOVERY_ENTRIES:
+                mark_incomplete()
                 return True
             entry = directory / name
             relative = entry.relative_to(project_root)
@@ -136,11 +145,10 @@ def _discover_source_files(
             ):
                 continue
             if is_directory:
-                if (
-                    entry.name in ignored_dirs
-                    or entry.name.startswith(".")
-                    or depth >= MAX_REPO_DISCOVERY_DEPTH
-                ):
+                if entry.name in ignored_dirs or entry.name.startswith("."):
+                    continue
+                if depth >= MAX_REPO_DISCOVERY_DEPTH:
+                    mark_incomplete()
                     continue
                 child_patterns = tuple(
                     _relative_pattern_for_child(pattern, entry.name)
@@ -580,7 +588,7 @@ class RepoMap:
 
     @property
     def index_incomplete(self) -> bool:
-        """Whether eligible source files were omitted from the current index."""
+        """Whether the current index may omit eligible source files."""
 
         self._wait_for_initial_refresh()
         return self._index_incomplete
@@ -939,10 +947,17 @@ class RepoMap:
     def _refresh(self, *, cancel_event: threading.Event | None = None) -> None:
         if cancel_event is not None and cancel_event.is_set():
             return
+        discovery_incomplete = False
+
+        def mark_discovery_incomplete() -> None:
+            nonlocal discovery_incomplete
+            discovery_incomplete = True
+
         discovered = _discover_source_files(
             self.project_root,
             exclude_patterns=self._exclude_patterns,
             guard=self._guard,
+            on_incomplete=mark_discovery_incomplete,
         )
         if cancel_event is not None and cancel_event.is_set():
             return
@@ -987,7 +1002,7 @@ class RepoMap:
             if module_name is not None:
                 module_index[module_name] = resolved
 
-        self._index_incomplete = len(files) < len(eligible)
+        self._index_incomplete = discovery_incomplete or len(files) < len(eligible)
         if next_cache == self._file_cache:
             return
 

@@ -5,6 +5,7 @@ import subprocess
 import pytest
 
 from ash.repo.repomap import RepoMap
+from ash.repo import repomap as repomap_module
 from ash.safety.guard import SafetyGuard
 from ash.tools.symbols import FindReferencesTool, FindSymbolTool
 
@@ -151,6 +152,32 @@ async def test_symbol_navigation_reports_incomplete_repository_index(
     refreshed = await FindSymbolTool(guard, repo_map).run(query="missing")
     assert refreshed.success and not refreshed.truncated
     assert "index incomplete" not in refreshed.output
+
+
+@pytest.mark.asyncio
+async def test_symbol_navigation_discloses_discovery_entry_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("a.py", "b.py", "z.py"):
+        (tmp_path / name).write_text(
+            "def present(): pass\n" if name != "z.py" else "def omitted(): pass\n"
+        )
+    monkeypatch.setattr(repomap_module, "MAX_REPO_DISCOVERY_ENTRIES", 2)
+    guard = SafetyGuard(tmp_path)
+    repo_map = RepoMap(tmp_path)
+
+    result = await FindSymbolTool(guard, repo_map).run(query="omitted")
+    assert result.success
+    assert result.truncated
+    assert "No definitions found in indexed files" in result.output
+    assert "Repository index incomplete" in result.output
+    assert "search_text" in result.output
+
+    # An exact indexed file remains reliable even if a broad index is incomplete.
+    exact = await FindSymbolTool(guard, repo_map).run(
+        query="present", path_glob="a.py"
+    )
+    assert not exact.truncated
 
 
 @pytest.mark.asyncio
