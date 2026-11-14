@@ -258,6 +258,7 @@ def test_search_discovery_requires_successfully_offered_exact_schema(
     # Compare with the schema Ash actually offers (including intentional
     # compact defaults), not Pydantic's unmodified argument-model schema.
     schema = SearchTextTool(SafetyGuard(tmp_path)).json_schema()
+    assert schema["properties"]["context_lines"]["maximum"] == 5
     request = {
         "tools": [
             {
@@ -301,10 +302,12 @@ def test_search_discovery_requires_successfully_offered_exact_schema(
     )
     # A model cannot legitimize widened or partially advertised limits merely
     # by repeating its forged schema in both the offer and discovery result.
-    for tamper in ("widen", "drop"):
+    for tamper in ("widen", "drop", "widen_context"):
         forged = json.loads(json.dumps(schema))
         if tamper == "widen":
             forged["properties"]["max_output_bytes"]["maximum"] = 20_000_000
+        elif tamper == "widen_context":
+            forged["properties"]["context_lines"]["maximum"] = 6
         else:
             del forged["properties"]["context_lines"]
         forged_request = {

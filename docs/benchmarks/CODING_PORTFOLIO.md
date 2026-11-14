@@ -24,7 +24,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Latest sequential 65K pair: both pass**; earlier Ash-only normal-128K trial also passed. Exact independent oracle and scope checks verified; no speed/reliability ranking |
 | R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **First sequential 65K pair: both pass**; Ash 106.68s / 14 requests, Codex 78.74s / 5 shell commands; one sample, Codex policy-parity caveat |
 | R10 | `pluggy-role-module-split` | Pinned real repo | Seven-module role-based refactor; old import shims and public plugin behavior, wrappers, firstresult, historic replay and subset callers | **Park after two matched pairs**; at 170s both timed out/incomplete; at 300s Ash stopped on protected opaque-context exhaustion after 4/7 files, Codex changed all seven and passed both oracles but timed out without executing the visible test. Neither a complete coding pass |
-| R11 | `boltons-bulk-ordered-collections` | Pinned real repo | Two-module ordered-container repair: multi-list index boundaries, insertion and tail handling, and linear-time ordered-set bulk removal | **Preflight confirmed:** original visible/hidden fail, reference visible/hidden pass. One ordinary vs one opt-in context-restart Ash trial planned at the same constrained context and deadline |
+| R11 | `boltons-bulk-ordered-collections` | Pinned real repo | Two-module ordered-container repair: multi-list index boundaries, insertion and tail handling, and linear-time ordered-set bulk removal | **Controlled Ash-only comparison completed:** no restart 85.33s, 3 requests, 0 edits, context error; one restart 113.86s, 5 requests, actual safe restart, 1/2 edited *before* restart, no edits in child, second context error. Both fail oracles; audits/scopes intact; no verified coding progress after restart |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -358,17 +358,43 @@ original and green on the upstream fix** in the existing networkless,
 read-only evaluator. Neither pinned tree contains symlinks. The authorized
 visible command is `python3 -B qa_visible.py`.
 
-**Frozen study design:** Run exactly one ordinary Ash turn and one turn
-with `--context-continuations 1` at GPT-6 Luna xhigh, requested 24,576-token
-context, zero cumulative turn cap, identical task, tools, sealed oracles and
-240-second external deadline. The constrained context tests one plausible
-history-pressure situation, not Ash's normal 128K production budget.
-Report only actual elapsed time, model/tool calls, changes, safety and oracle
-results. An actual continuation benefit requires an observed opaque-context
-error, successful safe parent-to-child handoff, and completion after verifying
-the remaining work; if neither trial restarts, there is no continuation
-effect to measure. Even if the two trials differ, one sample per condition is
-not a reliable success-rate estimate or a comparison with plain Codex.
+**Controlled R11 outcome (2026-11-14, one sample per condition):** Frozen task
+at commit `a080db9`, GPT-6 Luna xhigh, 24,576 requested context, zero
+cumulative turn cap, identical tools, user objective, visible/hidden oracles
+and 240-second external deadline; only `--context-continuations 0` vs `1`
+changed. **Ordinary Ash:** context error after 85.33s CLI / 3 model requests
+and six successful read/search tools, no edit and no authorized test; both
+oracles fail, source protected and audit intact. **Opt-in Ash:** real safe
+context restart (`session_count=2`, `context_continuations=1`), but second
+window also ended on a context error after 113.86s CLI / 5 requests and
+15 recorded tool calls; one of two source modules changed **before the
+context restart** (at ~100.8s), two stale-hash edit attempts rejected before
+dispatch, and one over-limit `search_text`
+`context_lines` call rejected before dispatch. Neither required visible test
+nor independent oracle passed. Protected files and both session audits
+remained intact. The actual restart followed the first turn error at ~100.94s;
+the child started at ~101.02s and made read-only inspection calls before its
+second context failure. The opt-in trial produced a partial edit relative to
+the baseline, but **the child made no edits and did not complete the task**.
+This does
+not show a stable improvement in reliability or compare with plain Codex;
+the 24K context is deliberately smaller than default 128K. Both trials are
+closed; no additional runs are planned merely to improve the score.
+Private receipts: `/var/tmp/ash-r11-boltons-control-20261114-r01/result.json`
+and `/var/tmp/ash-r11-boltons-continuation-20261114-r01/result.json`.
+
+**Cross-task tool-interface follow-up:** R8 independently recorded a rejected
+`search_text(context_lines=5)` invocation; R11's continued turn also tried
+an over-limit `context_lines` invocation. Both were safely refused, but the
+tool already caps contextual search results separately (24,576 bytes hard,
+16,384-byte default) with 512-character context previews. A deliberately
+narrow change now permits `context_lines=0..5` instead of `0..3`, while
+preserving the same capture bounds, zero-context default, path/permission
+safety and match counting. The separately maintained Explorer offered/schema
+validator must update its **exact** recognized maximum at the same time and
+still reject forged broader schemas. This addresses invalid but useful tool
+requests; it is **not a fix for R11's opaque reasoning-context exhaustion**
+and must not be credited as a measured coding pass-rate gain.
 
 **Excluded candidate:** A preliminary `python-dotenv` task for escaping
 backslashes passed its own red-original/green-reference oracles, but the

@@ -158,7 +158,7 @@ encoding and exact line/column continuation. Models and users may explicitly
 request larger `max_chars` values (up to the existing hard limit) when a
 fuller inspection is actually necessary. This is a context-economy default,
 not a proven increase in independent coding benchmark pass rates.
-`search_text` also supports optional `context_lines=1..3` for nearby source
+`search_text` also supports optional `context_lines=1..5` for nearby source
 lines around each match without a separate read request. Adjacent windows are
 merged, and the match count still controls `max_results`. Matching lines keep
 `path:line:text` locations; neighboring lines use `path-line-text` so callers

@@ -291,7 +291,7 @@ class SearchTextArgs(BaseModel):
     fixed_strings: bool = False
     case_sensitive: bool = True
     max_results: int = Field(DEFAULT_MAX_RESULTS, ge=1, le=HARD_MAX_RESULTS)
-    context_lines: int = Field(0, ge=0, le=3)
+    context_lines: int = Field(0, ge=0, le=5)
     max_output_bytes: int = Field(
         DEFAULT_SEARCH_CAPTURE_BYTES, ge=1_024, le=MAX_SEARCH_CAPTURE_BYTES
     )

@@ -11,7 +11,7 @@ import pytest
 from ash.safety.guard import SafetyGuard
 from ash.tools import search as search_module
 from ash.tools.filesystem import ReadFileTool
-from ash.tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
+from ash.tools.search import GlobFilesTool, ListDirectoryTool, SearchTextArgs, SearchTextTool
 
 
 @pytest.mark.asyncio
@@ -339,6 +339,33 @@ async def test_search_text_opt_in_context_merges_adjacent_match_windows(tmp_path
     assert limited.truncated is True
     default = await tool.run(pattern="needle", fixed_strings=True)
     assert default.output == "app.py:3:needle first\napp.py:5:needle second"
+
+
+@pytest.mark.asyncio
+async def test_search_text_five_context_lines_remain_bounded(tmp_path, monkeypatch) -> None:
+    """Allow a useful nearby source window without lifting the output cap."""
+    path = tmp_path / "app.py"
+    path.write_text(
+        "".join("needle\n" if index == 7 else f"line {index}\n" for index in range(1, 14))
+    )
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+    result = await tool.run(pattern="needle", fixed_strings=True, context_lines=5)
+    assert result.success and not result.truncated
+    assert result.output.splitlines() == [
+        *(f"app.py-{index}-line {index}" for index in range(2, 7)),
+        "app.py:7:needle",
+        *(f"app.py-{index}-line {index}" for index in range(8, 13)),
+    ]
+    monkeypatch.setattr(search_module, "MAX_SEARCH_CONTEXT_CAPTURE_BYTES", 64)
+    limited = await tool.run(
+        pattern="needle", fixed_strings=True, context_lines=5,
+        max_output_bytes=2_000_000,
+    )
+    assert limited.success and limited.truncated
+    assert "[search output capture truncated after 64 bytes]" in limited.output
+    assert "app.py-12-line 12" not in limited.output
+    with pytest.raises(ValueError, match="less than or equal to 5"):
+        SearchTextArgs(pattern="needle", context_lines=6)
 
 
 @pytest.mark.asyncio
