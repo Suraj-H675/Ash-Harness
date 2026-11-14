@@ -54,6 +54,7 @@ from ash.sandbox.process_utils import (
 
 MAX_REPO_DISCOVERY_ENTRIES = 100_000
 MAX_REPO_DISCOVERY_DEPTH = 32
+_FileFingerprint = tuple[int, int, int, int, int]
 
 
 def _dot_quote(value: str) -> str:
@@ -556,7 +557,7 @@ class RepoMap:
         self._index: dict[Path, int] = {}
         self._adjacency: _SparseAdjacency | None = None
         self._priority_paths: tuple[Path, ...] = ()
-        self._file_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
+        self._file_cache: dict[Path, tuple[_FileFingerprint, FileNode]] = {}
         self._index_incomplete = False
         self._initial_refresh_ready = threading.Event()
         self._initial_refresh_error: BaseException | None = None
@@ -987,7 +988,7 @@ class RepoMap:
         ][: self._max_files]
         files: list[FileNode] = []
         module_index: dict[str, Path] = {}
-        next_cache: dict[Path, tuple[tuple[int, int], FileNode]] = {}
+        next_cache: dict[Path, tuple[_FileFingerprint, FileNode]] = {}
 
         for path in paths:
             if cancel_event is not None and cancel_event.is_set():
@@ -1012,7 +1013,7 @@ class RepoMap:
         self._index = {node.path: i for i, node in enumerate(files)}
         self._adjacency = self._build_adjacency()
 
-    def _load_file(self, path: Path) -> tuple[Path, tuple[int, int], FileNode] | None:
+    def _load_file(self, path: Path) -> tuple[Path, _FileFingerprint, FileNode] | None:
         try:
             resolved, metadata = stat_scoped_path(path, self._guard)
         except (OSError, SafetyViolation):
@@ -1022,7 +1023,15 @@ class RepoMap:
             or metadata.st_size > MAX_SOURCE_FILE_BYTES
         ):
             return None
-        fingerprint = (metadata.st_mtime_ns, metadata.st_size)
+        # Editors and sync tools can atomically replace source while preserving
+        # both size and mtime. The inode and change time prevent stale symbols.
+        fingerprint = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+            metadata.st_size,
+        )
         cached = self._file_cache.get(resolved)
         if cached is not None and cached[0] == fingerprint:
             return resolved, fingerprint, cached[1]
@@ -1075,7 +1084,7 @@ class RepoMap:
             guard=self._guard,
             expected_root_identity=self._project_root_identity,
         )
-        loaded_files: dict[Path, tuple[tuple[int, int], FileNode]] = {}
+        loaded_files: dict[Path, tuple[_FileFingerprint, FileNode]] = {}
         for path in candidates:
             if path in ignored:
                 continue

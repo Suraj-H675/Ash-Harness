@@ -12,6 +12,10 @@ def matches_relative_glob(relative_path: str, pattern: str) -> bool:
     states = [False] * (len(parts) + 1)
     states[0] = True
     for segment in pattern.split("/"):
+        if segment == ".":
+            # A leading './' or interior '/./' is an explicit current-dir
+            # component, not a filename segment that must be consumed.
+            continue
         if segment == "**":
             # Globstar may match zero or more complete directory segments.
             reached = False

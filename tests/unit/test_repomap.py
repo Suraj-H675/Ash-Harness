@@ -769,6 +769,34 @@ def test_repomap_refresh_reuses_unchanged_parse_results(tmp_path: Path) -> None:
     assert extract.call_args.args[0] == first
 
 
+def test_repomap_reparses_atomically_replaced_source_with_preserved_mtime(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "module.py"
+    source.write_text("def old_name(): pass\n", encoding="utf-8")
+    before = source.stat()
+    repo_map = RepoMap(tmp_path)
+    extract = Mock(wraps=repo_map._extractor.extract)
+    repo_map._extractor.extract = extract
+
+    staged = tmp_path / "replacement.tmp"
+    staged.write_text("def new_name(): pass\n", encoding="utf-8")
+    os.utime(staged, ns=(before.st_atime_ns, before.st_mtime_ns))
+    staged.replace(source)
+    after = source.stat()
+    assert after.st_size == before.st_size
+    assert after.st_mtime_ns == before.st_mtime_ns
+    assert after.st_ino != before.st_ino
+
+    repo_map.refresh()
+
+    assert [symbol.name for symbol in repo_map.find_definitions("new_name", refresh=False)] == [
+        "new_name"
+    ]
+    assert repo_map.find_definitions("old_name", refresh=False) == []
+    assert extract.call_count == 1
+
+
 def test_repomap_resolves_relative_imports(tmp_path: Path) -> None:
     package = tmp_path / "package"
     package.mkdir()

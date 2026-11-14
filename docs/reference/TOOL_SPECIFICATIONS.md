@@ -209,6 +209,9 @@ Likewise, `src/**/*.py` includes both `src/app.py` and deeper descendants.
 `search_text(glob=...)` follows the same rules; indexed symbol queries apply
 `path_glob` relative to the project root. Matching does not override existing
 workspace scope, generated-directory exclusions, or search limits.
+Explicit current-directory segments such as `./src/**/*.py` and
+`src/./file.py` are equivalent to their project-relative forms; `..` is not
+resolved into an alternate search scope.
 When `search_text` targets one explicit file, its glob accepts either that
 file's basename or its project-relative path.
 

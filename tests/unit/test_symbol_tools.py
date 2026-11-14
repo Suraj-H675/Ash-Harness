@@ -224,11 +224,15 @@ async def test_explicit_symbol_path_finds_file_outside_repo_map_limit(
     assert wildcard.truncated
     assert "index incomplete" in wildcard.output
 
-    unmatched_spelling = await FindSymbolTool(guard, repo_map).run(
+    relative_spelling = await FindSymbolTool(guard, repo_map).run(
         query="Wanted", path_glob="./target.py"
     )
-    assert unmatched_spelling.truncated
-    assert "in indexed files" in unmatched_spelling.output
+    relative_reference = await FindReferencesTool(guard, repo_map).run(
+        query="Wanted", path_glob="./target.py"
+    )
+    assert "target.py:1: function Wanted" in relative_spelling.output
+    assert "target.py:3:5: Wanted" in relative_reference.output
+    assert not relative_spelling.truncated and not relative_reference.truncated
 
     target.write_text("def Renamed(): pass\ndef use():\n    Renamed()\n")
     updated = await FindSymbolTool(guard, repo_map).run(

@@ -243,6 +243,31 @@ async def test_workspace_globs_respect_directory_segments_and_recursive_zero_dep
 
 
 @pytest.mark.asyncio
+async def test_workspace_globs_accept_explicit_current_directory_segments(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "src" / "sub"
+    package.mkdir(parents=True)
+    (tmp_path / "src" / "direct.py").write_text("needle\n")
+    (package / "nested.py").write_text("needle\n")
+    guard = SafetyGuard(tmp_path)
+
+    found = await GlobFilesTool(guard).run(pattern="./src/./**/*.py")
+    searched = await SearchTextTool(guard).run(
+        pattern="needle", glob="./src/**/*.py", fixed_strings=True
+    )
+    parent_traversal_pattern = await GlobFilesTool(guard).run(
+        pattern="./../src/**/*.py"
+    )
+
+    assert found.output == "src/direct.py\nsrc/sub/nested.py"
+    assert searched.output == (
+        "src/direct.py:1:needle\nsrc/sub/nested.py:1:needle"
+    )
+    assert parent_traversal_pattern.output == ""
+
+
+@pytest.mark.asyncio
 async def test_glob_files_reports_depth_limit_incomplete(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
