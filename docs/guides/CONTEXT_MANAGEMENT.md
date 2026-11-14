@@ -133,12 +133,23 @@ reported total.
 `search_tools` indexes the complete live built-in, plugin, skill, and MCP tool
 catalog. When the catalog exceeds `tool_search_threshold` (32 by default), Ash
 sends only a compact essential set and `search_tools` to the provider. A search
-returns the best matching names, descriptions, and exact input schemas and
-activates those matches for the next model iteration. Ash retains at most 64
-recently activated deferred schemas per session; re-searching a tool refreshes
-its recency, and older activations fall out of the provider-visible window while
-remaining available through `search_tools`. The activation window resets when
-the session changes. Set
+returns the names, descriptions, and exact input schemas of the best matches
+that can actually be activated for the next model iteration. For effective
+input limits of 4,096 tokens or less, the result omits duplicate argument
+schemas, which are still provided in the **next provider request** with
+unchanged runtime validation.
+
+The runtime bounds the combined incremental schema and discovery-result token
+cost against the effective provider input limit. When matches cannot fit, the
+result reports the omitted count and is marked truncated rather than claiming
+those tools were activated. The reserved input budget protects space for
+instructions and current-turn evidence, but cannot repair a session whose
+protected history is already too large. Ash retains at most 64 recently
+activated deferred schemas per session;
+re-searching a tool refreshes its recency. Older activations may be evicted to
+make room, but no match advertised in one result is evicted by a later match in
+that same result. Deferred tools remain searchable. The window resets when the
+session changes. Set
 `tool_search_threshold = 0` to send the full catalog on every request.
 
 Only visible schemas count against the tools budget. Deferred tools remain in

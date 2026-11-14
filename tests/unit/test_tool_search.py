@@ -209,6 +209,31 @@ async def test_tool_search_activations_use_bounded_lru_window(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_search_never_advertises_matches_evicted_in_same_result(
+    tmp_path: Path,
+) -> None:
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(
+        guard, lambda: catalog, threshold=1, max_activations=2
+    )
+    catalog[search.name] = search
+    for name in ("alpha_remote", "beta_remote", "gamma_remote"):
+        catalog[name] = DummyTool(guard, name, "Remote integration service")
+
+    result = await search.run(query="remote integration", limit=3)
+    payload = json.loads(result.output)
+    names = {item["name"] for item in payload["tools"]}
+
+    assert result.success and result.truncated
+    assert names == {"alpha_remote", "beta_remote"}
+    assert payload["omitted_matches"] == 1
+    assert "activation" in payload["note"]
+    assert names == search.activated_names
+    assert set(search.visible_tools(catalog)) == {search.name, *names}
+
+
+@pytest.mark.asyncio
 async def test_tool_search_uses_bounded_search_schema_and_summarizes_large_match(
     tmp_path,
 ) -> None:
@@ -600,6 +625,88 @@ async def test_loop_exposes_search_match_on_next_iteration_and_budgets_visible_t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider_window", [4_096, 65_536])
+async def test_broad_tool_discovery_does_not_overflow_small_provider_window(
+    tmp_path: Path, provider_window: int,
+) -> None:
+    """A broad search must not make the very next provider request impossible."""
+
+    workspace = tmp_path / ("nested-" + "x" * 120)
+    workspace.mkdir()
+    guard = SafetyGuard(workspace)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=1)
+    catalog[search.name] = search
+
+    class VerboseIntegration(DummyTool):
+        def search_schema(self) -> dict[str, Any]:
+            return self.json_schema()
+
+        def json_schema(self) -> dict[str, Any]:
+            return {
+                "type": "object",
+                "properties": {
+                    f"field_{index}": {
+                        "type": "string",
+                        "description": "Remote service request field for structured records.",
+                    }
+                    for index in range(24)
+                },
+            }
+
+    for index in range(18):
+        name = f"remote_integration_{index:02d}"
+        catalog[name] = VerboseIntegration(
+            guard, name, "Use remote integration to inspect records and history."
+        )
+    provider = ScriptedDiscoveryProvider("remote integration", None, provider_window)
+    config = AshConfig(
+        model="local/intent-discovery",
+        workspace_root=workspace,
+        db_directory=workspace / "db",
+        max_context_tokens=provider_window,
+        max_completion_tokens=1_024,
+        memory_backend="off",
+        tool_search_threshold=1,
+    )
+    store = SessionStore(workspace / "many-tools.db")
+    loop = AshLoop(
+        store,
+        provider,
+        guard,
+        HeadlessUI(output_format="text", stream=io.StringIO()),
+        workspace,
+        tools=catalog,
+        config=config,
+    )
+    try:
+        session = await loop.start_session()
+        response = await loop.run_turn("Find the relevant remote integration")
+        assert response == "discovery complete"
+        assert provider.calls == 2
+        found = [
+            call
+            for call in store.load_session(session.session_id).tool_calls
+            if call.tool_name == "search_tools"
+        ]
+        assert len(found) == 1 and found[0].success
+        discovered = json.loads(found[0].result or "{}")
+        if provider_window == 4_096:
+            assert discovered["omitted_matches"] > 0
+            assert "context budget" in discovered["note"]
+        else:
+            assert "omitted_matches" not in discovered
+            assert len(discovered["tools"]) == 8
+        declared = {item["name"] for item in discovered["tools"]}
+        assert declared <= search.activated_names
+        assert declared <= provider.tool_names[1]
+        if provider_window == 4_096:
+            assert len(provider.tool_names[1]) < 9
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_loop_search_catalog_tracks_runtime_additions_and_removals(
     tmp_path,
 ) -> None:
@@ -771,8 +878,9 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
         agent_db_path=tmp_path / "agents.db",
     )
     provider = ScriptedDiscoveryProvider(query, expected_tool, context_window)
+    store = SessionStore(tmp_path / "intent-discovery.db")
     loop = AshLoop(
-        SessionStore(tmp_path / "intent-discovery.db"),
+        store,
         provider,
         guard,
         HeadlessUI(output_format="text", stream=io.StringIO()),
@@ -786,7 +894,7 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
     initial_names = {item["function"]["name"] for item in initial_payload}
     assert initial_names == {*ESSENTIAL_TOOL_NAMES, "search_tools"}
 
-    await loop.start_session()
+    session = await loop.start_session()
     response = await loop.run_turn(intent)
 
     assert response == "discovery complete"
@@ -805,6 +913,21 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
             provider.tool_schemas[1][expected_tool]
             == catalog[expected_tool].json_schema()
         )
+        discovered = next(
+            item
+            for item in store.load_session(session.session_id).tool_calls
+            if item.tool_name == "search_tools"
+        )
+        matched = next(
+            item
+            for item in json.loads(discovered.result or "{}")["tools"]
+            if item["name"] == expected_tool
+        )
+        if context_window == 4_096:
+            assert "input_schema" not in matched
+            assert "schema_summary" not in matched
+        elif "schema_truncated" not in matched:
+            assert matched["input_schema"] == catalog[expected_tool].search_schema()
     assert "search_tools" in provider.initial_system_prompt
     assert "next provider iteration" in provider.initial_system_prompt.casefold()
     assert "concrete tool actions" in provider.initial_system_prompt.casefold()

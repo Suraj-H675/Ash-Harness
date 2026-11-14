@@ -51,6 +51,10 @@ _SCHEMA_MATCH_SCORE = 10
 _EXACT_NAME_MATCH_BOOST = 1_000
 _PREFIX_NAME_MATCH_BOOST = 500
 _MIN_QUERY_MATCH_TERMS = 2
+_CONTEXT_OMISSION_NOTE = (
+    "Some tool schemas exceed the current activation or provider context budget. "
+    "Narrow the search or select a model with a larger context."
+)
 
 
 class SearchToolsArgs(BaseModel):
@@ -92,40 +96,107 @@ class SearchToolsTool(BaseTool):
         self.max_activations = max_activations
         self.activated_names: set[str] = set()
         self._activation_order: deque[str] = deque()
+        self._activation_fits: Callable[[set[str], str], bool] | None = None
+        self._compact_result: Callable[[], bool] | None = None
+
+    def set_activation_budget(
+        self,
+        fits: Callable[[set[str], str], bool],
+        *,
+        compact_result: Callable[[], bool] | None = None,
+    ) -> None:
+        """Bind the owning provider's schema and search-result token budget."""
+
+        self._activation_fits = fits
+        self._compact_result = compact_result
 
     async def run(self, **kwargs: Any) -> ToolResult:
         args = SearchToolsArgs(**kwargs)
         catalog = self._catalog()
         matches = _rank_tools(catalog, args.query, args.limit)
-        for name, _, _ in matches:
-            if name in self.activated_names:
-                try:
-                    self._activation_order.remove(name)
-                except ValueError:
-                    pass
-            self.activated_names.add(name)
-            self._activation_order.append(name)
-        while len(self.activated_names) > self.max_activations:
-            oldest = self._activation_order.popleft()
-            self.activated_names.discard(oldest)
-        payload = {
-            "query": redact_text(args.query),
-            "tools": [
-                _search_result_tool(name, tool)
-                for name, tool, _ in matches
-            ],
+        selected: list[tuple[str, BaseTool]] = []
+        selected_metadata: list[dict[str, Any]] = []
+        selected_names: set[str] = set()
+        omitted = 0
+        order = deque(self._activation_order)
+        query = redact_text(args.query)
+        deferred_catalog = self.threshold > 0 and len(catalog) > self.threshold
+        compact_result = bool(self._compact_result and self._compact_result())
+        for name, tool, _ in matches:
+            metadata = _search_result_tool(name, tool)
+            if compact_result:
+                # The exact schema is sent separately in the next provider
+                # tool declarations. Duplicating it in protected conversation
+                # history needlessly exhausts small model input windows.
+                metadata.pop("input_schema", None)
+                metadata.pop("schema_summary", None)
+                metadata.pop("schema_truncated", None)
+            candidate_order = deque(item for item in order if item != name)
+            candidate_order.append(name)
+            preview = (
+                json.dumps(
+                    {
+                        "query": query,
+                        "tools": [*selected_metadata, metadata],
+                        "omitted_matches": len(matches),
+                        "note": _CONTEXT_OMISSION_NOTE,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if deferred_catalog and self._activation_fits is not None
+                else ""
+            )
+
+            def over_budget(active: deque[str]) -> bool:
+                return len(active) > self.max_activations or bool(
+                    preview
+                    and self._activation_fits is not None
+                    and not self._activation_fits(set(active), preview)
+                )
+
+            while over_budget(candidate_order):
+                # Do not evict a match already promised in this response.
+                oldest = next(
+                    (
+                        item
+                        for item in candidate_order
+                        if item not in selected_names and item != name
+                    ),
+                    None,
+                )
+                if oldest is None:
+                    break
+                candidate_order.remove(oldest)
+            if over_budget(candidate_order):
+                omitted += 1
+                continue
+            order = candidate_order
+            selected.append((name, tool))
+            selected_names.add(name)
+            selected_metadata.append(metadata)
+        self._activation_order = order
+        self.activated_names = set(order)
+        payload: dict[str, Any] = {
+            "query": query,
+            "tools": selected_metadata,
         }
+        if omitted:
+            payload["omitted_matches"] = omitted
+            payload["note"] = _CONTEXT_OMISSION_NOTE
         output = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         self.emit_event(
             {
                 "type": "tool.search.completed",
-                "query": redact_text(args.query),
-                "matches": [name for name, _, _ in matches],
+                "query": query,
+                "matches": [name for name, _ in selected],
+                "omitted_matches": omitted,
             }
         )
         return ToolResult(
             success=True,
             output=output,
+            truncated=bool(omitted),
             token_count=count_output_tokens(output),
         )
 

@@ -1489,6 +1489,12 @@ class AshLoop:
         set_catalog_provider = getattr(search_tool, "set_catalog_provider", None)
         if callable(set_catalog_provider):
             set_catalog_provider(lambda: self.tools)
+        set_activation_budget = getattr(search_tool, "set_activation_budget", None)
+        if callable(set_activation_budget):
+            set_activation_budget(
+                self._search_activation_fits,
+                compact_result=self._compact_search_result,
+            )
         self._plugin_tool_names = {
             name
             for name, tool in self.tools.items()
@@ -5262,6 +5268,45 @@ class AshLoop:
                         visible[review_name] = self.tools[review_name]
             return visible
         return self.tools
+
+    def _search_activation_fits(
+        self, activated_names: set[str], search_output: str
+    ) -> bool:
+        """Bound the *incremental* discovery cost, not the essential tool set.
+
+        Essential tool schemas are already budgeted by the normal runtime. Keep
+        half of the remaining input window for trusted instructions and the
+        current conversation. This cannot make overfull existing history fit.
+        """
+
+        budget = self._resolve_request_token_budget()
+        if budget is None:
+            return True
+        from ash.tools.tool_search import ESSENTIAL_TOOL_NAMES
+
+        base_names = ESSENTIAL_TOOL_NAMES | {"search_tools"}
+        base = {name: tool for name, tool in self.tools.items() if name in base_names}
+        visible = {
+            name: tool
+            for name, tool in self.tools.items()
+            if name in (base_names | activated_names)
+        }
+        base_tokens = self._estimate_tool_schema_tokens(
+            self._tool_schema_payload(base)
+        )
+        full_tokens = self._estimate_tool_schema_tokens(
+            self._tool_schema_payload(visible)
+        )
+        share = max(1, (budget.input_limit - base_tokens) // 2)
+        return (
+            full_tokens - base_tokens
+            + max(0, int(self.provider.count_tokens(search_output)))
+            <= share
+        )
+
+    def _compact_search_result(self) -> bool:
+        budget = self._resolve_request_token_budget()
+        return budget is not None and budget.input_limit <= 4_096
 
     def _tool_schema_payload(
         self,
