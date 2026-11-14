@@ -3745,6 +3745,62 @@ def test_audit_log_hash_chain_detects_tampering(tmp_path: Path) -> None:
     ]
 
 
+def test_automatic_context_restart_rejects_tampered_parent_audit_atomically(
+    tmp_path: Path,
+) -> None:
+    """The durable fork boundary must not trust only an outer caller check."""
+    from ash.core.checkpoints import recover_interrupted_turns
+    from ash.safety.guard import SafetyGuard
+
+    store = SessionStore(tmp_path / "audit-fork.db")
+    source = store.create_session(str(tmp_path), model="openai/gpt-6-luna")
+    store.start_turn(source.session_id, "source-turn", "Fix the code")
+    store.save_tool_call(
+        source.session_id,
+        ToolCallRecord(
+            call_id="known-edit",
+            tool_name="replace_file_content",
+            arguments={"file_path": "module.py"},
+            approved=True,
+            dispatched=True,
+            executed=True,
+            success=True,
+            result="edit completed",
+            error=None,
+            timestamp=datetime.now(timezone.utc),
+        ),
+        turn_id="source-turn",
+    )
+    store.interrupt_turn("source-turn")
+    recovery = recover_interrupted_turns(
+        store, SafetyGuard(tmp_path), source.session_id,
+        include_quiescent_interrupted=True,
+    )
+    assert not recovery.needs_attention
+    audit = store.append_audit_log(
+        source.session_id,
+        action_type="file_write",
+        target_resource="replace_file_content",
+        details={"call_id": "known-edit", "success": True},
+        result="SUCCESS",
+    )
+    with get_db_connection(store.db_path) as conn, conn:
+        conn.execute(
+            "UPDATE audit_logs SET details_json = ? WHERE log_id = ?",
+            ('{"call_id":"known-edit","success":false}', audit.log_id),
+        )
+    assert store.verify_audit_log(source.session_id)
+
+    with pytest.raises(SessionForkConflictError, match="audit integrity"):
+        store.restart_context_session(
+            source.session_id,
+            expected_project_path=tmp_path,
+            user_handoff="Reinspect the existing edit before continuing",
+            automatic=True,
+        )
+    assert len(store.session_tree(source.session_id)) == 1
+
+
 def test_audit_append_serializes_chain_tail_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

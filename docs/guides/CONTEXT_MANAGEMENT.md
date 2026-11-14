@@ -266,7 +266,10 @@ or structured JSON-schema outputs.
 
 The original user task is preserved verbatim in a bounded handoff. Ash first
 closes and reconciles the interrupted turn, verifies its durable recovery
-record, and forks a fresh context without importing any reasoning items,
+record, and checks the parent session's audit hash chain within the same
+durable transaction that authorizes the automatic context fork. A broken
+audit chain blocks the new agent turn until the owner investigates. Ash then
+forks a fresh context without importing any reasoning items,
 tool results, approvals or tool dispatches. Automatic continuation is
 **refused** if the previous turn dispatched any shell command or other
 external tool, even when its result is known, or if it has ambiguous actions,

@@ -6,6 +6,7 @@ import argparse
 from contextlib import asynccontextmanager
 import io
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -153,6 +154,38 @@ async def test_automatic_continuation_uses_fresh_child_and_original_user_task(
     assert loop.session_store.interrupted_recovery_reports(parent.session_id)[0][
         "status"
     ] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_automatic_continuation_refuses_tampered_parent_audit(
+    tmp_path: Path,
+) -> None:
+    """A successful file edit is not enough to trust a broken audit chain."""
+    loop = FailingThenSuccessfulCodingLoop(tmp_path)
+    source = loop.current_session.session_id
+    record = loop.session_store.append_audit_log(
+        source,
+        action_type="file_write",
+        target_resource="replace_file_content",
+        details={"call_id": "previous-edit", "success": True},
+        result="SUCCESS",
+    )
+    with sqlite3.connect(loop.session_store.db_path) as conn:
+        conn.execute(
+            "UPDATE audit_logs SET details_json = ? WHERE log_id = ?",
+            ('{"call_id":"previous-edit","success":false}', record.log_id),
+        )
+    assert loop.session_store.verify_audit_log(source)
+
+    with pytest.raises(SessionForkConflictError, match="audit integrity"):
+        await run_with_context_continuation(
+            loop, "Finish the two-file repair", max_continuations=1
+        )
+    assert loop.model_attempts == 1
+    assert len(loop.session_store.session_tree(source)) == 1
+    assert [call.call_id for call in loop.session_store.load_session(source).tool_calls] == [
+        "call-1"
+    ]
 
 
 @pytest.mark.asyncio

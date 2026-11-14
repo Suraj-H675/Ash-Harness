@@ -5793,6 +5793,30 @@ class SessionStore:
                                 "reconciled coding turn without external "
                                 "actions or unknown tool outcomes"
                             )
+                        # Verify the parent audit chain within this same
+                        # write transaction. A caller-side audit check alone
+                        # is not an atomic authorization for a new agent turn.
+                        audit_rows = conn.execute(
+                            "SELECT log_id, session_id, timestamp, action_type, "
+                            "target_resource, details_json, result, sha256_hash, "
+                            "previous_hash FROM audit_logs WHERE session_id = ? "
+                            "ORDER BY log_id ASC",
+                            (session_id,),
+                        )
+                        try:
+                            audit_errors = self._verify_audit_entries(
+                                _audit_record_from_row(row) for row in audit_rows
+                            )
+                        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                            raise SessionForkConflictError(
+                                "automatic context handoff requires valid "
+                                "source audit integrity"
+                            ) from exc
+                        if audit_errors:
+                            raise SessionForkConflictError(
+                                "automatic context handoff requires valid "
+                                "source audit integrity"
+                            )
                 total_count, retained, removed = _message_boundary_rows(
                     conn,
                     session_id,
@@ -7546,6 +7570,12 @@ class SessionStore:
     def verify_audit_log(self, session_id: str) -> list[str]:
         """Return integrity errors for a session audit chain."""
 
+        return self._verify_audit_entries(self.iter_audit_logs(session_id))
+
+    @staticmethod
+    def _verify_audit_entries(records: Iterable[AuditLogRecord]) -> list[str]:
+        """Check a streamed audit chain, including within an active transaction."""
+
         errors: list[str] = []
         omitted = 0
         previous_hash = ""
@@ -7557,7 +7587,7 @@ class SessionStore:
             else:
                 omitted += 1
 
-        for record in self.iter_audit_logs(session_id):
+        for record in records:
             if record.previous_hash != previous_hash:
                 record_error(f"audit log {record.log_id} previous_hash mismatch")
             expected_hash = _audit_hash(
