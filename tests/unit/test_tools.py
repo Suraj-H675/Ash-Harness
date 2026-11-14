@@ -1056,6 +1056,95 @@ async def test_pytest_failure_locations_remain_redacted_in_full_tool_result(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [0, 1])
+async def test_command_stderr_is_not_a_failure_when_exit_code_is_zero(
+    tmp_path: Path, exit_code: int,
+) -> None:
+    script = (
+        "import sys;"
+        "print('check completed');"
+        "print('nonfatal warning', file=sys.stderr);"
+        f"sys.exit({exit_code})"
+    )
+    result = await RunCommandTool(SafetyGuard(tmp_path)).run(
+        command_line=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+    )
+
+    assert result.success is (exit_code == 0)
+    assert result.exit_code == exit_code
+    assert "check completed" in result.output
+    if exit_code == 0:
+        assert result.error is None
+        assert "[stderr]" in result.output
+        assert "nonfatal warning" in result.output
+    else:
+        assert "nonfatal warning" in (result.error or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unknown_outcome", [False, True])
+async def test_sandboxed_successful_command_stderr_preserves_outcome(
+    guard: SafetyGuard, unknown_outcome: bool,
+) -> None:
+    from ash.sandbox import SANDBOX_TIER_BWRAP
+    from ash.sandbox.manager import SandboxResult
+
+    class WarningSandbox:
+        tier = SANDBOX_TIER_BWRAP
+
+        async def run(self, *_args, **_kwargs) -> SandboxResult:
+            return SandboxResult(
+                exit_code=0,
+                stdout="suite passed\n",
+                stderr="src/app.py:4:2: warning: nonfatal\n",
+                tier=SANDBOX_TIER_BWRAP,
+                backend_name="fixture",
+                outcome_unknown=unknown_outcome,
+            )
+
+    result = await RunCommandTool(guard, sandbox_manager=WarningSandbox()).run(
+        command_line="echo test"
+    )
+    if unknown_outcome:
+        assert result.outcome is ToolExecutionOutcome.UNKNOWN
+        assert "nonfatal" in (result.error or "")
+    else:
+        assert result.success and result.exit_code == 0
+        assert result.error is None
+        assert "[stderr]" in result.output and "nonfatal" in result.output
+        assert result.diagnostics[0]["severity"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_successful_command_bounds_combined_stdout_and_stderr(
+    guard: SafetyGuard,
+) -> None:
+    from ash.sandbox import SANDBOX_TIER_BWRAP
+    from ash.sandbox.manager import SandboxResult
+
+    class VerboseSandbox:
+        tier = SANDBOX_TIER_BWRAP
+
+        async def run(self, *_args, **_kwargs) -> SandboxResult:
+            return SandboxResult(
+                exit_code=0,
+                stdout="head\n" + "progress\n" * 18_000 + "tail\n",
+                stderr="nonfatal verification warning\n",
+                tier=SANDBOX_TIER_BWRAP,
+                backend_name="fixture",
+            )
+
+    result = await RunCommandTool(guard, sandbox_manager=VerboseSandbox()).run(
+        command_line="echo test"
+    )
+    assert result.success and result.exit_code == 0 and result.error is None
+    assert result.truncated
+    assert len(result.output) <= 100_000
+    assert "nonfatal verification warning" in result.output
+    assert "[stderr]" in result.output
+
+
+@pytest.mark.asyncio
 async def test_real_python_command_failure_exposes_source_traceback(
     tmp_path: Path,
 ) -> None:
@@ -2808,8 +2897,9 @@ async def test_run_command_redacts_bare_provider_keys_from_final_result(
     assert result.success is True
     assert provider_key not in result.output
     assert provider_key not in (result.error or "")
-    assert "[REDACTED]" in result.output
-    assert "[REDACTED]" in (result.error or "")
+    assert result.error is None
+    assert "[stderr]" in result.output
+    assert result.output.count("[REDACTED]") == 2
 
 
 @pytest.mark.asyncio

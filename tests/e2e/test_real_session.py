@@ -368,9 +368,12 @@ def test_e2e_session_auto_commits_each_turn(tmp_path: Path) -> None:
     assert "?? unrelated.txt" in status.stdout
 
 
-@pytest.mark.parametrize("repair_and_reverify", [False, True])
+@pytest.mark.parametrize(
+    ("repair_and_reverify", "stderr_warning"),
+    [(False, False), (True, False), (True, True)],
+)
 def test_e2e_auto_commit_does_not_commit_known_failed_verification(
-    tmp_path: Path, repair_and_reverify: bool,
+    tmp_path: Path, repair_and_reverify: bool, stderr_warning: bool,
 ) -> None:
     """A failing post-edit test cannot silently become an automatic commit."""
 
@@ -378,9 +381,19 @@ def test_e2e_auto_commit_does_not_commit_known_failed_verification(
     workspace.mkdir()
     _git_init(workspace)
     db_path = tmp_path / "s.db"
+    if stderr_warning:
+        (workspace / "qa_visible.py").write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "print('nonfatal test warning', file=sys.stderr)\n"
+            "assert Path('answer.txt').read_text() == 'good\\n'\n",
+            encoding="utf-8",
+        )
     verify = [
         '<call_tool name="run_command">',
-        '<arg name="command_line">grep -qx good answer.txt</arg>',
+        '<arg name="command_line">'
+        + ("python3 -B qa_visible.py" if stderr_warning else "grep -qx good answer.txt")
+        + '</arg>',
         "</call_tool>",
     ]
     scripts = [
@@ -423,6 +436,10 @@ def test_e2e_auto_commit_does_not_commit_known_failed_verification(
     assert [r.success for r in records if r.tool_name == "run_command"] == (
         [False, True] if repair_and_reverify else [False]
     )
+    if stderr_warning:
+        passing_check = [r for r in records if r.tool_name == "run_command"][-1]
+        assert passing_check.exit_code == 0 and passing_check.error is None
+        assert "nonfatal test warning" in (passing_check.result or "")
     assert (workspace / "answer.txt").read_text() == (
         "good\n" if repair_and_reverify else "bad\n"
     )

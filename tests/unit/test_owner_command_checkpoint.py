@@ -426,15 +426,21 @@ def test_optional_owner_checkpoint_requires_confirmed_zero_exit_status(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("passes", [True, False])
+@pytest.mark.parametrize("stderr_warning", [False, True])
 async def test_required_check_real_workspace_command_is_run_once(
-    tmp_path: Path, passes: bool,
+    tmp_path: Path, passes: bool, stderr_warning: bool,
 ) -> None:
     from ash.tools.command import RunCommandTool
 
     expected_source = "after = 1\n" if passes else "after = 2\n"
+    warning_prefix = (
+        "import sys\nprint('nonfatal test warning', file=sys.stderr)\n"
+        if stderr_warning else ""
+    )
     (tmp_path / "qa_visible.py").write_text(
-        "from pathlib import Path\n"
-        f"assert Path('module.py').read_text() == {expected_source!r}\n",
+        warning_prefix
+        + "from pathlib import Path\n"
+        + f"assert Path('module.py').read_text() == {expected_source!r}\n",
         encoding="utf-8",
     )
     loop, _ = make_loop(tmp_path)

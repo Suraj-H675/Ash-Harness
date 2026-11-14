@@ -563,7 +563,9 @@ class RunCommandTool(BaseTool):
                 )
         finally:
             streamer.finish()
-        return _preserve_command_tail(result, streamer)
+        return _successful_command_stderr_as_output(
+            _preserve_command_tail(result, streamer)
+        )
 
     async def _run_pty(
         self,
@@ -1075,6 +1077,55 @@ def _truncate_command_output(
         output[:MAX_COMMAND_OUTPUT_CHARS]
         + f"\n[Warning: {notice}]",
         True,
+    )
+
+
+def _successful_command_stderr_as_output(result: ToolResult) -> ToolResult:
+    """Retain nonfatal stderr without recording a false command failure.
+
+    Verification gates use the durable error field as an execution-failure
+    signal. A *known completed* zero-exit command may legitimately write
+    warnings to stderr. Preserve those already-redacted bytes in model-visible
+    output, but never reclassify a failed or ambiguously completed process.
+    """
+
+    if (
+        not result.success
+        or result.exit_code != 0
+        or result.outcome is not ToolExecutionOutcome.COMPLETED
+        or not result.error
+    ):
+        return result
+
+    label = "\n[stderr]\n"
+    stderr = result.error
+    truncated = result.truncated
+    if len(label) + len(stderr) >= MAX_COMMAND_OUTPUT_CHARS:
+        warning = "[Warning: earlier successful-command stderr omitted]\n"
+        available = max(0, MAX_COMMAND_OUTPUT_CHARS - len(label) - len(warning))
+        output = label + warning + (stderr[-available:] if available else "")
+        truncated = True
+    else:
+        available = MAX_COMMAND_OUTPUT_CHARS - len(label) - len(stderr)
+        stdout = result.output
+        if len(stdout) > available:
+            marker = "\n[Warning: stdout middle omitted to retain stderr]\n"
+            if available > len(marker):
+                retained = available - len(marker)
+                head = retained // 2
+                stdout = stdout[:head] + marker + stdout[-(retained - head):]
+            else:
+                stdout = stdout[:available]
+            truncated = True
+        output = stdout + label + stderr
+    return ToolResult(
+        **{
+            **result.model_dump(),
+            "output": output,
+            "error": None,
+            "truncated": truncated,
+            "token_count": count_output_tokens(output),
+        }
     )
 
 

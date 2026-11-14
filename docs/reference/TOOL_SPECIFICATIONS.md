@@ -285,6 +285,11 @@ Tool results report `success` separately from process output and include an
 `exit_code` when the process completed with a known status. Timeouts and other
 unknown outcomes omit the code so a termination status is not presented as a
 completed command result.
+When a command has a **known completed zero exit status**, any nonfatal stderr
+is retained in bounded, redacted output under a `[stderr]` label rather than
+recorded as a tool error. A warning on stderr is not a failed verification;
+nonzero, interrupted, or uncertain command outcomes retain their failure and
+recovery semantics. Combined successful-command output remains capped.
 
 **Coding-failure diagnostics:** For Python tests and scripts, `run_command`
 also extracts bounded, structured source locations from real pytest failure/

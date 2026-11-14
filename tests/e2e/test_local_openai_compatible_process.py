@@ -496,8 +496,8 @@ def test_local_openai_compatible_route_runs_through_fresh_cli_process(
     ],
 )
 @pytest.mark.parametrize(
-    ("multifile_required_check", "final_check"),
-    [(False, True), (True, True), (True, False)],
+    ("multifile_required_check", "final_check", "stderr_warning"),
+    [(False, True, False), (True, True, False), (True, False, False), (True, True, True)],
 )
 def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
     tmp_path: Path,
@@ -506,6 +506,7 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
     native_tools: bool,
     multifile_required_check: bool,
     final_check: bool,
+    stderr_warning: bool,
 ) -> None:
     """Exercise repair and required-check evidence through real provider CLIs."""
     requests: list[dict[str, object]] = []
@@ -758,7 +759,12 @@ def test_local_runtime_fresh_process_completes_file_edit_tool_turn(
                 "from module_a import value\n\ndef result():\n    return value() + 1\n"
             )
             (workspace / "qa_visible.py").write_text(
-                "from module_b import result\nassert result() == 43\n"
+                "from module_b import result\n"
+                + (
+                    "import sys\nprint('nonfatal verification warning', file=sys.stderr)\n"
+                    if stderr_warning else ""
+                )
+                + "assert result() == 43\n"
             )
         (workspace / "unrelated.txt").write_text("preserve unrelated work\n")
         port = int(server.server_address[1])
