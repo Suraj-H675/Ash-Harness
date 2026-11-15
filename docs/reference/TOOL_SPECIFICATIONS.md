@@ -201,6 +201,14 @@ differences can also affect the advisory; run target-version checks when
 relevant. Git-style `apply_patch` retains its separate patch-validation and
 execution path; post-edit feedback does not change its success/failure status.
 
+Git-style `apply_patch` checks patch validity before applying changes, but a
+later filesystem error can leave a **partial multi-file edit** even when the
+`git apply` subprocess exits nonzero. A failed `--check` is a known-completed
+refusal before mutation. Once actual application is attempted, a nonzero exit
+is reported as `ToolResult.outcome=unknown`, not proof that all files stayed
+unchanged. Inspect affected files before any new approved edit; Ash does not
+automatically replay the original patch.
+
 ### 2.4 `list_dir`
 Scans workspace contents.
 

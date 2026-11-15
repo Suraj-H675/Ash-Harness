@@ -95,6 +95,188 @@ async def test_git_inspection_and_patch(tmp_path: Path) -> None:
     assert "initial" in log.output
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="requires unprivileged POSIX filesystem permissions",
+)
+@pytest.mark.asyncio
+async def test_real_git_patch_failure_after_first_file_edit_is_unknown(
+    tmp_path: Path,
+) -> None:
+    """`git apply --check` can pass, yet apply can fail after editing a file."""
+    await _init_repo(tmp_path)
+    first = tmp_path / "first.py"
+    first.write_text("value = 1\n", encoding="utf-8")
+    locked_dir = tmp_path / "z_locked"
+    locked_dir.mkdir()
+    second = locked_dir / "second.py"
+    second.write_text("value = 1\n", encoding="utf-8")
+    patch_text = """--- a/first.py
++++ b/first.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+--- a/z_locked/second.py
++++ b/z_locked/second.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+"""
+    tool = ApplyPatchTool(SafetyGuard(tmp_path))
+    locked_dir.chmod(0o555)
+    try:
+        dry_run = await tool.run(patch=patch_text, dry_run=True)
+        assert dry_run.success is True
+        assert first.read_text() == second.read_text() == "value = 1\n"
+        result = await tool.run(patch=patch_text)
+    finally:
+        locked_dir.chmod(0o755)
+
+    assert first.read_text() == "value = 2\n"
+    assert second.read_text() == "value = 1\n"
+    assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
+    assert "may have changed" in (result.error or "")
+    assert "inspect" in (result.error or "").lower()
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="requires unprivileged POSIX filesystem permissions",
+)
+@pytest.mark.asyncio
+async def test_coding_loop_inspects_partial_patch_instead_of_replaying(
+    tmp_path: Path,
+) -> None:
+    """The provider sees an ambiguous real partial write and checks both files."""
+    import io
+    import shlex
+    import sys
+
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.providers.base import ProviderABC, StreamChunk
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.tools.command import RunCommandTool
+    from ash.tools.filesystem import ReadFileTool
+    from ash.ui.headless import HeadlessUI
+
+    await _init_repo(tmp_path)
+    first = tmp_path / "first.py"
+    first.write_text("value = 1\n", encoding="utf-8")
+    locked_dir = tmp_path / "z_locked"
+    locked_dir.mkdir()
+    second = locked_dir / "second.py"
+    second.write_text("value = 1\n", encoding="utf-8")
+    (tmp_path / "verify_partial.py").write_text(
+        "from pathlib import Path\n"
+        "assert Path('first.py').read_text() == 'value = 2\\n'\n"
+        "assert Path('z_locked/second.py').read_text() == 'value = 1\\n'\n"
+        "print('PARTIAL-PATCH-CONFIRMED')\n",
+        encoding="utf-8",
+    )
+    command = f"{shlex.quote(sys.executable)} -B verify_partial.py"
+    patch_text = """--- a/first.py
++++ b/first.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+--- a/z_locked/second.py
++++ b/z_locked/second.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+"""
+
+    class Provider(ProviderABC):
+        model_name = "scripted-partial-git-patch"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.requests = 0
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests += 1
+            history = repr(messages)
+            if self.requests == 1:
+                calls = [{"id": "one-partial-patch", "name": "apply_patch",
+                          "arguments": {"patch": patch_text}}]
+            elif self.requests == 2:
+                assert "Tool outcome is ambiguous" in history
+                assert "workspace may have changed partially" in history
+                assert first.read_text() == "value = 2\n"
+                assert second.read_text() == "value = 1\n"
+                calls = [
+                    {"id": "inspect-first", "name": "read_file",
+                     "arguments": {"file_path": "first.py"}},
+                    {"id": "inspect-second", "name": "read_file",
+                     "arguments": {"file_path": "z_locked/second.py"}},
+                ]
+            elif self.requests == 3:
+                assert "1: value = 2" in history
+                assert "1: value = 1" in history
+                calls = [{"id": "verify-partial", "name": "run_command",
+                          "arguments": {"command_line": command}}]
+            else:
+                assert self.requests == 4
+                assert "PARTIAL-PATCH-CONFIRMED" in history
+                yield StreamChunk(
+                    content="Partial patch confirmed; second file still needs repair.",
+                    is_done=True,
+                )
+                return
+            yield StreamChunk(is_done=True, native_tool_calls=calls)
+
+    async def approve(name: str, arguments: dict[str, object]) -> bool:
+        if name == "run_command":
+            assert arguments["command_line"] == command
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "partial-patch-loop.db")
+    provider = Provider()
+    loop = AshLoop(
+        store, provider, guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path,
+        tools={
+            "apply_patch": ApplyPatchTool(guard),
+            "read_file": ReadFileTool(guard),
+            "run_command": RunCommandTool(guard),
+        },
+        on_tool_approval=approve,
+    )
+    locked_dir.chmod(0o555)
+    try:
+        session = await loop.start_session()
+        result = await loop.run_turn("Update both modules and verify the result")
+        assert result == "Partial patch confirmed; second file still needs repair."
+        assert provider.requests == 4
+        assert first.read_text() == "value = 2\n"
+        assert second.read_text() == "value = 1\n"
+        calls = store.load_session(session.session_id).tool_calls
+        assert [call.tool_name for call in calls] == [
+            "apply_patch", "read_file", "read_file", "run_command"
+        ]
+        assert calls[0].executed and calls[0].dispatched
+        assert calls[0].success is None
+        assert all(call.success is True for call in calls[1:])
+        assert "PARTIAL-PATCH-CONFIRMED" in (calls[3].result or "")
+        assert store.verify_audit_log(session.session_id) == []
+        assert any(
+            entry.result == "FAILURE"
+            and entry.details.get("call_id") == "one-partial-patch"
+            and entry.details.get("ambiguous") is True
+            for entry in store.list_audit_logs(session.session_id)
+        )
+    finally:
+        locked_dir.chmod(0o755)
+        await loop.aclose()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("staged", [False, True])
 async def test_git_diff_discloses_untracked_source_omitted_from_review(
@@ -380,6 +562,7 @@ async def test_apply_patch_explains_corrupt_hunk_counts(
     )
 
     assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
     assert "corrupt patch at" in (result.error or "")
     assert "context lines count on both sides" in (result.error or "")
     assert "replace_file_edits" in (result.error or "")

@@ -60,7 +60,8 @@ MAX_PATCH_PYTHON_SYNTAX_FILES = 12
 class ApplyPatchTool(BaseTool):
     name = "apply_patch"
     description = (
-        "Validate and atomically apply a git-style unified diff. Include "
+        "Validate and apply a git-style unified diff. A failed apply can leave "
+        "partial changes; inspect affected files before retrying. Include "
         "--- a/path, +++ b/path, and @@ hunk headers; Codex-style "
         "*** Begin Patch blocks are not supported."
     )
@@ -156,7 +157,12 @@ class ApplyPatchTool(BaseTool):
             return ToolResult(
                 success=False,
                 output=applied[1],
-                error=f"Patch apply failed: {applied[2].strip()}",
+                error=(
+                    "Patch apply failed after execution was attempted; the "
+                    "workspace may have changed partially. Inspect the affected "
+                    f"files before retrying. {applied[2].strip()}"
+                ),
+                outcome=ToolExecutionOutcome.UNKNOWN,
             )
         result = ToolResult(
             success=True,
