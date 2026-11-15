@@ -172,6 +172,15 @@ audit verifies. The oracle, tool activity, and final
 model claim are recorded separately so a confident answer cannot substitute
 for a completed edit or successful test.
 
+The grader captures a content-and-permission fingerprint of the isolated
+fixture before inference. Protected tests, documentation, and `keep.txt` must
+retain both their original bytes and file modes. Symlinks, FIFOs, sockets,
+other special filesystem entries, and unreadable files cannot silently disappear
+from protected-file scoring. The existing `workspace_files_sha256` receipt
+continues to contain content-only hashes for normal files, so historical
+receipt consumers are unaffected. These assertions are about the disposable
+workspace, not a guarantee of overall model correctness.
+
 Each trial also includes `setup_seconds`, `cli_seconds`, and `performance`, a
 bounded projection of **persisted, content-free runtime event fields**. The
 projection includes request counts, completed provider-request durations,

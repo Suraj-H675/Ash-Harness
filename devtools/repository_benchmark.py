@@ -36,6 +36,11 @@ from coding_benchmark import (
     command,
     oracle_python,
 )
+from evaluation_files import (
+    UNSAFE_ENTRIES,
+    content_identity,
+    snapshot_workspace_files as snapshot_files,
+)
 
 
 H11_VISIBLE = """from h11._events import Data, EndOfMessage
@@ -1619,24 +1624,10 @@ def fetch_pinned(destination: Path, task: RepositoryTask, sha: str) -> None:
         raise RuntimeError("pinned upstream checkout does not match manifest commit")
 
 
-def snapshot_files(root: Path) -> dict[str, str]:
-    """Track every source-tree entry, including unexpected files and symlinks."""
-    hashes: dict[str, str] = {}
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if relative.parts[0] == ".git":
-            continue
-        if path.is_symlink():
-            hashes[str(relative)] = "SYMLINK"
-        elif path.is_file():
-            hashes[str(relative)] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return hashes
-
-
 def check_edits(
     original: dict[str, str], updated: dict[str, str], editable: frozenset[str]
 ) -> tuple[bool, bool]:
-    if "SYMLINK" in original.values() or "SYMLINK" in updated.values():
+    if UNSAFE_ENTRIES.intersection(original.values()) or UNSAFE_ENTRIES.intersection(updated.values()):
         return False, False
     changed_paths = {
         path
@@ -1649,7 +1640,10 @@ def check_edits(
     # Editable paths may be new or intentionally removed by a refactor.
     # Every other addition, deletion, or content change remains protected.
     protected = changed_paths.issubset(editable)
-    changed = bool(editable) and editable.issubset(changed_paths)
+    changed = bool(editable) and all(
+        content_identity(original.get(path)) != content_identity(updated.get(path))
+        for path in editable
+    )
     return protected, changed
 
 
@@ -1731,10 +1725,15 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
     reference = root / "reference"
     fetch_pinned(baseline, task, task.base_sha)
     fetch_pinned(reference, task, task.reference_fix_sha)
-    if any(
-        "SYMLINK" in snapshot_files(tree).values() for tree in (baseline, reference)
-    ):
+    preflight_values = {
+        value
+        for tree in (baseline, reference)
+        for value in snapshot_files(tree).values()
+    }
+    if "SYMLINK" in preflight_values:
         raise RuntimeError("upstream checkout contains a symlink; refusing model trial")
+    if {"SPECIAL", "UNREADABLE"}.intersection(preflight_values):
+        raise RuntimeError("upstream checkout has special or unreadable files")
     for tree in (baseline, reference):
         visible = tree / task.visible_script
         if visible.exists() or visible.is_symlink():
@@ -1750,7 +1749,11 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
         )
     base_files = snapshot_files(baseline)
     reference_files = snapshot_files(reference)
-    if any(base_files.get(path) == reference_files.get(path) for path in task.editable):
+    if any(
+        content_identity(base_files.get(path))
+        == content_identity(reference_files.get(path))
+        for path in task.editable
+    ):
         raise RuntimeError("reference fix does not modify all required source files")
     added = sorted(
         path
@@ -1767,7 +1770,7 @@ def preflight(task: RepositoryTask, root: Path) -> tuple[Path, dict[str, object]
         for path in task.editable
         if path in base_files
         and path in reference_files
-        and base_files[path] != reference_files[path]
+        and content_identity(base_files[path]) != content_identity(reference_files[path])
     )
     return baseline, {
         "base_visible_exit": base_score["visible_oracle_exit"],

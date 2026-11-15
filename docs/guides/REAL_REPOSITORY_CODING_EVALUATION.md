@@ -94,7 +94,16 @@ also includes numeric `context.usage` slices, making inflated repeated file
 reads distinguishable from static system/tool-schema overhead.
 The grader requires a successful one-shot CLI completion, required source
 edits, an executed authorized test, both external oracles passing, protected
-files unchanged, and verified session audit.
+files unchanged, and verified session audit. The shared Ash/plain-Codex
+source-tree snapshot includes regular-file permission bits as well as content
+hashes; changed protected executable/read/write modes, symlinks, special file
+entries (including named pipes), and unreadable files invalidate the
+protected-file score rather than being ignored. These checks do not measure
+the behavior or security of the model itself.
+Required source changes still demand altered source **content**: a chmod-only
+change to an allowed source does not satisfy the required-edit gate or the
+reference-fix preflight. Historical source hashes and source-path receipts
+are not interpreted as evidence of changed code merely from permission bits.
 
 Ash's `replace_file_content` supports both strictly bounded replacements
 and exact, unique whole-line block matching without line bounds. The

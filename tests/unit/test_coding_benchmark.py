@@ -19,6 +19,9 @@ from ash.core.session import StoredRuntimeEvent
 
 
 _benchmark_path = Path(__file__).resolve().parents[2] / "devtools/coding_benchmark.py"
+_devtools = _benchmark_path.parent
+if str(_devtools) not in sys.path:
+    sys.path.insert(0, str(_devtools))
 _spec = importlib.util.spec_from_file_location(
     "ash_coding_benchmark_under_test", _benchmark_path
 )
@@ -962,10 +965,14 @@ def test_two_file_scoring_requires_both_original_sources_to_change(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
 
-    protected, changed, files = check_workspace_artifacts("two-file", workspace)
+    baseline = _benchmark.snapshot_workspace_files(workspace)
+    protected, changed, files = check_workspace_artifacts(
+        "two-file", workspace, baseline_snapshot=baseline
+    )
     assert protected is True
     assert changed is False
     assert set(files) == {"keep.txt", *task.initial_files}
+    assert files["keep.txt"] == _benchmark.hashlib.sha256(_benchmark.PRESERVED).hexdigest()
 
     tax_path = workspace / "billing/tax.py"
     tax_path.write_bytes(
@@ -974,14 +981,62 @@ def test_two_file_scoring_requires_both_original_sources_to_change(
             b"return subtotal * percent / Decimal('100')",
         )
     )
-    assert check_workspace_artifacts("two-file", workspace)[:2] == (True, False)
+    assert check_workspace_artifacts(
+        "two-file", workspace, baseline_snapshot=baseline
+    )[:2] == (True, False)
 
     receipt_path = workspace / "billing/receipt.py"
     receipt_path.write_bytes(_benchmark.BILLING_RECEIPT.replace(b":.1f}", b":.2f}"))
-    assert check_workspace_artifacts("two-file", workspace)[:2] == (True, True)
+    assert check_workspace_artifacts(
+        "two-file", workspace, baseline_snapshot=baseline
+    )[:2] == (True, True)
 
     (workspace / "test_billing.py").write_text("pass\n", encoding="utf-8")
-    assert check_workspace_artifacts("two-file", workspace)[:2] == (False, True)
+    assert check_workspace_artifacts(
+        "two-file", workspace, baseline_snapshot=baseline
+    )[:2] == (False, True)
+
+
+def test_synthetic_scoring_refuses_protected_mode_only_changes(
+    tmp_path: Path,
+) -> None:
+    import stat
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "keep.txt").write_bytes(_benchmark.PRESERVED)
+    for filename, content in TASKS["two-file"].initial_files.items():
+        target = workspace / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+    baseline = _benchmark.snapshot_workspace_files(workspace)
+    (workspace / "billing/tax.py").write_bytes(b"changed tax\n")
+    (workspace / "billing/receipt.py").write_bytes(b"changed receipt\n")
+    assert check_workspace_artifacts(
+        "two-file", workspace, baseline_snapshot=baseline
+    )[:2] == (True, True)
+    visible = workspace / "test_billing.py"
+    visible.chmod(stat.S_IMODE(visible.stat().st_mode) ^ stat.S_IXUSR)
+
+    assert check_workspace_artifacts(
+        "two-file", workspace, baseline_snapshot=baseline
+    )[:2] == (False, True)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation unavailable")
+def test_synthetic_scoring_refuses_unexpected_special_files(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "keep.txt").write_bytes(_benchmark.PRESERVED)
+    baseline = _benchmark.snapshot_workspace_files(workspace)
+    os.mkfifo(workspace / "unexpected.pipe")
+
+    protected, _, files = check_workspace_artifacts(
+        "marker", workspace, baseline_snapshot=baseline
+    )
+    assert protected is False
+    assert "unexpected.pipe" in files
 
 
 @pytest.mark.skipif(
@@ -1031,8 +1086,11 @@ def test_event_log_oracle_rejects_partial_repairs_and_accepts_three_module_fix(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
+    baseline = _benchmark.snapshot_workspace_files(workspace)
     assert grade("event-log", workspace)["correct"] is False
-    assert check_workspace_artifacts("event-log", workspace)[:2] == (True, False)
+    assert check_workspace_artifacts(
+        "event-log", workspace, baseline_snapshot=baseline
+    )[:2] == (True, False)
 
     parser = workspace / "eventlog/parser.py"
     parser.write_bytes(
@@ -1049,7 +1107,9 @@ def test_event_log_oracle_rejects_partial_repairs_and_accepts_three_module_fix(
         )
     )
     assert grade("event-log", workspace)["correct"] is False
-    assert check_workspace_artifacts("event-log", workspace)[:2] == (True, False)
+    assert check_workspace_artifacts(
+        "event-log", workspace, baseline_snapshot=baseline
+    )[:2] == (True, False)
 
     aggregate = workspace / "eventlog/aggregate.py"
     aggregate.write_bytes(
@@ -1058,7 +1118,9 @@ def test_event_log_oracle_rejects_partial_repairs_and_accepts_three_module_fix(
         ).replace(b"ms or previous", b"ms")
     )
     assert grade("event-log", workspace)["correct"] is False
-    assert check_workspace_artifacts("event-log", workspace)[:2] == (True, False)
+    assert check_workspace_artifacts(
+        "event-log", workspace, baseline_snapshot=baseline
+    )[:2] == (True, False)
 
     renderer = workspace / "eventlog/render.py"
     renderer.write_bytes(_benchmark.EVENTLOG_RENDER.replace(b", reverse=True", b""))
@@ -1067,7 +1129,7 @@ def test_event_log_oracle_rejects_partial_repairs_and_accepts_three_module_fix(
     assert final["visible_oracle_exit"] == 0
     assert final["hidden_oracle_exit"] == 0
     protected, sources_changed, files = check_workspace_artifacts(
-        "event-log", workspace
+        "event-log", workspace, baseline_snapshot=baseline
     )
     assert protected is True
     assert sources_changed is True
@@ -1107,7 +1169,9 @@ def test_event_log_oracle_rejects_partial_repairs_and_accepts_three_module_fix(
     # The external hidden oracle is not a substitute for the protected-file
     # contract: changing tests must still invalidate the scored workspace.
     (workspace / "test_eventlog.py").write_bytes(b"pass\n")
-    assert check_workspace_artifacts("event-log", workspace)[:2] == (False, True)
+    assert check_workspace_artifacts(
+        "event-log", workspace, baseline_snapshot=baseline
+    )[:2] == (False, True)
 
 
 @pytest.mark.skipif(

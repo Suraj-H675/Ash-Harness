@@ -31,6 +31,8 @@ from ash.core.activity import EDIT_TOOL_NAMES, summarize_operational_events
 from ash.core.session import SessionStore
 from ash.providers.openai_chatgpt_auth import ChatGPTAccount, ChatGPTCredentialStore
 
+from evaluation_files import UNSAFE_ENTRIES, content_identity, snapshot_workspace_files
+
 
 REPO = Path(__file__).resolve().parents[1]
 PYTHON = REPO / ".venv/bin/python"
@@ -533,9 +535,9 @@ def grade(task_name: str, workspace: Path) -> dict[str, Any]:
 
 
 def check_workspace_artifacts(
-    task_name: str, workspace: Path
+    task_name: str, workspace: Path, *, baseline_snapshot: dict[str, str]
 ) -> tuple[bool, bool, dict[str, str]]:
-    """Check protected fixture bytes and required source changes, not model claims."""
+    """Check protected bytes, modes, file types, and required source edits."""
     task = TASKS[task_name]
     keep = workspace / "keep.txt"
     protected = keep.is_file() and not keep.is_symlink()
@@ -556,20 +558,24 @@ def check_workspace_artifacts(
         allowed_files.add("marker.txt")
     elif task_name == "build-run":
         allowed_files.add("hello.py")
+    fingerprints = snapshot_workspace_files(workspace)
+    # Keep the historical content-only result receipt for comparability.
     files = {
-        str(path.relative_to(workspace)): (
-            "SYMLINK"
-            if path.is_symlink()
-            else hashlib.sha256(path.read_bytes()).hexdigest()
-        )
-        for path in workspace.rglob("*")
-        if path.is_file() or path.is_symlink()
+        name: content_identity(signature) or "UNREADABLE"
+        for name, signature in fingerprints.items()
     }
+    protected_files = {"keep.txt"} | (set(task.initial_files) - task.editable_files)
     protected = (
-        protected and set(files) <= allowed_files and "SYMLINK" not in files.values()
+        protected
+        and set(files) <= allowed_files
+        and not UNSAFE_ENTRIES.intersection(fingerprints.values())
+        and all(
+            fingerprints.get(name) == baseline_snapshot.get(name)
+            for name in protected_files
+        )
     )
     sources_changed = all(
-        files.get(filename) is not None
+        fingerprints.get(filename, "").startswith("FILE:")
         and files[filename] != hashlib.sha256(task.initial_files[filename]).hexdigest()
         for filename in task.editable_files
     )
@@ -641,6 +647,7 @@ def run_trial(
             target = workspace / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
+        baseline_snapshot = snapshot_workspace_files(workspace)
         (home / ".ash").mkdir()
         if chatgpt_model_id:
             assert chatgpt_account is not None
@@ -812,7 +819,7 @@ def run_trial(
                 ]
         outcome = grade(task_name, workspace)
         protected, sources_changed, files = check_workspace_artifacts(
-            task_name, workspace
+            task_name, workspace, baseline_snapshot=baseline_snapshot
         )
         required = any(
             (

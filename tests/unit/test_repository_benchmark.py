@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 from dataclasses import replace
@@ -339,6 +341,89 @@ def test_repository_snapshot_and_protected_edits_refuse_unexpected_changes(
     source.symlink_to(tmp_path / "qa_visible.py")
     assert bench.check_edits(
         baseline, bench.snapshot_files(tmp_path), frozenset({"h11/_readers.py"})
+    ) == (False, False)
+
+
+def test_repository_scoring_refuses_protected_file_mode_change(tmp_path: Path) -> None:
+    source = tmp_path / "module.py"
+    qa = tmp_path / "qa_visible.py"
+    source.write_text("VALUE = 0\n", encoding="utf-8")
+    qa.write_text("assert True\n", encoding="utf-8")
+    original = bench.snapshot_files(tmp_path)
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    assert bench.check_edits(
+        original, bench.snapshot_files(tmp_path), frozenset({"module.py"})
+    ) == (True, True)
+
+    original_mode = stat.S_IMODE(qa.stat().st_mode)
+    qa.chmod(original_mode ^ stat.S_IXUSR)
+    assert qa.read_bytes() == b"assert True\n"
+    assert bench.check_edits(
+        original, bench.snapshot_files(tmp_path), frozenset({"module.py"})
+    ) == (False, True)
+
+
+def test_repository_required_source_edits_cannot_be_mode_only(tmp_path: Path) -> None:
+    source = tmp_path / "module.py"
+    source.write_text("VALUE = 0\n", encoding="utf-8")
+    original = bench.snapshot_files(tmp_path)
+
+    source.chmod(stat.S_IMODE(source.stat().st_mode) ^ stat.S_IXUSR)
+    assert bench.check_edits(
+        original, bench.snapshot_files(tmp_path), frozenset({"module.py"})
+    ) == (True, False)
+
+
+def test_repository_preflight_refuses_reference_mode_only_source_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = bench.TASKS["h11-chunk-footer"]
+
+    def fake_fetch(destination: Path, _task: object, sha: str) -> None:
+        destination.mkdir()
+        source = destination / "h11/_readers.py"
+        source.parent.mkdir()
+        source.write_text("same source\n", encoding="utf-8")
+        if sha == task.reference_fix_sha:
+            source.chmod(stat.S_IMODE(source.stat().st_mode) ^ stat.S_IXUSR)
+
+    def fake_oracle(workspace: Path, _task: object) -> dict[str, object]:
+        passed = workspace.name == "reference"
+        return {
+            "correct": passed,
+            "visible_oracle_exit": 0 if passed else 1,
+            "hidden_oracle_exit": 0 if passed else 1,
+        }
+
+    monkeypatch.setattr(bench, "fetch_pinned", fake_fetch)
+    monkeypatch.setattr(bench, "check_oracles", fake_oracle)
+    with pytest.raises(RuntimeError, match="reference fix does not modify"):
+        bench.preflight(task, tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation unavailable")
+def test_repository_scoring_refuses_special_files_even_if_source_is_correct(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "module.py"
+    qa = tmp_path / "qa_visible.py"
+    source.write_text("VALUE = 0\n", encoding="utf-8")
+    qa.write_text("assert True\n", encoding="utf-8")
+    original = bench.snapshot_files(tmp_path)
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+
+    os.mkfifo(tmp_path / "unexpected.pipe")
+    updated = bench.snapshot_files(tmp_path)
+    assert "unexpected.pipe" in updated
+    assert bench.check_edits(original, updated, frozenset({"module.py"})) == (
+        False, False,
+    )
+
+    (tmp_path / "unexpected.pipe").unlink()
+    source.unlink()
+    os.mkfifo(source)
+    assert bench.check_edits(
+        original, bench.snapshot_files(tmp_path), frozenset({"module.py"})
     ) == (False, False)
 
 
