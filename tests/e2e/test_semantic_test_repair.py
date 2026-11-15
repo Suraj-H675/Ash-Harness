@@ -14,8 +14,9 @@ from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
+from ash.tools.base import ToolMiddleware, ToolMiddlewareSkip
 from ash.tools.command import RunCommandTool
-from ash.tools.filesystem import ReplaceFileContentTool, ReplaceFileEditsTool
+from ash.tools.filesystem import ReplaceFileContentTool, ReplaceFileEditsTool, WriteFileTool
 from ash.ui.headless import HeadlessUI
 
 
@@ -291,5 +292,123 @@ async def test_redundant_atomic_edit_batch_fails_then_real_check_verifies_retry(
         assert "edit 2" in (recorded[0].error or "")
         assert "CHECK-PASSED" in (recorded[2].result or "")
         assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_tool", ["write_file", "run_command"])
+async def test_skipped_coding_action_is_visible_as_failure_and_retried_deliberately(
+    tmp_path: Path, skip_tool: str,
+) -> None:
+    """A skipped write/check cannot masquerade as a completed coding action."""
+
+    (tmp_path / "verify.py").write_text(
+        "from pathlib import Path\n"
+        "from app import VALUE\n"
+        "assert VALUE == 42\n"
+        "Path('verified.txt').write_text('verified', encoding='utf-8')\n"
+        "print('CHECK-PASSED')\n",
+        encoding="utf-8",
+    )
+    command = f"{shlex.quote(sys.executable)} -B verify.py"
+
+    class SkipOnce(ToolMiddleware):
+        def __init__(self) -> None:
+            self.skipped = False
+
+        async def before_tool(self, name, arguments, tool) -> None:
+            if name == skip_tool and not self.skipped:
+                self.skipped = True
+                raise ToolMiddlewareSkip()
+
+    class Provider(ProviderABC):
+        model_name = "scripted-skip-retry"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.requests = 0
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests += 1
+            step = self.requests
+            if step == 1 or (step == 2 and skip_tool == "write_file"):
+                if step == 2:
+                    assert not (tmp_path / "app.py").exists()
+                    assert "Tool was not executed" in repr(messages)
+                    assert '"success": false' in repr(messages).lower()
+                calls = [{
+                    "id": f"write-{step}", "name": "write_file",
+                    "arguments": {
+                        "file_path": "app.py", "content": "VALUE = 42\n",
+                        "overwrite": False,
+                    },
+                }]
+            elif step in (2, 3):
+                assert (tmp_path / "app.py").read_text() == "VALUE = 42\n"
+                if step == 3 and skip_tool == "run_command":
+                    assert not (tmp_path / "verified.txt").exists()
+                    assert "Tool was not executed" in repr(messages)
+                    assert '"success": false' in repr(messages).lower()
+                calls = [{
+                    "id": f"check-{step}", "name": "run_command",
+                    "arguments": {"command_line": command},
+                }]
+            else:
+                assert step == 4
+                assert "CHECK-PASSED" in repr(messages)
+                yield StreamChunk(content="Verified after deliberate retry.", is_done=True)
+                return
+            yield StreamChunk(is_done=True, native_tool_calls=calls)
+
+    async def approve(tool_name: str, arguments: dict[str, object]) -> bool:
+        if tool_name == "run_command":
+            assert arguments["command_line"] == command
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / f"skip-{skip_tool}.db")
+    provider = Provider()
+    loop = AshLoop(
+        store, provider, guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path,
+        tools={
+            "write_file": WriteFileTool(guard),
+            "run_command": RunCommandTool(guard),
+        },
+        tool_middlewares=[SkipOnce()],
+        on_tool_approval=approve,
+    )
+    try:
+        session = await loop.start_session()
+        response = await loop.run_turn("Write app.py and verify it using verify.py")
+        assert response == "Verified after deliberate retry."
+        assert provider.requests == 4
+        assert (tmp_path / "verified.txt").read_text() == "verified"
+        calls = store.load_session(session.session_id).tool_calls
+        expected = (
+            ["write_file", "write_file", "run_command"]
+            if skip_tool == "write_file"
+            else ["write_file", "run_command", "run_command"]
+        )
+        assert [item.tool_name for item in calls] == expected
+        assert [item.executed for item in calls] == (
+            [False, True, True] if skip_tool == "write_file" else [True, False, True]
+        )
+        skipped = [item for item in calls if not item.executed]
+        assert len(skipped) == 1
+        assert skipped[0].dispatched is True
+        assert skipped[0].success is not True
+        assert "Tool was not executed" in (skipped[0].error or "")
+        assert store.verify_audit_log(session.session_id) == []
+        assert any(
+            entry.result == "FAILURE"
+            and entry.details.get("call_id") == skipped[0].call_id
+            for entry in store.list_audit_logs(session.session_id)
+        )
     finally:
         await loop.aclose()

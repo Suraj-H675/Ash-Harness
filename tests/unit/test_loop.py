@@ -59,7 +59,7 @@ from ash.tools.browser import (
     BrowserUnavailableError,
     build_browser_tools,
 )
-from ash.tools.filesystem import ReadFileTool
+from ash.tools.filesystem import ReadFileTool, WriteFileTool
 from ash.tools.search import GlobFilesTool, ListDirectoryTool, SearchTextTool
 from pathlib import Path
 import tempfile
@@ -10083,9 +10083,13 @@ async def test_middleware_skip_persists_effect_boundary_without_tool_execution(
 
     assert results == [
         {
-            "success": True,
+            "success": False,
             "output": "skipped by middleware",
-            "error": None,
+            "error": (
+                "Tool was not executed: pre-execution middleware skipped "
+                "tool.run(). Earlier hooks or middleware may have run; "
+                "inspect before retrying any external side effects."
+            ),
             "truncated": False,
             "token_count": 0,
         }
@@ -10094,10 +10098,59 @@ async def test_middleware_skip_persists_effect_boundary_without_tool_execution(
     assert record.executed is False
     assert record.dispatched is True
     assert record.result == "skipped by middleware"
-    assert record.error is None
+    assert record.error == results[0]["error"]
+    assert record.success is not True
     skipped = [event for event in ui.events if event["type"] == "tool.skipped"]
     assert len(skipped) == 1
     assert skipped[0]["dispatched"] is True
+    assert skipped[0]["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_middleware_skip_never_reports_a_write_as_success(tmp_path) -> None:
+    """A skipped write must not be reported as a successful model tool action."""
+    store = SessionStore(tmp_path / "skip-real-write.db")
+    guard = SafetyGuard(project_root=tmp_path)
+    ui = EventUI()
+    loop = AshLoop(
+        store,
+        NativeToolProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={"write_file": WriteFileTool(guard)},
+        tool_middlewares=[SkipMiddleware()],
+        safety_tier="auto_approve",
+    )
+    try:
+        session = await loop.start_session()
+        results = await loop._execute_tool_calls(
+            [{
+                "call_id": "skipped-write",
+                "name": "write_file",
+                "arguments": {"file_path": "not-created.py", "content": "VALUE = 42\n"},
+            }],
+            session,
+            persist_tool_messages=True,
+        )
+
+        assert len(results) == 1
+        assert results[0]["success"] is False
+        assert "skipped by middleware" in results[0]["output"]
+        assert "not executed" in results[0]["error"]
+        assert not (tmp_path / "not-created.py").exists()
+        record = store.load_session(session.session_id).tool_calls[-1]
+        assert record.executed is False
+        assert record.dispatched is True  # pre-hooks may have acted
+        assert record.success is not True
+        assert record.error == results[0]["error"]
+        assert store.verify_audit_log(session.session_id) == []
+        assert store.list_audit_logs(session.session_id)[-1].result == "FAILURE"
+        event = next(event for event in ui.events if event["type"] == "tool.skipped")
+        assert event["success"] is False
+        assert event["dispatched"] is True
+    finally:
+        await loop.aclose()
 
 
 @pytest.mark.asyncio

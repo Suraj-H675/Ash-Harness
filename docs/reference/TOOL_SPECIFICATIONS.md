@@ -40,6 +40,10 @@ fail-closed default for every built-in, plugin, and MCP-backed tool.
 
 Ash persists an approved tool intent before dispatch. It runs policy hooks and
 pre-execution middleware first; a middleware skip never invokes `tool.run()`.
+The tool result for a middleware skip is an explicit failure, never a
+successful edit or verification. The durable call still records dispatch
+before pre-execution hooks, since hooks or middleware may have had other
+effects; an agent must not blindly retry those effects.
 Immediately before `tool.run()` begins, Ash emits `tool.started`. From that
 point forward the runtime invokes that call exactly once. A returned failed
 `ToolResult` is a terminal tool outcome. `ToolResult.outcome` is `completed` by

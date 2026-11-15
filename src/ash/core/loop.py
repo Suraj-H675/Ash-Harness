@@ -6871,7 +6871,13 @@ class AshLoop:
                     )
                 except ToolMiddlewareSkip:
                     tool_result = ToolResult(
-                        success=True, output="skipped by middleware", error=None
+                        success=False,
+                        output="skipped by middleware",
+                        error=(
+                            "Tool was not executed: pre-execution middleware skipped "
+                            "tool.run(). Earlier hooks or middleware may have run; "
+                            "inspect before retrying any external side effects."
+                        ),
                     )
                 else:
                     self._emit_event({"type": "tool.started", **event_base})
