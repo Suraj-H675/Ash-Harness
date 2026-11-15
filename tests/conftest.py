@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import inspect
 import ipaddress
 import os
@@ -20,6 +21,29 @@ _ORIGINAL_CONNECT = socket.socket.connect
 _ORIGINAL_CONNECT_EX = socket.socket.connect_ex
 _PATH_HOME_WAS_OWNED = "home" in Path.__dict__
 _ORIGINAL_PATH_HOME = inspect.getattr_static(Path, "home")
+
+
+def pytest_make_parametrize_id(
+    config: pytest.Config, val: object, argname: str,
+) -> str | None:
+    """Keep adversarial test payloads out of GitHub Actions' verbose log lines.
+
+    Tests still receive their original values. Hashes distinguish otherwise
+    identical-length cases without echoing potentially private input bytes.
+    """
+    if isinstance(val, str):
+        if len(val) <= 96:
+            return None
+        raw = val.encode("utf-8", errors="surrogatepass")
+        kind = "text"
+    elif isinstance(val, bytes):
+        if len(val) <= 96:
+            return None
+        raw = val
+        kind = "bytes"
+    else:
+        return None
+    return f"{argname}-{kind}-{len(val)}-{hashlib.sha256(raw).hexdigest()[:12]}"
 
 
 def _remember_and_set(name: str, value: str) -> None:
