@@ -762,13 +762,14 @@ class ReplaceFileContentTool(BaseTool):
                 recovery_hint = _unique_line_mismatch_hint(
                     original_text, normalized_target, start_index, end_index
                 )
+                mismatch, truncated = _build_mismatch_error(
+                    normalized_target, normalized_segment
+                )
                 return ToolResult(
                     success=False,
                     output="",
-                    error=(
-                        _build_mismatch_error(normalized_target, normalized_segment)
-                        + recovery_hint
-                    ),
+                    error=mismatch + recovery_hint,
+                    truncated=truncated,
                 )
 
         replacement_lines = _replacement_lines_for_span(
@@ -882,14 +883,18 @@ class ReplaceFileEditsTool(BaseTool):
                 _normalize_line_endings(edit.target_content)
             )
             if normalized_segment != normalized_target:
+                mismatch, truncated = _build_mismatch_error(
+                    normalized_target, normalized_segment
+                )
                 return ToolResult(
                     success=False,
                     output="",
                     error=(
                         f"Error: edit {index} target_content does not match "
                         "the specified line range.\n"
-                        f"{_build_mismatch_error(normalized_target, normalized_segment)}"
+                        f"{mismatch}"
                     ),
+                    truncated=truncated,
                 )
             replacement_lines = _replacement_lines_for_span(
                 lines, edit.start_line - 1, edit.end_line, edit.replacement_content
@@ -1294,18 +1299,95 @@ def _validate_non_overlapping_edits(
     return None
 
 
-def _build_mismatch_error(expected: str, actual: str) -> str:
-    diff = "\n".join(
-        difflib.unified_diff(
-            expected.splitlines(),
-            actual.splitlines(),
-            fromfile="target_content",
-            tofile="file_segment",
-            lineterm="",
+_MAX_FULL_MISMATCH_INPUT_BYTES = 4_096
+_MAX_MISMATCH_PREVIEW_LINE_BYTES = 256
+
+
+def _build_mismatch_error(expected: str, actual: str) -> tuple[str, bool]:
+    """Bound failed-edit feedback before it enters protected model history.
+
+    Large mismatches show the first differing physical line and nearby context
+    instead of echoing the full rejected source/target blocks. The excerpt is
+    a diagnostic only: it never relaxes exact matching or selects an edit.
+    """
+    truncated = (
+        len(expected.encode("utf-8")) + len(actual.encode("utf-8"))
+        > _MAX_FULL_MISMATCH_INPUT_BYTES
+    )
+    if truncated:
+        expected_lines = _source_lines(expected)
+        actual_lines = _source_lines(actual)
+        first = next(
+            (
+                index
+                for index, (wanted, found) in enumerate(
+                    zip(expected_lines, actual_lines)
+                )
+                if wanted != found
+            ),
+            min(len(expected_lines), len(actual_lines)),
         )
+        start = max(0, first - 2)
+        end = first + 4
+        wanted_line = expected_lines[first] if first < len(expected_lines) else ""
+        found_line = actual_lines[first] if first < len(actual_lines) else ""
+        first_column = next(
+            (
+                index
+                for index, (wanted, found) in enumerate(
+                    zip(wanted_line, found_line)
+                )
+                if wanted != found
+            ),
+            min(len(wanted_line), len(found_line)),
+        )
+
+        def excerpt(lines: list[str]) -> list[str]:
+            rendered: list[str] = []
+            for index in range(start, min(end, len(lines))):
+                line = lines[index]
+                encoded = line.encode("utf-8")
+                if len(encoded) > _MAX_MISMATCH_PREVIEW_LINE_BYTES:
+                    if index == first:
+                        # The first mismatch may be deep into a long line.
+                        # Show the differing column, not an identical prefix.
+                        column_start = max(0, first_column - 32)
+                        line = (
+                            f"[excerpt from column {column_start + 1}] "
+                            + line[column_start : column_start + 64]
+                            + " [line truncated]"
+                        )
+                    else:
+                        line = (
+                            encoded[:_MAX_MISMATCH_PREVIEW_LINE_BYTES].decode(
+                                "utf-8", errors="ignore"
+                            )
+                            + " [line truncated]"
+                        )
+                rendered.append(line)
+            return rendered
+
+        diff_lines = difflib.unified_diff(
+            excerpt(expected_lines), excerpt(actual_lines),
+            fromfile="target_content", tofile="file_segment", lineterm="",
+        )
+        note = (
+            "\n[diff truncated: excerpt near first mismatch at "
+            f"line {first + 1}; target_content={len(expected_lines)} lines; "
+            f"file_segment={len(actual_lines)} lines. Other differences omitted.]"
+        )
+    else:
+        diff_lines = difflib.unified_diff(
+            _source_lines(expected), _source_lines(actual),
+            fromfile="target_content", tofile="file_segment", lineterm="",
+        )
+        note = ""
+    diff = "\n".join(
+        diff_lines
     )
     return (
         "Error: target_content does not match the specified line range. "
         "Read the file again and copy the exact complete lines, including indentation."
-        f"\n{diff}"
+        f"\n{diff}{note}",
+        truncated,
     )

@@ -2763,6 +2763,114 @@ async def test_replace_file_edits_rejects_mismatch_without_partial_write(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("batch", [False, True])
+async def test_failed_large_exact_edit_reports_bounded_actionable_mismatch(
+    project_root: Path, guard: SafetyGuard, batch: bool,
+) -> None:
+    """A pre-write refusal must not flood protected model context with diff text."""
+    target = project_root / "module.py"
+    original = "".join(
+        f"    result_{i:04d} = original_value_{i:04d}\n" for i in range(900)
+    )
+    incorrect_target = "".join(
+        f"    result_{i:04d} = desired_value_{i:04d}\n" for i in range(900)
+    )
+    target.write_text(original, encoding="utf-8")
+    if batch:
+        result = await ReplaceFileEditsTool(guard).run(
+            file_path="module.py", edits=[{
+                "start_line": 1, "end_line": 900,
+                "target_content": incorrect_target,
+                "replacement_content": "not written",
+            }],
+        )
+    else:
+        result = await ReplaceFileContentTool(guard).run(
+            file_path="module.py", start_line=1, end_line=900,
+            target_content=incorrect_target,
+            replacement_content="not written",
+        )
+    assert not result.success
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert result.truncated is True
+    assert len((result.error or "").encode("utf-8")) <= 8192
+    assert "target_content" in (result.error or "")
+    assert "file_segment" in (result.error or "")
+    assert "line 1" in (result.error or "")
+    assert "Read the file again" in (result.error or "")
+    assert "truncated" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_failed_exact_edit_locates_late_mismatch_without_echoing_large_lines(
+    project_root: Path, guard: SafetyGuard,
+) -> None:
+    target = project_root / "module.py"
+    prefix = "".join(f"unchanged_{i:04d} = True\n" for i in range(899))
+    original = prefix + 'line_900 = "' + "🚀" * 10_000 + '"\n'
+    expected = prefix + 'line_900 = "' + "🛰" * 10_000 + '"\n'
+    target.write_text(original, encoding="utf-8")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="module.py", start_line=1, end_line=900,
+        target_content=expected, replacement_content="not written",
+    )
+    assert not result.success
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert result.truncated is True
+    assert len((result.error or "").encode("utf-8")) <= 8192
+    assert "line 900" in (result.error or "")
+    assert "🚀" in (result.error or "")
+    assert "🛰" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_long_line_mismatch_excerpt_shows_actual_differing_column(
+    project_root: Path, guard: SafetyGuard,
+) -> None:
+    """Long shared prefixes must not make a truncated diff look identical."""
+    target = project_root / "module.py"
+    prefix = 'message = "' + "unchanged_" * 1200
+    original = prefix + 'ACTUAL_VALUE"\n'
+    expected = prefix + 'WRONG_VALUE"\n'
+    target.write_text(original, encoding="utf-8")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="module.py", start_line=1, end_line=1,
+        target_content=expected, replacement_content="not written",
+    )
+    assert not result.success and result.truncated
+    assert len((result.error or "").encode("utf-8")) <= 8192
+    assert "ACTUAL_VALUE" in (result.error or "")
+    assert "WRONG_VALUE" in (result.error or "")
+    assert "column" in (result.error or "")
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_small_exact_edit_mismatch_keeps_full_unified_diff(
+    project_root: Path, guard: SafetyGuard,
+) -> None:
+    target = project_root / "module.py"
+    target.write_text("alpha = 1\nbeta = 2\n", encoding="utf-8")
+
+    result = await ReplaceFileContentTool(guard).run(
+        file_path="module.py", start_line=2, end_line=2,
+        target_content="beta = 3", replacement_content="beta = 4",
+    )
+    assert not result.success
+    assert result.truncated is False
+    assert "--- target_content" in (result.error or "")
+    assert "+++ file_segment" in (result.error or "")
+    assert "-beta = 3" in (result.error or "")
+    assert "+beta = 2" in (result.error or "")
+    assert "diff truncated" not in (result.error or "")
+    assert target.read_text(encoding="utf-8") == "alpha = 1\nbeta = 2\n"
+
+
+@pytest.mark.asyncio
 async def test_replace_file_edits_rejects_overlapping_ranges(
     project_root: Path,
     guard: SafetyGuard,

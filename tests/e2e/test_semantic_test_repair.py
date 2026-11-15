@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from ash.config import AshConfig
 from ash.core.loop import AshLoop
 from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC, StreamChunk
@@ -26,6 +27,113 @@ from ash.tools.filesystem import (
 )
 from ash.tools.search import SearchTextTool
 from ash.ui.headless import HeadlessUI
+
+
+@pytest.mark.asyncio
+async def test_rejected_large_edit_preserves_context_for_repair_and_real_check(
+    tmp_path: Path,
+) -> None:
+    """Bound a refused edit so the next native-tool request can still proceed."""
+    source = tmp_path / "module.py"
+    source.write_text(
+        "".join(f"result_{index:04d} = {index}\n" for index in range(900)),
+        encoding="utf-8",
+    )
+    bad_target = "".join(
+        f"result_{index:04d} = wrong_{index:04d}\n" for index in range(900)
+    )
+    (tmp_path / "verify.py").write_text(
+        "from module import result_0000, result_0899\n"
+        "assert result_0000 == 0\n"
+        "assert result_0899 == 999\n"
+        "print('RECOVERY-CHECK-PASSED')\n",
+        encoding="utf-8",
+    )
+    command = f"{shlex.quote(sys.executable)} -B verify.py"
+
+    class Provider(ProviderABC):
+        model_name = "scripted-large-edit-recovery"
+        _ash_declared_capabilities = ProviderCapabilities(
+            native_tools=True, context_window=16_384
+        )
+
+        def __init__(self) -> None:
+            self.requests = 0
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests += 1
+            history = repr(messages)
+            if self.requests == 1:
+                calls = [{"id": "failed-large-edit", "name": "replace_file_content",
+                          "arguments": {"file_path": "module.py", "start_line": 1,
+                                        "end_line": 900, "target_content": bad_target,
+                                        "replacement_content": "not written"}}]
+            elif self.requests == 2:
+                assert "diff truncated" in history
+                assert "first mismatch at line 1" in history
+                assert source.read_text(encoding="utf-8").endswith(
+                    "result_0899 = 899\n"
+                )
+                calls = [{"id": "correct-edit", "name": "replace_file_content",
+                          "arguments": {"file_path": "module.py", "start_line": 900,
+                                        "end_line": 900,
+                                        "target_content": "result_0899 = 899",
+                                        "replacement_content": "result_0899 = 999"}}]
+            elif self.requests == 3:
+                assert source.read_text(encoding="utf-8").endswith(
+                    "result_0899 = 999\n"
+                )
+                calls = [{"id": "verify", "name": "run_command",
+                          "arguments": {"command_line": command}}]
+            else:
+                assert self.requests == 4
+                assert "RECOVERY-CHECK-PASSED" in history
+                yield StreamChunk(content="Fixed and independently checked.", is_done=True)
+                return
+            yield StreamChunk(is_done=True, native_tool_calls=calls)
+
+    async def approve(tool_name: str, arguments: dict[str, object]) -> bool:
+        if tool_name == "run_command":
+            assert arguments["command_line"] == command
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "large-edit-context.db")
+    provider = Provider()
+    loop = AshLoop(
+        store, provider, guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path,
+        tools={
+            "replace_file_content": ReplaceFileContentTool(guard),
+            "run_command": RunCommandTool(guard),
+        },
+        config=AshConfig(
+            model="local/large-edit-context", workspace_root=tmp_path,
+            db_directory=tmp_path / "db", max_context_tokens=16_384,
+            max_completion_tokens=1_024, memory_backend="off",
+        ),
+        on_tool_approval=approve,
+    )
+    try:
+        session = await loop.start_session()
+        response = await loop.run_turn("Correct the last line, then run verify.py")
+        assert response == "Fixed and independently checked."
+        assert provider.requests == 4
+        calls = store.load_session(session.session_id).tool_calls
+        assert [call.tool_name for call in calls] == [
+            "replace_file_content", "replace_file_content", "run_command"
+        ]
+        assert [call.success for call in calls] == [False, True, True]
+        assert calls[0].error and "diff truncated" in calls[0].error
+        assert calls[1].success and calls[2].exit_code == 0
+        assert "RECOVERY-CHECK-PASSED" in (calls[2].result or "")
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
 
 
 @pytest.mark.asyncio
