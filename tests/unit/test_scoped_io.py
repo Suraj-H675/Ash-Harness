@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from ash.safety.guard import SafetyGuard, SafetyViolation
+from ash.safety.anchored_fs import AnchoredDirectory
 from ash.safety.scoped_io import (
     ScopedFileChanged,
     ScopedIOError,
@@ -26,6 +27,26 @@ from ash.safety.scoped_io import (
     stat_scoped_path,
     workspace_mutation_lock,
 )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptor")
+def test_anchored_directory_listing_uses_fresh_cursor_and_original_inode(
+    tmp_path: Path,
+) -> None:
+    """Enumerating a held directory must not inherit another reader's offset."""
+    original = tmp_path / "source"
+    original.mkdir()
+    (original / "plugin.json").write_text("{}", encoding="utf-8")
+    with AnchoredDirectory.open(original, create=False, private=False) as held:
+        os.lseek(held.descriptor, 0, os.SEEK_END)
+        assert held.list_names() == ["plugin.json"]
+
+        displaced = tmp_path / "displaced"
+        original.rename(displaced)
+        original.mkdir()
+        (original / "hostile.json").write_text("{}", encoding="utf-8")
+        os.lseek(held.descriptor, 0, os.SEEK_END)
+        assert held.list_names() == ["plugin.json"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX directory descriptor")

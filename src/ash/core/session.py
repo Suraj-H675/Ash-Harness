@@ -6809,7 +6809,49 @@ class SessionStore:
     ) -> None:
         """Save or update a tool execution record."""
 
+        self._validate_new_tool_call_state(record)
         with closing(self._connect()) as conn, conn:
+            # A call ID represents one exact operation. Check while holding
+            # the SQLite writer lock so concurrent writers cannot rebind it.
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT tool_name, arguments_json, approved, dispatched, executed, "
+                "result, error, success, exit_code, turn_id "
+                "FROM tool_calls WHERE session_id = ? AND call_id = ?",
+                (session_id, record.call_id),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["tool_name"] != record.tool_name
+                    or json.loads(existing["arguments_json"]) != record.arguments
+                    or (
+                        turn_id is not None
+                        and existing["turn_id"] is not None
+                        and existing["turn_id"] != turn_id
+                    )
+                ):
+                    raise SessionStorageError("conflicting tool-call identity")
+                if (
+                    (existing["approved"] and not record.approved)
+                    or (existing["dispatched"] and not record.dispatched)
+                    or (existing["executed"] and not record.executed)
+                ):
+                    raise SessionStorageError("tool-call state cannot move backward")
+                if (
+                    existing["result"] is not None
+                    or existing["error"] is not None
+                    or existing["success"] is not None
+                    or existing["exit_code"] is not None
+                ) and (
+                    existing["result"] != record.result
+                    or existing["error"] != record.error
+                    or existing["success"] != record.success
+                    or existing["exit_code"] != record.exit_code
+                    or bool(existing["approved"]) != record.approved
+                    or bool(existing["dispatched"]) != record.dispatched
+                    or bool(existing["executed"]) != record.executed
+                ):
+                    raise SessionStorageError("terminal tool-call state is immutable")
             conn.execute(
                 """
                 INSERT INTO tool_calls (
@@ -6829,8 +6871,6 @@ class SessionStore:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, call_id) DO UPDATE SET
-                    tool_name = excluded.tool_name,
-                    arguments_json = excluded.arguments_json,
                     approved = excluded.approved,
                     executed = excluded.executed,
                     dispatched = excluded.dispatched,
@@ -6862,6 +6902,15 @@ class SessionStore:
                     conn, session_id, record.call_id
                 )
 
+    @staticmethod
+    def _validate_new_tool_call_state(record: ToolCallRecord) -> None:
+        # Pending, approved, and dispatched-but-not-executed are legitimate;
+        # the latter represents a potentially ambiguous external side effect.
+        if (record.dispatched and not record.approved) or (
+            record.executed and not record.dispatched
+        ):
+            raise SessionStorageError("inconsistent tool-call state")
+
     def finalize_tool_call_with_message(
         self,
         session_id: str,
@@ -6875,6 +6924,8 @@ class SessionStore:
 
         if message.role != "tool" or message.metadata.get("call_id") != record.call_id:
             raise SessionStorageError("conflicting terminal tool message identity")
+
+        self._validate_new_tool_call_state(record)
 
         with closing(self._connect()) as conn, conn:
             # Acquire the writer lock before checking the call ID: two callers
@@ -6899,7 +6950,16 @@ class SessionStore:
             ):
                 raise SessionStorageError("conflicting terminal tool call retry")
             if existing is not None and (
-                existing["result"] is not None or existing["error"] is not None
+                (existing["approved"] and not record.approved)
+                or (existing["dispatched"] and not record.dispatched)
+                or (existing["executed"] and not record.executed)
+            ):
+                raise SessionStorageError("tool-call state cannot move backward")
+            if existing is not None and (
+                existing["result"] is not None
+                or existing["error"] is not None
+                or existing["success"] is not None
+                or existing["exit_code"] is not None
             ):
                 if (
                     bool(existing["approved"]) != record.approved

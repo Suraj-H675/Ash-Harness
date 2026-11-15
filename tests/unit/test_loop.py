@@ -4967,6 +4967,7 @@ async def test_session_resume_loads_only_persisted_runtime_history_window(tmp_pa
             tool_name="read_file",
             arguments={"file_path": "README.md"},
             approved=True,
+            dispatched=True,
             executed=True,
             result="old result",
             timestamp=datetime.now(timezone.utc),

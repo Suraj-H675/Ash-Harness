@@ -1089,6 +1089,7 @@ async def test_acp_load_replays_and_lists_durable_sessions(
             tool_name="read_file",
             arguments={"path": "README.md", "token": "secret"},
             approved=True,
+            dispatched=True,
             executed=True,
             result="contents",
             timestamp=now,

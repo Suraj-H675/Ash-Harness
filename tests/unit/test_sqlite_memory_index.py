@@ -415,31 +415,29 @@ def test_memory_sqlite_files_are_private(tmp_path: Path) -> None:
             assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux POSIX locks are observable")
 def test_memory_index_peer_preserves_live_sqlite_locks(tmp_path: Path) -> None:
     if preferred_sqlite_journal_mode() != "WAL":
         pytest.skip("requires a SQLite runtime with safe WAL mode")
 
     index = _index(tmp_path)
-    db_stat = index.db_path.stat()
-    lock_identity = (
-        f"{os.major(db_stat.st_dev):02x}:{os.minor(db_stat.st_dev):02x}:"
-        f"{db_stat.st_ino}"
-    )
-
-    def active_locks() -> list[str]:
-        return [
-            line
-            for line in Path("/proc/locks").read_text().splitlines()
-            if lock_identity in line
-        ]
+    def checkpoint_status() -> tuple[int, int, int]:
+        with sqlite3.connect(index.db_path, timeout=0.1) as connection:
+            row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        assert row is not None
+        return int(row[0]), int(row[1]), int(row[2])
 
     with sqlite3.connect(index.db_path) as live:
+        # A WAL read snapshot prevents truncating frames committed after it.
+        # This tests the lock's actual effect, not /proc/locks visibility or
+        # a kernel-specific inode representation.
         live.execute("BEGIN")
         live.execute("SELECT COUNT(*) FROM memory_documents").fetchone()
-        assert active_locks()
+        with sqlite3.connect(index.db_path) as writer:
+            writer.execute(
+                "INSERT INTO memory_meta (key, value) VALUES ('lock-probe', '1')"
+            )
+        assert checkpoint_status()[0] == 1
         assert index.document_paths() == set()
-        assert active_locks()
 
         peer = subprocess.run(
             [
@@ -457,9 +455,11 @@ def test_memory_index_peer_preserves_live_sqlite_locks(tmp_path: Path) -> None:
             timeout=10,
         )
         assert peer.returncode == 0, peer.stderr
-        assert active_locks()
+        assert checkpoint_status()[0] == 1
         assert Path(f"{index.db_path}-wal").exists()
         assert Path(f"{index.db_path}-shm").exists()
+
+    assert checkpoint_status()[0] == 0
 
 
 def test_corrupt_vector_blob_fails_closed_without_losing_lexical_rows(

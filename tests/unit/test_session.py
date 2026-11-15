@@ -798,6 +798,7 @@ def test_runtime_session_load_uses_persisted_compaction_window(tmp_path: Path) -
             tool_name="read_file",
             arguments={"file_path": "README.md"},
             approved=True,
+            dispatched=True,
             executed=True,
             result="ok",
             timestamp=datetime.now(timezone.utc),
@@ -845,6 +846,7 @@ def test_runtime_session_load_bounds_recent_tool_call_tail(
                 tool_name="read_file",
                 arguments={"file_path": f"{index}.txt"},
                 approved=True,
+                dispatched=True,
                 executed=True,
                 result=f"result-{index}",
                 timestamp=datetime(2026, 1, 1, 0, 0, index, tzinfo=timezone.utc),
@@ -1262,6 +1264,7 @@ def test_v21_migration_preserves_tool_calls_without_inventing_outcomes(
             tool_name="run_command",
             arguments={"command_line": "false"},
             approved=True,
+            dispatched=True,
             executed=True,
             result="checks failed on stdout",
             error=None,
@@ -2206,7 +2209,7 @@ def test_context_checkpoint_rejects_completed_turn_with_unknown_tool_outcome(
             tool_name="run_command",
             arguments={"command_line": "touch changed-file"},
             approved=True,
-            dispatched=dispatched,
+            dispatched=True,
             executed=True,
             success=None,
             result="",
@@ -2215,6 +2218,14 @@ def test_context_checkpoint_rejects_completed_turn_with_unknown_tool_outcome(
         ),
         turn_id="turn-unknown",
     )
+    if not dispatched:
+        # Deliberately model a historical, inconsistent row rather than
+        # admitting it through the current persistence API.
+        with closing(get_db_connection(store.db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE tool_calls SET dispatched = 0 WHERE call_id = ?",
+                ("unknown-outcome",),
+            )
     store.complete_turn("turn-unknown")
     assert store.load_session(parent.session_id).tool_calls[-1].success is None
 
@@ -2301,7 +2312,7 @@ def test_context_restart_refuses_inconsistent_dispatched_tool_state(
             call_id="unknown-dispatch",
             tool_name="run_command",
             arguments={"command_line": "true"},
-            approved=False,
+            approved=True,
             dispatched=True,
             executed=False,
             result=None,
@@ -2309,6 +2320,13 @@ def test_context_restart_refuses_inconsistent_dispatched_tool_state(
             timestamp=datetime.now(timezone.utc),
         ),
     )
+    # Exercise recovery of a corrupt/legacy database row. New writes cannot
+    # create this inconsistent state via save_tool_call().
+    with closing(get_db_connection(store.db_path)) as conn, conn:
+        conn.execute(
+            "UPDATE tool_calls SET approved = 0 WHERE call_id = ?",
+            ("unknown-dispatch",),
+        )
     with pytest.raises(SessionForkConflictError, match="ambiguous actions"):
         store.restart_context_session(
             parent.session_id,
@@ -3704,6 +3722,7 @@ def test_tool_call_storage_inserts_and_updates_records(tmp_path: Path) -> None:
     )
     updated = record.model_copy(
         update={
+            "dispatched": True,
             "executed": True,
             "result": "SUCCESS",
             "timestamp": datetime(2026, 6, 2, 11, 1, tzinfo=timezone.utc),
@@ -3716,6 +3735,124 @@ def test_tool_call_storage_inserts_and_updates_records(tmp_path: Path) -> None:
     loaded = store.load_session(session.session_id)
 
     assert loaded.tool_calls == [updated]
+
+
+@pytest.mark.parametrize(
+    ("approved", "dispatched", "executed"),
+    [(False, True, False), (False, False, True), (True, False, True)],
+)
+def test_tool_call_save_rejects_impossible_lifecycle_states(
+    tmp_path: Path, approved: bool, dispatched: bool, executed: bool,
+) -> None:
+    store = SessionStore(tmp_path / "invalid-state.db")
+    session = store.create_session(str(tmp_path))
+    record = ToolCallRecord(
+        call_id="invalid-call", tool_name="run_command",
+        arguments={"command_line": "echo test"},
+        approved=approved, dispatched=dispatched, executed=executed,
+        timestamp=datetime.now(timezone.utc),
+    )
+    with pytest.raises(SessionStorageError, match="inconsistent tool-call state"):
+        store.save_tool_call(session.session_id, record)
+    assert store.load_session(session.session_id).tool_calls == []
+
+
+def test_tool_call_save_rejects_identity_rebinding_and_state_rollback(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "tool-call-identity.db")
+    session = store.create_session(str(tmp_path))
+    original = ToolCallRecord(
+        call_id="fixed-call", tool_name="run_command",
+        arguments={"command_line": "echo safe"},
+        approved=True, dispatched=False, executed=False,
+        timestamp=datetime.now(timezone.utc),
+    )
+    store.save_tool_call(session.session_id, original, turn_id="turn-original")
+
+    for conflicting in (
+        original.model_copy(update={"tool_name": "write_file"}),
+        original.model_copy(update={"arguments": {"command_line": "echo unsafe"}}),
+    ):
+        with pytest.raises(SessionStorageError, match="conflicting tool-call identity"):
+            store.save_tool_call(session.session_id, conflicting)
+    with pytest.raises(SessionStorageError, match="conflicting tool-call identity"):
+        store.save_tool_call(
+            session.session_id, original, turn_id="turn-other"
+        )
+
+    dispatched = original.model_copy(update={"dispatched": True})
+    store.save_tool_call(session.session_id, dispatched, turn_id="turn-original")
+    completed = dispatched.model_copy(update={
+        "executed": True, "success": True, "result": "done", "exit_code": 0,
+    })
+    store.save_tool_call(session.session_id, completed, turn_id="turn-original")
+    store.save_tool_call(session.session_id, completed, turn_id="turn-original")
+    for changed in (
+        completed.model_copy(update={"dispatched": False}),
+        completed.model_copy(update={"approved": False}),
+        completed.model_copy(update={"executed": False}),
+        completed.model_copy(update={"result": "different"}),
+    ):
+        with pytest.raises(SessionStorageError):
+            store.save_tool_call(session.session_id, changed)
+
+    assert store.load_session(session.session_id).tool_calls == [completed]
+
+
+def test_tool_call_finalization_cannot_undo_durable_dispatch(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "tool-finalization-state.db")
+    session = store.create_session(str(tmp_path))
+    original = ToolCallRecord(
+        call_id="dispatched-call", tool_name="run_command",
+        arguments={"command_line": "echo saved"},
+        approved=True, dispatched=True, executed=False,
+        timestamp=datetime.now(timezone.utc),
+    )
+    store.save_tool_call(session.session_id, original)
+    message = Message(
+        role="tool", content="not executed",
+        timestamp=original.timestamp,
+        metadata={"call_id": original.call_id},
+    )
+    with pytest.raises(SessionStorageError, match="cannot move backward"):
+        store.finalize_tool_call_with_message(
+            session.session_id,
+            original.model_copy(update={
+                "approved": False, "dispatched": False, "result": "not executed",
+            }),
+            message,
+        )
+    assert store.load_session(session.session_id).tool_calls == [original]
+
+    completed = original.model_copy(update={
+        "executed": True, "result": "done", "success": True, "exit_code": 0,
+    })
+    assert store.finalize_tool_call_with_message(
+        session.session_id,
+        completed,
+        message.model_copy(update={"content": "done"}),
+    )
+    assert store.load_session(session.session_id).tool_calls == [completed]
+
+
+def test_tool_call_terminal_success_without_output_cannot_be_rewritten(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "empty-output-tool.db")
+    session = store.create_session(str(tmp_path))
+    completed = ToolCallRecord(
+        call_id="empty-output", tool_name="run_command",
+        arguments={"command_line": "true"}, approved=True,
+        dispatched=True, executed=True, success=True, exit_code=0,
+        timestamp=datetime.now(timezone.utc),
+    )
+    store.save_tool_call(session.session_id, completed)
+    with pytest.raises(SessionStorageError, match="terminal tool-call"):
+        store.save_tool_call(session.session_id, completed.model_copy(update={
+            "success": False, "exit_code": 1,
+        }))
+    assert store.load_session(session.session_id).tool_calls == [completed]
 
 
 def test_tool_call_ids_are_scoped_per_session(tmp_path: Path) -> None:

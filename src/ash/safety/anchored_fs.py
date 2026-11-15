@@ -292,7 +292,19 @@ class AnchoredDirectory:
         return self.create_child(name)
 
     def list_names(self) -> list[str]:
-        return list(os.listdir(self.descriptor))
+        # os.listdir(fd) uses the held directory's *shared* open-file offset.
+        # Another scan or process using this descriptor can leave the cursor
+        # at EOF, causing an existing directory to look empty. Reopen '.'
+        # relative to the held directory, never via its replaceable pathname.
+        fresh = os.open(
+            ".",
+            os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=self.descriptor,
+        )
+        try:
+            return list(os.listdir(fresh))
+        finally:
+            os.close(fresh)
 
     def stat(self, name: str) -> os.stat_result | None:
         _validate_name(name)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -376,7 +377,7 @@ def test_required_check_durable_evidence_rejects_unsafe_or_stale_proof(
             session.session_id,
             ToolCallRecord(
                 call_id=f"record-{index}", tool_name=name, arguments=arguments,
-                approved=case != "unapproved" or index != 1,
+                approved=True,
                 dispatched=case != "denied" or index != 1,
                 executed=case != "denied" or index != 1,
                 success=success, exit_code=exit_code,
@@ -384,6 +385,14 @@ def test_required_check_durable_evidence_rejects_unsafe_or_stale_proof(
             ),
             turn_id="only-turn",
         )
+    if case == "unapproved":
+        # Simulate a corrupted legacy row; the current storage API must not
+        # accept an unapproved operation that was already dispatched.
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "UPDATE tool_calls SET approved = 0 WHERE call_id = ?",
+                ("record-1",),
+            )
     store.complete_turn("only-turn")
     assert store.required_check_command_succeeded(
         session.session_id,
@@ -561,7 +570,7 @@ def test_durable_owner_checkpoint_rejects_unverified_action_history(
             session.session_id,
             ToolCallRecord(
                 call_id=f"call-{idx}", tool_name=name, arguments=arguments,
-                approved=case != "unapproved" or idx != 0,
+                approved=True,
                 dispatched=case != "undispatched" or idx != 0,
                 executed=case != "undispatched" or idx != 0,
                 success=case != "failed_read" or name != "read_file",
@@ -570,6 +579,13 @@ def test_durable_owner_checkpoint_rejects_unverified_action_history(
             ),
             turn_id=turn_id,
         )
+    if case == "unapproved":
+        # The owner checkpoint must still reject historically corrupt rows.
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "UPDATE tool_calls SET approved = 0 WHERE call_id = ?",
+                ("call-0",),
+            )
     result = store.owner_command_checkpoint_evidence(
         session.session_id, turn_id,
         expected_project_path=(tmp_path / "elsewhere" if case == "other_project" else tmp_path),

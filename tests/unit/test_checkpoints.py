@@ -825,7 +825,7 @@ def _tool_record(
         arguments={},
         approved=True,
         executed=executed,
-        dispatched=not executed,
+        dispatched=True,
         result="done" if executed else None,
         timestamp=datetime.now(timezone.utc),
     )
