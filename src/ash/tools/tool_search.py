@@ -51,6 +51,20 @@ _SCHEMA_MATCH_SCORE = 10
 _EXACT_NAME_MATCH_BOOST = 1_000
 _PREFIX_NAME_MATCH_BOOST = 500
 _MIN_QUERY_MATCH_TERMS = 2
+_MULTIFILE_EDIT_ACTIONS = frozenset(
+    {
+        "edit", "editing", "modify", "modifying", "change", "changing",
+        "update", "updating", "refactor", "refactoring", "split",
+        "splitting", "rewrite", "rewriting",
+    }
+)
+_MULTIFILE_EDIT_QUANTIFIERS = frozenset(
+    {
+        "multiple", "multi", "bulk", "many", "several", "two", "three",
+        "four", "five", "across", "all",
+    }
+)
+_MULTIFILE_EDIT_TARGETS = frozenset({"files", "modules", "packages"})
 _CONTEXT_OMISSION_NOTE = (
     "Some tool schemas exceed the current activation or provider context budget. "
     "Narrow the search or select a model with a larger context."
@@ -122,6 +136,16 @@ class SearchToolsTool(BaseTool):
         query = redact_text(args.query)
         deferred_catalog = self.threshold > 0 and len(catalog) > self.threshold
         compact_result = bool(self._compact_result and self._compact_result())
+        if (
+            deferred_catalog
+            and compact_result
+            and _is_multifile_edit_intent(_search_words(args.query))
+        ):
+            # The actual 4K input window cannot retain the patch schema plus
+            # unrelated file-finder schemas and their protected search result.
+            # Return the best edit tool now; other tools remain discoverable.
+            omitted = max(0, len(matches) - 1)
+            matches = matches[:1]
         for name, tool, _ in matches:
             metadata = _search_result_tool(name, tool)
             if compact_result:
@@ -240,6 +264,11 @@ def _rank_tools(
         )
     )
     normalized_name_query = re.sub(r"\s+", "_", normalized)
+    # A request to modify several source files should find the multi-file
+    # patch editor, not merely a file finder or grouped reader whose names
+    # happen to contain the word "files". Require all three parts of intent;
+    # read-only and multiple-range-in-one-file queries keep ordinary ranking.
+    multi_file_edit = _is_multifile_edit_intent(set(terms))
     ranked: list[tuple[str, BaseTool, int]] = []
     name_fallbacks: list[tuple[str, BaseTool, int]] = []
     for name, tool in catalog.items():
@@ -264,6 +293,9 @@ def _rank_tools(
             elif term in schema_words:
                 score += _SCHEMA_MATCH_SCORE
                 matched_terms += 1
+        if name == "apply_patch" and multi_file_edit:
+            score += 240
+            matched_terms = max(matched_terms, _MIN_QUERY_MATCH_TERMS)
         exact_name_query = normalized_name == normalized_name_query
         name_prefix_query = bool(normalized_name_query) and normalized_name.startswith(
             normalized_name_query
@@ -288,6 +320,17 @@ def _rank_tools(
     candidates = ranked if ranked else name_fallbacks
     candidates.sort(key=lambda item: (-item[2], item[0]))
     return candidates[:limit]
+
+
+def _is_multifile_edit_intent(terms: set[str]) -> bool:
+    return (
+        bool(_MULTIFILE_EDIT_ACTIONS.intersection(terms))
+        and bool(_MULTIFILE_EDIT_QUANTIFIERS.intersection(terms))
+        and (
+            bool(_MULTIFILE_EDIT_TARGETS.intersection(terms))
+            or ("multi" in terms and bool({"file", "module"}.intersection(terms)))
+        )
+    )
 
 
 def _search_words(value: str) -> set[str]:

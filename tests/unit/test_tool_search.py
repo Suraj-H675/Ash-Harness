@@ -493,6 +493,95 @@ async def test_real_git_review_tool_is_available_with_large_effective_context(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "edit multiple files in one operation",
+        "multi-file edit",
+        "bulk edit files",
+        "edit many files together",
+        "modify several files together",
+        "change three modules at once",
+        "refactor across several modules",
+        "split a module into several files",
+    ],
+)
+async def test_multifile_edit_intent_discovers_patch_instead_of_file_finder(
+    tmp_path: Path, monkeypatch, intent: str,
+) -> None:
+    """Common coding intent must surface the actual multi-file edit tool."""
+    from ash.runtime import build_tools
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    config = AshConfig(
+        model="local/intent-discovery", workspace_root=tmp_path,
+        db_directory=tmp_path / "db", max_context_tokens=65_536,
+        max_completion_tokens=1_024, memory_backend="off",
+        tool_search_threshold=32,
+    )
+    guard = SafetyGuard(tmp_path)
+    tools = build_tools(
+        guard, tmp_path, runtime_config=config,
+        provider_factory=lambda *_args, **_kwargs: None,
+        agent_db_path=tmp_path / "agents.db",
+    )
+    search = tools["search_tools"]
+    assert len(tools) > config.tool_search_threshold
+    assert "apply_patch" not in search.visible_tools(tools)
+
+    selected = await search.run(query=intent, limit=1)
+    assert selected.success
+    assert [tool["name"] for tool in json.loads(selected.output)["tools"]] == [
+        "apply_patch"
+    ]
+    assert "apply_patch" in search.visible_tools(tools)
+
+    search.reset_activations()
+    selected = await search.run(query="read several source files together", limit=1)
+    assert selected.success
+    assert [tool["name"] for tool in json.loads(selected.output)["tools"]] == [
+        "read_files"
+    ]
+    assert "apply_patch" not in search.visible_tools(tools)
+
+    selected = await search.run(query="edit several ranges in one file", limit=1)
+    assert selected.success
+    assert [tool["name"] for tool in json.loads(selected.output)["tools"]] == [
+        "replace_file_edits"
+    ]
+    assert "apply_patch" not in search.visible_tools(tools)
+
+
+@pytest.mark.asyncio
+async def test_small_context_does_not_limit_already_visible_tool_catalog(
+    tmp_path: Path,
+) -> None:
+    """Compact disclosure is only necessary when schemas are deferred."""
+    guard = SafetyGuard(tmp_path)
+    catalog: dict[str, BaseTool] = {}
+    search = SearchToolsTool(guard, lambda: catalog, threshold=0)
+    catalog.update({
+        search.name: search,
+        "apply_patch": DummyTool(
+            guard, "apply_patch", "Edit multiple files in one operation"
+        ),
+        "glob_files": DummyTool(
+            guard, "glob_files", "Find multiple files in one operation"
+        ),
+    })
+    search.set_activation_budget(lambda _active, _preview: True,
+                                 compact_result=lambda: True)
+    result = await search.run(query="edit multiple files in one operation", limit=3)
+    payload = json.loads(result.output)
+    assert result.success and not result.truncated
+    assert {item["name"] for item in payload["tools"]} == {
+        "apply_patch", "glob_files"
+    }
+    assert "omitted_matches" not in payload
+
+
+@pytest.mark.asyncio
 async def test_large_context_prefers_checkpoint_review_without_git_and_git_with_marker(
     tmp_path: Path,
 ) -> None:
@@ -799,6 +888,18 @@ async def test_iteration_tool_snapshot_survives_live_catalog_removal(tmp_path) -
             8_192,
         ),
         (
+            "Edit multiple files in one operation.",
+            "edit multiple files in one operation",
+            "apply_patch",
+            4_096,
+        ),
+        (
+            "Refactor across several modules.",
+            "refactor across several modules",
+            "apply_patch",
+            65_536,
+        ),
+        (
             "Fill out a browser form.",
             "fill out a browser form",
             "browser_type",
@@ -925,6 +1026,12 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
             for item in json.loads(discovered.result or "{}")["tools"]
             if item["name"] == expected_tool
         )
+        if expected_tool == "apply_patch" and context_window == 4_096:
+            search_result = json.loads(discovered.result or "{}")
+            assert [item["name"] for item in search_result["tools"]] == [
+                "apply_patch"
+            ]
+            assert search_result["omitted_matches"] > 0
         if context_window == 4_096:
             assert "input_schema" not in matched
             assert "schema_summary" not in matched

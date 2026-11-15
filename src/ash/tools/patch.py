@@ -60,7 +60,8 @@ MAX_PATCH_PYTHON_SYNTAX_FILES = 12
 class ApplyPatchTool(BaseTool):
     name = "apply_patch"
     description = (
-        "Validate and apply a git-style unified diff. A failed apply can leave "
+        "Edit multiple files in one operation with a git-style unified diff. "
+        "A failed apply can leave "
         "partial changes; inspect affected files before retrying. Include "
         "--- a/path, +++ b/path, and @@ hunk headers; Codex-style "
         "*** Begin Patch blocks are not supported."

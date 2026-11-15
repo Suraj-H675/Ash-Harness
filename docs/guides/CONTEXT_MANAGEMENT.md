@@ -220,6 +220,12 @@ eager previously harmed local-model multi-file trials, and its usefulness as
 a general default has not been established. Models with smaller *actual*
 input limits keep the original compact catalog and prompt, even if the user
 configured a larger nominal context window.
+For explicit requests to edit several files or modules together, `search_tools`
+prioritizes the deferred multi-file `apply_patch` tool. Read-only grouped
+source requests still favor `read_files`, and multiple ranges within one
+file still favor `replace_file_edits`. Discovery neither runs the patch nor
+grants approval; normal validation, permission and ambiguous-result safeguards
+remain in force.
 
 After a request is assembled, `ContextBudgetReport.fragments` records each
 fragment's typed kind, source, trust class, token use and limit, truncation

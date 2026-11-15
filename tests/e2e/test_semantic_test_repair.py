@@ -6,6 +6,7 @@ import io
 import os
 import shlex
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,6 +28,118 @@ from ash.tools.filesystem import (
 )
 from ash.tools.search import SearchTextTool
 from ash.ui.headless import HeadlessUI
+
+
+@pytest.mark.asyncio
+async def test_multifile_coding_discovery_patch_and_real_verification(
+    tmp_path: Path,
+) -> None:
+    """Natural-language discovery activates a real atomic multi-file code path."""
+    from ash.runtime import build_tools
+
+    subprocess.run(
+        ["git", "init", "-q"], cwd=tmp_path, check=True,
+        capture_output=True, timeout=10,
+    )
+    for index, name in enumerate(("alpha", "beta", "gamma"), 1):
+        (tmp_path / f"{name}.py").write_text(
+            f"VALUE = {index}\n", encoding="utf-8"
+        )
+    (tmp_path / "verify.py").write_text(
+        "import alpha, beta, gamma\n"
+        "assert (alpha.VALUE, beta.VALUE, gamma.VALUE) == (10, 20, 30)\n"
+        "print('MULTI-FILE-CHECK-PASSED')\n", encoding="utf-8",
+    )
+    patch = "".join(
+        f"diff --git a/{name}.py b/{name}.py\n"
+        f"--- a/{name}.py\n+++ b/{name}.py\n"
+        f"@@ -1 +1 @@\n-VALUE = {index}\n+VALUE = {index * 10}\n"
+        for index, name in enumerate(("alpha", "beta", "gamma"), 1)
+    )
+    command = f"{shlex.quote(sys.executable)} -B verify.py"
+
+    class Provider(ProviderABC):
+        model_name = "scripted-multifile-discovery"
+        _ash_declared_capabilities = ProviderCapabilities(
+            native_tools=True, context_window=65_536
+        )
+
+        def __init__(self) -> None:
+            self.requests = 0
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests += 1
+            visible = {tool["function"]["name"] for tool in (tools or [])}
+            history = repr(messages)
+            if self.requests == 1:
+                assert "search_tools" in visible
+                assert "apply_patch" not in visible
+                calls = [{"id": "discover", "name": "search_tools", "arguments": {
+                    "query": "edit multiple files in one operation", "limit": 1,
+                }}]
+            elif self.requests == 2:
+                assert "apply_patch" in visible
+                assert "apply_patch" in history
+                calls = [{"id": "three-file-change", "name": "apply_patch",
+                          "arguments": {"patch": patch}}]
+            elif self.requests == 3:
+                for index, name in enumerate(("alpha", "beta", "gamma"), 1):
+                    assert (tmp_path / f"{name}.py").read_text() == (
+                        f"VALUE = {index * 10}\n"
+                    )
+                calls = [{"id": "verify", "name": "run_command",
+                          "arguments": {"command_line": command}}]
+            else:
+                assert self.requests == 4
+                assert "MULTI-FILE-CHECK-PASSED" in history
+                yield StreamChunk(content="Three modules updated and verified.",
+                                  is_done=True)
+                return
+            yield StreamChunk(is_done=True, native_tool_calls=calls)
+
+    async def approve(name: str, arguments: dict[str, object]) -> bool:
+        if name == "run_command":
+            assert arguments["command_line"] == command
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    config = AshConfig(
+        model="local/scripted-multifile-discovery", workspace_root=tmp_path,
+        db_directory=tmp_path / "db", max_context_tokens=65_536,
+        max_completion_tokens=1_024, memory_backend="off",
+        tool_search_threshold=32,
+    )
+    tools = build_tools(
+        guard, tmp_path, runtime_config=config,
+        provider_factory=lambda *_args, **_kwargs: None,
+        agent_db_path=tmp_path / "agents.db",
+    )
+    assert len(tools) > config.tool_search_threshold
+    store = SessionStore(tmp_path / "multifile-discovery.db")
+    provider = Provider()
+    loop = AshLoop(
+        store, provider, guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path, tools=tools, config=config, on_tool_approval=approve,
+    )
+    try:
+        session = await loop.start_session()
+        response = await loop.run_turn("Edit all three modules and verify")
+        assert response == "Three modules updated and verified."
+        assert provider.requests == 4
+        calls = store.load_session(session.session_id).tool_calls
+        assert [call.tool_name for call in calls] == [
+            "search_tools", "apply_patch", "run_command",
+        ]
+        assert [call.success for call in calls] == [True, True, True]
+        assert calls[-1].exit_code == 0
+        assert "MULTI-FILE-CHECK-PASSED" in (calls[-1].result or "")
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
 
 
 @pytest.mark.asyncio
