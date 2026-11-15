@@ -6096,12 +6096,14 @@ class SessionStore:
     def auto_commit_verification_blocker(
         self, session_id: str, turn_id: str,
     ) -> str | None:
-        """Fail closed on unresolved command checks after a successful edit.
+        """Fail closed on uncertain edits and unresolved post-edit checks.
 
         This is not a test-pass certificate: it only prevents automatic commits
-        when Ash *knows* a post-edit command failed or has uncertain execution.
+        when a dispatched file edit has an uncertain outcome, or Ash *knows* a
+        post-edit command failed or has uncertain execution.
         Retrying a failed command is never performed here; a later recorded
-        success with the same invocation can clear its failure.
+        success with the same invocation can clear its failure. A passing check
+        cannot resolve an uncertain edit effect.
         """
 
         edit_tools = {
@@ -6125,6 +6127,16 @@ class SessionStore:
         previously_failed: set[tuple[str, str | None]] = set()
         for row in rows:
             name = str(row["tool_name"])
+            # An ambiguous file edit may already have modified the workspace,
+            # including paths outside the set of confidently owned edits.
+            # Neither a later successful check nor a later successful write
+            # proves that earlier side effects are safe to auto-commit.
+            if (
+                name in edit_tools
+                and row["dispatched"]
+                and row["success"] is None
+            ):
+                return "a file edit has an uncertain outcome; inspect before committing"
             if (
                 name in edit_tools
                 and row["approved"]

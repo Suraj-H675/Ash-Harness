@@ -157,6 +157,61 @@ def test_auto_commit_verification_unknown_outcome_cannot_be_cleared_by_retry(
     )
 
 
+@pytest.mark.parametrize(
+    ("steps", "should_block"),
+    [
+        (["edit_ok", "check_ok", "edit_unknown"], True),
+        (["edit_ok", "edit_unknown", "check_ok"], True),
+        (["edit_unknown", "edit_ok", "check_ok"], True),
+        (["edit_ok", "check_ok", "patch_unknown"], True),
+        (["edit_ok", "check_ok", "edit_failed"], False),
+        (["edit_ok", "check_ok", "edit_denied"], False),
+        (["edit_ok", "check_ok", "edit_skipped"], True),
+    ],
+)
+def test_auto_commit_never_ignores_unknown_file_effect(
+    tmp_path: Path, steps: list[str], should_block: bool,
+) -> None:
+    """An ambiguous write invalidates the turn's safe auto-commit boundary."""
+    store = SessionStore(tmp_path / "unknown-edit.db")
+    session = store.create_session(str(tmp_path))
+    turn_id = "unknown-edit-turn"
+    store.start_turn(session.session_id, turn_id, "edit and verify")
+    for index, step in enumerate(steps):
+        is_check = step == "check_ok"
+        is_patch = step == "patch_unknown"
+        is_unknown = step in {"edit_unknown", "patch_unknown", "edit_skipped"}
+        is_denied = step == "edit_denied"
+        store.save_tool_call(
+            session.session_id,
+            ToolCallRecord(
+                call_id=f"call-{index}",
+                tool_name=(
+                    "run_command" if is_check else "apply_patch" if is_patch
+                    else "write_file"
+                ),
+                arguments=(
+                    {"command_line": "python3 -m pytest"} if is_check
+                    else {"patch": "synthetic"} if is_patch
+                    else {"file_path": "module.py"}
+                ),
+                approved=not is_denied,
+                dispatched=not is_denied,
+                executed=not is_denied and step != "edit_skipped",
+                success=None if is_unknown else step not in {"edit_failed", "edit_denied"},
+                error="effect uncertain" if is_unknown else None,
+                exit_code=0 if is_check else None,
+                timestamp=datetime.now(timezone.utc),
+            ),
+            turn_id=turn_id,
+        )
+
+    reason = store.auto_commit_verification_blocker(session.session_id, turn_id)
+    assert (reason is not None) is should_block
+    if should_block:
+        assert "uncertain" in reason.lower()
+
+
 def test_terminal_tool_persistence_retry_is_idempotent_and_conflicts_are_rejected(
     tmp_path: Path,
 ) -> None:

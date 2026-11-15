@@ -62,6 +62,11 @@ silently resume the original operation. Provider-request retries before visible
 model output are separate transport mechanisms and never permit host-level
 replay of a tool invocation.
 
+Automatic Git commits are also withheld when any dispatched file edit in the
+turn has an uncertain outcome. A passing command, or a successful later edit,
+does not establish the missing file-effect evidence. Known failed or denied
+edits are not treated as uncertain solely because they failed.
+
 ### 1.2 Sensitive Argument Persistence
 
 Tools whose otherwise ordinary argument names can carry confidential values may

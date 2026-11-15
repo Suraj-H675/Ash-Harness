@@ -448,6 +448,122 @@ def test_e2e_auto_commit_does_not_commit_known_failed_verification(
         assert "auto_commit skipped" in ui.console.file.getvalue()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX filesystem fault injection")
+@pytest.mark.parametrize("unknown_edit", ["published_write", "partial_git_patch"])
+def test_e2e_auto_commit_refuses_uncertain_file_effect_after_passing_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unknown_edit: str,
+) -> None:
+    """No automatic commit after an ambiguous write, even when a check passed."""
+    import stat
+
+    from ash.safety import scoped_io
+    from ash.tools.patch import ApplyPatchTool
+
+    if unknown_edit == "partial_git_patch" and os.geteuid() == 0:
+        pytest.skip("cannot reproduce an unprivileged Git write failure as root")
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    _git_init(workspace)
+    db_path = tmp_path / "uncertain-edit.db"
+    verified_file = workspace / "checked.txt"
+    command = "grep -qx safe checked.txt"
+    unknown_file = workspace / "uncertain" / "unknown.txt"
+    locked_dir = workspace / "locked"
+    if unknown_edit == "published_write":
+        unknown_file.parent.mkdir()
+        unknown_action = [
+            '<call_tool name="write_file">',
+            '<arg name="file_path">uncertain/unknown.txt</arg>',
+            '<arg name="content">published\n</arg>',
+            "</call_tool>",
+        ]
+    else:
+        (workspace / "first.py").write_text("VALUE = 1\n", encoding="utf-8")
+        locked_dir.mkdir()
+        (locked_dir / "second.py").write_text("VALUE = 1\n", encoding="utf-8")
+        patch_text = (
+            "--- a/first.py\n+++ b/first.py\n@@ -1 +1 @@\n"
+            "-VALUE = 1\n+VALUE = 2\n"
+            "--- a/locked/second.py\n+++ b/locked/second.py\n@@ -1 +1 @@\n"
+            "-VALUE = 1\n+VALUE = 2\n"
+        )
+        unknown_action = [
+            '<call_tool name="apply_patch">',
+            f'<arg name="patch">{patch_text}</arg>',
+            "</call_tool>",
+        ]
+
+    provider = SessionProvider(scripts=[
+        [
+            '<call_tool name="write_file">',
+            '<arg name="file_path">checked.txt</arg>',
+            '<arg name="content">safe\n</arg>',
+            "</call_tool>",
+        ],
+        [
+            '<call_tool name="run_command">',
+            f'<arg name="command_line">{command}</arg>',
+            "</call_tool>",
+        ],
+        unknown_action,
+        ["<response>Must inspect the uncertain edit; do not auto-commit.</response>"],
+    ])
+    ui = _make_ui()
+
+    async def drive() -> tuple[str, list[object], list[str]]:
+        loop = _make_loop(workspace, db_path, provider, auto_commit=True, ui=ui)
+        loop.tools["apply_patch"] = ApplyPatchTool(loop.safety_guard)
+        await loop.start_session()
+        try:
+            response = await loop.run_turn("Write, check, then apply another edit")
+            session = loop.session_store.load_session(loop.current_session.session_id)
+            assert loop.session_store.verify_audit_log(session.session_id) == []
+            return response, session.tool_calls, _git_log(workspace)
+        finally:
+            await loop.aclose()
+
+    if unknown_edit == "published_write":
+        parent_identity = unknown_file.parent.stat()
+        original_sync = scoped_io.os.fsync
+
+        def fault_on_published_directory(fd: int) -> None:
+            metadata = os.fstat(fd)
+            if stat.S_ISDIR(metadata.st_mode) and (
+                metadata.st_dev, metadata.st_ino
+            ) == (parent_identity.st_dev, parent_identity.st_ino):
+                raise OSError("injected post-publication directory sync failure")
+            original_sync(fd)
+
+        with monkeypatch.context() as fault:
+            fault.setattr(scoped_io.os, "fsync", fault_on_published_directory)
+            response, calls, commits = asyncio.run(drive())
+        assert unknown_file.read_text() == "published\n"
+    else:
+        locked_dir.chmod(0o555)
+        try:
+            response, calls, commits = asyncio.run(drive())
+        finally:
+            locked_dir.chmod(0o755)
+        assert (workspace / "first.py").read_text() == "VALUE = 2\n"
+        assert (locked_dir / "second.py").read_text() == "VALUE = 1\n"
+
+    assert "do not auto-commit" in response
+    assert verified_file.read_text() == "safe\n"
+    assert [call.tool_name for call in calls] == [
+        "write_file", "run_command",
+        "write_file" if unknown_edit == "published_write" else "apply_patch",
+    ]
+    assert [call.success for call in calls] == [True, True, None]
+    assert calls[1].exit_code == 0
+    assert calls[2].dispatched and calls[2].executed
+    assert "ambiguous" in (calls[2].error or "").lower()
+    assert len(commits) == 1, "the earlier checked file must not be committed"
+    assert "auto_commit skipped: a file edit has an uncertain outcome" in (
+        ui.console.file.getvalue()
+    )
+
+
 def test_e2e_auto_commit_skips_iteration_limited_partial_edit(tmp_path: Path) -> None:
     workspace = tmp_path / "project"
     workspace.mkdir()
