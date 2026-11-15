@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import os
 import shlex
+import stat
 import sys
 from pathlib import Path
 
@@ -16,7 +18,12 @@ from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
 from ash.tools.base import ToolMiddleware, ToolMiddlewareSkip
 from ash.tools.command import RunCommandTool
-from ash.tools.filesystem import ReplaceFileContentTool, ReplaceFileEditsTool, WriteFileTool
+from ash.tools.filesystem import (
+    ReadFileTool,
+    ReplaceFileContentTool,
+    ReplaceFileEditsTool,
+    WriteFileTool,
+)
 from ash.ui.headless import HeadlessUI
 
 
@@ -408,6 +415,120 @@ async def test_skipped_coding_action_is_visible_as_failure_and_retried_deliberat
         assert any(
             entry.result == "FAILURE"
             and entry.details.get("call_id") == skipped[0].call_id
+            for entry in store.list_audit_logs(session.session_id)
+        )
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX parent-directory fsync")
+@pytest.mark.asyncio
+async def test_published_write_with_failed_sync_is_inspected_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real coding loop must preserve an ambiguous published write."""
+    from ash.safety import scoped_io
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "verify.py").write_text(
+        "from pathlib import Path\n"
+        "assert Path('module.py').read_text() == 'VALUE = 42\\n'\n"
+        "print('VISIBLE-CHECK-PASSED')\n",
+        encoding="utf-8",
+    )
+    source = workspace / "module.py"
+    command = f"{shlex.quote(sys.executable)} -B verify.py"
+    expected_parent = workspace.stat()
+    real_sync = scoped_io.os.fsync
+
+    def fail_workspace_directory_sync(fd: int) -> None:
+        metadata = os.fstat(fd)
+        if stat.S_ISDIR(metadata.st_mode) and (
+            metadata.st_dev, metadata.st_ino
+        ) == (expected_parent.st_dev, expected_parent.st_ino):
+            raise OSError("injected project-directory sync failure")
+        real_sync(fd)
+
+    class Provider(ProviderABC):
+        model_name = "scripted-published-write-recovery"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.requests = 0
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests += 1
+            history = repr(messages)
+            if self.requests == 1:
+                calls = [{"id": "one-write", "name": "write_file",
+                          "arguments": {"file_path": "module.py", "content": "VALUE = 42\n"}}]
+            elif self.requests == 2:
+                assert source.read_text() == "VALUE = 42\n"
+                assert "Tool outcome is ambiguous" in history
+                assert "did not retry" in history
+                calls = [{"id": "inspect-after-fault", "name": "read_file",
+                          "arguments": {"file_path": "module.py"}}]
+            elif self.requests == 3:
+                assert "1: VALUE = 42" in history
+                calls = [{"id": "check-after-inspection", "name": "run_command",
+                          "arguments": {"command_line": command}}]
+            else:
+                assert self.requests == 4
+                assert "VISIBLE-CHECK-PASSED" in history
+                yield StreamChunk(
+                    content="Workspace checked; write durability remains uncertain.",
+                    is_done=True,
+                )
+                return
+            yield StreamChunk(is_done=True, native_tool_calls=calls)
+
+    async def approve(tool_name: str, arguments: dict[str, object]) -> bool:
+        if tool_name == "run_command":
+            assert arguments["command_line"] == command
+        return True
+
+    guard = SafetyGuard(workspace)
+    store = SessionStore(tmp_path / "published-write.db")
+    provider = Provider()
+    loop = AshLoop(
+        store, provider, guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        workspace,
+        tools={
+            "write_file": WriteFileTool(guard),
+            "read_file": ReadFileTool(guard),
+            "run_command": RunCommandTool(guard),
+        },
+        on_tool_approval=approve,
+    )
+    try:
+        with monkeypatch.context() as filesystem_fault:
+            filesystem_fault.setattr(
+                scoped_io.os, "fsync", fail_workspace_directory_sync
+            )
+            session = await loop.start_session()
+            response = await loop.run_turn("Create module and test it")
+        assert response == "Workspace checked; write durability remains uncertain."
+        assert provider.requests == 4
+        assert source.read_text() == "VALUE = 42\n"
+        calls = store.load_session(session.session_id).tool_calls
+        assert [call.tool_name for call in calls] == [
+            "write_file", "read_file", "run_command"
+        ]
+        assert calls[0].dispatched and calls[0].executed
+        assert calls[0].success is None
+        assert "ambiguous" in (calls[0].error or "").lower()
+        assert calls[1].success and calls[2].success
+        assert "VISIBLE-CHECK-PASSED" in (calls[2].result or "")
+        assert store.verify_audit_log(session.session_id) == []
+        assert any(
+            entry.result == "FAILURE"
+            and entry.details.get("call_id") == "one-write"
+            and entry.details.get("ambiguous") is True
             for entry in store.list_audit_logs(session.session_id)
         )
     finally:

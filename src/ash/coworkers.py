@@ -73,6 +73,7 @@ from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.grants import load_managed_permission_rules, load_permission_rules
 from ash.safety.policy import PermissionPolicy, PolicyAction
 from ash.safety.scoped_io import (
+    ScopedEffectUncertain,
     ScopedFileChanged,
     ScopedIOError,
     atomic_write_scoped_bytes,
@@ -9213,18 +9214,22 @@ class CoworkerDirectory:
                 except Exception as exc:
                     observed_sha256 = self._observe_approval_target(approval, guard)
                     matched = observed_sha256 == approval.replacement_sha256
+                    # Visible matching bytes cannot establish durable success
+                    # after the scoped writer reported a post-publication sync
+                    # failure. The approval is consumed, never replayed.
+                    verified = matched and not isinstance(exc, ScopedEffectUncertain)
                     self._transition_file_approval(
                         handle,
                         approval_id=approval.approval_id,
                         expected_status="dispatching",
-                        status="succeeded" if matched else "ambiguous",
+                        status="succeeded" if verified else "ambiguous",
                         detail=(
                             "target_matches_approved_payload"
-                            if matched
+                            if verified
                             else "effect_outcome_uncertain"
                         ),
                         finished=True,
-                        failure_code=None if matched else "unknown_dispatch_outcome",
+                        failure_code=None if verified else "unknown_dispatch_outcome",
                         observed_sha256=observed_sha256,
                         observation_recorded=True,
                     )

@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from ash.core.redaction import redact_text
 from ash.safety.guard import SafetyGuard, SafetyViolation
 from ash.safety.scoped_io import (
+    ScopedEffectUncertain,
     ScopedFileChanged,
     ScopedIOError,
     atomic_write_scoped_bytes,
@@ -24,6 +25,7 @@ from ash.safety.scoped_io import (
 from ash.tools.base import (
     BaseTool,
     ToolExecutionContract,
+    ToolExecutionOutcome,
     ToolResult,
     count_output_tokens,
     scoped_path_refusal,
@@ -53,6 +55,8 @@ EXISTS_ERROR = (
     "Error: Target file already exists. Set overwrite to true to replace it, "
     "or use replace_file_content to patch specific regions."
 )
+
+
 NO_OP_EDIT_ERROR = (
     "Error: replacement would not change the file; no edit was made. "
     "Supply a replacement with different content."
@@ -62,6 +66,16 @@ IDENTICAL_EDIT_ERROR = (
     "no edit was made. Use the actual old file lines as target_content "
     "and the desired new lines as replacement_content."
 )
+
+
+def _uncertain_write_result(exc: ScopedEffectUncertain) -> ToolResult:
+    """Preserve published-write uncertainty instead of claiming a known failure."""
+    return ToolResult(
+        success=False,
+        output="",
+        error=f"Error: {exc}",
+        outcome=ToolExecutionOutcome.UNKNOWN,
+    )
 
 
 @dataclass(frozen=True)
@@ -580,6 +594,8 @@ class WriteFileTool(BaseTool):
                 output="",
                 error="Error: File changed during overwrite. Read it again before editing.",
             )
+        except ScopedEffectUncertain as exc:
+            return _uncertain_write_result(exc)
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
         return _python_syntax_advisory(
@@ -765,6 +781,8 @@ class ReplaceFileContentTool(BaseTool):
                 output="",
                 error="Error: File changed during edit. Read it again before editing.",
             )
+        except ScopedEffectUncertain as exc:
+            return _uncertain_write_result(exc)
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
         return _python_syntax_advisory(
@@ -887,6 +905,8 @@ class ReplaceFileEditsTool(BaseTool):
                 output="",
                 error="Error: File changed during edit. Read it again before editing.",
             )
+        except ScopedEffectUncertain as exc:
+            return _uncertain_write_result(exc)
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
         return _python_syntax_advisory(
@@ -939,6 +959,8 @@ class WholeEditTool(BaseTool):
                 output="",
                 error="Error: File changed during overwrite. Read it again before editing.",
             )
+        except ScopedEffectUncertain as exc:
+            return _uncertain_write_result(exc)
         except (OSError, ScopedIOError) as exc:
             return ToolResult(success=False, output="", error=f"Error: {exc}")
         return _python_syntax_advisory(

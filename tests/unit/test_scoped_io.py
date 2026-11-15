@@ -5,6 +5,7 @@ import hashlib
 import os
 import stat
 from contextlib import nullcontext
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -198,6 +199,109 @@ def test_scoped_atomic_write_detects_in_place_change_before_replace(tmp_path) ->
 
     assert target.read_text(encoding="utf-8") == "concurrent update"
     assert list(tmp_path.glob(".target.txt.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX parent-directory fsync")
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_scoped_atomic_write_reports_uncertain_after_publication(
+    tmp_path, overwrite: bool,
+) -> None:
+    """A failed durability sync cannot conceal an already-visible write."""
+    from ash.safety import scoped_io
+
+    target = tmp_path / "target.txt"
+    if overwrite:
+        target.write_bytes(b"previous")
+    real_sync = scoped_io.os.fsync
+
+    def fault_after_publish(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("injected parent-directory sync failure")
+        real_sync(fd)
+
+    with patch("ash.safety.scoped_io.os.fsync", side_effect=fault_after_publish):
+        with pytest.raises(ScopedIOError, match="may have changed"):
+            atomic_write_scoped_bytes(
+                target,
+                b"published",
+                SafetyGuard(tmp_path),
+                overwrite=overwrite,
+            )
+
+    assert target.read_bytes() == b"published"
+    assert list(tmp_path.glob(".target.txt.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file-descriptor sync")
+def test_scoped_atomic_write_failing_before_publication_keeps_original(
+    tmp_path,
+) -> None:
+    from ash.safety import scoped_io
+
+    target = tmp_path / "target.txt"
+    target.write_bytes(b"original")
+    real_sync = scoped_io.os.fsync
+
+    def fail_file_sync(fd: int) -> None:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("injected staged-file sync failure")
+        real_sync(fd)
+
+    with patch("ash.safety.scoped_io.os.fsync", side_effect=fail_file_sync):
+        with pytest.raises(OSError, match="staged-file sync failure") as error:
+            atomic_write_scoped_bytes(
+                target, b"replacement", SafetyGuard(tmp_path), overwrite=True
+            )
+
+    assert not isinstance(error.value, ScopedIOError)
+    assert target.read_bytes() == b"original"
+    assert list(tmp_path.glob(".target.txt.*.tmp")) == []
+
+
+def test_fallback_create_does_not_hide_postpublication_cleanup_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even fallback link publication must not turn a cleanup error into a retry."""
+    target = tmp_path / "created.txt"
+    original_unlink = Path.unlink
+
+    def fail_staged_cleanup(path, *args, **kwargs):
+        if path.name.endswith(".tmp") and path.name.startswith(".created.txt."):
+            raise OSError("injected staged-file cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    with patch("ash.safety.scoped_io._supports_anchored_io", return_value=False), monkeypatch.context() as scoped_fault:
+        scoped_fault.setattr(Path, "unlink", fail_staged_cleanup)
+        with pytest.raises(ScopedIOError, match="may have changed"):
+            atomic_write_scoped_bytes(
+                target, b"published", SafetyGuard(tmp_path), overwrite=False
+            )
+
+    assert target.read_bytes() == b"published"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor-anchored write")
+def test_anchored_create_does_not_hide_postpublication_cleanup_failure(tmp_path) -> None:
+    """An unlink failure after successful link publication stays ambiguous."""
+    from ash.safety import scoped_io
+
+    target = tmp_path / "created.txt"
+    original_unlink = scoped_io.os.unlink
+
+    def fail_staged_cleanup(path, *args, **kwargs):
+        if str(path).startswith(".created.txt.") and str(path).endswith(".tmp"):
+            raise OSError("injected anchored cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    # Open the Ash workspace lease before patching the POSIX unlink function.
+    with workspace_mutation_lock():
+        with patch("ash.safety.scoped_io.os.unlink", side_effect=fail_staged_cleanup):
+            with pytest.raises(ScopedIOError, match="may have changed"):
+                atomic_write_scoped_bytes(
+                    target, b"published", SafetyGuard(tmp_path), overwrite=False
+                )
+
+    assert target.read_bytes() == b"published"
 
 
 def test_revalidated_fallback_write_and_read(tmp_path) -> None:

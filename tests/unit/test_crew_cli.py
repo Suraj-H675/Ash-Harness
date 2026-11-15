@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import sys
 from collections.abc import AsyncGenerator, Sequence
 from pathlib import Path
@@ -2670,6 +2671,50 @@ def test_file_approval_restart_reconciles_dispatch_crashes_without_replay(
     with pytest.raises(CoworkerRuntimeUnavailable, match="consumed"):
         after_restart._apply_file_approval(second.approval_id)
     assert second_target.read_bytes() == b"VALUE = 2\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX parent-directory fsync")
+def test_file_approval_postpublication_sync_failure_remains_ambiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A visible approved payload is not proof of completed durable publication."""
+    from ash.coworkers import CoworkerRuntimeUnavailable
+    from ash.safety import scoped_io
+
+    _, handle, identity, _, target, _, approval, _ = _new_pending_file_approval(
+        tmp_path, monkeypatch, capsys
+    )
+    assert handle._approve_file_approval(approval.approval_id).status == "approved"
+    expected_dir = target.parent.stat()
+    real_sync = scoped_io.os.fsync
+
+    def fail_target_directory_sync(fd: int) -> None:
+        current = os.fstat(fd)
+        if stat.S_ISDIR(current.st_mode) and (
+            current.st_dev, current.st_ino
+        ) == (expected_dir.st_dev, expected_dir.st_ino):
+            raise OSError("injected file-approval directory fsync failure")
+        real_sync(fd)
+
+    with monkeypatch.context() as scoped_fault:
+        scoped_fault.setattr(scoped_io.os, "fsync", fail_target_directory_sync)
+        with pytest.raises(CoworkerRuntimeUnavailable, match="inspect this approval"):
+            handle._apply_file_approval(approval.approval_id)
+
+    assert target.read_bytes() == b"VALUE = 2\n"
+    reopened = CoworkerDirectory.open().open_coworker(
+        owner_id=identity.owner_id,
+        coworker_id=identity.coworker_id,
+    )
+    approval_state, events = reopened.inspect_file_approval(approval.approval_id)
+    assert approval_state.status == "ambiguous"
+    assert approval_state.failure_code == "unknown_dispatch_outcome"
+    assert approval_state.observed_sha256 == hashlib.sha256(b"VALUE = 2\n").hexdigest()
+    assert events[-1].detail == "effect_outcome_uncertain"
+    with pytest.raises(CoworkerRuntimeUnavailable, match="consumed"):
+        reopened._apply_file_approval(approval.approval_id)
 
 
 @pytest.mark.skipif(not hasattr(os, "geteuid"), reason="Crew requires a local effective UID")

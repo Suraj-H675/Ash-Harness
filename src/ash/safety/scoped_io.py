@@ -26,6 +26,10 @@ class ScopedFileChanged(ScopedIOError):
     """The destination changed between validation and mutation."""
 
 
+class ScopedEffectUncertain(ScopedIOError):
+    """An effect was published, but post-publication completion is uncertain."""
+
+
 _MUTATION_STATE_GUARD = threading.Lock()
 _MUTATION_OWNER: tuple[str, int] | None = None
 _MUTATION_DEPTH = 0
@@ -637,6 +641,7 @@ def _anchored_atomic_write_chunks(
                 )
         temp_name = f".{name}.{secrets.token_hex(8)}.tmp"
         temp_fd = -1
+        cleanup_failed = False
         try:
             flags = (
                 os.O_WRONLY
@@ -688,13 +693,28 @@ def _anchored_atomic_write_chunks(
                     )
                 except FileExistsError:
                     raise
-                os.unlink(temp_name, dir_fd=parent_fd)
+                try:
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                except OSError as exc:
+                    # Preserve the original post-publication uncertainty;
+                    # repeating a failed cleanup can mask this exception.
+                    cleanup_failed = True
+                    raise ScopedEffectUncertain(
+                        "File update may have changed the workspace; cleanup failed "
+                        "after publication. Inspect the file before retrying."
+                    ) from exc
                 temp_name = ""
-            os.fsync(parent_fd)
+            try:
+                os.fsync(parent_fd)
+            except OSError as exc:
+                raise ScopedEffectUncertain(
+                    "File update may have changed the workspace; directory sync "
+                    "failed after publication. Inspect the file before retrying."
+                ) from exc
         finally:
             if temp_fd >= 0:
                 os.close(temp_fd)
-            if temp_name:
+            if temp_name and not cleanup_failed:
                 try:
                     os.unlink(temp_name, dir_fd=parent_fd)
                 except FileNotFoundError:
@@ -988,6 +1008,7 @@ def _fallback_atomic_write_chunks(
                 f"file changed before write: expected {expected_sha256}, got {actual}"
             )
     temp = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
+    cleanup_failed = False
     try:
         fd = os.open(
             temp,
@@ -1031,12 +1052,23 @@ def _fallback_atomic_write_chunks(
             os.replace(temp, target)
         else:
             os.link(temp, target, follow_symlinks=False)
-            temp.unlink()
+            try:
+                temp.unlink()
+            except OSError as exc:
+                # A second failed cleanup in finally must not mask the
+                # published-effect uncertainty. Leave the staged file for
+                # inspection rather than concealing the first failure.
+                cleanup_failed = True
+                raise ScopedEffectUncertain(
+                    "File update may have changed the workspace; cleanup failed "
+                    "after publication. Inspect the file before retrying."
+                ) from exc
     finally:
-        try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
+        if not cleanup_failed:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _fallback_restore(

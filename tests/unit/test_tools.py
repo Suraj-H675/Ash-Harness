@@ -1921,6 +1921,85 @@ async def test_atomic_overwrite_preserves_executable_mode(
     assert target.stat().st_mode & 0o777 == 0o755
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX parent-directory fsync")
+@pytest.mark.parametrize("tool_type", ["create", "overwrite", "replace", "batch", "whole"])
+@pytest.mark.asyncio
+async def test_file_tools_report_unknown_when_parent_sync_fails_after_publication(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_type: str,
+) -> None:
+    """A published edit cannot be described as a proven unexecuted failure."""
+    import stat
+    from ash.safety import scoped_io
+
+    target = project_root / "doc.txt"
+    if tool_type != "create":
+        target.write_text("before\n", encoding="utf-8")
+    original_sync = scoped_io.os.fsync
+
+    def fault_after_publish(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("injected parent-directory sync failure")
+        original_sync(fd)
+
+    monkeypatch.setattr(scoped_io.os, "fsync", fault_after_publish)
+    if tool_type in {"create", "overwrite"}:
+        result = await WriteFileTool(guard).run(
+            file_path="doc.txt", content="after\n", overwrite=tool_type == "overwrite"
+        )
+    elif tool_type == "replace":
+        result = await ReplaceFileContentTool(guard).run(
+            file_path="doc.txt", target_content="before", replacement_content="after"
+        )
+    elif tool_type == "batch":
+        result = await ReplaceFileEditsTool(guard).run(
+            file_path="doc.txt",
+            edits=[{
+                "start_line": 1, "end_line": 1,
+                "target_content": "before", "replacement_content": "after",
+            }],
+        )
+    else:
+        result = await WholeEditTool(guard).run(file_path="doc.txt", content="after\n")
+
+    assert target.read_text(encoding="utf-8") == "after\n"
+    assert result.success is False
+    assert result.outcome is ToolExecutionOutcome.UNKNOWN
+    assert "may have changed" in (result.error or "")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX staged-file sync")
+@pytest.mark.asyncio
+async def test_file_write_prepublication_sync_error_remains_known_failure(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import stat
+    from ash.safety import scoped_io
+
+    target = project_root / "doc.txt"
+    target.write_bytes(b"before\n")
+    real_sync = scoped_io.os.fsync
+
+    def fail_staged_file_sync(fd: int) -> None:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("injected staged-file sync error")
+        real_sync(fd)
+
+    monkeypatch.setattr(scoped_io.os, "fsync", fail_staged_file_sync)
+    result = await WriteFileTool(guard).run(
+        file_path="doc.txt", content="after\n", overwrite=True
+    )
+
+    assert not result.success
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert "staged-file sync error" in (result.error or "")
+    assert target.read_bytes() == b"before\n"
+
+
 async def _run_single_range_edit(
     tool_type: type[ReplaceFileContentTool] | type[ReplaceFileEditsTool],
     guard: SafetyGuard,

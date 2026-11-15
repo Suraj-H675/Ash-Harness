@@ -48,7 +48,9 @@ Immediately before `tool.run()` begins, Ash emits `tool.started`. From that
 point forward the runtime invokes that call exactly once. A returned failed
 `ToolResult` is a terminal tool outcome. `ToolResult.outcome` is `completed` by
 default; transport-backed tools set it to `unknown` whenever they cannot prove
-the remote result. An exception, transport loss, timeout, or process
+the remote result. Atomic local file writes also use `unknown` after a
+published write whose durability or cleanup could not be confirmed. An
+exception, transport loss, timeout, or process
 interruption after dispatch is recorded as an **ambiguous** failure:
 the side effect may have occurred, and Ash does not automatically replay it.
 
@@ -175,7 +177,8 @@ will be refused. An intentional newline/line-ending change is the exception.
         -   For `replace_file_content`, reject a replacement that leaves the decoded file unchanged without rewriting the file. When identical target/replacement text fails to match any complete line block, report the invalid no-op intent explicitly. A replacement that **does** change the final newline or line-ending style remains valid even if its two argument strings are identical.
         -   For `replace_file_edits`, reject the entire batch without writing if **any** requested range would leave its original physical lines unchanged, even if other ranges would change. Identify the redundant edit by its original 1-based argument index. A genuine newline-only change remains valid.
         -   Encode using the source file's detected encoding and BOM, then enforce the byte-size limit.
-        -   Write through the scoped atomic writer with the original file digest as its compare-and-swap expectation; remove any temporary file on completion or failure.
+        -   Write through the scoped atomic writer with the original file digest as its compare-and-swap expectation and best-effort temporary-file cleanup.
+        -   A failure **before** publication is a known failure that preserves the prior file. If a create/overwrite has already been published but directory sync or staged-file cleanup then fails, `write_file`, `replace_file_content`, `replace_file_edits`, and `whole_edit` return `ToolResult.outcome=unknown`: inspect the workspace and **do not replay** automatically. A failed cleanup may leave a temporary file. Crew file approvals encountering this specific uncertainty remain consumed and ambiguous even when visible bytes match the approved payload.
     7.  **Scope Refusals**: `read_file`, `write_file`, `replace_file_content`, `replace_file_edits`, and `whole_edit` return an unsuccessful, known-completed `ToolResult` for paths denied by the workspace guard. None of the filesystem tools attempts to read or write the denied path.
 
 **Immediate Python syntax feedback:** After a successful `write_file`,
