@@ -832,6 +832,7 @@ class ReplaceFileEditsTool(BaseTool):
         if validation_error is not None:
             return ToolResult(success=False, output="", error=validation_error)
 
+        replacements: list[tuple[ReplacementEdit, list[str]]] = []
         for index, edit in enumerate(args.edits, start=1):
             segment = "".join(lines[edit.start_line - 1 : edit.end_line])
             normalized_segment = _strip_trailing_newlines(
@@ -850,14 +851,27 @@ class ReplaceFileEditsTool(BaseTool):
                         f"{_build_mismatch_error(normalized_target, normalized_segment)}"
                     ),
                 )
+            replacement_lines = _replacement_lines_for_span(
+                lines, edit.start_line - 1, edit.end_line, edit.replacement_content
+            )
+            if replacement_lines == lines[edit.start_line - 1 : edit.end_line]:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=(
+                        f"Error: edit {index} would not change its selected lines; "
+                        "no edit was made. Remove the redundant edit and retry."
+                    ),
+                )
+            replacements.append((edit, replacement_lines))
 
         new_lines = list(lines)
-        for edit in sorted(args.edits, key=lambda item: item.start_line, reverse=True):
+        for edit, replacement_lines in sorted(
+            replacements, key=lambda item: item[0].start_line, reverse=True
+        ):
             start_index = edit.start_line - 1
             end_index = edit.end_line
-            new_lines[start_index:end_index] = _replacement_lines_for_span(
-                lines, start_index, end_index, edit.replacement_content
-            )
+            new_lines[start_index:end_index] = replacement_lines
         new_text = "".join(new_lines)
         try:
             atomic_write_scoped_bytes(

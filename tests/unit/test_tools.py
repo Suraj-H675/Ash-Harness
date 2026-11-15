@@ -2508,6 +2508,69 @@ async def test_replace_file_edits_applies_multiple_ranges_atomically(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mixed", [False, True])
+async def test_replace_file_edits_rejects_redundant_ranges_without_any_write(
+    project_root: Path,
+    guard: SafetyGuard,
+    monkeypatch: pytest.MonkeyPatch,
+    mixed: bool,
+) -> None:
+    """No-op ranges must not count as applied, even alongside a valid edit."""
+    target = project_root / "doc.txt"
+    original = b"one\r\ntwo\r\nthree\r\n"
+    target.write_bytes(original)
+
+    def unexpected_write(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a redundant edit must not rewrite the source")
+
+    monkeypatch.setattr("ash.tools.filesystem.atomic_write_scoped_bytes", unexpected_write)
+    edits = [
+        {
+            "start_line": 1,
+            "end_line": 1,
+            "target_content": "one",
+            "replacement_content": "one",
+        },
+    ]
+    if mixed:
+        edits.insert(0, {
+            "start_line": 3,
+            "end_line": 3,
+            "target_content": "three",
+            "replacement_content": "THREE",
+        })
+
+    result = await ReplaceFileEditsTool(guard).run(file_path="doc.txt", edits=edits)
+
+    assert not result.success
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert f"edit {2 if mixed else 1}" in (result.error or "")
+    assert "no edit was made" in (result.error or "")
+    assert target.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_replace_file_edits_allows_identical_text_that_changes_line_endings(
+    project_root: Path, guard: SafetyGuard,
+) -> None:
+    target = project_root / "doc.txt"
+    target.write_bytes(b"one\ntwo\n")
+
+    result = await ReplaceFileEditsTool(guard).run(
+        file_path="doc.txt",
+        edits=[{
+            "start_line": 2,
+            "end_line": 2,
+            "target_content": "two",
+            "replacement_content": "two\r\n",
+        }],
+    )
+
+    assert result.success
+    assert target.read_bytes() == b"one\ntwo\r\n"
+
+
+@pytest.mark.asyncio
 async def test_replace_file_edits_rejects_mismatch_without_partial_write(
     project_root: Path,
     guard: SafetyGuard,

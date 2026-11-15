@@ -15,7 +15,7 @@ from ash.providers.base import ProviderABC, StreamChunk
 from ash.providers.capabilities import ProviderCapabilities
 from ash.safety.guard import SafetyGuard
 from ash.tools.command import RunCommandTool
-from ash.tools.filesystem import ReplaceFileContentTool
+from ash.tools.filesystem import ReplaceFileContentTool, ReplaceFileEditsTool
 from ash.ui.headless import HeadlessUI
 
 
@@ -181,6 +181,115 @@ async def test_real_pytest_failures_guide_two_module_repair_and_recheck(
         assert [call.tool_name for call in calls] == expected_tools
         assert [call.success for call in calls] == expected_success
         assert [calls[0].exit_code, calls[-1].exit_code] == [1, 0]
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_redundant_atomic_edit_batch_fails_then_real_check_verifies_retry(
+    tmp_path: Path,
+) -> None:
+    """Do not report a partly redundant batch as applied coding work."""
+
+    source = tmp_path / "invoice.py"
+    source.write_text(
+        "def subtotal(price):\n    return price - 5\n\n"
+        "def taxed(subtotal):\n    return subtotal + 11\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "verify.py").write_text(
+        "from invoice import subtotal, taxed\n"
+        "assert subtotal(100) == 90\n"
+        "assert taxed(90) == 99\n"
+        "print('CHECK-PASSED')\n",
+        encoding="utf-8",
+    )
+    command = f"{shlex.quote(sys.executable)} -B verify.py"
+    original = source.read_bytes()
+
+    class Provider(ProviderABC):
+        model_name = "scripted-atomic-retry"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                # First candidate would fix the tax but silently rewrite an
+                # unchanged subtotal range if the tool allowed partial no-ops.
+                assert source.read_bytes() == original
+                edits = [
+                    {"start_line": 5, "end_line": 5,
+                     "target_content": "    return subtotal + 11",
+                     "replacement_content": "    return subtotal + 9"},
+                    {"start_line": 2, "end_line": 2,
+                     "target_content": "    return price - 5",
+                     "replacement_content": "    return price - 5"},
+                ]
+                calls = [{"id": "redundant-batch", "name": "replace_file_edits",
+                          "arguments": {"file_path": "invoice.py", "edits": edits}}]
+            elif self.calls == 2:
+                assert source.read_bytes() == original
+                assert "edit 2" in repr(messages)
+                assert "no edit was made" in repr(messages)
+                edits = [
+                    {"start_line": 5, "end_line": 5,
+                     "target_content": "    return subtotal + 11",
+                     "replacement_content": "    return subtotal + 9"},
+                    {"start_line": 2, "end_line": 2,
+                     "target_content": "    return price - 5",
+                     "replacement_content": "    return price - 10"},
+                ]
+                calls = [{"id": "actual-batch", "name": "replace_file_edits",
+                          "arguments": {"file_path": "invoice.py", "edits": edits}}]
+            elif self.calls == 3:
+                assert b"return price - 10" in source.read_bytes()
+                assert b"return subtotal + 9" in source.read_bytes()
+                calls = [{"id": "verify-after-edit", "name": "run_command",
+                          "arguments": {"command_line": command}}]
+            else:
+                assert self.calls == 4
+                assert "CHECK-PASSED" in repr(messages)
+                yield StreamChunk(content="Repaired and verified.", is_done=True)
+                return
+            yield StreamChunk(is_done=True, native_tool_calls=calls)
+
+    async def approve(tool_name: str, arguments: dict[str, object]) -> bool:
+        if tool_name == "run_command":
+            assert arguments["command_line"] == command
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "atomic-retry.db")
+    provider = Provider()
+    loop = AshLoop(
+        store, provider, guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path,
+        tools={
+            "replace_file_edits": ReplaceFileEditsTool(guard),
+            "run_command": RunCommandTool(guard),
+        },
+        on_tool_approval=approve,
+    )
+    try:
+        session = await loop.start_session()
+        response = await loop.run_turn("Fix invoice.py and verify with verify.py")
+        assert response == "Repaired and verified."
+        assert provider.calls == 4
+        recorded = store.load_session(session.session_id).tool_calls
+        assert [call.tool_name for call in recorded] == [
+            "replace_file_edits", "replace_file_edits", "run_command"
+        ]
+        assert [call.success for call in recorded] == [False, True, True]
+        assert "edit 2" in (recorded[0].error or "")
+        assert "CHECK-PASSED" in (recorded[2].result or "")
         assert store.verify_audit_log(session.session_id) == []
     finally:
         await loop.aclose()

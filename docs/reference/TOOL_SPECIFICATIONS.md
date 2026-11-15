@@ -169,6 +169,7 @@ will be refused. An intentional newline/line-ending change is the exception.
     6.  **Atomic Write Commit**:
         -   Re-assemble the full file content by substituting only the targeted range. `replace_file_edits` uses the same matching and replacement rules for each non-overlapping range.
         -   For `replace_file_content`, reject a replacement that leaves the decoded file unchanged without rewriting the file. When identical target/replacement text fails to match any complete line block, report the invalid no-op intent explicitly. A replacement that **does** change the final newline or line-ending style remains valid even if its two argument strings are identical.
+        -   For `replace_file_edits`, reject the entire batch without writing if **any** requested range would leave its original physical lines unchanged, even if other ranges would change. Identify the redundant edit by its original 1-based argument index. A genuine newline-only change remains valid.
         -   Encode using the source file's detected encoding and BOM, then enforce the byte-size limit.
         -   Write through the scoped atomic writer with the original file digest as its compare-and-swap expectation; remove any temporary file on completion or failure.
     7.  **Scope Refusals**: `read_file`, `write_file`, `replace_file_content`, `replace_file_edits`, and `whole_edit` return an unsuccessful, known-completed `ToolResult` for paths denied by the workspace guard. None of the filesystem tools attempts to read or write the denied path.
