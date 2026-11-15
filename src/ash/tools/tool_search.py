@@ -39,8 +39,8 @@ MAX_TOOL_SEARCH_SUMMARY_FIELD_CHARS = 128
 _SEARCH_WORD_PATTERN = re.compile(r"[a-z0-9]+")
 _SEARCH_STOP_WORDS = frozenset(
     """
-    a an and are as at be by can could did do does for from had has have how i in
-    into is it its me my of on or our out please so that the their them then
+    a an and are as at be before by can could did do does for from had has have how i in
+    into is it its leave making me my of on or our out please so that the their them then
     show there these they this those to up use we were what when where which who
     will with would you your action actions tool tools
     """.split()

@@ -227,6 +227,9 @@ remain subject to the same workspace guards; no denied path is rewritten.
 
 File-discovery globs match complete path segments: `*.py` selects immediate
 files only, while `**/*.py` includes files at the search root and below.
+Generated/dependency subdirectories are excluded even when `directory_path`
+narrows to a source subtree. Selecting a generated directory (or one of its
+descendants) explicitly includes that tree, including nested caches.
 Likewise, `src/**/*.py` includes both `src/app.py` and deeper descendants.
 `search_text(glob=...)` follows the same rules; indexed symbol queries apply
 `path_glob` relative to the project root. Matching does not override existing

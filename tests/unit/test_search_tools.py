@@ -1161,3 +1161,140 @@ async def test_workspace_wide_search_skips_generated_dependencies_but_keeps_sour
 
     directory = await ListDirectoryTool(guard).run()
     assert f"{generated_name}/" in directory.output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generated_name", ["__pycache__", ".venv", "node_modules"])
+async def test_narrow_source_search_skips_nested_generated_but_explicit_root_can_search(
+    tmp_path: Path, generated_name: str,
+) -> None:
+    """Narrowing search to src must not re-enable generated descendants."""
+    source = tmp_path / "src" / "pkg"
+    source.mkdir(parents=True)
+    (source / "actual.py").write_text("real_source_marker\n", encoding="utf-8")
+    generated = source / generated_name / "nested"
+    generated.mkdir(parents=True)
+    (generated / "shadow.py").write_text("generated_only_marker\n", encoding="utf-8")
+    nested_cache = generated.parent / "__pycache__"
+    nested_cache.mkdir(exist_ok=True)
+    (nested_cache / "explicit.py").write_text(
+        "explicit_generated_marker\n", encoding="utf-8"
+    )
+    # Binary caches should not create misleading 'incomplete' results for a
+    # source-only query, but an explicitly selected cache remains inspectable.
+    (generated / "compiled.pyc").write_bytes(b"\x00\xff\x00invalid")
+    guard = SafetyGuard(tmp_path)
+
+    paths = await GlobFilesTool(guard).run(pattern="**/*.py", directory_path="src")
+    source_search = await SearchTextTool(guard).run(
+        pattern="real_source_marker", fixed_strings=True, directory_path="src"
+    )
+    absent = await SearchTextTool(guard).run(
+        pattern="generated_only_marker", fixed_strings=True,
+        directory_path="src",
+    )
+    for result in (paths, source_search, absent):
+        assert result.success and not result.truncated
+        assert "shadow.py" not in result.output
+        assert "workspace search incomplete" not in result.output
+        assert f"skipped generated directories: {generated_name}" in result.output
+    assert "src/pkg/actual.py" in paths.output
+    assert "src/pkg/actual.py:1:real_source_marker" in source_search.output
+
+    # Explicitly requesting the generated subtree opts into its contents.
+    relative_generated = f"src/pkg/{generated_name}"
+    explicit_glob = await GlobFilesTool(guard).run(
+        pattern="**/*.py", directory_path=relative_generated
+    )
+    explicit_text = await SearchTextTool(guard).run(
+        pattern="generated_only_marker", fixed_strings=True,
+        directory_path=relative_generated,
+        glob="**/*.py",
+    )
+    assert explicit_glob.success and "shadow.py" in explicit_glob.output
+    assert "explicit.py" in explicit_glob.output
+    assert explicit_text.success and "shadow.py:1:generated_only_marker" in explicit_text.output
+
+
+@pytest.mark.asyncio
+async def test_coding_loop_narrow_source_discovery_avoids_generated_cache(
+    tmp_path: Path,
+) -> None:
+    """Real agent search results keep source discovery reliable without retries."""
+    import io
+
+    from ash.core.loop import AshLoop
+    from ash.core.session import SessionStore
+    from ash.providers.base import ProviderABC, StreamChunk
+    from ash.providers.capabilities import ProviderCapabilities
+    from ash.ui.headless import HeadlessUI
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "app.py").write_text("real_source_marker\n", encoding="utf-8")
+    generated = source / "__pycache__"
+    generated.mkdir()
+    (generated / "shadow.py").write_text("generated_only_marker\n", encoding="utf-8")
+    (generated / "app.cpython.pyc").write_bytes(b"\xff\x00junk")
+
+    class SearchProvider(ProviderABC):
+        model_name = "scripted-narrow-code-search"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.requests = 0
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests += 1
+            history = repr(messages)
+            if self.requests == 1:
+                call = {"id": "find-marker", "name": "search_text", "arguments": {
+                    "pattern": "real_source_marker", "fixed_strings": True,
+                    "directory_path": "src",
+                }}
+            elif self.requests == 2:
+                assert "src/app.py:1:real_source_marker" in history
+                assert "skipped generated directories: __pycache__" in history
+                assert "workspace search incomplete" not in history
+                assert "shadow.py" not in history
+                call = {"id": "list-source", "name": "glob_files", "arguments": {
+                    "pattern": "**/*.py", "directory_path": "src",
+                }}
+            else:
+                assert self.requests == 3
+                assert "src/app.py" in history
+                assert "shadow.py" not in history
+                yield StreamChunk(content="Found the real source module.", is_done=True)
+                return
+            yield StreamChunk(is_done=True, native_tool_calls=[call])
+
+    async def approve(_name: str, _args: dict[str, object]) -> bool:
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "search-loop.db")
+    provider = SearchProvider()
+    loop = AshLoop(
+        store, provider, guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path,
+        tools={
+            "search_text": SearchTextTool(guard),
+            "glob_files": GlobFilesTool(guard),
+        },
+        on_tool_approval=approve,
+    )
+    try:
+        session = await loop.start_session()
+        result = await loop.run_turn("Find the source module, not its caches")
+        assert result == "Found the real source module."
+        assert provider.requests == 3
+        calls = store.load_session(session.session_id).tool_calls
+        assert [call.tool_name for call in calls] == ["search_text", "glob_files"]
+        assert all(call.success is True for call in calls)
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()

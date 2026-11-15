@@ -115,6 +115,21 @@ def _skipped_generated_note(skipped: set[str]) -> str:
     )
 
 
+def _generated_descendants_to_skip(root: Path, guard: SafetyGuard) -> frozenset[str]:
+    """Skip generated descendants unless the selected root is already inside one.
+
+    Broad code discovery should behave the same in `src/` as at the project
+    root. An explicit `directory_path` within a generated tree opts into that
+    tree, including its nested caches and dependencies.
+    """
+    relative_parts = root.relative_to(guard.project_root).parts
+    return (
+        frozenset()
+        if any(part in DEFAULT_IGNORED_DIRS for part in relative_parts)
+        else DEFAULT_IGNORED_DIRS
+    )
+
+
 class ListDirectoryArgs(BaseModel):
     directory_path: str = Field(
         ".", description="Project-relative directory; '.' lists the project root."
@@ -228,11 +243,7 @@ class GlobFilesTool(BaseTool):
             recursive=True,
             max_depth=MAX_GLOB_DEPTH,
             on_incomplete=mark_incomplete,
-            ignored_dirs=(
-                DEFAULT_IGNORED_DIRS
-                if root == self.safety_guard.project_root
-                else frozenset()
-            ),
+            ignored_dirs=_generated_descendants_to_skip(root, self.safety_guard),
             on_skipped=skipped_generated.add,
         ):
             scanned += 1
@@ -489,11 +500,7 @@ class SearchTextTool(BaseTool):
                 recursive=True,
                 max_depth=MAX_SEARCH_DEPTH,
                 on_incomplete=mark_scan_incomplete,
-                ignored_dirs=(
-                    DEFAULT_IGNORED_DIRS
-                    if root == self.safety_guard.project_root
-                    else frozenset()
-                ),
+                ignored_dirs=_generated_descendants_to_skip(root, self.safety_guard),
                 on_skipped=skipped_generated.add,
             )
         )

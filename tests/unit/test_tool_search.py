@@ -909,6 +909,8 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
     else:
         assert expected_tool in provider.tool_names[1]
         assert expected_tool in catalog["search_tools"].activated_names
+        if expected_tool == "background_process":
+            assert "apply_patch" not in provider.tool_names[1]
         assert (
             provider.tool_schemas[1][expected_tool]
             == catalog[expected_tool].json_schema()
