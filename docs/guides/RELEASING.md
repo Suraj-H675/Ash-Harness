@@ -37,9 +37,11 @@ this preflight.
 
 The release workflow first calls the complete reusable supported-host CI
 workflow and cannot enter the publishing job until every required Linux/macOS,
-Python-version, packaging, browser, sandbox, LSP, and MCP lane succeeds. The
+Python-version, packaging, browser, sandbox, LSP, and MCP lane succeeds. Unlike
+ordinary push/PR CI, a release runs **full unit, integration, and E2E suites**
+on every supported Python-version/OS matrix entry. The
 publishing job then checks that the tag matches the package version, validates
-the lockfile and dependencies again, runs its Ubuntu/Python 3.12 lint/type/test
+the lockfile and dependencies again, runs its Ubuntu/Python 3.12 lint/type
 gate, builds the sdist and then the wheel from that fresh sdist, installs the
 wheel and requires its exact `ash --version` output to match the release tag,
 smoke-tests the wheel, tests the standalone installer on Python 3.10, emits

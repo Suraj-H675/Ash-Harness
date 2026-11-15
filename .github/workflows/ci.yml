@@ -6,6 +6,11 @@ on:
       - "**"
   pull_request:
   workflow_call:
+  workflow_dispatch:
+  # Exercise every supported Python version with the full suite at least
+  # weekly, even though ordinary pushes use a smaller compatibility slice.
+  schedule:
+    - cron: "17 3 * * 0"
 
 permissions:
   contents: read
@@ -63,23 +68,25 @@ jobs:
 
   test:
     timeout-minutes: 40
-    # Linux is the primary host: exercise every supported Python version.
-    # Native macOS is a supported secondary host: run the full suite on the
-    # minimum Python version, with an installed Python 3.14 smoke below.
-    # Avoid multiplying the slow macOS suite across all Python minors: Python
-    # 3.13/3.14 compatibility is already exercised by the Linux matrix.
+    # Full suites on the minimum Python on both OSes; focused interpreter
+    # compatibility on the other supported versions on ordinary pushes/PRs.
+    # Weekly, manually dispatched and release-reused CI run the full matrix.
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             python-version: "3.12"
+            coverage: full
           - os: ubuntu-latest
             python-version: "3.13"
+            coverage: compatibility
           - os: ubuntu-latest
             python-version: "3.14"
+            coverage: compatibility
           - os: macos-latest
             python-version: "3.12"
+            coverage: full
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -95,13 +102,39 @@ jobs:
       # previously left four cancelled jobs with no retrievable pytest logs.
       # A step-level timeout retains time for GitHub to record a failed job.
       - name: Unit test suite
+        if: ${{ matrix.coverage == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' }}
         timeout-minutes: 20
         env:
           PYTHONUNBUFFERED: "1"
         run: >-
           uv run --locked pytest -v tests/unit
           --timeout=120 --timeout-method=thread --durations=30 --durations-min=1 -ra
+      - name: Python interpreter compatibility slice
+        if: ${{ matrix.coverage == 'compatibility' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && github.event_name != 'workflow_call' }}
+        timeout-minutes: 12
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: >-
+          uv run --locked pytest -q
+          tests/unit/test_config.py
+          tests/unit/test_runtime.py
+          tests/unit/test_session.py
+          tests/unit/test_loop.py
+          tests/unit/test_tools.py
+          tests/unit/test_safety.py
+          tests/unit/test_providers.py
+          tests/unit/test_provider_registry.py
+          tests/unit/test_mcp_transport.py
+          tests/unit/test_tool_search.py
+          tests/unit/test_context_continuation.py
+          tests/unit/test_openai_chatgpt_provider.py
+          tests/unit/test_agent_tool.py
+          tests/e2e/test_cli_incomplete_turn_exit.py
+          tests/e2e/test_semantic_test_repair.py
+          tests/packaging
+          --timeout=120 --timeout-method=thread --durations=20 -ra
       - name: Integration test suite
+        if: ${{ matrix.coverage == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' }}
         timeout-minutes: 12
         env:
           PYTHONUNBUFFERED: "1"
@@ -109,6 +142,7 @@ jobs:
           uv run --locked pytest -v tests/integration
           --timeout=120 --timeout-method=thread --durations=30 --durations-min=1 -ra
       - name: End-to-end test suite (macOS Explorer tests run separately)
+        if: ${{ matrix.coverage == 'full' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' }}
         timeout-minutes: 20
         env:
           PYTHONUNBUFFERED: "1"
