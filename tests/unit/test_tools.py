@@ -502,6 +502,75 @@ async def test_read_file_returns_numbered_line_slice(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "embedded_separator",
+    ["\x85", "\u2028", "\u2029", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e"],
+    ids=[
+        "unicode-nel", "unicode-line", "unicode-paragraph", "vertical-tab",
+        "form-feed", "file-separator", "group-separator", "record-separator",
+    ],
+)
+async def test_read_search_and_bounded_edit_agree_on_physical_source_lines(
+    project_root: Path, guard: SafetyGuard, embedded_separator: str,
+) -> None:
+    """Valid source strings must not turn into phantom editor line numbers."""
+    from ash.tools.search import SearchTextTool
+
+    original = f'label = "a{embedded_separator}b"\nanswer = 1\n'
+    compile(original, "module.py", "exec")
+    target = project_root / "module.py"
+    target.write_text(original, encoding="utf-8")
+    search = await SearchTextTool(guard).run(
+        pattern="answer = 1", fixed_strings=True, directory_path="module.py"
+    )
+    read = await ReadFileTool(guard).run(file_path="module.py")
+    assert search.success and search.output == "module.py:2:answer = 1"
+    assert read.success and "total_file_lines=2" in read.output
+    assert f'1: label = "a{embedded_separator}b"\n2: answer = 1' in read.output
+
+    changed = await ReplaceFileContentTool(guard).run(
+        file_path="module.py", start_line=2, end_line=2,
+        target_content="answer = 1", replacement_content="answer = 2",
+    )
+    assert changed.success, changed.error
+    assert target.read_text(encoding="utf-8") == original.replace("answer = 1", "answer = 2")
+    compile(target.read_text(encoding="utf-8"), "module.py", "exec")
+
+
+@pytest.mark.asyncio
+async def test_multi_range_edits_and_unique_block_respect_physical_lines(
+    project_root: Path, guard: SafetyGuard,
+) -> None:
+    target = project_root / "mixed.txt"
+    original = "header = 'alpha\u2028beta'\r\nfirst = 1\nsecond = 2\rthird = 3\r\n"
+    target.write_bytes(original.encode("utf-8"))
+    read = await ReadFileTool(guard).run(file_path="mixed.txt")
+    assert read.success and "total_file_lines=4" in read.output
+    assert "2: first = 1\n3: second = 2\n4: third = 3" in read.output
+
+    batch = await ReplaceFileEditsTool(guard).run(
+        file_path="mixed.txt", edits=[
+            {"start_line": 2, "end_line": 2, "target_content": "first = 1",
+             "replacement_content": "first = 10"},
+            {"start_line": 4, "end_line": 4, "target_content": "third = 3",
+             "replacement_content": "third = 30"},
+        ],
+    )
+    assert batch.success, batch.error
+    assert target.read_bytes() == original.replace(
+        "first = 1", "first = 10"
+    ).replace("third = 3", "third = 30").encode("utf-8")
+
+    unique = await ReplaceFileContentTool(guard).run(
+        file_path="mixed.txt",
+        target_content="header = 'alpha\u2028beta'",
+        replacement_content="header = 'gamma\u2028delta'",
+    )
+    assert unique.success, unique.error
+    assert target.read_bytes().startswith("header = 'gamma\u2028delta'\r\n".encode())
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("start_line", [4, 100])
 async def test_read_file_rejects_stale_start_line_after_end_of_file(
     project_root: Path, guard: SafetyGuard, start_line: int,
@@ -2515,7 +2584,7 @@ async def test_replace_file_content_unique_mode_checks_hash_and_bounds(
 
 
 @pytest.mark.asyncio
-async def test_replace_file_content_unique_mode_refuses_unicode_line_mismatch(
+async def test_replace_file_content_unique_mode_preserves_physical_unicode_line(
     project_root: Path, guard: SafetyGuard
 ) -> None:
     target = project_root / "doc.txt"
@@ -2528,9 +2597,20 @@ async def test_replace_file_content_unique_mode_refuses_unicode_line_mismatch(
         replacement_content="new",
     )
 
-    assert result.success is False
-    assert "does not match complete file lines" in (result.error or "")
-    assert target.read_text(encoding="utf-8") == original
+    assert result.success is True
+    assert target.read_text(encoding="utf-8") == "new\nthree\n"
+
+    target.write_text(original, encoding="utf-8")
+    # Matching only a substring on either side of the embedded separator
+    # must still refuse the edit, rather than treating it as a new source line.
+    for partial in ("one", "two"):
+        rejected = await ReplaceFileContentTool(guard).run(
+            file_path="doc.txt", target_content=partial,
+            replacement_content="unsafe",
+        )
+        assert not rejected.success
+        assert "does not match a complete block of lines" in (rejected.error or "")
+        assert target.read_text(encoding="utf-8") == original
 
 
 @pytest.mark.asyncio
@@ -2981,7 +3061,7 @@ async def test_indent_only_hint_does_not_expose_existing_source_text(
 
 
 @pytest.mark.asyncio
-async def test_replace_file_content_shift_hint_refuses_unicode_line_boundary_near_match(
+async def test_replace_file_content_shift_hint_keeps_unicode_source_location_safe(
     project_root: Path, guard: SafetyGuard
 ) -> None:
     target = project_root / "doc.txt"
@@ -2995,7 +3075,7 @@ async def test_replace_file_content_shift_hint_refuses_unicode_line_boundary_nea
         replacement_content="replacement",
     )
     assert failed.success is False
-    assert "once at lines" not in (failed.error or "")
+    assert "once at lines 2-2 instead; no edit was made" in (failed.error or "")
     assert target.read_text(encoding="utf-8") == source
 
 

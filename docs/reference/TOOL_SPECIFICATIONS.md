@@ -91,6 +91,9 @@ from the remaining non-sensitive arguments after informing the user.
 ### 2.1 `read_file`
 Retrieves numbered, bounded source text from the local workspace with a
 whole-file SHA-256 digest and detected text encoding. The read is non-mutating.
+Line numbers use physical LF, CRLF and CR terminators, as do source search and
+bounded edits. Unicode line/paragraph separators, form feeds and other embedded
+non-newline control characters do not create phantom source lines.
 
 *   **Arguments Schema**:
     ```python
@@ -99,7 +102,7 @@ whole-file SHA-256 digest and detected text encoding. The read is non-mutating.
         start_line: int = Field(1, description="1-indexed starting line number (inclusive).")
         end_line: int | None = Field(None, description="1-indexed ending line number (inclusive).")
         start_column: int = Field(1, description="1-indexed Unicode character offset within start_line.")
-        max_chars: int = Field(32768, ge=1, le=131072, description="Source characters per read, excluding metadata and line numbers.")
+        max_chars: int = Field(8192, ge=1, le=131072, description="Source characters per read, excluding metadata and line numbers.")
         expected_sha256: str | None = Field(None, description="Optional digest from a prior read; reject changed files.")
     ```
 *   **Security & Safety Checks**:
@@ -118,7 +121,7 @@ whole-file SHA-256 digest and detected text encoding. The read is non-mutating.
     ```
     If the source-character limit is reached, the result also includes:
     ```
-    [read_file truncated: source_chars_limit=32768; next_start_line=3; next_start_column=128]
+    [read_file truncated: source_chars_limit=8192; next_start_line=3; next_start_column=128]
     ```
     A page limited only by the 800-line cap retains the existing line-based
     truncation metadata. Normal small reads retain their original numbering

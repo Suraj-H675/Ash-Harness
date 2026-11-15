@@ -24,7 +24,102 @@ from ash.tools.filesystem import (
     ReplaceFileEditsTool,
     WriteFileTool,
 )
+from ash.tools.search import SearchTextTool
 from ash.ui.headless import HeadlessUI
+
+
+@pytest.mark.asyncio
+async def test_coding_agent_uses_search_line_to_edit_valid_unicode_source(
+    tmp_path: Path,
+) -> None:
+    """Real search -> exact line edit -> authorized Python check must agree."""
+    module = tmp_path / "module.py"
+    original = 'greeting = "hello\u2028world"\nanswer = 1\n'
+    compile(original, str(module), "exec")
+    module.write_text(original, encoding="utf-8")
+    (tmp_path / "verify.py").write_text(
+        "from module import answer, greeting\n"
+        "assert answer == 2\n"
+        "assert len(greeting) == 11\n"
+        "print('PHYSICAL-LINE-CHECK-PASSED')\n",
+        encoding="utf-8",
+    )
+    command = f"{shlex.quote(sys.executable)} -B verify.py"
+
+    class Provider(ProviderABC):
+        model_name = "scripted-physical-source-lines"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self) -> None:
+            self.requests = 0
+
+        def count_tokens(self, text: str) -> int:
+            return max(1, len(str(text)) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.requests += 1
+            history = repr(messages)
+            if self.requests == 1:
+                tool_calls = [{"id": "find", "name": "search_text", "arguments": {
+                    "pattern": "answer = 1", "fixed_strings": True,
+                    "directory_path": "module.py",
+                }}]
+            elif self.requests == 2:
+                assert "module.py:2:answer = 1" in history
+                tool_calls = [{"id": "bounded-edit", "name": "replace_file_content",
+                               "arguments": {"file_path": "module.py",
+                                             "start_line": 2, "end_line": 2,
+                                             "target_content": "answer = 1",
+                                             "replacement_content": "answer = 2"}}]
+            elif self.requests == 3:
+                assert module.read_text(encoding="utf-8") == original.replace(
+                    "answer = 1", "answer = 2"
+                )
+                assert '"success": true' in history.lower()
+                tool_calls = [{"id": "check", "name": "run_command",
+                               "arguments": {"command_line": command}}]
+            else:
+                assert self.requests == 4
+                assert "PHYSICAL-LINE-CHECK-PASSED" in history
+                yield StreamChunk(content="Correct source line edited and verified.",
+                                  is_done=True)
+                return
+            yield StreamChunk(is_done=True, native_tool_calls=tool_calls)
+
+    async def approve(name: str, arguments: dict[str, object]) -> bool:
+        if name == "run_command":
+            assert arguments["command_line"] == command
+        return True
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "physical-lines.db")
+    provider = Provider()
+    loop = AshLoop(
+        store, provider, guard,
+        HeadlessUI(output_format="stream-json", stream=io.StringIO()),
+        tmp_path,
+        tools={
+            "search_text": SearchTextTool(guard),
+            "replace_file_content": ReplaceFileContentTool(guard),
+            "run_command": RunCommandTool(guard),
+        },
+        on_tool_approval=approve,
+    )
+    try:
+        session = await loop.start_session()
+        response = await loop.run_turn("Find and fix answer, then run verify.py")
+        assert response == "Correct source line edited and verified."
+        assert provider.requests == 4
+        records = store.load_session(session.session_id).tool_calls
+        assert [call.tool_name for call in records] == [
+            "search_text", "replace_file_content", "run_command",
+        ]
+        assert [call.success for call in records] == [True, True, True]
+        assert records[-1].exit_code == 0
+        assert "PHYSICAL-LINE-CHECK-PASSED" in (records[-1].result or "")
+        assert store.verify_audit_log(session.session_id) == []
+    finally:
+        await loop.aclose()
 
 
 @pytest.mark.asyncio

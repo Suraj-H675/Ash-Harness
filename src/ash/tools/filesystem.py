@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import difflib
 import hashlib
+import re
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -93,6 +94,27 @@ BOM_ENCODINGS = (
     TextEncoding("utf-16-le", "utf-16-le", codecs.BOM_UTF16_LE),
     TextEncoding("utf-16-be", "utf-16-be", codecs.BOM_UTF16_BE),
 )
+
+# Python's str.splitlines() treats NEL, Unicode line/paragraph separators,
+# vertical tabs, form feeds and ASCII record separators as line breaks. They
+# can occur *inside* valid source strings but do not advance compiler or
+# search_text line numbers. Keep the fast C split on ordinary source, and use
+# only physical CRLF, CR and LF when any such character is present.
+_NON_PHYSICAL_LINE_BREAKS = "\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+_SOURCE_LINE_ENDINGS = re.compile(r"\r\n|\r|\n")
+
+
+def _source_lines(text: str, *, keepends: bool = False) -> list[str]:
+    if not any(marker in text for marker in _NON_PHYSICAL_LINE_BREAKS):
+        return text.splitlines(keepends=keepends)
+    lines: list[str] = []
+    start = 0
+    for ending in _SOURCE_LINE_ENDINGS.finditer(text):
+        lines.append(text[start : ending.end() if keepends else ending.start()])
+        start = ending.end()
+    if start < len(text):
+        lines.append(text[start:])
+    return lines
 
 
 class BinaryContentError(ValueError):
@@ -391,7 +413,7 @@ class ReadFileTool(BaseTool):
                 output="",
                 error=str(exc),
             )
-        lines = original_text.splitlines()
+        lines = _source_lines(original_text)
         if args.end_line is not None and args.end_line < args.start_line:
             return ToolResult(
                 success=False, output="", error="Error: end_line must be >= start_line."
@@ -686,7 +708,7 @@ class ReplaceFileContentTool(BaseTool):
         stale_error = _validate_expected_sha256(args.expected_sha256, actual_sha256)
         if stale_error is not None:
             return ToolResult(success=False, output="", error=stale_error)
-        lines = original_text.splitlines(keepends=True)
+        lines = _source_lines(original_text, keepends=True)
 
         normalized_target = _strip_trailing_newlines(
             _normalize_line_endings(args.target_content)
@@ -845,7 +867,7 @@ class ReplaceFileEditsTool(BaseTool):
         if stale_error is not None:
             return ToolResult(success=False, output="", error=stale_error)
 
-        lines = original_text.splitlines(keepends=True)
+        lines = _source_lines(original_text, keepends=True)
         validation_error = _validate_non_overlapping_edits(args.edits, len(lines))
         if validation_error is not None:
             return ToolResult(success=False, output="", error=validation_error)
@@ -1097,7 +1119,7 @@ def _replacement_lines_for_span(
     ):
         replacement_content += source_boundary
 
-    return replacement_content.splitlines(keepends=True)
+    return _source_lines(replacement_content, keepends=True)
 
 
 def _strip_trailing_newlines(content: str) -> str:
@@ -1191,9 +1213,8 @@ def _unique_line_mismatch_hint(
     """Diagnose a shifted match; never turn a bounded edit into a search/edit."""
     span, error = _find_unique_line_span(original_text, normalized_target)
     if span is not None and span != (start_index, end_index):
-        # Match the unique-block tool's second exact-line validation. Some
-        # Unicode line separators affect splitlines() differently than LF.
-        source_lines = original_text.splitlines(keepends=True)
+        # Match the unique-block tool's second exact physical-line validation.
+        source_lines = _source_lines(original_text, keepends=True)
         segment = "".join(source_lines[span[0] : span[1]])
         if _strip_trailing_newlines(_normalize_line_endings(segment)) == normalized_target:
             return (
