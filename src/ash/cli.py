@@ -235,6 +235,11 @@ def _config_overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
         overrides["no_color"] = True
     if getattr(args, "db_directory", None) is not None:
         overrides["db_directory"] = args.db_directory
+    if (
+        getattr(args, "prompt", None) is not None
+        and getattr(args, "max_turn_iterations", None) is not None
+    ):
+        overrides["max_turn_iterations"] = args.max_turn_iterations
     if getattr(args, "command", "") == "diff-mode" and getattr(args, "mode", None):
         overrides["approval_diff_mode"] = args.mode
     return overrides
@@ -3196,6 +3201,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
             parser.error("--turn-time-budget requires a one-shot prompt")
         if not 30 <= args.turn_time_budget <= 3600:
             parser.error("--turn-time-budget must be between 30 and 3600 seconds")
+    if args.max_turn_iterations is not None:
+        if args.prompt is None or args.command is not None:
+            parser.error("--max-turn-iterations requires a one-shot prompt")
+        if not 1 <= args.max_turn_iterations <= 100:
+            parser.error("--max-turn-iterations must be between 1 and 100")
     if args.report_after_command is not None:
         if (
             args.prompt is None

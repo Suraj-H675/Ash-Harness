@@ -16,6 +16,18 @@ queued steering messages. A configured `max_turn_total_tokens` also limits the
 combined prompt and completion tokens for a turn; `0` disables that token
 limit.
 
+For a more involved **one-shot** coding task, explicitly opt into more cycles
+without editing your persistent profile, for example:
+
+```shell
+ash -p "Fix the multi-file issue and run its tests" --max-turn-iterations 24
+```
+
+This overrides the iteration ceiling **for that CLI invocation only** (1–100).
+The default remains 10, and other token, time, command, permission and sandbox
+limits still apply. More requests can increase provider usage and cost; the
+flag does not force the model to use them or prove that its edits are correct.
+
 After a turn reaches `token_budget`, `iteration_limit`, or `circuit_breaker`,
 the user may explicitly start another turn in the same saved session. On the
 next turn, Ash reads only the latest completed turn's persisted terminal event

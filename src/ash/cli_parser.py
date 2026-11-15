@@ -1599,6 +1599,17 @@ def configure_parser(parser: argparse.ArgumentParser, version: str) -> None:
         ),
     )
     parser.add_argument(
+        "--max-turn-iterations",
+        type=int,
+        default=None,
+        metavar="REQUESTS",
+        help=(
+            "For one one-shot prompt, allow 1..100 model request cycles "
+            "(default: the configured limit, normally 10). Higher values "
+            "may increase model usage and cost."
+        ),
+    )
+    parser.add_argument(
         "--report-after-command",
         type=str,
         default=None,
