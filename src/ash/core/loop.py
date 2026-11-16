@@ -45,7 +45,11 @@ from xml.sax.saxutils import escape as xml_escape, quoteattr
 
 from pydantic import ValidationError
 
-from ash.context.history import RequestTokenBudget, resolve_request_token_budget
+from ash.context.history import (
+    RUNTIME_ONLY_HISTORY_KEY,
+    RequestTokenBudget,
+    resolve_request_token_budget,
+)
 from ash.core.goals import (
     DEFAULT_MAX_GOAL_CONTINUATIONS,
     GoalRecord,
@@ -7695,6 +7699,55 @@ class AshLoop:
             provider_max_output_tokens=capabilities.max_output_tokens,
         )
 
+    def _provider_history_messages(
+        self,
+        session: Session,
+        *,
+        tool_result_images: _TurnToolResultImages | None,
+        mark_runtime_only: bool,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """Serialize tool/reasoning history identically across context modes.
+
+        The protected index is one-based because the caller prefixes the
+        provider's system message. The runtime-only marker is private to the
+        compactor and must never reach the external provider.
+        """
+
+        history: list[dict[str, Any]] = []
+        active_turn_seen = False
+        protected_index: int | None = None
+        can_replay_images = (
+            tool_result_images is not None
+            and _provider_capabilities(self.provider).vision
+        )
+        for message in session.messages:
+            if message is self._active_turn_user_message:
+                active_turn_seen = True
+            item: dict[str, Any] = {
+                "role": message.role,
+                "content": _canonical_message_content(message),
+            }
+            if message.role == "assistant" and message.metadata.get("tool_calls"):
+                item["tool_calls"] = self._provider_history_tool_calls(
+                    message.metadata["tool_calls"]
+                )
+            if message.role == "assistant" and message.metadata.get("provider_state"):
+                item["provider_state"] = message.metadata["provider_state"]
+            if message.role == "tool" and message.metadata.get("call_id"):
+                call_id = message.metadata["call_id"]
+                item["tool_call_id"] = call_id
+                if active_turn_seen and can_replay_images:
+                    assert tool_result_images is not None
+                    image_blocks = tool_result_images.for_call(call_id)
+                    if image_blocks:
+                        item["tool_result_images"] = image_blocks
+            if mark_runtime_only and message.is_runtime_only:
+                item[RUNTIME_ONLY_HISTORY_KEY] = True
+            history.append(item)
+            if self._turn_running and message is self._active_turn_user_message:
+                protected_index = len(history)
+        return history, protected_index
+
     def _build_messages(
         self,
         session: Session,
@@ -7809,7 +7862,6 @@ class AshLoop:
                 ContextTrust,
                 HistoryCompactor,
                 RequestBudgetError,
-                RUNTIME_ONLY_HISTORY_KEY,
                 context_fragment,
             )
 
@@ -7991,43 +8043,12 @@ class AshLoop:
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_content}
             ]
-            protected_history_index: int | None = None
-            active_turn_message_seen = False
-            for message in session.messages:
-                if message is self._active_turn_user_message:
-                    active_turn_message_seen = True
-                msg_dict: dict[str, Any] = {
-                    "role": message.role,
-                    "content": _canonical_message_content(message),
-                }
-                if message.role == "assistant" and message.metadata.get("tool_calls"):
-                    msg_dict["tool_calls"] = self._provider_history_tool_calls(
-                        message.metadata["tool_calls"]
-                    )
-                if message.role == "assistant" and message.metadata.get(
-                    "provider_state"
-                ):
-                    msg_dict["provider_state"] = message.metadata["provider_state"]
-                # OpenAI requires tool_call_id on role=tool messages.
-                if message.role == "tool" and message.metadata.get("call_id"):
-                    call_id = message.metadata["call_id"]
-                    msg_dict["tool_call_id"] = call_id
-                    if (
-                        active_turn_message_seen
-                        and tool_result_images is not None
-                        and _provider_capabilities(self.provider).vision
-                    ):
-                        image_blocks = tool_result_images.for_call(call_id)
-                        if image_blocks:
-                            msg_dict["tool_result_images"] = image_blocks
-                if message.is_runtime_only:
-                    msg_dict[RUNTIME_ONLY_HISTORY_KEY] = True
-                messages.append(msg_dict)
-                if (
-                    self._turn_running
-                    and message is self._active_turn_user_message
-                ):
-                    protected_history_index = len(messages) - 1
+            history, protected_history_index = self._provider_history_messages(
+                session,
+                tool_result_images=tool_result_images,
+                mark_runtime_only=True,
+            )
+            messages.extend(history)
 
             reserved_message_tokens = (
                 budget_usage["system"]
@@ -8232,34 +8253,12 @@ class AshLoop:
                 messages[0]["content"] = (
                     f"{messages[0]['content']}\n\n{tool_schema_content}"
                 )
-        active_turn_message_seen = False
-        for message in session.messages:
-            if message is self._active_turn_user_message:
-                active_turn_message_seen = True
-            msg_dict = {
-                "role": message.role,
-                "content": _canonical_message_content(message),
-            }
-            if message.role == "assistant" and message.metadata.get("tool_calls"):
-                msg_dict["tool_calls"] = self._provider_history_tool_calls(
-                    message.metadata["tool_calls"]
-                )
-            if message.role == "assistant" and message.metadata.get(
-                "provider_state"
-            ):
-                msg_dict["provider_state"] = message.metadata["provider_state"]
-            if message.role == "tool" and message.metadata.get("call_id"):
-                call_id = message.metadata["call_id"]
-                msg_dict["tool_call_id"] = call_id
-                if (
-                    active_turn_message_seen
-                    and tool_result_images is not None
-                    and _provider_capabilities(self.provider).vision
-                ):
-                    image_blocks = tool_result_images.for_call(call_id)
-                    if image_blocks:
-                        msg_dict["tool_result_images"] = image_blocks
-            messages.append(msg_dict)
+        history, _ = self._provider_history_messages(
+            session,
+            tool_result_images=tool_result_images,
+            mark_runtime_only=False,
+        )
+        messages.extend(history)
         return messages
 
     async def _refresh_repo_map_before_prompt(self) -> Exception | None:

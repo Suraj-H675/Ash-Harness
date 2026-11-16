@@ -7686,6 +7686,142 @@ def test_build_messages_injects_untrusted_content_boundary(tmp_path: Path) -> No
     assert "Untrusted-content boundary:" in messages[0]["content"]
 
 
+@pytest.mark.parametrize("configured", [False, True])
+def test_provider_history_replay_is_consistent_with_and_without_context_budget(
+    tmp_path: Path, configured: bool
+) -> None:
+    store = SessionStore(tmp_path / "history-replay.db")
+    config = (
+        AshConfig(
+            model="local/history-replay",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            max_context_tokens=16_384,
+            max_completion_tokens=512,
+            memory_backend="off",
+        )
+        if configured
+        else None
+    )
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={},
+        config=config,
+    )
+    session = store.create_session(str(tmp_path))
+    active = Message(
+        role="user", content="inspect file", timestamp=datetime.now(timezone.utc)
+    )
+    calls = [
+        {"id": "call-1", "name": "read_file", "arguments": {"file_path": "a.py"}}
+    ]
+    provider_state = [{"type": "reasoning", "encrypted_content": "opaque-replay"}]
+    assistant = Message(
+        role="assistant",
+        content="",
+        timestamp=datetime.now(timezone.utc),
+        metadata={"tool_calls": calls, "provider_state": provider_state},
+    )
+    outcome = Message(
+        role="tool",
+        content="file output",
+        timestamp=datetime.now(timezone.utc),
+        metadata={"call_id": "call-1"},
+    )
+    transient = Message(
+        role="system",
+        content="runtime-only note",
+        timestamp=datetime.now(timezone.utc),
+    )
+    transient.mark_runtime_only()
+    session.messages.extend([active, assistant, outcome, transient])
+    loop.current_session = session
+    loop._turn_running = True
+    loop._active_turn_user_message = active
+
+    provider_messages = loop._build_messages(session)
+
+    assert [message["role"] for message in provider_messages[1:]] == [
+        "user",
+        "assistant",
+        "tool",
+        "system",
+    ]
+    assert provider_messages[2]["tool_calls"] == calls
+    assert provider_messages[2]["provider_state"] == provider_state
+    assert provider_messages[3]["tool_call_id"] == "call-1"
+    assert all("_ash_runtime_only" not in item for item in provider_messages)
+    assert provider_messages[-1]["content"] == "runtime-only note"
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_provider_history_replays_images_only_after_active_turn_start(
+    tmp_path: Path, configured: bool
+) -> None:
+    class VisionProvider(MockProvider):
+        _ash_declared_capabilities = ProviderCapabilities(vision=True)
+
+    store = SessionStore(tmp_path / "vision-history.db")
+    config = (
+        AshConfig(
+            model="local/vision-history",
+            workspace_root=tmp_path,
+            db_directory=tmp_path / "db",
+            memory_backend="off",
+            max_context_tokens=16_384,
+            max_completion_tokens=512,
+        )
+        if configured
+        else None
+    )
+    loop = AshLoop(
+        store,
+        VisionProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        tools={},
+        config=config,
+    )
+    session = store.create_session(str(tmp_path))
+    older_tool = Message(
+        role="tool",
+        content="earlier result",
+        timestamp=datetime.now(timezone.utc),
+        metadata={"call_id": "old"},
+    )
+    active = Message(
+        role="user",
+        content="inspect screenshot",
+        timestamp=datetime.now(timezone.utc),
+    )
+    recent_tool = Message(
+        role="tool",
+        content="new screenshot",
+        timestamp=datetime.now(timezone.utc),
+        metadata={"call_id": "current"},
+    )
+    session.messages.extend([older_tool, active, recent_tool])
+    loop.current_session = session
+    loop._active_turn_user_message = active
+    loop._turn_running = True
+    images = loop_module._TurnToolResultImages(enabled=True)
+    image = {"type": "image", "media_type": "image/png", "data": "cG5nLWRhdGE="}
+    images.capture("old", [image])
+    images.capture("current", [image])
+
+    messages = loop._build_messages(session, tool_result_images=images)
+
+    older = next(item for item in messages if item.get("tool_call_id") == "old")
+    recent = next(item for item in messages if item.get("tool_call_id") == "current")
+    assert "tool_result_images" not in older
+    assert recent["tool_result_images"] == [image]
+
+
 def test_failed_nested_instruction_refresh_falls_back_to_baseline(tmp_path: Path) -> None:
     baseline = tmp_path
     nested_a = tmp_path / "a"
