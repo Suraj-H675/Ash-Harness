@@ -230,6 +230,13 @@ source requests still favor `read_files`, and multiple ranges within one
 file still favor `replace_file_edits`. Discovery neither runs the patch nor
 grants approval; normal validation, permission and ambiguous-result safeguards
 remain in force.
+The optional large-effective-context coding guidance also explains why several
+sequential `replace_file_content` calls cannot reuse one file's original
+`expected_sha256`: the first successful write makes later hashes stale. It
+directs the model to discover `replace_file_edits` for one-file non-overlapping
+changes or `apply_patch` across files. Hash validation remains mandatory when
+the caller supplies it; this is a selection hint, not automatic mutation
+coalescing or a demonstrated improvement in live task completion.
 
 After a request is assembled, `ContextBudgetReport.fragments` records each
 fragment's typed kind, source, trust class, token use and limit, truncation

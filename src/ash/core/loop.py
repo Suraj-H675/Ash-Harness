@@ -993,7 +993,12 @@ LARGE_CONTEXT_CODING_GUIDANCE = (
     "files, and run the explicitly authorized focused test before reporting "
     "completion. Review edits with the available workspace_diff (Ash-edited "
     "files, no Git required) or git_diff (Git worktree) tool rather than an "
-    "unapproved shell command. Do not bypass policy or claim unrun tests."
+    "unapproved shell command. For several non-overlapping changes to one "
+    "file, discover replace_file_edits via search_tools and apply one atomic "
+    "edit. Multiple replace_file_content calls using one expected_sha256 "
+    "become stale after the first successful write; do not omit the hash to "
+    "avoid that guard. For coordinated changes across files, discover "
+    "apply_patch. Do not bypass policy or claim unrun tests."
 )
 
 NATIVE_TOOL_PROTOCOL = """### Tool Call Format

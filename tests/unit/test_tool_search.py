@@ -435,6 +435,9 @@ async def test_large_context_coding_tools_fit_effective_provider_window(
     if promoted:
         assert "git_diff" in messages[0]["content"]
         assert LARGE_CONTEXT_CODING_GUIDANCE in messages[0]["content"]
+        assert "replace_file_edits" in messages[0]["content"]
+        assert "apply_patch" in messages[0]["content"]
+        assert "expected_sha256" in messages[0]["content"]
     assert loop._last_context_tokens <= loop._resolve_request_token_budget().input_limit
     await loop.aclose()
 
