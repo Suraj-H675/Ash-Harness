@@ -38,6 +38,7 @@ DEFAULT_SEARCH_CAPTURE_BYTES = 16_384
 MAX_SEARCH_LINE_CHARS = 64 * 1024
 MAX_SEARCH_CONTEXT_PREVIEW_CHARS = 512
 MAX_SEARCH_CONTEXT_CAPTURE_BYTES = 24_576
+MAX_SEARCH_CONTEXT_LINES = 10
 MAX_LIST_DIRECTORY_DEPTH = 4
 MAX_GLOB_SCAN_ENTRIES = 100_000
 MAX_GLOB_DEPTH = 32
@@ -299,7 +300,12 @@ class SearchTextArgs(BaseModel):
     fixed_strings: bool = False
     case_sensitive: bool = True
     max_results: int = Field(DEFAULT_MAX_RESULTS, ge=1, le=HARD_MAX_RESULTS)
-    context_lines: int = Field(0, ge=0, le=5)
+    context_lines: int = Field(
+        0,
+        ge=0,
+        le=MAX_SEARCH_CONTEXT_LINES,
+        description="Nearby source lines before/after each match (0–10); output byte caps remain enforced.",
+    )
     max_output_bytes: int = Field(
         DEFAULT_SEARCH_CAPTURE_BYTES, ge=1_024, le=MAX_SEARCH_CAPTURE_BYTES
     )

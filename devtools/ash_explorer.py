@@ -1929,7 +1929,7 @@ def _valid_search_text_schema(schema: object) -> bool:
             return False
     if bounded_fields.issubset(properties):
         for name, lower, upper, default in (
-            ("context_lines", 0, 5, 0),
+            ("context_lines", 0, 10, 0),
             ("max_output_bytes", 1_024, 2_000_000, 16_384),
         ):
             definition = properties[name]

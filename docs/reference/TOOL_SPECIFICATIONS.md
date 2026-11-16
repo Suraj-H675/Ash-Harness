@@ -252,6 +252,10 @@ Explicit current-directory segments such as `./src/**/*.py` and
 resolved into an alternate search scope.
 When `search_text` targets one explicit file, its glob accepts either that
 file's basename or its project-relative path.
+`search_text(context_lines=...)` accepts 0–10 lines before and after a match.
+This improves focused code inspection without raising the 16,384-byte default
+search capture or the 24,576-byte contextual hard cap; result truncation remains
+explicit. Use `fixed_strings=true` for literal symbols containing regex syntax.
 
 `find_symbol` and `find_references` use a bounded repository index. If
 discovery stops at its entry/depth limit, a directory cannot be enumerated,

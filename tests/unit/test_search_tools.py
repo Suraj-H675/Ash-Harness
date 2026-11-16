@@ -414,8 +414,38 @@ async def test_search_text_five_context_lines_remain_bounded(tmp_path, monkeypat
     assert limited.success and limited.truncated
     assert "[search output capture truncated after 64 bytes]" in limited.output
     assert "app.py-12-line 12" not in limited.output
-    with pytest.raises(ValueError, match="less than or equal to 5"):
-        SearchTextArgs(pattern="needle", context_lines=6)
+
+
+@pytest.mark.asyncio
+async def test_search_text_ten_context_lines_preserve_results_under_fixed_byte_cap(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "module.py"
+    path.write_text(
+        "".join("needle\n" if index == 13 else f"line {index}\n"
+                for index in range(1, 26))
+    )
+    tool = SearchTextTool(SafetyGuard(tmp_path))
+    window = await tool.run(pattern="needle", fixed_strings=True, context_lines=10)
+    assert window.success and not window.truncated
+    assert window.output.splitlines() == [
+        *(f"module.py-{index}-line {index}" for index in range(3, 13)),
+        "module.py:13:needle",
+        *(f"module.py-{index}-line {index}" for index in range(14, 24)),
+    ]
+    direct = await tool.run(pattern="needle", fixed_strings=True)
+    assert direct.success and direct.output == "module.py:13:needle"
+
+    monkeypatch.setattr(search_module, "MAX_SEARCH_CONTEXT_CAPTURE_BYTES", 64)
+    truncated = await tool.run(
+        pattern="needle", fixed_strings=True, context_lines=10,
+        max_output_bytes=2_000_000,
+    )
+    assert truncated.success and truncated.truncated
+    assert "[search output capture truncated after 64 bytes]" in truncated.output
+    assert "module.py-23-line 23" not in truncated.output
+    with pytest.raises(ValueError, match="less than or equal to 10"):
+        SearchTextArgs(pattern="needle", context_lines=11)
 
 
 @pytest.mark.asyncio
