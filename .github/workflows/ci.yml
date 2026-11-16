@@ -52,6 +52,15 @@ jobs:
           uv venv .smoke-venv --python 3.12
           uv pip install --python .smoke-venv dist/*.whl
           .smoke-venv/bin/python tests/packaging/smoke_minimal_install.py
+      - name: Installed wheel interactive first-use journey
+        # Reuse the real-PTY first-use assertions, but launch every Ash process
+        # with the freshly installed wheel and without source PYTHONPATH.
+        env:
+          ASH_FIRST_USE_WHEEL_PYTHON: ${{ github.workspace }}/.smoke-venv/bin/python
+        run: >-
+          uv run --locked pytest -q
+          tests/e2e/test_cli_terminal_fallbacks.py::test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume
+          --timeout=90 --timeout-method=thread
       - name: Installed wheel upper-bound Python smoke
         shell: bash
         run: |

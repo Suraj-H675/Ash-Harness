@@ -144,9 +144,22 @@ verifies the saved route without a completion request; a fresh `ash --continue`
 process restores the same session without replaying either side effect, and
 the audit verifies before and after resume. The related first-run, provider,
 approval, session, permission and audit suite passed **168 tests**. This
-verifies source-checkout CLI wiring with a deterministic local test provider;
-it is **not** a fresh *installed-wheel* first-use proof, a strong-model task
-quality result, a rich-terminal walk-through, or macOS interactive validation.
+first establishes source-checkout CLI wiring with a deterministic local test
+provider; it is not a strong-model task-quality result, a rich-terminal
+walk-through, or macOS interactive validation.
+
+**Installed-wheel first-use gate (2026-11-17):** After correcting the hosted
+macOS test environment's `python3` search path, the full supported CI matrix
+passed **18/18** at `d9b6d0e`. Independently, a wheel built from an sdist
+with pinned `uv 0.12.17` was installed into a fresh isolated environment;
+the real first-use CLI journey and existing installed-wheel smoke both passed
+with no source `PYTHONPATH`. The same first-use test now offers a strict
+installed-interpreter mode: it rejects editable source imports, and the
+artifact-install CI lane runs that test against its freshly installed wheel.
+Both source and wheel modes passed locally; the automated **hosted wheel
+first-use step** still requires its own successful CI run before acceptance.
+These checks do not establish public release installation, strong-model
+interactive performance or complete macOS onboarding usability.
 
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic

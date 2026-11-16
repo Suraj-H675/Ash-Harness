@@ -75,6 +75,7 @@ def _open_pty_cli(
     rows: int = 24,
     columns: int = 80,
     args: tuple[str, ...] = (),
+    python_executable: str | None = None,
 ) -> tuple[int, subprocess.Popen[bytes]]:
     import fcntl
     import pty
@@ -87,7 +88,7 @@ def _open_pty_cli(
         struct.pack("HHHH", rows, columns, 0, 0),
     )
     process = subprocess.Popen(
-        [sys.executable, "-m", "ash", *args],
+        [python_executable or sys.executable, "-m", "ash", *args],
         cwd=workspace,
         env=environment,
         stdin=slave,
@@ -567,7 +568,35 @@ def test_first_run_local_provider_picker_ctrl_c_cancels_setup(
 def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
     tmp_path: Path,
 ) -> None:
-    """One real first-run TTY journey with a disposable provider and workspace."""
+    """One real first-run TTY journey; CI can target the installed wheel."""
+    python_executable = sys.executable
+    installed_python = os.environ.get("ASH_FIRST_USE_WHEEL_PYTHON")
+    if installed_python is not None:
+        # Do not accept a source-checkout interpreter masquerading as the
+        # installed artifact. -I ignores PYTHONPATH and user site packages.
+        # Keep the venv executable pathname: resolving its symlink to the base
+        # interpreter would drop the venv's own site-packages on CPython/uv.
+        wheel_executable = Path(installed_python).expanduser().absolute()
+        assert wheel_executable.is_file(), wheel_executable
+        python_executable = str(wheel_executable)
+        identity = subprocess.run(
+            [
+                python_executable,
+                "-I",
+                "-c",
+                "import ash, pathlib, sys; "
+                "p = pathlib.Path(ash.__file__).resolve(); "
+                "prefix = pathlib.Path(sys.prefix).resolve(); "
+                "assert p.is_relative_to(prefix), (p, prefix); "
+                "assert 'site-packages' in p.parts, p",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert identity.returncode == 0, (identity.stdout, identity.stderr)
+
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"
     home.mkdir()
@@ -645,20 +674,24 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     environment = _terminal_environment(home, workspace, model=None)
-    # macOS runners can resolve a bare python3 to Apple's developer-tools
-    # shim when PATH only contains /usr/bin:/bin. Prepend the interpreter
-    # installation used by this test suite. On Linux bubblewrap intentionally
-    # resets child PATH to its sandbox-visible /usr/bin:/bin instead.
+    # macOS runners can resolve python3 to Apple's developer-tools shim.
+    # Use the actual selected interpreter's bin dir; Linux bubblewrap still
+    # resets command PATH to its isolated /usr/bin:/bin as intended.
     environment["PATH"] = os.pathsep.join(
-        (str(Path(sys.executable).parent), os.defpath)
+        (str(Path(python_executable).parent), os.defpath)
     )
+    if installed_python is not None:
+        # A source PYTHONPATH would defeat the whole installed-wheel check.
+        environment.pop("PYTHONPATH", None)
     environment.update(
         {"NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
     )
     master: int | None = None
     process: subprocess.Popen[bytes] | None = None
     try:
-        master, process = _open_pty_cli(workspace, environment)
+        master, process = _open_pty_cli(
+            workspace, environment, python_executable=python_executable
+        )
         captured = bytearray()
 
         def reply(marker: bytes, answer: bytes, *, timeout: float = 25) -> None:
@@ -717,7 +750,7 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
         # Model discovery from setup is not a completion request; doctor must
         # be able to verify the persisted route without consuming a turn.
         doctor = subprocess.run(
-            [sys.executable, "-m", "ash", "doctor", "--connect", "--json"],
+            [python_executable, "-m", "ash", "doctor", "--connect", "--json"],
             cwd=workspace,
             env=environment,
             capture_output=True,
@@ -757,7 +790,7 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
 
         resumed = subprocess.run(
             [
-                sys.executable,
+                python_executable,
                 "-m",
                 "ash",
                 "--continue",
