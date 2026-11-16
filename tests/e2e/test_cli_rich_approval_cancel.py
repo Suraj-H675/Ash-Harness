@@ -1,4 +1,4 @@
-"""Exercise Ctrl-C cancellation in a real rich-mode approval chooser."""
+"""Exercise real rich-mode approval, cancellation, and CLI session continuity."""
 
 from __future__ import annotations
 
@@ -19,12 +19,14 @@ import pyte
 import pytest
 
 from ash.core.session import SessionStore
+from ash.safety.grants import load_permission_rules
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
 @pytest.mark.parametrize("columns", [24, 80])
-def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
-    tmp_path: Path, columns: int
+@pytest.mark.parametrize("decision", ["cancel", "allow_once"])
+def test_rich_approval_decision_preserves_session_and_tool_state(
+    tmp_path: Path, columns: int, decision: str
 ) -> None:
     import fcntl
     import termios
@@ -37,9 +39,13 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
 
     requests: list[dict[str, object]] = []
     second_request = threading.Event()
+    command = (
+        "touch denied.marker" if decision == "cancel"
+        else "printf approved >> approved.marker"
+    )
     tool_request = (
         '<call_tool name="run_command">'
-        '<arg name="command_line">touch denied.marker</arg>'
+        f'<arg name="command_line">{command}</arg>'
         '<arg name="timeout_seconds">15</arg>'
         "</call_tool>"
     )
@@ -211,53 +217,97 @@ def test_rich_approval_ctrl_c_cancels_turn_and_keeps_repl_usable(
         visible_screen = "\n".join(screen.display)
         assert "Matching scope only." in visible_screen
         assert "Esc deny" in visible_screen
-        os.write(master_fd, b"\x03")
-        assert not second_request.wait(timeout=2), (
-            "the provider received another request after Ctrl-C in approval"
-        )
-        wait_for(b"Turn cancelled.", timeout=15)
-        wait_for_main_composer()
+        if decision == "cancel":
+            os.write(master_fd, b"\x03")
+            assert not second_request.wait(timeout=2), (
+                "the provider received another request after Ctrl-C in approval"
+            )
+            wait_for(b"Turn cancelled.", timeout=15)
+            wait_for_main_composer()
 
-        assert len(requests) == 1
-        assert not (workspace / "denied.marker").exists()
+            assert len(requests) == 1
+            assert not (workspace / "denied.marker").exists()
 
-        os.write(master_fd, b"/recovery\r")
-        wait_for(b"Recovery 1:", timeout=10)
-        # The 24-column renderer may split 'interrupted' across PTY writes;
-        # verify the durable recovery status below instead.
-        wait_for_main_composer()
-        assert len(requests) == 1
+            os.write(master_fd, b"/recovery\r")
+            wait_for(b"Recovery 1:", timeout=10)
+            # The 24-column renderer may split 'interrupted' across PTY writes;
+            # verify the durable recovery status below instead.
+            wait_for_main_composer()
+            assert len(requests) == 1
 
-        os.write(master_fd, b"continue safely\r")
-        wait_for(b"NEXT_TURN_OK", timeout=20)
-        assert second_request.is_set()
-        assert len(requests) == 2
+            os.write(master_fd, b"continue safely\r")
+            wait_for(b"NEXT_TURN_OK", timeout=20)
+            assert second_request.is_set()
+            assert len(requests) == 2
+        else:
+            os.write(master_fd, b"\x1b[A")
+            wait_for_screen("> Allow once")
+            os.write(master_fd, b"\r")
+            wait_for(b"NEXT_TURN_OK", timeout=25)
+            wait_for_main_composer()
+            assert second_request.is_set()
+            assert len(requests) == 2
+            assert (workspace / "approved.marker").read_bytes() == b"approved"
+
         wait_for_main_composer()
         os.write(master_fd, b"/exit\r")
         process.wait(timeout=15)
         assert process.returncode == 0
 
+        if decision == "allow_once":
+            resumed = subprocess.run(
+                [
+                    sys.executable, "-m", "ash", "--db-directory", str(db_directory),
+                    "--continue", "-p", "continue after approved action",
+                    "--output-format", "json",
+                ],
+                cwd=workspace, env=environment,
+                capture_output=True, text=True, timeout=25, check=False,
+            )
+            assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
+            resumed_payload = json.loads(resumed.stdout)
+            assert resumed_payload["response"] == "NEXT_TURN_OK"
+            assert len(requests) == 3
+            # The real approved command appended once, never on session resume.
+            assert (workspace / "approved.marker").read_bytes() == b"approved"
+
         store = SessionStore(db_directory / "sessions.db")
         sessions = store.list_sessions(project_path=str(workspace), limit=5)
         assert len(sessions) == 1
         session_id = sessions[0].session_id
+        if decision == "allow_once":
+            assert resumed_payload["session_id"] == session_id
+            assert load_permission_rules(workspace) == []
         calls = [
             call
             for call in store.load_session(session_id).tool_calls
             if call.tool_name == "run_command"
         ]
         assert len(calls) == 1
-        assert calls[0].approved is False
-        assert calls[0].dispatched is False
-        reports = store.interrupted_recovery_reports(session_id)
-        assert len(reports) == 1
-        assert reports[0]["status"] == "interrupted"
-        assert reports[0]["unknown_calls"] == []
-        print(
-            "provider_requests=2 (one cancelled, one fresh turn); "
-            "cancelled_turn_recovered=True; dispatched=False; "
-            "denied_effect_absent=True; next_turn_completed=True"
-        )
+        if decision == "allow_once":
+            assert calls[0].approved is True
+            assert calls[0].dispatched is True
+            assert calls[0].executed is True
+            assert calls[0].success is True
+            assert calls[0].error is None
+            assert store.interrupted_recovery_reports(session_id) == []
+            verified = subprocess.run(
+                [
+                    sys.executable, "-m", "ash", "--db-directory", str(db_directory),
+                    "audit", "verify", "--session", session_id, "--json",
+                ],
+                cwd=workspace, env=environment,
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            assert verified.returncode == 0, (verified.stdout, verified.stderr)
+            assert json.loads(verified.stdout)["ok"] is True
+        else:
+            assert calls[0].approved is False
+            assert calls[0].dispatched is False
+            reports = store.interrupted_recovery_reports(session_id)
+            assert len(reports) == 1
+            assert reports[0]["status"] == "interrupted"
+            assert reports[0]["unknown_calls"] == []
     finally:
         if process is not None and process.poll() is None:
             process.terminate()

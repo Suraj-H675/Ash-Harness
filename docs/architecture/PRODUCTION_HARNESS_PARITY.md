@@ -117,6 +117,19 @@ verified public build containing the current candidate remain unaccepted.
 Do not merge, publish, or announce “Ash is done” on these results alone; see
 [`CODING_PORTFOLIO.md`](../benchmarks/CODING_PORTFOLIO.md) for the exact grades.
 
+**Linux daily-driver approval evidence (2026-11-16):** The real-process rich
+terminal approval test now exercises both Ctrl-C cancellation and an actual
+**Allow once** decision at 24- and 80-column widths. In the approved case,
+the user-selected command executes exactly once, the completed action is
+persisted with approved/dispatched/executed/success flags, the project gains
+no persistent permission grant, and a fresh `ash --continue` process uses
+the same session without replaying the side effect. Session audit verification
+passes and no interrupted-turn recovery is reported. The cancelled path
+still denies dispatch and permits a subsequent turn. The focused real-PTY
+tests and related lifecycle/recovery/permission/audit suite passed **56 tests**;
+this is actual interactive-workflow evidence, **not** a complete first-run,
+new-user install, strong-model interactive or macOS approval acceptance.
+
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
 three-module `event-log` fixture with GPT-6.1 Sol. The intervening Luna
