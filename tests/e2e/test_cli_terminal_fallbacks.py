@@ -580,6 +580,7 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
     (workspace / "protected.txt").write_text("unchanged\n", encoding="utf-8")
 
     requests: list[dict[str, object]] = []
+    test_command = "python3 -B qa_visible.py"
 
     class Provider(BaseHTTPRequestHandler):
         def log_message(self, *_args: object) -> None:
@@ -617,7 +618,7 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
             elif step == 2:
                 output = (
                     '<call_tool name="run_command">'
-                    '<arg name="command_line">python3 -B qa_visible.py</arg>'
+                    f'<arg name="command_line">{test_command}</arg>'
                     '<arg name="timeout_seconds">15</arg>'
                     "</call_tool>"
                 )
@@ -644,6 +645,13 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     environment = _terminal_environment(home, workspace, model=None)
+    # macOS runners can resolve a bare python3 to Apple's developer-tools
+    # shim when PATH only contains /usr/bin:/bin. Prepend the interpreter
+    # installation used by this test suite. On Linux bubblewrap intentionally
+    # resets child PATH to its sandbox-visible /usr/bin:/bin instead.
+    environment["PATH"] = os.pathsep.join(
+        (str(Path(sys.executable).parent), os.defpath)
+    )
     environment.update(
         {"NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
     )
@@ -730,6 +738,7 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
         assert len(sessions) == 1
         session_id = sessions[0].session_id
         calls = store.load_session(session_id).tool_calls
+        assert calls[1].arguments["command_line"] == test_command
         assert [
             (
                 call.tool_name,
