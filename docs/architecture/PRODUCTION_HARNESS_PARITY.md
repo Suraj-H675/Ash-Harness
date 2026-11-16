@@ -93,6 +93,24 @@ Local evidence is retained outside Git under
 `/var/tmp/ash-daily-driver-verify-20261110-113c849/` and
 `/var/tmp/ash-daily-driver-wheel-20261110-113c849/`.
 
+**Latest acceptance checkpoint (2026-11-16): NOT YET ACCEPTED.** Ash Crew v1
+has completed its agreed local acceptance and has been integrated into local
+`main`; that is not full-harness acceptance. The isolated candidate at
+`cfababc` passed **18/18 hosted CI jobs**, including the macOS Python 3.12
+regression fix. The coding portfolio now contains three separate, sequential
+plain-Codex comparisons on the pinned three-module R9 task: both agents
+passed in all three, but Codex was faster in each single pair. A different
+two-module Rich repair (R12) also passed both agents once. At `534ca18`, a
+model-visible large-context atomic-edit selection hint was validated with
+local regression tests and one additional R9 pair, but the model chose
+individual replacements and no completion-rate improvement is established.
+The comparative receipts still do **not** independently verify equivalent
+native sandbox, network-blocking, or shell approval behavior. Broader task
+repetitions, normal interactive workflows, operational competitiveness and a
+verified public build containing the current candidate remain unaccepted.
+Do not merge, publish, or announce “Ash is done” on these results alone; see
+[`CODING_PORTFOLIO.md`](../benchmarks/CODING_PORTFOLIO.md) for the exact grades.
+
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
 three-module `event-log` fixture with GPT-6.1 Sol. The intervening Luna

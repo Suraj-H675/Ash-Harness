@@ -22,7 +22,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Initial pair: Ash timeout / Codex pass**; no Ash source edit or verification |
 | R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Initial pair: both fail**; Ash 32K protected-context overflow after one edit, Codex visible pass but hidden fail; Ash 64K ablation reaches 120K total-turn cap. Park fixture-specific remediation. |
 | R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Latest sequential 65K pair: both pass**; earlier Ash-only normal-128K trial also passed. Exact independent oracle and scope checks verified; no speed/reliability ranking |
-| R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **Two separate sequential 65K pairs: both pass in both trials**; latest Ash 168.05s / 14 model requests / 33 tools, Codex 87.27s / 6 shell commands; one outcome per revision, policy-parity caveat |
+| R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **Three separate sequential 65K pairs: both engines passed all three**; latest Ash 120.72s / 10 model requests / 26 tools, Codex 83.71s / 3 non-test commands; not a controlled before/after, policy-parity caveat |
 | R10 | `pluggy-role-module-split` | Pinned real repo | Seven-module role-based refactor; old import shims and public plugin behavior, wrappers, firstresult, historic replay and subset callers | **Park after two matched pairs**; at 170s both timed out/incomplete; at 300s Ash stopped on protected opaque-context exhaustion after 4/7 files, Codex changed all seven and passed both oracles but timed out without executing the visible test. Neither a complete coding pass |
 | R11 | `boltons-bulk-ordered-collections` | Pinned real repo | Two-module ordered-container repair: multi-list index boundaries, insertion and tail handling, and linear-time ordered-set bulk removal | **Controlled Ash-only comparison completed:** no restart 85.33s, 3 requests, 0 edits, context error; one restart 113.86s, 5 requests, actual safe restart, 1/2 edited *before* restart, no edits in child, second context error. Both fail oracles; audits/scopes intact; no verified coding progress after restart |
 | R12 | `rich-soft-wrap-background-style` | Pinned real repo | Two-module Rich terminal-rendering bug: prevent background/style bleed across physical newlines under `soft_wrap=True`, while preserving multiline, blank-line and styled text behavior | **First 65K sequential pair: both pass**; Ash 105.80s / 10 model requests / 23 tool calls, Codex 98.29s / 5 non-test commands + visible test; one trial, policy-parity caveat |
@@ -318,13 +318,44 @@ separate coding-tool usability investigation, **not** a claim that later
 patch-format support has improved real-model success or efficiency. Private
 receipt: `/var/tmp/ash-r9-current-parity-20261116-r01/`.
 
-**Parity caveat for both new pairs:** The checker accepted requested model,
+**R9 edit-selection guidance trial (2026-11-16, third separate paired
+observation):** The previous R9 trace contained **three** rejected
+`replace_file_content` calls using stale `expected_sha256` values after prior
+successful writes, then additional reads and repairs. At `534ca18`, the
+large-*effective*-context coding guidance explicitly recommends discovering
+atomic `replace_file_edits` for multiple changes to one file and `apply_patch`
+across modules, instead of reusing a pre-edit SHA-256. The default 4K prompt,
+tool exposure, permissions, workspace guards and stale-hash enforcement did
+not change. The prompt addition was tested red-first and locally passed
+**590** loop/context/patch/discovery/real-session and fresh-process CLI
+regressions; Ruff and mypy (237 source files) also passed.
+
+One fresh sequential 65K pair of the **unchanged, frozen R9 task** used GPT-6
+Luna xhigh, 170s per engine, uncapped Ash cumulative turn tokens and the same
+attested task input, pinned upstream commits, visible/hidden oracle SHA-256,
+test command and independent strict grading. Both passed, edited exactly
+`_utils.py`, `api.py` and `items.py`, executed the visible command, preserved
+protected files, and completed with valid Ash audit / isolated Codex events.
+Ash: **120.72s CLI, 10 completed model requests, 26 tools, zero failed edits,
+187,950 prompt / 3,661 completion tokens**. Plain Codex: **83.71s CLI, three
+non-test shell commands and the required test**. Codex was faster by 37.01s
+in this single pair. The model **did not select either batch editor**: it
+made seven successful individual `replace_file_content` calls. The change
+may have helped planning, but the observed zero stale failures cannot be
+causally attributed to guidance because the earlier first R9 run also had
+zero failures, and neither prompts nor sampled model choices were randomized
+across revisions. This outcome **does not demonstrate a higher completion
+rate, lower stable latency or strict shell/network/sandbox parity**. Do not
+repeat this fixture just to chase a favorable number. Private receipts:
+`/var/tmp/ash-r9-atomic-guidance-paired-20261116-r01/`.
+
+**Parity caveat across R9 pairs:** The checker accepted requested model,
 effort, context, prompts, pins and independent grading, **not** actual
 tool/permission/sandbox equivalence. Codex's receipt does not independently
 verify the same network blocking or enforce the same exact shell-command
 policy as Ash. Codex input-token counts include cached input and cannot be
-directly compared to Ash's prompt-token accounting. Neither new pair proves
-a throughput gain or motivates a production-code adjustment.
+directly compared to Ash's prompt-token accounting. These pairs do not prove
+a stable throughput gain or causal improvement from an Ash code change.
 
 **R10 provenance and preflight (2026-11-13):** The new
 `pytest-dev/pluggy` case uses original commit
@@ -506,11 +537,12 @@ relaxed and that non-runnable task was not added to the tracked portfolio.
 
 ## Next portfolio slice
 
-**Now:** R5, R8, R9 and the new R12 have positive paired outcomes, each a
-single observation at its respective code revision;
-none isolates a source change's impact. R10 exposed a genuine complexity and
-context-pressure limit in a seven-module refactor, but both the 170s and 300s
-pairs are complete; **park it instead of chasing a green result**. A safe
+**Now:** R5, R8 and R12 have positive single paired outcomes; R9 has three
+sequential paired passes at different Ash revisions. None isolates a source
+change's impact or establishes a stable latency distribution. R10 exposed a
+genuine complexity and context-pressure limit in a seven-module refactor, but
+both the 170s and 300s pairs are complete; **park it instead of chasing a green
+result**. A safe
 opaque-state stop is expected behavior, not permission to discard provider
 reasoning or replay tool actions. Future evaluation may deliberately test the
 existing opt-in safe context-restart path on a separate frozen scenario with
