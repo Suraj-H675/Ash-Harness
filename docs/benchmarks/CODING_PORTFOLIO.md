@@ -26,7 +26,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R10 | `pluggy-role-module-split` | Pinned real repo | Seven-module role-based refactor; old import shims and public plugin behavior, wrappers, firstresult, historic replay and subset callers | **Park after two matched pairs**; at 170s both timed out/incomplete; at 300s Ash stopped on protected opaque-context exhaustion after 4/7 files, Codex changed all seven and passed both oracles but timed out without executing the visible test. Neither a complete coding pass |
 | R11 | `boltons-bulk-ordered-collections` | Pinned real repo | Two-module ordered-container repair: multi-list index boundaries, insertion and tail handling, and linear-time ordered-set bulk removal | **Controlled Ash-only comparison completed:** no restart 85.33s, 3 requests, 0 edits, context error; one restart 113.86s, 5 requests, actual safe restart, 1/2 edited *before* restart, no edits in child, second context error. Both fail oracles; audits/scopes intact; no verified coding progress after restart |
 | R12 | `rich-soft-wrap-background-style` | Pinned real repo | Two-module Rich terminal-rendering bug: prevent background/style bleed across physical newlines under `soft_wrap=True`, while preserving multiline, blank-line and styled text behavior | **First 65K sequential pair: both pass**; Ash 105.80s / 10 model requests / 23 tool calls, Codex 98.29s / 5 non-test commands + visible test; one trial, policy-parity caveat |
-| R13 | `moreitertools-peekable-reverse-slice` | Pinned real repo | Prevent `peekable` from exhausting an infinite or large finite iterator when reverse slicing with a known start and omitted stop; preserve caching and genuine right-relative indexing | **New frozen task:** independent original red/reference green oracles; paired Ash/plain-Codex result pending |
+| R13 | `moreitertools-peekable-reverse-slice` | Pinned real repo | Prevent `peekable` from exhausting an infinite or large finite iterator when reverse slicing with a known start and omitted stop; preserve caching and genuine right-relative indexing | **First sequential 65K pair: both pass**; Ash 69.16s / 6 model requests / 6 tools / 0 rejects, Codex 53.46s / 3 non-test shell commands; one observation and native policy-parity caveat |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -60,8 +60,31 @@ iteration, forward slicing, and right-relative negative-index behavior.
 Both tests **fail on the original and pass on the reference**, and the
 official pinned preflight confirms only the permitted production module
 needs modifying, with no unsafe symlinks or special files. This establishes a
-valid evaluation fixture, **not** a real-model success. Private evidence:
+valid independent evaluation fixture. Private preflight evidence:
 `/var/tmp/ash-r13-moreitertools-official-preflight-20261116/`.
+
+**R13 first sequential Ash/plain-Codex pair (2026-11-16, one observation):**
+At pinned Ash `fbf7e92`, the pair ran the unchanged, preflighted R13 task
+with requested GPT-6 Luna xhigh, 65,536 request-context tokens, 170-second
+per-engine deadline, and normal uncapped Ash cumulative turn budget. The
+runner independently verified **all six SHA-256 commitments** (source base,
+reference fix, task prompt, user prompt, visible oracle, hidden oracle) in
+both Ash and Codex receipts and reported `comparison_verified=true`. Both
+engines **passed both independent tests**, edited only
+`more_itertools/more.py`, ran `python3 -B qa_visible.py`, preserved protected
+files, and terminated normally. Ash passed audit verification in **69.16s**,
+with **six model requests, six successful tool calls** (two source reads, one
+search, one exact replacement, one Git diff, one visible test), **zero failed
+calls**, 53,287 prompt and 2,779 completion tokens. Isolated, unmodified
+plain Codex passed in **53.46s**, using three non-test shell commands and
+the visible test, with private auth cleanup verified. Codex was faster by
+15.70s in this one pair, **not** a stable ranking. Native permission, shell,
+skill-stack and network-sandbox parity have not been independently proved,
+and the engines' token accounting differs. The clean Ash trace gives no
+indication of a harness-specific defect requiring a speculative fix. The
+R13 success does **not** establish a coding completion-rate improvement from
+the preceding tool-guidance changes. Private paired receipts:
+`/var/tmp/ash-r13-moreitertools-paired-20261116-r01/`.
 
 **R12 provenance and independent preflight (2026-11-16):** A new coding task
 uses real upstream [Rich issue #3838](https://github.com/Textualize/rich/issues/3838)
@@ -557,7 +580,7 @@ relaxed and that non-runnable task was not added to the tracked portfolio.
 
 ## Next portfolio slice
 
-**Now:** R5, R8 and R12 have positive single paired outcomes; R9 has three
+**Now:** R5, R8, R12 and R13 have positive single paired outcomes; R9 has three
 sequential paired passes at different Ash revisions. None isolates a source
 change's impact or establishes a stable latency distribution. R10 exposed a
 genuine complexity and context-pressure limit in a seven-module refactor, but

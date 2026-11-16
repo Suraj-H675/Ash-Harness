@@ -104,6 +104,12 @@ two-module Rich repair (R12) also passed both agents once. At `534ca18`, a
 model-visible large-context atomic-edit selection hint was validated with
 local regression tests and one additional R9 pair, but the model chose
 individual replacements and no completion-rate improvement is established.
+An additional **dependency-free, pinned more-itertools R13** reverse-slice
+repair was independently preflighted and then passed both engines on the first
+sequential 65K pair (Ash **69.16s**, plain Codex **53.46s**, both visible/hidden
+tests and protected-file checks green). Ash used six model requests and six
+successful tool calls with no edit rejection. This expands real-repository
+coverage but remains one sample per revision, not a stable comparative grade.
 The comparative receipts still do **not** independently verify equivalent
 native sandbox, network-blocking, or shell approval behavior. Broader task
 repetitions, normal interactive workflows, operational competitiveness and a
