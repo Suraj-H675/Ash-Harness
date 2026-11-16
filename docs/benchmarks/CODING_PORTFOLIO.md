@@ -7,8 +7,8 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These seventeen fixtures already have runnable code and grading logic. They do
-not represent seventeen independent real repositories: R1–R11 are pinned
+These eighteen fixtures already have runnable code and grading logic. They do
+not represent eighteen independent real repositories: R1–R12 are pinned
 repository tasks (some share an upstream project), while S1–S6 are synthetic.
 Keep the lanes separate and do not pool their scores into a single win rate.
 
@@ -25,6 +25,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **Two separate sequential 65K pairs: both pass in both trials**; latest Ash 168.05s / 14 model requests / 33 tools, Codex 87.27s / 6 shell commands; one outcome per revision, policy-parity caveat |
 | R10 | `pluggy-role-module-split` | Pinned real repo | Seven-module role-based refactor; old import shims and public plugin behavior, wrappers, firstresult, historic replay and subset callers | **Park after two matched pairs**; at 170s both timed out/incomplete; at 300s Ash stopped on protected opaque-context exhaustion after 4/7 files, Codex changed all seven and passed both oracles but timed out without executing the visible test. Neither a complete coding pass |
 | R11 | `boltons-bulk-ordered-collections` | Pinned real repo | Two-module ordered-container repair: multi-list index boundaries, insertion and tail handling, and linear-time ordered-set bulk removal | **Controlled Ash-only comparison completed:** no restart 85.33s, 3 requests, 0 edits, context error; one restart 113.86s, 5 requests, actual safe restart, 1/2 edited *before* restart, no edits in child, second context error. Both fail oracles; audits/scopes intact; no verified coding progress after restart |
+| R12 | `rich-soft-wrap-background-style` | Pinned real repo | Two-module Rich terminal-rendering bug: prevent background/style bleed across physical newlines under `soft_wrap=True`, while preserving multiline, blank-line and styled text behavior | **First 65K sequential pair: both pass**; Ash 105.80s / 10 model requests / 23 tool calls, Codex 98.29s / 5 non-test commands + visible test; one trial, policy-parity caveat |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -39,8 +40,50 @@ distinct codebases and multi-module workflows, with R10 covering a seven-module
 refactor behind compatibility shims; they do not fill all these gaps. Every
 additional task still needs pinned base/fix provenance and independently
 authored sealed oracles with red-original/green-reference preflight.
-The present **16-case inventory** is not a stable reliability benchmark;
+The present **18-case inventory** is not a stable reliability benchmark;
 repetitions and broader workflow diversity remain necessary.
+
+**R12 provenance and independent preflight (2026-11-16):** A new coding task
+uses real upstream [Rich issue #3838](https://github.com/Textualize/rich/issues/3838)
+and [merged fix PR #3938](https://github.com/Textualize/rich/pull/3938).
+Pinned original `Textualize/rich` commit
+`05ff970926cbd0b5d0acb6fc18cdbd1fc971e582` and post-fix source
+`2c247e6da72dfa69dd6148f1a0657e2440d1ebe9` differ in exactly the
+two authorized runtime modules `rich/console.py` and `rich/segment.py`,
+plus upstream tests and changelog, which remain protected. Independently
+authored, standard-library-driven checks exercise ANSI reset placement before
+physical linefeeds, successive separately styled lines, multiline and blank
+text, nested `Text` styles, plain output and non-soft-wrapped behavior.
+The explicit TERM override is inside each oracle because the isolated runner
+uses `TERM=dumb`; `force_terminal=True` alone does not guarantee ANSI output
+under that terminal setting. Fresh official pinned-fetch preflight found no
+symlinks/special files, **both visible and hidden failed on the original and
+both passed on the reference**, and verified both editable modules actually
+changed. This is a distinct real-repository terminal coding problem, **not a
+benchmark result** until the model execution and independent grading finish.
+Private preflight: `/var/tmp/ash-r12-rich-official-preflight-20261116/`.
+
+**R12 first sequential pair (2026-11-16, one sample):** With Ash
+`a1d150d`, both Ash and **plain, unmodified Codex** completed the frozen
+Rich bug repair, ran the required `python3 -B qa_visible.py`, passed both
+independent oracles and changed exactly `rich/console.py` and `rich/segment.py`,
+without modifying protected files. The comparison receipt independently
+matched task objective, prompt, reference SHA, oracle hashes, requested
+`gpt-6-luna` xhigh model/effort, 65,536-token context, 210-second deadlines,
+native plain Codex, and temporary authorization isolation and cleanup.
+Ash: **105.80s CLI, 10 model requests / 23 tool calls, valid audit**;
+Codex: **98.29s CLI, five non-test shell commands and one required test**.
+Ash's model requests took 101.345s and its completed tool executions 0.911s.
+Two Ash `search_text` calls were rejected (an invalid regex, and a request for
+10 context lines against the then-5-line maximum); Ash recovered and completed.
+Codex's 7.51s advantage is a single outcome, **not** a stable ranking.
+Actual permission, shell-policy and network-sandbox parity is not independently
+verified; model token accounting differs. A later, separately tested search
+interface change permits context lines 0–10 while retaining existing hard
+output budgets. **That later interface change has not been tested with a
+model** and is not credited with a success-rate or latency improvement.
+Private exact receipts:
+`/var/tmp/ash-r12-rich-soft-wrap-paired-20261116-r01/`.
 
 **Evidence checkpoint:** Before this workflow change, the locally retained
 paired receipts showed **R1 and R2 passing for both engines** in a concurrent
@@ -463,7 +506,8 @@ relaxed and that non-runnable task was not added to the tracked portfolio.
 
 ## Next portfolio slice
 
-**Now:** R5, R8 and R9 have positive paired outcomes, each a single observation;
+**Now:** R5, R8, R9 and the new R12 have positive paired outcomes, each a
+single observation at its respective code revision;
 none isolates a source change's impact. R10 exposed a genuine complexity and
 context-pressure limit in a seven-module refactor, but both the 170s and 300s
 pairs are complete; **park it instead of chasing a green result**. A safe

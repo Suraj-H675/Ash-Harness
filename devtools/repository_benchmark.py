@@ -1244,6 +1244,91 @@ assert list(small) == [0, 3, 12, 22]
 """
 
 
+RICH_SOFT_WRAP_VISIBLE = r"""import os
+os.environ["TERM"] = "xterm-256color"
+os.environ.pop("NO_COLOR", None)
+
+from rich.console import Console
+
+def rendered_lines(lines):
+    console = Console(
+        color_system="standard", force_terminal=True, width=60,
+        _environ={"TERM": "xterm-256color"},
+    )
+    with console.capture() as capture:
+        for content, options in lines:
+            console.print(content, **options)
+    return capture.get()
+
+# Color must be reset before the *physical* newline so that the next line
+# never inherits the previous line's background in a terminal that scrolls.
+actual = rendered_lines([
+    ("ready", {"style": "blue on white", "soft_wrap": True}),
+    ("next", {}),
+])
+assert actual == "\x1b[34;47mready\x1b[0m\nnext\n", repr(actual)
+
+# Embedded newlines must remain and each nonempty line must be styled
+# independently, not as one style spanning a linefeed.
+actual = rendered_lines([
+    ("north\nsouth", {"style": "red on blue", "soft_wrap": True}),
+    ("end", {}),
+])
+assert actual == (
+    "\x1b[31;44mnorth\x1b[0m\n"
+    "\x1b[31;44msouth\x1b[0m\nend\n"
+), repr(actual)
+
+# Preserve the control paths: no style and ordinary (non-soft) wrapping.
+assert rendered_lines([("text", {"soft_wrap": True})]) == "text\n"
+assert rendered_lines([("plain", {"style": "red on blue", "soft_wrap": False})]) == (
+    "\x1b[31;44mplain\x1b[0m\n"
+)
+print("RICH_SOFT_WRAP_VISIBLE_OK")
+"""
+
+RICH_SOFT_WRAP_HIDDEN = r"""import os
+os.environ["TERM"] = "xterm-256color"
+os.environ.pop("NO_COLOR", None)
+
+from rich.console import Console
+from rich.text import Text
+
+def render(*items):
+    console = Console(
+        color_system="standard", force_terminal=True, width=80,
+        _environ={"TERM": "xterm-256color"},
+    )
+    with console.capture() as buffer:
+        for item, style, soft in items:
+            console.print(item, style=style, soft_wrap=soft)
+    return buffer.get()
+
+# Multiple empty lines must not inherit a colored background; following
+# unstyled output must be uncolored, including after a blank logical line.
+assert render(("a\n\nb", "blue on white", True), ("tail", None, False)) == (
+    "\x1b[34;47ma\x1b[0m\n\n"
+    "\x1b[34;47mb\x1b[0m\ntail\n"
+)
+
+# Rendering a pre-styled Text with an additional print style must preserve
+# the combined style on characters but reset before each line separator.
+text = Text("first\nsecond", style="bold green")
+assert render((text, "red on blue", True), ("tail", None, False)) == (
+    "\x1b[1;32;44mfirst\x1b[0m\n"
+    "\x1b[1;32;44msecond\x1b[0m\ntail\n"
+)
+
+# Maintain real text, blank lines, and the existing non-soft-wrap result.
+uncolored = render(("line1\n\nline3", None, True))
+assert uncolored == "line1\n\nline3\n", repr(uncolored)
+assert render(("unchanged", "red on blue", False)) == (
+    "\x1b[31;44munchanged\x1b[0m\n"
+)
+print("RICH_SOFT_WRAP_HIDDEN_OK")
+"""
+
+
 @dataclass(frozen=True)
 class RepositoryTask:
     source: str
@@ -1259,6 +1344,33 @@ class RepositoryTask:
 
 
 TASKS = {
+    "rich-soft-wrap-background-style": RepositoryTask(
+        source="Textualize/rich",
+        upstream="https://github.com/Textualize/rich.git",
+        base_sha="05ff970926cbd0b5d0acb6fc18cdbd1fc971e582",
+        reference_fix_sha="2c247e6da72dfa69dd6148f1a0657e2440d1ebe9",
+        editable=frozenset({"rich/console.py", "rich/segment.py"}),
+        visible_script="qa_visible.py",
+        visible_source=RICH_SOFT_WRAP_VISIBLE,
+        hidden_source=RICH_SOFT_WRAP_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Repair a real Rich terminal output bug in this pinned repository. "
+            "When Console.print() is given a background-colored style and "
+            "soft_wrap=True, ANSI styling can leak across a newline: physical "
+            "linefeeds are styled or reset only after the newline, so the "
+            "next terminal line inherits a background. Preserve visible "
+            "character styles but make line breaks unstyled, including "
+            "multiline text and blank lines, without breaking existing "
+            "unstyled printing, non-soft-wrapped output or styled Text. "
+            "Investigate the render/segment handling in rich/console.py and "
+            "rich/segment.py, inspect qa_visible.py, and edit ONLY "
+            "rich/console.py and rich/segment.py. Run exactly "
+            "python3 -B qa_visible.py with run_command after editing. "
+            "No other commands are authorized. Do not change tests, "
+            "metadata, docs, or unrelated files."
+        ),
+    ),
     "boltons-bulk-ordered-collections": RepositoryTask(
         source="mahmoud/boltons",
         upstream="https://github.com/mahmoud/boltons.git",
