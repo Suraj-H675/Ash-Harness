@@ -7,8 +7,8 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These eighteen fixtures already have runnable code and grading logic. They do
-not represent eighteen independent real repositories: R1–R12 are pinned
+These nineteen fixtures already have runnable code and grading logic. They do
+not represent nineteen independent real repositories: R1–R13 are pinned
 repository tasks (some share an upstream project), while S1–S6 are synthetic.
 Keep the lanes separate and do not pool their scores into a single win rate.
 
@@ -26,6 +26,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R10 | `pluggy-role-module-split` | Pinned real repo | Seven-module role-based refactor; old import shims and public plugin behavior, wrappers, firstresult, historic replay and subset callers | **Park after two matched pairs**; at 170s both timed out/incomplete; at 300s Ash stopped on protected opaque-context exhaustion after 4/7 files, Codex changed all seven and passed both oracles but timed out without executing the visible test. Neither a complete coding pass |
 | R11 | `boltons-bulk-ordered-collections` | Pinned real repo | Two-module ordered-container repair: multi-list index boundaries, insertion and tail handling, and linear-time ordered-set bulk removal | **Controlled Ash-only comparison completed:** no restart 85.33s, 3 requests, 0 edits, context error; one restart 113.86s, 5 requests, actual safe restart, 1/2 edited *before* restart, no edits in child, second context error. Both fail oracles; audits/scopes intact; no verified coding progress after restart |
 | R12 | `rich-soft-wrap-background-style` | Pinned real repo | Two-module Rich terminal-rendering bug: prevent background/style bleed across physical newlines under `soft_wrap=True`, while preserving multiline, blank-line and styled text behavior | **First 65K sequential pair: both pass**; Ash 105.80s / 10 model requests / 23 tool calls, Codex 98.29s / 5 non-test commands + visible test; one trial, policy-parity caveat |
+| R13 | `moreitertools-peekable-reverse-slice` | Pinned real repo | Prevent `peekable` from exhausting an infinite or large finite iterator when reverse slicing with a known start and omitted stop; preserve caching and genuine right-relative indexing | **New frozen task:** independent original red/reference green oracles; paired Ash/plain-Codex result pending |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -40,8 +41,27 @@ distinct codebases and multi-module workflows, with R10 covering a seven-module
 refactor behind compatibility shims; they do not fill all these gaps. Every
 additional task still needs pinned base/fix provenance and independently
 authored sealed oracles with red-original/green-reference preflight.
-The present **18-case inventory** is not a stable reliability benchmark;
+The present **19-case inventory** is not a stable reliability benchmark;
 repetitions and broader workflow diversity remain necessary.
+
+**R13 provenance and reproducible preflight (2026-11-16):** This new task
+uses real upstream
+[more-itertools PR #1322](https://github.com/more-itertools/more-itertools/pull/1322)
+to repair `peekable` reverse slices with a nonnegative start, negative step,
+and omitted stop. The pinned original is
+`4aeb4338ae1407d8da9723e86da99efeb446f719`; the reference fix is
+`69dbc3392928afe1cc892a387bf0e721522f21c2`. Only
+`more_itertools/more.py` is editable; upstream tests and documentation are
+protected. Independently authored, no-network/no-dependency visible and
+hidden tests require a bounded number of reads from a guarded infinite
+iterator, correct repeated reverse slicing after a partially cached prefix,
+no eager full-source caching on a large finite sequence, preserved normal
+iteration, forward slicing, and right-relative negative-index behavior.
+Both tests **fail on the original and pass on the reference**, and the
+official pinned preflight confirms only the permitted production module
+needs modifying, with no unsafe symlinks or special files. This establishes a
+valid evaluation fixture, **not** a real-model success. Private evidence:
+`/var/tmp/ash-r13-moreitertools-official-preflight-20261116/`.
 
 **R12 provenance and independent preflight (2026-11-16):** A new coding task
 uses real upstream [Rich issue #3838](https://github.com/Textualize/rich/issues/3838)

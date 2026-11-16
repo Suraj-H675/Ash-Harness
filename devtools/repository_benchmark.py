@@ -1329,6 +1329,81 @@ print("RICH_SOFT_WRAP_HIDDEN_OK")
 """
 
 
+MORE_ITERTOOLS_PEEKABLE_VISIBLE = r"""from itertools import count, islice
+
+from more_itertools import peekable
+
+# A reverse slice with a concrete nonnegative start and omitted stop must
+# never exhaust an unbounded source. Fail promptly if too much is pulled.
+seen = []
+def guarded():
+    for value in count():
+        if len(seen) >= 7:
+            raise AssertionError("reverse slice consumed beyond its rightmost index")
+        seen.append(value)
+        yield value
+
+items = peekable(guarded())
+assert items[5::-1] == [5, 4, 3, 2, 1, 0]
+assert seen == list(range(6)), seen
+assert items[5::-2] == [5, 3, 1]
+assert seen == list(range(6)), seen
+assert list(islice(items, 6)) == list(range(6))
+assert seen == list(range(6)), seen
+
+# Ordinary forward slices must continue working.
+forward = peekable(range(12))
+assert forward[2:7:2] == [2, 4, 6]
+assert next(forward) == 0
+print("MORE_ITERTOOLS_PEEKABLE_VISIBLE_OK")
+"""
+
+MORE_ITERTOOLS_PEEKABLE_HIDDEN = r"""from itertools import count, islice
+
+from more_itertools import peekable
+
+seen = []
+def guarded():
+    for value in count(10):
+        if len(seen) >= 12:
+            raise AssertionError("read past requested slice window")
+        seen.append(value)
+        yield value
+
+# A partially prefetched cache must be reused; a second reverse slice
+# with an omitted stop must not pull the source again.
+items = peekable(guarded())
+assert items[2] == 12
+assert len(seen) == 3
+assert items[10::-3] == [20, 17, 14, 11]
+assert seen == list(range(10, 21)), seen
+assert items[10::-1] == list(range(20, 9, -1))
+assert seen == list(range(10, 21)), seen
+assert list(islice(items, 11)) == list(range(10, 21))
+assert seen == list(range(10, 21)), seen
+
+# Large finite streams must also remain lazy rather than needlessly cached.
+read_count = [0]
+def large():
+    for value in range(2000):
+        read_count[0] += 1
+        yield value
+
+items = peekable(large())
+assert items[4::-1] == [4, 3, 2, 1, 0]
+assert read_count == [5], read_count
+assert next(items) == 0
+
+# True right-relative indexes and omitted starts still require the finite
+# source's full extent. Preserve Python's reverse slicing semantics.
+assert peekable(range(8))[::-2] == [7, 5, 3, 1]
+assert peekable(range(8))[-1] == 7
+assert peekable(range(8))[7:-9:-2] == [7, 5, 3, 1]
+
+print("MORE_ITERTOOLS_PEEKABLE_HIDDEN_OK")
+"""
+
+
 @dataclass(frozen=True)
 class RepositoryTask:
     source: str
@@ -1344,6 +1419,31 @@ class RepositoryTask:
 
 
 TASKS = {
+    "moreitertools-peekable-reverse-slice": RepositoryTask(
+        source="more-itertools/more-itertools",
+        upstream="https://github.com/more-itertools/more-itertools.git",
+        base_sha="4aeb4338ae1407d8da9723e86da99efeb446f719",
+        reference_fix_sha="69dbc3392928afe1cc892a387bf0e721522f21c2",
+        editable=frozenset({"more_itertools/more.py"}),
+        visible_script="qa_visible.py",
+        visible_source=MORE_ITERTOOLS_PEEKABLE_VISIBLE,
+        hidden_source=MORE_ITERTOOLS_PEEKABLE_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Repair a lazy-iterator bug in this pinned more-itertools repository. "
+            "A peekable reverse slice with a nonnegative start, negative step "
+            "and omitted stop (for example items[5::-1]) currently tries to "
+            "exhaust the entire input. This hangs on an infinite iterator and "
+            "unnecessarily buffers a large finite one. Fetch only the needed "
+            "prefix while preserving Python slice results, existing cached "
+            "items, normal subsequent iteration, forward slicing, and genuine "
+            "right-relative negative indices or an omitted reverse start. "
+            "Inspect qa_visible.py and the peekable implementation; edit ONLY "
+            "more_itertools/more.py. Run exactly python3 -B qa_visible.py "
+            "with run_command after editing. No other commands are authorized. "
+            "Do not modify tests, documentation, metadata, or other files."
+        ),
+    ),
     "rich-soft-wrap-background-style": RepositoryTask(
         source="Textualize/rich",
         upstream="https://github.com/Textualize/rich.git",
