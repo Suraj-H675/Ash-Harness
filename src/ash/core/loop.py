@@ -6485,11 +6485,12 @@ class AshLoop:
             }
             self._emit_event({"type": "tool.requested", **event_base})
 
-            if tool is None:
-                record.error = _bounded_durable_tool_error(
-                    f"Unknown tool: {tool_name}",
-                    fallback="Unknown tool",
-                )
+            async def reject_invalid_call(
+                *, error: str, provider_error: str | None = None
+            ) -> None:
+                """Persist a pre-dispatch refusal without granting approval."""
+
+                record.error = error
                 if not defer_terminal_persistence:
                     self.session_store.save_tool_call(
                         session.session_id,
@@ -6516,7 +6517,7 @@ class AshLoop:
                     {
                         "success": False,
                         "output": "",
-                        "error": f"Unknown tool: {tool_name}",
+                        "error": provider_error if provider_error is not None else error,
                     },
                     record,
                     defer_terminal_persistence=defer_terminal_persistence,
@@ -6536,62 +6537,26 @@ class AshLoop:
                     error=record.error,
                 )
                 record_breaker_outcome(tool_name, False)
+
+            if tool is None:
+                await reject_invalid_call(
+                    error=_bounded_durable_tool_error(
+                        f"Unknown tool: {tool_name}", fallback="Unknown tool"
+                    ),
+                    provider_error=f"Unknown tool: {tool_name}",
+                )
                 continue
 
             try:
                 if tool.args_schema is not None:
                     tool.validate_args(**deepcopy(arguments))
             except (TypeError, ValueError) as exc:
-                record.error = _bounded_durable_tool_error(
-                    f"Invalid tool arguments: {exc}",
-                    fallback="Invalid tool arguments",
-                )
-                if not defer_terminal_persistence:
-                    self.session_store.save_tool_call(
-                        session.session_id,
-                        record,
-                        turn_id=(
-                            self.turn_context.turn_id if self.turn_context else None
-                        ),
+                await reject_invalid_call(
+                    error=_bounded_durable_tool_error(
+                        f"Invalid tool arguments: {exc}",
+                        fallback="Invalid tool arguments",
                     )
-                self._append_tool_audit(
-                    session,
-                    action_type="tool_call",
-                    target_resource=tool_name,
-                    details={
-                        "call_id": record.call_id,
-                        "arguments": record.arguments,
-                        "error": record.error,
-                    },
-                    result="FAILURE",
                 )
-                self._emit_event(
-                    {"type": "tool.error", **event_base, "error": record.error}
-                )
-                result_payload = self._tool_result_payload(
-                    {
-                        "success": False,
-                        "output": "",
-                        "error": record.error,
-                    },
-                    record,
-                    defer_terminal_persistence=defer_terminal_persistence,
-                )
-                if persist_tool_messages:
-                    self._persist_deferred_tool_result(
-                        session=session,
-                        call=call,
-                        result=result_payload,
-                    )
-                results.append(result_payload)
-                await self._fire_tool_error_hook(
-                    session,
-                    call_id=record.call_id,
-                    tool_name=tool_name,
-                    arguments=record.arguments,
-                    error=record.error,
-                )
-                record_breaker_outcome(tool_name, False)
                 continue
 
             decision = self.permission_policy.evaluate(

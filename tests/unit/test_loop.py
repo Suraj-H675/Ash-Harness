@@ -10197,6 +10197,63 @@ async def test_invalid_known_tool_arguments_are_rejected_before_approval(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unknown", "invalid_args"])
+@pytest.mark.parametrize("persist_messages", [False, True])
+async def test_pre_dispatch_tool_refusal_keeps_audit_event_and_terminal_order(
+    tmp_path, failure: str, persist_messages: bool
+) -> None:
+    from ash.tools.filesystem import WriteFileTool
+
+    guard = SafetyGuard(tmp_path)
+    store = SessionStore(tmp_path / "pre-dispatch-refusal.db")
+    ui = EventUI()
+    seen_approvals: list[str] = []
+
+    async def approve(name, arguments):
+        del arguments
+        seen_approvals.append(name)
+        return True
+
+    loop = AshLoop(
+        store,
+        MockProvider(),
+        guard,
+        ui,
+        tmp_path,
+        tools={"write_file": WriteFileTool(guard)},
+        on_tool_approval=approve,
+    )
+    try:
+        session = await loop.start_session()
+        name, arguments = (
+            ("missing_tool", {"value": 1})
+            if failure == "unknown"
+            else ("write_file", {"content": "missing path"})
+        )
+        call = {"call_id": "rejected", "name": name, "arguments": arguments}
+        result = await loop._execute_tool_calls(
+            [call], session, persist_tool_messages=persist_messages
+        )
+        assert len(result) == 1 and result[0]["success"] is False
+        assert seen_approvals == []
+        saved = store.load_session(session.session_id)
+        assert len(saved.tool_calls) == 1
+        assert not saved.tool_calls[0].approved
+        assert not saved.tool_calls[0].executed
+        assert not saved.tool_calls[0].dispatched
+        assert saved.tool_calls[0].error == result[0]["error"]
+        assert [event["type"] for event in ui.events if event["type"].startswith("tool.")] == [
+            "tool.requested", "tool.error"
+        ]
+        assert [message.metadata["call_id"] for message in saved.messages
+                if message.role == "tool"] == (["rejected"] if persist_messages else [])
+        assert store.verify_audit_log(session.session_id) == []
+        assert store.list_audit_logs(session.session_id)[-1].result == "FAILURE"
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool_name", "arguments"),
     [
