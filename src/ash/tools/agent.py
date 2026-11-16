@@ -42,7 +42,7 @@ from ash.core.session import SessionStore
 from ash.providers.base import ProviderABC
 from ash.safety.guard import SafetyGuard
 from ash.safety.environment import build_scrubbed_environment
-from ash.safety.policy import PermissionPolicy, PolicyAction, READ_ONLY_TOOLS
+from ash.safety.policy import PermissionPolicy, PolicyAction, is_read_only_tool_call
 from ash.sandbox import SandboxManager
 from ash.sandbox.process_utils import (
     ProcessOutputLimitExceeded,
@@ -2378,12 +2378,7 @@ class SpawnAgentTool(BaseTool):
                 return
             tool_name = str(event.get("tool", ""))
             arguments = event.get("arguments")
-            read_only = tool_name in READ_ONLY_TOOLS or (
-                tool_name == "background_process"
-                and isinstance(arguments, dict)
-                and arguments.get("action") in {"list", "poll"}
-            )
-            if not read_only:
+            if not is_read_only_tool_call(tool_name, arguments):
                 attempt_state["side_effect_dispatched"] = True
 
         worker_ui.subscribe(observe_worker_event)

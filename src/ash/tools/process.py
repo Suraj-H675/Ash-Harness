@@ -57,6 +57,8 @@ MAX_BACKGROUND_JOBS = 32
 MAX_BACKGROUND_HISTORY_JOBS = 32
 MAX_BACKGROUND_COMMAND_CHARS = 100_000
 MAX_BACKGROUND_INPUT_CHARS = 1_000_000
+MAX_BACKGROUND_WAIT_SECONDS = 30.0
+BACKGROUND_EXIT_DRAIN_GRACE_SECONDS = 0.25
 BACKGROUND_STDIN_WRITE_TIMEOUT_SECONDS = PTY_WRITE_TIMEOUT_SECONDS
 MAX_BACKGROUND_JOB_ID_CHARS = 128
 MAX_BACKGROUND_CWD_CHARS = 4_096
@@ -145,14 +147,21 @@ class Job:
     pty_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pty_input_enabled: bool = True
     stdin_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    output_changed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class BackgroundProcessArgs(BaseModel):
-    action: str = Field(..., pattern="^(start|list|poll|write|stop)$")
+    action: str = Field(..., pattern="^(start|list|poll|wait|write|stop)$")
     command: str = Field("", max_length=MAX_BACKGROUND_COMMAND_CHARS)
     job_id: str = Field("", max_length=MAX_BACKGROUND_JOB_ID_CHARS)
     input: str = Field("", max_length=MAX_BACKGROUND_INPUT_CHARS)
     cwd: str | None = Field(None, max_length=MAX_BACKGROUND_CWD_CHARS)
+    timeout_seconds: float = Field(
+        10.0,
+        gt=0,
+        le=MAX_BACKGROUND_WAIT_SECONDS,
+        description="Maximum seconds to wait for new output or process exit (wait only).",
+    )
     pty: bool = Field(
         False,
         description=(
@@ -167,7 +176,8 @@ class BackgroundProcessTool(BaseTool):
     description = (
         "Start a development server or run tests and other commands in the "
         "background, keep them running, and poll status or output to check "
-        "progress; send input or stop the process."
+        "progress; send input or stop the process. Wait up to 30 seconds "
+        "for new output or exit without repeated polling."
     )
     args_schema = BackgroundProcessArgs
 
@@ -209,11 +219,73 @@ class BackgroundProcessTool(BaseTool):
             return ToolResult(
                 success=False, output="", error=f"Unknown job: {args.job_id}"
             )
-        if args.action == "poll":
+        if args.action in {"poll", "wait"}:
+            timed_out = False
+            if (
+                args.action == "wait"
+                and job.cursor >= len(job.output)
+                and self._has_active_readers_or_root(job)
+            ):
+                # No await occurs between inspecting the unread cursor and
+                # clearing the signal; an arriving output chunk cannot be lost.
+                job.output_changed.clear()
+                output_wait = asyncio.create_task(job.output_changed.wait())
+                exit_wait = asyncio.create_task(job.process.wait())
+                deadline = asyncio.get_running_loop().time() + args.timeout_seconds
+                try:
+                    finished, _ = await asyncio.wait(
+                        {output_wait, exit_wait},
+                        timeout=args.timeout_seconds,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    timed_out = not finished
+                    if exit_wait in finished and not output_wait.done() and job.readers:
+                        # An exited root can still have unread pipe buffers.
+                        # Give the readers the remaining wait budget to flush
+                        # redacted output, without cancelling their tasks if
+                        # descendants retain an inherited pipe open.
+                        readers_done = asyncio.gather(
+                            *(asyncio.shield(reader) for reader in job.readers),
+                            return_exceptions=True,
+                        )
+                        try:
+                            completion: set[asyncio.Future[Any]] = {
+                                output_wait,
+                                readers_done,
+                            }
+                            drained, _ = await asyncio.wait(
+                                completion,
+                                timeout=min(
+                                    BACKGROUND_EXIT_DRAIN_GRACE_SECONDS,
+                                    max(
+                                        0.0,
+                                        deadline - asyncio.get_running_loop().time(),
+                                    ),
+                                ),
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            timed_out = not drained
+                        finally:
+                            readers_done.cancel()
+                            await asyncio.gather(readers_done, return_exceptions=True)
+                finally:
+                    for task in (output_wait, exit_wait):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(output_wait, exit_wait, return_exceptions=True)
             output = "".join(job.output[job.cursor :])
             job.cursor = len(job.output)
+            status = self._status(job)
+            if (
+                args.action == "wait"
+                and job.process.returncode is not None
+                and any(not reader.done() for reader in job.readers)
+            ):
+                status += "\n[output still draining; poll for final output]"
+            if timed_out and not output and job.process.returncode is None:
+                status += f"\n[no new output within {args.timeout_seconds:g} seconds]"
             return self._result(
-                f"{self._status(job)}\n{output}".rstrip(),
+                f"{status}\n{output}".rstrip(),
                 truncated=job.output_truncated,
             )
         if args.action == "write":
@@ -544,12 +616,14 @@ class BackgroundProcessTool(BaseTool):
         if len(text) <= remaining:
             job.output.append(text)
             job.output_size += len(text)
+            job.output_changed.set()
             return
         if remaining:
             job.output.append(text[:remaining])
             job.output_size += remaining
         job.output.append(BACKGROUND_OUTPUT_TRUNCATION_MARKER)
         job.output_truncated = True
+        job.output_changed.set()
 
     @staticmethod
     def _status(job: Job) -> str:

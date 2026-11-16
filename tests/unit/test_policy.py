@@ -24,6 +24,26 @@ def test_plan_mode_allows_reads() -> None:
     assert decision.action == PolicyAction.ALLOW
 
 
+def test_background_wait_is_read_only_but_cannot_bypass_explicit_deny() -> None:
+    request = {"action": "wait", "job_id": "job123", "timeout_seconds": 2}
+    assert PermissionPolicy("plan").evaluate("background_process", request).action == (
+        PolicyAction.ALLOW
+    )
+    rule = PermissionRule.create(RuleEffect.DENY, "background_process")
+    assert (
+        PermissionPolicy("plan", managed_rules=[rule])
+        .evaluate("background_process", request)
+        .action
+        == PolicyAction.DENY
+    )
+    assert (
+        PermissionPolicy("plan")
+        .evaluate("background_process", {"action": "start", "command": "echo denied"})
+        .action
+        == PolicyAction.DENY
+    )
+
+
 @pytest.mark.parametrize("mode", ["interactive", "auto_edit", "plan"])
 def test_workspace_diff_is_read_only_but_respects_explicit_denials(mode: str) -> None:
     assert PermissionPolicy(mode).evaluate("workspace_diff", {}).action == (

@@ -261,7 +261,8 @@ The core loop supports:
 - cancellation that propagates through provider and tool work;
 - structured JSON and JSON-Schema output for machine consumers;
 - capability-aware tool and vision negotiation; and
-- bounded long-running process management with process-tree cleanup.
+- bounded long-running process management, event-driven waits for new output
+  or process exit (30-second maximum per wait), and process-tree cleanup.
 
 The model receives an explicit untrusted-content boundary. Workspace files,
 tool output, memory, citations, and project-derived instructions are treated

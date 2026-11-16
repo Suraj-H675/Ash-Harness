@@ -69,6 +69,162 @@ async def test_background_process_start_poll_and_close(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_background_process_wait_for_new_output_without_repeated_polling(
+    tmp_path: Path,
+) -> None:
+    command = _python_shell_command(
+        "import sys; print('ready', flush=True); "
+        "sys.stdin.readline(); print('next', flush=True); "
+        "sys.stdin.readline()"
+    )
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    try:
+        started = await tool.run(action="start", command=command)
+        assert started.success
+        job_id = started.output.split()[1]
+        first = await asyncio.wait_for(
+            tool.run(action="wait", job_id=job_id, timeout_seconds=2), 3
+        )
+        assert first.success and "ready" in first.output.split("\n", 1)[1]
+        assert "running" in first.output.split("\n", 1)[0]
+
+        waiting = asyncio.create_task(
+            tool.run(action="wait", job_id=job_id, timeout_seconds=2)
+        )
+        await asyncio.sleep(0.05)
+        assert not waiting.done()
+        wrote = await tool.run(action="write", job_id=job_id, input="\n")
+        assert wrote.success
+        second = await asyncio.wait_for(waiting, 2)
+        assert second.success and "next" in second.output.split("\n", 1)[1]
+        assert "ready" not in second.output.split("\n", 1)[1]
+
+        started_at = asyncio.get_running_loop().time()
+        quiet = await tool.run(action="wait", job_id=job_id, timeout_seconds=0.08)
+        assert asyncio.get_running_loop().time() - started_at >= 0.05
+        assert quiet.success and "running" in quiet.output
+        assert "next" not in quiet.output.split("\n", 1)[1]
+        assert "no new output" in quiet.output
+
+        wrote = await tool.run(action="write", job_id=job_id, input="\n")
+        assert wrote.success
+        done = await asyncio.wait_for(
+            tool.run(action="wait", job_id=job_id, timeout_seconds=2), 3
+        )
+        assert done.success and "exited(0)" in done.output
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.parametrize("already_exited", [False, True])
+@pytest.mark.asyncio
+async def test_background_process_wait_drains_delayed_reader_after_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, already_exited: bool
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    original_read = tool._read
+
+    async def delayed_read(*args):
+        await asyncio.sleep(0.15)
+        await original_read(*args)
+
+    monkeypatch.setattr(tool, "_read", delayed_read)
+    try:
+        started = await tool.run(
+            action="start", command=_successful_shell_command(output="FINISHED_SENTINEL")
+        )
+        assert started.success
+        job_id = started.output.split()[1]
+        if already_exited:
+            await asyncio.wait_for(tool.jobs[job_id].process.wait(), 2)
+        observed = await asyncio.wait_for(
+            tool.run(action="wait", job_id=job_id, timeout_seconds=1), 2
+        )
+        assert observed.success and "exited(0)" in observed.output
+        assert "FINISHED_SENTINEL" in observed.output.split("\n", 1)[1]
+        assert len((await tool.run(action="poll", job_id=job_id)).output.splitlines()) == 1
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.parametrize("interrupt", ["timeout", "cancel", "exit_grace"])
+@pytest.mark.asyncio
+async def test_background_process_wait_interruption_keeps_output_readers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupt: str
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    original_read = tool._read
+
+    async def delayed_read(*args):
+        await asyncio.sleep(0.6 if interrupt == "exit_grace" else 0.15)
+        await original_read(*args)
+
+    monkeypatch.setattr(tool, "_read", delayed_read)
+    try:
+        started = await tool.run(
+            action="start", command=_successful_shell_command(output="AFTER_WAIT_END")
+        )
+        assert started.success
+        job_id = started.output.split()[1]
+        job = tool.jobs[job_id]
+        await asyncio.wait_for(job.process.wait(), 2)
+
+        if interrupt == "timeout":
+            observed = await tool.run(
+                action="wait", job_id=job_id, timeout_seconds=0.03
+            )
+            assert observed.success and "exited(0)" in observed.output
+        elif interrupt == "exit_grace":
+            started_at = asyncio.get_running_loop().time()
+            observed = await tool.run(action="wait", job_id=job_id, timeout_seconds=1)
+            assert asyncio.get_running_loop().time() - started_at < 0.45
+            assert "still draining" in observed.output
+        else:
+            waiting = asyncio.create_task(
+                tool.run(action="wait", job_id=job_id, timeout_seconds=1)
+            )
+            await asyncio.sleep(0.03)
+            assert not waiting.done()
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting
+
+        assert all(not reader.cancelled() for reader in job.readers)
+        await asyncio.wait_for(asyncio.gather(*job.readers), 2)
+        polled = await tool.run(action="poll", job_id=job_id)
+        assert polled.output.split("\n", 1)[1] == "AFTER_WAIT_END"
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_background_process_cancelled_wait_leaves_job_running(
+    tmp_path: Path,
+) -> None:
+    tool = BackgroundProcessTool(SafetyGuard(tmp_path))
+    try:
+        started = await tool.run(
+            action="start",
+            command=_python_shell_command("import sys; sys.stdin.readline()"),
+        )
+        assert started.success
+        job_id = started.output.split()[1]
+        waiting = asyncio.create_task(
+            tool.run(action="wait", job_id=job_id, timeout_seconds=2)
+        )
+        await asyncio.sleep(0.05)
+        assert not waiting.done()
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert tool.jobs[job_id].process.returncode is None
+        assert (await tool.run(action="write", job_id=job_id, input="\n")).success
+        assert (await tool.run(action="wait", job_id=job_id, timeout_seconds=2)).success
+    finally:
+        await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_background_process_pipe_write_timeout_fails_without_hanging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

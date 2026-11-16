@@ -72,6 +72,14 @@ EDIT_TOOLS = frozenset(
 )
 
 
+def is_read_only_tool_call(tool_name: str, arguments: dict[str, Any] | None) -> bool:
+    return tool_name in READ_ONLY_TOOLS or (
+        tool_name == "background_process"
+        and isinstance(arguments, dict)
+        and arguments.get("action") in {"list", "poll", "wait"}
+    )
+
+
 @dataclass(frozen=True)
 class PolicyDecision:
     action: PolicyAction
@@ -172,10 +180,7 @@ class PermissionPolicy:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> PolicyDecision:
-        read_only = tool_name in READ_ONLY_TOOLS or (
-            tool_name == "background_process"
-            and arguments.get("action") in {"list", "poll"}
-        )
+        read_only = is_read_only_tool_call(tool_name, arguments)
         if self.mode == PermissionMode.DRY_RUN:
             return PolicyDecision(
                 PolicyAction.DENY, "dry-run mode forbids side effects"

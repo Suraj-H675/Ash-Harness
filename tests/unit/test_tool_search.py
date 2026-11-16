@@ -966,6 +966,12 @@ async def test_iteration_tool_snapshot_survives_live_catalog_removal(tmp_path) -
             4_096,
         ),
         (
+            "Wait for my background test process to produce output.",
+            "wait for background process output",
+            "background_process",
+            4_096,
+        ),
+        (
             "Start a server and keep it running while I edit code.",
             "start server",
             "background_process",
