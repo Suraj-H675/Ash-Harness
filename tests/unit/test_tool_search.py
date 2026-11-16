@@ -1009,6 +1009,12 @@ async def test_default_runtime_discovers_tools_for_natural_language_intents(
 ) -> None:
     from ash.runtime import build_tools
 
+    if intent.startswith("Run pytest and leave it running"):
+        # macOS CI uses a deeply nested /private/var/folders test workspace.
+        # Its real project path must still fit the protected 4K discovery turn.
+        tmp_path = tmp_path / ("deep-project-" + "x" * 72)
+        tmp_path.mkdir()
+
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     config = AshConfig(

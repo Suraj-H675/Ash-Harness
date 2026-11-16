@@ -160,24 +160,20 @@ class BackgroundProcessArgs(BaseModel):
         10.0,
         gt=0,
         le=MAX_BACKGROUND_WAIT_SECONDS,
-        description="Maximum seconds to wait for new output or process exit (wait only).",
+        description="Wait for output or exit, at most 30 seconds (wait only).",
     )
     pty: bool = Field(
         False,
-        description=(
-            "Allocate a POSIX pseudo-terminal for a started process. PTY output "
-            "merges stdout/stderr and write sends input to the terminal."
-        ),
+        description="Start with a POSIX PTY (merged output, terminal input).",
     )
 
 
 class BackgroundProcessTool(BaseTool):
     name = "background_process"
     description = (
-        "Start a development server or run tests and other commands in the "
-        "background, keep them running, and poll status or output to check "
-        "progress; send input or stop the process. Wait up to 30 seconds "
-        "for new output or exit without repeated polling."
+        "Run tests or start a server in background; leave it running and check "
+        "progress. Actions: start, list, poll output/status, wait up to 30s "
+        "for output or exit, write input, stop. Prefer wait to repeated polling."
     )
     args_schema = BackgroundProcessArgs
 

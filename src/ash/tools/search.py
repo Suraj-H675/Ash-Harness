@@ -304,7 +304,6 @@ class SearchTextArgs(BaseModel):
         0,
         ge=0,
         le=MAX_SEARCH_CONTEXT_LINES,
-        description="Nearby source lines before/after each match (0–10); output byte caps remain enforced.",
     )
     max_output_bytes: int = Field(
         DEFAULT_SEARCH_CAPTURE_BYTES, ge=1_024, le=MAX_SEARCH_CAPTURE_BYTES
