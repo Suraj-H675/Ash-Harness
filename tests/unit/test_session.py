@@ -3855,6 +3855,52 @@ def test_tool_call_terminal_success_without_output_cannot_be_rewritten(
     assert store.load_session(session.session_id).tool_calls == [completed]
 
 
+def test_terminal_tool_message_seals_call_even_without_result_fields(
+    tmp_path: Path,
+) -> None:
+    """A denied/no-op terminal result cannot later turn into an executed call."""
+    store = SessionStore(tmp_path / "terminal-without-record-result.db")
+    session = store.create_session(str(tmp_path))
+    original = ToolCallRecord(
+        call_id="denied-call", tool_name="run_command",
+        arguments={"command_line": "echo not-run"},
+        approved=False, dispatched=False, executed=False,
+        timestamp=datetime.now(timezone.utc),
+    )
+    message = Message(
+        role="tool", content='{"success":false,"error":"denied"}',
+        timestamp=original.timestamp, metadata={"call_id": original.call_id},
+    )
+    assert store.finalize_tool_call_with_message(
+        session.session_id, original, message
+    ) is True
+    changed = original.model_copy(update={
+        "approved": True, "dispatched": True, "executed": True,
+        "result": "unverified execution", "success": True, "exit_code": 0,
+    })
+    with pytest.raises(SessionStorageError, match="terminal tool-call"):
+        store.save_tool_call(session.session_id, changed)
+    with pytest.raises(SessionStorageError, match="terminal tool-call"):
+        store.finalize_tool_call_with_message(session.session_id, changed, message)
+    with pytest.raises(SessionStorageError, match="terminal tool-call"):
+        store.save_tool_call(
+            session.session_id, original, turn_id="unrelated-later-turn"
+        )
+    altered_timestamp = original.model_copy(update={
+        "timestamp": datetime(2030, 1, 1, tzinfo=timezone.utc),
+    })
+    with pytest.raises(SessionStorageError, match="terminal tool-call"):
+        store.save_tool_call(session.session_id, altered_timestamp)
+    with pytest.raises(SessionStorageError, match="terminal tool-call"):
+        store.finalize_tool_call_with_message(
+            session.session_id, altered_timestamp, message,
+        )
+    assert store.load_session(session.session_id).tool_calls == [original]
+    assert [
+        m for m in store.load_session(session.session_id).messages if m.role == "tool"
+    ] == [message]
+
+
 def test_tool_call_ids_are_scoped_per_session(tmp_path: Path) -> None:
     db_path = tmp_path / "session_store.db"
     store = SessionStore(db_path)

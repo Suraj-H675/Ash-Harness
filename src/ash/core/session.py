@@ -6816,7 +6816,7 @@ class SessionStore:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT tool_name, arguments_json, approved, dispatched, executed, "
-                "result, error, success, exit_code, turn_id "
+                "result, error, success, exit_code, turn_id, timestamp "
                 "FROM tool_calls WHERE session_id = ? AND call_id = ?",
                 (session_id, record.call_id),
             ).fetchone()
@@ -6837,21 +6837,27 @@ class SessionStore:
                     or (existing["executed"] and not record.executed)
                 ):
                     raise SessionStorageError("tool-call state cannot move backward")
-                if (
-                    existing["result"] is not None
-                    or existing["error"] is not None
-                    or existing["success"] is not None
-                    or existing["exit_code"] is not None
-                ) and (
-                    existing["result"] != record.result
-                    or existing["error"] != record.error
-                    or existing["success"] != record.success
-                    or existing["exit_code"] != record.exit_code
-                    or bool(existing["approved"]) != record.approved
-                    or bool(existing["dispatched"]) != record.dispatched
-                    or bool(existing["executed"]) != record.executed
+                changed = self._tool_call_execution_fields_differ(existing, record)
+                metadata_changed = (
+                    existing["timestamp"] != _serialize_datetime(record.timestamp)
+                    or (turn_id is not None and existing["turn_id"] is None)
+                )
+                if changed and any(
+                    existing[field] is not None
+                    for field in ("result", "error", "success", "exit_code")
                 ):
                     raise SessionStorageError("terminal tool-call state is immutable")
+                if changed or metadata_changed:
+                    # The terminal message seals the operation even when an
+                    # older record has no result fields (e.g. denied calls).
+                    sealed = conn.execute(
+                        "SELECT 1 FROM messages WHERE session_id = ? "
+                        "AND role = 'tool' "
+                        "AND json_extract(metadata_json, '$.call_id') = ? LIMIT 1",
+                        (session_id, record.call_id),
+                    ).fetchone()
+                    if sealed:
+                        raise SessionStorageError("terminal tool-call state is immutable")
             conn.execute(
                 """
                 INSERT INTO tool_calls (
@@ -6911,6 +6917,21 @@ class SessionStore:
         ):
             raise SessionStorageError("inconsistent tool-call state")
 
+    @staticmethod
+    def _tool_call_execution_fields_differ(
+        existing: sqlite3.Row, record: ToolCallRecord,
+    ) -> bool:
+        """Compare durable execution truth, independently of optional output."""
+        return (
+            bool(existing["approved"]) != record.approved
+            or bool(existing["dispatched"]) != record.dispatched
+            or bool(existing["executed"]) != record.executed
+            or existing["result"] != record.result
+            or existing["error"] != record.error
+            or existing["success"] != record.success
+            or existing["exit_code"] != record.exit_code
+        )
+
     def finalize_tool_call_with_message(
         self,
         session_id: str,
@@ -6933,7 +6954,7 @@ class SessionStore:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT tool_name, arguments_json, approved, executed, dispatched, "
-                "result, error, success, exit_code, turn_id FROM tool_calls "
+                "result, error, success, exit_code, turn_id, timestamp FROM tool_calls "
                 "WHERE session_id = ? AND call_id = ?",
                 (session_id, record.call_id),
             ).fetchone()
@@ -6955,22 +6976,20 @@ class SessionStore:
                 or (existing["executed"] and not record.executed)
             ):
                 raise SessionStorageError("tool-call state cannot move backward")
-            if existing is not None and (
-                existing["result"] is not None
-                or existing["error"] is not None
-                or existing["success"] is not None
-                or existing["exit_code"] is not None
+            if existing is not None and self._tool_call_execution_fields_differ(
+                existing, record
             ):
-                if (
-                    bool(existing["approved"]) != record.approved
-                    or bool(existing["executed"]) != record.executed
-                    or bool(existing["dispatched"]) != record.dispatched
-                    or existing["result"] != record.result
-                    or existing["error"] != record.error
-                    or existing["success"] != record.success
-                    or existing["exit_code"] != record.exit_code
+                if any(
+                    existing[field] is not None
+                    for field in ("result", "error", "success", "exit_code")
                 ):
                     raise SessionStorageError("conflicting terminal tool call retry")
+                if terminal_messages:
+                    raise SessionStorageError("terminal tool-call state is immutable")
+            if terminal_messages and existing is not None and (
+                existing["timestamp"] != _serialize_datetime(record.timestamp)
+            ):
+                raise SessionStorageError("terminal tool-call metadata is immutable")
             if terminal_messages:
                 if (
                     len(terminal_messages) != 1
