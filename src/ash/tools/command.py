@@ -459,7 +459,8 @@ def extract_diagnostic_summary(output: str, error: str) -> dict[str, int]:
 class RunCommandTool(BaseTool):
     name = "run_command"
     description = (
-        "Execute a shell command after safety validation, starting in the "
+        "Run visible tests (such as pytest) to verify a patch or fix, or "
+        "execute another shell command after safety validation, starting in the "
         "current project root by default. Command authorization is checked "
         "against the supplied arguments before execution."
     )

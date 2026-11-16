@@ -553,6 +553,54 @@ async def test_multifile_edit_intent_discovers_patch_instead_of_file_finder(
     assert "apply_patch" not in search.visible_tools(tools)
 
 
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        ("inspect implementations across several files", "read_files"),
+        ("read the definitions in these two modules", "read_files"),
+        ("make changes in 7 source files", "apply_patch"),
+        ("fix a bug across two modules", "apply_patch"),
+        ("repair two source files", "apply_patch"),
+        ("find all call sites of Foo.bar in code", "search_text"),
+        ("run the visible tests for my patch", "run_command"),
+        ("review changes in several files", "git_diff"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_real_catalog_selects_coding_action_not_related_noun(
+    tmp_path: Path, intent: str, expected: str,
+) -> None:
+    """Coding navigation/edit/test requests must select their actual action."""
+    from ash.runtime import build_tools
+
+    config = AshConfig(
+        model="local/coding-intents", workspace_root=tmp_path,
+        db_directory=tmp_path / "db", max_context_tokens=65_536,
+        max_completion_tokens=1_024, memory_backend="off",
+        tool_search_threshold=32,
+    )
+    guard = SafetyGuard(tmp_path)
+    catalog = build_tools(
+        guard, tmp_path, runtime_config=config,
+        provider_factory=lambda *_args, **_kwargs: None,
+        agent_db_path=tmp_path / "agents.db",
+    )
+    assert len(catalog) > config.tool_search_threshold
+    result = await catalog["search_tools"].run(query=intent, limit=1)
+    assert result.success
+    assert [item["name"] for item in json.loads(result.output)["tools"]] == [expected]
+
+    if expected == "read_files":
+        (tmp_path / "first.py").write_text("ANSWER = 1\n")
+        (tmp_path / "second.py").write_text("ANSWER = 2\n")
+        actual = await catalog["read_files"].run(files=[
+            {"file_path": "first.py"}, {"file_path": "second.py"},
+        ])
+        assert actual.success
+        assert "ANSWER = 1" in actual.output
+        assert "ANSWER = 2" in actual.output
+
+
 @pytest.mark.asyncio
 async def test_small_context_does_not_limit_already_visible_tool_catalog(
     tmp_path: Path,

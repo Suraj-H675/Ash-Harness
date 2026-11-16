@@ -55,7 +55,7 @@ _MULTIFILE_EDIT_ACTIONS = frozenset(
     {
         "edit", "editing", "modify", "modifying", "change", "changing",
         "update", "updating", "refactor", "refactoring", "split",
-        "splitting", "rewrite", "rewriting",
+        "splitting", "rewrite", "rewriting", "fix", "repair",
     }
 )
 _MULTIFILE_EDIT_QUANTIFIERS = frozenset(
@@ -268,7 +268,11 @@ def _rank_tools(
     # patch editor, not merely a file finder or grouped reader whose names
     # happen to contain the word "files". Require all three parts of intent;
     # read-only and multiple-range-in-one-file queries keep ordinary ranking.
-    multi_file_edit = _is_multifile_edit_intent(set(terms))
+    query_terms = set(terms)
+    multi_file_edit = _is_multifile_edit_intent(query_terms)
+    change_review = "changes" in query_terms and bool(
+        {"review", "inspect"}.intersection(query_terms)
+    )
     ranked: list[tuple[str, BaseTool, int]] = []
     name_fallbacks: list[tuple[str, BaseTool, int]] = []
     for name, tool in catalog.items():
@@ -295,6 +299,10 @@ def _rank_tools(
                 matched_terms += 1
         if name == "apply_patch" and multi_file_edit:
             score += 240
+            matched_terms = max(matched_terms, _MIN_QUERY_MATCH_TERMS)
+        elif name == "git_diff" and change_review:
+            # Reviewing modifications is not the same as reading source files.
+            score += 140
             matched_terms = max(matched_terms, _MIN_QUERY_MATCH_TERMS)
         exact_name_query = normalized_name == normalized_name_query
         name_prefix_query = bool(normalized_name_query) and normalized_name.startswith(
@@ -324,8 +332,14 @@ def _rank_tools(
 
 def _is_multifile_edit_intent(terms: set[str]) -> bool:
     return (
-        bool(_MULTIFILE_EDIT_ACTIONS.intersection(terms))
-        and bool(_MULTIFILE_EDIT_QUANTIFIERS.intersection(terms))
+        (
+            bool(_MULTIFILE_EDIT_ACTIONS.intersection(terms))
+            or {"make", "changes"}.issubset(terms)
+        )
+        and (
+            bool(_MULTIFILE_EDIT_QUANTIFIERS.intersection(terms))
+            or any(term.isdecimal() and int(term) > 1 for term in terms)
+        )
         and (
             bool(_MULTIFILE_EDIT_TARGETS.intersection(terms))
             or ("multi" in terms and bool({"file", "module"}.intersection(terms)))

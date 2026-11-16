@@ -514,8 +514,9 @@ class ReadFilesTool(BaseTool):
     name = "read_files"
     execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
-        "Read up to 4 focused source ranges together, with numbered lines, "
-        "SHA-256 and truncation markers per file. Search for symbols first; "
+        "Read or inspect implementations and definitions across several files "
+        "or two modules. Up to 4 focused source ranges together, with numbered "
+        "lines, SHA-256 and truncation markers per file. Search for symbols first; "
         "keep the combined source budget at or below 16384 characters. "
         "Each read retains normal workspace and stale-file checks."
     )

@@ -309,8 +309,10 @@ class SearchTextTool(BaseTool):
     name = "search_text"
     execution_contract = ToolExecutionContract(parallel_safe=True)
     description = (
-        "Search text with file:line matches. Scope with directory_path; "
-        "context_lines adds nearby lines."
+        "Search source text to find function definitions, call sites, and "
+        "symbol usages by textual matches (not semantic reference analysis). "
+        "Return file:line matches; scope with directory_path, and use "
+        "context_lines for nearby lines."
     )
     args_schema = SearchTextArgs
 
