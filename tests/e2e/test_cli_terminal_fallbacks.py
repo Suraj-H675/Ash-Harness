@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import struct
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+
+from ash.core.session import SessionStore
+from ash.safety.grants import load_permission_rules
 
 
 def _terminal_environment(
@@ -555,3 +561,222 @@ def test_first_run_local_provider_picker_ctrl_c_cancels_setup(
         assert b"Setup cancelled." in captured
     finally:
         _stop_pty_cli(master, process)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
+    tmp_path: Path,
+) -> None:
+    """One real first-run TTY journey with a disposable provider and workspace."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    source = workspace / "calc.py"
+    source.write_text("def add_one(n):\n    return n - 1\n", encoding="utf-8")
+    (workspace / "qa_visible.py").write_text(
+        "from calc import add_one\nassert add_one(2) == 3\n", encoding="utf-8"
+    )
+    (workspace / "protected.txt").write_text("unchanged\n", encoding="utf-8")
+
+    requests: list[dict[str, object]] = []
+
+    class Provider(BaseHTTPRequestHandler):
+        def log_message(self, *_args: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            if self.path != "/v1/models":
+                self.send_error(404)
+                return
+            self.send_json({"data": [{"id": "first-use-model"}]})
+
+        def send_json(self, payload: object) -> None:
+            content = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
+        def do_POST(self) -> None:
+            if self.path != "/v1/chat/completions":
+                self.send_error(404)
+                return
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(request)
+            step = len(requests)
+            if step == 1:
+                output = (
+                    '<call_tool name="replace_file_content">'
+                    '<arg name="file_path">calc.py</arg>'
+                    '<arg name="target_content">    return n - 1\n</arg>'
+                    '<arg name="replacement_content">    return n + 1\n</arg>'
+                    "</call_tool>"
+                )
+            elif step == 2:
+                output = (
+                    '<call_tool name="run_command">'
+                    '<arg name="command_line">python3 -B qa_visible.py</arg>'
+                    '<arg name="timeout_seconds">15</arg>'
+                    "</call_tool>"
+                )
+            else:
+                output = "FIRST-CODING-OK" if step == 3 else "RESUMED-OK"
+            chunk = {
+                "id": f"first-use-{step}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "first-use-model",
+                "choices": [
+                    {"index": 0, "delta": {"content": output}, "finish_reason": "stop"}
+                ],
+            }
+            body = ("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    server.daemon_threads = True
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    environment = _terminal_environment(home, workspace, model=None)
+    environment.update(
+        {"NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
+    )
+    master: int | None = None
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        master, process = _open_pty_cli(workspace, environment)
+        captured = bytearray()
+
+        def reply(marker: bytes, answer: bytes, *, timeout: float = 25) -> None:
+            fresh = bytearray()
+            _read_until(master, process, fresh, marker, timeout=timeout)
+            captured.extend(fresh)
+            os.write(master, answer + b"\r")
+
+        reply(b"? [y/N] ", b"n")
+        reply(b"Press Enter to run setup", b"")
+        fresh = bytearray()
+        _read_until(master, process, fresh, b"Custom endpoint", timeout=25)
+        captured.extend(fresh)
+        match = re.search(rb"\[(\d+)\] Custom endpoint", fresh)
+        assert match is not None, fresh[-2000:]
+        os.write(master, match.group(1) + b"\r")
+        reply("Provider › ".encode(), b"openai-compatible")
+        reply(b"Provider name (e.g.", b"first-use-route")
+        reply(b"Base URL (e.g.", f"http://127.0.0.1:{server.server_port}/v1".encode())
+        reply(b"API key (optional, press Enter to skip)", b"")
+        reply(b"Select or type a model name", b"1")
+
+        fresh = bytearray()
+        _read_until(master, process, fresh, "ASH · type /help".encode(), timeout=30)
+        captured.extend(fresh)
+        assert b"Setup saved" in captured
+        assert requests == [], "setup must not make a model completion request"
+        os.write(master, b"Fix calc.py and execute qa_visible.py\r")
+
+        reply(b"Approve [y] once", b"y", timeout=30)
+        reply(b"Approve [y] once", b"y", timeout=30)
+        fresh = bytearray()
+        _read_until(master, process, fresh, b"FIRST-CODING-OK", timeout=30)
+        after_response = fresh.split(b"FIRST-CODING-OK", 1)[1]
+        if b"> " not in after_response:
+            _read_until(master, process, bytearray(), b"> ", timeout=15)
+        assert source.read_text(encoding="utf-8") == (
+            "def add_one(n):\n    return n + 1\n"
+        )
+        assert (workspace / "protected.txt").read_text() == "unchanged\n"
+        assert len(requests) == 3
+
+        os.write(master, b"/exit\r")
+        process.wait(timeout=12)
+        assert process.returncode == 0
+
+        config_path = home / ".ash" / "ash.toml"
+        assert "first-use-route" in config_path.read_text(encoding="utf-8")
+        assert "http://127.0.0.1:" in config_path.read_text(encoding="utf-8")
+        trust_store = json.loads(
+            (home / ".ash" / "trusted-workspaces.json").read_text()
+        )
+        assert trust_store["workspaces"][str(workspace)] is False
+        assert load_permission_rules(workspace) == []
+
+        # Model discovery from setup is not a completion request; doctor must
+        # be able to verify the persisted route without consuming a turn.
+        doctor = subprocess.run(
+            [sys.executable, "-m", "ash", "doctor", "--connect", "--json"],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=25,
+        )
+        assert doctor.returncode == 0, (doctor.stdout, doctor.stderr)
+        checks = json.loads(doctor.stdout)["checks"]
+        assert any(
+            check["name"] == "connectivity" and check["status"] == "pass"
+            for check in checks
+        ), checks
+        assert len(requests) == 3, "doctor must not call the completion endpoint"
+
+        store = SessionStore(home / "db" / "sessions.db")
+        sessions = store.list_sessions(project_path=str(workspace), limit=5)
+        assert len(sessions) == 1
+        session_id = sessions[0].session_id
+        calls = store.load_session(session_id).tool_calls
+        assert [
+            (
+                call.tool_name,
+                call.approved,
+                call.dispatched,
+                call.executed,
+                call.success,
+                call.error,
+            )
+            for call in calls
+        ] == [
+            ("replace_file_content", True, True, True, True, None),
+            ("run_command", True, True, True, True, None),
+        ]
+        assert store.verify_audit_log(session_id) == []
+
+        resumed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ash",
+                "--continue",
+                "-p",
+                "Check completion",
+                "--output-format",
+                "json",
+            ],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=25,
+        )
+        assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
+        response = json.loads(resumed.stdout)
+        assert response["session_id"] == session_id
+        assert response["response"] == "RESUMED-OK"
+        assert len(requests) == 4
+        assert source.read_text(encoding="utf-8") == (
+            "def add_one(n):\n    return n + 1\n"
+        )
+        assert len(store.load_session(session_id).tool_calls) == 2
+        assert store.verify_audit_log(session_id) == []
+    finally:
+        if master is not None and process is not None:
+            _stop_pty_cli(master, process)
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)

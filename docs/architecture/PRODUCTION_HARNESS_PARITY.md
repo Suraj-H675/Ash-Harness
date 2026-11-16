@@ -130,6 +130,24 @@ tests and related lifecycle/recovery/permission/audit suite passed **56 tests**;
 this is actual interactive-workflow evidence, **not** a complete first-run,
 new-user install, strong-model interactive or macOS approval acceptance.
 
+**Fresh-home first-use CLI evidence (2026-11-17):** A separate real Linux
+TTY/accessibility-mode journey now starts without an Ash model or user
+configuration, explicitly declines trust in an unfamiliar project, completes
+interactive setup for a disposable local OpenAI-compatible endpoint, and
+persists the selected route. Setup discovers a model without making a model
+completion request. In the same CLI session, two distinct **Allow once**
+decisions authorize a source edit and a test command; the repaired source
+passes its executable check, protected files are unchanged, and durable tool
+records show approval, dispatch, execution and success. The workspace stays
+untrusted and has no persistent permission grants. `ash doctor --connect`
+verifies the saved route without a completion request; a fresh `ash --continue`
+process restores the same session without replaying either side effect, and
+the audit verifies before and after resume. The related first-run, provider,
+approval, session, permission and audit suite passed **168 tests**. This
+verifies source-checkout CLI wiring with a deterministic local test provider;
+it is **not** a fresh *installed-wheel* first-use proof, a strong-model task
+quality result, a rich-terminal walk-through, or macOS interactive validation.
+
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
 three-module `event-log` fixture with GPT-6.1 Sol. The intervening Luna
