@@ -198,7 +198,7 @@ command. Files over 128 KiB and non-Python files skip this advisory. If the
 compiler identifies a syntax error, the completed write **remains successful**
 and unchanged; its tool result adds a compact line/column/message and one
 structured `python_syntax_errors` diagnostic per affected module. For a
-successful Git-style multi-file `apply_patch`, at most the first **12** Python
+successful multi-file `apply_patch`, at most the first **12** Python
 paths are checked using bounded, no-follow workspace reads. Deleted, oversized,
 or unreadable files are skipped, and any paths omitted by the count bound are
 reported explicitly. Dry-run patches do not trigger this post-edit check.
@@ -207,10 +207,19 @@ syntax in the next coding step without first running a separate command.
 It is *not* permission to run tests, and a file that parses successfully may
 still have runtime, import, typing, or semantic defects. Compiler-version
 differences can also affect the advisory; run target-version checks when
-relevant. Git-style `apply_patch` retains its separate patch-validation and
+relevant. `apply_patch` retains its separate patch-validation and
 execution path; post-edit feedback does not change its success/failure status.
 
-Git-style `apply_patch` checks patch validity before applying changes, but a
+`apply_patch` accepts Git unified diffs (`--- a/path`, `+++ b/path`,
+`@@ -start +start @@`) and model-oriented `*** Begin Patch` blocks with
+`*** Update File:`, `*** Add File:`, `*** Delete File:`, `@@` context and
+`*** End Patch`. Model-oriented edits require exact, unique matching context;
+ambiguous hunks, moves, binary/non-UTF-8 sources and mixed line endings are
+refused. Ash translates supported model-oriented patches into unified diffs
+through bounded no-follow reads, then uses the same gated Git validation,
+checkpoint, authorization and execution boundaries. Dry runs do not edit.
+
+`apply_patch` checks patch validity before applying changes, but a
 later filesystem error can leave a **partial multi-file edit** even when the
 `git apply` subprocess exits nonzero. A failed `--check` is a known-completed
 refusal before mutation. Once actual application is attempted, a nonzero exit

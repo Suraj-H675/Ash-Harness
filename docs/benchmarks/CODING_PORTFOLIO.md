@@ -22,7 +22,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R6 | `dateutil-strict-numeric-fields` | Pinned real repo | Two-file ISO date/time and calendar-offset input validation | **Initial pair: Ash timeout / Codex pass**; no Ash source edit or verification |
 | R7 | `attrs-generator-setattr-hooks` | Pinned real repo | Two-source-module class-generation feature, generator lifecycle and compatibility | **Initial pair: both fail**; Ash 32K protected-context overflow after one edit, Codex visible pass but hidden fail; Ash 64K ablation reaches 120K total-turn cap. Park fixture-specific remediation. |
 | R8 | `packaging-exception-pickle` | Pinned real repo | Two-module exception serialization compatibility | **Latest sequential 65K pair: both pass**; earlier Ash-only normal-128K trial also passed. Exact independent oracle and scope checks verified; no speed/reliability ranking |
-| R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **First sequential 65K pair: both pass**; Ash 106.68s / 14 requests, Codex 78.74s / 5 shell commands; one sample, Codex policy-parity caveat |
+| R9 | `tomlkit-comment-control-validation` | Pinned real repo | Three-module TOML comment validation across standalone, item and array APIs; control-character rejection and mutation safety | **Two separate sequential 65K pairs: both pass in both trials**; latest Ash 168.05s / 14 model requests / 33 tools, Codex 87.27s / 6 shell commands; one outcome per revision, policy-parity caveat |
 | R10 | `pluggy-role-module-split` | Pinned real repo | Seven-module role-based refactor; old import shims and public plugin behavior, wrappers, firstresult, historic replay and subset callers | **Park after two matched pairs**; at 170s both timed out/incomplete; at 300s Ash stopped on protected opaque-context exhaustion after 4/7 files, Codex changed all seven and passed both oracles but timed out without executing the visible test. Neither a complete coding pass |
 | R11 | `boltons-bulk-ordered-collections` | Pinned real repo | Two-module ordered-container repair: multi-list index boundaries, insertion and tail handling, and linear-time ordered-set bulk removal | **Controlled Ash-only comparison completed:** no restart 85.33s, 3 requests, 0 edits, context error; one restart 113.86s, 5 requests, actual safe restart, 1/2 edited *before* restart, no edits in child, second context error. Both fail oracles; audits/scopes intact; no verified coding progress after restart |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
@@ -253,6 +253,27 @@ not a stable latency ranking or throughput claim. Ash's prompt-token and
 Codex's cached-input accounting are not directly comparable. No production
 Ash change is justified by this pass; R9 establishes a positive result on a
 new codebase, not a repeatability estimate.
+
+**R9 current-revision pair (2026-11-16, one additional trial):** At Ash
+`82f33a9`, the existing frozen R9 task was compared sequentially against
+unmodified plain Codex with the same requested GPT-6 Luna xhigh, 65,536
+context tokens, 170-second per-engine CLI deadline, task prompt, repository
+pins and independent visible/hidden oracles. The pair receipt validated
+shared inputs and recorded **both engines passing**, performing the required
+visible test, preserving source scope and completing normally. Ash: **168.05s
+CLI, 14 completed model requests / 33 tool calls**, 162.734s in model requests
+and 1.464s executing tools, valid audit. Codex: **87.27s CLI, six shell
+commands**, valid event record and isolated profile. This is not a matched
+code-level before/after experiment: model output and infrastructure conditions
+vary across dates, so the old 106.68s Ash result versus 168.05s here does
+not establish a regression from any specific source change. In the new pair,
+Codex was faster by 80.78s, but one observation at this revision is not a
+stable timing distribution. The comparator still does not independently prove
+Codex sandbox/network or exact shell-command-policy parity, and the engines'
+token usage accounting is not directly comparable. This pair motivated a
+separate coding-tool usability investigation, **not** a claim that later
+patch-format support has improved real-model success or efficiency. Private
+receipt: `/var/tmp/ash-r9-current-parity-20261116-r01/`.
 
 **Parity caveat for both new pairs:** The checker accepted requested model,
 effort, context, prompts, pins and independent grading, **not** actual

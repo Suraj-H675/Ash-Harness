@@ -95,6 +95,135 @@ async def test_git_inspection_and_patch(tmp_path: Path) -> None:
     assert "initial" in log.output
 
 
+@pytest.mark.asyncio
+async def test_model_oriented_patch_updates_two_modules_and_respects_dry_run(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("def value():\n    return 1\n")
+    second.write_text("def value():\n    return 2\n")
+    patch_text = """*** Begin Patch
+*** Update File: first.py
+@@ def value():
+-    return 1
++    return 11
+*** Update File: second.py
+@@ def value():
+-    return 2
++    return 22
+*** End Patch"""
+    tool = ApplyPatchTool(SafetyGuard(tmp_path))
+    dry = await tool.run(patch=patch_text, dry_run=True)
+    assert dry.success, dry.error
+    assert first.read_text() == "def value():\n    return 1\n"
+    assert second.read_text() == "def value():\n    return 2\n"
+    applied = await tool.run(patch=patch_text)
+    assert applied.success, applied.error
+    assert first.read_text() == "def value():\n    return 11\n"
+    assert second.read_text() == "def value():\n    return 22\n"
+
+
+@pytest.mark.asyncio
+async def test_model_oriented_patch_add_delete_and_preserve_line_endings(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "original.txt"
+    windows = tmp_path / "windows.txt"
+    original.write_text("remove me\n")
+    windows.write_bytes(b"first\r\nsecond\r\n")
+    patch_text = """*** Begin Patch
+*** Add File: added.txt
++new content
+*** Delete File: original.txt
+*** Update File: windows.txt
+@@
+-second
++replacement
+*** End Patch"""
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(patch=patch_text)
+    assert result.success, result.error
+    assert (tmp_path / "added.txt").read_text() == "new content\n"
+    assert not original.exists()
+    assert windows.read_bytes() == b"first\r\nreplacement\r\n"
+
+
+@pytest.mark.asyncio
+async def test_model_oriented_patch_rejects_ambiguous_and_out_of_scope_edits(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "module.py"
+    target.write_text("value = 1\nvalue = 1\n")
+    tool = ApplyPatchTool(SafetyGuard(tmp_path))
+    ambiguous = """*** Begin Patch
+*** Update File: module.py
+@@
+-value = 1
++value = 2
+*** End Patch"""
+    response = await tool.run(patch=ambiguous)
+    assert not response.success
+    assert "ambiguous" in (response.error or "").lower()
+    assert target.read_text() == "value = 1\nvalue = 1\n"
+
+    traversal = """*** Begin Patch
+*** Update File: ../outside.py
+@@
+-value = 1
++value = 2
+*** End Patch"""
+    refused = await tool.run(patch=traversal)
+    assert not refused.success
+    assert target.read_text() == "value = 1\nvalue = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_model_oriented_patch_preserves_missing_final_newline_and_multiple_hunks(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "module.txt"
+    target.write_bytes(b"alpha\nbeta\ngamma\ndelta")
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
+        patch="""*** Begin Patch
+*** Update File: module.txt
+@@
+-alpha
++ALPHA
+@@
+-delta
++DELTA
+*** End Patch"""
+    )
+    assert result.success, result.error
+    assert target.read_bytes() == b"ALPHA\nbeta\ngamma\nDELTA"
+
+
+@pytest.mark.parametrize(
+    "raw_content,patch_body",
+    [
+        (b"\x00\x01", "*** Delete File: module.txt"),
+        (b"\xff\xfe", "*** Delete File: module.txt"),
+        (b"first\nsecond\n", "*** Update File: module.txt\n@@\n-missing\n+replacement"),
+        (b"first\n", "*** Update File: module.txt\n*** Move to: moved.txt\n@@\n-first\n+other"),
+        (b"first\n", "*** Update File: module\x1b[31m.txt\n@@\n-first\n+other"),
+        (b"first\n", "*** Update File: module.txt\n@@\n-first\n+other\n*** Add File: ./module.txt\n+other"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_model_patch_refuses_unsafe_or_stale_source_without_writes(
+    tmp_path: Path, raw_content: bytes, patch_body: str
+) -> None:
+    target = tmp_path / "module.txt"
+    target.write_bytes(raw_content)
+    result = await ApplyPatchTool(SafetyGuard(tmp_path)).run(
+        patch=f"*** Begin Patch\n{patch_body}\n*** End Patch"
+    )
+    assert not result.success
+    assert result.outcome is ToolExecutionOutcome.COMPLETED
+    assert target.read_bytes() == raw_content
+    assert not (tmp_path / "moved.txt").exists()
+
+
 @pytest.mark.skipif(
     os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
     reason="requires unprivileged POSIX filesystem permissions",
@@ -432,9 +561,10 @@ async def test_multi_file_patch_syntax_advisories_bound_number_of_python_files(
         assert (tmp_path / name).read_text(encoding="utf-8") == "def invalid(:\n"
 
 
+@pytest.mark.parametrize("patch_format", ["unified", "model"])
 @pytest.mark.asyncio
 async def test_coding_loop_repairs_syntax_after_multi_file_patch(
-    tmp_path: Path,
+    tmp_path: Path, patch_format: str,
 ) -> None:
     import io
 
@@ -459,6 +589,17 @@ async def test_coding_loop_repairs_syntax_after_multi_file_patch(
 -value = 1
 +def broken(:
 """
+    if patch_format == "model":
+        patch = """*** Begin Patch
+*** Update File: first.py
+@@
+-value = 1
++value = 2
+*** Update File: second.py
+@@
+-value = 1
++def broken(:
+*** End Patch"""
 
     class RepairFromPatchFeedback(ProviderABC):
         model_name = "patch-feedback"
@@ -530,18 +671,18 @@ async def test_coding_loop_repairs_syntax_after_multi_file_patch(
 
 
 @pytest.mark.asyncio
-async def test_apply_patch_explains_unsupported_codex_format(tmp_path: Path) -> None:
+async def test_apply_patch_explains_malformed_model_patch(tmp_path: Path) -> None:
     target = tmp_path / "hello.txt"
     target.write_text("old\n")
     tool = ApplyPatchTool(SafetyGuard(tmp_path))
     assert "unified diff" in tool.json_schema()["properties"]["patch"]["description"]
 
     result = await tool.run(
-        patch="*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch\n"
+        patch="*** Begin Patch\n*** Update File: hello.txt\n@@\nold\n+new\n*** End Patch\n"
     )
 
     assert result.success is False
-    assert "git-style unified diff" in (result.error or "")
+    assert "expected an @@ context or prefixed change line" in (result.error or "")
     assert target.read_text() == "old\n"
 
 

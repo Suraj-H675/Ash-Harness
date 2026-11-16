@@ -19,6 +19,7 @@ from ash.safety.guard import SafetyGuard
 from ash.safety.scoped_io import ScopedIOError, workspace_mutation_lock
 from ash.tools.base import ToolResult
 from ash.tools.filesystem import WholeEditTool
+from ash.tools.patch import ApplyPatchTool
 
 
 @pytest.mark.asyncio
@@ -77,6 +78,43 @@ async def test_checkpoint_undo_and_conflict_detection(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="changed after"):
         undo_latest_checkpoint(store, guard, session.session_id)
     assert path.read_text() == "user change"
+
+
+@pytest.mark.asyncio
+async def test_model_patch_preserves_multifile_checkpoints_and_undo(tmp_path) -> None:
+    first = tmp_path / "first.txt"
+    first.write_text("before\n", encoding="utf-8")
+    store = SessionStore(tmp_path / "sessions.db")
+    session = store.create_session(str(tmp_path))
+    guard = SafetyGuard(tmp_path)
+    middleware = FileCheckpointMiddleware(
+        store, guard, lambda: (session.session_id, "turn-1", "patch-call")
+    )
+    arguments = {
+        "patch": """*** Begin Patch
+*** Update File: first.txt
+@@
+-before
++after
+*** Add File: second.txt
++created
+*** End Patch"""
+    }
+    tool = ApplyPatchTool(guard)
+    await middleware.before_tool("apply_patch", arguments, tool)
+    result = await tool.run(**arguments)
+    assert result.success, result.error
+    await middleware.after_tool("apply_patch", arguments, result)
+    assert first.read_text() == "after\n"
+    assert (tmp_path / "second.txt").read_text() == "created\n"
+    rows = store.file_checkpoints_for_call(session.session_id, "turn-1", "patch-call")
+    assert len(rows) == 2
+    assert all(row["after_sha256"] is not None for row in rows)
+    assert set(undo_latest_checkpoint(store, guard, session.session_id)) == {
+        first, tmp_path / "second.txt"
+    }
+    assert first.read_text() == "before\n"
+    assert not (tmp_path / "second.txt").exists()
 
 
 @pytest.mark.asyncio

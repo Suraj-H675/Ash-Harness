@@ -1410,6 +1410,39 @@ async def test_post_edit_diagnostics_are_advisory(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_patch_post_edit_lsp_inspects_each_modified_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("first.py", "second.py"):
+        (tmp_path / name).write_text("value = 1\n", encoding="utf-8")
+    manager = LanguageServerManager(tmp_path, {})
+    diagnostics_for = AsyncMock(return_value=[{
+        "severity": 1,
+        "message": "diagnostic present",
+        "source": "test",
+    }])
+    monkeypatch.setattr(manager, "diagnostics_for", diagnostics_for)
+    result = ToolResult(success=True, output="Patched")
+    patch_text = """*** Begin Patch
+*** Update File: first.py
+@@
+-value = 1
++value = 2
+*** Update File: second.py
+@@
+-value = 1
++value = 3
+*** End Patch"""
+
+    await LSPDiagnosticsMiddleware(manager, SafetyGuard(tmp_path)).after_tool(
+        "apply_patch", {"patch": patch_text}, result
+    )
+    assert diagnostics_for.await_count == 2
+    assert '"first.py"' in result.output
+    assert '"second.py"' in result.output
+
+
+@pytest.mark.asyncio
 async def test_post_edit_lsp_preview_prioritizes_errors_and_bounds_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

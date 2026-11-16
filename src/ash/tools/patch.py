@@ -35,6 +35,7 @@ from ash.tools.filesystem import (
     _decode_text_bytes,
     _python_syntax_advisory,
 )
+from ash.tools.model_patch import model_patch_as_unified_diff, parse_model_patch
 
 
 class ApplyPatchArgs(BaseModel):
@@ -42,10 +43,11 @@ class ApplyPatchArgs(BaseModel):
         ...,
         min_length=1,
         description=(
-            "Git-style unified diff, with --- a/path, +++ b/path, and "
-            "@@ -1 +1 @@ hunk headers; hunk line counts must match the "
-            "context, added, and removed lines. Do not use the Codex "
-            "*** Begin Patch / *** Update File format."
+            "A git-style unified diff (--- a/path, +++ b/path, @@ -1 +1 @@) "
+            "or model-oriented *** Begin Patch / *** Update File: path / "
+            "@@ context / -old / +new / *** End Patch. Model-oriented "
+            "format supports add, delete, and unambiguous text updates; "
+            "moves require a unified diff."
         ),
     )
     dry_run: bool = False
@@ -60,11 +62,11 @@ MAX_PATCH_PYTHON_SYNTAX_FILES = 12
 class ApplyPatchTool(BaseTool):
     name = "apply_patch"
     description = (
-        "Edit multiple files in one operation with a git-style unified diff. "
+        "Edit multiple files in one operation with a git unified diff or "
+        "*** Begin Patch / *** Update File model-oriented patch. "
         "A failed apply can leave "
-        "partial changes; inspect affected files before retrying. Include "
-        "--- a/path, +++ b/path, and @@ hunk headers; Codex-style "
-        "*** Begin Patch blocks are not supported."
+        "partial changes; inspect affected files before retrying. "
+        "Model-oriented patches require unique context and do not support moves."
     )
     args_schema = ApplyPatchArgs
 
@@ -77,17 +79,36 @@ class ApplyPatchTool(BaseTool):
                 output="",
                 error=f"Patch exceeds {MAX_PATCH_BYTES} bytes",
             )
+        operations = None
         try:
-            paths = extract_patch_paths(args.patch, self.safety_guard)
+            if args.patch.startswith("*** Begin Patch"):
+                operations = parse_model_patch(args.patch, self.safety_guard)
+                paths = {op.path for op in operations}
+            else:
+                paths = extract_patch_paths(args.patch, self.safety_guard)
         except (ValueError, SafetyViolation) as exc:
             return ToolResult(success=False, output="", error=f"Invalid patch: {exc}")
+
+        def materialize() -> str:
+            if operations is None:
+                return args.patch
+            normalized = model_patch_as_unified_diff(
+                operations, self.safety_guard, max_source_bytes=MAX_PATCH_BYTES
+            )
+            if len(normalized.encode("utf-8")) > MAX_PATCH_BYTES:
+                raise ValueError("translated patch exceeds the bounded patch size")
+            return normalized
+
         if args.dry_run:
             try:
+                patch_to_apply = materialize()
                 check = await _git_apply(
                     self.safety_guard.project_root,
-                    args.patch,
+                    patch_to_apply,
                     check=True,
                 )
+            except (ValueError, SafetyViolation, ScopedIOError, OSError) as exc:
+                return ToolResult(success=False, output="", error=f"Invalid patch: {exc}")
             except asyncio.TimeoutError as exc:
                 return _patch_timeout_result(exc, mutation_may_have_started=False)
             if check[0] != 0:
@@ -103,9 +124,15 @@ class ApplyPatchTool(BaseTool):
         mutation_attempted = False
         try:
             with workspace_mutation_lock():
+                try:
+                    patch_to_apply = materialize()
+                except (ValueError, SafetyViolation, ScopedIOError, OSError) as exc:
+                    return ToolResult(
+                        success=False, output="", error=f"Invalid patch: {exc}"
+                    )
                 check = await _git_apply(
                     self.safety_guard.project_root,
-                    args.patch,
+                    patch_to_apply,
                     check=True,
                 )
                 if check[0] != 0:
@@ -119,7 +146,7 @@ class ApplyPatchTool(BaseTool):
                 mutation_attempted = True
                 applied = await _git_apply(
                     self.safety_guard.project_root,
-                    args.patch,
+                    patch_to_apply,
                     check=False,
                 )
         except asyncio.TimeoutError as exc:
@@ -262,10 +289,7 @@ def _patch_check_error(stderr: str) -> str:
 
 def extract_patch_paths(patch: str, guard: SafetyGuard) -> set[str]:
     if patch.lstrip().startswith("*** Begin Patch"):
-        raise ValueError(
-            "Codex-style *** Begin Patch blocks are not supported; provide "
-            "a git-style unified diff with --- a/path, +++ b/path, and @@ hunks"
-        )
+        return {op.path for op in parse_model_patch(patch, guard)}
     paths: set[str] = set()
     for line in patch.splitlines():
         candidate = ""

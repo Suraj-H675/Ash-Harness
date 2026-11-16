@@ -220,6 +220,10 @@ eager previously harmed local-model multi-file trials, and its usefulness as
 a general default has not been established. Models with smaller *actual*
 input limits keep the original compact catalog and prompt, even if the user
 configured a larger nominal context window.
+When discovered, `apply_patch` accepts Git unified diffs and a bounded
+`*** Begin Patch` / `*** Update File` model-oriented form. Both paths retain
+the same permission, checkpoint and ambiguous-result contracts. Support for
+the additional input syntax does not by itself establish fewer model steps.
 For explicit requests to edit several files or modules together, `search_tools`
 prioritizes the deferred multi-file `apply_patch` tool. Read-only grouped
 source requests still favor `read_files`, and multiple ranges within one
