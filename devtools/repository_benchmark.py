@@ -1329,6 +1329,94 @@ print("RICH_SOFT_WRAP_HIDDEN_OK")
 """
 
 
+TOOLZ_PARTITION_LENGTH_VISIBLE = r"""from toolz.itertoolz import partition_all
+
+class Misreported(list):
+    def __init__(self, values, delta):
+        super().__init__(values)
+        self.delta = delta
+
+    def __len__(self):
+        return super().__len__() + self.delta
+
+
+def must_fail(values, size, delta):
+    sequence = Misreported(values, delta)
+    try:
+        list(partition_all(size, sequence))
+    except LookupError:
+        return
+    raise AssertionError(
+        f"invalid reported length silently accepted for {len(values)=}, {size=}, {delta=}"
+    )
+
+# A length estimate must not silently change the final partition's contents.
+must_fail([10, 20], 5, +1)
+must_fail([10, 20], 5, -1)
+must_fail([1, 2, 3, 4, 5], 3, +1)
+must_fail([1, 2, 3, 4, 5], 3, -1)
+
+# Correct-sized lists, exact multiples, empty inputs and one-shot iterators
+# preserve their original tuple semantics.
+assert list(partition_all(4, list(range(10)))) == [
+    (0, 1, 2, 3), (4, 5, 6, 7), (8, 9)
+]
+assert list(partition_all(3, range(9))) == [
+    (0, 1, 2), (3, 4, 5), (6, 7, 8)
+]
+assert list(partition_all(4, iter([1, 2, 3]))) == [(1, 2, 3)]
+assert list(partition_all(7, [])) == []
+"""
+
+
+TOOLZ_PARTITION_LENGTH_HIDDEN = r"""from toolz.itertoolz import partition_all
+
+class LengthLiar(list):
+    def __init__(self, data, *, difference):
+        super().__init__(data)
+        self.difference = difference
+
+    def __len__(self):
+        return super().__len__() + self.difference
+
+
+def raises_lookup(value, chunk_size):
+    try:
+        tuple(partition_all(chunk_size, value))
+    except LookupError:
+        return True
+    return False
+
+# Use different sizes and input payloads from visible checks: misreported
+# partially-filled chunks must fail, even if earlier full chunks were emitted.
+for size, data in (
+    (4, ['a', 'b', 'c']),
+    (5, [None, False, 'x', 3]),
+    (6, list(range(8))),
+    (7, list(range(10))),
+):
+    for difference in (-1, 1):
+        assert raises_lookup(LengthLiar(data, difference=difference), size), (
+            size, difference
+        )
+
+# Iterables that cannot report a length still produce every element in order,
+# and unchanged valid source lengths preserve normal chunk boundaries.
+class NoLength:
+    def __iter__(self):
+        yield from ('a', None, False, 9, 10)
+
+    def __len__(self):
+        raise TypeError('no size known')
+
+assert list(partition_all(4, NoLength())) == [('a', None, False, 9), (10,)]
+assert list(partition_all(1, [9, 8])) == [(9,), (8,)]
+assert list(partition_all(3, [1, 2, 3, 4, 5, 6, 7])) == [
+    (1, 2, 3), (4, 5, 6), (7,)
+]
+"""
+
+
 MORE_ITERTOOLS_PEEKABLE_VISIBLE = r"""from itertools import count, islice
 
 from more_itertools import peekable
@@ -1419,6 +1507,31 @@ class RepositoryTask:
 
 
 TASKS = {
+    "toolz-partition-invalid-length": RepositoryTask(
+        source="pytoolz/toolz",
+        upstream="https://github.com/pytoolz/toolz.git",
+        base_sha="08f2604f599847272d801c7f0467451de59fa33a",
+        reference_fix_sha="defe68c33ddaa2c2a9b3d4e53818a1fbe63c3f85",
+        editable=frozenset({"toolz/itertoolz.py"}),
+        visible_script="qa_visible.py",
+        visible_source=TOOLZ_PARTITION_LENGTH_VISIBLE,
+        hidden_source=TOOLZ_PARTITION_LENGTH_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Fix a historical correctness bug in this pinned toolz repository. "
+            "When an iterable with a __len__ reports a value inconsistent "
+            "with the items it yields, partition_all may silently truncate "
+            "or mispartition a partial trailing chunk. Detect mismatched "
+            "reported length for partially filled partitions and raise "
+            "LookupError rather than returning incorrect data. Preserve "
+            "correct partitioning of normal sized sequences, generators, "
+            "iterables whose __len__ raises TypeError, full chunks, and "
+            "empty inputs. Inspect qa_visible.py and the existing code, "
+            "edit ONLY toolz/itertoolz.py, then run exactly "
+            "python3 -B qa_visible.py with run_command. No other commands "
+            "are authorized. Do not alter tests, docs or metadata."
+        ),
+    ),
     "moreitertools-peekable-reverse-slice": RepositoryTask(
         source="more-itertools/more-itertools",
         upstream="https://github.com/more-itertools/more-itertools.git",

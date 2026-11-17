@@ -209,6 +209,11 @@ def test_headless_error_category_refuses_untrusted_or_large_output(
     ("task_id", "upstream", "editable"),
     [
         (
+            "toolz-partition-invalid-length",
+            "https://github.com/pytoolz/toolz.git",
+            {"toolz/itertoolz.py"},
+        ),
+        (
             "dateutil-strict-numeric-fields",
             "https://github.com/dateutil/dateutil.git",
             {"src/dateutil/parser/isoparser.py", "src/dateutil/tz/tz.py"},

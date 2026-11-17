@@ -7,8 +7,8 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These nineteen fixtures already have runnable code and grading logic. They do
-not represent nineteen independent real repositories: R1–R13 are pinned
+These twenty fixtures already have runnable code and grading logic. They do
+not represent twenty independent real repositories: R1–R14 are pinned
 repository tasks (some share an upstream project), while S1–S6 are synthetic.
 Keep the lanes separate and do not pool their scores into a single win rate.
 
@@ -27,6 +27,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R11 | `boltons-bulk-ordered-collections` | Pinned real repo | Two-module ordered-container repair: multi-list index boundaries, insertion and tail handling, and linear-time ordered-set bulk removal | **Controlled Ash-only comparison completed:** no restart 85.33s, 3 requests, 0 edits, context error; one restart 113.86s, 5 requests, actual safe restart, 1/2 edited *before* restart, no edits in child, second context error. Both fail oracles; audits/scopes intact; no verified coding progress after restart |
 | R12 | `rich-soft-wrap-background-style` | Pinned real repo | Two-module Rich terminal-rendering bug: prevent background/style bleed across physical newlines under `soft_wrap=True`, while preserving multiline, blank-line and styled text behavior | **First 65K sequential pair: both pass**; Ash 105.80s / 10 model requests / 23 tool calls, Codex 98.29s / 5 non-test commands + visible test; one trial, policy-parity caveat |
 | R13 | `moreitertools-peekable-reverse-slice` | Pinned real repo | Prevent `peekable` from exhausting an infinite or large finite iterator when reverse slicing with a known start and omitted stop; preserve caching and genuine right-relative indexing | **First sequential 65K pair: both pass**; Ash 69.16s / 6 model requests / 6 tools / 0 rejects, Codex 53.46s / 3 non-test shell commands; one observation and native policy-parity caveat |
+| R14 | `toolz-partition-invalid-length` | Pinned real repo | Detect an iterable's incorrect reported length rather than silently truncate a partially filled partition; preserve correct normal and no-length iteration | **New independent fixture; preflight red/green verified**. No Ash or Codex coding result yet |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -41,8 +42,24 @@ distinct codebases and multi-module workflows, with R10 covering a seven-module
 refactor behind compatibility shims; they do not fill all these gaps. Every
 additional task still needs pinned base/fix provenance and independently
 authored sealed oracles with red-original/green-reference preflight.
-The present **19-case inventory** is not a stable reliability benchmark;
+The present **20-case inventory** is not a stable reliability benchmark;
 repetitions and broader workflow diversity remain necessary.
+
+**R14 provenance and offline preflight (2026-11-17):** A new independent
+source project, [pytoolz/toolz PR #603](https://github.com/pytoolz/toolz/pull/603),
+merged October 16, 2025, corrects `partition_all` producing the wrong trailing
+chunk when an iterable reports a length inconsistent with its contents. The
+pinned original `08f2604f599847272d801c7f0467451de59fa33a` and upstream
+reference `defe68c33ddaa2c2a9b3d4e53818a1fbe63c3f85` differ in exactly
+`toolz/itertoolz.py` and upstream `toolz/tests/test_itertoolz.py`; only the
+implementation is editable. Separately authored visible/hidden standard-library
+checks cover overstated and understated lengths across different partial
+partition sizes, preservation of valid full and partial chunks, empty inputs,
+and iterables for which `__len__` raises `TypeError`. Both checks **fail on
+the original and pass on the pinned reference** in isolated source trees.
+This is benchmark validity evidence, **not** an agent coding pass or an
+improvement in Ash reliability. Private source/oracle preflight files are in
+`/var/tmp/ash-r14-toolz-preflight-20261117/`.
 
 **R13 provenance and reproducible preflight (2026-11-16):** This new task
 uses real upstream
