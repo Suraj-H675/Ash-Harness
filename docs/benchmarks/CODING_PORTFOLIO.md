@@ -27,7 +27,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R11 | `boltons-bulk-ordered-collections` | Pinned real repo | Two-module ordered-container repair: multi-list index boundaries, insertion and tail handling, and linear-time ordered-set bulk removal | **Controlled Ash-only comparison completed:** no restart 85.33s, 3 requests, 0 edits, context error; one restart 113.86s, 5 requests, actual safe restart, 1/2 edited *before* restart, no edits in child, second context error. Both fail oracles; audits/scopes intact; no verified coding progress after restart |
 | R12 | `rich-soft-wrap-background-style` | Pinned real repo | Two-module Rich terminal-rendering bug: prevent background/style bleed across physical newlines under `soft_wrap=True`, while preserving multiline, blank-line and styled text behavior | **First 65K sequential pair: both pass**; Ash 105.80s / 10 model requests / 23 tool calls, Codex 98.29s / 5 non-test commands + visible test; one trial, policy-parity caveat |
 | R13 | `moreitertools-peekable-reverse-slice` | Pinned real repo | Prevent `peekable` from exhausting an infinite or large finite iterator when reverse slicing with a known start and omitted stop; preserve caching and genuine right-relative indexing | **First sequential 65K pair: both pass**; Ash 69.16s / 6 model requests / 6 tools / 0 rejects, Codex 53.46s / 3 non-test shell commands; one observation and native policy-parity caveat |
-| R14 | `toolz-partition-invalid-length` | Pinned real repo | Detect an iterable's incorrect reported length rather than silently truncate a partially filled partition; preserve correct normal and no-length iteration | **New independent fixture; preflight red/green verified**. No Ash or Codex coding result yet |
+| R14 | `toolz-partition-invalid-length` | Pinned real repo | Detect an iterable's incorrect reported length rather than silently truncate a partially filled partition; preserve correct normal and no-length iteration | **First sequential 65K pair: both pass**; Ash 88.85s / 8 model requests / 8 tool calls (one safe edit rejection), Codex 104.25s / 4 non-test commands; one sample, with policy-parity limits |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -60,6 +60,27 @@ the original and pass on the pinned reference** in isolated source trees.
 This is benchmark validity evidence, **not** an agent coding pass or an
 improvement in Ash reliability. Private source/oracle preflight files are in
 `/var/tmp/ash-r14-toolz-preflight-20261117/`.
+
+**R14 first sequential Ash/plain-Codex pair (2026-11-17, one sample):**
+At pinned Ash `a2421ec`, the existing evaluator ran the unchanged R14 fixture
+sequentially, Ash then *plain, unmodified Codex*, both requesting GPT-6 Luna
+xhigh with 65,536 context tokens and 170 seconds per engine. The comparison
+receipt independently verifies the same source and reference commits, shared
+user prompt, identical visible and hidden oracle sources, requested model and
+effort, and matched request-context limits (`comparison_verified=true`).
+**Both engines passed both independent oracles**, edited only
+`toolz/itertoolz.py`, executed the authorized visible test and completed their
+CLI turns. Ash took **88.85s** (eight completed model requests, eight tool
+calls, **86.989s** of completed model time, **0.227s** of tool execution) with
+one `replace_file_content` rejected for an exact-line mismatch; it reread the
+file, recovered, passed the test and verified its session audit. Plain Codex
+took **104.25s**, used four non-test shell commands, and terminated normally.
+Ash was **15.40s faster in this one pair**, not evidence of a consistent
+speed or quality advantage. Equivalent native sandbox enforcement, approval,
+network restrictions, system prompts and skill-stack isolation remain
+unverified across the engines. The final output and protected-file checks
+passed, and both runners cleaned their isolated scratch resources. Private
+receipts: `/var/tmp/ash-r14-toolz-paired-20261117-r01/`.
 
 **R13 provenance and reproducible preflight (2026-11-16):** This new task
 uses real upstream
