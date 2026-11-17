@@ -2049,7 +2049,11 @@ async def _repl(loop: AshLoop, config: AshConfig, sandbox_manager: Any) -> int:
                 )
                 continue
             if command.name == "compact":
-                tokens, changed = loop.compact_current_context()
+                try:
+                    tokens, changed = loop.compact_current_context()
+                except (RuntimeError, ValueError) as exc:
+                    _print_classified_error(exc)
+                    continue
                 state = "updated" if changed else "already compact"
                 print(
                     f"Context summary {state}; estimated input {tokens} tokens.",

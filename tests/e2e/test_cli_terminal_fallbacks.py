@@ -246,6 +246,68 @@ def test_linear_help_search_matches_multiple_terms(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_manual_compact_refusal_keeps_opaque_session_alive(
+    tmp_path: Path,
+) -> None:
+    """A refused opaque-state compaction must not terminate the real REPL."""
+    from datetime import datetime, timezone
+
+    from ash.core.session import Message
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    (home / "db").mkdir()
+    environment = _terminal_environment(home, workspace, model="lmstudio/local-model")
+    _set_workspace_trust(workspace, environment, trusted=False)
+    store = SessionStore(home / "db" / "sessions.db")
+    source = store.create_session(str(workspace), model="lmstudio/local-model")
+    now = datetime.now(timezone.utc)
+    store.save_message(
+        source.session_id,
+        Message(role="user", content="Previous coding task", timestamp=now),
+    )
+    store.save_message(
+        source.session_id,
+        Message(
+            role="assistant",
+            content="Prior answer",
+            timestamp=now,
+            metadata={
+                "provider_state": [
+                    {"type": "reasoning", "encrypted_content": "opaque-replay"}
+                ]
+            },
+        ),
+    )
+    original = store.load_session(source.session_id)
+    master, process = _open_pty_cli(
+        workspace, environment, columns=120,
+        args=("--session", source.session_id),
+    )
+    observed = bytearray()
+
+    try:
+        _read_until(master, process, observed, b"> ", timeout=30)
+        os.write(master, b"/compact\r")
+        _read_until(master, process, observed, b"/restart-context", timeout=15)
+        assert process.poll() is None, "refusing /compact exited the interactive CLI"
+        os.write(master, b"/status\r")
+        _read_until(
+            master, process, observed,
+            f"Session: {source.session_id}".encode(), timeout=15,
+        )
+        assert store.load_session(source.session_id).messages == original.messages
+        assert store.load_session(source.session_id).context_summary == ""
+        os.write(master, b"/exit\r")
+        process.wait(timeout=10)
+        assert process.returncode == 0
+    finally:
+        _stop_pty_cli(master, process)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
 def test_restart_context_in_real_repl_preserves_parent_and_permission_mode(
     tmp_path: Path,
 ) -> None:

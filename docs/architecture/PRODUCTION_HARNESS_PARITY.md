@@ -185,6 +185,17 @@ are unchanged. Red-first tests established all three problems; the combined
 approval/UI/secret and real-terminal regression suite passed **275 tests**.
 Hosted verification at the new revision is still pending.
 
+**Opaque-history `/compact` refusal (2026-11-17, local):** Manually forcing
+local compaction on a session containing opaque provider reasoning correctly
+fails closed, but the resulting `ContextBudgetExceededError` previously
+escaped the interactive slash-command handler and terminated the CLI.
+A real PTY regression first reproduced the exit-code-1 failure, then
+confirmed that Ash now reports the classified context error and
+`/restart-context` recovery guidance without exiting. `/status` and `/exit`
+remain usable, and the original durable messages and context summary stay
+unchanged. The provider-replay protection and compaction implementation have
+not been weakened; hosted verification remains pending.
+
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
 three-module `event-log` fixture with GPT-6.1 Sol. The intervening Luna
