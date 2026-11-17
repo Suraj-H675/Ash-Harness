@@ -28,7 +28,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R12 | `rich-soft-wrap-background-style` | Pinned real repo | Two-module Rich terminal-rendering bug: prevent background/style bleed across physical newlines under `soft_wrap=True`, while preserving multiline, blank-line and styled text behavior | **First 65K sequential pair: both pass**; Ash 105.80s / 10 model requests / 23 tool calls, Codex 98.29s / 5 non-test commands + visible test; one trial, policy-parity caveat |
 | R13 | `moreitertools-peekable-reverse-slice` | Pinned real repo | Prevent `peekable` from exhausting an infinite or large finite iterator when reverse slicing with a known start and omitted stop; preserve caching and genuine right-relative indexing | **First sequential 65K pair: both pass**; Ash 69.16s / 6 model requests / 6 tools / 0 rejects, Codex 53.46s / 3 non-test shell commands; one observation and native policy-parity caveat |
 | R14 | `toolz-partition-invalid-length` | Pinned real repo | Detect an iterable's incorrect reported length rather than silently truncate a partially filled partition; preserve correct normal and no-length iteration | **First sequential 65K pair: both pass**; Ash 88.85s / 8 model requests / 8 tool calls (one safe edit rejection), Codex 104.25s / 4 non-test commands; one sample, with policy-parity limits |
-| R15 | `click-clirunner-context-settings` | Pinned real repo | Extend Click's `CliRunner.invoke` public API with context-settings overrides that avoid parameter-name collisions while preserving existing invocation behavior | **New feature-addition fixture; original/reference red-green preflight verified.** No coding result yet |
+| R15 | `click-clirunner-context-settings` | Pinned real repo | Extend Click's `CliRunner.invoke` public API with context-settings overrides that avoid parameter-name collisions while preserving existing invocation behavior | **First sequential 65K pair: both pass**; Ash 113.51s / 12 model requests / 15 tools (one rejected regex), Codex 86.05s / four non-test shell commands; one sample and native-policy caveat |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -65,6 +65,23 @@ both tests fail on the original, both pass on the reference, no unsafe tree
 entries, and only `src/click/testing.py` must change. This is validity
 evidence, **not a model coding result**. Private preflight receipts are under
 `/var/tmp/ash-r15-click-feature-preflight-20261117/`.
+
+**R15 first frozen Ash/plain-Codex coding pair (2026-11-17):** With Ash
+`16ab78a`, ran exactly one sequential pair on the unchanged R15 fixture,
+with a 65,536-token request context, 170-second per-engine deadline, and
+GPT-6 Luna xhigh requested for both. The independent comparison verified
+identical pinned source and reference commits, shared user prompt, visible
+and hidden oracle sources, and requested model/effort/context. **Both passed**
+the independently graded visible and sealed hidden checks, changed only
+authorized `src/click/testing.py`, ran the required visible test, and
+terminated normally. Ash **113.51s** (12 model requests, 15 tools, one
+invalid-regex search safely rejected and recovered, 109.324s completed model
+time, 0.970s completed tool time, valid session audit); plain Codex **86.05s**
+(four non-test shell commands). Codex was **27.46s faster in one sample**;
+this is neither a stable ranking nor evidence of a causal harness defect.
+Native shell authorization, network isolation, system prompts, and skill
+stacks remain unverified as equivalent across engines. Private receipts:
+`/var/tmp/ash-r15-click-feature-paired-20261117-r01/`.
 
 **R14 provenance and offline preflight (2026-11-17):** A new independent
 source project, [pytoolz/toolz PR #603](https://github.com/pytoolz/toolz/pull/603),
