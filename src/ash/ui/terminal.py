@@ -35,7 +35,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TaskID, TextColumn
 from rich.text import Text
 
-from ash.core.redaction import redact_value
+from ash.core.redaction import redact_text, redact_value
 from ash.safe_io import read_bounded_bytes
 from ash.safety.environment import build_scrubbed_environment, resolve_host_executable
 from ash.ui.inline_surface import ActivityDockView
@@ -49,6 +49,11 @@ MAX_EDIT_PREVIEW_FILE_BYTES = 1_000_000
 MAX_EDIT_PREVIEW_TEXT_CHARS = 128_000
 MAX_EDIT_PREVIEW_LINES = 400
 DIFF_PREVIEW_TRUNCATED = "[diff preview truncated]"
+MAX_APPROVAL_ARGUMENT_DISPLAY_CHARS = 8_192
+MAX_APPROVAL_DIFF_DISPLAY_CHARS = 16_384
+APPROVAL_ARGUMENTS_TRUNCATED = (
+    "[approval arguments truncated: inspect full arguments before allowing]"
+)
 MAX_LINEAR_HISTORY_ENTRIES = 12
 LIVE_AUX_PREVIEW_CHARS = 3_000
 PROMPT_NOTICE_SECONDS = 2.0
@@ -1422,20 +1427,38 @@ class TerminalUI:
         body.append("\nArgs:\n")
         display_arguments = redact_value(arguments)
         assert isinstance(display_arguments, dict)
+        remaining_chars = MAX_APPROVAL_ARGUMENT_DISPLAY_CHARS
+        arguments_truncated = False
         for key, value in display_arguments.items():
-            body.append(
-                f"  {terminal_safe_text(str(key), single_line=True)} = ",
-                style="dim",
-            )
-            body.append(terminal_safe_text(repr(value)))
-            body.append("\n")
+            label = f"  {terminal_safe_text(str(key), single_line=True)} = "
+            rendered_value = terminal_safe_text(repr(value))
+            if len(label) + len(rendered_value) + 1 <= remaining_chars:
+                body.append(label, style="dim")
+                body.append(rendered_value)
+                body.append("\n")
+                remaining_chars -= len(label) + len(rendered_value) + 1
+                continue
+            if remaining_chars:
+                body.append((label + rendered_value + "\n")[:remaining_chars])
+            body.append("\n" + APPROVAL_ARGUMENTS_TRUNCATED + "\n", style=self.theme.error)
+            arguments_truncated = True
+            break
         preview = self._edit_preview(
             tool_name,
             arguments,
             side_by_side=side_by_side,
         )
         if preview:
-            preview = terminal_safe_text(preview)
+            safe_preview = redact_text(preview)
+            if safe_preview != preview:
+                body.append("\n[sensitive values redacted]\n", style=self.theme.error)
+            preview = terminal_safe_text(safe_preview)
+            if len(preview) > MAX_APPROVAL_DIFF_DISPLAY_CHARS:
+                preview = (
+                    preview[:MAX_APPROVAL_DIFF_DISPLAY_CHARS].rstrip("\n")
+                    + "\n"
+                    + DIFF_PREVIEW_TRUNCATED
+                )
             body.append(
                 "\nDiff preview (side-by-side):\n" if side_by_side else "\nDiff preview:\n",
                 style="bold",
@@ -1452,7 +1475,7 @@ class TerminalUI:
             "approval",
             body.plain,
             title=display_tool_name,
-            metadata={"auto": auto},
+            metadata={"auto": auto, "arguments_truncated": arguments_truncated},
         )
         if self.screen_reader_mode:
             self.console.print("Approval:", markup=False, highlight=False)

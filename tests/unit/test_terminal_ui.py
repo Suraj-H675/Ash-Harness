@@ -1067,6 +1067,99 @@ def test_terminal_ui_builds_workspace_edit_preview(tmp_path):
     assert "+new" in preview
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("whole_edit", {"file_path": "large.py", "content": "new line\n" * 12_000}),
+        ("run_command", {"command_line": "python -c '" + "x" * 90_000 + "'"}),
+        ("custom_tool", {"first": "a" * 6_000, "second": "b" * 6_000}),
+    ],
+)
+def test_approval_arguments_have_total_display_budget_and_explicit_warning(
+    tmp_path: Path, tool_name: str, arguments: dict[str, str],
+) -> None:
+    ui = TerminalUI(
+        workspace_root=tmp_path,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    text = ui.show_tool_approval(tool_name, arguments, auto=False)
+    args_section = text.partition("\nDiff preview:")[0]
+
+    assert len(args_section) <= 9_000
+    assert "[approval arguments truncated" in args_section
+    assert "inspect full arguments before allowing" in args_section
+    assert len(ui.transcript.snapshot()[-1].content) < 30_000
+    if tool_name == "whole_edit":
+        assert "Diff preview:" in text
+        assert "[diff preview truncated]" in text
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "whole_edit",
+            {"file_path": "secrets.py", "content": "api_key = 'sk-" + "A" * 24 + "'\n"},
+        ),
+        (
+            "replace_file_content",
+            {
+                "target_content": "api_key = 'old'\n",
+                "replacement_content": "api_key = 'sk-" + "A" * 24 + "'\n",
+            },
+        ),
+        (
+            "apply_patch",
+            {
+                "patch": "*** Begin Patch\n*** Add File: secrets.py\n"
+                "+api_key = 'sk-" + "A" * 24 + "'\n*** End Patch\n",
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("diff_mode", ["unified", "side-by-side"])
+def test_approval_diff_preview_redacts_secret_values(
+    tmp_path: Path, tool_name: str, arguments: dict[str, str], diff_mode: str,
+) -> None:
+    ui = TerminalUI(
+        workspace_root=tmp_path,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    original_arguments = dict(arguments)
+    text = ui.show_tool_approval(
+        tool_name, arguments, auto=False, diff_mode=diff_mode
+    )
+
+    assert "Diff preview" in text
+    assert "sk-" + "A" * 24 not in text
+    assert "[REDACTED]" in text
+    assert "sensitive values redacted" in text
+    assert ui.transcript.snapshot()[-1].content == text
+    assert arguments == original_arguments, "preview must not mutate the edit request"
+
+
+def test_approval_diff_preview_binds_one_extremely_long_source_line(
+    tmp_path: Path,
+) -> None:
+    ui = TerminalUI(
+        workspace_root=tmp_path,
+        console=Console(file=StringIO(), force_terminal=False),
+    )
+    text = ui.show_tool_approval(
+        "replace_file_content",
+        {
+            "target_content": "old line",
+            "replacement_content": "new line " + "x" * 200_000,
+        },
+        auto=False,
+    )
+
+    assert len(text) < 27_000
+    assert "[approval arguments truncated" in text
+    assert "[diff preview truncated]" in text
+    assert ui.transcript.snapshot()[-1].content == text
+
+
 def test_side_by_side_approval_preview_is_bounded_and_labeled(tmp_path):
     target = tmp_path / "example.txt"
     target.write_text("\n".join(f"old {index}" for index in range(250)) + "\n")

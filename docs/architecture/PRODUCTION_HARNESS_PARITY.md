@@ -173,6 +173,18 @@ invocation; hosted verification of this extension remains pending. This is
 provider-routing/UX evidence with a deterministic local server, not a model
 quality comparison.
 
+**Approval preview bounds and redaction (2026-11-17, local):** Real terminal
+approval review previously bounded diff *lines* but could still retain an
+unbounded argument rendering or a very long single diff line. It also
+redacted argument fields but not the raw edit diff itself, allowing
+credential-shaped values to appear in the approval transcript. The terminal
+now caps rendered arguments and diff content separately, warns explicitly
+when either is truncated, and redacts sensitive diff values with an explicit
+notice. Actual tool arguments, sandbox decisions, and edit preflight semantics
+are unchanged. Red-first tests established all three problems; the combined
+approval/UI/secret and real-terminal regression suite passed **275 tests**.
+Hosted verification at the new revision is still pending.
+
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
 three-module `event-log` fixture with GPT-6.1 Sol. The intervening Luna
