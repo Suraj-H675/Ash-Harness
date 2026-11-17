@@ -3113,6 +3113,7 @@ async def test_native_compaction_installs_replayable_child_and_preserves_source(
     assert len(child.messages) == 1
     assert child.messages[0].role == "assistant"
     assert "OPAQUE_REPLAY_CHECKPOINT" in repr(child.messages[0].metadata)
+    assert child.messages[0].metadata["provider_state_owner"] == loop.active_model_id
     assert store.load_session(source.session_id).messages == original
     assert store.verify_audit_log(source.session_id) == []
     assert store.verify_audit_log(child.session_id) == []
@@ -9719,6 +9720,132 @@ async def test_failover_turn_prices_each_completion_by_serving_model(tmp_path) -
     assert loop._last_turn_completion_tokens == 5
     assert loop._last_turn_cost_usd == pytest.approx(expected)
     assert store.get_session_usage(session.session_id).cost_usd == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_legacy_unowned_replay_refuses_before_any_provider_dispatch(
+    tmp_path: Path,
+) -> None:
+    class ForbiddenProvider(ProviderABC):
+        provider_family = "primary"
+        model_name = "first"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def count_tokens(self, text):
+            return max(1, len(text) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            raise AssertionError("legacy opaque reasoning must never reach a provider")
+            yield  # pragma: no cover
+
+    store = SessionStore(tmp_path / "legacy-unowned-replay.db")
+    source = store.create_session(str(tmp_path), model="primary/first")
+    stored = Message(
+        role="assistant", content="Legacy reply", timestamp=datetime.now(timezone.utc),
+        metadata={
+            "provider_state": [{
+                "type": "reasoning", "id": "old-rs", "summary": [],
+                "encrypted_content": "old-opaque-state",
+            }]
+        },
+    )
+    store.save_message(source.session_id, stored)
+    loop = AshLoop(
+        store, ForbiddenProvider(), SafetyGuard(tmp_path), EventUI(), tmp_path,
+        config=AshConfig(
+            model="primary/first", workspace_root=tmp_path,
+            db_directory=tmp_path / "db", memory_backend="off",
+        ),
+        tools={},
+    )
+    try:
+        await loop.start_session(source.session_id)
+        with pytest.raises(RuntimeError, match="/restart-context"):
+            await loop.run_turn("Continue legacy session")
+        assert store.load_session(source.session_id).messages[0] == stored
+    finally:
+        await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_opaque_backup_replay_resumes_on_actual_owner_not_primary(
+    tmp_path: Path,
+) -> None:
+    """An opaque backup response stays bound after runtime reconstruction."""
+    state = [{
+        "type": "reasoning", "id": "backup-rs-1", "summary": [],
+        "encrypted_content": "opaque-backup-only-replay",
+    }]
+
+    class ReplayProvider(ProviderABC):
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self, family: str, name: str, *, unavailable=False) -> None:
+            self.provider_family = family
+            self._model_name = name
+            self.unavailable = unavailable
+            self.calls = 0
+
+        @property
+        def model_name(self) -> str:
+            return self._model_name
+
+        def count_tokens(self, text):
+            return max(1, len(text) // 4)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            self.calls += 1
+            if self.unavailable:
+                raise ConnectionError("first route unavailable")
+            prior = [msg for msg in messages if msg.get("provider_state")]
+            if prior:
+                assert self.provider_family == "backup", (
+                    "opaque backup replay sent to the wrong provider"
+                )
+                assert prior[0]["provider_state"] == state
+            yield StreamChunk(
+                content=self.provider_family + " reply",
+                model=self.model_name,
+                provider_state=state if self.provider_family == "backup" else None,
+                is_done=True,
+            )
+
+    store = SessionStore(tmp_path / "durable-opaque-affinity.db")
+    config = AshConfig(
+        model="primary/first",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    first = ReplayProvider("primary", "first", unavailable=True)
+    backup = ReplayProvider("backup", "second")
+    first_loop = AshLoop(
+        store, FailoverProvider([first, backup]), SafetyGuard(tmp_path),
+        EventUI(), tmp_path, config=config, tools={},
+    )
+    session = await first_loop.start_session()
+    assert await first_loop.run_turn("Prior task") == "backup reply"
+    original = store.load_session(session.session_id)
+    assert original.messages[-1].metadata["provider_state"] == state
+    assert original.messages[-1].metadata.get("provider_state_owner") == "backup/second"
+    await first_loop.aclose()
+
+    resumed_primary = ReplayProvider("primary", "first")
+    resumed_backup = ReplayProvider("backup", "second")
+    resumed = AshLoop(
+        store, FailoverProvider([resumed_primary, resumed_backup]),
+        SafetyGuard(tmp_path), EventUI(), tmp_path, config=config, tools={},
+    )
+    try:
+        await resumed.start_session(session.session_id)
+        assert await resumed.run_turn("Continue") == "backup reply"
+        assert resumed_primary.calls == 0
+        assert resumed_backup.calls == 1
+        assert store.load_session(session.session_id).messages[-1].metadata[
+            "provider_state_owner"
+        ] == "backup/second"
+    finally:
+        await resumed.aclose()
 
 
 @pytest.mark.asyncio

@@ -5399,6 +5399,53 @@ class SessionStore:
                     return True
         return False
 
+    def provider_replay_state_owner(self, session_id: str) -> str | None:
+        """Resolve one verified replay source across the entire durable history.
+
+        Historic state without a source, or state produced by multiple models,
+        must not be assigned to the configured primary by guesswork. Keep
+        model-specific replay provenance outside the canonical provider input.
+        """
+
+        owner: str | None = None
+        with closing(self._connect()) as conn:
+            for row in conn.execute(
+                "SELECT metadata_json FROM messages "
+                "WHERE session_id = ? AND role = 'assistant'",
+                (session_id,),
+            ):
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, ValueError) as exc:
+                    raise _invalid_stored_data_error(self.db_path) from exc
+                if not isinstance(metadata, dict):
+                    raise _invalid_stored_data_error(self.db_path)
+                state = metadata.get("provider_state")
+                if not state:
+                    continue
+                if not isinstance(state, list):
+                    raise _invalid_stored_data_error(self.db_path)
+                source = metadata.get("provider_state_owner")
+                if (
+                    not isinstance(source, str)
+                    or not 1 <= len(source) <= 1024
+                    or "/" not in source
+                    or any(ord(char) < 33 or ord(char) == 127 for char in source)
+                ):
+                    raise RuntimeError(
+                        "Opaque provider replay state has no verified source model; "
+                        "use /restart-context with an explicit handoff before "
+                        "another model request."
+                    )
+                if owner is not None and source != owner:
+                    raise RuntimeError(
+                        "Opaque provider replay state has conflicting source models; "
+                        "use /restart-context with an explicit handoff before "
+                        "another model request."
+                    )
+                owner = source
+        return owner
+
     def save_runtime_events(self, events: list[dict[str, Any]]) -> int:
         """Append a batch of canonical events, ignoring replayed event IDs."""
 
@@ -5656,6 +5703,7 @@ class SessionStore:
         _restart_handoff: str | None = None,
         _automatic_context_handoff: bool = False,
         _native_checkpoint: list[dict[str, Any]] | None = None,
+        _native_checkpoint_owner: str | None = None,
         _expected_parent_messages: int | None = None,
         _expected_parent_revision: str | None = None,
         _expected_parent_model: str | None = None,
@@ -5681,10 +5729,22 @@ class SessionStore:
             })
             if _native_checkpoint[0].get("type") != "responses_compacted_input":
                 raise ValueError("native checkpoint must contain complete Responses input")
-            checkpoint_metadata = json.dumps(
-                {"provider_state": _native_checkpoint, "context_checkpoint": True},
-                sort_keys=True, allow_nan=False,
-            )
+            metadata: dict[str, Any] = {
+                "provider_state": _native_checkpoint,
+                "context_checkpoint": True,
+            }
+            if (
+                not isinstance(_native_checkpoint_owner, str)
+                or not 1 <= len(_native_checkpoint_owner) <= 1024
+                or "/" not in _native_checkpoint_owner
+                or any(
+                    ord(char) < 33 or ord(char) == 127
+                    for char in _native_checkpoint_owner
+                )
+            ):
+                raise ValueError("native checkpoint requires a valid source model")
+            metadata["provider_state_owner"] = _native_checkpoint_owner
+            checkpoint_metadata = json.dumps(metadata, sort_keys=True, allow_nan=False)
         if _restart_handoff is not None:
             from ash.core.redaction import redact_text
 
@@ -6415,6 +6475,7 @@ class SessionStore:
         expected_parent_model: str | None = None,
         expected_parent_permission_mode: str | None = None,
         checkpoint: list[dict[str, Any]],
+        checkpoint_owner: str,
     ) -> Session:
         """Atomically install a provider-generated opaque checkpoint in a child."""
         return self.fork_session(
@@ -6424,6 +6485,7 @@ class SessionStore:
             branch_name="Native context checkpoint",
             branch_summary="Provider-managed compaction; source audit retained",
             _native_checkpoint=checkpoint,
+            _native_checkpoint_owner=checkpoint_owner,
             _expected_parent_messages=expected_parent_messages,
             _expected_parent_revision=expected_parent_revision,
             _expected_parent_model=expected_parent_model,

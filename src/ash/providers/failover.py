@@ -148,21 +148,38 @@ class FailoverProvider(ProviderABC):
         messages: Sequence[MessageInput],
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
+        *,
+        replay_owner: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         last_error: Exception | None = None
         failures: list[str] = []
-        for index, provider in enumerate(self.providers):
-            if index > 0 and any(
-                item.get("role") == "assistant" and item.get("provider_state")
-                for item in normalize_messages(messages)
-            ):
-                self.failures = failures
+        historical_state = any(
+            item.get("role") == "assistant" and item.get("provider_state")
+            for item in normalize_messages(messages)
+        )
+        if historical_state and replay_owner is None:
+            raise RuntimeError(
+                "Opaque reasoning replay has no verified source model. "
+                "Use /restart-context with an explicit handoff before "
+                "continuing, or supply verified replay ownership."
+            )
+        if replay_owner is not None:
+            matches = [
+                index
+                for index, candidate in enumerate(self.providers)
+                if f"{candidate.provider_family}/{candidate.model_name}" == replay_owner
+            ]
+            if len(matches) != 1:
                 raise RuntimeError(
-                    "Cannot send a session with opaque provider reasoning state "
-                    "to a fallback model after the primary fails. Continue with "
-                    "the original model or use /restart-context with an explicit "
-                    "handoff before switching."
-                ) from last_error
+                    "The provider that owns retained reasoning state is not "
+                    "uniquely available. Use /restart-context with an explicit "
+                    "handoff before continuing."
+                )
+            candidate_indexes = matches
+        else:
+            candidate_indexes = list(range(len(self.providers)))
+        for index in candidate_indexes:
+            provider = self.providers[index]
             self.active_index = index
             self.provider_family = provider.provider_family
             emitted_output = False
@@ -205,6 +222,12 @@ class FailoverProvider(ProviderABC):
                 )
         self.failures = failures
         assert last_error is not None
+        if replay_owner is not None:
+            raise RuntimeError(
+                "The model owning retained opaque reasoning state is unavailable; "
+                "use /restart-context with an explicit handoff or restore the "
+                "original provider before retrying."
+            ) from last_error
         raise RuntimeError(
             "All configured providers failed: " + "; ".join(failures)
         ) from last_error

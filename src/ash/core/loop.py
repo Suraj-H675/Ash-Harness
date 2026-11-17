@@ -4513,6 +4513,11 @@ class AshLoop:
                         if model_completion.provider_state
                         else {}
                     ),
+                    **(
+                        {"provider_state_owner": self.active_model_id}
+                        if model_completion.provider_state
+                        else {}
+                    ),
                 },
             )
             persisted_metadata = redact_value(assistant_message.metadata)
@@ -5426,6 +5431,26 @@ class AshLoop:
         """Stream one completion with normalized token and cache usage."""
 
         canonical_messages = normalize_messages(messages)
+        has_replay = any(message.get("provider_state") for message in canonical_messages)
+        replay_owner = (
+            self.session_store.provider_replay_state_owner(session_id)
+            if has_replay and session_id is not None
+            else None
+        )
+        if has_replay and session_id is not None and replay_owner is None:
+            raise RuntimeError(
+                "Opaque provider reasoning state has no verified model owner; "
+                "use /restart-context with an explicit handoff."
+            )
+        if (
+            replay_owner is not None
+            and not isinstance(self.provider, FailoverProvider)
+            and self.active_model_id != replay_owner
+        ):
+            raise RuntimeError(
+                "The current model does not own the session's opaque reasoning "
+                "state; use /restart-context with an explicit handoff."
+            )
         # Build OpenAI-format tools list for providers that support native tool_calls.
         provider_tools = (
             self._provider_tools() if provider_tools is None else provider_tools
@@ -5477,6 +5502,9 @@ class AshLoop:
             self.provider,
             configured_model,
         )
+        if replay_owner is not None and isinstance(self.provider, FailoverProvider):
+            provider_family, _ = replay_owner.split("/", 1)
+            request_model_id = replay_owner
 
         try:
             self.provider_circuit_breaker.before_request(self._provider_circuit_key)
@@ -5531,10 +5559,17 @@ class AshLoop:
                             if first_output_timeout > 0
                             else None
                         )
-                        active_provider_stream = self.provider.stream_chat(
-                            canonical_messages,
-                            tools=openai_tools,
-                        )
+                        if isinstance(self.provider, FailoverProvider):
+                            active_provider_stream = self.provider.stream_chat(
+                                canonical_messages,
+                                tools=openai_tools,
+                                replay_owner=replay_owner,
+                            )
+                        else:
+                            active_provider_stream = self.provider.stream_chat(
+                                canonical_messages,
+                                tools=openai_tools,
+                            )
                         stream = active_provider_stream
                         while True:
                             now = asyncio.get_running_loop().time()
@@ -8386,6 +8421,7 @@ class AshLoop:
             expected_parent_model=source.model,
             expected_parent_permission_mode=source.permission_mode,
             checkpoint=checkpoint,
+            checkpoint_owner=self.active_model_id,
         )
 
     # --- provider switching -------------------------------------------------

@@ -75,7 +75,7 @@ async def test_failover_does_not_send_historical_opaque_replay_to_backup() -> No
 
     with pytest.raises(RuntimeError, match="/restart-context"):
         _ = [chunk async for chunk in provider.stream_chat(history)]
-    assert provider.failures == ["primary: temporary upstream outage"]
+    assert provider.failures == []
     assert provider.model_name == "primary"
 
 
@@ -95,9 +95,138 @@ async def test_healthy_primary_remains_usable_with_historical_opaque_state() -> 
         {"role": "user", "content": "Continue"},
     ]
 
-    chunks = [chunk async for chunk in provider.stream_chat(history)]
+    chunks = [
+        chunk async for chunk in provider.stream_chat(
+            history, replay_owner=f"{provider.providers[0].provider_family}/primary"
+        )
+    ]
     assert [chunk.content for chunk in chunks] == ["primary"]
     assert provider.failures == []
+
+
+@pytest.mark.asyncio
+async def test_unowned_historical_replay_never_reaches_even_healthy_primary() -> None:
+    calls: list[str] = []
+
+    class ForbiddenProvider(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            calls.append(self.model_name)
+            raise AssertionError("unowned state must not reach any provider")
+            yield  # pragma: no cover
+
+    provider = FailoverProvider([
+        ForbiddenProvider("primary"), ForbiddenProvider("backup")
+    ])
+    history = [
+        {"role": "assistant", "content": "Prior reply", "provider_state": [{
+            "type": "reasoning", "id": "rs-1", "summary": [],
+            "encrypted_content": "unknown-origin-replay",
+        }]},
+        {"role": "user", "content": "Continue"},
+    ]
+    with pytest.raises(RuntimeError, match="/restart-context"):
+        _ = [chunk async for chunk in provider.stream_chat(history)]
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_owned_replay_uses_only_exact_backup_and_never_probes_primary() -> None:
+    calls: list[str] = []
+
+    class OwnedProvider(FakeProvider):
+        def __init__(self, family: str, name: str) -> None:
+            super().__init__(name)
+            self.provider_family = family
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            calls.append(self.model_name)
+            yield StreamChunk(content=self.model_name, is_done=True)
+
+    provider = FailoverProvider([
+        OwnedProvider("primary", "first"),
+        OwnedProvider("backup", "second"),
+    ])
+    history = [
+        {"role": "assistant", "content": "Earlier answer", "provider_state": [{
+            "type": "reasoning", "id": "rs-1", "summary": [],
+            "encrypted_content": "backup-owned-state",
+        }]},
+        {"role": "user", "content": "Continue"},
+    ]
+    chunks = [
+        chunk async for chunk in provider.stream_chat(
+            history, replay_owner="backup/second"
+        )
+    ]
+    assert [chunk.content for chunk in chunks] == ["second"]
+    assert calls == ["second"]
+    assert provider.provider_family == "backup"
+    assert provider.active_index == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "configured_routes",
+    [
+        [("primary", "first"), ("alternate", "third")],
+        [("backup", "second"), ("backup", "second")],
+    ],
+)
+async def test_owned_replay_fails_closed_without_one_exact_matching_route(
+    configured_routes: list[tuple[str, str]],
+) -> None:
+    class ForbiddenProvider(FakeProvider):
+        def __init__(self, family: str, model: str) -> None:
+            super().__init__(model)
+            self.provider_family = family
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            raise AssertionError("no provider may receive ambiguous opaque state")
+            yield  # pragma: no cover
+
+    provider = FailoverProvider([
+        ForbiddenProvider(family, model) for family, model in configured_routes
+    ])
+    with pytest.raises(RuntimeError, match="/restart-context"):
+        _ = [
+            chunk async for chunk in provider.stream_chat(
+                [{"role": "user", "content": "Continue"}],
+                replay_owner="backup/second",
+            )
+        ]
+
+
+@pytest.mark.asyncio
+async def test_owned_replay_provider_failure_requires_handoff_not_fallback() -> None:
+    calls: list[str] = []
+
+    class FailOwner(FakeProvider):
+        provider_family = "backup"
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            calls.append(self.model_name)
+            raise ConnectionError("source model offline")
+            yield  # pragma: no cover
+
+    class ForbiddenPrimary(FakeProvider):
+        provider_family = "primary"
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            calls.append(self.model_name)
+            raise AssertionError("must never replay owned state to another model")
+            yield  # pragma: no cover
+
+    provider = FailoverProvider([
+        ForbiddenPrimary("first"), FailOwner("second"),
+    ])
+    with pytest.raises(RuntimeError, match="/restart-context"):
+        _ = [
+            item async for item in provider.stream_chat(
+                [{"role": "user", "content": "Continue"}],
+                replay_owner="backup/second",
+            )
+        ]
+    assert calls == ["second"]
 
 
 @pytest.mark.asyncio

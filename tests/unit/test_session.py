@@ -9,6 +9,7 @@ import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -78,6 +79,64 @@ def test_provider_replay_state_check_fails_closed_on_corrupt_assistant_metadata(
         )
     with pytest.raises(SessionStorageError):
         store.has_provider_replay_state(session.session_id)
+
+
+@pytest.mark.parametrize(
+    ("owners", "error"),
+    [
+        ([None], "no verified source model"),
+        (["primary/one", "backup/two"], "conflicting source models"),
+        (["invalid-owner"], "no verified source model"),
+        (["primary/one\nunsafe"], "no verified source model"),
+    ],
+)
+def test_replay_owner_refuses_legacy_conflicted_or_invalid_sources(
+    tmp_path: Path, owners: list[str | None], error: str,
+) -> None:
+    store = SessionStore(tmp_path / "replay-owner.db")
+    session = store.create_session(str(tmp_path))
+    for idx, owner in enumerate(owners):
+        metadata: dict[str, Any] = {
+            "provider_state": [{
+                "type": "reasoning", "id": f"rs-{idx}", "summary": [],
+                "encrypted_content": "opaque",
+            }],
+        }
+        if owner is not None:
+            metadata["provider_state_owner"] = owner
+        store.save_message(
+            session.session_id,
+            Message(
+                role="assistant", content="prior",
+                timestamp=datetime.now(timezone.utc), metadata=metadata,
+            ),
+        )
+    with pytest.raises(RuntimeError, match=error + ".*/restart-context"):
+        store.provider_replay_state_owner(session.session_id)
+
+
+def test_replay_owner_matches_only_consistent_durable_assistant_sources(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "consistent-owner.db")
+    session = store.create_session(str(tmp_path))
+    assert store.provider_replay_state_owner(session.session_id) is None
+    for idx in range(3):
+        store.save_message(
+            session.session_id,
+            Message(
+                role="assistant", content=f"prior-{idx}",
+                timestamp=datetime.now(timezone.utc),
+                metadata={
+                    "provider_state": [{
+                        "type": "reasoning", "id": f"rs-{idx}", "summary": [],
+                        "encrypted_content": f"opaque-{idx}",
+                    }],
+                    "provider_state_owner": "backup/second",
+                },
+            ),
+        )
+    assert store.provider_replay_state_owner(session.session_id) == "backup/second"
 
 
 @pytest.mark.parametrize(
@@ -2124,6 +2183,7 @@ def test_context_restart_preserves_known_completed_action_and_native_gate(
     with pytest.raises(SessionForkConflictError, match="quiescent"):
         store.install_native_context_checkpoint(
             source.session_id,
+            checkpoint_owner="openai/test-checkpoint",
             expected_project_path=tmp_path,
             expected_parent_messages=0,
             expected_parent_revision=store.session_history_revision(source.session_id),
@@ -2291,6 +2351,7 @@ def test_context_checkpoint_rejects_completed_turn_with_unknown_tool_outcome(
         else:
             store.install_native_context_checkpoint(
                 parent.session_id,
+                checkpoint_owner="openai/test-checkpoint",
                 expected_project_path=tmp_path,
                 expected_parent_messages=0,
                 expected_parent_revision=store.session_history_revision(
@@ -2337,6 +2398,7 @@ def test_context_checkpoint_allows_confirmed_completed_tool_outcome(
     else:
         child = store.install_native_context_checkpoint(
             parent.session_id,
+            checkpoint_owner="openai/test-checkpoint",
             expected_project_path=tmp_path,
             expected_parent_messages=0,
             expected_parent_revision=store.session_history_revision(
@@ -2414,6 +2476,7 @@ def test_native_context_checkpoint_preserves_parent_without_replaying_actions(
     }]
     child = store.install_native_context_checkpoint(
         root.session_id,
+        checkpoint_owner="openai/test-checkpoint",
         expected_project_path=tmp_path,
         expected_parent_messages=1,
         expected_parent_revision=store.session_history_revision(root.session_id),
@@ -2444,6 +2507,7 @@ def test_native_checkpoint_child_does_not_inherit_parent_summary(
     }]
     child = store.install_native_context_checkpoint(
         parent.session_id,
+        checkpoint_owner="openai/test-checkpoint",
         expected_project_path=tmp_path,
         expected_parent_messages=0,
         expected_parent_revision=store.session_history_revision(parent.session_id),
@@ -2468,6 +2532,7 @@ def test_native_checkpoint_refuses_malformed_or_stale_source_atomically(
     with pytest.raises(SessionForkConflictError, match="source session changed"):
         store.install_native_context_checkpoint(
             root.session_id,
+            checkpoint_owner="openai/test-checkpoint",
             expected_project_path=tmp_path,
             expected_parent_messages=1,
             expected_parent_revision=store.session_history_revision(root.session_id),
@@ -2495,6 +2560,7 @@ def test_native_checkpoint_refuses_malformed_or_stale_source_atomically(
         with pytest.raises(ValueError):
             store.install_native_context_checkpoint(
                 root.session_id,
+                checkpoint_owner="openai/test-checkpoint",
                 expected_project_path=tmp_path,
                 expected_parent_messages=0,
                 expected_parent_revision=store.session_history_revision(root.session_id),
@@ -2524,6 +2590,7 @@ def test_native_checkpoint_rejects_same_count_rewritten_source(
     with pytest.raises(SessionForkConflictError, match="source session changed"):
         store.install_native_context_checkpoint(
             root.session_id,
+            checkpoint_owner="openai/test-checkpoint",
             expected_project_path=tmp_path,
             expected_parent_messages=1,
             expected_parent_revision=revision,
@@ -2556,6 +2623,7 @@ def test_native_checkpoint_rejects_model_change_during_remote_compaction(
     ):
         store.install_native_context_checkpoint(
             root.session_id,
+            checkpoint_owner="openai/test-checkpoint",
             expected_project_path=tmp_path,
             expected_parent_messages=1,
             expected_parent_revision=revision,
@@ -2590,6 +2658,7 @@ def test_native_checkpoint_rejects_permission_change_during_remote_compaction(
     ):
         store.install_native_context_checkpoint(
             root.session_id,
+            checkpoint_owner="openai/test-checkpoint",
             expected_project_path=tmp_path,
             expected_parent_messages=1,
             expected_parent_revision=revision,

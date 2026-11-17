@@ -206,10 +206,30 @@ handoff. A real terminal test verifies the refusal and a successful switch
 after a handoff. When the primary provider fails before output, a failover
 chain likewise refuses to forward historic opaque replay state to a backup;
 a healthy primary and ordinary stateless failover remain usable. The new
-guards do **not** establish safe route affinity after a previous successful
-backup response or an interrupted/resumed fallback session: that requires
-durable provenance of the replay-state-producing provider and remains open.
-Hosted verification of this checkpoint is pending.
+initial guards did **not** establish safe route affinity after a prior
+successful backup. The follow-up checkpoint below adds durable source-model
+ownership while retaining the original fail-closed model-switch behavior.
+
+**Durable replay-owner affinity (2026-11-17, local):** A separate red-first
+reproduction showed a successful backup response retaining opaque reasoning
+without the source model's identity. Reconstructing a new runtime from the
+same session database then retried the configured primary with that state.
+Ash now persists the actual producing `provider/model` alongside each new
+assistant replay-state item and each native Responses checkpoint, outside the
+canonical provider payload. Continuation resolves a single consistent owner
+from *all* durable assistant metadata; failover dispatches only to exactly
+one matching child, including if that child is the backup. Unknown legacy
+state, conflicting origins, missing/duplicate provider routes, and unavailable
+owners fail closed with `/restart-context` guidance, without dispatching
+the private state to another provider. Native checkpoint installation now
+requires source-model ownership. A new real `AshLoop` instance resumed the
+persisted backup turn and continued only on the backup; this is a fresh-runtime
+database round trip **within one test process**, not a separate-process CLI
+resume or a live provider-network test. Credential-profile affinity when the
+same model route uses distinct accounts or transports, adversarial database
+tampering, and broader provider combinations remain unverified. The earlier
+conservative manual `/model` transition rule stays unchanged. Hosted CI for
+this checkpoint is pending; provider failover remains **Partial**.
 
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
@@ -2368,7 +2388,7 @@ truthful evidence boundaries, not open mission blockers.
 | Long-running process control | Verified locally | Managed start/list/poll/stdin/stop with process-tree cleanup |
 | Structured output mode | Verified locally | One-shot JSON Schema injection with strict JSON parsing/validation; JSON and stream-JSON terminal output is released only after validation, successful completions include parsed `structured_output`, and invalid model output is a stable `output` error rather than an internal failure |
 | Model capability negotiation | Verified locally | Tools, vision, reasoning, local status, and known context/output limits use provider/model evidence rather than wire-protocol identity; Ollama, OpenRouter, Hugging Face, Mistral, xAI, Together, Fireworks, Cerebras, LM Studio, vLLM, and generic OpenAI-compatible routes negotiate bounded provider-owned metadata before use where available; exact IDs and unique provider aliases resolve consistently, conflicting/missing/malformed/ambiguous/different-model evidence stays conservative, and `/capabilities` distinguishes dynamic evidence even inside failover chains |
-| Provider failover | Partial | Ordered fallback only before first emitted chunk; static/dynamic chains enforce tool-protocol parity, expose a conservative whole-chain capability envelope, use the maximum child token estimate, forward per-turn output ceilings to every child, and keep configured models/failures visible. A backup cannot receive historic opaque replay after a failed primary. Persisted source-provider ownership for state generated on a prior successful backup, including resume, is not yet established; safe route affinity remains open |
+| Provider failover | Partial | Ordered fallback only before first emitted chunk; static/dynamic chains enforce tool-protocol parity, expose a conservative whole-chain capability envelope, use the maximum child token estimate, forward per-turn output ceilings to every child, and keep configured models/failures visible. New opaque replay state records the producing model; continuation selects exactly that owner after a successful backup and a fresh-runtime database reload. Direct unowned replay, legacy unknown origins, conflicting sources, and unavailable or ambiguous owners fail closed. Credential/account affinity, true separate-process continuation and expanded provider combinations require further verification |
 
 ## 3. Context And Memory
 
