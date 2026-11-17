@@ -619,7 +619,12 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
             if self.path != "/v1/models":
                 self.send_error(404)
                 return
-            self.send_json({"data": [{"id": "first-use-model"}]})
+            self.send_json({
+                "data": [
+                    {"id": "first-use-model"},
+                    {"id": "second-use-model"},
+                ]
+            })
 
         def send_json(self, payload: object) -> None:
             content = json.dumps(payload).encode()
@@ -657,7 +662,7 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
                 "id": f"first-use-{step}",
                 "object": "chat.completion.chunk",
                 "created": 1,
-                "model": "first-use-model",
+                "model": request.get("model", "first-use-model"),
                 "choices": [
                     {"index": 0, "delta": {"content": output}, "finish_reason": "stop"}
                 ],
@@ -734,12 +739,46 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
         assert (workspace / "protected.txt").read_text() == "unchanged\n"
         assert len(requests) == 3
 
+        # Reviewing Ash's own checkpoint must work in a fresh, non-Git
+        # directory. It is a local read-only command, not another model turn.
+        os.write(master, b"/diff --turn\r")
+        review = bytearray()
+        _read_until(master, process, review, b"+    return n + 1", timeout=15)
+        assert b"--- a/calc.py" in review
+        assert b"+++ b/calc.py" in review
+        assert b"-    return n - 1" in review
+        assert b"+    return n + 1" in review
+        assert len(requests) == 3
+        if not review.endswith(b"> "):
+            _read_until(master, process, bytearray(), b"> ", timeout=10)
+
+        os.write(master, b"/model first-use-route/second-use-model\r")
+        switched = bytearray()
+        _read_until(
+            master, process, switched,
+            b"Switched to first-use-route/second-use-model", timeout=15,
+        )
+        assert b"for this session only" in switched
+        if not switched.endswith(b"> "):
+            _read_until(master, process, bytearray(), b"> ", timeout=10)
+
+        os.write(master, b"Confirm the alternate model\r")
+        next_turn = bytearray()
+        _read_until(master, process, next_turn, b"RESUMED-OK", timeout=30)
+        assert len(requests) == 4
+        assert requests[3]["model"] == "second-use-model"
+        if not next_turn.endswith(b"> "):
+            _read_until(master, process, bytearray(), b"> ", timeout=10)
+
         os.write(master, b"/exit\r")
         process.wait(timeout=12)
         assert process.returncode == 0
 
         config_path = home / ".ash" / "ash.toml"
         assert "first-use-route" in config_path.read_text(encoding="utf-8")
+        persisted_env = (home / ".ash" / ".env").read_text(encoding="utf-8")
+        assert "first-use-route/first-use-model" in persisted_env
+        assert "second-use-model" not in persisted_env
         assert "http://127.0.0.1:" in config_path.read_text(encoding="utf-8")
         trust_store = json.loads(
             (home / ".ash" / "trusted-workspaces.json").read_text()
@@ -764,7 +803,7 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
             check["name"] == "connectivity" and check["status"] == "pass"
             for check in checks
         ), checks
-        assert len(requests) == 3, "doctor must not call the completion endpoint"
+        assert len(requests) == 4, "doctor must not call the completion endpoint"
 
         store = SessionStore(home / "db" / "sessions.db")
         sessions = store.list_sessions(project_path=str(workspace), limit=5)
@@ -810,7 +849,8 @@ def test_fresh_cli_setup_reaches_approved_edit_test_and_safe_resume(
         response = json.loads(resumed.stdout)
         assert response["session_id"] == session_id
         assert response["response"] == "RESUMED-OK"
-        assert len(requests) == 4
+        assert len(requests) == 5
+        assert requests[4]["model"] == "second-use-model"
         assert source.read_text(encoding="utf-8") == (
             "def add_one(n):\n    return n + 1\n"
         )

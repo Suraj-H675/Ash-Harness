@@ -161,6 +161,18 @@ first-use step** still requires its own successful CI run before acceptance.
 These checks do not establish public release installation, strong-model
 interactive performance or complete macOS onboarding usability.
 
+**Interactive review and model switching (2026-11-17):** The same real source
+and isolated installed-wheel first-use paths now exercise `/diff --turn`
+after an approved edit in a non-Git workspace. The checkpoint review displays
+the exact removed and added source lines without requesting another model
+completion. A subsequent `/model` switch to a second discovered model on the
+custom provider routes the next real completion to that model, persists the
+session selection for fresh-process resume, and leaves the saved user default
+unchanged. Both paths passed locally, including the installed-wheel CI-style
+invocation; hosted verification of this extension remains pending. This is
+provider-routing/UX evidence with a deterministic local server, not a model
+quality comparison.
+
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
 three-module `event-log` fixture with GPT-6.1 Sol. The intervening Luna
