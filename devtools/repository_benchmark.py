@@ -1329,6 +1329,88 @@ print("RICH_SOFT_WRAP_HIDDEN_OK")
 """
 
 
+CLICK_CONTEXT_SETTINGS_VISIBLE = r"""import sys
+sys.path.insert(0, 'src')
+
+import click
+from click.testing import CliRunner
+
+
+@click.command(context_settings={'color': False, 'terminal_width': 91})
+@click.pass_context
+def report(ctx):
+    click.echo(f'width={ctx.terminal_width};color={ctx.color};obj={ctx.obj}')
+
+
+runner = CliRunner()
+# Existing **extra behavior must remain valid when the new parameter is absent.
+previous = runner.invoke(report, obj='previous')
+assert previous.exit_code == 0, (previous.output, previous.exception)
+assert previous.output.strip() == 'width=91;color=False;obj=previous', previous.output
+
+# New settings bypass CliRunner.invoke(color=...) and take precedence over
+# the command's declared context defaults, not just missing settings.
+settings = {'color': True, 'terminal_width': 41, 'obj': 'caller'}
+new = runner.invoke(report, args=[], color=False, context_settings=settings)
+assert new.exit_code == 0, (new.output, new.exception)
+assert new.output.strip() == 'width=41;color=True;obj=caller', new.output
+assert settings == {'color': True, 'terminal_width': 41, 'obj': 'caller'}
+
+# An empty override behaves exactly like the pre-feature call.
+empty = runner.invoke(report, context_settings={})
+assert empty.exit_code == 0, (empty.output, empty.exception)
+assert empty.output.strip() == 'width=91;color=False;obj=None'
+"""
+
+
+CLICK_CONTEXT_SETTINGS_HIDDEN = r"""import sys
+sys.path.insert(0, 'src')
+
+import click
+from click.testing import CliRunner
+
+
+@click.group(context_settings={'terminal_width': 88, 'color': False})
+@click.pass_context
+def cli(ctx):
+    pass
+
+
+@cli.command()
+@click.option('--source', default='normal')
+@click.pass_context
+def inspect(ctx, source):
+    root = ctx.find_root()
+    click.echo(f'{source}|{root.terminal_width}|{ctx.terminal_width}|{root.color}|{root.obj}')
+
+
+runner = CliRunner()
+options = {'default_map': {'inspect': {'source': 'from-map'}},
+           'terminal_width': 37, 'color': True, 'obj': 'audit'}
+result = runner.invoke(cli, ['inspect'], context_settings=options, color=False)
+assert result.exit_code == 0, (result.output, result.exception)
+assert result.output.strip() == 'from-map|37|37|True|audit', result.output
+assert options['terminal_width'] == 37
+
+# Backwards-compatible direct keyword Context settings through **extra.
+legacy = runner.invoke(cli, ['inspect', '--source', 'explicit'],
+                       terminal_width=70, obj='legacy')
+assert legacy.exit_code == 0, (legacy.output, legacy.exception)
+assert legacy.output.strip() == 'explicit|70|70|False|legacy', legacy.output
+
+# An explicit new context setting must not be intercepted by similarly named
+# CliRunner parameters (including the capture-time color switch).
+@click.command()
+@click.pass_context
+def colors(ctx):
+    click.echo(f'context-color={ctx.color}')
+
+result = runner.invoke(colors, color=False, context_settings={'color': True})
+assert result.exit_code == 0, (result.output, result.exception)
+assert result.output.strip() == 'context-color=True', result.output
+"""
+
+
 TOOLZ_PARTITION_LENGTH_VISIBLE = r"""from toolz.itertoolz import partition_all
 
 class Misreported(list):
@@ -1507,6 +1589,31 @@ class RepositoryTask:
 
 
 TASKS = {
+    "click-clirunner-context-settings": RepositoryTask(
+        source="pallets/click",
+        upstream="https://github.com/pallets/click.git",
+        base_sha="ac0e297ec2d7d78455a7d18ce306996e668c4a85",
+        reference_fix_sha="90a2973f85fffc4d8a20effb2bcdff3f394c5e62",
+        editable=frozenset({"src/click/testing.py"}),
+        visible_script="qa_visible.py",
+        visible_source=CLICK_CONTEXT_SETTINGS_VISIBLE,
+        hidden_source=CLICK_CONTEXT_SETTINGS_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Add a backward-compatible feature to Click's CliRunner.invoke in "
+            "this pinned repository: accept an optional context_settings "
+            "mapping that passes Context settings to the command's root "
+            "context. A caller must be able to set context.color independently "
+            "of CliRunner.invoke(color=...) for output capture, and explicit "
+            "context settings must override the command's declared context "
+            "defaults. Preserve existing extra keyword arguments, no-override "
+            "invocations, capture semantics, and the input mapping. Inspect "
+            "qa_visible.py and relevant source, edit ONLY src/click/testing.py, "
+            "then run exactly python3 -B qa_visible.py with run_command. "
+            "No other commands are authorized. Do not modify tests, docs, "
+            "or metadata."
+        ),
+    ),
     "toolz-partition-invalid-length": RepositoryTask(
         source="pytoolz/toolz",
         upstream="https://github.com/pytoolz/toolz.git",

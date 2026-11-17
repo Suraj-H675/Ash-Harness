@@ -209,6 +209,11 @@ def test_headless_error_category_refuses_untrusted_or_large_output(
     ("task_id", "upstream", "editable"),
     [
         (
+            "click-clirunner-context-settings",
+            "https://github.com/pallets/click.git",
+            {"src/click/testing.py"},
+        ),
+        (
             "toolz-partition-invalid-length",
             "https://github.com/pytoolz/toolz.git",
             {"toolz/itertoolz.py"},

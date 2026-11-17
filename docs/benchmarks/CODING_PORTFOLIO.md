@@ -7,8 +7,8 @@ not a claim that all scenarios have been run or passed.
 
 ## First portfolio: existing cases, not invented benchmarks
 
-These twenty fixtures already have runnable code and grading logic. They do
-not represent twenty independent real repositories: R1–R14 are pinned
+These twenty-one fixtures already have runnable code and grading logic. They do
+not represent twenty-one independent real repositories: R1–R15 are pinned
 repository tasks (some share an upstream project), while S1–S6 are synthetic.
 Keep the lanes separate and do not pool their scores into a single win rate.
 
@@ -28,6 +28,7 @@ Keep the lanes separate and do not pool their scores into a single win rate.
 | R12 | `rich-soft-wrap-background-style` | Pinned real repo | Two-module Rich terminal-rendering bug: prevent background/style bleed across physical newlines under `soft_wrap=True`, while preserving multiline, blank-line and styled text behavior | **First 65K sequential pair: both pass**; Ash 105.80s / 10 model requests / 23 tool calls, Codex 98.29s / 5 non-test commands + visible test; one trial, policy-parity caveat |
 | R13 | `moreitertools-peekable-reverse-slice` | Pinned real repo | Prevent `peekable` from exhausting an infinite or large finite iterator when reverse slicing with a known start and omitted stop; preserve caching and genuine right-relative indexing | **First sequential 65K pair: both pass**; Ash 69.16s / 6 model requests / 6 tools / 0 rejects, Codex 53.46s / 3 non-test shell commands; one observation and native policy-parity caveat |
 | R14 | `toolz-partition-invalid-length` | Pinned real repo | Detect an iterable's incorrect reported length rather than silently truncate a partially filled partition; preserve correct normal and no-length iteration | **First sequential 65K pair: both pass**; Ash 88.85s / 8 model requests / 8 tool calls (one safe edit rejection), Codex 104.25s / 4 non-test commands; one sample, with policy-parity limits |
+| R15 | `click-clirunner-context-settings` | Pinned real repo | Extend Click's `CliRunner.invoke` public API with context-settings overrides that avoid parameter-name collisions while preserving existing invocation behavior | **New feature-addition fixture; original/reference red-green preflight verified.** No coding result yet |
 | S1 | `marker` | Synthetic CLI smoke | Exact file creation and protected-file preservation | Exists; record separately as smoke |
 | S2 | `build-run` | Synthetic CLI smoke | Create a script, then execute authorized check | Exists; verify tool execution and terminal completion |
 | S3 | `repair-test` | Synthetic repair | Single-file bug and independent hidden check | Exists; current strong-model baseline pending |
@@ -42,8 +43,28 @@ distinct codebases and multi-module workflows, with R10 covering a seven-module
 refactor behind compatibility shims; they do not fill all these gaps. Every
 additional task still needs pinned base/fix provenance and independently
 authored sealed oracles with red-original/green-reference preflight.
-The present **20-case inventory** is not a stable reliability benchmark;
+The present **21-case inventory** is not a stable reliability benchmark;
 repetitions and broader workflow diversity remain necessary.
+
+**R15 provenance and preflight (2026-11-17):**
+The independently selected [pallets/click PR #3896](https://github.com/pallets/click/pull/3896),
+merged November 6, 2026, adds an optional `context_settings` mapping to
+`CliRunner.invoke`. The feature permits root Context settings such as `color`
+to be passed separately from parameters controlling the runner itself, while
+preserving existing extra keyword arguments and allowing explicit context
+settings to override command defaults. Pinned original
+`ac0e297ec2d7d78455a7d18ce306996e668c4a85` and reference PR head
+`90a2973f85fffc4d8a20effb2bcdff3f394c5e62` differ in five files:
+`src/click/testing.py`, upstream tests, changelog, and docs. Only the
+production module is editable. Separately authored standard-library-driven
+visible and sealed hidden scripts cover context color and terminal width,
+declared-default precedence, root-to-subcommand inheritance, default-map
+option values, legacy `**extra` forwarding, empty overrides, and preservation
+of the caller's mapping. The **official fresh pinned-fetch preflight** confirms
+both tests fail on the original, both pass on the reference, no unsafe tree
+entries, and only `src/click/testing.py` must change. This is validity
+evidence, **not a model coding result**. Private preflight receipts are under
+`/var/tmp/ash-r15-click-feature-preflight-20261117/`.
 
 **R14 provenance and offline preflight (2026-11-17):** A new independent
 source project, [pytoolz/toolz PR #603](https://github.com/pytoolz/toolz/pull/603),
