@@ -196,6 +196,21 @@ remain usable, and the original durable messages and context summary stay
 unchanged. The provider-replay protection and compaction implementation have
 not been weakened; hosted verification remains pending.
 
+**Opaque reasoning and model changes (2026-11-17, local):** An in-place
+`/model` change previously updated the session's provider without checking
+its durable assistant history. That could carry opaque reasoning replay state
+from the previous provider or model into an incompatible request. Ash now
+refuses such changes while replay state remains, preserves the original model
+and transcript, and directs the user to `/restart-context` with an explicit
+handoff. A real terminal test verifies the refusal and a successful switch
+after a handoff. When the primary provider fails before output, a failover
+chain likewise refuses to forward historic opaque replay state to a backup;
+a healthy primary and ordinary stateless failover remain usable. The new
+guards do **not** establish safe route affinity after a previous successful
+backup response or an interrupted/resumed fallback session: that requires
+durable provenance of the replay-state-producing provider and remains open.
+Hosted verification of this checkpoint is pending.
+
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic
 three-module `event-log` fixture with GPT-6.1 Sol. The intervening Luna
@@ -2353,7 +2368,7 @@ truthful evidence boundaries, not open mission blockers.
 | Long-running process control | Verified locally | Managed start/list/poll/stdin/stop with process-tree cleanup |
 | Structured output mode | Verified locally | One-shot JSON Schema injection with strict JSON parsing/validation; JSON and stream-JSON terminal output is released only after validation, successful completions include parsed `structured_output`, and invalid model output is a stable `output` error rather than an internal failure |
 | Model capability negotiation | Verified locally | Tools, vision, reasoning, local status, and known context/output limits use provider/model evidence rather than wire-protocol identity; Ollama, OpenRouter, Hugging Face, Mistral, xAI, Together, Fireworks, Cerebras, LM Studio, vLLM, and generic OpenAI-compatible routes negotiate bounded provider-owned metadata before use where available; exact IDs and unique provider aliases resolve consistently, conflicting/missing/malformed/ambiguous/different-model evidence stays conservative, and `/capabilities` distinguishes dynamic evidence even inside failover chains |
-| Provider failover | Verified locally | Ordered fallback only before first emitted chunk; static/dynamic chains enforce tool-protocol parity, expose a conservative whole-chain capability envelope, use the maximum child token estimate, forward per-turn output ceilings to every child, and keep configured models/failures visible |
+| Provider failover | Partial | Ordered fallback only before first emitted chunk; static/dynamic chains enforce tool-protocol parity, expose a conservative whole-chain capability envelope, use the maximum child token estimate, forward per-turn output ceilings to every child, and keep configured models/failures visible. A backup cannot receive historic opaque replay after a failed primary. Persisted source-provider ownership for state generated on a prior successful backup, including resume, is not yet established; safe route affinity remains open |
 
 ## 3. Context And Memory
 

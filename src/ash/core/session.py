@@ -5375,6 +5375,30 @@ class SessionStore:
             ).fetchone()
         return int(row["count"])
 
+    def has_provider_replay_state(self, session_id: str) -> bool:
+        """Check the entire durable assistant history, not just its live window.
+
+        Provider replay state cannot safely follow an in-place model or
+        provider switch. Stream only the stored metadata so an old, long
+        session need not be hydrated into memory for this check.
+        """
+
+        with closing(self._connect()) as conn:
+            for row in conn.execute(
+                "SELECT metadata_json FROM messages "
+                "WHERE session_id = ? AND role = 'assistant'",
+                (session_id,),
+            ):
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, ValueError) as exc:
+                    raise _invalid_stored_data_error(self.db_path) from exc
+                if not isinstance(metadata, dict):
+                    raise _invalid_stored_data_error(self.db_path)
+                if metadata.get("provider_state"):
+                    return True
+        return False
+
     def save_runtime_events(self, events: list[dict[str, Any]]) -> int:
         """Append a batch of canonical events, ignoring replayed event IDs."""
 

@@ -54,6 +54,53 @@ async def test_failover_switches_only_before_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failover_does_not_send_historical_opaque_replay_to_backup() -> None:
+    primary = FakeProvider("primary", error=RuntimeError("temporary upstream outage"))
+    backup = FakeProvider("backup")
+    provider = FailoverProvider([primary, backup])
+    history = [
+        {"role": "user", "content": "Original task"},
+        {
+            "role": "assistant",
+            "content": "Previous response",
+            "provider_state": [
+                {
+                    "type": "reasoning", "id": "rs-1", "summary": [],
+                    "encrypted_content": "opaque-previous-model-state",
+                }
+            ],
+        },
+        {"role": "user", "content": "Continue"},
+    ]
+
+    with pytest.raises(RuntimeError, match="/restart-context"):
+        _ = [chunk async for chunk in provider.stream_chat(history)]
+    assert provider.failures == ["primary: temporary upstream outage"]
+    assert provider.model_name == "primary"
+
+
+@pytest.mark.asyncio
+async def test_healthy_primary_remains_usable_with_historical_opaque_state() -> None:
+    class ForbiddenBackup(FakeProvider):
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            raise AssertionError("backup must not be contacted")
+            yield  # pragma: no cover
+
+    provider = FailoverProvider([FakeProvider("primary"), ForbiddenBackup("backup")])
+    history = [
+        {"role": "assistant", "content": "Prior turn", "provider_state": [{
+            "type": "reasoning", "id": "rs-1", "summary": [],
+            "encrypted_content": "opaque-previous-model-state",
+        }]},
+        {"role": "user", "content": "Continue"},
+    ]
+
+    chunks = [chunk async for chunk in provider.stream_chat(history)]
+    assert [chunk.content for chunk in chunks] == ["primary"]
+    assert provider.failures == []
+
+
+@pytest.mark.asyncio
 async def test_failover_never_replays_after_output() -> None:
     provider = FailoverProvider(
         [

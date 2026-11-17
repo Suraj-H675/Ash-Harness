@@ -8673,6 +8673,59 @@ async def test_session_model_switch_is_durable_and_new_restores_default(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_switch_model_rejects_durable_opaque_replay_state_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Never carry a prior provider's opaque reasoning into another route."""
+    config = AshConfig(
+        model="openai/primary",
+        workspace_root=tmp_path,
+        db_directory=tmp_path / "db",
+        memory_backend="off",
+    )
+    store = SessionStore(tmp_path / "opaque-model-switch.db")
+    original_provider = MockProvider()
+    loop = AshLoop(
+        store,
+        original_provider,
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+        provider_factory=lambda _config: MockProvider(),
+        config=config,
+    )
+    session = await loop.start_session()
+    original = store.session_model(session.session_id)
+    opaque = Message(
+        role="assistant",
+        content="Prior model output",
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "provider_state": [{
+                "type": "reasoning",
+                "id": "rs-1",
+                "summary": [],
+                "encrypted_content": "opaque-previous-model-state",
+            }],
+        },
+    )
+    # Persist the historical assistant state without adding it to the current
+    # resident window: switching must consult durable history, not just RAM.
+    store.save_message(session.session_id, opaque)
+
+    for next_route in ("openai/other-model", "anthropic/other-provider"):
+        with pytest.raises(RuntimeError, match="/restart-context"):
+            loop.switch_model(next_route)
+        assert loop.provider is original_provider
+        assert loop._config is config
+        assert session.model == original
+        assert store.session_model(session.session_id) == original
+        assert store.load_session(session.session_id).messages == [opaque]
+
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
 async def test_failed_model_switch_rolls_back_durable_session_model(tmp_path):
     class BrokenCapabilitiesProvider(MockProvider):
         @property

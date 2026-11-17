@@ -246,6 +246,76 @@ def test_linear_help_search_matches_multiple_terms(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
+def test_model_switch_with_opaque_history_requires_explicit_context_restart(
+    tmp_path: Path,
+) -> None:
+    """Do not move an opaque provider's state into another model in the REPL."""
+    from datetime import datetime, timezone
+
+    from ash.core.session import Message
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    (home / "db").mkdir()
+    environment = _terminal_environment(home, workspace, model="lmstudio/local-model")
+    _set_workspace_trust(workspace, environment, trusted=False)
+    store = SessionStore(home / "db" / "sessions.db")
+    source = store.create_session(str(workspace), model="lmstudio/local-model")
+    store.save_message(
+        source.session_id,
+        Message(
+            role="assistant",
+            content="Original model answer",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "provider_state": [
+                    {
+                        "type": "reasoning", "id": "rs-1", "summary": [],
+                        "encrypted_content": "old-provider-replay-state",
+                    }
+                ]
+            },
+        ),
+    )
+    original = store.load_session(source.session_id)
+    master, process = _open_pty_cli(
+        workspace, environment, columns=120, args=("--session", source.session_id)
+    )
+    observed = bytearray()
+
+    try:
+        _read_until(master, process, observed, b"> ", timeout=30)
+        os.write(master, b"/model lmstudio/backup-model\r")
+        _read_until(master, process, observed, b"/restart-context", timeout=20)
+        assert process.poll() is None
+        assert store.session_model(source.session_id) == "lmstudio/local-model"
+        assert store.load_session(source.session_id).messages == original.messages
+
+        os.write(master, b"/restart-context Reinspect files before continuing\r")
+        _read_until(master, process, observed, b"Started a new reasoning window")
+        children = [
+            row for row in store.list_sessions(project_path=str(workspace))
+            if row.session_id != source.session_id
+        ]
+        assert len(children) == 1
+        child_id = children[0].session_id
+        assert store.load_session(child_id).parent_session_id == source.session_id
+
+        os.write(master, b"/model lmstudio/backup-model\r")
+        _read_until(master, process, observed, b"Switched to lmstudio/backup-model")
+        assert store.session_model(child_id) == "lmstudio/backup-model"
+        assert store.session_model(source.session_id) == "lmstudio/local-model"
+        assert store.load_session(source.session_id).messages == original.messages
+        os.write(master, b"/exit\r")
+        process.wait(timeout=10)
+        assert process.returncode == 0
+    finally:
+        _stop_pty_cli(master, process)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX pseudo-terminal contract")
 def test_manual_compact_refusal_keeps_opaque_session_alive(
     tmp_path: Path,
 ) -> None:

@@ -28,6 +28,58 @@ from ash.core.session import (
 from ash.sqlite_utils import preferred_sqlite_journal_mode
 
 
+def test_provider_replay_state_check_reads_durable_assistant_history(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "replay-history.db")
+    session = store.create_session(str(tmp_path))
+    now = datetime.now(timezone.utc)
+
+    assert store.has_provider_replay_state(session.session_id) is False
+    store.save_message(
+        session.session_id,
+        Message(role="user", content="Previous task", timestamp=now),
+    )
+    store.save_message(
+        session.session_id,
+        Message(role="assistant", content="Done", timestamp=now,
+                metadata={"provider_state": [], "other": "safe"}),
+    )
+    assert store.has_provider_replay_state(session.session_id) is False
+
+    store.save_message(
+        session.session_id,
+        Message(role="assistant", content="Earlier reasoning", timestamp=now,
+                metadata={"provider_state": [{
+                    "type": "reasoning", "id": "rs-1", "summary": [],
+                    "encrypted_content": "opaque-state",
+                }]}),
+    )
+    store.save_message(
+        session.session_id,
+        Message(role="assistant", content="Latest answer", timestamp=now),
+    )
+    assert store.has_provider_replay_state(session.session_id) is True
+
+
+def test_provider_replay_state_check_fails_closed_on_corrupt_assistant_metadata(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "replay-corruption.db")
+    session = store.create_session(str(tmp_path))
+    store.save_message(
+        session.session_id,
+        Message(role="assistant", content="Stored", timestamp=datetime.now(timezone.utc)),
+    )
+    with closing(get_db_connection(store.db_path)) as conn, conn:
+        conn.execute(
+            "UPDATE messages SET metadata_json = ? WHERE session_id = ?",
+            ("{invalid", session.session_id),
+        )
+    with pytest.raises(SessionStorageError):
+        store.has_provider_replay_state(session.session_id)
+
+
 @pytest.mark.parametrize(
     "stop_reason", ["token_budget", "iteration_limit", "circuit_breaker"]
 )

@@ -19,7 +19,7 @@ from ash.providers.base import (
     stream_chunk_commits_provider,
 )
 from ash.providers.capabilities import ProviderCapabilities
-from ash.providers.messages import MessageInput
+from ash.providers.messages import MessageInput, normalize_messages
 from ash.providers.reasoning import ReasoningEffortSpec
 
 
@@ -152,6 +152,17 @@ class FailoverProvider(ProviderABC):
         last_error: Exception | None = None
         failures: list[str] = []
         for index, provider in enumerate(self.providers):
+            if index > 0 and any(
+                item.get("role") == "assistant" and item.get("provider_state")
+                for item in normalize_messages(messages)
+            ):
+                self.failures = failures
+                raise RuntimeError(
+                    "Cannot send a session with opaque provider reasoning state "
+                    "to a fallback model after the primary fails. Continue with "
+                    "the original model or use /restart-context with an explicit "
+                    "handoff before switching."
+                ) from last_error
             self.active_index = index
             self.provider_family = provider.provider_family
             emitted_output = False

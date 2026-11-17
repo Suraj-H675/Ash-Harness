@@ -8548,6 +8548,19 @@ class AshLoop:
             raise
         return new_config, replacement
 
+    def _require_replay_compatible_model_switch(
+        self, session_id: str, previous_model: str, next_model: str
+    ) -> None:
+        if (
+            previous_model != next_model
+            and self.session_store.has_provider_replay_state(session_id)
+        ):
+            raise RuntimeError(
+                "Cannot switch models while this session retains opaque provider "
+                "reasoning state. Use /restart-context with an explicit handoff "
+                "to start a new reasoning window before changing models."
+            )
+
     def _commit_provider_switch(
         self,
         new_config: "AshConfig",
@@ -8580,9 +8593,13 @@ class AshLoop:
         old_core_prompt = self._core_system_prompt
         old_base_prompt = self._base_system_prompt
         old_system_prompt = self.system_prompt
+        session = self.current_session if persist_session_model else None
+        if session is not None:
+            self._require_replay_compatible_model_switch(
+                session.session_id, session.model, new_config.model
+            )
         replacement = replacement or self._provider_factory(new_config)
         effort = self.reasoning_effort
-        session = self.current_session if persist_session_model else None
         session_lease = None
         old_session_model = ""
         model_persisted = False
@@ -8596,6 +8613,9 @@ class AshLoop:
                     session.session_id
                 )
                 old_session_model = self.session_store.session_model(session.session_id)
+                self._require_replay_compatible_model_switch(
+                    session.session_id, old_session_model, new_config.model
+                )
                 self.session_store.update_session_model(
                     session.session_id,
                     new_config.model,
