@@ -1,217 +1,106 @@
 # ASH — Context & Memory Specification
 
-This document details the context budgeting, token allocation, historical log compaction, and repository mapping algorithms for the Ash harness.
+This document describes the implemented provider-input, history compaction,
+repository-map and memory boundaries. The live code, rather than an illustrative
+algorithm, is authoritative if they differ.
 
----
+## 1. Provider-input assembly and budgets
 
-## 1. Context Window Budgets & Packing Order
+`AshLoop._build_messages()` in `src/ash/core/loop.py` gathers live project
+instructions, the skill catalog, repository-map output, Goal and Sprint state,
+untrusted prior-session/project memory, tool schemas, and canonical session
+history. It preserves assistant tool-call IDs, tool results, and opaque provider
+replay state. The current user message and its active tool chain are protected
+from truncation.
 
-When assembling the prompt context for a model invocation, the `ContextBuilder` packs information according to a strict priority hierarchy. If the total context footprint exceeds the model's max limit, lower-priority components are pruned or compacted.
+For configured runtimes, the loop builds a typed `ContextAssemblyRequest` and
+calls `ash.context.assembly.assemble_context()`. This deterministic function
+returns provider-visible messages, a `ContextBudgetReport`, content-free usage
+telemetry, and a proposed `CompactionResult`. It does **not** write SQLite,
+modify a `Session`, emit events or update the UI. `AshLoop` owns those effects:
+it publishes token usage, persists a redacted summary when needed, adjusts the
+resident history window **after** persistence succeeds, and then returns the
+assembled provider request. Unconfigured legacy/test loops retain the original
+minimal, unbudgeted assembly path.
 
-```
-┌─────────────────────────────────────────────────────────────┐ ▲ High Priority
-│ 1. Core System Prompt (Safety + Tools Schema + XML Tags)    │ │
-├─────────────────────────────────────────────────────────────┤ │
-│ 2. Active Code Files (Directly requested or edited files)   │ │
-├─────────────────────────────────────────────────────────────┤ │
-│ 3. User Input (Current turn message)                        │ │
-├─────────────────────────────────────────────────────────────┤ │
-│ 4. Short-term Session History (Last 5 conversation turns)   │ │
-├─────────────────────────────────────────────────────────────┤ │
-│ 5. Compacted Session History Summary (Layered/Anchored)     │ │
-├─────────────────────────────────────────────────────────────┤ │
-│ 6. Dynamic Repository Map (Personalized PageRank symbols)    │ │
-├─────────────────────────────────────────────────────────────┤ │
-│ 7. Relevant Project Memory (lexical or hybrid retrieval)    │ ▼ Low Priority
-└─────────────────────────────────────────────────────────────┘
-```
+`resolve_request_token_budget()` computes a provider-aware combined context
+limit, input limit and output reserve from configuration and declared provider
+capabilities. A request must fit the input limit after reserving output tokens.
+The `ContextBudgetAllocator` uses configurable relative weights, with these
+defaults:
 
-### Context Budgeting Strategy
-For a standard `128,000` token context limit:
-*   **System Prompt & Tools Schema**: Max 3,000 tokens (strict limit).
-*   **Active Files Buffer**: Max 45,000 tokens.
-*   **Active History**: Max 40,000 tokens (latest turns, raw).
-*   **Compacted Summary**: Max 10,000 tokens.
-*   **Repository Map**: Max 20,000 tokens.
-*   **Semantic Memories**: Max 10,000 tokens.
+| Section | Default share | Content |
+| --- | ---: | --- |
+| System | 20% | Core instructions, persistent instructions, supplemental skills |
+| Tools | 15% | Model-visible catalog/schema accounting |
+| History | 45% | Current turn, session transcript and bounded historical summary |
+| Repository map | 10% | Ranked code-symbol context |
+| Memory | 10% | Goal/Sprint state, recalled memory and prior-session context |
 
----
+These are **relative allocations**, not fixed hardcoded 128K-token quotas.
+The system slice redistributes space between core, persistent and
+supplemental content (initial weights 55/35/10). Persistent instructions
+preserve both ends when truncated. A built-in untrusted-content boundary
+is always retained; content from a repository, memory or tool does not gain
+permission authority by appearing in the prompt.
 
-## 2. Context Compaction Algorithms
+Native tool schemas are charged outside the chat messages; non-native
+catalogs are included in system text for the XML fallback protocol, without
+double-charging. Provider-specific token counting is used for budgeting,
+and actual provider usage is normalized separately after completion.
 
-When historical messages exceed the active history budget, Ash compacts only
-the provider-visible history. The durable transcript remains intact in SQLite.
-Compaction is deterministic and extractive: it does not make a helper-model
-request, incur another inference charge, or invent a synthesized state object.
+## 2. Compaction and state boundaries
 
-### 2.1 Layered Compaction
-Before removing conversation turns, Ash bounds stale tool-result payloads and
-preserves valid assistant-tool/result protocol groups atomically. The current
-user request and its active tool chain are protected; if that protected state
-alone cannot fit, Ash fails with a context-budget error rather than silently
-dropping it.
+`HistoryCompactor` in `src/ash/context/history.py` bounds stale tool output,
+preserves complete assistant tool-call/result groups, and makes a deterministic,
+extractive summary when the configured threshold requires it. The current
+active turn's user input and tool chain cannot be silently dropped. If
+protected material cannot fit, the request fails with
+`ContextBudgetExceededError` rather than dispatching a broken prompt.
 
-### 2.2 Anchored Extractive Summary
-Removed turns are represented by a bounded text summary built from observable
-state: recent user requests, referenced paths, tool names/arguments, assistant
-outcomes, and bounded event text. A prior durable summary is carried forward
-with both ends preserved, then merged with newly removed state. The persisted
-summary may be larger than the provider-visible copy; Ash separately fits the
-visible summary to the remaining input budget without shrinking durable state.
+The durable SQLite transcript remains intact; only the model-visible
+window and a separately stored bounded summary change. Old summaries carry
+forward anchored historical decisions and tool evidence. The summary is
+redacted before persistence, and resident message offsets count only durable
+messages, not transient runtime-only entries. Failed summary persistence
+must leave the live session history and summary unchanged.
 
-Repeated compaction therefore retains earlier anchors while adding newer
-decisions and blockers. The algorithm intentionally trades abstractive polish
-for reproducibility, zero extra model calls, and a lower risk of fabricated
-history.
+**Opaque reasoning replay:** if history contains provider-owned reasoning
+state, Ash preserves the original request prefix exactly instead of
+locally pruning or summarizing that prefix. A request that cannot fit is
+refused. Provider-native checkpointing, when genuinely supported, installs
+a separate child session; an explicit `/restart-context` creates a new
+reasoning window with a user handoff, only after recovery and action-integrity
+checks. Neither mechanism silently replays tool side effects.
 
----
+`/context` and the `context.usage` event expose section counts and
+truncation status. Fragment provenance uses hashes and bounded metadata,
+not a second persistent copy of source contents.
 
-## 3. Token Counting & Rate Limiting
+## 3. Provider counting and rate limiting
 
-To avoid hitting API limits or causing unexpected billing spikes, Ash implements a **Token Bucket Rate Limiter** alongside provider-specific exact counting.
+Input estimates are counted by the active provider's `count_tokens` method;
+returned usage, cache reads and writes, and missing-usage estimates remain
+distinguishable in the model-usage/reporting pipeline. The separate
+`TokenBucketRateLimiter` in `src/ash/providers/rate_limiter.py` is an
+exported utility, not an automatically attached per-provider request
+throttle. The active provider transport instead applies the configured
+retry, cooldown/circuit-breaker and failure classification policies.
 
-### 3.1 Token Bucket Algorithm
-```python
-import time
-from typing import Tuple
+## 4. Repository-map input
 
-class TokenBucketRateLimiter:
-    def __init__(self, capacity: int, fill_rate: float) -> None:
-        self.capacity = capacity      # Max tokens/requests bucket can hold
-        self.fill_rate = fill_rate    # Tokens/requests added per second
-        self.tokens = float(capacity)
-        self.last_update = time.monotonic()
+`RepoMap` in `src/ash/repo/repomap.py` incrementally parses supported source
+languages with Tree-sitter, extracts definitions/imports/references, maintains
+a sparse dependency graph and ranks files using personalized PageRank.
+The ranking favors the current active-file context, or defaults to a
+workspace-wide distribution when there is no active focus. A typical prompt
+renders up to five ranked files with up to six selected symbols per file;
+it does **not** place entire source files into the system prompt.
 
-    def consume(self, tokens_needed: int) -> Tuple[bool, float]:
-        """
-        Attempts to consume tokens.
-        Returns: (success, wait_time_seconds)
-        """
-        now = time.monotonic()
-        elapsed = now - self.last_update
-        self.last_update = now
-
-        # Add accumulated tokens based on elapsed time
-        self.tokens = min(self.capacity, self.tokens + (elapsed * self.fill_rate))
-
-        if self.tokens >= tokens_needed:
-            self.tokens -= tokens_needed
-            return True, 0.0
-
-        # Calculate how long to wait to accumulate enough tokens
-        deficit = tokens_needed - self.tokens
-        wait_time = deficit / self.fill_rate
-        return False, wait_time
-```
-
-### 3.2 Provider Token Counts
-*   **Anthropic**: Queries client-side token calculators or uses headers returned in the response stream.
-*   **OpenAI**: Uses the `tiktoken` library with the specific encoding matching the active model (e.g. `cl100k_base` or `o200k_base`).
-
----
-
-## 4. Repository Mapping
-
-The repository map allows Ash to understand code definitions and imports across the entire workspace without loading all files into context. It utilizes **Tree-sitter** for symbol parsing and a **Personalized PageRank (PPR)** algorithm to rank symbol importance relative to the user's active file focus.
-
-```
-1. File Parse   --->  2. Construct Dependency Graph  --->  3. Calculate PPR Ranks
-┌─────────────┐       ┌───────────────────────────┐         ┌───────────────────┐
-│ config.py   │ ───>  │ config.py                 │  ───>   │ config: PPR=0.45  │
-│ main.py     │       │   └─> db.py (uses config) │         │ db:     PPR=0.35  │
-│ db.py       │       │   └─> main.py (uses db)   │         │ main:   PPR=0.20  │
-└─────────────┘       └───────────────────────────┘         └───────────────────┘
-```
-
-### 4.1 Tree-sitter Parser Wrapper
-```python
-from pathlib import Path
-from tree_sitter import Parser, Language
-import tree_sitter_python as tspython
-
-class SymbolExtractor:
-    def __init__(self) -> None:
-        self.parser = Parser()
-        # Initialize parser using Python grammar
-        self.language = Language(tspython.language())
-        self.parser.set_language(self.language)
-
-    def extract_symbols(self, file_path: Path) -> list[dict]:
-        """
-        Parses a file and returns a list of symbols:
-        Classes, functions, imports, method declarations, and global variables.
-        """
-        content = file_path.read_bytes()
-        tree = self.parser.parse(content)
-        query_str = """
-        (class_definition name: (identifier) @class.name)
-        (function_definition name: (identifier) @function.name)
-        (import_statement) @import
-        (import_from_statement) @import
-        """
-        query = self.language.query(query_str)
-        captures = query.captures(tree.root_node)
-        # Parse captures into structured dicts containing name, type, and start/end lines
-        ...
-```
-
-### 4.2 Personalized PageRank (PPR)
-PPR computes symbol importance starting from a specific set of **Active Files** (the teleport vector), ensuring the repo map displays contextually relevant files first instead of just globals.
-
-$$\mathbf{v} = (1 - \alpha) \mathbf{M} \mathbf{v} + \alpha \mathbf{p}$$
-
-Where:
-*   $\mathbf{v}$: PageRank score vector.
-*   $\mathbf{M}$: Transition probability matrix (edges represent code dependencies, class inheritances, or method calls).
-*   $\alpha$: Damping factor (typically $0.85$).
-*   $\mathbf{p}$: Teleport vector, concentrated entirely on the user's currently active files.
-
-```python
-import numpy as np
-from typing import Dict, List
-
-def calculate_personalized_pagerank(
-    adjacency_matrix: np.ndarray,
-    teleport_indices: List[int],
-    alpha: float = 0.85,
-    max_iter: int = 100,
-    tol: float = 1e-6
-) -> np.ndarray:
-    """
-    Computes Personalized PageRank for a directed dependency graph.
-    teleport_indices: indices of files open/edited in current session.
-    """
-    n = adjacency_matrix.shape[0]
-    if n == 0:
-        return np.array([])
-
-    # Normalize adjacency matrix columns (transitions)
-    column_sums = adjacency_matrix.sum(axis=0)
-    # Handle dangling nodes (nodes with no outbound edges)
-    normalized_matrix = np.zeros_like(adjacency_matrix, dtype=float)
-    for col in range(n):
-        if column_sums[col] > 0:
-            normalized_matrix[:, col] = adjacency_matrix[:, col] / column_sums[col]
-        else:
-            normalized_matrix[:, col] = np.ones(n) / n
-
-    # Initialize teleport vector p
-    p = np.zeros(n)
-    if teleport_indices:
-        p[teleport_indices] = 1.0 / len(teleport_indices)
-    else:
-        p[:] = 1.0 / n
-
-    # Power iteration
-    v = np.copy(p)
-    for _ in range(max_iter):
-        v_next = (1.0 - alpha) * np.dot(normalized_matrix, v) + alpha * p
-        if np.linalg.norm(v_next - v, 1) < tol:
-            return v_next
-        v = v_next
-    return v
-```
-Using the PPR scores, Ash extracts code definitions (signatures) from the highest-ranking files and writes them to a structured Markdown representation in the context.
+Refresh and rendering are best-effort: a pending map can be omitted; a
+failed refresh is reported without turning untrusted repository text into
+instructions. Budgeted assembly bounds this section separately. The map
+does not replace explicit safe source reads by the coding agent.
 
 ---
 
@@ -242,7 +131,7 @@ not stored in the repository and does not require a separate vector database.
                                   ▼
                      Reciprocal-Rank Fusion
                                   ▼
-                    Inject to Context Builder
+                    Inject as untrusted context
 ```
 
 ### 5.1 Single Transactional Store
