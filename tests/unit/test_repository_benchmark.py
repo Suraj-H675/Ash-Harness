@@ -281,6 +281,11 @@ def test_headless_error_category_refuses_untrusted_or_large_output(
             "https://github.com/mahmoud/boltons.git",
             {"boltons/listutils.py", "boltons/setutils.py"},
         ),
+        (
+            "pyflakes-functional-typing-fields",
+            "https://github.com/PyCQA/pyflakes.git",
+            {"pyflakes/checker.py"},
+        ),
     ],
 )
 def test_upstream_tasks_are_pinned_and_oracles_sealed(
@@ -299,6 +304,20 @@ def test_upstream_tasks_are_pinned_and_oracles_sealed(
     assert task.hidden_source not in task.prompt
     compile(task.visible_source, task.visible_script, "exec")
     compile(task.hidden_source, "<sealed-oracle>", "exec")
+
+
+def test_pyflakes_r16_pins_and_model_inputs() -> None:
+    task_id = "pyflakes-functional-typing-fields"
+    assert [name for name in bench.TASKS if name.startswith("pyflakes-")] == [task_id]
+    task = bench.TASKS[task_id]
+    assert task.source == "PyCQA/pyflakes"
+    assert task.base_sha == "9f0a7f9c8feb4d086a918a708bb778b38ce7a248"
+    assert task.reference_fix_sha == "5f2af952d81a8bead32d3ab91a60f7efbc6d8aea"
+
+    for model_input in (task.prompt, bench.shared_user_prompt(task), task.visible_source):
+        assert task.hidden_source not in model_input
+        assert "PYFLAKES_TYPING_FIELDS_HIDDEN_OK" not in model_input
+        assert task.reference_fix_sha not in model_input
 
 
 @pytest.mark.parametrize("task_id", tuple(bench.TASKS))

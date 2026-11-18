@@ -1574,6 +1574,93 @@ print("MORE_ITERTOOLS_PEEKABLE_HIDDEN_OK")
 """
 
 
+PYFLAKES_TYPING_FIELDS_VISIBLE = """from io import StringIO
+
+from pyflakes.api import check
+from pyflakes.reporter import Reporter
+
+source = '''from typing import NamedTuple, TypedDict
+from schema_catalog import columns, properties
+
+Profile = TypedDict("Profile", properties)
+Visit = NamedTuple("Visit", columns)
+'''
+
+warnings, errors = StringIO(), StringIO()
+count = check(source, "profiles.py", Reporter(warnings, errors))
+assert count == 0, warnings.getvalue() + errors.getvalue()
+
+print("PYFLAKES_TYPING_FIELDS_VISIBLE_OK")
+"""
+
+
+PYFLAKES_TYPING_FIELDS_HIDDEN = """from io import StringIO
+
+from pyflakes.api import check
+from pyflakes.messages import UndefinedName, UnusedImport
+from pyflakes.reporter import Reporter
+
+
+class RecordingReporter(Reporter):
+    def __init__(self):
+        self.errors = StringIO()
+        super().__init__(StringIO(), self.errors)
+        self.diagnostics = []
+
+    def flake(self, message):
+        self.diagnostics.append((type(message), message.message_args))
+
+
+def expect_diagnostics(filename, source, *expected):
+    reporter = RecordingReporter()
+    count = check(source, filename, reporter)
+    assert not reporter.errors.getvalue(), reporter.errors.getvalue()
+    actual = tuple(reporter.diagnostics)
+    assert count == len(expected) and actual == expected, (filename, actual)
+
+
+expect_diagnostics(
+    "runtime_fields.py",
+    '''import typing as types
+import field_catalog as catalog
+from field_catalog import select_fields, stored_rows
+
+Packet = types.TypedDict("Packet", catalog.mappings["wire"])
+Record = types.NamedTuple("Record", select_fields(stored_rows, "stored"))
+''',
+)
+
+expect_diagnostics(
+    "missing_fields.py",
+    '''from typing import NamedTuple as record, TypedDict as mapping
+from field_catalog import select_fields, surplus
+
+Event = mapping("Event", unknown_schema)
+Entry = record("Entry", select_fields(unknown_fields))
+''',
+    (UnusedImport, ("field_catalog.surplus",)),
+    (UndefinedName, ("unknown_schema",)),
+    (UndefinedName, ("unknown_fields",)),
+)
+
+expect_diagnostics(
+    "forward_references.py",
+    '''from typing import NamedTuple, TypedDict
+
+Payload = TypedDict("Payload", {"value": "Value", "note": "UnknownNote"})
+Row = NamedTuple("Row", [("value", "Value"), ("tag", "UnknownTag")])
+
+class Value:
+    pass
+''',
+    (UndefinedName, ("UnknownNote",)),
+    (UndefinedName, ("UnknownTag",)),
+)
+
+print("PYFLAKES_TYPING_FIELDS_HIDDEN_OK")
+"""
+
+
 @dataclass(frozen=True)
 class RepositoryTask:
     source: str
@@ -1589,6 +1676,30 @@ class RepositoryTask:
 
 
 TASKS = {
+    "pyflakes-functional-typing-fields": RepositoryTask(
+        source="PyCQA/pyflakes",
+        upstream="https://github.com/PyCQA/pyflakes.git",
+        base_sha="9f0a7f9c8feb4d086a918a708bb778b38ce7a248",
+        reference_fix_sha="5f2af952d81a8bead32d3ab91a60f7efbc6d8aea",
+        editable=frozenset({"pyflakes/checker.py"}),
+        visible_script="qa_visible.py",
+        visible_source=PYFLAKES_TYPING_FIELDS_VISIBLE,
+        hidden_source=PYFLAKES_TYPING_FIELDS_HIDDEN,
+        command_grant="python3 -B qa_visible.py",
+        prompt=(
+            "Repair a historical static analysis bug in this pinned Pyflakes "
+            "repository. Functional typing.TypedDict and typing.NamedTuple "
+            "calls can report a false unused import when their second "
+            "argument is a runtime expression that uses an imported name. "
+            "Check that expression for ordinary name uses and undefined "
+            "names. Preserve annotation handling for types in literal "
+            "TypedDict mappings and NamedTuple field lists, including "
+            "quoted forward references. Inspect qa_visible.py and the "
+            "relevant source. Edit only pyflakes/checker.py, then run exactly "
+            "python3 -B qa_visible.py with run_command. No other commands are "
+            "authorized. Preserve upstream tests and all other files."
+        ),
+    ),
     "click-clirunner-context-settings": RepositoryTask(
         source="pallets/click",
         upstream="https://github.com/pallets/click.git",
