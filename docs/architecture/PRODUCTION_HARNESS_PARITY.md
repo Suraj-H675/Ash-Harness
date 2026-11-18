@@ -210,26 +210,53 @@ initial guards did **not** establish safe route affinity after a prior
 successful backup. The follow-up checkpoint below adds durable source-model
 ownership while retaining the original fail-closed model-switch behavior.
 
-**Durable replay-owner affinity (2026-11-17, local):** A separate red-first
-reproduction showed a successful backup response retaining opaque reasoning
-without the source model's identity. Reconstructing a new runtime from the
-same session database then retried the configured primary with that state.
-Ash now persists the actual producing `provider/model` alongside each new
-assistant replay-state item and each native Responses checkpoint, outside the
-canonical provider payload. Continuation resolves a single consistent owner
-from *all* durable assistant metadata; failover dispatches only to exactly
-one matching child, including if that child is the backup. Unknown legacy
-state, conflicting origins, missing/duplicate provider routes, and unavailable
-owners fail closed with `/restart-context` guidance, without dispatching
-the private state to another provider. Native checkpoint installation now
-requires source-model ownership. A new real `AshLoop` instance resumed the
-persisted backup turn and continued only on the backup; this is a fresh-runtime
-database round trip **within one test process**, not a separate-process CLI
-resume or a live provider-network test. Credential-profile affinity when the
-same model route uses distinct accounts or transports, adversarial database
-tampering, and broader provider combinations remain unverified. The earlier
-conservative manual `/model` transition rule stays unchanged. Hosted CI for
-this checkpoint is pending; provider failover remains **Partial**.
+**Durable model and credential-profile replay affinity (2026-11-17, local):**
+A red-first reproduction showed a successful backup response retaining opaque
+reasoning without the source model's identity; a reconstructed runtime then
+retried the recovered primary with that state. A follow-up separate-process
+test exposed the second boundary: a model route can itself contain an ordered
+credential pool, and a new process resets that pool's active profile. Model
+identity alone would therefore let a different credential profile receive
+opaque state. Ash now persists the actual producing `provider/model` and the
+active **logical credential-profile ID**, when present, alongside each new
+assistant replay-state item and native Responses checkpoint, outside the
+canonical provider payload. Credential bytes, tokens, and API keys are never
+persisted. Profile IDs identify configured slots (for example, an environment
+variable name or credential-helper slot), not a cryptographic fingerprint of
+the credential value; changing the secret behind an unchanged slot is not
+detectable by this metadata.
+
+Continuation resolves one consistent model and optional profile from *all*
+durable assistant replay metadata. Failover selects exactly one matching
+provider/model child; a credential pool then selects only the exact recorded
+profile and does not rotate to another profile if it is missing, cooling down,
+or unavailable. Replay without a durable session identity, multi-profile replay with no
+verified profile, conflicting profile labels, missing/duplicate model routes,
+and unavailable owners fail closed with `/restart-context` guidance, before
+opaque state is dispatched. Legacy state without a verified profile ID is
+refused through every credential pool, including a currently single-profile
+pool: current configuration cannot prove which slot originally produced the
+state. Native checkpoint installation validates and persists optional profile
+ownership as part of the same child transaction. Credential-profile telemetry
+for resumed requests resolves the actual owner route rather than reporting the
+configured primary's profile.
+
+The new red-first integration test launches **two separate OS processes through
+the real Ash CLI entry point**, each with a fresh provider registry and local
+HTTP fixture: process one fails over from the primary model, rotates from a
+rejected credential slot to the successful backup slot, and persists opaque
+state; process two starts with the primary model and first credential slot
+healthy, but sends the replay only to the exact backup model and recorded
+credential profile. The fixture verifies that neither recovered alternative
+receives the state. This is a deterministic local test-provider simulation,
+not a live provider-network or cross-account compatibility test. The earlier
+conservative manual `/model` transition rule remains unchanged. Adversarial
+database tampering, secret replacement behind a stable profile ID, and broader
+real-provider combinations remain unverified; provider failover remains
+**Partial**. The preceding model-owner-only checkpoint passed hosted CI
+[#44145180094](https://github.com/Suraj-H675/Ash-Harness/actions/runs/44145180094)
+with 18/18 jobs green; this credential-profile follow-up must be judged against
+its own hosted run on the exact follow-up commit, not inherit the earlier pass.
 
 **Later coding evidence (2026-11-10):** The first ChatGPT-plan coding replay
 passed the synthetic two-file fixture with GPT-6 Luna and the synthetic

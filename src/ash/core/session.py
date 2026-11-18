@@ -5399,15 +5399,20 @@ class SessionStore:
                     return True
         return False
 
-    def provider_replay_state_owner(self, session_id: str) -> str | None:
-        """Resolve one verified replay source across the entire durable history.
+    def provider_replay_state_identity(
+        self,
+        session_id: str,
+    ) -> tuple[str | None, str | None]:
+        """Resolve one model and optional credential-profile owner for replay.
 
-        Historic state without a source, or state produced by multiple models,
-        must not be assigned to the configured primary by guesswork. Keep
-        model-specific replay provenance outside the canonical provider input.
+        Historic state without a source, or state produced by multiple models
+        or credential profiles, must not be assigned by guesswork. Profile IDs
+        are logical, non-secret slots; credential material is never persisted.
         """
 
         owner: str | None = None
+        credential_profile: str | None = None
+        profile_seen = False
         with closing(self._connect()) as conn:
             for row in conn.execute(
                 "SELECT metadata_json FROM messages "
@@ -5444,7 +5449,32 @@ class SessionStore:
                         "another model request."
                     )
                 owner = source
-        return owner
+                raw_profile = metadata.get("provider_state_credential_profile")
+                if raw_profile is not None and (
+                    not isinstance(raw_profile, str)
+                    or not 1 <= len(raw_profile) <= 256
+                    or any(ord(char) < 33 or ord(char) == 127 for char in raw_profile)
+                ):
+                    raise RuntimeError(
+                        "Opaque provider replay state has an invalid credential "
+                        "profile identity; use /restart-context with an explicit "
+                        "handoff before another model request."
+                    )
+                if profile_seen and raw_profile != credential_profile:
+                    raise RuntimeError(
+                        "Opaque provider replay state has conflicting credential "
+                        "profiles; use /restart-context with an explicit handoff "
+                        "before another model request."
+                    )
+                if not profile_seen:
+                    credential_profile = raw_profile
+                    profile_seen = True
+        return owner, credential_profile
+
+    def provider_replay_state_owner(self, session_id: str) -> str | None:
+        """Return the verified model owner, retaining the older narrow API."""
+
+        return self.provider_replay_state_identity(session_id)[0]
 
     def save_runtime_events(self, events: list[dict[str, Any]]) -> int:
         """Append a batch of canonical events, ignoring replayed event IDs."""
@@ -5704,6 +5734,7 @@ class SessionStore:
         _automatic_context_handoff: bool = False,
         _native_checkpoint: list[dict[str, Any]] | None = None,
         _native_checkpoint_owner: str | None = None,
+        _native_checkpoint_credential_profile: str | None = None,
         _expected_parent_messages: int | None = None,
         _expected_parent_revision: str | None = None,
         _expected_parent_model: str | None = None,
@@ -5744,6 +5775,21 @@ class SessionStore:
             ):
                 raise ValueError("native checkpoint requires a valid source model")
             metadata["provider_state_owner"] = _native_checkpoint_owner
+            if _native_checkpoint_credential_profile is not None:
+                if (
+                    not isinstance(_native_checkpoint_credential_profile, str)
+                    or not 1 <= len(_native_checkpoint_credential_profile) <= 256
+                    or any(
+                        ord(char) < 33 or ord(char) == 127
+                        for char in _native_checkpoint_credential_profile
+                    )
+                ):
+                    raise ValueError(
+                        "native checkpoint has an invalid credential profile"
+                    )
+                metadata["provider_state_credential_profile"] = (
+                    _native_checkpoint_credential_profile
+                )
             checkpoint_metadata = json.dumps(metadata, sort_keys=True, allow_nan=False)
         if _restart_handoff is not None:
             from ash.core.redaction import redact_text
@@ -6476,6 +6522,7 @@ class SessionStore:
         expected_parent_permission_mode: str | None = None,
         checkpoint: list[dict[str, Any]],
         checkpoint_owner: str,
+        checkpoint_credential_profile: str | None = None,
     ) -> Session:
         """Atomically install a provider-generated opaque checkpoint in a child."""
         return self.fork_session(
@@ -6486,6 +6533,7 @@ class SessionStore:
             branch_summary="Provider-managed compaction; source audit retained",
             _native_checkpoint=checkpoint,
             _native_checkpoint_owner=checkpoint_owner,
+            _native_checkpoint_credential_profile=checkpoint_credential_profile,
             _expected_parent_messages=expected_parent_messages,
             _expected_parent_revision=expected_parent_revision,
             _expected_parent_model=expected_parent_model,

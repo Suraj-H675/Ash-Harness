@@ -150,6 +150,7 @@ class FailoverProvider(ProviderABC):
         tools: list[dict[str, Any]] | None = None,
         *,
         replay_owner: str | None = None,
+        replay_profile: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         last_error: Exception | None = None
         failures: list[str] = []
@@ -162,6 +163,11 @@ class FailoverProvider(ProviderABC):
                 "Opaque reasoning replay has no verified source model. "
                 "Use /restart-context with an explicit handoff before "
                 "continuing, or supply verified replay ownership."
+            )
+        if replay_profile is not None and replay_owner is None:
+            raise RuntimeError(
+                "Opaque reasoning replay has no verified model owner for its "
+                "credential profile; use /restart-context with an explicit handoff."
             )
         if replay_owner is not None:
             matches = [
@@ -186,10 +192,28 @@ class FailoverProvider(ProviderABC):
             exposed_terminal = False
             saw_terminal = False
             try:
-                async with managed_async_stream(
-                    provider.stream_chat(
+                if replay_profile is not None:
+                    from ash.providers.credential_pool import CredentialPoolProvider
+
+                    if not isinstance(provider, CredentialPoolProvider):
+                        raise RuntimeError(
+                            "The credential profile owning retained opaque "
+                            "reasoning state is not available on the selected "
+                            "model route; use /restart-context with an explicit "
+                            "handoff before continuing."
+                        )
+                    child_stream = provider.stream_chat(
+                        messages,
+                        temperature=temperature,
+                        tools=tools,
+                        replay_profile=replay_profile,
+                    )
+                else:
+                    child_stream = provider.stream_chat(
                         messages, temperature=temperature, tools=tools
-                    ),
+                    )
+                async with managed_async_stream(
+                    child_stream,
                     label="failover child",
                 ) as child_stream:
                     async for chunk in child_stream:
@@ -223,6 +247,12 @@ class FailoverProvider(ProviderABC):
         self.failures = failures
         assert last_error is not None
         if replay_owner is not None:
+            if replay_profile is not None:
+                raise RuntimeError(
+                    "The model and credential profile owning retained opaque "
+                    "reasoning state are unavailable; restore that exact route "
+                    "or use /restart-context with an explicit handoff."
+                ) from last_error
             raise RuntimeError(
                 "The model owning retained opaque reasoning state is unavailable; "
                 "use /restart-context with an explicit handoff or restore the "

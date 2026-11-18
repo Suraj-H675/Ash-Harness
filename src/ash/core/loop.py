@@ -887,10 +887,21 @@ def _provider_request_identity(
 
 def _provider_credential_context(
     provider: ProviderABC,
+    *,
+    model_id: str | None = None,
 ) -> tuple[str | None, int]:
-    """Return the active secret-free credential profile ID and pool size."""
+    """Return a route's secret-free credential profile ID and pool size."""
 
     current: ProviderABC = provider
+    if model_id is not None and isinstance(provider, FailoverProvider):
+        matches = [
+            candidate
+            for candidate in provider.providers
+            if f"{candidate.provider_family}/{candidate.model_name}" == model_id
+        ]
+        if len(matches) != 1:
+            return None, 0
+        current = matches[0]
     seen: set[int] = set()
     while id(current) not in seen:
         seen.add(id(current))
@@ -919,8 +930,13 @@ def _provider_credential_context(
 
 def _provider_credential_event_fields(
     provider: ProviderABC,
+    *,
+    model_id: str | None = None,
+    profile_override: str | None = None,
 ) -> dict[str, str | int]:
-    profile, count = _provider_credential_context(provider)
+    profile, count = _provider_credential_context(provider, model_id=model_id)
+    if profile_override is not None:
+        profile = profile_override
     if profile is None:
         return {}
     return {
@@ -4502,6 +4518,11 @@ class AshLoop:
             )
 
             # Persist the assistant turn.
+            replay_credential_profile, _ = (
+                _provider_credential_context(self.provider)
+                if model_completion.provider_state
+                else (None, 0)
+            )
             assistant_message = Message(
                 role="assistant",
                 content=assistant_text,
@@ -4516,6 +4537,15 @@ class AshLoop:
                     **(
                         {"provider_state_owner": self.active_model_id}
                         if model_completion.provider_state
+                        else {}
+                    ),
+                    **(
+                        {
+                            "provider_state_credential_profile": (
+                                replay_credential_profile
+                            )
+                        }
+                        if replay_credential_profile is not None
                         else {}
                     ),
                 },
@@ -5431,11 +5461,18 @@ class AshLoop:
         """Stream one completion with normalized token and cache usage."""
 
         canonical_messages = normalize_messages(messages)
-        has_replay = any(message.get("provider_state") for message in canonical_messages)
-        replay_owner = (
-            self.session_store.provider_replay_state_owner(session_id)
+        has_replay = any(
+            message.get("provider_state") for message in canonical_messages
+        )
+        if has_replay and session_id is None:
+            raise RuntimeError(
+                "Opaque provider reasoning state has no durable session identity; "
+                "use /restart-context with an explicit handoff."
+            )
+        replay_owner, replay_profile = (
+            self.session_store.provider_replay_state_identity(session_id)
             if has_replay and session_id is not None
-            else None
+            else (None, None)
         )
         if has_replay and session_id is not None and replay_owner is None:
             raise RuntimeError(
@@ -5451,6 +5488,17 @@ class AshLoop:
                 "The current model does not own the session's opaque reasoning "
                 "state; use /restart-context with an explicit handoff."
             )
+        if replay_profile is not None and not isinstance(
+            self.provider, FailoverProvider
+        ):
+            from ash.providers.credential_pool import CredentialPoolProvider
+
+            if not isinstance(self.provider, CredentialPoolProvider):
+                raise RuntimeError(
+                    "The credential profile owning retained opaque reasoning "
+                    "state is not available on the current model route; use "
+                    "/restart-context with an explicit handoff."
+                )
         # Build OpenAI-format tools list for providers that support native tool_calls.
         provider_tools = (
             self._provider_tools() if provider_tools is None else provider_tools
@@ -5525,7 +5573,11 @@ class AshLoop:
                             "message_count": len(canonical_messages),
                             "tool_count": len(openai_tools or ()),
                             "native_tools": native_protocol,
-                            **_provider_credential_event_fields(self.provider),
+                            **_provider_credential_event_fields(
+                                self.provider,
+                                model_id=replay_owner,
+                                profile_override=replay_profile,
+                            ),
                         }
                     )
                     notice_operation_id = active_request_id
@@ -5564,6 +5616,18 @@ class AshLoop:
                                 canonical_messages,
                                 tools=openai_tools,
                                 replay_owner=replay_owner,
+                                replay_profile=replay_profile,
+                            )
+                        elif replay_profile is not None:
+                            from ash.providers.credential_pool import (
+                                CredentialPoolProvider,
+                            )
+
+                            assert isinstance(self.provider, CredentialPoolProvider)
+                            active_provider_stream = self.provider.stream_chat(
+                                canonical_messages,
+                                tools=openai_tools,
+                                replay_profile=replay_profile,
                             )
                         else:
                             active_provider_stream = self.provider.stream_chat(
@@ -8422,6 +8486,9 @@ class AshLoop:
             expected_parent_permission_mode=source.permission_mode,
             checkpoint=checkpoint,
             checkpoint_owner=self.active_model_id,
+            checkpoint_credential_profile=(
+                _provider_credential_context(self.provider)[0]
+            ),
         )
 
     # --- provider switching -------------------------------------------------

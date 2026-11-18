@@ -20,7 +20,7 @@ from ash.providers.base import (
     stream_chunk_commits_provider,
 )
 from ash.providers.capabilities import ProviderCapabilities
-from ash.providers.messages import MessageInput
+from ash.providers.messages import MessageInput, normalize_messages
 from ash.providers.retry import (
     ProviderFailure,
     ProviderFailureCategory,
@@ -67,7 +67,7 @@ class _CredentialState:
 
 
 class CredentialPoolProvider(ProviderABC):
-    """Rotate ordered credentials for one provider/model before model failover."""
+    """Rotate credentials before output; pin opaque replay to its source profile."""
 
     def __init__(
         self,
@@ -164,9 +164,47 @@ class CredentialPoolProvider(ProviderABC):
         messages: Sequence[MessageInput],
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
+        *,
+        replay_profile: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         last_error: Exception | None = None
-        candidates = self._candidate_indices()
+        historical_state = any(
+            item.get("role") == "assistant" and item.get("provider_state")
+            for item in normalize_messages(messages)
+        )
+        if replay_profile is not None:
+            if not historical_state:
+                raise ValueError(
+                    "a replay credential profile requires retained provider state"
+                )
+            matches = [
+                index
+                for index, profile_id in enumerate(self.profile_ids)
+                if profile_id == replay_profile
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "The credential profile owning retained opaque reasoning state "
+                    "is not uniquely available; use /restart-context with an "
+                    "explicit handoff before continuing."
+                )
+            owner_index = matches[0]
+            remaining = self._states[owner_index].cooldown_until - self._clock()
+            if remaining > 0:
+                raise RuntimeError(
+                    "The credential profile owning retained opaque reasoning "
+                    f"state is cooling down for {remaining:.1f} seconds; wait or "
+                    "use /restart-context with an explicit handoff."
+                )
+            candidates = [owner_index]
+        elif historical_state:
+            raise RuntimeError(
+                "Opaque provider reasoning state has no verified credential "
+                "profile owner; use /restart-context with an explicit handoff "
+                "before continuing."
+            )
+        else:
+            candidates = self._candidate_indices()
         if not candidates:
             raise self._cooldown_error()
         for index in candidates:
@@ -214,6 +252,12 @@ class CredentialPoolProvider(ProviderABC):
                 last_error = exc
                 continue
         assert last_error is not None
+        if replay_profile is not None:
+            raise RuntimeError(
+                "The credential profile owning retained opaque reasoning state "
+                "is unavailable; restore that profile or use /restart-context "
+                "with an explicit handoff before continuing."
+            ) from last_error
         raise last_error
 
     def snapshot(self) -> tuple[dict[str, str | float | bool], ...]:

@@ -139,6 +139,73 @@ def test_replay_owner_matches_only_consistent_durable_assistant_sources(
     assert store.provider_replay_state_owner(session.session_id) == "backup/second"
 
 
+def test_provider_replay_identity_retains_one_consistent_logical_profile(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "consistent-replay-identity.db")
+    session = store.create_session(str(tmp_path))
+    for idx in range(2):
+        store.save_message(
+            session.session_id,
+            Message(
+                role="assistant", content=f"prior-{idx}",
+                timestamp=datetime.now(timezone.utc),
+                metadata={
+                    "provider_state": [{
+                        "type": "reasoning", "id": f"rs-{idx}", "summary": [],
+                        "encrypted_content": f"opaque-{idx}",
+                    }],
+                    "provider_state_owner": "openai/gpt-test",
+                    "provider_state_credential_profile": "OPENAI_BACKUP",
+                },
+            ),
+        )
+
+    assert store.provider_replay_state_identity(session.session_id) == (
+        "openai/gpt-test",
+        "OPENAI_BACKUP",
+    )
+
+
+@pytest.mark.parametrize(
+    "profiles",
+    [
+        ["OPENAI_PRIMARY", "OPENAI_BACKUP"],
+        ["OPENAI_BACKUP", None],
+        ["OPENAI_BACKUP\nunsafe"],
+    ],
+)
+def test_provider_replay_identity_refuses_conflicting_or_invalid_profiles(
+    tmp_path: Path,
+    profiles: list[str | None],
+) -> None:
+    store = SessionStore(tmp_path / "conflicting-replay-identity.db")
+    session = store.create_session(str(tmp_path))
+    for idx, profile in enumerate(profiles):
+        metadata: dict[str, Any] = {
+            "provider_state": [
+                {
+                    "type": "reasoning",
+                    "id": f"rs-{idx}",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                }
+            ],
+            "provider_state_owner": "openai/gpt-test",
+        }
+        if profile is not None:
+            metadata["provider_state_credential_profile"] = profile
+        store.save_message(
+            session.session_id,
+            Message(
+                role="assistant", content="prior",
+                timestamp=datetime.now(timezone.utc), metadata=metadata,
+            ),
+        )
+    with pytest.raises(RuntimeError, match="credential profile.*/restart-context"):
+        store.provider_replay_state_identity(session.session_id)
+
+
 @pytest.mark.parametrize(
     "stop_reason", ["token_budget", "iteration_limit", "circuit_breaker"]
 )
@@ -2477,6 +2544,7 @@ def test_native_context_checkpoint_preserves_parent_without_replaying_actions(
     child = store.install_native_context_checkpoint(
         root.session_id,
         checkpoint_owner="openai/test-checkpoint",
+        checkpoint_credential_profile="OPENAI_BACKUP",
         expected_project_path=tmp_path,
         expected_parent_messages=1,
         expected_parent_revision=store.session_history_revision(root.session_id),
@@ -2489,6 +2557,9 @@ def test_native_context_checkpoint_preserves_parent_without_replaying_actions(
     assert child.messages[0].role == "assistant"
     assert child.messages[0].content == ""
     assert child.messages[0].metadata["provider_state"] == checkpoint
+    assert child.messages[0].metadata["provider_state_credential_profile"] == (
+        "OPENAI_BACKUP"
+    )
     assert child.tool_calls == []
     assert store.list_audit_logs(child.session_id) == []
     assert store.verify_audit_log(child.session_id) == []

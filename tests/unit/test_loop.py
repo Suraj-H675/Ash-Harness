@@ -9768,6 +9768,36 @@ async def test_legacy_unowned_replay_refuses_before_any_provider_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_opaque_replay_without_durable_session_id_refuses_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    loop = AshLoop(
+        SessionStore(tmp_path / "sessionless-opaque-replay.db"),
+        MustNotRunProvider(),
+        SafetyGuard(tmp_path),
+        EventUI(),
+        tmp_path,
+    )
+    history = [
+        {
+            "role": "assistant",
+            "content": "Earlier answer",
+            "provider_state": [
+                {
+                    "type": "reasoning",
+                    "id": "rs-sessionless",
+                    "summary": [],
+                    "encrypted_content": "sessionless-opaque-state",
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="durable session identity"):
+        await loop._stream_one_completion(history)
+
+
+@pytest.mark.asyncio
 async def test_opaque_backup_replay_resumes_on_actual_owner_not_primary(
     tmp_path: Path,
 ) -> None:
@@ -12481,6 +12511,52 @@ async def test_credential_rotation_is_one_model_attempt_with_profile_telemetry(
         for event in ui.events
     )
     assert loop._provider_circuit_key == "openai/gpt-test"
+
+
+def test_replay_credential_telemetry_resolves_nonprimary_model_and_profile() -> None:
+    from ash.providers.credential_pool import CredentialPoolProvider
+
+    class ProfileProvider(ProviderABC):
+        provider_family = "openai"
+        _ash_declared_capabilities = ProviderCapabilities(native_tools=True)
+
+        def __init__(self, model: str) -> None:
+            self._model_name = model
+
+        @property
+        def model_name(self) -> str:
+            return self._model_name
+
+        def count_tokens(self, text):
+            return len(text)
+
+        async def stream_chat(self, messages, temperature=0.0, tools=None):
+            del messages, temperature, tools
+            yield StreamChunk(content="unused", is_done=True)
+
+    primary = CredentialPoolProvider(
+        [ProfileProvider("primary"), ProfileProvider("primary")],
+        ["PRIMARY_ONE", "PRIMARY_TWO"],
+    )
+    backup = CredentialPoolProvider(
+        [ProfileProvider("backup"), ProfileProvider("backup")],
+        ["BACKUP_ONE", "BACKUP_OWNER"],
+    )
+    chain = FailoverProvider([primary, backup])
+
+    assert chain.active_index == 0
+    assert loop_module._provider_credential_context(
+        chain, model_id="openai/backup"
+    ) == ("BACKUP_ONE", 2)
+    assert loop_module._provider_credential_event_fields(
+        chain,
+        model_id="openai/backup",
+        profile_override="BACKUP_OWNER",
+    ) == {
+        "credential_profile": "BACKUP_OWNER",
+        "credential_pool_size": 2,
+    }
+    assert chain.active_index == 0
 
 
 @pytest.mark.asyncio
