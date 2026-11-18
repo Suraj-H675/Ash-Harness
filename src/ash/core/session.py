@@ -4346,11 +4346,26 @@ class SessionStore:
             )
 
     def complete_turn(self, turn_id: str) -> None:
+        """Complete a started turn; repeated completion is an idempotent no-op."""
+
         with closing(self._connect()) as conn, conn:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE turn_journal SET status = 'completed', completed_at = ? "
-                "WHERE turn_id = ?",
+                "WHERE turn_id = ? AND status = 'started'",
                 (_serialize_datetime(_utc_now()), turn_id),
+            )
+            if cursor.rowcount:
+                return
+            row = conn.execute(
+                "SELECT status FROM turn_journal WHERE turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Turn not found: {turn_id}")
+            if row["status"] == "completed":
+                return
+            raise SessionStorageError(
+                f"cannot complete turn {turn_id!r} from {row['status']!r} state"
             )
 
     def latest_incomplete_turn_reason(self, session_id: str) -> str | None:
@@ -4739,9 +4754,51 @@ class SessionStore:
         recovery: dict[str, Any],
         recovered_calls: list[Any],
     ) -> None:
-        """Atomically persist one startup recovery decision."""
+        """Atomically persist one startup recovery decision exactly once."""
+
+        recovery_json = json.dumps(recovery, sort_keys=True)
+        if recovery_json == "{}":
+            raise ValueError("interrupted recovery receipt must not be empty")
+        if recovery.get("turn_id") != turn_id:
+            raise ValueError("interrupted recovery receipt turn_id does not match")
 
         with closing(self._connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE turn_journal SET status = 'interrupted', completed_at = ?, "
+                "recovery_json = ? WHERE session_id = ? AND turn_id = ? "
+                "AND status IN ('started', 'interrupted') "
+                "AND COALESCE(recovery_json, '{}') = '{}'",
+                (
+                    _serialize_datetime(_utc_now()),
+                    recovery_json,
+                    session_id,
+                    turn_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                row = conn.execute(
+                    "SELECT status, recovery_json FROM turn_journal "
+                    "WHERE session_id = ? AND turn_id = ?",
+                    (session_id, turn_id),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Turn not found: {turn_id}")
+                if row["status"] == "completed":
+                    raise SessionStorageError(
+                        f"cannot finalize recovery for completed turn {turn_id!r}"
+                    )
+                if (
+                    row["status"] == "interrupted"
+                    and str(row["recovery_json"] or "{}") != "{}"
+                ):
+                    raise SessionStorageError(
+                        f"recovery already finalized for turn {turn_id!r}"
+                    )
+                raise SessionStorageError(
+                    f"cannot finalize recovery for turn {turn_id!r} "
+                    f"in {row['status']!r} state"
+                )
+
             recovered_by_id = {str(call.call_id): call for call in recovered_calls}
             for call in recovered_calls:
                 assistant_message_id = getattr(call, "assistant_message_id", None)
@@ -4926,24 +4983,16 @@ class SessionStore:
                 )
             if restored_checkpoint_ids:
                 placeholders = ",".join("?" for _ in restored_checkpoint_ids)
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE file_checkpoints SET restored = 1 "
-                    f"WHERE session_id = ? AND checkpoint_id IN ({placeholders})",
-                    (session_id, *restored_checkpoint_ids),
+                    f"WHERE session_id = ? AND turn_id = ? AND restored = 0 "
+                    f"AND checkpoint_id IN ({placeholders})",
+                    (session_id, turn_id, *restored_checkpoint_ids),
                 )
-            conn.execute(
-                "UPDATE turn_journal SET status = 'interrupted', completed_at = ?, "
-                "recovery_json = ? WHERE session_id = ? AND turn_id = ? "
-                "AND (status = 'started' OR ("
-                "status = 'interrupted' AND COALESCE(recovery_json, '{}') = '{}'"
-                "))",
-                (
-                    _serialize_datetime(_utc_now()),
-                    json.dumps(recovery, sort_keys=True),
-                    session_id,
-                    turn_id,
-                ),
-            )
+                if cursor.rowcount != len(restored_checkpoint_ids):
+                    raise SessionStorageError(
+                        "recovery checkpoint set changed or belongs to another turn"
+                    )
 
     def interrupted_recovery_reports(self, session_id: str) -> list[dict[str, Any]]:
         """Return persisted non-empty startup recovery reports newest-first."""
