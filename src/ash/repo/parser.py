@@ -20,6 +20,9 @@ import tree_sitter_typescript as tstypescript
 
 
 MAX_SOURCE_FILE_BYTES = 8 * 1024 * 1024
+MAX_IDENTIFIER_NAME_INDEX_BYTES_PER_FILE = 1024 * 1024
+_IDENTIFIER_INDEX_BASE_BYTES = 256
+_IDENTIFIER_INDEX_ENTRY_OVERHEAD_BYTES = 128
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,52 @@ class SourceLocation:
     end_line: int
     end_column: int
     language: str
+
+
+@dataclass(frozen=True)
+class ExtractedSource:
+    """Symbols and complete identifier metadata from one source parse."""
+
+    symbols: tuple[Symbol, ...]
+    # None marks unavailable or budget-exceeded metadata; callers must fall back.
+    identifier_names: frozenset[str] | None
+    # Conservative estimate used to bound retained per-file index memory.
+    identifier_index_bytes: int
+    # True when a larger per-file budget could produce complete metadata.
+    identifier_index_overflowed: bool
+
+
+class _IdentifierNameCollector:
+    """Collect exact names while bounding the retained per-file index size."""
+
+    def __init__(self, max_estimated_bytes: int) -> None:
+        self._max_estimated_bytes = max_estimated_bytes
+        self._estimated_bytes = _IDENTIFIER_INDEX_BASE_BYTES
+        self._names: set[str] = set()
+        self._complete = max_estimated_bytes >= _IDENTIFIER_INDEX_BASE_BYTES
+        self._overflowed = not self._complete
+
+    @property
+    def collecting(self) -> bool:
+        return self._complete
+
+    def add(self, name: str) -> None:
+        if not self._complete or name in self._names:
+            return
+        estimated_name_bytes = _IDENTIFIER_INDEX_ENTRY_OVERHEAD_BYTES + 4 * len(name)
+        if self._estimated_bytes + estimated_name_bytes > self._max_estimated_bytes:
+            self._names.clear()
+            self._complete = False
+            self._overflowed = True
+            self._estimated_bytes = 0
+            return
+        self._names.add(name)
+        self._estimated_bytes += estimated_name_bytes
+
+    def finish(self) -> tuple[frozenset[str] | None, int, bool]:
+        if not self._complete:
+            return None, 0, self._overflowed
+        return frozenset(self._names), self._estimated_bytes, False
 
 
 @dataclass(frozen=True)
@@ -242,18 +291,70 @@ class SymbolExtractor:
         self._parsers: dict[str, Parser] = {}
 
     def extract(self, file_path: Path, *, source: bytes | None = None) -> list[Symbol]:
+        return self._extract(file_path, source=source)
+
+    def extract_index(
+        self,
+        file_path: Path,
+        *,
+        source: bytes | None = None,
+        max_identifier_index_bytes: int = MAX_IDENTIFIER_NAME_INDEX_BYTES_PER_FILE,
+    ) -> ExtractedSource:
+        """Extract map metadata in one syntax-tree traversal."""
+
+        if (
+            type(self).extract is not SymbolExtractor.extract
+            or type(self).find_references is not SymbolExtractor.find_references
+            or any(
+                "_parse_file" in cls.__dict__ or "_collect" in cls.__dict__
+                for cls in type(self).__mro__
+                if cls not in {SymbolExtractor, object}
+            )
+            or "extract" in self.__dict__
+            or "find_references" in self.__dict__
+            or "_parse_file" in self.__dict__
+            or "_collect" in self.__dict__
+        ):
+            return ExtractedSource(
+                tuple(self.extract(file_path, source=source)), None, 0, False
+            )
+
+        identifier_names = _IdentifierNameCollector(max_identifier_index_bytes)
+        symbols = self._extract(
+            file_path, source=source, identifier_names=identifier_names
+        )
+        names, estimated_bytes, overflowed = identifier_names.finish()
+        return ExtractedSource(tuple(symbols), names, estimated_bytes, overflowed)
+
+    def _extract(
+        self,
+        file_path: Path,
+        *,
+        source: bytes | None,
+        identifier_names: _IdentifierNameCollector | None = None,
+    ) -> list[Symbol]:
         parsed = self._parse_file(file_path, source=source)
         if parsed is None:
             return []
         spec, root = parsed
         symbols: list[Symbol] = []
-        self._collect(
-            root,
-            file_path=file_path,
-            spec=spec,
-            parent=None,
-            out=symbols,
-        )
+        if identifier_names is None:
+            self._collect(
+                root,
+                file_path=file_path,
+                spec=spec,
+                parent=None,
+                out=symbols,
+            )
+        else:
+            self._collect(
+                root,
+                file_path=file_path,
+                spec=spec,
+                parent=None,
+                out=symbols,
+                identifier_names=identifier_names,
+            )
         return symbols
 
     def find_references(
@@ -325,9 +426,17 @@ class SymbolExtractor:
         spec: LanguageSpec,
         parent: str | None,
         out: list[Symbol],
+        identifier_names: _IdentifierNameCollector | None = None,
     ) -> None:
         node_type = node.type
         child_parent = parent
+
+        if (
+            identifier_names is not None
+            and identifier_names.collecting
+            and node_type in IDENTIFIER_NODE_TYPES
+        ):
+            identifier_names.add(self._text(node))
 
         class_kind = spec.class_nodes.get(node_type)
         if class_kind is not None:
@@ -427,6 +536,7 @@ class SymbolExtractor:
                 spec=spec,
                 parent=child_parent,
                 out=out,
+                identifier_names=identifier_names,
             )
 
     @classmethod

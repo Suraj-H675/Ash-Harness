@@ -34,8 +34,10 @@ from ash.safety.git import (
 from ash.repo.ignore import DEFAULT_IGNORED_DIRS
 from ash.repo.path_glob import matches_relative_glob
 from ash.repo.parser import (
+    MAX_IDENTIFIER_NAME_INDEX_BYTES_PER_FILE,
     MAX_SOURCE_FILE_BYTES,
     SOURCE_SUFFIXES,
+    ExtractedSource,
     SourceLocation,
     Symbol,
     SymbolExtractor,
@@ -54,6 +56,7 @@ from ash.sandbox.process_utils import (
 
 MAX_REPO_DISCOVERY_ENTRIES = 100_000
 MAX_REPO_DISCOVERY_DEPTH = 32
+MAX_REPO_MAP_IDENTIFIER_INDEX_BYTES = 16 * 1024 * 1024
 _FileFingerprint = tuple[int, int, int, int, int]
 
 
@@ -72,11 +75,15 @@ def _dot_quote(value: str) -> str:
 
 @dataclass(frozen=True)
 class FileNode:
-    """A workspace file plus its extracted symbols."""
+    """A workspace file plus metadata extracted from its source."""
 
     path: Path
     symbols: tuple[Symbol, ...]
     referenced_modules: tuple[str, ...]
+    identifier_names: frozenset[str] | None = None
+    identifier_index_bytes: int = 0
+    identifier_index_pending: bool = False
+    identifier_index_pending_budget_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -698,14 +705,31 @@ class RepoMap:
         if refresh:
             self._refresh()
         matches: list[SourceLocation] = []
+        expected = name if case_sensitive else name.casefold()
         ascii_name = name.encode("ascii") if case_sensitive and name.isascii() else None
         paths = [node.path for node in self._files]
+        indexed_paths = set(paths)
         explicit = self._explicit_unindexed_path(path_glob)
         if explicit is not None:
             paths.append(explicit)
         for path in paths:
             if not self._matches_path_glob(path, path_glob):
                 continue
+            if path in indexed_paths:
+                loaded = self._load_file(path)
+                if loaded is None:
+                    continue
+                identifier_names = loaded[2].identifier_names
+                if identifier_names is not None:
+                    if case_sensitive:
+                        has_identifier = name in identifier_names
+                    else:
+                        has_identifier = any(
+                            candidate.casefold() == expected
+                            for candidate in identifier_names
+                        )
+                    if not has_identifier:
+                        continue
             try:
                 _, source = read_scoped_bytes(
                     path,
@@ -989,14 +1013,23 @@ class RepoMap:
         files: list[FileNode] = []
         module_index: dict[str, Path] = {}
         next_cache: dict[Path, tuple[_FileFingerprint, FileNode]] = {}
+        identifier_index_bytes_remaining = MAX_REPO_MAP_IDENTIFIER_INDEX_BYTES
 
         for path in paths:
             if cancel_event is not None and cancel_event.is_set():
                 return
-            loaded = self._load_file(path)
+            loaded = self._load_file(
+                path,
+                max_identifier_index_bytes=min(
+                    identifier_index_bytes_remaining,
+                    MAX_IDENTIFIER_NAME_INDEX_BYTES_PER_FILE,
+                ),
+                retry_pending_identifier_index=True,
+            )
             if loaded is None:
                 continue
             resolved, fingerprint, node = loaded
+            identifier_index_bytes_remaining -= node.identifier_index_bytes
             files.append(node)
             next_cache[resolved] = (fingerprint, node)
             module_name = _normalize_module_name(resolved, self.project_root)
@@ -1013,7 +1046,14 @@ class RepoMap:
         self._index = {node.path: i for i, node in enumerate(files)}
         self._adjacency = self._build_adjacency()
 
-    def _load_file(self, path: Path) -> tuple[Path, _FileFingerprint, FileNode] | None:
+    def _load_file(
+        self,
+        path: Path,
+        *,
+        max_identifier_index_bytes: int = MAX_IDENTIFIER_NAME_INDEX_BYTES_PER_FILE,
+        defer_identifier_index: bool = False,
+        retry_pending_identifier_index: bool = False,
+    ) -> tuple[Path, _FileFingerprint, FileNode] | None:
         try:
             resolved, metadata = stat_scoped_path(path, self._guard)
         except (OSError, SafetyViolation):
@@ -1034,7 +1074,25 @@ class RepoMap:
         )
         cached = self._file_cache.get(resolved)
         if cached is not None and cached[0] == fingerprint:
-            return resolved, fingerprint, cached[1]
+            node = cached[1]
+            should_retry_pending_index = (
+                retry_pending_identifier_index
+                and node.identifier_index_pending
+                and max_identifier_index_bytes
+                > node.identifier_index_pending_budget_bytes
+            )
+            if not should_retry_pending_index:
+                if node.identifier_index_bytes > max_identifier_index_bytes:
+                    node = FileNode(
+                        path=node.path,
+                        symbols=node.symbols,
+                        referenced_modules=node.referenced_modules,
+                        identifier_index_pending=True,
+                        identifier_index_pending_budget_bytes=(
+                            max_identifier_index_bytes
+                        ),
+                    )
+                return resolved, fingerprint, node
         try:
             _, source = read_scoped_bytes(
                 resolved,
@@ -1043,12 +1101,28 @@ class RepoMap:
             )
         except (OSError, SafetyViolation):
             return None
-        symbols = tuple(self._extractor.extract(resolved, source=source))
+        extracted: ExtractedSource = self._extractor.extract_index(
+            resolved,
+            source=source,
+            max_identifier_index_bytes=max_identifier_index_bytes,
+        )
+        symbols = extracted.symbols
         refs = _extract_references(symbols)
+        identifier_index_pending = defer_identifier_index or (
+            extracted.identifier_index_overflowed
+            and max_identifier_index_bytes
+            < MAX_IDENTIFIER_NAME_INDEX_BYTES_PER_FILE
+        )
         node = FileNode(
             path=resolved,
             symbols=symbols,
             referenced_modules=tuple(sorted(refs)),
+            identifier_names=extracted.identifier_names,
+            identifier_index_bytes=extracted.identifier_index_bytes,
+            identifier_index_pending=identifier_index_pending,
+            identifier_index_pending_budget_bytes=(
+                max_identifier_index_bytes if identifier_index_pending else 0
+            ),
         )
         return resolved, fingerprint, node
 
@@ -1088,7 +1162,13 @@ class RepoMap:
         for path in candidates:
             if path in ignored:
                 continue
-            loaded = self._load_file(path)
+            # Active-file additions are temporary until the next full refresh;
+            # they need symbols for ranking but must not bypass the index budget.
+            loaded = self._load_file(
+                path,
+                max_identifier_index_bytes=0,
+                defer_identifier_index=True,
+            )
             if loaded is not None:
                 resolved, fingerprint, node = loaded
                 loaded_files[resolved] = (fingerprint, node)

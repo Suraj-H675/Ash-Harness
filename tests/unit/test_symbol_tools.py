@@ -49,6 +49,90 @@ async def test_find_references_excludes_definition_sites(workspace: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_find_references_skips_files_without_structural_identifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text(
+        "def calculate_total(amount: int) -> int:\n    return amount\n"
+    )
+    (tmp_path / "b.py").write_text(
+        "from a import calculate_total\n\n"
+        "def checkout(amount: int) -> int:\n"
+        "    return calculate_total(amount)\n"
+    )
+    (tmp_path / "c.py").write_text(
+        "# calculate_total\nLABEL = 'calculate_total'\n"
+    )
+    (tmp_path / "d.py").write_text("def unrelated():\n    return 1\n")
+    repo_map = RepoMap(tmp_path)
+    read_paths: list[str] = []
+    real_read = repomap_module.read_scoped_bytes
+
+    def counted_read(path, *args, **kwargs):
+        read_paths.append(Path(path).name)
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(repomap_module, "read_scoped_bytes", counted_read)
+    result = await FindReferencesTool(SafetyGuard(tmp_path), repo_map).run(
+        query="calculate_total"
+    )
+
+    assert result.success
+    assert "b.py:4:12: calculate_total" in result.output
+    assert sorted(read_paths) == ["a.py", "b.py"]
+
+
+@pytest.mark.asyncio
+async def test_find_references_refreshes_identifier_names_after_file_changes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "checkout.py"
+    source.write_text("def caller():\n    return old_total()\n")
+    repo_map = RepoMap(tmp_path)
+    tool = FindReferencesTool(SafetyGuard(tmp_path), repo_map)
+
+    before = await tool.run(query="old_total")
+    source.write_text("def caller():\n    return new_total()\n")
+    after = await tool.run(query="new_total")
+    removed = await tool.run(query="old_total")
+
+    assert "checkout.py:2:12: old_total" in before.output
+    assert "checkout.py:2:12: new_total" in after.output
+    assert "checkout.py:2:12: old_total" not in removed.output
+
+
+@pytest.mark.asyncio
+async def test_find_references_falls_back_when_identifier_index_budget_is_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("def one(): pass\n")
+    (tmp_path / "b.py").write_text(
+        "def target(): pass\ndef caller():\n    return target()\n"
+    )
+    monkeypatch.setattr(repomap_module, "MAX_REPO_MAP_IDENTIFIER_INDEX_BYTES", 500)
+    repo_map = RepoMap(tmp_path)
+    nodes = {node.path.name: node for node in repo_map.files}
+    assert nodes["a.py"].identifier_names is not None
+    assert nodes["b.py"].identifier_names is None
+
+    read_paths: list[str] = []
+    real_read = repomap_module.read_scoped_bytes
+
+    def counted_read(path, *args, **kwargs):
+        read_paths.append(Path(path).name)
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(repomap_module, "read_scoped_bytes", counted_read)
+    result = await FindReferencesTool(SafetyGuard(tmp_path), repo_map).run(
+        query="target"
+    )
+
+    assert result.success
+    assert "b.py:3:12: target" in result.output
+    assert read_paths == ["b.py"]
+
+
+@pytest.mark.asyncio
 async def test_symbol_tools_support_globs_case_folding_and_limits(
     workspace: Path,
 ) -> None:

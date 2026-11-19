@@ -13,7 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from ash.repo.parser import SymbolExtractor
+from ash.repo.parser import Symbol, SymbolExtractor
 from ash.repo import repomap as repomap_module
 from ash.repo.repomap import RepoMap, calculate_personalized_pagerank
 from ash.safety.guard import SafetyGuard
@@ -233,14 +233,68 @@ def test_repomap_includes_late_active_file_within_file_limit(tmp_path: Path) -> 
     assert ranked[0][0] == active.resolve()
     assert "late_active_symbol" in repo_map.render(ranked, top_files=1)
 
-    graph = repo_map._adjacency
-    extract = Mock(wraps=repo_map._extractor.extract)
-    repo_map._extractor.extract = extract
+    extract = Mock(wraps=repo_map._extractor.extract_index)
+    repo_map._extractor.extract_index = extract
     repo_map.rank([active])
     repo_map.refresh()
 
+    assert extract.call_count == 1
+    assert next(node for node in repo_map.files if node.path == active).identifier_names
+    graph = repo_map._adjacency
+    repo_map.refresh()
+
     assert repo_map._adjacency is graph
-    assert extract.call_count == 0
+    assert extract.call_count == 1
+
+
+def test_active_file_addition_respects_identifier_index_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("def existing(): pass\n")
+    active = tmp_path / "b.py"
+    repo_map = RepoMap(tmp_path, max_files=2)
+    monkeypatch.setattr(repomap_module, "MAX_REPO_MAP_IDENTIFIER_INDEX_BYTES", 1000)
+
+    active.write_text("def target(): pass\ndef caller():\n    return target()\n")
+    repo_map.rank([active])
+    active_node = next(node for node in repo_map.files if node.path == active)
+    assert active_node.identifier_index_pending
+    assert active_node.identifier_names is None
+    assert sum(node.identifier_index_bytes for node in repo_map.files) <= 1000
+
+    references = repo_map.find_references("target", refresh=False)
+    assert [(item.file_path, item.start_line, item.start_column) for item in references] == [
+        (str(active), 3, 12)
+    ]
+
+    repo_map.refresh()
+    active_node = next(node for node in repo_map.files if node.path == active)
+    assert not active_node.identifier_index_pending
+    assert active_node.identifier_names is not None
+    assert sum(node.identifier_index_bytes for node in repo_map.files) <= 1000
+
+
+def test_partial_identifier_budget_retries_after_prioritization_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("def tiny(): pass\n")
+    later = tmp_path / "b.py"
+    later.write_text("def target(): pass\ndef caller():\n    return target()\n")
+    monkeypatch.setattr(repomap_module, "MAX_REPO_MAP_IDENTIFIER_INDEX_BYTES", 600)
+    repo_map = RepoMap(tmp_path)
+
+    initially_later = next(node for node in repo_map.files if node.path == later)
+    assert initially_later.identifier_names is None
+    assert initially_later.identifier_index_pending
+    assert initially_later.identifier_index_pending_budget_bytes > 0
+
+    repo_map.rank([later])
+    repo_map.refresh()
+
+    prioritized_later = next(node for node in repo_map.files if node.path == later)
+    assert prioritized_later.identifier_names is not None
+    assert not prioritized_later.identifier_index_pending
+    assert sum(node.identifier_index_bytes for node in repo_map.files) <= 600
 
 
 def test_repomap_render_includes_top_symbols(tmp_path: Path) -> None:
@@ -342,7 +396,7 @@ def test_repomap_does_not_parse_file_swapped_to_external_symlink(
         "def OUTSIDE_SECRET_SYMBOL():\n    pass\n",
         encoding="utf-8",
     )
-    real_extract = SymbolExtractor.extract
+    real_extract = SymbolExtractor.extract_index
     swapped = False
 
     def extract_after_swap(self, file_path, *args, **kwargs):
@@ -357,7 +411,7 @@ def test_repomap_does_not_parse_file_swapped_to_external_symlink(
             swapped = True
         return real_extract(self, file_path, *args, **kwargs)
 
-    monkeypatch.setattr(SymbolExtractor, "extract", extract_after_swap)
+    monkeypatch.setattr(SymbolExtractor, "extract_index", extract_after_swap)
     try:
         repo_map = RepoMap(workspace)
     finally:
@@ -379,9 +433,9 @@ def test_repomap_find_references_does_not_read_swapped_external_file(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "safe.py"
-    target.write_text(
-        "def harmless():\n    return 'outside_name'\n", encoding="utf-8"
-    )
+    # A declaration enters the identifier metadata but must not be returned as
+    # a reference. This keeps the swapped-path check on the candidate-file path.
+    target.write_text("def outside_name():\n    pass\n", encoding="utf-8")
     saved = workspace / "safe-saved.py"
     outside = tmp_path / "outside.py"
     outside.write_text(
@@ -754,8 +808,8 @@ def test_repomap_refresh_reuses_unchanged_parse_results(tmp_path: Path) -> None:
     first.write_text("def first(): pass\n")
     second.write_text("def second(): pass\n")
     repo_map = RepoMap(tmp_path)
-    extract = Mock(wraps=repo_map._extractor.extract)
-    repo_map._extractor.extract = extract
+    extract = Mock(wraps=repo_map._extractor.extract_index)
+    repo_map._extractor.extract_index = extract
     adjacency = repo_map._adjacency
 
     repo_map.refresh()
@@ -776,8 +830,8 @@ def test_repomap_reparses_atomically_replaced_source_with_preserved_mtime(
     source.write_text("def old_name(): pass\n", encoding="utf-8")
     before = source.stat()
     repo_map = RepoMap(tmp_path)
-    extract = Mock(wraps=repo_map._extractor.extract)
-    repo_map._extractor.extract = extract
+    extract = Mock(wraps=repo_map._extractor.extract_index)
+    repo_map._extractor.extract_index = extract
 
     staged = tmp_path / "replacement.tmp"
     staged.write_text("def new_name(): pass\n", encoding="utf-8")
@@ -979,6 +1033,27 @@ def test_reference_lookup_avoids_parsing_files_without_case_sensitive_ascii_name
     updated = repo_map.find_references("Needle")
     assert {Path(item.file_path) for item in updated} == {matching, different_case}
     assert set(parsed_files) == {matching, different_case}
+
+
+def test_repomap_custom_extractor_uses_unfiltered_reference_fallback(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "custom.py"
+    source.write_text("def caller():\n    return custom_target()\n")
+
+    class CustomExtractor(SymbolExtractor):
+        def extract(
+            self, file_path: Path, *, source: bytes | None = None
+        ) -> list[Symbol]:
+            return super().extract(file_path, source=source)
+
+    repo_map = RepoMap(tmp_path, extractor=CustomExtractor())
+
+    assert repo_map.files[0].identifier_names is None
+    references = repo_map.find_references("custom_target")
+    assert [
+        (item.file_path, item.start_line, item.start_column) for item in references
+    ] == [(str(source), 2, 12)]
 
 
 def test_repomap_symbol_queries_support_path_globs_and_case_folding(
